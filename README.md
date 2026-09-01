@@ -162,8 +162,14 @@ the panic handler and drift with the toolchain.
 | Measured | Gated on | How |
 | --- | --- | --- |
 | Incremental code flash | the `default` row, 8 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
-| Engine RAM | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
+| Engine statics | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
+
+Section sizes see `.data` and `.bss` and nothing else, so the statics figure is a **floor**
+on §04's runtime RAM rather than the rule itself: a cursor, context or record header that
+lives on the caller's stack moves no writable section, and neither does a deeper call frame.
+The report says so rather than printing "runtime RAM: ok"; stack accounting needs a call
+graph and arrives with the code that has one.
 
 Only the `default` row is gated on the first two, because §04 states them for "core + flash
 adapter" and that row is exactly that. The `facade` row and the per-feature rows are
@@ -178,17 +184,26 @@ The matrix is derived from `cargo metadata`, not written down: the `default` and
 rows, plus one row per feature every layer declares. Adding `serde`, `postcard`, `defmt` or
 a CRC choice to a crate makes a row appear with nothing to remember.
 
-Making that row *mean something* is a different question, and it is not automatic. A delta
-can only charge for code the linker keeps, and with `lto = "fat"` and `--gc-sections` the
-linker keeps only what the probe reaches. A feature whose code the probe never calls is
-discarded, and its row comes back byte for byte identical to the row below it. So the probe
-has to be given something to call — in
-[`crates/waymaker-size-probe/src/main.rs`](crates/waymaker-size-probe/src/main.rs), where
-the `engine` and `facade` functions carry a marker for the rung that fills them in.
+Making that row *mean something* is a different question. A delta can only charge for code
+the linker keeps, and with `lto = "fat"` and `--gc-sections` the linker keeps only what the
+probe reaches. Enabling the optional dependency is not enough, and neither is naming the
+crate: a public function nothing calls is discarded, and the row keeps reporting the probe's
+own arithmetic while the real firmware grows.
 
-That cannot be a gate: a feature that genuinely costs nothing is indistinguishable from one
-the probe does not exercise. It is a **notice** instead, printed on every run, naming the
-row and saying what to do:
+Half of that **is** a gate. `size-probe-reach` fails a pull request on any public function
+of a layer that the probe does not call, and names it:
+
+```
+[size-probe-reach] waymaker-size-probe: does not call `advance`, declared in
+crates/waymaker-core/src/lib.rs, so the linker discards it and no row charges for it;
+add a call in the probe or the size report understates waymaker-core for ever
+```
+
+So a layer cannot grow public code that the budget quietly stops covering. What is left is
+the *feature* half: a feature row whose code the probe does not reach comes back identical
+to the row below it, and that cannot be a gate — a feature which genuinely costs nothing is
+indistinguishable from one the probe does not exercise. It is a **notice** instead, printed
+on every run, naming the row and saying what to do:
 
 ```
 notice: `waymaker-core/serde` measured exactly the same image as `default`, so its
@@ -196,8 +211,11 @@ incremental cost is 0 B: either it costs nothing, or waymaker-size-probe does no
 any code the feature adds and the linker discarded it. ...
 ```
 
-So the bookkeeping you cannot forget is the row; the bookkeeping you can forget is the
-probe call, and CI says so out loud every time.
+So the row is automatic, a public function the probe stops reaching fails the build, and a
+feature row measuring nothing is named on every run. The probe's `engine` and `facade`
+functions in
+[`crates/waymaker-size-probe/src/main.rs`](crates/waymaker-size-probe/src/main.rs) are where
+the calls go, and they carry a marker for the rung that fills them in.
 
 The report — absolute sizes, per-section deltas, and each row's cost over the row it is an
 increment on — is written to `target/waymaker-size.json` and uploaded as a CI artifact. On a
@@ -232,7 +250,8 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `ci-pipeline` | the CI workflow stops running a pipeline stage, moves it to another job, runs a job's stages out of order, or leaves a stage in place while making it unable to fail |
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, is not executable, or has drifted from the pipeline table |
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or a component a stage needs |
-| `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, or its crate root stops being bare-metal firmware |
+| `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
+| `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 

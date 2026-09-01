@@ -4,7 +4,7 @@
 //! the kernel plus the flash adapter, on `thumbv6m-none-eabi`, with release-size settings.
 //! An incremental number needs two images, so this one is built twice — once with none of
 //! the layers linked and once with them — and the budget is the difference. `cargo xtask
-//! size` drives that, once per feature combination.
+//! size` drives that, once per feature.
 //!
 //! # Why there is no runtime here
 //!
@@ -27,9 +27,10 @@
 //!
 //! The runtime RAM budget is stated "with a 512 B scratch page", and the page is
 //! caller-owned: the engine borrows it. A probe that declared one would put the caller's
-//! buffer into `.bss` and charge the engine for it. The RAM gate is therefore
+//! buffer into `.bss` and charge the engine for it. The statics gate is therefore
 //! `waymaker_core::budget::ENGINE_RAM_BYTES` — what is left of the 768 B once the page is
-//! accounted for.
+//! accounted for. It is a floor on §04's runtime RAM and not the rule itself: section
+//! sizes cannot see a cursor or a context that lives on the caller's stack.
 
 #![no_std]
 #![no_main]
@@ -62,14 +63,33 @@ fn probe() -> usize {
 }
 
 /// The kernel and the flash adapter, when they are linked in.
+///
+/// # What a delta can and cannot charge for
+///
+/// Only for code the linker keeps, and with `lto = "fat"` and `--gc-sections` the linker
+/// keeps what this function reaches. Enabling the optional dependency is not enough, and
+/// neither is naming the crate: a public function nothing calls is discarded, and the row
+/// reports the same twenty-odd bytes of arithmetic below while the real firmware grows.
+///
+/// That is not left to memory. `cargo xtask check-layering` fails on any public function
+/// of a layer this file does not call, and names it. The calls below are that rule's
+/// answer, not decoration.
 #[cfg(feature = "engine")]
 fn engine() -> usize {
-    // Rung 0.1 replaces this with the record codec, the cursor, and a replay step: the
-    // shape stays the same, and every function the probe reaches is a function the delta
-    // charges for.
-    core::hint::black_box(waymaker_core::budget::KERNEL_STATE_TOTAL_BYTES).wrapping_add(
-        core::hint::black_box(waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES),
-    )
+    // `use ... as _` links the crate without naming an item, which is all there is to name
+    // in it at rung 0.0. It is what makes this row genuinely "core plus the flash adapter"
+    // rather than core alone.
+    use waymaker_flash as _;
+
+    // Rung 0.1: the record codec, the cursor, and one replay step are called from here.
+    let registered = waymaker_core::budget::TypeSize::of::<u32>("u32");
+    core::hint::black_box(registered.size)
+        .wrapping_add(core::hint::black_box(
+            waymaker_core::budget::KERNEL_STATE_TOTAL_BYTES,
+        ))
+        .wrapping_add(core::hint::black_box(
+            waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES,
+        ))
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.

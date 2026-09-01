@@ -52,18 +52,31 @@ one. Gating it is therefore conservative in the safe direction: it can fail earl
 late, and a build it fails might have fitted on the target. It is not evidence that the
 target is over budget — the target-side assertion is what says that.
 
-### The probe measures what it reaches, and says when that is nothing
+### The probe measures what it reaches, and the reach is a gate
 
 A delta can only charge for code the linker keeps, and with `lto = "fat"` and
-`--gc-sections` the linker keeps what the probe reaches. A feature whose code the probe
-never calls is discarded, and its row comes back byte for byte identical to the row below
-it. The row still appears automatically; its number is zero for a reason that has nothing
-to do with the feature being free.
+`--gc-sections` the linker keeps what the probe reaches. Enabling the optional dependency
+is not enough, and neither is naming the crate: a public function nothing calls is
+discarded. So a layer can grow an arbitrary amount of code while the 8 KiB gate keeps
+reporting the same twenty-odd bytes of the probe's own arithmetic — and nothing else
+notices, because the row is not identical to its base and the positive-delta test still
+passes.
 
-This cannot be made a gate, because a feature that genuinely costs nothing is
-indistinguishable from one the probe does not exercise. So `SizeReport::notices` reports it
-instead, on every run, naming the row and pointing at the probe. The derived matrix means
-the row cannot be forgotten; the notice means the probe call cannot be either.
+`size-probe-reach` closes that. It scans each layer's sources for public functions, outside
+their `#[cfg(test)]` modules, and fails the build naming any the probe does not call. A
+function the probe genuinely should not charge for is a function that should not be public,
+or a deliberate exception — either is a conversation in review, which is where a decision
+about what the budget covers belongs.
+
+The rule matches identifiers in code, not in prose. It has to: the first version was
+satisfied by the English word "of" appearing five times in the probe's documentation while
+`TypeSize::of` went unlinked, which is the exact failure it exists to catch.
+
+What remains beyond a gate is the *feature* half. A feature row whose code the probe does
+not reach comes back byte for byte identical to the row below it, and that cannot be made a
+gate: a feature which genuinely costs nothing is indistinguishable from one the probe does
+not exercise. `SizeReport::notices` reports it instead, on every run, naming the row and
+pointing at the probe.
 
 At rung 0.0 the layers have no functions, so what the `default` and `facade` rows measure is
 the probe's own arithmetic plus the cost of linking the crates. That is an honest zero for
@@ -130,7 +143,16 @@ Accounting is by flags and type rather than by name:
   pieces the linker split out of it (`.text.unlikely`, `.bss.probe`), because a report that
   missed those would show a shrinking `.text` for a growing image.
 
-### RAM accounting is a floor, not the whole budget
+### RAM accounting is a floor, and is named for what it measures
+
+The budget is reported as **engine statics**, not as runtime RAM, because that is what
+`.data + .bss` is. Calling it runtime RAM would print "ok" for a §04 rule the measurement
+cannot evaluate: a cursor, context or record header on the caller's stack moves no writable
+section, and neither does a deeper call frame, so the number would stay green while real
+runtime RAM went past 768 B. Stack accounting needs a call graph — `-Z emit-stack-sizes` or
+equivalent — and belongs with the rung that first has one; issue filed separately.
+
+### What the statics figure covers
 
 `.data + .bss` is what a linked image says about RAM, and it is what the gate measures. §04's
 runtime RAM rule — "Cursor, context, record header, and storage scratch" — covers things a
@@ -201,6 +223,10 @@ is an error rather than a pass:
   plausibly;
 - a report read back from JSON with a missing or mistyped size, or taken on another target.
 
+A base worktree is swept only when it is older than any run could be, never by process id:
+removing a checkout that a concurrent run is still measuring makes *that* run report "not
+compared", which is a comparison lost silently rather than an error anyone sees.
+
 Each variant also links into a target directory named after it. They share one artifact file
 name, so a shared directory lets one variant's image be uplifted over another's between the
 build and the read — which is a flaky test, and also a real image of the wrong variant
@@ -218,7 +244,7 @@ measured as though it were the right one.
   `size::check_size_probe` applies the rules that do belong to it — including that each of
   its features still enables the crates its row is supposed to measure, because `engine = []`
   is a plausible thing to write while debugging a link failure and collapses every delta to
-  zero.
+  zero, and that the probe calls every public function the layers declare.
 - The probe is the one crate no lint stage covers: `required-features` keeps it out of
   `cargo clippy --all-targets`, which is the trade the `example` alternative below was
   rejected to get. Mistakes in it surface in the size job.

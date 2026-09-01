@@ -380,8 +380,14 @@ impl KernelState {
 pub enum Budget {
     /// Design document §04's 8 KiB for the kernel plus the flash adapter.
     IncrementalCodeFlash,
-    /// What the engine may own of runtime RAM once the caller's scratch page is counted.
-    EngineRam,
+    /// What the engine may own in statics once the caller's scratch page is counted.
+    ///
+    /// Named for what it measures. Section sizes see `.data` and `.bss` and nothing else,
+    /// so this is a floor on §04's runtime RAM rather than the rule itself: a cursor,
+    /// context or record header that lives on the caller's stack moves no writable section,
+    /// and neither does a deeper call frame. Calling this "runtime RAM" would report a
+    /// budget as enforced that section sizes cannot enforce.
+    EngineStatics,
     /// `waymaker-core` state only, no page buffer.
     KernelState,
 }
@@ -392,7 +398,7 @@ impl Budget {
     pub const fn limit(self) -> u64 {
         match self {
             Self::IncrementalCodeFlash => INCREMENTAL_CODE_FLASH_BUDGET_BYTES,
-            Self::EngineRam => ENGINE_RAM_BUDGET_BYTES,
+            Self::EngineStatics => ENGINE_RAM_BUDGET_BYTES,
             Self::KernelState => KERNEL_STATE_BUDGET_BYTES,
         }
     }
@@ -402,7 +408,7 @@ impl Budget {
     pub const fn name(self) -> &'static str {
         match self {
             Self::IncrementalCodeFlash => "incremental code flash",
-            Self::EngineRam => "engine RAM",
+            Self::EngineStatics => "engine statics (.data + .bss)",
             Self::KernelState => "kernel state",
         }
     }
@@ -598,7 +604,7 @@ impl SizeReport {
             }
             if delta.ram > ENGINE_RAM_BUDGET_BYTES {
                 shortfalls.push(BudgetShortfall::Exceeded {
-                    budget: Budget::EngineRam,
+                    budget: Budget::EngineStatics,
                     subject: row.name.clone(),
                     measured: delta.ram,
                 });
@@ -677,10 +683,14 @@ impl SizeReport {
         }
 
         table.push(format!(
-            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B, engine RAM {ENGINE_RAM_BUDGET_BYTES} B (of {} B runtime RAM, less a {} B caller-owned scratch page)\n",
+            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B, engine statics {ENGINE_RAM_BUDGET_BYTES} B (of {} B runtime RAM, less a {} B caller-owned scratch page)\n",
             waymaker_core::budget::RUNTIME_RAM_BYTES,
             waymaker_core::budget::SCRATCH_PAGE_BYTES,
         ));
+        table.push(
+            "runtime RAM: statics only. A cursor, context or record header on the caller's stack moves no writable section, so \u{394}ram is a floor on design document \u{a7}04's runtime RAM and not the rule itself; stack accounting needs a call graph and arrives with the code that has one.\n"
+                .to_owned(),
+        );
         table.push(format!(
             "kernel state: {} B of {KERNEL_STATE_BUDGET_BYTES} B across {} registered type(s), sized for the host, which is an upper bound on the target; the gate for {FIRMWARE_TARGET} is the const assertion in waymaker_core::budget, which every row above but the baseline compiles\n",
             self.kernel_state.total,
@@ -1417,6 +1427,167 @@ fn check_probe_source(source: Option<&str>) -> Vec<Violation> {
         .collect()
 }
 
+/// One source file of a firmware layer, for the reach rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerSource {
+    /// The crate the file belongs to.
+    pub crate_name: String,
+    /// Its path, for a violation message.
+    pub path: String,
+    /// Its contents.
+    pub contents: String,
+}
+
+/// A public function of a layer, which the probe must reach for its cost to be measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicFunction {
+    /// The crate that declares it.
+    pub crate_name: String,
+    /// The file it is declared in.
+    pub path: String,
+    /// Its name.
+    pub name: String,
+}
+
+/// Every public function the layers declare, outside their test modules.
+///
+/// Scanned rather than parsed, like every other rule here: the question is which names
+/// exist, not what they mean. `#[cfg(test)]` modules are skipped by brace depth, because a
+/// test helper is not code the firmware links.
+#[must_use]
+pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
+    let mut found = Vec::new();
+    for source in sources {
+        let mut depth: i32 = 0;
+        let mut test_module: Option<i32> = None;
+        let mut pending_test_attribute = false;
+
+        for line in source.contents.lines() {
+            let trimmed = line.trim();
+
+            if !trimmed.starts_with("//") {
+                if trimmed.contains("#[cfg(test)]") {
+                    pending_test_attribute = true;
+                }
+                if pending_test_attribute && trimmed.contains('{') {
+                    test_module = Some(depth);
+                    pending_test_attribute = false;
+                }
+            }
+
+            if test_module.is_none() && !trimmed.starts_with("//") {
+                if let Some(name) = function_name(trimmed) {
+                    found.push(PublicFunction {
+                        crate_name: source.crate_name.clone(),
+                        path: source.path.clone(),
+                        name: name.to_owned(),
+                    });
+                }
+            }
+
+            depth += i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+            depth -= i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+            if test_module.is_some_and(|opened| depth <= opened) {
+                test_module = None;
+            }
+        }
+    }
+    found
+}
+
+/// The name declared by a `pub fn` line, if the line declares one.
+fn function_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("pub ")?;
+    // `pub const fn`, `pub async fn`, `pub unsafe fn`, `pub extern "C" fn`, and any
+    // combination: skip everything up to the `fn` keyword.
+    let rest = rest.split_once("fn ")?.1;
+    let name = rest
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .find(|token| !token.is_empty())?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Rule: the probe reaches every public function the layers declare.
+///
+/// This is the rule that stops the whole gate becoming decorative. A delta charges only for
+/// code the linker keeps, and with `lto = "fat"` and `--gc-sections` the linker keeps what
+/// the probe reaches — so a layer can grow an arbitrary amount of code, and the 8 KiB gate
+/// keeps reporting the same twenty-odd bytes of the probe's own arithmetic. Nothing else
+/// notices: the row is not identical to its base, because the probe's constants already
+/// make it bigger, so `notices` stays quiet and the positive-delta test still passes.
+///
+/// Enabling the optional dependency is not enough, and neither is naming the crate: only a
+/// call retains a function. So the rule asks for the one thing that makes the number real —
+/// that every public function appears in the probe — and names the ones that do not.
+///
+/// A function the probe genuinely should not charge for is a function that should not be
+/// public, or a deliberate exception; either is a conversation in review, which is where a
+/// decision about what the budget covers belongs.
+#[must_use]
+pub fn check_probe_reach(sources: &[LayerSource], probe: Option<&str>) -> Vec<Violation> {
+    let functions = public_functions(sources);
+    if functions.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(probe) = probe else {
+        return vec![Violation::new(
+            "size-probe-reach",
+            PROBE_PACKAGE,
+            "the probe has no crate root, so nothing can be said about what it reaches",
+        )];
+    };
+
+    functions
+        .into_iter()
+        .filter(|function| !mentions(probe, &function.name))
+        .map(|function| {
+            Violation::new(
+                "size-probe-reach",
+                PROBE_PACKAGE,
+                format!(
+                    "does not call `{}`, declared in {}, so the linker discards it and no row charges for it; add a call in the probe or the size report understates {} for ever",
+                    function.name, function.path, function.crate_name
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Whether `source` calls `name`, ignoring what its comments happen to say.
+///
+/// Comments are stripped first, and the reason is a fail-open this rule walked straight
+/// into: `waymaker-core` declares `TypeSize::of`, and the probe's prose contains the
+/// English word "of" five times, so the rule reported the function as reached while the
+/// linker discarded it. Prose is not a call. A `//` inside a string literal is stripped
+/// too, which can only make the rule stricter — the safe direction for a rule whose whole
+/// job is to notice something missing.
+fn mentions(source: &str, name: &str) -> bool {
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find(name) {
+        let before = rest.get(..at).and_then(|text| text.chars().next_back());
+        let after = rest
+            .get(at.saturating_add(name.len())..)
+            .and_then(|text| text.chars().next());
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+        };
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        let Some(next) = rest.get(at.saturating_add(1)..) else {
+            return false;
+        };
+        rest = next;
+    }
+    false
+}
+
 /// The base branch a pull request is being measured against, as CI reports it.
 ///
 /// Read from the environment rather than passed on the command line so that the workflow
@@ -1470,6 +1641,15 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
     measured
 }
 
+/// How long a base worktree must have sat untouched before a sweep will remove it.
+///
+/// A size run is minutes of work, so a directory hours old belongs to a process that is no
+/// longer running. Age rather than liveness because there is no portable way to ask whether
+/// a process id is alive, and the failure mode of guessing wrong is the worse one: removing
+/// a worktree a concurrent run is still measuring makes *that* run report "not compared",
+/// which is a silently lost comparison rather than a visible error.
+const LEAKED_WORKTREE_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 /// Removes base worktrees left behind by runs that were killed before they could clean up.
 ///
 /// `git worktree prune` cannot help with these: it drops registrations whose directory is
@@ -1478,33 +1658,57 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
 /// `cancel-in-progress` sees to that — so without this they accumulate one per cancelled
 /// run on any runner whose disk outlives the job.
 fn sweep_leaked_worktrees(root: &Path) {
-    let Some(parent) = root
-        .join(BASELINE_WORKTREE_PATH)
-        .parent()
-        .map(Path::to_path_buf)
-    else {
-        return;
-    };
-    let Some(prefix) = Path::new(BASELINE_WORKTREE_PATH)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
+    let base = root.join(BASELINE_WORKTREE_PATH);
+    let (Some(parent), Some(prefix)) = (
+        base.parent().map(Path::to_path_buf),
+        base.file_name().and_then(|name| name.to_str()),
+    ) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(&parent) else {
         return;
     };
+
+    let mut swept = false;
     for entry in entries.flatten() {
         let path = entry.path();
-        let leaked = path
+        if !path.is_dir() {
+            continue;
+        }
+        let named = path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(&format!("{prefix}-")));
-        if leaked && path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
+        if !named {
+            continue;
         }
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
+        if !is_leaked(age) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        swept = true;
     }
-    let _ = git(root).args(["worktree", "prune"]).output();
+
+    if swept {
+        let _ = git(root).args(["worktree", "prune"]).output();
+    }
+}
+
+/// Whether a base worktree of this age is one a killed run left behind.
+///
+/// An unreadable timestamp is treated as "not leaked": a directory whose age cannot be
+/// established might be in use, and leaving a stale one on disk costs space, while removing
+/// a live one costs a measurement.
+const fn is_leaked(age: Option<std::time::Duration>) -> bool {
+    match age {
+        Some(age) => age.as_secs() >= LEAKED_WORKTREE_AGE.as_secs(),
+        None => false,
+    }
 }
 
 /// The commit `reference` names, trying the remote-tracking form first.
@@ -1517,12 +1721,12 @@ fn resolve_ref(root: &Path, reference: &str) -> Result<String, SizeError> {
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("{candidate}^{{commit}}"))
             .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if !commit.is_empty() {
-                    return Ok(commit);
-                }
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !commit.is_empty() {
+                return Ok(commit);
             }
         }
     }
@@ -1531,6 +1735,7 @@ fn resolve_ref(root: &Path, reference: &str) -> Result<String, SizeError> {
     )))
 }
 
+/// Removes the worktree this process created, and its registration.
 fn remove_worktree(root: &Path, worktree: &Path) {
     // Best effort on both halves: `git worktree remove` fails when there is nothing to
     // remove, and the directory can outlive its registration if a previous run was killed.
@@ -1835,11 +2040,20 @@ mod tests {
     }
 
     #[test]
-    fn exceeding_the_engine_ram_budget_names_the_offending_number() {
+    fn exceeding_the_engine_statics_budget_names_the_offending_number() {
         let over = ENGINE_RAM_BUDGET_BYTES + 1;
         let message = rendered(&report(0, over).shortfalls());
         assert!(message.contains(&over.to_string()), "{message}");
-        assert!(message.contains("engine RAM"), "{message}");
+        assert!(message.contains("engine statics"), "{message}");
+    }
+
+    #[test]
+    fn the_report_does_not_claim_to_have_measured_stack_usage() {
+        // Section sizes cannot see the stack, and a report that said "runtime RAM: ok"
+        // would be claiming a budget it did not evaluate.
+        let table = report(0, 0).render();
+        assert!(table.contains("runtime RAM: statics only"), "{table}");
+        assert!(table.contains("engine statics"), "{table}");
     }
 
     #[test]
@@ -1884,7 +2098,7 @@ mod tests {
             Budget::IncrementalCodeFlash.limit(),
             INCREMENTAL_CODE_FLASH_BUDGET_BYTES
         );
-        assert_eq!(Budget::EngineRam.limit(), ENGINE_RAM_BUDGET_BYTES);
+        assert_eq!(Budget::EngineStatics.limit(), ENGINE_RAM_BUDGET_BYTES);
         assert_eq!(Budget::KernelState.limit(), KERNEL_STATE_BUDGET_BYTES);
         assert_eq!(Budget::KernelState.name(), "kernel state");
     }
@@ -2483,6 +2697,145 @@ mod tests {
         let message = probe_violations(&probe_graph(), None, None);
         assert!(message.contains("manifest could not be read"), "{message}");
         assert!(message.contains("no crate root"), "{message}");
+    }
+
+    // --- the reach rule -------------------------------------------------------------
+
+    fn kernel(contents: &str) -> Vec<LayerSource> {
+        vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: contents.to_owned(),
+        }]
+    }
+
+    fn reach_violations(sources: &[LayerSource], probe: &str) -> String {
+        check_probe_reach(sources, Some(probe))
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_public_function_the_probe_never_calls_is_reported() {
+        // The failure this rule exists for: the layer grows code, the probe does not, the
+        // linker discards it, and the 8 KiB gate keeps measuring the probe's own
+        // arithmetic. Nothing else catches it — the row is not identical to its base,
+        // because the probe's own constants already made it bigger.
+        let message = reach_violations(
+            &kernel("pub fn advance(&mut self) {}\n"),
+            "fn probe() -> usize { 0 }\n",
+        );
+        assert!(message.contains("advance"), "{message}");
+        assert!(message.contains("understates"), "{message}");
+    }
+
+    #[test]
+    fn a_public_function_the_probe_calls_is_accepted() {
+        assert!(
+            check_probe_reach(
+                &kernel("pub fn advance() {}\n"),
+                Some("fn probe() { waymaker_core::advance(); }\n"),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_probes_prose_is_not_a_call() {
+        // The rule walked into this: `TypeSize::of` was reported as reached because the
+        // probe's documentation contains the English word "of".
+        let message = reach_violations(
+            &kernel("impl T {\n    pub const fn of<X>() -> Self {}\n}\n"),
+            "//! The shape of the probe, and the cost of it.\nfn probe() {}\n",
+        );
+        assert!(message.contains("`of`"), "{message}");
+    }
+
+    #[test]
+    fn a_name_inside_a_longer_identifier_is_not_a_call() {
+        let message = reach_violations(
+            &kernel("pub fn seal() {}\n"),
+            "fn probe() { let sealed_record = 0; }\n",
+        );
+        assert!(message.contains("seal"), "{message}");
+    }
+
+    #[test]
+    fn every_shape_of_public_function_is_found() {
+        let functions = public_functions(&kernel(
+            "pub fn plain() {}\n\
+             pub const fn constant() {}\n\
+             pub async fn eventual() {}\n\
+             pub unsafe fn risky() {}\n\
+             pub extern \"C\" fn abi() {}\n\
+             impl T {\n    pub fn method(&self) {}\n}\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["plain", "constant", "eventual", "risky", "abi", "method"]
+        );
+    }
+
+    #[test]
+    fn a_private_function_is_not_the_probes_business() {
+        assert!(public_functions(&kernel("fn hidden() {}\n")).is_empty());
+        assert!(public_functions(&kernel("pub(crate) fn internal() {}\n")).is_empty());
+    }
+
+    #[test]
+    fn a_function_in_a_test_module_is_not_linked_and_is_not_required() {
+        let functions = public_functions(&kernel(
+            "pub fn shipped() {}\n\
+             #[cfg(test)]\n\
+             mod tests {\n    pub fn helper() {}\n}\n\
+             pub fn also_shipped() {}\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["shipped", "also_shipped"]);
+    }
+
+    #[test]
+    fn a_commented_out_declaration_is_not_a_function() {
+        assert!(public_functions(&kernel("// pub fn ghost() {}\n")).is_empty());
+    }
+
+    #[test]
+    fn a_workspace_whose_layers_have_no_public_functions_yet_has_nothing_to_reach() {
+        // Rung 0.0. The rule must be silent rather than demanding the probe call nothing.
+        assert!(check_probe_reach(&kernel("//! Docs only.\n"), Some("")).is_empty());
+    }
+
+    #[test]
+    fn a_probe_with_no_source_cannot_be_shown_to_reach_anything() {
+        let violations = check_probe_reach(&kernel("pub fn advance() {}\n"), None);
+        assert!(!violations.is_empty());
+    }
+
+    #[test]
+    fn a_worktree_a_concurrent_run_is_using_is_not_swept() {
+        // The sweep was added to stop killed runs leaking checkouts, and removing a live
+        // one costs the run using it its whole base comparison — which `baseline_diff`
+        // downgrades to "not compared", so it is lost silently.
+        assert!(!is_leaked(Some(std::time::Duration::from_secs(0))));
+        assert!(!is_leaked(Some(std::time::Duration::from_secs(60 * 30))));
+        assert!(!is_leaked(None), "an unknown age might be a live run");
+    }
+
+    #[test]
+    fn a_worktree_older_than_any_run_could_be_is_swept() {
+        assert!(is_leaked(Some(LEAKED_WORKTREE_AGE)));
+        assert!(is_leaked(Some(
+            LEAKED_WORKTREE_AGE + std::time::Duration::from_secs(1)
+        )));
     }
 
     #[test]
