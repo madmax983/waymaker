@@ -189,7 +189,15 @@ fn baseline_diff(root: &Path, options: &SizeOptions, report: &xtask::size::SizeR
     };
 
     match xtask::size::measure_baseline(root, &reference) {
-        Ok(base) => xtask::size::render_diff(&xtask::size::diff(&base, report)),
+        Ok(base) => {
+            let rows = xtask::size::render_diff(&xtask::size::diff(&base, report));
+            // Appended rather than folded into the row diff: kernel state is the one budget
+            // the section sizes cannot see, so a pull request that changes only the
+            // registry has no row to move and would otherwise read "no change".
+            let kernel_state = xtask::size::kernel_state_change(&base, report)
+                .map_or_else(String::new, |change| format!("  {change}\n"));
+            format!("{rows}{kernel_state}")
+        }
         Err(error) => format!("size against the base branch: not compared; {error}\n"),
     }
 }

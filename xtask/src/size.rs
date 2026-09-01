@@ -354,7 +354,13 @@ pub struct KernelState {
 }
 
 impl KernelState {
-    /// Reads the registry out of [`waymaker_core::budget`].
+    /// Reads the registry out of [`waymaker_core::budget`], for the checkout `xtask` was
+    /// built from.
+    ///
+    /// Only ever `Some` for that checkout: this reads the crate linked into this binary, so
+    /// asking it about a base-branch worktree would answer about the head. Callers
+    /// measuring another tree pass `None`, and the report says the figure is unknown rather
+    /// than printing the head's.
     ///
     /// These are sizes for the host, because that is the target `xtask` is compiled for.
     /// The budget is stated for `thumbv6m-none-eabi`, where a type holding a pointer is
@@ -364,14 +370,14 @@ impl KernelState {
     /// [`waymaker_core::budget`], which every row of the matrix but the baseline evaluates,
     /// because every one of those compiles `waymaker-core` for the firmware target.
     #[must_use]
-    pub fn measured() -> Self {
-        Self {
+    pub fn measured() -> Option<Self> {
+        Some(Self {
             total: waymaker_core::budget::KERNEL_STATE_TOTAL_BYTES as u64,
             types: waymaker_core::budget::KERNEL_STATE_TYPES
                 .iter()
                 .map(|entry| (entry.name.to_owned(), entry.size as u64))
                 .collect(),
-        }
+        })
     }
 }
 
@@ -464,13 +470,13 @@ impl fmt::Display for BudgetShortfall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeReport {
     rows: Vec<Row>,
-    kernel_state: KernelState,
+    kernel_state: Option<KernelState>,
 }
 
 impl SizeReport {
     /// Collects measured rows into a report.
     #[must_use]
-    pub const fn new(rows: Vec<Row>, kernel_state: KernelState) -> Self {
+    pub const fn new(rows: Vec<Row>, kernel_state: Option<KernelState>) -> Self {
         Self { rows, kernel_state }
     }
 
@@ -480,10 +486,13 @@ impl SizeReport {
         &self.rows
     }
 
-    /// The kernel state registry the report was taken with.
+    /// The kernel state registry the report was taken with, where it could be read.
+    ///
+    /// `None` for a checkout this build of `xtask` was not compiled against — the base
+    /// branch — because the only registry it can read is its own.
     #[must_use]
-    pub const fn kernel_state(&self) -> &KernelState {
-        &self.kernel_state
+    pub const fn kernel_state(&self) -> Option<&KernelState> {
+        self.kernel_state.as_ref()
     }
 
     /// The row every other row is measured against.
@@ -558,11 +567,13 @@ impl SizeReport {
     pub fn shortfalls(&self) -> Vec<BudgetShortfall> {
         let mut shortfalls = Vec::new();
 
-        if self.kernel_state.total > KERNEL_STATE_BUDGET_BYTES {
+        if let Some(kernel_state) = self.kernel_state.as_ref()
+            && kernel_state.total > KERNEL_STATE_BUDGET_BYTES
+        {
             shortfalls.push(BudgetShortfall::Exceeded {
                 budget: Budget::KernelState,
                 subject: "waymaker-core".to_owned(),
-                measured: self.kernel_state.total,
+                measured: kernel_state.total,
             });
         }
 
@@ -590,6 +601,22 @@ impl SizeReport {
         if baseline.sizes.flash == 0 {
             shortfalls.push(BudgetShortfall::Unmeasurable {
                 detail: "the baseline image reports no bytes in flash at all, which no linked firmware does; its section headers were probably stripped or the wrong file was measured".to_owned(),
+            });
+        }
+
+        // The report says which rows are gated, and `--report` gates a document this
+        // process did not produce. A report with no `default` row, or one whose `gated`
+        // flag says false, would otherwise leave the loop below with nothing to check and
+        // exit zero — letting the document choose whether it is gated.
+        if !self
+            .rows
+            .iter()
+            .any(|row| row.name == DEFAULT_ROW && row.gated)
+        {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: format!(
+                    "the report has no gated `{DEFAULT_ROW}` row, which is the configuration design document \u{a7}04's budgets are stated for"
+                ),
             });
         }
 
@@ -691,10 +718,13 @@ impl SizeReport {
             "runtime RAM: statics only. A cursor, context or record header on the caller's stack moves no writable section, so \u{394}ram is a floor on design document \u{a7}04's runtime RAM and not the rule itself; stack accounting needs a call graph and arrives with the code that has one.\n"
                 .to_owned(),
         );
-        table.push(format!(
-            "kernel state: {} B of {KERNEL_STATE_BUDGET_BYTES} B across {} registered type(s), sized for the host, which is an upper bound on the target; the gate for {FIRMWARE_TARGET} is the const assertion in waymaker_core::budget, which every row above but the baseline compiles\n",
-            self.kernel_state.total,
-            self.kernel_state.types.len(),
+        table.push(self.kernel_state.as_ref().map_or_else(
+            || "kernel state: not read; this report is of a checkout `xtask` was not built against, so the only registry it could read would be the wrong one\n".to_owned(),
+            |kernel_state| format!(
+                "kernel state: {} B of {KERNEL_STATE_BUDGET_BYTES} B across {} registered type(s), sized for the host, which is an upper bound on the target; the gate for {FIRMWARE_TARGET} is the const assertion in waymaker_core::budget, which every row above but the baseline compiles\n",
+                kernel_state.total,
+                kernel_state.types.len(),
+            ),
         ));
         for notice in self.notices() {
             table.push(format!("\nnotice: {notice}\n"));
@@ -736,21 +766,22 @@ impl SizeReport {
             })
             .collect();
 
-        let types: Vec<Value> = self
-            .kernel_state
-            .types
-            .iter()
-            .map(|(name, size)| {
-                let mut entry = Map::new();
-                entry.insert("name".to_owned(), Value::from(name.clone()));
-                entry.insert("size".to_owned(), Value::from(*size));
-                Value::Object(entry)
-            })
-            .collect();
-
-        let mut kernel_state = Map::new();
-        kernel_state.insert("total".to_owned(), Value::from(self.kernel_state.total));
-        kernel_state.insert("types".to_owned(), Value::Array(types));
+        let kernel_state = self.kernel_state.as_ref().map_or(Value::Null, |state| {
+            let types: Vec<Value> = state
+                .types
+                .iter()
+                .map(|(name, size)| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(name.clone()));
+                    entry.insert("size".to_owned(), Value::from(*size));
+                    Value::Object(entry)
+                })
+                .collect();
+            let mut object = Map::new();
+            object.insert("total".to_owned(), Value::from(state.total));
+            object.insert("types".to_owned(), Value::Array(types));
+            Value::Object(object)
+        });
 
         let mut budgets = Map::new();
         budgets.insert(
@@ -770,7 +801,7 @@ impl SizeReport {
         document.insert("schema".to_owned(), Value::from(REPORT_SCHEMA));
         document.insert("target".to_owned(), Value::from(FIRMWARE_TARGET));
         document.insert("budgets".to_owned(), Value::Object(budgets));
-        document.insert("kernel_state".to_owned(), Value::Object(kernel_state));
+        document.insert("kernel_state".to_owned(), kernel_state);
         document.insert("rows".to_owned(), Value::Array(rows));
 
         format!("{:#}\n", Value::Object(document))
@@ -860,6 +891,12 @@ impl SizeReport {
         let kernel_state = document
             .get("kernel_state")
             .ok_or_else(|| SizeError::new("the size report has no `kernel_state`"))?;
+        if kernel_state.is_null() {
+            return Ok(Self {
+                rows,
+                kernel_state: None,
+            });
+        }
         let kernel_state = KernelState {
             total: number(kernel_state, "total")?,
             types: kernel_state
@@ -877,7 +914,10 @@ impl SizeReport {
                 .collect::<Result<Vec<(String, u64)>, SizeError>>()?,
         };
 
-        Ok(Self { rows, kernel_state })
+        Ok(Self {
+            rows,
+            kernel_state: Some(kernel_state),
+        })
     }
 }
 
@@ -988,17 +1028,22 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
 /// it would otherwise be invisible in a diff of linked images.
 #[must_use]
 pub fn kernel_state_change(base: &SizeReport, head: &SizeReport) -> Option<String> {
-    let (before, after) = (base.kernel_state(), head.kernel_state());
-    if before == after {
-        return None;
+    match (base.kernel_state(), head.kernel_state()) {
+        (Some(before), Some(after)) if before == after => None,
+        (Some(before), Some(after)) => Some(format!(
+            "kernel state {} B across {} type(s) -> {} B across {} type(s)",
+            before.total,
+            before.types.len(),
+            after.total,
+            after.types.len(),
+        )),
+        // The base branch's registry cannot be read from here, so silence would be a claim
+        // that it did not change. It says so instead.
+        _ => Some(
+            "kernel state: not compared; the base branch's registry cannot be read by this build, and the const assertion in waymaker_core::budget is what gates it"
+                .to_owned(),
+        ),
     }
-    Some(format!(
-        "kernel state {} B across {} type(s) -> {} B across {} type(s)",
-        before.total,
-        before.types.len(),
-        after.total,
-        after.types.len(),
-    ))
 }
 
 /// The diff as a table, or a line saying there is nothing to show.
@@ -1141,7 +1186,7 @@ pub fn check_workspace_root(metadata: &str, root: &Path) -> Result<(), SizeError
 /// Returns [`SizeError`] if the workspace cannot be resolved, if it has no size probe, or
 /// if any image fails to build or to be read.
 pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
-    measure_into(root, &root.join(BUILD_DIR))
+    measure_into(root, &root.join(BUILD_DIR), KernelState::measured())
 }
 
 /// Measures the workspace at `root`, linking into `build_dir`.
@@ -1153,7 +1198,11 @@ pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
 /// # Errors
 ///
 /// As [`measure`].
-pub fn measure_into(root: &Path, build_dir: &Path) -> Result<SizeReport, SizeError> {
+pub fn measure_into(
+    root: &Path,
+    build_dir: &Path,
+    kernel_state: Option<KernelState>,
+) -> Result<SizeReport, SizeError> {
     let metadata = crate::run_cargo_metadata(root)
         .map_err(|err| SizeError::new(format!("could not resolve the workspace: {err}")))?;
     check_workspace_root(&metadata, root)?;
@@ -1176,6 +1225,15 @@ pub fn measure_into(root: &Path, build_dir: &Path) -> Result<SizeReport, SizeErr
                 image.display()
             ))
         })?;
+        let machine = elf::machine(&bytes)
+            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+        if machine != elf::EM_ARM {
+            return Err(SizeError::new(format!(
+                "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
+                image.display(),
+                elf::EM_ARM
+            )));
+        }
         let sections = elf::sections(&bytes)
             .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
         rows.push(Row {
@@ -1187,7 +1245,7 @@ pub fn measure_into(root: &Path, build_dir: &Path) -> Result<SizeReport, SizeErr
         });
     }
 
-    Ok(SizeReport::new(rows, KernelState::measured()))
+    Ok(SizeReport::new(rows, kernel_state))
 }
 
 /// Links one image and returns the path to it.
@@ -1636,7 +1694,16 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
     // Linked into a directory beside the head build rather than inside the worktree, so
     // that the base half survives the worktree's removal and a CI build cache can see it.
     // Otherwise every pull request pays for a cold build of the base branch, for ever.
-    let measured = measure_into(&worktree, &root.join(BUILD_DIR).with_extension("base"));
+    // No kernel state. `KernelState::measured` reads the `waymaker-core` that *this*
+    // `xtask` was compiled against, which is the head's — so recording it for the base too
+    // would put the same registry on both sides of the diff and make a pull request that
+    // changes the registry look like one that did not. Unknown is the truth here, and the
+    // diff says so.
+    let measured = measure_into(
+        &worktree,
+        &root.join(BUILD_DIR).with_extension("base"),
+        None,
+    );
     remove_worktree(root, &worktree);
     measured
 }
@@ -2232,6 +2299,68 @@ mod tests {
     }
 
     #[test]
+    fn a_report_with_no_gated_default_row_does_not_get_to_gate_itself() {
+        // `--report` gates a document this process did not produce. Letting the document's
+        // own `gated` flags decide which rows are checked means a report with the flag
+        // cleared, or with the row removed, gates nothing and exits zero.
+        let ungated = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                flash: baseline_sizes().flash + INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1,
+                ..baseline_sizes()
+            },
+            false,
+        );
+        let message = rendered(
+            &SizeReport::new(vec![baseline_row(), ungated], KernelState::measured()).shortfalls(),
+        );
+        assert!(message.contains("no gated `default` row"), "{message}");
+
+        let missing = SizeReport::new(vec![baseline_row()], KernelState::measured()).shortfalls();
+        assert!(
+            rendered(&missing).contains("no gated `default` row"),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_kernel_state_of_a_checkout_this_build_cannot_read_is_not_the_head_s() {
+        // `KernelState::measured` reads the `waymaker-core` linked into this binary. For a
+        // base-branch worktree that is the head's registry, so recording it would put the
+        // same figure on both sides of the diff and make a change to the registry invisible.
+        let base = SizeReport::new(vec![baseline_row(), default_row(0, 0)], None);
+        let head = report(0, 0);
+
+        assert!(base.kernel_state().is_none());
+        assert!(base.shortfalls().iter().all(|shortfall| !matches!(
+            shortfall,
+            BudgetShortfall::Exceeded {
+                budget: Budget::KernelState,
+                ..
+            }
+        )));
+        assert!(
+            base.render().contains("kernel state: not read"),
+            "{}",
+            base.render()
+        );
+
+        let change = kernel_state_change(&base, &head).expect("an unknown side is not a match");
+        assert!(change.contains("not compared"), "{change}");
+    }
+
+    #[test]
+    fn a_report_with_an_unknown_kernel_state_survives_a_json_round_trip() {
+        let original = SizeReport::new(vec![baseline_row(), default_row(0, 0)], None);
+        let restored =
+            SizeReport::from_json(&original.to_json()).expect("its own JSON is readable");
+        assert_eq!(restored, original);
+        assert!(restored.kernel_state().is_none());
+    }
+
+    #[test]
     fn a_report_with_no_baseline_row_fails_rather_than_reporting_zero() {
         let report = SizeReport::new(vec![default_row(0, 0)], KernelState::measured());
         let message = rendered(&report.shortfalls());
@@ -2242,10 +2371,10 @@ mod tests {
     fn the_kernel_state_budget_is_gated_too() {
         let report = SizeReport::new(
             vec![baseline_row()],
-            KernelState {
+            Some(KernelState {
                 total: KERNEL_STATE_BUDGET_BYTES + 7,
                 types: vec![("Cursor".to_owned(), KERNEL_STATE_BUDGET_BYTES + 7)],
-            },
+            }),
         );
         let message = rendered(&report.shortfalls());
         assert!(
@@ -2424,10 +2553,10 @@ mod tests {
         let base = report(0, 0);
         let head = SizeReport::new(
             vec![baseline_row(), default_row(0, 0)],
-            KernelState {
+            Some(KernelState {
                 total: 24,
                 types: vec![("Cursor".to_owned(), 24)],
-            },
+            }),
         );
         let change = kernel_state_change(&base, &head).expect("the registry changed");
         assert!(change.contains("24"), "{change}");
