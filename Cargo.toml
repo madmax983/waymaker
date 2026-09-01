@@ -27,22 +27,28 @@ waymaker-core = { path = "crates/waymaker-core", version = "0.0.0", default-feat
 waymaker-flash = { path = "crates/waymaker-flash", version = "0.0.0", default-features = false }
 
 [workspace.lints.rust]
-# No crate in the workspace has an unsafe block today. An exception requires an ADR and a
-# crate-level `#![deny(unsafe_code)]` with a documented `unsafe` module, not a quiet edit.
-unsafe_code = "forbid"
-missing_docs = "warn"
+# Denied rather than forbidden at the workspace level on purpose. Each firmware crate
+# raises this to `#![forbid(unsafe_code)]` in its own root, which `cargo xtask
+# check-layering` requires; a workspace-level `forbid` cannot be relaxed by any in-crate
+# attribute, so the only way out would be to drop `[lints] workspace = true` entirely and
+# silently lose pedantic, nursery and unwrap_used with it. `deny` keeps a documented
+# exception a reviewable one-line `#![allow(unsafe_code)]` plus an ADR.
+unsafe_code = "deny"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+# `missing_docs` is set per crate root rather than here: a workspace lint also applies to
+# every `tests/*.rs` target, where a missing crate-level doc comment is noise.
 
 [workspace.lints.clippy]
 # Negative priority so that the individual denials below outrank the groups.
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 # `clippy.toml` exempts tests; see `allow-unwrap-in-tests` and `allow-expect-in-tests`.
+# Denied, not warned, so that a local `cargo clippy` and CI's `-D warnings` agree.
 unwrap_used = "deny"
 expect_used = "deny"
-panic = "warn"
-indexing_slicing = "warn"
+panic = "deny"
+indexing_slicing = "deny"
 
 # Design document §04 Resource budgets. The incremental code-flash budget is measured
 # against these settings; changing them changes the number CI gates on.

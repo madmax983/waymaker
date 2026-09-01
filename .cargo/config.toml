@@ -1,3 +1,13 @@
 [alias]
 # CI and a local checkout run the same command, so CI is confirmation, not discovery.
+#
+# Cargo flags must precede an alias: `cargo --locked xtask check-layering`, not
+# `cargo xtask --locked check-layering`, which the binary would read as a subcommand.
+#
+# Do not add a `[build] target` here: it would make `cargo xtask` try to cross-compile
+# its own host-only dependencies. Firmware targets belong on the command line.
+#
+# Do not add a `[profile.*]` table here either: it silently overrides the release profile
+# in Cargo.toml, which the size budgets in design document §04 are measured against.
+# `cargo xtask check-layering` fails the build if one appears.
 xtask = "run --quiet --package xtask --"

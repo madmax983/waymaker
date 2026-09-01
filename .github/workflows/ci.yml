@@ -1,5 +1,8 @@
 # Rung 0.0 pipeline. Issue #9 extends this with the thumbv6m-none-eabi build, the
 # coverage gate, and the pre-commit hooks that mirror it; issue #10 adds the size job.
+#
+# The toolchain comes from rust-toolchain.toml, which both jobs and a local checkout read,
+# so CI is confirmation rather than discovery.
 name: CI
 
 on:
@@ -7,13 +10,21 @@ on:
     branches: [main]
   pull_request:
 
+# A superseded pull-request run is wasted work, but cancelling a push to main can leave
+# the default branch with no completed run at all.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # Deliberately not RUSTFLAGS: that is passed to every registry dependency as well, so a
+  # new rustc warning inside `toml` or `serde_json` would fail a build with nothing in
+  # this repository to fix. The denial belongs on the tools that lint our own code.
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   check:
@@ -23,38 +34,42 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 
       - name: Build
-        run: cargo build --workspace --no-default-features
+        run: cargo build --locked --workspace --no-default-features
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace --no-default-features
+
+      - name: Docs
+        run: cargo doc --locked --workspace --no-deps --no-default-features
 
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash
     # reaches for Embassy directly or through another crate, if a crate stops being
-    # no_std, or if the release profile or lint table drifts from the design document.
+    # no_std or starts allowing unsafe code, if a new workspace member appears that no
+    # layer rule covers, or if the release profile or lint table drifts from the design
+    # document.
+    #
+    # `cargo test` also runs this gate through xtask's integration tests. This job is
+    # kept separate because it is the only thing that exercises the binary a developer
+    # runs, and because a layering failure should be legible in the checks list without
+    # reading a test log.
     name: layering contract
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Check the layering contract
-        run: cargo xtask check-layering
+        run: cargo --locked xtask check-layering

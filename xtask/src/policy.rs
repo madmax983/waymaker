@@ -9,9 +9,16 @@
 pub struct LayerSpec {
     /// Package name as it appears in `Cargo.toml`.
     pub name: &'static str,
-    /// Every package this crate may depend on, directly or transitively, in any
-    /// dependency kind. An empty list means the crate must have no dependencies at all.
+    /// Every workspace crate this crate may depend on, directly or transitively, in any
+    /// dependency kind.
     pub may_depend_on: &'static [&'static str],
+    /// Third-party crates this layer is allowed to reach.
+    ///
+    /// This is the designed escape hatch. `waymaker-embassy` will need Embassy itself at
+    /// rung 0.4; naming those crates here is how that arrives without anyone reaching for
+    /// a broader exemption. A layer with both lists empty must have no dependencies at
+    /// all.
+    pub may_depend_on_external: &'static [&'static str],
     /// The design document's "must not own" column, quoted so that a violation message
     /// can say why the rule exists.
     pub must_not_own: &'static str,
@@ -22,19 +29,28 @@ pub const LAYERS: &[LayerSpec] = &[
     LayerSpec {
         name: "waymaker-core",
         may_depend_on: &[],
+        may_depend_on_external: &[],
         must_not_own: "allocation, serialization framework, CRC, clock, storage driver, executor, logging",
     },
     LayerSpec {
         name: "waymaker-flash",
         may_depend_on: &["waymaker-core"],
+        may_depend_on_external: &[],
         must_not_own: "activities, workflow types, timers, Embassy",
     },
     LayerSpec {
         name: "waymaker-embassy",
         may_depend_on: &["waymaker-core", "waymaker-flash"],
+        // Rung 0.4 adds the Embassy crates the facade actually needs. Until then the
+        // facade is as dependency-free as the layers below it.
+        may_depend_on_external: &[],
         must_not_own: "on-media authority or hidden global state",
     },
 ];
+
+/// Host-only tooling that lives in the workspace but is not part of the firmware
+/// layering. These crates are excluded from firmware-target builds by `default-members`.
+pub const HOST_TOOLS: &[&str] = &["xtask"];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";
@@ -49,6 +65,27 @@ pub const EMBASSY_PREFIXES: &[&str] = &["embassy"];
 #[must_use]
 pub fn layer(name: &str) -> Option<&'static LayerSpec> {
     LAYERS.iter().find(|layer| layer.name == name)
+}
+
+impl LayerSpec {
+    /// Every crate this layer may reach, workspace and third-party alike.
+    pub fn allowed_dependencies(&self) -> impl Iterator<Item = &'static str> + use<'_> {
+        self.may_depend_on
+            .iter()
+            .chain(self.may_depend_on_external)
+            .copied()
+    }
+
+    /// Renders the allowlist for a violation message.
+    #[must_use]
+    pub fn render_allowed(&self) -> String {
+        let allowed: Vec<&str> = self.allowed_dependencies().collect();
+        if allowed.is_empty() {
+            "nothing".to_owned()
+        } else {
+            allowed.join(", ")
+        }
+    }
 }
 
 /// Returns true if `name` is an Embassy crate or the Waymaker Embassy façade.
@@ -88,15 +125,43 @@ mod tests {
     }
 
     #[test]
-    fn every_layer_may_only_depend_on_other_layers() {
+    fn every_workspace_allowance_names_a_layer() {
+        // Third-party allowances belong in `may_depend_on_external`, which this
+        // assertion deliberately does not constrain.
         for spec in LAYERS {
             for allowed in spec.may_depend_on {
                 assert!(
                     layer(allowed).is_some(),
-                    "{} may depend on {allowed}, which is not a layer",
+                    "{} may depend on {allowed}, which is not a layer; third-party crates belong in may_depend_on_external",
                     spec.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_allowlist_covers_both_workspace_and_external_crates() {
+        let spec = LayerSpec {
+            name: "example",
+            may_depend_on: &["waymaker-core"],
+            may_depend_on_external: &["embassy-time"],
+            must_not_own: "nothing in particular",
+        };
+        let allowed: Vec<&str> = spec.allowed_dependencies().collect();
+        assert_eq!(allowed, ["waymaker-core", "embassy-time"]);
+        assert_eq!(spec.render_allowed(), "waymaker-core, embassy-time");
+    }
+
+    #[test]
+    fn a_layer_with_no_allowances_renders_as_nothing() {
+        let kernel = layer("waymaker-core").expect("the kernel is a layer");
+        assert_eq!(kernel.render_allowed(), "nothing");
+    }
+
+    #[test]
+    fn host_tools_are_not_layers() {
+        for tool in HOST_TOOLS {
+            assert!(layer(tool).is_none(), "{tool} must not also be a layer");
         }
     }
 }

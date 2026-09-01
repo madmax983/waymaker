@@ -54,7 +54,15 @@ pub fn check_release_profile(manifest: &str) -> Vec<Violation> {
     REQUIRED_RELEASE_PROFILE
         .iter()
         .filter_map(|(key, expected)| {
-            let expected_value = expected.parse::<Value>().ok()?;
+            // A gate must never be able to silently uncheck one of its own rules: an
+            // expected literal that does not parse is a bug in the gate, reported as one.
+            let Ok(expected_value) = expected.parse::<Value>() else {
+                return Some(Violation::new(
+                    "gate-broken",
+                    "REQUIRED_RELEASE_PROFILE",
+                    format!("the expected value for {key} is not valid TOML: {expected}"),
+                ));
+            };
             match profile.get(*key) {
                 Some(actual) if *actual == expected_value => None,
                 Some(actual) => Some(Violation::new(
@@ -152,6 +160,45 @@ pub fn check_workspace_lints(manifest: &str) -> Vec<Violation> {
     }
 
     violations
+}
+
+/// Rule: `.cargo/config.toml` declares no profile.
+///
+/// A `[profile.*]` table in `.cargo/config.toml` overrides the manifest, so four lines in
+/// a file the release-profile rule does not read are enough to defeat the size budget the
+/// release profile exists to protect. Banning profiles there outright is simpler and more
+/// honest than reimplementing cargo's precedence.
+#[must_use]
+pub fn check_cargo_config(config: Option<&str>) -> Vec<Violation> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let Some(document) = parse(config) else {
+        return vec![Violation::new(
+            "cargo-config-profile",
+            ".cargo/config.toml",
+            "is not valid TOML",
+        )];
+    };
+
+    document
+        .get("profile")
+        .and_then(Value::as_table)
+        .map(|profiles| {
+            profiles
+                .keys()
+                .map(|name| {
+                    Violation::new(
+                        "cargo-config-profile",
+                        ".cargo/config.toml",
+                        format!(
+                            "declares [profile.{name}], which silently overrides the release profile in Cargo.toml; profiles belong in the workspace manifest"
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Rule: every firmware crate inherits the workspace lints and declares no default
@@ -338,6 +385,136 @@ strip = "symbols"
         let allowed = GOOD_WORKSPACE.replace("unsafe_code = \"forbid\"", "unsafe_code = \"allow\"");
         let violations = check_workspace_lints(&allowed);
         assert!(violations.iter().any(|v| v.subject == "unsafe_code"));
+    }
+
+    #[test]
+    fn a_lint_group_set_to_allow_is_reported() {
+        let disabled = GOOD_WORKSPACE.replace(
+            "pedantic = { level = \"warn\", priority = -1 }",
+            "pedantic = { level = \"allow\", priority = -1 }",
+        );
+        let violations = check_workspace_lints(&disabled);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "clippy::pedantic" && v.detail.contains("warn, deny")),
+            "an allowed group is a disabled group: {}",
+            details(&violations)
+        );
+    }
+
+    #[test]
+    fn a_merely_warned_unwrap_is_reported() {
+        let warned = GOOD_WORKSPACE.replace("unwrap_used = \"deny\"", "unwrap_used = \"warn\"");
+        let violations = check_workspace_lints(&warned);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "clippy::unwrap_used"),
+            "the issue asks for denied, not warned: {}",
+            details(&violations)
+        );
+    }
+
+    #[test]
+    fn merely_warned_unsafe_code_is_reported() {
+        let warned = GOOD_WORKSPACE.replace("unsafe_code = \"forbid\"", "unsafe_code = \"warn\"");
+        let violations = check_workspace_lints(&warned);
+        assert!(violations.iter().any(|v| v.subject == "unsafe_code"));
+    }
+
+    #[test]
+    fn a_denied_unsafe_code_is_accepted() {
+        let denied = GOOD_WORKSPACE.replace("unsafe_code = \"forbid\"", "unsafe_code = \"deny\"");
+        assert!(check_workspace_lints(&denied).is_empty());
+    }
+
+    #[test]
+    fn a_missing_lint_table_is_reported() {
+        let without = "[workspace]\nmembers = []\n";
+        let violations = check_workspace_lints(without);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].subject, "Cargo.toml");
+    }
+
+    #[test]
+    fn an_invalid_workspace_manifest_is_reported_by_both_manifest_rules() {
+        let broken = "[workspace\nmembers = [";
+        assert!(
+            check_workspace_lints(broken)
+                .iter()
+                .any(|v| v.detail.contains("not valid TOML"))
+        );
+        assert!(
+            check_release_profile(broken)
+                .iter()
+                .any(|v| v.detail.contains("not valid TOML"))
+        );
+    }
+
+    #[test]
+    fn an_invalid_member_manifest_is_reported() {
+        let violations = check_member_manifest("waymaker-core", "[package\nname =");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("not valid TOML"))
+        );
+        assert!(violations.iter().all(|v| v.subject == "waymaker-core"));
+    }
+
+    #[test]
+    fn every_dependency_table_in_the_kernel_manifest_is_reported() {
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let manifest = format!(
+                "[package]\nname = \"waymaker-core\"\n\n[lints]\nworkspace = true\n\n[{table}]\nmemchr = \"2\"\n"
+            );
+            let violations = check_member_manifest("waymaker-core", &manifest);
+            assert!(
+                violations.iter().any(|v| v.detail.contains(table)),
+                "[{table}] in the kernel manifest went unreported: {}",
+                details(&violations)
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_tables_are_only_banned_in_the_kernel() {
+        let manifest = "[package]\nname = \"waymaker-flash\"\n\n[lints]\nworkspace = true\n\n[dependencies]\nwaymaker-core = { path = \"../waymaker-core\" }\n";
+        assert!(check_member_manifest("waymaker-flash", manifest).is_empty());
+    }
+
+    #[test]
+    fn a_cargo_config_without_a_profile_passes() {
+        assert!(check_cargo_config(Some("[alias]\nxtask = \"run -p xtask --\"\n")).is_empty());
+        assert!(check_cargo_config(None).is_empty());
+    }
+
+    #[test]
+    fn a_profile_in_the_cargo_config_is_reported() {
+        let config = "[alias]\nxtask = \"run\"\n\n[profile.release]\nopt-level = 3\n";
+        let violations = check_cargo_config(Some(config));
+        assert_eq!(violations.len(), 1, "{}", details(&violations));
+        assert_eq!(violations[0].rule, "cargo-config-profile");
+        assert!(violations[0].detail.contains("profile.release"));
+    }
+
+    #[test]
+    fn every_profile_in_the_cargo_config_is_named() {
+        let config = "[profile.release]\nopt-level = 3\n\n[profile.dev]\ndebug = false\n";
+        let violations = check_cargo_config(Some(config));
+        assert_eq!(violations.len(), 2, "{}", details(&violations));
+    }
+
+    #[test]
+    fn an_unparseable_expected_profile_value_is_reported_as_a_broken_gate() {
+        // Guards the constant itself: every entry must be a TOML literal.
+        for (key, expected) in REQUIRED_RELEASE_PROFILE {
+            assert!(
+                expected.parse::<Value>().is_ok(),
+                "the expected value for {key} is not valid TOML: {expected}"
+            );
+        }
     }
 
     #[test]

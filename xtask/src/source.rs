@@ -19,6 +19,14 @@ pub struct CrateSource<'a> {
 /// Inner attributes that every firmware crate root must carry.
 pub const REQUIRED_INNER_ATTRIBUTES: &[&str] = &["#![no_std]", "#![forbid(unsafe_code)]"];
 
+/// `extern crate` declarations that re-admit what `#![no_std]` excludes.
+///
+/// `#![no_std]` is an attribute, not a guarantee: `extern crate std;` below it puts the
+/// standard library back, and `extern crate alloc;` puts the allocator back, with the
+/// attribute still sitting there for a reviewer to see. Until the firmware target is
+/// built in CI (issue #9), this scan is what stops that.
+pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
+
 /// Rule: every firmware crate is `no_std` and forbids unsafe code.
 ///
 /// A crate named in [`LAYERS`] but absent from `sources` is not reported here; the graph
@@ -53,6 +61,18 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
                 "src/lib.rs allows unsafe code; a documented exception belongs in an ADR",
             ));
         }
+
+        for name in extern_crates(source.contents) {
+            if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
+                violations.push(Violation::new(
+                    "crate-attributes",
+                    spec.name,
+                    format!(
+                        "src/lib.rs declares `extern crate {name};`, which puts back what #![no_std] excludes"
+                    ),
+                ));
+            }
+        }
     }
 
     violations
@@ -60,6 +80,20 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
 
 /// Collects the crate-level inner attributes, ignoring comments and normalising
 /// whitespace, so that formatting does not decide whether the rule passes.
+/// Collects the crate names in `extern crate <name>;` declarations, ignoring comments.
+fn extern_crates(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("extern crate "))
+        .filter_map(|rest| {
+            rest.split([' ', ';'])
+                .find(|token| !token.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn inner_attributes(contents: &str) -> Vec<String> {
     contents
         .lines()
