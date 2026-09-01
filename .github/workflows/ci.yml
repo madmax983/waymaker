@@ -35,6 +35,7 @@ jobs:
   check:
     name: fmt, clippy, build, test, docs, coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -95,6 +96,7 @@ jobs:
     # `xtask`'s host-only dependencies never reach the firmware target.
     name: thumbv6m-none-eabi build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +126,9 @@ jobs:
     # than at the end of another job's log.
     name: size budgets
     runs-on: ubuntu-latest
+    # Links the matrix twice on a pull request, so it gets more room than the other
+    # jobs — but not six hours of a runner, which is what no timeout means.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -174,6 +179,7 @@ jobs:
     # reading a test log.
     name: layering contract
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

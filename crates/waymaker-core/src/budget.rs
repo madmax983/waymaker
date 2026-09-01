@@ -6,8 +6,8 @@
 //! * the `const` assertions in this module, which fail the build for
 //!   `thumbv6m-none-eabi` — the target the budgets are stated for — the moment kernel
 //!   state outgrows [`KERNEL_STATE_BYTES`];
-//! * `cargo xtask size`, which links the size probe once per feature combination and
-//!   measures the section deltas against a firmware that links nothing from Waymaker.
+//! * `cargo xtask size`, which links the size probe once per feature and measures the
+//!   section deltas against a firmware that links nothing from Waymaker.
 //!
 //! Neither transcribes the numbers: the gate depends on this crate, so a budget changed
 //! here is a budget changed everywhere.
@@ -84,6 +84,14 @@ impl TypeSize {
 /// waymaker_core::assert_kernel_state_size!(u64, 8);
 /// ```
 ///
+/// That doctest proves the path resolves; it cannot prove the expansion is hygienic,
+/// because a doctest compiles as an ordinary crate with nothing shadowed. The leading `::`
+/// on `::core::mem::size_of` below is what makes it hygienic: an unqualified `core`
+/// resolves at the *call site*, so a firmware crate with a module of its own by that name —
+/// or one that renamed a dependency to it — would be told that `mem` could not be found,
+/// by a macro it did not write. This is the one item of this crate's surface that
+/// downstream firmware touches, and the leading `::` is not optional in it.
+///
 /// The failure is a compile error rather than a report, which is the point: a regression
 /// that only shows up in a report is a regression somebody has to be looking for.
 #[macro_export]
@@ -93,7 +101,7 @@ macro_rules! assert_kernel_state_size {
     };
     ($ty:ty, $limit:expr) => {
         const _: () = assert!(
-            core::mem::size_of::<$ty>() <= $limit,
+            ::core::mem::size_of::<$ty>() <= $limit,
             concat!(
                 "`",
                 stringify!($ty),
@@ -113,12 +121,8 @@ macro_rules! assert_kernel_state_size {
 macro_rules! kernel_state_types {
     ($($ty:ty),* $(,)?) => {
         /// Every type that is part of the kernel's live state, with its size.
-        ///
-        /// Empty at rung 0.0: the record codec, cursor, and transition rules arrive with
-        /// rung 0.1, and an empty registry that totals zero is the honest report until
-        /// they do.
-        pub const KERNEL_STATE_TYPES: &[TypeSize] = &[
-            $(TypeSize::of::<$ty>(stringify!($ty))),*
+        pub const KERNEL_STATE_TYPES: &[$crate::budget::TypeSize] = &[
+            $($crate::budget::TypeSize::of::<$ty>(stringify!($ty))),*
         ];
 
         /// The kernel's live state in bytes: the sum of [`KERNEL_STATE_TYPES`].
@@ -126,21 +130,33 @@ macro_rules! kernel_state_types {
         /// The budget applies to the sum rather than to any one type, so the registry
         /// names types that are independently live rather than types that contain one
         /// another.
-        pub const KERNEL_STATE_TOTAL_BYTES: usize = 0 $(+ core::mem::size_of::<$ty>())*;
+        pub const KERNEL_STATE_TOTAL_BYTES: usize = 0 $(+ ::core::mem::size_of::<$ty>())*;
 
         $($crate::assert_kernel_state_size!($ty);)*
 
         const _: () = assert!(
-            KERNEL_STATE_TOTAL_BYTES <= KERNEL_STATE_BYTES,
+            KERNEL_STATE_TOTAL_BYTES <= $crate::budget::KERNEL_STATE_BYTES,
             "the kernel's live state exceeds the budget in design document \u{a7}04; \
-             run `cargo xtask size` for the measured figure",
+             run `cargo xtask size` for the measured figure, which names it",
         );
     };
 }
 
+// Empty at rung 0.0: the record codec, cursor, and transition rules arrive with rung 0.1,
+// and an empty registry that totals zero is the honest report until they do. The caveat
+// lives here rather than in the macro's own doc comment, which is emitted verbatim for
+// whatever list is passed and would become false the moment this list stopped being empty.
 kernel_state_types! {
     // Rung 0.1 adds the replay cursor, the record header view, and the context.
 }
+
+/// The assertion macro, documented beside the constants it is stated against.
+///
+/// `#[macro_export]` puts it at the crate root, which is where a caller writes it. This
+/// re-export is so that a reader following the module documentation, the README or ADR
+/// 0002 to `waymaker_core::budget` finds it there too.
+#[doc(inline)]
+pub use crate::assert_kernel_state_size;
 
 const _: () = assert!(
     SCRATCH_PAGE_BYTES < RUNTIME_RAM_BYTES,
@@ -168,9 +184,58 @@ mod tests {
         assert_eq!(TypeSize::of::<()>("()").size, 0);
     }
 
+    /// A registry with types in it, which the real one does not have until rung 0.1.
+    ///
+    /// The macro emits `pub` items, which are unreachable from outside a test module; that
+    /// is what a fixture is, so the lint is allowed here rather than the macro weakened.
+    ///
+    /// This is the only thing that exercises what `kernel_state_types!` actually builds.
+    /// Asserting over the real registry proves nothing while it is empty: the names are an
+    /// empty slice, the total is a literal zero, and every property holds vacuously.
+    #[allow(
+        unreachable_pub,
+        reason = "a test-only registry is reachable from its tests"
+    )]
+    mod populated {
+        kernel_state_types! {
+            [u8; 8],
+            u32,
+        }
+    }
+
     #[test]
-    fn the_registry_and_the_total_agree() {
-        let summed: usize = KERNEL_STATE_TYPES.iter().map(|entry| entry.size).sum();
-        assert_eq!(summed, KERNEL_STATE_TOTAL_BYTES);
+    fn the_registry_names_each_type_and_its_size() {
+        // Compared by iterator rather than collected: this crate is `no_std`, and putting
+        // the standard library back to hold a two-element list is what the gate's
+        // `extern crate std` rule exists to stop.
+        assert!(
+            populated::KERNEL_STATE_TYPES
+                .iter()
+                .map(|entry| (entry.name, entry.size))
+                .eq([("[u8; 8]", 8), ("u32", 4)])
+        );
+    }
+
+    #[test]
+    fn the_registry_total_is_the_sum_of_its_entries() {
+        assert_eq!(populated::KERNEL_STATE_TOTAL_BYTES, 12);
+        let summed: usize = populated::KERNEL_STATE_TYPES
+            .iter()
+            .map(|entry| entry.size)
+            .sum();
+        assert_eq!(summed, populated::KERNEL_STATE_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn an_empty_registry_totals_nothing() {
+        #[allow(
+            unreachable_pub,
+            reason = "a test-only registry is reachable from its tests"
+        )]
+        mod empty {
+            kernel_state_types! {}
+        }
+        assert!(empty::KERNEL_STATE_TYPES.is_empty());
+        assert_eq!(empty::KERNEL_STATE_TOTAL_BYTES, 0);
     }
 }

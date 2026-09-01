@@ -159,22 +159,51 @@ against a **baseline image that links no Waymaker at all**. The budget is increm
 the measurement is a subtraction rather than an absolute size that would charge Waymaker for
 the panic handler and drift with the toolchain.
 
-| Measured | Gated against | How |
+| Measured | Gated on | How |
 | --- | --- | --- |
-| Incremental code flash | 8 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
-| Engine RAM | 256 B | every allocated writable section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
-| Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix |
+| Incremental code flash | the `default` row, 8 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Engine RAM | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
+| Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
+
+Only the `default` row is gated on the first two, because §04 states them for "core + flash
+adapter" and that row is exactly that. The `facade` row and the per-feature rows are
+reported with their incremental cost and not gated: §04 requires an optional cost to be
+*shown* and budgets none of them, and gating the façade against the kernel's number would
+either fail a build for a cost that number never covered or quietly widen the kernel's
+budget to pay for it.
+
+### What "no bookkeeping" does and does not mean
 
 The matrix is derived from `cargo metadata`, not written down: the `default` and `facade`
 rows, plus one row per feature every layer declares. Adding `serde`, `postcard`, `defmt` or
-a CRC choice to a crate adds a row to the report with no bookkeeping anywhere. Those
-per-feature rows are reported with their incremental cost but not gated — §04 requires an
-optional cost to be *shown*, and sets no per-feature budget — so the base-branch diff is
-what makes their growth visible in review.
+a CRC choice to a crate makes a row appear with nothing to remember.
 
-The report is written to `target/waymaker-size.json` and uploaded as a CI artifact. On a
+Making that row *mean something* is a different question, and it is not automatic. A delta
+can only charge for code the linker keeps, and with `lto = "fat"` and `--gc-sections` the
+linker keeps only what the probe reaches. A feature whose code the probe never calls is
+discarded, and its row comes back byte for byte identical to the row below it. So the probe
+has to be given something to call — in
+[`crates/waymaker-size-probe/src/main.rs`](crates/waymaker-size-probe/src/main.rs), where
+the `engine` and `facade` functions carry a marker for the rung that fills them in.
+
+That cannot be a gate: a feature that genuinely costs nothing is indistinguishable from one
+the probe does not exercise. It is a **notice** instead, printed on every run, naming the
+row and saying what to do:
+
+```
+notice: `waymaker-core/serde` measured exactly the same image as `default`, so its
+incremental cost is 0 B: either it costs nothing, or waymaker-size-probe does not reach
+any code the feature adds and the linker discarded it. ...
+```
+
+So the bookkeeping you cannot forget is the row; the bookkeeping you can forget is the
+probe call, and CI says so out loud every time.
+
+The report — absolute sizes, per-section deltas, and each row's cost over the row it is an
+increment on — is written to `target/waymaker-size.json` and uploaded as a CI artifact. On a
 pull request the base branch is checked out into a worktree, measured with the same build of
-the gate, and diffed. A base that cannot be measured — a shallow clone, or a commit from
+the gate, and diffed on *incremental cost* rather than on absolute size, so a rustc bump
+that moves every number without changing anyone's cost is not reported as a change. A base that cannot be measured — a shallow clone, or a commit from
 before the probe existed — is reported as "not compared" rather than as a failure: a missing
 comparison is not a budget breach, and the budgets are gated either way. The reasoning is in
 [ADR 0002](docs/adr/0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md).

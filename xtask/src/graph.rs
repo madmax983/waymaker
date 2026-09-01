@@ -705,12 +705,12 @@ pub fn check_workspace_membership(graph: &PackageGraph) -> Vec<Violation> {
             };
             let known = policy::layer(&package.name).is_some()
                 || policy::HOST_TOOLS.contains(&package.name.as_str())
-                || policy::MEASUREMENT_FIXTURES.contains(&package.name.as_str());
+                || policy::MEASUREMENT_CRATES.contains(&package.name.as_str());
             (!known).then(|| {
                 Violation::new(
                     "workspace-membership",
                     package.name.clone(),
-                    "is a workspace member but is neither a layer, declared host tooling, nor a measurement fixture; add a row to policy::LAYERS, policy::HOST_TOOLS or policy::MEASUREMENT_FIXTURES",
+                    "is a workspace member but is neither a layer, declared host tooling, nor a measurement fixture; add a row to policy::LAYERS, policy::HOST_TOOLS or policy::MEASUREMENT_CRATES",
                 )
             })
         })

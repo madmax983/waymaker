@@ -14,8 +14,18 @@
 #![allow(clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use xtask::size;
+
+/// The measured workspace, linked once for the whole test binary.
+///
+/// Each `measure` links the whole matrix, and libtest runs these on separate threads: six
+/// of them would queue on cargo's build lock and pay for the same images six times.
+fn measured() -> &'static size::SizeReport {
+    static REPORT: OnceLock<size::SizeReport> = OnceLock::new();
+    REPORT.get_or_init(|| size::measure(&workspace_root()).expect("the size matrix should link"))
+}
 
 /// The workspace root, which is this crate's parent directory.
 fn workspace_root() -> PathBuf {
@@ -37,7 +47,7 @@ fn scratch(label: &str) -> PathBuf {
 
 #[test]
 fn the_workspace_we_ship_is_within_every_size_budget() {
-    let report = size::measure(&workspace_root()).expect("the size matrix should link");
+    let report = measured();
 
     assert!(
         report.baseline().is_some(),
@@ -57,7 +67,7 @@ fn the_workspace_we_ship_is_within_every_size_budget() {
 
 #[test]
 fn the_matrix_links_a_baseline_a_default_and_a_facade_image() {
-    let report = size::measure(&workspace_root()).expect("the size matrix should link");
+    let report = measured();
     for expected in ["baseline", "default", "facade"] {
         assert!(
             report.row(expected).is_some(),
@@ -76,7 +86,7 @@ fn the_engine_costs_more_flash_than_the_baseline() {
     // The whole gate rests on the probe actually linking the layers rather than the
     // linker discarding them: a probe whose engine is dead-stripped reports a delta of
     // zero and passes every budget for ever.
-    let report = size::measure(&workspace_root()).expect("the size matrix should link");
+    let report = measured();
     let delta = report
         .delta_of("default")
         .expect("the default row is measured against the baseline");
@@ -93,7 +103,7 @@ fn the_engine_costs_more_flash_than_the_baseline() {
 
 #[test]
 fn the_facade_costs_at_least_as_much_as_the_engine_it_sits_on() {
-    let report = size::measure(&workspace_root()).expect("the size matrix should link");
+    let report = measured();
     let engine = report.delta_of("default").expect("a default row");
     let facade = report.delta_of("facade").expect("a facade row");
     assert!(
@@ -106,15 +116,15 @@ fn the_facade_costs_at_least_as_much_as_the_engine_it_sits_on() {
 
 #[test]
 fn a_report_written_to_disk_reads_back_unchanged() {
-    let report = size::measure(&workspace_root()).expect("the size matrix should link");
+    let report = measured();
     let path = scratch("round-trip").join("nested").join("report.json");
 
-    size::write_report(&path, &report).expect("the report should be writable");
+    size::write_report(&path, report).expect("the report should be writable");
     let restored = size::read_report(&path).expect("the report should be readable");
 
-    assert_eq!(restored, report);
+    assert_eq!(&restored, report);
     assert!(
-        size::diff(&report, &restored).is_empty(),
+        size::diff(report, &restored).is_empty(),
         "a report diffed against its own round trip must show no change"
     );
     let _ = std::fs::remove_dir_all(path.parent().and_then(Path::parent).unwrap_or(&path));
@@ -186,4 +196,163 @@ fn first_commit(root: &Path) -> Option<String> {
         .next()
         .map(str::to_owned)
         .filter(|commit| !commit.is_empty())
+}
+
+#[test]
+fn the_baseline_image_really_is_an_arm_image_with_bytes_in_it() {
+    // Two things nothing else would notice: a measurement taken from a host binary (every
+    // number plausible, none of them about firmware), and one taken from a file whose
+    // section headers were stripped (every number zero, every budget passed).
+    let baseline = measured().baseline().expect("a baseline row");
+    assert!(
+        baseline.sizes.flash > 0,
+        "the baseline image reports no stored bytes, so nothing was linked or nothing was read"
+    );
+    assert!(
+        baseline.sizes.text > 0,
+        "the baseline image has no `.text`, which no linked firmware manages"
+    );
+}
+
+#[test]
+fn the_parser_agrees_with_llvm_size_about_the_probe() {
+    // The synthetic-ELF tests prove the parser is self-consistent. They cannot prove it
+    // reads the layout a real linker writes: an offset wrong in both the builder and the
+    // parser would leave every one of them green. This is the second opinion, and it comes
+    // from `llvm-size` in the pinned toolchain's own sysroot rather than from anything a
+    // developer has to install.
+    let Some(llvm_size) = llvm_size() else {
+        // Not a silent pass: the toolchain pins `llvm-tools-preview`, so CI always has it.
+        panic!(
+            "llvm-size is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+    };
+
+    let report = measured();
+    let baseline = report.baseline().expect("a baseline row");
+    let image = workspace_root()
+        .join("target/waymaker-size-build/baseline")
+        .join(xtask::pipeline::FIRMWARE_TARGET)
+        .join("release")
+        .join(size::PROBE_PACKAGE);
+
+    let output = std::process::Command::new(&llvm_size)
+        .arg("-A")
+        .arg(&image)
+        .output()
+        .expect("llvm-size should run");
+    assert!(output.status.success(), "llvm-size failed on {image:?}");
+    let listing = String::from_utf8_lossy(&output.stdout);
+
+    for (section, measured) in [
+        (".text", baseline.sizes.text),
+        (".rodata", baseline.sizes.rodata),
+    ] {
+        let second_opinion = section_size(&listing, section);
+        assert_eq!(
+            Some(measured),
+            second_opinion,
+            "our parser and llvm-size disagree about {section} of {image:?}:\n{listing}"
+        );
+    }
+}
+
+/// The size `llvm-size -A` reports for one section.
+fn section_size(listing: &str, section: &str) -> Option<u64> {
+    listing.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some(section))
+            .then(|| fields.next().and_then(|size| size.parse().ok()))
+            .flatten()
+    })
+}
+
+/// `llvm-size` from the pinned toolchain's sysroot, where `llvm-tools-preview` puts it.
+fn llvm_size() -> Option<PathBuf> {
+    let sysroot = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).ok()?.trim());
+    let host = std::process::Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .ok()?;
+    let host = String::from_utf8(host.stdout).ok()?;
+    let host = host
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))?
+        .trim()
+        .to_owned();
+    let path = sysroot.join("lib/rustlib").join(host).join("bin/llvm-size");
+    path.is_file().then_some(path)
+}
+
+#[test]
+fn a_kernel_state_type_over_budget_fails_to_compile() {
+    // The `const` assertion is the kernel-state gate: it is what turns a regression into a
+    // build failure rather than a line in a report nobody reads. Proving it means building
+    // something that must not build, which needs a crate of its own — this one path-depends
+    // on the real `waymaker-core` so it is the shipped macro that is exercised.
+    let root = scratch("oversize");
+    std::fs::create_dir_all(root.join("src")).expect("the crate should be creatable");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"oversize\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nwaymaker-core = {{ path = {:?} }}\n\n[workspace]\n",
+            workspace_root().join("crates/waymaker-core")
+        ),
+    )
+    .expect("the manifest should be writable");
+
+    let over = waymaker_core::budget::KERNEL_STATE_BYTES + 1;
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!("#![no_std]\nwaymaker_core::assert_kernel_state_size!([u8; {over}]);\n"),
+    )
+    .expect("the crate root should be writable");
+
+    // `uninstrumented_cargo` because under `cargo llvm-cov` a nested build inherits its
+    // wrapper and flags, and would fail for reasons that have nothing to do with the
+    // assertion under test.
+    let output = xtask::coverage::uninstrumented_cargo()
+        .current_dir(&root)
+        .args(["build", "--quiet"])
+        .output()
+        .expect("cargo should run");
+
+    assert!(
+        !output.status.success(),
+        "a {over} byte kernel state built cleanly against a {} byte budget",
+        waymaker_core::budget::KERNEL_STATE_BYTES
+    );
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complaint.contains("does not fit the kernel-state budget"),
+        "the build failed for some other reason:\n{complaint}"
+    );
+
+    // And the same type one byte smaller builds, or the test above proves only that the
+    // crate does not compile.
+    std::fs::write(
+        root.join("src/lib.rs"),
+        format!(
+            "#![no_std]\nwaymaker_core::assert_kernel_state_size!([u8; {}]);\n",
+            waymaker_core::budget::KERNEL_STATE_BYTES
+        ),
+    )
+    .expect("the crate root should be writable");
+    let output = xtask::coverage::uninstrumented_cargo()
+        .current_dir(&root)
+        .args(["build", "--quiet"])
+        .output()
+        .expect("cargo should run");
+    assert!(
+        output.status.success(),
+        "a kernel state exactly at the budget must build:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

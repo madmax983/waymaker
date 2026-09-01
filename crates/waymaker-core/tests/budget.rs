@@ -2,7 +2,9 @@
 //!
 //! These are integration tests rather than unit tests so that the numbers are exercised
 //! through the crate's public surface, which is the surface `xtask` and the size probe
-//! read them through.
+//! read them through. What the macro *builds* is tested inside `budget.rs` instead, over a
+//! registry with types in it: the real one is empty until rung 0.1, so asserting over it
+//! here would prove only that an empty slice is empty.
 
 use waymaker_core::budget;
 
@@ -31,22 +33,6 @@ fn kernel_state_fits_the_runtime_ram_budget_it_is_part_of() {
     const {
         assert!(budget::KERNEL_STATE_BYTES <= budget::ENGINE_RAM_BYTES);
     }
-}
-
-#[test]
-fn a_type_size_records_the_size_of_the_type_it_names() {
-    let entry = budget::TypeSize::of::<u32>("u32");
-    assert_eq!(entry.name, "u32");
-    assert_eq!(entry.size, 4);
-}
-
-#[test]
-fn the_kernel_state_registry_totals_its_entries() {
-    let total: usize = budget::KERNEL_STATE_TYPES
-        .iter()
-        .map(|entry| entry.size)
-        .sum();
-    assert_eq!(total, budget::KERNEL_STATE_TOTAL_BYTES);
 }
 
 #[test]
@@ -84,6 +70,7 @@ fn the_registry_names_each_type_once() {
 }
 
 // A type that fits passes the public assertion macro. A type that does not is a compile
-// error, which `xtask`'s `kernel-state-assertion` test proves by trying to build one.
+// error, which `a_kernel_state_type_over_budget_fails_to_compile` in
+// `xtask/tests/size_budgets.rs` proves by building a crate that must not build.
 waymaker_core::assert_kernel_state_size!([u8; 128]);
 waymaker_core::assert_kernel_state_size!(u64, 8);

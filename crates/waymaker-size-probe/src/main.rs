@@ -79,9 +79,15 @@ const fn engine() -> usize {
 }
 
 /// The Embassy façade, when it is linked in.
+///
+/// Subject to the same hazard as [`engine`]: the façade's cost is what this function
+/// reaches, and rung 0.4 must add the dispatcher step here for the `facade` row to mean
+/// anything.
 #[cfg(feature = "facade")]
 fn facade() -> usize {
-    // Rung 0.4 replaces this with a dispatcher step once the façade has one.
+    use waymaker_embassy as _;
+
+    // Rung 0.4: drive one dispatcher step here.
     core::hint::black_box(0)
 }
 

@@ -96,7 +96,12 @@ fn extern_crates(contents: &str) -> Vec<String> {
 
 /// Collects the crate-level inner attributes, ignoring comments and normalising
 /// whitespace, so that formatting does not decide whether the rule passes.
-fn inner_attributes(contents: &str) -> Vec<String> {
+///
+/// `pub(crate)` because [`crate::size::check_size_probe`] asks the same question of the
+/// size probe's crate root. One scanner, so that the tests here — a commented-out
+/// attribute does not count, extra whitespace is tolerated — are load-bearing for both
+/// rules rather than for whichever copy they happen to sit beside.
+pub(crate) fn inner_attributes(contents: &str) -> Vec<String> {
     contents
         .lines()
         .map(str::trim)

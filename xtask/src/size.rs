@@ -64,11 +64,11 @@ pub const REPORT_PATH: &str = "target/waymaker-size.json";
 /// `cargo clean`, and suffixed with the process id by [`baseline_worktree`] so that two
 /// gates running at once — two tests, or a developer and a hook — cannot check out over
 /// one another.
-pub const BASELINE_WORKTREE_PATH: &str = "target/waymaker-size-base";
+const BASELINE_WORKTREE_PATH: &str = "target/waymaker-size-base";
 
 /// The directory this process checks the base branch out into.
 #[must_use]
-pub fn baseline_worktree(root: &Path) -> PathBuf {
+fn baseline_worktree(root: &Path) -> PathBuf {
     root.join(format!("{BASELINE_WORKTREE_PATH}-{}", std::process::id()))
 }
 
@@ -77,10 +77,38 @@ pub fn baseline_worktree(root: &Path) -> PathBuf {
 /// Its own directory so that a size run does not evict the rest of the pipeline's build
 /// cache: each row is a different feature selection of the same crates, so they would
 /// otherwise take turns invalidating one another and everything else.
-pub const BUILD_DIR: &str = "target/waymaker-size-build";
+///
+/// Each variant then gets a subdirectory of its own, from [`variant_build_dir`]. Cargo's
+/// build lock serialises the builds but not the read that follows one, and every variant
+/// links to the same file name — so a shared directory lets one run's `baseline` image be
+/// uplifted over another run's `default` between the build and the read. That is not only
+/// a flaky test: the row that gets read is a real image of the wrong variant, so a delta
+/// of zero passes the gate with nothing to show for it.
+const BUILD_DIR: &str = "target/waymaker-size-build";
+
+/// The directory one variant links into, named after the variant.
+fn variant_build_dir(build_dir: &Path, variant: &str) -> PathBuf {
+    // `/` appears in every feature row's name (`waymaker-core/serde`) and would otherwise
+    // make a nested directory per crate; the other two are for the benefit of any future
+    // feature name a filesystem would object to.
+    let slug: String = variant
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '-',
+        })
+        .collect();
+    build_dir.join(slug)
+}
 
 /// The version stamped into the JSON report.
-pub const REPORT_SCHEMA: u64 = 1;
+const REPORT_SCHEMA: u64 = 1;
+
+/// The row every other row is an increment on: an image with no Waymaker in it.
+pub const BASELINE_ROW: &str = "baseline";
+
+/// The engine as it ships with no optional cost enabled.
+pub const DEFAULT_ROW: &str = "default";
 
 /// Incremental code-flash budget, from [`waymaker_core::budget`].
 pub const INCREMENTAL_CODE_FLASH_BUDGET_BYTES: u64 =
@@ -100,6 +128,13 @@ pub struct Variant {
     pub name: String,
     /// The feature selection passed to `cargo build --features`.
     pub features: Vec<String>,
+    /// The row whose cost this one is an increment on: `baseline` for the engine rows,
+    /// `default` or `facade` for a feature row.
+    ///
+    /// Recorded rather than inferred so that the report can say what a feature actually
+    /// cost, and so that a feature row identical to its base can be named as the
+    /// unexercised measurement it is.
+    pub measured_against: String,
     /// Whether exceeding a budget on this row fails the gate.
     pub gated: bool,
 }
@@ -118,19 +153,28 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
 
     let mut variants = vec![
         Variant {
-            name: "baseline".to_owned(),
+            name: BASELINE_ROW.to_owned(),
             features: vec![PROBE_FEATURE.to_owned()],
+            measured_against: BASELINE_ROW.to_owned(),
             gated: false,
         },
         Variant {
-            name: "default".to_owned(),
+            name: DEFAULT_ROW.to_owned(),
             features: vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()],
+            measured_against: BASELINE_ROW.to_owned(),
             gated: true,
         },
         Variant {
+            // Reported, not gated. Design document §04 states the 8 KiB for "core + flash
+            // adapter", and the Embassy façade is neither. Gating it here would either
+            // fail a build for a cost the budget never covered, or — worse, once someone
+            // raised the number to make it pass — quietly widen the kernel's budget to pay
+            // for the façade. The façade's own cost is the `Δ vs default` column, and it
+            // gets a budget of its own in `waymaker_core::budget` when it needs one.
             name: FACADE_FEATURE.to_owned(),
             features: vec![PROBE_FEATURE.to_owned(), FACADE_FEATURE.to_owned()],
-            gated: true,
+            measured_against: DEFAULT_ROW.to_owned(),
+            gated: false,
         },
     ];
 
@@ -160,6 +204,11 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
                     base.to_owned(),
                     format!("{}/{feature}", spec.name),
                 ],
+                measured_against: if base == FACADE_FEATURE {
+                    FACADE_FEATURE.to_owned()
+                } else {
+                    DEFAULT_ROW.to_owned()
+                },
                 gated: false,
             });
         }
@@ -185,11 +234,25 @@ pub struct SectionSizes {
     /// named after neither. The budget is about bytes programmed into the part, so the
     /// gated number is the one that counts all of them.
     pub flash: u64,
-    /// Every allocated section that is writable, which is what occupies RAM.
+    /// Every allocated section that is writable and not thread-local, which is what
+    /// occupies RAM.
+    ///
+    /// Thread-local sections are excluded because `.tdata` and `.tbss` are a template that
+    /// a thread's storage is initialised *from*, not storage itself, so counting both
+    /// charges the same bytes twice. Nothing else is excluded: without a linker script
+    /// there is no memory map to say that `.got` or `.init_array` were placed in flash, so
+    /// they are counted as RAM. That errs toward failing the gate rather than passing it,
+    /// which is the direction a budget should err in.
     pub ram: u64,
 }
 
-/// The named sections the report breaks out, longest prefix first.
+/// `SHF_TLS`: the section holds thread-local storage.
+const SHF_TLS: u64 = 0x400;
+
+/// The named sections the report breaks out.
+///
+/// Order is not significant: no entry is a prefix of another under [`in_section`], which
+/// matches either the whole name or the name followed by a `.`.
 const REPORTED_SECTIONS: &[&str] = &[".text", ".rodata", ".data", ".bss"];
 
 impl SectionSizes {
@@ -201,7 +264,7 @@ impl SectionSizes {
             if section.occupies_storage() {
                 sizes.flash = sizes.flash.saturating_add(section.size);
             }
-            if section.allocated() && section.writable() {
+            if section.allocated() && section.writable() && section.flags & SHF_TLS == 0 {
                 sizes.ram = sizes.ram.saturating_add(section.size);
             }
             // `.text.unlikely`, `.bss.probe` and friends: the linker splits a section and
@@ -242,7 +305,8 @@ impl SectionSizes {
 
 /// Whether `name` is `section` or one of the pieces the linker split out of it.
 fn in_section(name: &str, section: &str) -> bool {
-    name == section || name.starts_with(&format!("{section}."))
+    name.strip_prefix(section)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// One measured row of the report.
@@ -252,6 +316,8 @@ pub struct Row {
     pub name: String,
     /// The feature selection the image was built with.
     pub features: Vec<String>,
+    /// The row whose cost this one is an increment on.
+    pub measured_against: String,
     /// The measured sections.
     pub sizes: SectionSizes,
     /// Whether exceeding a budget on this row fails the gate.
@@ -261,10 +327,17 @@ pub struct Row {
 impl Row {
     /// Records one measurement.
     #[must_use]
-    pub fn new(name: &str, features: &[&str], sizes: SectionSizes, gated: bool) -> Self {
+    pub fn new(
+        name: &str,
+        features: &[&str],
+        measured_against: &str,
+        sizes: SectionSizes,
+        gated: bool,
+    ) -> Self {
         Self {
             name: name.to_owned(),
             features: features.iter().map(|f| (*f).to_owned()).collect(),
+            measured_against: measured_against.to_owned(),
             sizes,
             gated,
         }
@@ -285,11 +358,11 @@ impl KernelState {
     ///
     /// These are sizes for the host, because that is the target `xtask` is compiled for.
     /// The budget is stated for `thumbv6m-none-eabi`, where a type holding a pointer is
-    /// smaller, so the authoritative check is the `const` assertion in
-    /// [`waymaker_core::budget`] — which every row of the matrix evaluates, because every
-    /// row compiles `waymaker-core` for the firmware target. This figure is reported so
-    /// that the number has a name and a place in the artifact, and gated as well because
-    /// a host figure over budget means the target figure is over budget too.
+    /// *smaller* — so the host figure is an upper bound on the target one. Gating it is
+    /// therefore conservative: it can fail early, never late, and a build it fails might
+    /// have fitted on the target. The authoritative check is the `const` assertion in
+    /// [`waymaker_core::budget`], which every row of the matrix but the baseline evaluates,
+    /// because every one of those compiles `waymaker-core` for the firmware target.
     #[must_use]
     pub fn measured() -> Self {
         Self {
@@ -302,30 +375,82 @@ impl KernelState {
     }
 }
 
-/// A budget that was exceeded, and by how much.
+/// One of the gates a measurement is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// Design document §04's 8 KiB for the kernel plus the flash adapter.
+    IncrementalCodeFlash,
+    /// What the engine may own of runtime RAM once the caller's scratch page is counted.
+    EngineRam,
+    /// `waymaker-core` state only, no page buffer.
+    KernelState,
+}
+
+impl Budget {
+    /// The limit in bytes.
+    #[must_use]
+    pub const fn limit(self) -> u64 {
+        match self {
+            Self::IncrementalCodeFlash => INCREMENTAL_CODE_FLASH_BUDGET_BYTES,
+            Self::EngineRam => ENGINE_RAM_BUDGET_BYTES,
+            Self::KernelState => KERNEL_STATE_BUDGET_BYTES,
+        }
+    }
+
+    /// The budget's name, as design document §04 writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::IncrementalCodeFlash => "incremental code flash",
+            Self::EngineRam => "engine RAM",
+            Self::KernelState => "kernel state",
+        }
+    }
+}
+
+/// Why the gate failed.
+///
+/// Two shapes, because there are two ways to fail and they read very differently. A budget
+/// was exceeded, and the message names the measurement and the limit; or the report cannot
+/// be held to a budget at all, and the message says what is missing. Forcing the second
+/// through the first produced "missing baseline on baseline: 0 B measured against a 0 B
+/// budget, over by 0 B", which tells a reader at two in the morning nothing whatsoever.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BudgetShortfall {
-    /// Which budget: `incremental code flash`, `engine RAM`, `kernel state`.
-    pub budget: &'static str,
-    /// The row or type the number was measured on.
-    pub subject: String,
-    /// What was measured.
-    pub measured: u64,
-    /// What design document §04 allows.
-    pub limit: u64,
+pub enum BudgetShortfall {
+    /// A measurement exceeded its budget.
+    Exceeded {
+        /// Which budget.
+        budget: Budget,
+        /// The row the number was measured on.
+        subject: String,
+        /// What was measured.
+        measured: u64,
+    },
+    /// The report cannot be gated, so it has not passed.
+    Unmeasurable {
+        /// What is missing.
+        detail: String,
+    },
 }
 
 impl fmt::Display for BudgetShortfall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} on `{}`: {} B measured against a {} B budget, over by {} B",
-            self.budget,
-            self.subject,
-            self.measured,
-            self.limit,
-            self.measured.saturating_sub(self.limit)
-        )
+        match self {
+            Self::Exceeded {
+                budget,
+                subject,
+                measured,
+            } => write!(
+                f,
+                "{} on `{subject}`: {measured} B measured against a {} B budget, over by {} B",
+                budget.name(),
+                budget.limit(),
+                measured.saturating_sub(budget.limit())
+            ),
+            Self::Unmeasurable { detail } => {
+                write!(f, "nothing was measured: {detail}")
+            }
+        }
     }
 }
 
@@ -349,13 +474,6 @@ impl SizeReport {
         &self.rows
     }
 
-    /// Every measured row, for a test that needs to describe a workspace that does not
-    /// exist.
-    #[must_use]
-    pub const fn rows_mut(&mut self) -> &mut Vec<Row> {
-        &mut self.rows
-    }
-
     /// The kernel state registry the report was taken with.
     #[must_use]
     pub const fn kernel_state(&self) -> &KernelState {
@@ -365,7 +483,7 @@ impl SizeReport {
     /// The row every other row is measured against.
     #[must_use]
     pub fn baseline(&self) -> Option<&Row> {
-        self.rows.iter().find(|row| row.name == "baseline")
+        self.rows.iter().find(|row| row.name == BASELINE_ROW)
     }
 
     /// The row named `name`.
@@ -382,6 +500,49 @@ impl SizeReport {
         Some(row.sizes.saturating_delta(&baseline.sizes))
     }
 
+    /// How much bigger `name` is than the row it is an increment on.
+    ///
+    /// For a feature row that is the feature's own cost, which is the number design
+    /// document §04 asks every optional feature to show.
+    #[must_use]
+    pub fn increment_of(&self, name: &str) -> Option<SectionSizes> {
+        let row = self.row(name)?;
+        if row.measured_against == row.name {
+            return None;
+        }
+        let base = self.row(&row.measured_against)?;
+        Some(row.sizes.saturating_delta(&base.sizes))
+    }
+
+    /// Rows that measured exactly what they are an increment on, and so measured nothing.
+    ///
+    /// A feature row is built by enabling the feature and linking the probe again. If the
+    /// probe never calls anything the feature adds, `--gc-sections` and fat LTO discard all
+    /// of it and the row comes back byte for byte identical to its base. The row is still
+    /// derived automatically — nobody has to remember to add it — but its number is zero
+    /// for a reason that has nothing to do with the feature being free.
+    ///
+    /// This cannot be a gate, because a feature that genuinely costs nothing is
+    /// indistinguishable from one the probe does not exercise. So it is said out loud,
+    /// every run, naming the row and what to do about it.
+    #[must_use]
+    pub fn notices(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| row.measured_against != row.name)
+            .filter(|row| {
+                self.row(&row.measured_against)
+                    .is_some_and(|base| base.sizes == row.sizes)
+            })
+            .map(|row| {
+                format!(
+                    "`{}` measured exactly the same image as `{}`, so its incremental cost is 0 B: either it costs nothing, or {} does not reach any code the feature adds and the linker discarded it. Design document \u{a7}04 asks every optional feature to show its own cost, so give the probe something to call.",
+                    row.name, row.measured_against, PROBE_PACKAGE
+                )
+            })
+            .collect()
+    }
+
     /// Every budget this report exceeds.
     ///
     /// A report with no baseline row is itself a shortfall: without one there is no delta
@@ -392,42 +553,54 @@ impl SizeReport {
         let mut shortfalls = Vec::new();
 
         if self.kernel_state.total > KERNEL_STATE_BUDGET_BYTES {
-            shortfalls.push(BudgetShortfall {
-                budget: "kernel state",
+            shortfalls.push(BudgetShortfall::Exceeded {
+                budget: Budget::KernelState,
                 subject: "waymaker-core".to_owned(),
                 measured: self.kernel_state.total,
-                limit: KERNEL_STATE_BUDGET_BYTES,
             });
         }
 
+        // No `if !rows.is_empty()` escape. A report with no rows is a report of a run that
+        // did not happen — a truncated artifact, a build that produced nothing — and the
+        // one thing it must not do is exit zero.
+        if self.rows.is_empty() {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report has no rows, so no image was linked".to_owned(),
+            });
+            return shortfalls;
+        }
+
         let Some(baseline) = self.baseline() else {
-            if !self.rows.is_empty() {
-                shortfalls.push(BudgetShortfall {
-                    budget: "missing baseline",
-                    subject: "baseline".to_owned(),
-                    measured: 0,
-                    limit: 0,
-                });
-            }
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report has no `baseline` row, so there is nothing to measure the other rows against".to_owned(),
+            });
             return shortfalls;
         };
+
+        // An image with no stored bytes at all is not a small image, it is a file the
+        // linker did not produce or the parser could not read. Section headers can be
+        // stripped, flags cleared, or a wrong artifact measured, and every one of those
+        // reads as a delta of zero against a delta of zero.
+        if baseline.sizes.flash == 0 {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the baseline image reports no bytes in flash at all, which no linked firmware does; its section headers were probably stripped or the wrong file was measured".to_owned(),
+            });
+        }
 
         for row in self.rows.iter().filter(|row| row.gated) {
             let delta = row.sizes.saturating_delta(&baseline.sizes);
             if delta.flash > INCREMENTAL_CODE_FLASH_BUDGET_BYTES {
-                shortfalls.push(BudgetShortfall {
-                    budget: "incremental code flash",
+                shortfalls.push(BudgetShortfall::Exceeded {
+                    budget: Budget::IncrementalCodeFlash,
                     subject: row.name.clone(),
                     measured: delta.flash,
-                    limit: INCREMENTAL_CODE_FLASH_BUDGET_BYTES,
                 });
             }
             if delta.ram > ENGINE_RAM_BUDGET_BYTES {
-                shortfalls.push(BudgetShortfall {
-                    budget: "engine RAM",
+                shortfalls.push(BudgetShortfall::Exceeded {
+                    budget: Budget::EngineRam,
                     subject: row.name.clone(),
                     measured: delta.ram,
-                    limit: ENGINE_RAM_BUDGET_BYTES,
                 });
             }
         }
@@ -456,7 +629,7 @@ impl SizeReport {
         Some(message.concat())
     }
 
-    /// A table with one row per image, and the delta against the baseline beside it.
+    /// A table with one row per image, its section deltas, and what it cost over its base.
     #[must_use]
     pub fn render(&self) -> String {
         let width = self
@@ -470,27 +643,35 @@ impl SizeReport {
         let mut table = vec![
             format!("section sizes on {FIRMWARE_TARGET}, release-size profile\n"),
             format!(
-                "  {:<width$}  {:>8} {:>8} {:>8} {:>8}  {:>10} {:>8}\n",
-                "variant", ".text", ".rodata", ".data", ".bss", "Δflash", "Δram",
+                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9}  {:>12}\n",
+                "variant",
+                "\u{394}.text",
+                "\u{394}.rodata",
+                "\u{394}.data",
+                "\u{394}.bss",
+                "\u{394}flash",
+                "\u{394}ram",
+                "over base",
             ),
         ];
 
-        let baseline = self.baseline().map(|row| row.sizes);
         for row in &self.rows {
-            let delta = baseline.map(|base| row.sizes.saturating_delta(&base));
-            let (flash, ram) = delta.map_or_else(
-                || ("?".to_owned(), "?".to_owned()),
-                |delta| (format!("+{}", delta.flash), format!("+{}", delta.ram)),
+            // The baseline's own row shows what a firmware with no Waymaker in it costs,
+            // so its columns are absolute and everything else is a delta against it.
+            let delta = self.delta_of(&row.name).unwrap_or(row.sizes);
+            let increment = self.increment_of(&row.name).map_or_else(
+                || "-".to_owned(),
+                |increment| format!("+{} flash", increment.flash),
             );
             table.push(format!(
-                "  {:<width$}  {:>8} {:>8} {:>8} {:>8}  {:>10} {:>8}{}\n",
+                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9}  {increment:>12}{}\n",
                 row.name,
-                row.sizes.text,
-                row.sizes.rodata,
-                row.sizes.data,
-                row.sizes.bss,
-                flash,
-                ram,
+                delta.text,
+                delta.rodata,
+                delta.data,
+                delta.bss,
+                delta.flash,
+                delta.ram,
                 if row.gated { "  gated" } else { "" },
             ));
         }
@@ -501,10 +682,13 @@ impl SizeReport {
             waymaker_core::budget::SCRATCH_PAGE_BYTES,
         ));
         table.push(format!(
-            "kernel state: {} B of {KERNEL_STATE_BUDGET_BYTES} B across {} registered type(s), sized for the host; the gate for {FIRMWARE_TARGET} is the const assertion in waymaker_core::budget, which every row above compiles\n",
+            "kernel state: {} B of {KERNEL_STATE_BUDGET_BYTES} B across {} registered type(s), sized for the host, which is an upper bound on the target; the gate for {FIRMWARE_TARGET} is the const assertion in waymaker_core::budget, which every row above but the baseline compiles\n",
             self.kernel_state.total,
             self.kernel_state.types.len(),
         ));
+        for notice in self.notices() {
+            table.push(format!("\nnotice: {notice}\n"));
+        }
         table.concat()
     }
 
@@ -518,6 +702,10 @@ impl SizeReport {
                 let mut entry = Map::new();
                 entry.insert("name".to_owned(), Value::from(row.name.clone()));
                 entry.insert("features".to_owned(), Value::from(row.features.clone()));
+                entry.insert(
+                    "measured_against".to_owned(),
+                    Value::from(row.measured_against.clone()),
+                );
                 entry.insert("gated".to_owned(), Value::from(row.gated));
                 entry.insert("text".to_owned(), Value::from(row.sizes.text));
                 entry.insert("rodata".to_owned(), Value::from(row.sizes.rodata));
@@ -525,6 +713,15 @@ impl SizeReport {
                 entry.insert("bss".to_owned(), Value::from(row.sizes.bss));
                 entry.insert("flash".to_owned(), Value::from(row.sizes.flash));
                 entry.insert("ram".to_owned(), Value::from(row.sizes.ram));
+                // The deltas are what the issue asks the job to record and what a reader
+                // wants; they are derivable from the baseline row, but a consumer that has
+                // to re-derive them is a consumer that can derive them differently.
+                if let Some(delta) = self.delta_of(&row.name) {
+                    entry.insert("delta".to_owned(), delta_json(&delta));
+                }
+                if let Some(increment) = self.increment_of(&row.name) {
+                    entry.insert("increment".to_owned(), delta_json(&increment));
+                }
                 Value::Object(entry)
             })
             .collect();
@@ -590,6 +787,18 @@ impl SizeReport {
             )));
         }
 
+        // The budgets are stated for one target, so a report taken on another is not a
+        // report this gate can hold to them.
+        let target = document
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SizeError::new("the size report names no `target`"))?;
+        if target != FIRMWARE_TARGET {
+            return Err(SizeError::new(format!(
+                "the size report was taken on {target}, but the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}"
+            )));
+        }
+
         let rows = document
             .get("rows")
             .and_then(Value::as_array)
@@ -613,14 +822,26 @@ impl SizeReport {
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    gated: row.get("gated").and_then(Value::as_bool).unwrap_or(false),
+                    measured_against: row
+                        .get("measured_against")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            SizeError::new(
+                                "a size report row does not say what it is measured against",
+                            )
+                        })?
+                        .to_owned(),
+                    gated: row
+                        .get("gated")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| SizeError::new("a size report row has no `gated` flag"))?,
                     sizes: SectionSizes {
-                        text: number(row, "text"),
-                        rodata: number(row, "rodata"),
-                        data: number(row, "data"),
-                        bss: number(row, "bss"),
-                        flash: number(row, "flash"),
-                        ram: number(row, "ram"),
+                        text: number(row, "text")?,
+                        rodata: number(row, "rodata")?,
+                        data: number(row, "data")?,
+                        bss: number(row, "bss")?,
+                        flash: number(row, "flash")?,
+                        ram: number(row, "ram")?,
                     },
                 })
             })
@@ -630,30 +851,51 @@ impl SizeReport {
             .get("kernel_state")
             .ok_or_else(|| SizeError::new("the size report has no `kernel_state`"))?;
         let kernel_state = KernelState {
-            total: number(kernel_state, "total"),
+            total: number(kernel_state, "total")?,
             types: kernel_state
                 .get("types")
                 .and_then(Value::as_array)
-                .map(|types| {
-                    types
-                        .iter()
-                        .filter_map(|entry| {
-                            Some((
-                                entry.get("name")?.as_str()?.to_owned(),
-                                number(entry, "size"),
-                            ))
-                        })
-                        .collect()
+                .ok_or_else(|| SizeError::new("the size report's `kernel_state` has no `types`"))?
+                .iter()
+                .map(|entry| {
+                    let name = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| SizeError::new("a kernel state entry has no `name`"))?;
+                    Ok((name.to_owned(), number(entry, "size")?))
                 })
-                .unwrap_or_default(),
+                .collect::<Result<Vec<(String, u64)>, SizeError>>()?,
         };
 
         Ok(Self { rows, kernel_state })
     }
 }
 
-fn number(value: &Value, field: &str) -> u64 {
-    value.get(field).and_then(Value::as_u64).unwrap_or(0)
+/// A required byte count.
+///
+/// Missing and mistyped both fail rather than defaulting to zero. A report is only read
+/// back to be gated or diffed, and in both of those a silent zero is the most convincing
+/// possible way to say nothing is wrong: a truncated artifact would gate clean, and
+/// `--json` would then re-emit the laundered numbers as a well-formed report that no
+/// downstream reader could tell from a real measurement.
+/// One set of section deltas, as JSON.
+fn delta_json(sizes: &SectionSizes) -> Value {
+    let mut entry = Map::new();
+    entry.insert("text".to_owned(), Value::from(sizes.text));
+    entry.insert("rodata".to_owned(), Value::from(sizes.rodata));
+    entry.insert("data".to_owned(), Value::from(sizes.data));
+    entry.insert("bss".to_owned(), Value::from(sizes.bss));
+    entry.insert("flash".to_owned(), Value::from(sizes.flash));
+    entry.insert("ram".to_owned(), Value::from(sizes.ram));
+    Value::Object(entry)
+}
+
+fn number(value: &Value, field: &str) -> Result<u64, SizeError> {
+    value.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        SizeError::new(format!(
+            "the size report has no `{field}`, or it is not a byte count"
+        ))
+    })
 }
 
 /// What one row did between two reports.
@@ -675,22 +917,44 @@ impl RowDiff {
         let after = self.after?;
         Some(i128::from(after.flash) - i128::from(before.flash))
     }
+
+    /// How the change reads in the table: `+40`, `-8`, or `0`.
+    #[must_use]
+    pub fn render_flash_change(&self) -> String {
+        self.flash_change().map_or_else(
+            || "?".to_owned(),
+            |change| {
+                if change > 0 {
+                    format!("+{change}")
+                } else {
+                    change.to_string()
+                }
+            },
+        )
+    }
 }
 
-/// Every row that differs between `base` and `head`, plus the rows only one of them has.
+/// Every row whose *cost* differs between `base` and `head`, plus the rows only one has.
+///
+/// Compared on deltas against each report's own baseline rather than on absolute sizes.
+/// The two reports are built with the same toolchain in the same job today, so the two
+/// agree — but a rustc bump or a change to the panic handler moves every absolute number
+/// while changing nobody's incremental cost, and a diff that reported all of that as
+/// "changed" would be a diff people stop reading.
 #[must_use]
 pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
     let mut diffs = Vec::new();
 
     for row in head.rows() {
-        let before = base.row(&row.name).map(|other| other.sizes);
-        if before == Some(row.sizes) {
+        let after = head.delta_of(&row.name);
+        let before = base.row(&row.name).and_then(|_| base.delta_of(&row.name));
+        if before == after && before.is_some() {
             continue;
         }
         diffs.push(RowDiff {
             name: row.name.clone(),
             before,
-            after: Some(row.sizes),
+            after,
         });
     }
 
@@ -698,13 +962,33 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
         if head.row(&row.name).is_none() {
             diffs.push(RowDiff {
                 name: row.name.clone(),
-                before: Some(row.sizes),
+                before: base.delta_of(&row.name),
                 after: None,
             });
         }
     }
 
     diffs
+}
+
+/// How the kernel state registry changed between two reports.
+///
+/// Reported beside the row diff because kernel state is the one budget the section sizes
+/// cannot see: it is asserted at compile time and carried in the registry, so a change to
+/// it would otherwise be invisible in a diff of linked images.
+#[must_use]
+pub fn kernel_state_change(base: &SizeReport, head: &SizeReport) -> Option<String> {
+    let (before, after) = (base.kernel_state(), head.kernel_state());
+    if before == after {
+        return None;
+    }
+    Some(format!(
+        "kernel state {} B across {} type(s) -> {} B across {} type(s)",
+        before.total,
+        before.types.len(),
+        after.total,
+        after.types.len(),
+    ))
 }
 
 /// The diff as a table, or a line saying there is nothing to show.
@@ -847,6 +1131,19 @@ pub fn check_workspace_root(metadata: &str, root: &Path) -> Result<(), SizeError
 /// Returns [`SizeError`] if the workspace cannot be resolved, if it has no size probe, or
 /// if any image fails to build or to be read.
 pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
+    measure_into(root, &root.join(BUILD_DIR))
+}
+
+/// Measures the workspace at `root`, linking into `build_dir`.
+///
+/// Separated so that the base-branch measurement can link into a directory that outlives
+/// its worktree: a build inside the worktree is deleted with it, so the base half of every
+/// pull request would be a cold build for ever, invisible to any CI build cache.
+///
+/// # Errors
+///
+/// As [`measure`].
+pub fn measure_into(root: &Path, build_dir: &Path) -> Result<SizeReport, SizeError> {
     let metadata = crate::run_cargo_metadata(root)
         .map_err(|err| SizeError::new(format!("could not resolve the workspace: {err}")))?;
     check_workspace_root(&metadata, root)?;
@@ -862,7 +1159,7 @@ pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
 
     let mut rows = Vec::with_capacity(variants.len());
     for variant in variants {
-        let image = build_variant(root, &variant)?;
+        let image = build_variant(root, build_dir, &variant)?;
         let bytes = std::fs::read(&image).map_err(|err| {
             SizeError::new(format!(
                 "could not read the linked image at {}: {err}",
@@ -874,6 +1171,7 @@ pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
         rows.push(Row {
             name: variant.name,
             features: variant.features,
+            measured_against: variant.measured_against,
             sizes: SectionSizes::of(&sections),
             gated: variant.gated,
         });
@@ -883,7 +1181,7 @@ pub fn measure(root: &Path) -> Result<SizeReport, SizeError> {
 }
 
 /// Links one image and returns the path to it.
-fn build_variant(root: &Path, variant: &Variant) -> Result<PathBuf, SizeError> {
+fn build_variant(root: &Path, build_dir: &Path, variant: &Variant) -> Result<PathBuf, SizeError> {
     // `uninstrumented_cargo` because a size run under `cargo llvm-cov` would otherwise
     // inherit its `RUSTC_WRAPPER` and `RUSTFLAGS` and try to build instrumented firmware,
     // which has no `profiler_builtins` for this target — and, worse, can succeed from a
@@ -899,7 +1197,9 @@ fn build_variant(root: &Path, variant: &Variant) -> Result<PathBuf, SizeError> {
             "--target",
             FIRMWARE_TARGET,
             "--target-dir",
-            BUILD_DIR,
+        ])
+        .arg(variant_build_dir(build_dir, &variant.name))
+        .args([
             "--package",
             PROBE_PACKAGE,
             "--no-default-features",
@@ -997,9 +1297,51 @@ pub fn check_size_probe(
             ));
         }
     }
+    violations.extend(check_probe_features(manifest));
 
     violations.extend(check_probe_manifest(manifest));
     violations.extend(check_probe_source(source));
+    violations
+}
+
+/// What each probe feature must enable for its row to measure anything.
+///
+/// Checking that the feature *exists* is not enough: `engine = []` is a plausible thing to
+/// write while debugging a link failure, it satisfies every other rule, and it collapses
+/// every delta in the report to zero because the baseline and the engine then link exactly
+/// the same image.
+const REQUIRED_PROBE_FEATURES: &[(&str, &[&str])] = &[
+    (ENGINE_FEATURE, &["dep:waymaker-core", "dep:waymaker-flash"]),
+    (FACADE_FEATURE, &[ENGINE_FEATURE, "dep:waymaker-embassy"]),
+];
+
+/// Rule: each probe feature still enables the crates its row is supposed to measure.
+fn check_probe_features(manifest: Option<&str>) -> Vec<Violation> {
+    let Some(parsed) = manifest.and_then(|manifest| manifest.parse::<toml::Table>().ok()) else {
+        // Already reported by `check_probe_manifest`.
+        return Vec::new();
+    };
+    let features = parsed.get("features").and_then(toml::Value::as_table);
+
+    let mut violations = Vec::new();
+    for (feature, required) in REQUIRED_PROBE_FEATURES {
+        let enabled: Vec<&str> = features
+            .and_then(|table| table.get(*feature))
+            .and_then(toml::Value::as_array)
+            .map(|entries| entries.iter().filter_map(toml::Value::as_str).collect())
+            .unwrap_or_default();
+        for wanted in *required {
+            if !enabled.contains(wanted) {
+                violations.push(Violation::new(
+                    "size-probe",
+                    PROBE_PACKAGE,
+                    format!(
+                        "its `{feature}` feature does not enable `{wanted}`, so the `{feature}` row links the same image as the row below it and every delta reads zero"
+                    ),
+                ));
+            }
+        }
+    }
     violations
 }
 
@@ -1047,7 +1389,7 @@ fn check_probe_manifest(manifest: Option<&str>) -> Vec<Violation> {
 }
 
 /// Attributes the probe's crate root must carry for its measurements to mean anything.
-pub const PROBE_REQUIRED_ATTRIBUTES: &[&str] =
+const PROBE_REQUIRED_ATTRIBUTES: &[&str] =
     &["#![no_std]", "#![no_main]", "#![forbid(unsafe_code)]"];
 
 /// Rule: the probe is still bare-metal firmware.
@@ -1060,12 +1402,7 @@ fn check_probe_source(source: Option<&str>) -> Vec<Violation> {
         )];
     };
 
-    let attributes: Vec<String> = source
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("#!["))
-        .map(|line| line.split_whitespace().collect::<String>())
-        .collect();
+    let attributes = crate::source::inner_attributes(source);
 
     PROBE_REQUIRED_ATTRIBUTES
         .iter()
@@ -1108,6 +1445,7 @@ pub fn base_ref_from_environment() -> Option<String> {
 /// as a failure: a missing comparison is not a budget breach.
 pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, SizeError> {
     let commit = resolve_ref(root, reference)?;
+    sweep_leaked_worktrees(root);
     let worktree = baseline_worktree(root);
     remove_worktree(root, &worktree);
 
@@ -1124,9 +1462,49 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
         )));
     }
 
-    let measured = measure(&worktree);
+    // Linked into a directory beside the head build rather than inside the worktree, so
+    // that the base half survives the worktree's removal and a CI build cache can see it.
+    // Otherwise every pull request pays for a cold build of the base branch, for ever.
+    let measured = measure_into(&worktree, &root.join(BUILD_DIR).with_extension("base"));
     remove_worktree(root, &worktree);
     measured
+}
+
+/// Removes base worktrees left behind by runs that were killed before they could clean up.
+///
+/// `git worktree prune` cannot help with these: it drops registrations whose directory is
+/// gone, and a killed run leaves the directory in place. Each leak is a full checkout, and
+/// a cancelled pull-request run is the normal case rather than the exception —
+/// `cancel-in-progress` sees to that — so without this they accumulate one per cancelled
+/// run on any runner whose disk outlives the job.
+fn sweep_leaked_worktrees(root: &Path) {
+    let Some(parent) = root
+        .join(BASELINE_WORKTREE_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    let Some(prefix) = Path::new(BASELINE_WORKTREE_PATH)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let leaked = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{prefix}-")));
+        if leaked && path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    let _ = git(root).args(["worktree", "prune"]).output();
 }
 
 /// The commit `reference` names, trying the remote-tracking form first.
@@ -1208,11 +1586,16 @@ pub fn read_report(path: &Path) -> Result<SizeReport, SizeError> {
 }
 
 /// Fixtures describing a size probe that does not exist on disk.
+#[cfg(test)]
 pub mod tests_support {
-    use super::{ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE, PROBE_REQUIRED_ATTRIBUTES};
+    use super::{PROBE_FEATURE, PROBE_REQUIRED_ATTRIBUTES, REQUIRED_PROBE_FEATURES};
     use crate::policy::LAYERS;
 
     /// A probe manifest that satisfies every rule in [`super::check_size_probe`].
+    ///
+    /// Rendered from the same tables the rules read, so that a rule tightened without the
+    /// fixture being updated fails loudly here rather than leaving the fixture describing
+    /// a probe the gate would now reject.
     #[must_use]
     pub fn clean_probe_manifest() -> String {
         let dependencies = LAYERS
@@ -1225,8 +1608,20 @@ pub mod tests_support {
             })
             .collect::<Vec<String>>()
             .concat();
+        let features = REQUIRED_PROBE_FEATURES
+            .iter()
+            .map(|(feature, enables)| {
+                let enabled = enables
+                    .iter()
+                    .map(|name| format!("\"{name}\""))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                format!("{feature} = [{enabled}]\n")
+            })
+            .collect::<Vec<String>>()
+            .concat();
         format!(
-            "[package]\nname = \"waymaker-size-probe\"\n\n[dependencies]\n{dependencies}\n[features]\ndefault = []\n{PROBE_FEATURE} = []\n{ENGINE_FEATURE} = []\n{FACADE_FEATURE} = []\n"
+            "[package]\nname = \"waymaker-size-probe\"\n\n[dependencies]\n{dependencies}\n[features]\ndefault = []\n{PROBE_FEATURE} = []\n{features}"
         )
     }
 
@@ -1369,25 +1764,56 @@ mod tests {
         assert_eq!(sizes.bss, 32);
     }
 
+    /// A baseline image with enough in it to look like something a linker produced.
+    fn baseline_sizes() -> SectionSizes {
+        SectionSizes {
+            text: 20,
+            rodata: 4,
+            flash: 40,
+            ..SectionSizes::default()
+        }
+    }
+
+    fn baseline_row() -> Row {
+        Row::new(
+            BASELINE_ROW,
+            &[PROBE_FEATURE],
+            BASELINE_ROW,
+            baseline_sizes(),
+            false,
+        )
+    }
+
+    fn default_row(flash_over_baseline: u64, ram_over_baseline: u64) -> Row {
+        let base = baseline_sizes();
+        Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: base.text + flash_over_baseline,
+                flash: base.flash + flash_over_baseline,
+                bss: ram_over_baseline,
+                ram: ram_over_baseline,
+                ..base
+            },
+            true,
+        )
+    }
+
     fn report(default_flash: u64, default_ram: u64) -> SizeReport {
         SizeReport::new(
-            vec![
-                Row::new("baseline", &[PROBE_FEATURE], SectionSizes::default(), false),
-                Row::new(
-                    "default",
-                    &[PROBE_FEATURE, ENGINE_FEATURE],
-                    SectionSizes {
-                        text: default_flash,
-                        flash: default_flash,
-                        bss: default_ram,
-                        ram: default_ram,
-                        ..SectionSizes::default()
-                    },
-                    true,
-                ),
-            ],
+            vec![baseline_row(), default_row(default_flash, default_ram)],
             KernelState::measured(),
         )
+    }
+
+    fn rendered(shortfalls: &[BudgetShortfall]) -> String {
+        shortfalls
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1398,117 +1824,270 @@ mod tests {
     #[test]
     fn exceeding_the_code_flash_budget_names_the_offending_number() {
         let over = INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1;
-        let shortfalls = report(over, 0).shortfalls();
-        let rendered = shortfalls
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains(&over.to_string()), "{rendered}");
+        let message = rendered(&report(over, 0).shortfalls());
+        assert!(message.contains(&over.to_string()), "{message}");
         assert!(
-            rendered.contains(&INCREMENTAL_CODE_FLASH_BUDGET_BYTES.to_string()),
-            "{rendered}"
+            message.contains(&INCREMENTAL_CODE_FLASH_BUDGET_BYTES.to_string()),
+            "{message}"
         );
-        assert!(rendered.contains("default"), "{rendered}");
+        assert!(message.contains(DEFAULT_ROW), "{message}");
+        assert!(message.contains("over by 1 B"), "{message}");
     }
 
     #[test]
     fn exceeding_the_engine_ram_budget_names_the_offending_number() {
         let over = ENGINE_RAM_BUDGET_BYTES + 1;
-        let rendered = report(0, over)
-            .shortfalls()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains(&over.to_string()), "{rendered}");
-        assert!(rendered.contains("RAM"), "{rendered}");
+        let message = rendered(&report(0, over).shortfalls());
+        assert!(message.contains(&over.to_string()), "{message}");
+        assert!(message.contains("engine RAM"), "{message}");
+    }
+
+    #[test]
+    fn a_report_with_no_rows_at_all_fails_rather_than_passing_empty() {
+        let empty = SizeReport::new(Vec::new(), KernelState::measured());
+        let message = rendered(&empty.shortfalls());
+        assert!(message.contains("no rows"), "{message}");
+        assert!(empty.shortfall_report().is_some());
+    }
+
+    #[test]
+    fn a_baseline_with_nothing_in_flash_is_not_a_measurement() {
+        // An image with no stored bytes is one whose section headers were stripped or
+        // whose file was never linked, and every delta against it reads zero.
+        let report = SizeReport::new(
+            vec![Row::new(
+                BASELINE_ROW,
+                &[PROBE_FEATURE],
+                BASELINE_ROW,
+                SectionSizes::default(),
+                false,
+            )],
+            KernelState::measured(),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("no bytes in flash"), "{message}");
+    }
+
+    #[test]
+    fn an_unmeasurable_report_does_not_render_as_a_zero_byte_budget() {
+        let message = BudgetShortfall::Unmeasurable {
+            detail: "the report has no rows".to_owned(),
+        }
+        .to_string();
+        assert!(message.contains("nothing was measured"), "{message}");
+        assert!(!message.contains("0 B budget"), "{message}");
+    }
+
+    #[test]
+    fn a_budget_knows_its_own_limit_and_name() {
+        assert_eq!(
+            Budget::IncrementalCodeFlash.limit(),
+            INCREMENTAL_CODE_FLASH_BUDGET_BYTES
+        );
+        assert_eq!(Budget::EngineRam.limit(), ENGINE_RAM_BUDGET_BYTES);
+        assert_eq!(Budget::KernelState.limit(), KERNEL_STATE_BUDGET_BYTES);
+        assert_eq!(Budget::KernelState.name(), "kernel state");
     }
 
     #[test]
     fn the_gate_measures_a_delta_rather_than_an_absolute_size() {
         // A baseline that is itself large must not be charged to the engine.
-        let mut report = report(64, 0);
-        report.rows_mut().first_mut().expect("a baseline").sizes = SectionSizes {
-            text: 4_096,
-            flash: 4_096,
-            ..SectionSizes::default()
-        };
-        let delta = report.delta_of("default").expect("a default row");
+        let big_baseline = Row::new(
+            BASELINE_ROW,
+            &[PROBE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: 4_096,
+                flash: 4_096,
+                ..SectionSizes::default()
+            },
+            false,
+        );
+        let report = SizeReport::new(
+            vec![big_baseline, default_row(64, 0)],
+            KernelState::measured(),
+        );
+        let delta = report.delta_of(DEFAULT_ROW).expect("a default row");
         assert_eq!(delta.flash, 0, "a smaller image is not a negative cost");
         assert!(report.shortfalls().is_empty());
     }
 
-    #[test]
-    fn an_ungated_row_is_reported_but_not_failed() {
-        let mut report = report(0, 0);
-        report.rows_mut().push(Row::new(
-            "waymaker-core/serde",
-            &[PROBE_FEATURE, ENGINE_FEATURE, "waymaker-core/serde"],
+    /// A feature row costing `flash_over_default` more than the `default` row it sits on.
+    fn feature_row(name: &str, default: &Row, flash_over_default: u64) -> Row {
+        Row::new(
+            name,
+            &[PROBE_FEATURE, ENGINE_FEATURE, name],
+            DEFAULT_ROW,
             SectionSizes {
-                flash: INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1,
-                ..SectionSizes::default()
+                flash: default.sizes.flash + flash_over_default,
+                text: default.sizes.text + flash_over_default,
+                ..default.sizes
             },
             false,
-        ));
+        )
+    }
+
+    #[test]
+    fn an_ungated_row_is_reported_but_not_failed() {
+        let default = default_row(20, 0);
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row(
+                    "waymaker-core/serde",
+                    &default,
+                    INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1,
+                ),
+            ],
+            KernelState::measured(),
+        );
         assert!(report.shortfalls().is_empty());
         assert!(report.render().contains("waymaker-core/serde"));
     }
 
     #[test]
-    fn a_report_with_no_baseline_row_fails_rather_than_reporting_zero() {
+    fn a_feature_row_reports_its_cost_over_the_engine_rather_than_over_the_baseline() {
+        let default = default_row(100, 0);
         let report = SizeReport::new(
-            vec![Row::new(
-                "default",
-                &[PROBE_FEATURE, ENGINE_FEATURE],
-                SectionSizes::default(),
-                true,
-            )],
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 32),
+            ],
             KernelState::measured(),
         );
-        let shortfalls = report.shortfalls();
-        assert!(
-            shortfalls
-                .iter()
-                .any(|shortfall| shortfall.to_string().contains("baseline")),
-            "{shortfalls:?}"
+        let increment = report
+            .increment_of("waymaker-core/serde")
+            .expect("a feature row is an increment on the engine");
+        assert_eq!(increment.flash, 32);
+        assert!(report.render().contains("+32 flash"), "{}", report.render());
+    }
+
+    #[test]
+    fn an_engine_row_identical_to_the_baseline_is_named_too() {
+        // The same failure one level down: the layers linked but contributed nothing,
+        // which is what a dead-stripped engine looks like from here.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(0, 0)],
+            KernelState::measured(),
         );
+        let notices = report.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices
+                .first()
+                .is_some_and(|notice| notice.contains(DEFAULT_ROW)),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_feature_row_identical_to_its_base_is_named_as_measuring_nothing() {
+        // This is the failure that makes an automatically derived matrix worthless: the
+        // row appears, and reads zero because the probe never calls the feature.
+        let default = default_row(20, 0);
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 0),
+            ],
+            KernelState::measured(),
+        );
+        let notices = report.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = notices.first().map(String::as_str).unwrap_or_default();
+        assert!(notice.contains("waymaker-core/serde"), "{notice}");
+        assert!(notice.contains(PROBE_PACKAGE), "{notice}");
+        assert!(report.render().contains("notice:"));
+    }
+
+    #[test]
+    fn a_feature_row_that_cost_something_is_not_a_notice() {
+        let default = default_row(20, 0);
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 8),
+            ],
+            KernelState::measured(),
+        );
+        assert!(report.notices().is_empty(), "{:?}", report.notices());
+    }
+
+    #[test]
+    fn a_report_with_no_baseline_row_fails_rather_than_reporting_zero() {
+        let report = SizeReport::new(vec![default_row(0, 0)], KernelState::measured());
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("baseline"), "{message}");
     }
 
     #[test]
     fn the_kernel_state_budget_is_gated_too() {
         let report = SizeReport::new(
-            vec![Row::new(
-                "baseline",
-                &[PROBE_FEATURE],
-                SectionSizes::default(),
-                false,
-            )],
+            vec![baseline_row()],
             KernelState {
                 total: KERNEL_STATE_BUDGET_BYTES + 7,
                 types: vec![("Cursor".to_owned(), KERNEL_STATE_BUDGET_BYTES + 7)],
             },
         );
-        let rendered = report
-            .shortfalls()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let message = rendered(&report.shortfalls());
         assert!(
-            rendered.contains(&(KERNEL_STATE_BUDGET_BYTES + 7).to_string()),
-            "{rendered}"
+            message.contains(&(KERNEL_STATE_BUDGET_BYTES + 7).to_string()),
+            "{message}"
         );
     }
 
     #[test]
-    fn the_report_renders_every_row_with_its_delta() {
-        let rendered = report(512, 32).render();
-        assert!(rendered.contains("baseline"), "{rendered}");
-        assert!(rendered.contains("default"), "{rendered}");
-        assert!(rendered.contains("512"), "{rendered}");
-        assert!(rendered.contains(".text"), "{rendered}");
-        assert!(rendered.contains(".bss"), "{rendered}");
+    fn the_report_renders_every_row_with_its_per_section_deltas() {
+        let table = report(512, 32).render();
+        assert!(table.contains(BASELINE_ROW), "{table}");
+        assert!(table.contains(DEFAULT_ROW), "{table}");
+        assert!(table.contains("512"), "{table}");
+        // The issue asks the job to record `.text` / `.rodata` / `.bss` deltas by name.
+        for column in [
+            "\u{394}.text",
+            "\u{394}.rodata",
+            "\u{394}.data",
+            "\u{394}.bss",
+        ] {
+            assert!(table.contains(column), "{column} is missing from\n{table}");
+        }
+    }
+
+    #[test]
+    fn the_json_report_carries_the_deltas_as_well_as_the_absolute_sizes() {
+        let json = report(512, 32).to_json();
+        let document: Value = serde_json::from_str(&json).expect("its own JSON parses");
+        let rows = document
+            .get("rows")
+            .and_then(Value::as_array)
+            .expect("rows");
+        let default = rows
+            .iter()
+            .find(|row| row.get("name").and_then(Value::as_str) == Some(DEFAULT_ROW))
+            .expect("a default row");
+        assert_eq!(
+            default
+                .get("delta")
+                .and_then(|d| d.get("flash"))
+                .and_then(Value::as_u64),
+            Some(512)
+        );
+        assert_eq!(
+            default
+                .get("delta")
+                .and_then(|d| d.get("bss"))
+                .and_then(Value::as_u64),
+            Some(32)
+        );
+        assert_eq!(
+            default.get("flash").and_then(Value::as_u64),
+            Some(baseline_sizes().flash + 512),
+            "the absolute size is still there"
+        );
     }
 
     #[test]
@@ -1526,24 +2105,119 @@ mod tests {
     }
 
     #[test]
+    fn a_row_missing_a_size_is_rejected_rather_than_read_as_zero() {
+        // `--report` gates a document this process did not produce: a truncated CI
+        // artifact must fail the gate, not sail through it with every number defaulted.
+        let json = report(512, 32).to_json();
+        let mut document: Value = serde_json::from_str(&json).expect("its own JSON parses");
+        if let Some(row) = document
+            .get_mut("rows")
+            .and_then(Value::as_array_mut)
+            .and_then(|rows| rows.first_mut())
+            .and_then(Value::as_object_mut)
+        {
+            row.remove("flash");
+        }
+        let error = SizeReport::from_json(&document.to_string())
+            .expect_err("a row with no flash figure has not been measured");
+        assert!(error.to_string().contains("flash"), "{error}");
+    }
+
+    #[test]
+    fn a_row_whose_gated_flag_is_missing_is_rejected() {
+        let json = report(0, 0).to_json();
+        let mut document: Value = serde_json::from_str(&json).expect("parses");
+        if let Some(row) = document
+            .get_mut("rows")
+            .and_then(Value::as_array_mut)
+            .and_then(|rows| rows.get_mut(1))
+            .and_then(Value::as_object_mut)
+        {
+            row.remove("gated");
+        }
+        assert!(SizeReport::from_json(&document.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_report_taken_on_another_target_is_rejected() {
+        let json = report(0, 0)
+            .to_json()
+            .replace(FIRMWARE_TARGET, "x86_64-unknown-linux-gnu");
+        let error =
+            SizeReport::from_json(&json).expect_err("the budgets are stated for one target");
+        assert!(error.to_string().contains(FIRMWARE_TARGET), "{error}");
+    }
+
+    #[test]
     fn a_diff_names_what_grew_what_shrank_and_what_is_new() {
         let base = report(500, 16);
-        let mut head = report(700, 16);
-        head.rows_mut().push(Row::new(
-            "waymaker-core/serde",
-            &[PROBE_FEATURE, ENGINE_FEATURE, "waymaker-core/serde"],
+        let default = default_row(700, 16);
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 900),
+            ],
+            KernelState::measured(),
+        );
+
+        let table = render_diff(&diff(&base, &head));
+        assert!(table.contains(DEFAULT_ROW), "{table}");
+        assert!(table.contains("+200"), "{table}");
+        assert!(table.contains("waymaker-core/serde"), "{table}");
+        assert!(table.contains("new"), "{table}");
+    }
+
+    #[test]
+    fn a_diff_ignores_a_baseline_that_moved_without_changing_any_cost() {
+        // A rustc bump or a change to the panic handler moves every absolute number while
+        // nobody's incremental cost changes. A diff that shouted about that is a diff
+        // people stop reading.
+        let base = report(500, 16);
+        let bigger_baseline = Row::new(
+            BASELINE_ROW,
+            &[PROBE_FEATURE],
+            BASELINE_ROW,
             SectionSizes {
-                flash: 900,
-                ..SectionSizes::default()
+                flash: baseline_sizes().flash + 1_000,
+                text: baseline_sizes().text + 1_000,
+                ..baseline_sizes()
             },
             false,
-        ));
+        );
+        let shifted_default = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                flash: bigger_baseline.sizes.flash + 500,
+                text: bigger_baseline.sizes.text + 500,
+                bss: 16,
+                ram: 16,
+                ..bigger_baseline.sizes
+            },
+            true,
+        );
+        let head = SizeReport::new(
+            vec![bigger_baseline, shifted_default],
+            KernelState::measured(),
+        );
+        assert!(diff(&base, &head).is_empty(), "{:?}", diff(&base, &head));
+    }
 
-        let rendered = render_diff(&diff(&base, &head));
-        assert!(rendered.contains("default"), "{rendered}");
-        assert!(rendered.contains("+200"), "{rendered}");
-        assert!(rendered.contains("waymaker-core/serde"), "{rendered}");
-        assert!(rendered.contains("new"), "{rendered}");
+    #[test]
+    fn a_kernel_state_change_is_reported_beside_the_rows() {
+        let base = report(0, 0);
+        let head = SizeReport::new(
+            vec![baseline_row(), default_row(0, 0)],
+            KernelState {
+                total: 24,
+                types: vec![("Cursor".to_owned(), 24)],
+            },
+        );
+        let change = kernel_state_change(&base, &head).expect("the registry changed");
+        assert!(change.contains("24"), "{change}");
+        assert!(kernel_state_change(&base, &base).is_none());
     }
 
     #[test]
@@ -1555,10 +2229,9 @@ mod tests {
     #[test]
     fn a_row_that_disappeared_is_reported_as_removed() {
         let base = report(500, 16);
-        let mut head = report(500, 16);
-        head.rows_mut().retain(|row| row.name != "default");
-        let rendered = render_diff(&diff(&base, &head));
-        assert!(rendered.contains("removed"), "{rendered}");
+        let head = SizeReport::new(vec![baseline_row()], KernelState::measured());
+        let table = render_diff(&diff(&base, &head));
+        assert!(table.contains("removed"), "{table}");
     }
 
     #[test]
@@ -1627,6 +2300,205 @@ mod tests {
     fn metadata_with_no_workspace_root_is_rejected() {
         assert!(check_workspace_root("{}", Path::new("/w")).is_err());
         assert!(check_workspace_root("not json", Path::new("/w")).is_err());
+    }
+
+    // --- the probe rule ------------------------------------------------------------
+    //
+    // `check_size_probe` is what stops the whole gate from being silently disarmed, so
+    // every branch of it is a test. Each of these describes a probe that does not exist.
+
+    fn probe_graph() -> PackageGraph {
+        PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy"),
+            Package::new(PROBE_PACKAGE)
+                .with_features(&[ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE])
+                .with_bin(PROBE_PACKAGE, &[PROBE_FEATURE]),
+        ])
+    }
+
+    fn probe_violations(
+        graph: &PackageGraph,
+        manifest: Option<&str>,
+        source: Option<&str>,
+    ) -> String {
+        check_size_probe(graph, manifest, source)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_well_formed_probe_passes_every_rule() {
+        let violations = check_size_probe(
+            &probe_graph(),
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_workspace_with_no_probe_at_all_is_reported() {
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core")]);
+        let message = probe_violations(&graph, None, None);
+        assert!(message.contains("no size probe"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_with_a_non_empty_default_feature_is_reported() {
+        let graph = PackageGraph::new(vec![
+            Package::new(PROBE_PACKAGE)
+                .with_features(&[ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE])
+                .with_bin(PROBE_PACKAGE, &[PROBE_FEATURE])
+                .with_default_features(&[ENGINE_FEATURE]),
+        ]);
+        let message = probe_violations(
+            &graph,
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("default must be empty"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_binary_without_required_features_is_reported() {
+        // Without them, `cargo build --workspace` and `cargo clippy --all-targets` start
+        // trying to link `#![no_main]` firmware for the host.
+        let graph = PackageGraph::new(vec![
+            Package::new(PROBE_PACKAGE)
+                .with_features(&[ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE])
+                .with_bin(PROBE_PACKAGE, &[]),
+        ]);
+        let message = probe_violations(
+            &graph,
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("required-features"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_with_no_binary_at_all_is_reported() {
+        let graph = PackageGraph::new(vec![Package::new(PROBE_PACKAGE).with_features(&[
+            ENGINE_FEATURE,
+            FACADE_FEATURE,
+            PROBE_FEATURE,
+        ])]);
+        let message = probe_violations(
+            &graph,
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("no binary target"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_missing_a_feature_the_matrix_selects_is_reported() {
+        let graph = PackageGraph::new(vec![
+            Package::new(PROBE_PACKAGE)
+                .with_features(&[PROBE_FEATURE])
+                .with_bin(PROBE_PACKAGE, &[PROBE_FEATURE]),
+        ]);
+        let message = probe_violations(
+            &graph,
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains(ENGINE_FEATURE), "{message}");
+        assert!(message.contains(FACADE_FEATURE), "{message}");
+    }
+
+    #[test]
+    fn a_layer_that_is_not_an_optional_dependency_is_reported() {
+        // A layer the baseline image also links contributes nothing to any delta.
+        let manifest = tests_support::clean_probe_manifest().replace(
+            "waymaker-core = { path = \"../waymaker-core\", optional = true }",
+            "waymaker-core = { path = \"../waymaker-core\" }",
+        );
+        let message = probe_violations(
+            &probe_graph(),
+            Some(&manifest),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("optional = true"), "{message}");
+        assert!(message.contains("waymaker-core"), "{message}");
+    }
+
+    #[test]
+    fn a_feature_that_stopped_enabling_its_layers_is_reported() {
+        // `engine = []` satisfies every rule about feature *names* and collapses every
+        // delta in the report to zero.
+        let manifest = tests_support::clean_probe_manifest().replace(
+            "engine = [\"dep:waymaker-core\", \"dep:waymaker-flash\"]",
+            "engine = []",
+        );
+        let message = probe_violations(
+            &probe_graph(),
+            Some(&manifest),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("dep:waymaker-core"), "{message}");
+        assert!(message.contains("every delta reads zero"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_manifest_that_is_not_toml_is_reported() {
+        let message = probe_violations(
+            &probe_graph(),
+            Some("this is not = = toml"),
+            Some(&tests_support::clean_probe_source()),
+        );
+        assert!(message.contains("not valid TOML"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_that_stopped_being_bare_metal_firmware_is_reported() {
+        let message = probe_violations(
+            &probe_graph(),
+            Some(&tests_support::clean_probe_manifest()),
+            Some("//! Not firmware any more.\n"),
+        );
+        for attribute in PROBE_REQUIRED_ATTRIBUTES {
+            assert!(message.contains(attribute), "{attribute} in {message}");
+        }
+    }
+
+    #[test]
+    fn a_commented_out_probe_attribute_does_not_count() {
+        // The shared scanner in `source` is what makes this true; the rule inherits it.
+        let source = tests_support::clean_probe_source().replace("#![no_main]", "// #![no_main]");
+        let message = probe_violations(
+            &probe_graph(),
+            Some(&tests_support::clean_probe_manifest()),
+            Some(&source),
+        );
+        assert!(message.contains("#![no_main]"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_with_no_readable_manifest_or_source_is_reported_rather_than_skipped() {
+        let message = probe_violations(&probe_graph(), None, None);
+        assert!(message.contains("manifest could not be read"), "{message}");
+        assert!(message.contains("no crate root"), "{message}");
+    }
+
+    #[test]
+    fn a_variant_builds_into_a_directory_named_after_it() {
+        // `/` in `waymaker-core/serde` would otherwise nest a directory per crate, and
+        // every variant sharing one directory is what let one row's image be read for
+        // another's.
+        let root = Path::new("/w/target/size");
+        assert_eq!(
+            variant_build_dir(root, "waymaker-core/serde"),
+            root.join("waymaker-core-serde")
+        );
+        assert_ne!(
+            variant_build_dir(root, BASELINE_ROW),
+            variant_build_dir(root, DEFAULT_ROW)
+        );
     }
 
     fn find<'a>(variants: &'a [Variant], name: &str) -> &'a Variant {
