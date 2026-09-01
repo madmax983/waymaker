@@ -203,6 +203,56 @@ impl PackageGraph {
         reached
     }
 
+    /// Returns the shortest path to every package reachable from `name` that is not in
+    /// `allowed`, stopping at the first illegal hop on each branch.
+    ///
+    /// Truncating at the first illegal package is what keeps the report readable. One
+    /// forbidden dependency drags in its whole subtree; naming the subtree tells a
+    /// reviewer nothing they can act on, while naming the edge that admitted it tells
+    /// them exactly what to delete.
+    ///
+    /// Each path starts at `name` and ends at the offending package.
+    #[must_use]
+    pub fn illegal_reach_paths(&self, name: &str, allowed: &BTreeSet<&str>) -> Vec<Vec<String>> {
+        let Some(root) = self.find(name) else {
+            return Vec::new();
+        };
+
+        let mut paths = Vec::new();
+        let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+        seen_ids.insert(root.id.as_str());
+
+        let mut queue: VecDeque<(&str, Vec<String>)> = root
+            .resolved_deps
+            .iter()
+            .map(|id| (id.as_str(), vec![root.name.clone()]))
+            .collect();
+
+        while let Some((id, path)) = queue.pop_front() {
+            if !seen_ids.insert(id) {
+                continue;
+            }
+            let Some(package) = self.by_id(id) else {
+                continue;
+            };
+
+            let mut path = path;
+            path.push(package.name.clone());
+
+            if package.name == name || allowed.contains(package.name.as_str()) {
+                for next in &package.resolved_deps {
+                    queue.push_back((next.as_str(), path.clone()));
+                }
+            } else {
+                // Do not descend: everything below is a consequence of this one edge.
+                paths.push(path);
+            }
+        }
+
+        paths.sort();
+        paths
+    }
+
     /// Parses the output of `cargo metadata --format-version 1`.
     ///
     /// # Errors
@@ -363,17 +413,23 @@ pub fn check_dependency_direction(graph: &PackageGraph) -> Vec<Violation> {
             }
         }
 
-        for reached in graph.transitive_dependencies(spec.name) {
-            if !allowed.contains(reached.as_str()) {
-                violations.push(Violation::new(
-                    "dependency-direction-transitive",
-                    spec.name,
-                    format!(
-                        "reaches `{reached}` through its dependency graph; this layer may only depend on {}",
-                        render_allowed(spec.may_depend_on)
-                    ),
-                ));
+        for path in graph.illegal_reach_paths(spec.name, &allowed) {
+            // A path of two names is a direct edge, already reported above.
+            if path.len() <= 2 {
+                continue;
             }
+            let Some(offender) = path.last() else {
+                continue;
+            };
+            violations.push(Violation::new(
+                "dependency-direction-transitive",
+                spec.name,
+                format!(
+                    "reaches `{offender}` through {}; this layer may only depend on {}",
+                    path.join(" -> "),
+                    render_allowed(spec.may_depend_on)
+                ),
+            ));
         }
     }
 
@@ -409,11 +465,20 @@ pub fn check_kernel_has_no_dependencies(graph: &PackageGraph) -> Vec<Violation> 
         })
         .collect();
 
-    for reached in graph.transitive_dependencies(kernel.name) {
+    for path in graph.illegal_reach_paths(kernel.name, &BTreeSet::new()) {
+        if path.len() <= 2 {
+            continue;
+        }
+        let Some(offender) = path.last() else {
+            continue;
+        };
         violations.push(Violation::new(
             "kernel-zero-dependencies",
             kernel.name,
-            format!("reaches `{reached}`; the kernel is dependency-free by contract"),
+            format!(
+                "reaches `{offender}` through {}; the kernel is dependency-free by contract",
+                path.join(" -> ")
+            ),
         ));
     }
 
@@ -591,10 +656,19 @@ mod tests {
 
         let violations = rules(&graph);
         assert!(
-            fired(&violations, "dependency-direction-transitive"),
-            "the transitive edge must be caught: {violations:?}"
+            violations.iter().any(|violation| {
+                violation.rule == "dependency-direction" && violation.subject == "waymaker-flash"
+            }),
+            "the edge that admitted Embassy must be named: {violations:?}"
         );
-        assert!(fired(&violations, "embassy-below-facade"));
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule == "embassy-below-facade"
+                    && violation.subject == "waymaker-flash"
+                    && violation.detail.contains("embassy-executor")
+            }),
+            "the Embassy crate itself must be named even though it is two hops away: {violations:?}"
+        );
     }
 
     #[test]
@@ -641,6 +715,118 @@ mod tests {
         ]);
 
         assert!(fired(&rules(&graph), "empty-default-features"));
+    }
+
+    #[test]
+    fn an_illegal_transitive_reach_is_reported_once_at_the_edge_that_admitted_it() {
+        // waymaker-embassy -> waymaker-flash (allowed) -> innocent-helper (not allowed)
+        // -> embassy-executor -> junk-a, junk-b
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("innocent-helper", DepKind::Normal),
+            Package::new("innocent-helper").with_dependency("embassy-executor", DepKind::Normal),
+            Package::new("embassy-executor")
+                .with_dependency("junk-a", DepKind::Normal)
+                .with_dependency("junk-b", DepKind::Normal),
+            Package::new("junk-a"),
+            Package::new("junk-b"),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+        ]);
+
+        let violations = check_dependency_direction(&graph);
+        let reported: Vec<&Violation> = violations
+            .iter()
+            .filter(|violation| {
+                violation.rule == "dependency-direction-transitive"
+                    && violation.subject == "waymaker-embassy"
+            })
+            .collect();
+
+        assert_eq!(
+            reported.len(),
+            1,
+            "the subtree below the offending edge must not be enumerated: {reported:?}"
+        );
+        assert!(
+            reported[0]
+                .detail
+                .contains("waymaker-embassy -> waymaker-flash -> innocent-helper"),
+            "the message must name the path that admitted it: {}",
+            reported[0].detail
+        );
+        assert!(
+            !reported[0].detail.contains("junk-a"),
+            "consequences of the offending edge are noise: {}",
+            reported[0].detail
+        );
+    }
+
+    #[test]
+    fn a_direct_illegal_dependency_is_not_also_reported_as_transitive() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("embassy-time", DepKind::Normal),
+            Package::new("embassy-time"),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+        ]);
+
+        let violations = check_dependency_direction(&graph);
+        let flash: Vec<&Violation> = violations
+            .iter()
+            .filter(|violation| violation.subject == "waymaker-flash")
+            .collect();
+
+        assert_eq!(flash.len(), 1, "one edge, one violation: {flash:?}");
+        assert_eq!(flash[0].rule, "dependency-direction");
+    }
+
+    #[test]
+    fn illegal_reach_paths_takes_the_shortest_route() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-flash")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("detour", DepKind::Normal),
+            Package::new("waymaker-core").with_dependency("banned", DepKind::Normal),
+            Package::new("detour").with_dependency("banned", DepKind::Normal),
+            Package::new("banned"),
+        ]);
+
+        let allowed = ["waymaker-core"].into_iter().collect();
+        let paths = graph.illegal_reach_paths("waymaker-flash", &allowed);
+
+        assert_eq!(
+            paths.len(),
+            2,
+            "detour and banned are both illegal: {paths:?}"
+        );
+        assert!(paths.contains(&vec![
+            "waymaker-flash".to_owned(),
+            "waymaker-core".to_owned(),
+            "banned".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn illegal_reach_paths_terminates_on_a_cycle() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("a", DepKind::Normal),
+            Package::new("a").with_dependency("b", DepKind::Normal),
+            Package::new("b").with_dependency("a", DepKind::Normal),
+        ]);
+
+        let paths = graph.illegal_reach_paths("waymaker-core", &BTreeSet::new());
+        assert_eq!(
+            paths,
+            vec![vec!["waymaker-core".to_owned(), "a".to_owned()]]
+        );
     }
 
     #[test]

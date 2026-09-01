@@ -15,7 +15,8 @@ deterministic workflow durable.**
 
 ## Status
 
-Pre-implementation. The design is settled at draft v0.2; the crates do not exist yet.
+Rung 0.0. The design is settled at draft v0.2 and the three crates exist as `no_std`
+scaffolding with the layering mechanically enforced. No protocol code has been written yet.
 See [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) for the
 full document, and the issue tracker for the build-out.
 
@@ -28,7 +29,8 @@ full document, and the issue tracker for the build-out.
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | On-media authority or hidden global state |
 
 Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `waymaker-core`.
-The kernel is `no_std`, `no_alloc`, and dependency-free.
+The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
+convention — see [Development](#development).
 
 ## Budgets
 
@@ -64,6 +66,33 @@ behavior requires an idempotent activity or downstream deduplication of that ID.
 | 0.4 · embassy | Async `Ctx`, activity dispatcher, in-boot timer, provisioning and OTA examples | Runtime RAM and code-flash budgets pass on `thumbv6m` |
 | 0.5 · time | Persistent-clock capability and recorded timers | RTC-backed timer survives total power loss with defined semantics |
 | 1.0 | Workflow version markers, stable wire format, book, hardware compatibility matrix | Format frozen and migration policy documented |
+
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo build --workspace --no-default-features
+cargo test --workspace
+cargo xtask check-layering
+```
+
+`cargo xtask check-layering` is the layering contract from design document §05, turned into
+something that fails a pull request. It reads the resolved `cargo metadata` graph rather
+than the manifests, so a forbidden dependency cannot hide behind a target table, an
+optional feature, or one level of indirection. It fails if:
+
+- `waymaker-core` grows a dependency of any kind, including a dev- or build-dependency;
+- `waymaker-flash` reaches Embassy, directly or through another crate;
+- any firmware crate stops being `#![no_std]` or stops forbidding unsafe code;
+- any firmware crate gains a non-empty default feature or stops inheriting the workspace
+  lints;
+- the release profile or the workspace lint table drifts from the design document.
+
+`xtask` is a host tool and is excluded from firmware-target builds by `default-members`;
+build the firmware crates for a target with
+`cargo build -p waymaker-core -p waymaker-flash -p waymaker-embassy --no-default-features
+--target thumbv6m-none-eabi`.
 
 ## License
 
