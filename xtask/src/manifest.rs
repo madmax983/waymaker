@@ -31,6 +31,18 @@ pub const REQUIRED_CLIPPY_DENIALS: &[&str] = &["unwrap_used"];
 /// Rule: the release profile matches the design document exactly.
 #[must_use]
 pub fn check_release_profile(manifest: &str) -> Vec<Violation> {
+    check_release_profile_against(REQUIRED_RELEASE_PROFILE, manifest)
+}
+
+/// [`check_release_profile`] against an explicit specification.
+///
+/// Taking the specification as a parameter is what makes the "the gate itself is broken"
+/// branch reachable from a test.
+#[must_use]
+pub fn check_release_profile_against(
+    specification: &[(&str, &str)],
+    manifest: &str,
+) -> Vec<Violation> {
     let Some(document) = parse(manifest) else {
         return vec![Violation::new(
             "release-profile",
@@ -51,7 +63,7 @@ pub fn check_release_profile(manifest: &str) -> Vec<Violation> {
         )];
     };
 
-    REQUIRED_RELEASE_PROFILE
+    specification
         .iter()
         .filter_map(|(key, expected)| {
             // A gate must never be able to silently uncheck one of its own rules: an
@@ -507,14 +519,25 @@ strip = "symbols"
     }
 
     #[test]
-    fn an_unparseable_expected_profile_value_is_reported_as_a_broken_gate() {
-        // Guards the constant itself: every entry must be a TOML literal.
+    fn every_expected_profile_value_is_a_toml_literal() {
+        // Guards the constant itself: an entry that does not parse would otherwise
+        // silently uncheck its key.
         for (key, expected) in REQUIRED_RELEASE_PROFILE {
             assert!(
                 expected.parse::<Value>().is_ok(),
                 "the expected value for {key} is not valid TOML: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn an_unparseable_expected_value_is_reported_as_a_broken_gate() {
+        // `z` rather than `"z"`: a plausible tidy-up that would otherwise disable the
+        // check for that key without a word.
+        let violations = check_release_profile_against(&[("opt-level", "z")], GOOD_WORKSPACE);
+        assert_eq!(violations.len(), 1, "{}", details(&violations));
+        assert_eq!(violations[0].rule, "gate-broken");
+        assert!(violations[0].detail.contains("opt-level"));
     }
 
     #[test]

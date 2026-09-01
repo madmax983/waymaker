@@ -132,6 +132,25 @@ fn the_binary_rejects_an_unknown_command() {
 }
 
 #[test]
+fn the_binary_reports_a_check_error_and_exits_non_zero() {
+    let scratch = scratch_workspace("stale-binary");
+    add_path_crate(&scratch.root, "stowaway");
+    let manifest = scratch.root.join("crates/waymaker-core/Cargo.toml");
+    let existing = std::fs::read_to_string(&manifest).expect("the kernel manifest should be read");
+    std::fs::write(
+        &manifest,
+        format!("{existing}\n[dependencies]\nstowaway = {{ path = \"../stowaway\" }}\n"),
+    )
+    .expect("the kernel manifest should be writable");
+    // No lockfile refresh: the gate must stop rather than re-resolve.
+
+    let output = run_xtask(&["check-layering"], &scratch.root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("xtask: "), "stderr: {stderr}");
+}
+
+#[test]
 fn the_binary_prints_usage_for_help() {
     let output = run_xtask(&["--help"], &workspace_root());
     assert!(output.status.success());

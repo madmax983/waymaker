@@ -69,30 +69,49 @@ behavior requires an idempotent activity or downstream deduplication of that ID.
 
 ## Development
 
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it
+up automatically.
+
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-cargo build --workspace --no-default-features
-cargo test --workspace
-cargo xtask check-layering
+cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+cargo build  --locked --workspace --no-default-features
+cargo test   --locked --workspace --no-default-features
+cargo --locked xtask check-layering
 ```
 
 `cargo xtask check-layering` is the layering contract from design document §05, turned into
 something that fails a pull request. It reads the resolved `cargo metadata` graph rather
 than the manifests, so a forbidden dependency cannot hide behind a target table, an
-optional feature, or one level of indirection. It fails if:
+optional feature, a rename, or one level of indirection. Its rules:
 
-- `waymaker-core` grows a dependency of any kind, including a dev- or build-dependency;
-- `waymaker-flash` reaches Embassy, directly or through another crate;
-- any firmware crate stops being `#![no_std]` or stops forbidding unsafe code;
-- any firmware crate gains a non-empty default feature or stops inheriting the workspace
-  lints;
-- the release profile or the workspace lint table drifts from the design document.
+| Rule | Fails when |
+| --- | --- |
+| `dependency-direction` | a firmware crate declares a dependency its layer does not allow |
+| `dependency-direction-transitive` | it reaches one through another crate; the report names the edge that admitted it |
+| `kernel-zero-dependencies` | `waymaker-core` declares any dependency, including a dev- or build-dependency |
+| `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
+| `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
+| `workspace-membership` | a workspace member is neither a layer nor declared host tooling |
+| `no-build-scripts` | a firmware crate has a `build.rs` |
+| `empty-default-features` | a firmware crate has a non-empty `default` feature |
+| `crate-attributes` | a crate root drops `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std`/`alloc` |
+| `member-manifest` | a firmware crate stops inheriting the workspace lints |
+| `release-profile` | `[profile.release]` drifts from design document §04 |
+| `cargo-config-profile` | `.cargo/config.toml` declares a profile, which would silently override it |
+| `workspace-lints` | the lint table stops denying `unwrap_used`, or a lint group loses its negative priority |
+| `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 
-`xtask` is a host tool and is excluded from firmware-target builds by `default-members`;
-build the firmware crates for a target with
-`cargo build -p waymaker-core -p waymaker-flash -p waymaker-embassy --no-default-features
---target thumbv6m-none-eabi`.
+The contract lives in one table, [`xtask/src/policy.rs`](xtask/src/policy.rs), transcribed
+from the design document's "must not own" column. Adding a crate means adding a row.
+
+`xtask` is host tooling and is excluded from firmware-target builds by `default-members`;
+build the firmware crates for a target with:
+
+```sh
+cargo build -p waymaker-core -p waymaker-flash -p waymaker-embassy \
+  --no-default-features --target thumbv6m-none-eabi
+```
 
 ## License
 

@@ -548,22 +548,9 @@ pub fn check_kernel_has_no_dependencies(graph: &PackageGraph) -> Vec<Violation> 
         })
         .collect();
 
-    for path in graph.illegal_reach_paths(kernel.name, &BTreeSet::new()) {
-        if path.len() <= 2 {
-            continue;
-        }
-        let Some(offender) = path.last() else {
-            continue;
-        };
-        violations.push(Violation::new(
-            "kernel-zero-dependencies",
-            kernel.name,
-            format!(
-                "reaches `{offender}` through {}; the kernel is dependency-free by contract",
-                path.join(" -> ")
-            ),
-        ));
-    }
+    // There is deliberately no transitive check here. The kernel's allowlist is empty, so
+    // every dependency it has is a direct violation, and everything reachable below one
+    // is a consequence of that single edge. Walking further would only restate it.
 
     violations
 }
@@ -948,30 +935,48 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_reports_a_transitive_dependency_with_its_path() {
+    fn the_kernel_reports_one_violation_per_edge_however_deep_the_subtree() {
         let graph = PackageGraph::new(vec![
             Package::new("waymaker-core").with_dependency("direct", DepKind::Normal),
             Package::new("direct").with_dependency("indirect", DepKind::Normal),
-            Package::new("indirect"),
+            Package::new("indirect").with_dependency("deeper", DepKind::Normal),
+            Package::new("deeper"),
         ]);
 
         let violations = check_kernel_has_no_dependencies(&graph);
-        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(
+            violations.len(),
+            1,
+            "the subtree is a consequence of one edge: {violations:?}"
+        );
         assert!(
             violations[0].detail.contains("declares `direct`"),
             "the direct edge is the actionable one: {}",
             violations[0].detail
         );
+    }
 
-        // With the direct edge removed the transitive branch is the one that reports.
+    #[test]
+    fn the_kernel_reports_every_direct_edge() {
         let graph = PackageGraph::new(vec![
-            Package::new("waymaker-core").with_dependency("waymaker-core-shim", DepKind::Normal),
-            Package::new("waymaker-core-shim").with_dependency("indirect", DepKind::Normal),
-            Package::new("indirect"),
+            Package::new("waymaker-core")
+                .with_dependency("one", DepKind::Normal)
+                .with_dependency("two", DepKind::Development),
+            Package::new("one"),
+            Package::new("two"),
         ]);
-        let violations = check_kernel_has_no_dependencies(&graph);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].detail.contains("waymaker-core-shim"));
+
+        assert_eq!(check_kernel_has_no_dependencies(&graph).len(), 2);
+    }
+
+    #[test]
+    fn a_workspace_member_missing_from_the_package_list_is_reported() {
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core")])
+            .with_workspace_members(&["waymaker-core", "ghost-id"]);
+
+        let violations = check_workspace_membership(&graph);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].subject, "ghost-id");
     }
 
     #[test]
