@@ -1,0 +1,9 @@
+# Pinned rather than floating. The workspace denies clippy's `pedantic` and `nursery`
+# groups and CI runs with `-D warnings`; `nursery` in particular gains lints every six
+# weeks, so a floating channel turns an unrelated pull request red for a lint nobody in
+# the change ever saw. Bump this deliberately, with the clippy fixes in the same commit.
+# Issue #9 adds `targets = ["thumbv6m-none-eabi"]` here.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

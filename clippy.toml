@@ -1,0 +1,6 @@
+# `unwrap_used` and `expect_used` are denied in the workspace lint table. Tests are the
+# documented exception: a panicking assertion in a test is the point of the test.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
