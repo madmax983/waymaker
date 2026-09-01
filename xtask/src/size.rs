@@ -984,20 +984,36 @@ impl RowDiff {
     }
 }
 
-/// Every row whose *cost* differs between `base` and `head`, plus the rows only one has.
+/// Every row whose *own cost* differs between `base` and `head`, plus the rows only one
+/// has.
 ///
-/// Compared on deltas against each report's own baseline rather than on absolute sizes.
-/// The two reports are built with the same toolchain in the same job today, so the two
-/// agree — but a rustc bump or a change to the panic handler moves every absolute number
-/// while changing nobody's incremental cost, and a diff that reported all of that as
-/// "changed" would be a diff people stop reading.
+/// Two choices here, and both are about what a reader should be able to conclude from a
+/// line in this table.
+///
+/// Costs rather than absolute sizes: the two reports are built with the same toolchain in
+/// the same job today, so the absolute numbers agree — but a rustc bump or a change to the
+/// panic handler moves every one of them while changing nobody's incremental cost, and a
+/// diff that reported all of that as "changed" is a diff people stop reading.
+///
+/// Each row against the base it declares, rather than every row against `baseline`: a
+/// feature row's cost is what the feature added, not what the feature added plus whatever
+/// the engine underneath it did. Diffing them all against `baseline` means a hundred bytes
+/// of engine growth is reported once as the engine's and again as every feature's, which
+/// contradicts the `measured_against` relationship the report itself prints and buries the
+/// one row that actually changed.
 #[must_use]
 pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
+    // `increment_of` is `None` for a row that is its own base — `baseline` — where the
+    // delta against itself is the honest answer.
+    let cost = |report: &SizeReport, name: &str| {
+        report.increment_of(name).or_else(|| report.delta_of(name))
+    };
+
     let mut diffs = Vec::new();
 
     for row in head.rows() {
-        let after = head.delta_of(&row.name);
-        let before = base.row(&row.name).and_then(|_| base.delta_of(&row.name));
+        let after = cost(head, &row.name);
+        let before = base.row(&row.name).and_then(|_| cost(base, &row.name));
         if before == after && before.is_some() {
             continue;
         }
@@ -1012,7 +1028,7 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
         if head.row(&row.name).is_none() {
             diffs.push(RowDiff {
                 name: row.name.clone(),
-                before: base.delta_of(&row.name),
+                before: cost(base, &row.name),
                 after: None,
             });
         }
@@ -2614,6 +2630,72 @@ mod tests {
         assert!(table.contains("+200"), "{table}");
         assert!(table.contains("waymaker-core/serde"), "{table}");
         assert!(table.contains("new"), "{table}");
+    }
+
+    #[test]
+    fn engine_growth_is_not_reported_again_as_every_features_growth() {
+        // A feature row's cost is what the feature added, not that plus whatever the engine
+        // underneath it did. Diffing every row against `baseline` reports one hundred bytes
+        // of engine growth once as the engine's and again as each feature's, which buries
+        // the row that actually changed.
+        let small = default_row(20, 0);
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                small.clone(),
+                feature_row("waymaker-core/serde", &small, 8),
+            ],
+            KernelState::measured(),
+        );
+
+        let grown = default_row(120, 0);
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                grown.clone(),
+                // The feature still costs the same 8 B on top of the engine.
+                feature_row("waymaker-core/serde", &grown, 8),
+            ],
+            KernelState::measured(),
+        );
+
+        let diffs = diff(&base, &head);
+        let names: Vec<&str> = diffs.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [DEFAULT_ROW],
+            "only the engine changed, so only the engine row should be reported"
+        );
+        assert_eq!(
+            diffs.first().and_then(RowDiff::flash_change),
+            Some(100),
+            "and it should be reported once, at its real size"
+        );
+    }
+
+    #[test]
+    fn a_feature_that_really_did_grow_is_still_reported() {
+        let default = default_row(20, 0);
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 8),
+            ],
+            KernelState::measured(),
+        );
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 40),
+            ],
+            KernelState::measured(),
+        );
+        let diffs = diff(&base, &head);
+        let names: Vec<&str> = diffs.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["waymaker-core/serde"]);
+        assert_eq!(diffs.first().and_then(RowDiff::flash_change), Some(32));
     }
 
     #[test]
