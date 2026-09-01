@@ -1,0 +1,1027 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="Waymaker: a firmware-first, no_std durable workflow engine for Rust.">
+  <title>Waymaker — no_std Durable Workflow Engine</title>
+  <style>
+    :root {
+      --ink: #16201d;
+      --muted: #5f6f69;
+      --faint: #82908b;
+      --line: #d8e0dc;
+      --line-strong: #bfcac5;
+      --paper: #fbfcfa;
+      --panel: #ffffff;
+      --wash: #f0f5f2;
+      --green: #176b4d;
+      --green-dark: #0f4e39;
+      --green-soft: #dceee5;
+      --amber: #b96b19;
+      --amber-soft: #fff0d8;
+      --red: #a33b36;
+      --red-soft: #fbe8e5;
+      --blue: #2d608c;
+      --blue-soft: #e7f0f8;
+      --code: #101a17;
+      --code-ink: #e5f0eb;
+      --shadow: 0 1px 2px rgba(20, 35, 29, .06), 0 8px 28px rgba(20, 35, 29, .04);
+      --serif: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 7% 3%, rgba(23, 107, 77, .06), transparent 23rem),
+        var(--paper);
+      font: 15px/1.65 var(--sans);
+      text-rendering: optimizeLegibility;
+    }
+
+    a { color: var(--green-dark); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    code, pre { font-family: var(--mono); }
+    code {
+      padding: .12em .34em;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--wash);
+      color: #29433a;
+      font-size: .9em;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 850px);
+      gap: 56px;
+      width: min(1180px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 32px 0 96px;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      padding-right: 8px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-bottom: 28px;
+      color: var(--ink);
+      text-decoration: none;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 37px;
+      height: 37px;
+      border-radius: 11px;
+      background: var(--green-dark);
+      box-shadow: var(--shadow);
+    }
+
+    .brand strong { display: block; font-size: 15px; letter-spacing: -.01em; }
+    .brand small { display: block; color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+
+    .toc-label {
+      margin: 0 0 8px 10px;
+      color: var(--faint);
+      font: 600 10px/1 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc a {
+      display: block;
+      padding: 6px 10px;
+      border-radius: 7px;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.3;
+      text-decoration: none;
+    }
+    .toc a:hover { color: var(--green-dark); background: var(--green-soft); }
+
+    .sidebar-note {
+      margin-top: 26px;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .72);
+      color: var(--muted);
+      font-size: 11.5px;
+      line-height: 1.55;
+    }
+
+    main { min-width: 0; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 38px 40px 34px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: linear-gradient(145deg, #ffffff 0%, #f2f7f4 100%);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -70px;
+      top: -105px;
+      width: 290px;
+      height: 290px;
+      border: 46px solid rgba(23, 107, 77, .055);
+      border-radius: 50%;
+    }
+
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-bottom: 22px;
+    }
+
+    .pill {
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.75);
+      color: var(--muted);
+      font: 600 10px/1.2 var(--mono);
+      letter-spacing: .03em;
+    }
+
+    h1, h2, h3, h4 { text-wrap: balance; }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 700px;
+      margin: 0;
+      font: 500 clamp(40px, 7vw, 64px)/.98 var(--serif);
+      letter-spacing: -.045em;
+    }
+
+    h1 span { color: var(--green); }
+    .dek {
+      position: relative;
+      z-index: 1;
+      max-width: 650px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font: 19px/1.5 var(--serif);
+    }
+
+    .invariant {
+      position: relative;
+      z-index: 1;
+      margin: 27px 0 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 9px 9px 0;
+      background: rgba(220, 238, 229, .72);
+      color: var(--green-dark);
+      font: 600 15px/1.5 var(--serif);
+    }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin: 16px 0 54px;
+    }
+
+    .fact {
+      padding: 14px 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--panel);
+    }
+    .fact dt { color: var(--faint); font: 600 9px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .fact dd { margin: 6px 0 0; font: 600 13px/1.35 var(--mono); }
+
+    section { scroll-margin-top: 28px; margin: 0 0 58px; }
+    section > h2 {
+      margin: 0 0 19px;
+      padding-bottom: 11px;
+      border-bottom: 1px solid var(--line);
+      font: 500 29px/1.15 var(--serif);
+      letter-spacing: -.025em;
+    }
+
+    section > h2 .n {
+      display: inline-block;
+      width: 28px;
+      color: var(--green);
+      font: 600 11px/1 var(--mono);
+      letter-spacing: .05em;
+      vertical-align: .45em;
+    }
+
+    h3 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; letter-spacing: -.01em; }
+    h4 { margin: 22px 0 8px; font-size: 14px; }
+    p { margin: 0 0 14px; }
+    strong { font-weight: 650; }
+
+    ul, ol { margin: 10px 0 16px; padding-left: 23px; }
+    li { margin: 5px 0; }
+    li::marker { color: var(--green); }
+
+    .lead { color: #394a44; font: 17px/1.65 var(--serif); }
+    .small { color: var(--muted); font-size: 12px; }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+
+    .card {
+      padding: 18px 19px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 1px 2px rgba(20,35,29,.025);
+    }
+    .card h3, .card h4 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+
+    .callout {
+      margin: 20px 0;
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    .callout strong { display: block; margin-bottom: 4px; }
+    .callout.green { border-left-color: var(--green); background: #f3f9f6; }
+    .callout.amber { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.red { border-left-color: var(--red); background: var(--red-soft); }
+    .callout.blue { border-left-color: var(--blue); background: var(--blue-soft); }
+
+    pre {
+      position: relative;
+      overflow-x: auto;
+      margin: 17px 0 20px;
+      padding: 18px 20px;
+      border: 1px solid #263b34;
+      border-radius: 12px;
+      background: var(--code);
+      color: var(--code-ink);
+      font-size: 12.5px;
+      line-height: 1.58;
+      tab-size: 4;
+      box-shadow: var(--shadow);
+    }
+    pre code { padding: 0; border: 0; background: transparent; color: inherit; font-size: inherit; }
+    .comment { color: #88a89a; }
+    .kw { color: #f1c27d; }
+    .ty { color: #8ccfc1; }
+    .str { color: #cce09c; }
+
+    table {
+      width: 100%;
+      margin: 18px 0 22px;
+      border-collapse: separate;
+      border-spacing: 0;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      overflow: hidden;
+      background: var(--panel);
+      font-size: 13px;
+    }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--wash); color: #374941; font: 650 11px/1.35 var(--mono); letter-spacing: .02em; }
+    tr:last-child td { border-bottom: 0; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr 24px 1fr 24px 1fr;
+      align-items: stretch;
+      margin: 20px 0;
+    }
+    .flow-step {
+      display: grid;
+      place-items: center;
+      min-height: 82px;
+      padding: 13px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: var(--panel);
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .flow-step b { display: block; color: var(--green-dark); font-family: var(--mono); font-size: 11px; }
+    .arrow { display: grid; place-items: center; color: var(--green); font-weight: 700; }
+
+    .protocol {
+      margin: 20px 0;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+    .protocol-row { display: grid; grid-template-columns: 46px 1fr 112px; border-bottom: 1px solid var(--line); }
+    .protocol-row:last-child { border-bottom: 0; }
+    .protocol-row > * { padding: 12px 14px; }
+    .protocol-num { display: grid; place-items: center; background: var(--wash); color: var(--green-dark); font: 700 12px var(--mono); }
+    .protocol-action b { display: block; font-size: 13px; }
+    .protocol-action span { color: var(--muted); font-size: 12px; }
+    .protocol-state { display: grid; place-items: center; border-left: 1px solid var(--line); color: var(--faint); font: 600 10px var(--mono); text-transform: uppercase; text-align: center; }
+
+    .bank-wrap { display: grid; grid-template-columns: 1fr 46px 1fr; align-items: center; margin: 18px 0; }
+    .bank {
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .bank-title { padding: 10px 13px; background: var(--green-dark); color: white; font: 650 11px var(--mono); }
+    .bank-segment { padding: 9px 12px; border-top: 1px solid var(--line); color: var(--muted); font: 11px var(--mono); }
+    .bank-segment.seal { background: var(--green-soft); color: var(--green-dark); }
+    .bank-segment.tail { min-height: 78px; background: repeating-linear-gradient(135deg, #fff, #fff 8px, #f5f8f6 8px, #f5f8f6 16px); }
+    .swap { text-align: center; color: var(--green); font: 700 20px var(--mono); }
+
+    .status {
+      display: inline-block;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font: 650 9px/1.3 var(--mono);
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .status.now { background: var(--green-soft); color: var(--green-dark); }
+    .status.later { background: var(--blue-soft); color: var(--blue); }
+    .status.no { background: var(--wash); color: var(--muted); }
+
+    .decision-list { counter-reset: decision; margin: 0; padding: 0; list-style: none; }
+    .decision-list li {
+      counter-increment: decision;
+      display: grid;
+      grid-template-columns: 32px 1fr;
+      gap: 11px;
+      margin: 0;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .decision-list li:last-child { border-bottom: 0; }
+    .decision-list li::before {
+      content: counter(decision, decimal-leading-zero);
+      color: var(--green);
+      font: 700 10px/1.7 var(--mono);
+    }
+
+    .footer {
+      margin-top: 80px;
+      padding-top: 21px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    @media (max-width: 930px) {
+      .shell { display: block; width: min(850px, calc(100% - 32px)); padding-top: 16px; }
+      .sidebar { position: static; max-height: none; margin-bottom: 20px; padding: 0; }
+      .brand { margin-bottom: 12px; }
+      .toc-label, .toc, .sidebar-note { display: none; }
+      .facts { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 640px) {
+      .hero { padding: 28px 24px; border-radius: 16px; }
+      .facts, .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; gap: 7px; }
+      .arrow { transform: rotate(90deg); }
+      .bank-wrap { grid-template-columns: 1fr; gap: 10px; }
+      .swap { transform: rotate(90deg); }
+      .protocol-row { grid-template-columns: 40px 1fr; }
+      .protocol-state { display: none; }
+      th, td { padding: 9px; }
+    }
+
+    @media print {
+      @page { size: A4; margin: 16mm; }
+      body { background: white; font-size: 10.5pt; }
+      .shell { display: block; width: 100%; padding: 0; }
+      .sidebar { display: none; }
+      .hero, .card, table, pre, .bank { box-shadow: none; }
+      .hero { break-after: page; }
+      section { break-before: auto; }
+      h2, h3, table, pre, .callout, .bank-wrap { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Document navigation">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="23" height="23" viewBox="0 0 24 24" fill="none">
+            <path d="M5 19c0-6.4 2.8-9.2 8.5-9.2H19" stroke="#dceee5" stroke-width="2" stroke-linecap="round"/>
+            <path d="M14.8 5.3 19 9.8l-4.2 4.3" stroke="#dceee5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="5" cy="19" r="2" fill="#f1c27d"/>
+          </svg>
+        </span>
+        <span><strong>Waymaker</strong><small>Design document</small></span>
+      </a>
+
+      <p class="toc-label">Contents</p>
+      <ol class="toc">
+        <li><a href="#summary">1. Summary</a></li>
+        <li><a href="#decisions">2. Settled decisions</a></li>
+        <li><a href="#scope">3. Goals &amp; non-goals</a></li>
+        <li><a href="#budgets">4. Resource budgets</a></li>
+        <li><a href="#architecture">5. Architecture</a></li>
+        <li><a href="#workflow">6. Workflow model</a></li>
+        <li><a href="#effects">7. Durable effects</a></li>
+        <li><a href="#replay">8. Replay &amp; determinism</a></li>
+        <li><a href="#journal">9. Journal format</a></li>
+        <li><a href="#banks">10. Two-bank lifecycle</a></li>
+        <li><a href="#time">11. Time &amp; timers</a></li>
+        <li><a href="#storage">12. Storage interface</a></li>
+        <li><a href="#api">13. API sketch</a></li>
+        <li><a href="#failure">14. Failure semantics</a></li>
+        <li><a href="#testing">15. Verification</a></li>
+        <li><a href="#roadmap">16. Roadmap</a></li>
+      </ol>
+
+      <div class="sidebar-note">
+        <strong>Draft v0.2</strong><br>
+        Firmware-first rewrite<br>
+        1 September 2026
+      </div>
+    </aside>
+
+    <main id="top">
+      <header class="hero">
+        <div class="eyebrow">
+          <span class="pill">#![no_std]</span>
+          <span class="pill">no_alloc kernel</span>
+          <span class="pill">Cortex-M0+</span>
+          <span class="pill">Embassy façade</span>
+        </div>
+        <h1>Waymaker: <span>durable workflows for firmware</span></h1>
+        <p class="dek">A tiny Rust record-and-replay engine that lets deterministic workflows survive brownouts, watchdog resets, and power loss—without pretending an MCU is a server.</p>
+        <blockquote class="invariant">The machine may die. The workflow does not get to pretend the committed past did not happen.</blockquote>
+      </header>
+
+      <dl class="facts">
+        <div class="fact"><dt>Kernel</dt><dd>zero dependencies</dd></div>
+        <div class="fact"><dt>RAM goal</dt><dd>&lt; 1 KiB runtime</dd></div>
+        <div class="fact"><dt>Persistence</dt><dd>two flash banks</dd></div>
+        <div class="fact"><dt>Effects</dt><dd>intent before I/O</dd></div>
+      </dl>
+
+      <section id="summary">
+        <h2><span class="n">01</span> Summary</h2>
+        <p class="lead">Waymaker is a firmware-first durable workflow engine for Rust. A workflow is re-created from its beginning after reboot and deterministically replayed through an ordered journal. Completed effects return their recorded results; the first unresolved effect becomes the next piece of work.</p>
+
+        <p>The semantic kernel does not persist Rust stacks, futures, heap graphs, or executor state. It persists only a compact history of effect boundaries and outcomes. An optional Embassy adapter turns those boundaries into familiar <code>ctx.activity(...).await</code> and timer APIs.</p>
+
+        <div class="callout green">
+          <strong>Design center</strong>
+          Waymaker does not make arbitrary Rust futures durable. It makes the observable path through a deterministic workflow durable.
+        </div>
+
+        <div class="grid-3">
+          <div class="card"><h3>Streaming replay</h3><p>History is consumed sequentially from flash with one caller-owned scratch page. No in-RAM journal or index is required.</p></div>
+          <div class="card"><h3>Durable outbox</h3><p>Effect intent is committed before physical execution. Results are committed before the workflow may observe them.</p></div>
+          <div class="card"><h3>Bounded by design</h3><p>Payloads, history, buffers, identifiers, and retries all have explicit limits and explicit exhaustion behavior.</p></div>
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2><span class="n">02</span> Settled design decisions</h2>
+        <ol class="decision-list">
+          <li><div><strong>The kernel is <code>no_std</code>, <code>no_alloc</code>, and dependency-free.</strong> Serialization, logging, executors, and hardware drivers live above it.</div></li>
+          <li><div><strong>Replay is sequential.</strong> A cursor advances through history in workflow order; the engine never requires <code>Journal::get(id)</code> or an in-memory event index.</div></li>
+          <li><div><strong>Physical effects happen only after durable intent.</strong> The schedule record crosses a durability barrier before dispatch.</div></li>
+          <li><div><strong>History records use numeric kinds and borrowed bytes.</strong> Strings, <code>Vec</code>, Serde, and Postcard are optional user-facing conveniences, not wire-format requirements.</div></li>
+          <li><div><strong>Normal async syntax is an adapter.</strong> <code>waymaker-embassy</code> supplies the ergonomic façade; the persistence protocol does not depend on Embassy or <code>Future</code>.</div></li>
+          <li><div><strong>Arbitrary suspended futures are not snapshotted.</strong> Bounded-history reclamation occurs at an explicit <code>continue_as_new</code> boundary.</div></li>
+          <li><div><strong>Two flash banks provide atomic run replacement.</strong> A new run becomes authoritative only after its payload and generation seal are durable.</div></li>
+          <li><div><strong>Durable timers require durable time.</strong> A resettable monotonic clock cannot claim that time elapsed while power was absent.</div></li>
+        </ol>
+      </section>
+
+      <section id="scope">
+        <h2><span class="n">03</span> Goals and non-goals</h2>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Goals</h3>
+            <ul>
+              <li>Run on Cortex-M0+ class devices.</li>
+              <li>Require no heap in the runtime.</li>
+              <li>Recover to a legal committed history prefix after power loss at any write boundary.</li>
+              <li>Offer deterministic activity, timer, completion, and failure boundaries.</li>
+              <li>Integrate cleanly with Embassy without replacing its executor.</li>
+              <li>Make RAM, code flash, data flash, and write amplification measurable.</li>
+              <li>Permit hardware-specific storage beneath a narrow protocol.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Non-goals for v0.x</h3>
+            <ul>
+              <li>Persist arbitrary stacks or suspended futures.</li>
+              <li>Exactly-once physical side effects.</li>
+              <li>SQLite, filesystems, networking, or host databases in the firmware runtime.</li>
+              <li>Distributed consensus or multi-writer histories.</li>
+              <li>Dynamic workflow loading or string-addressed activity registries.</li>
+              <li>Unbounded payloads, histories, mailboxes, or retry queues.</li>
+              <li>Compatibility with Temporal's wire protocols or server APIs.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="budgets">
+        <h2><span class="n">04</span> Resource budgets</h2>
+        <p class="lead">“Small” must be enforced as four independent budgets. A tiny context does not compensate for a large generated future; a tiny binary does not compensate for wasteful flash records.</p>
+
+        <table>
+          <thead><tr><th>Budget</th><th>v0.1 target</th><th>Accounting rule</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Runtime RAM</strong></td><td>&le; 768 B with a 512 B scratch page</td><td>Cursor, context, record header, and storage scratch. Excludes user workflow future and hardware-driver buffers.</td></tr>
+            <tr><td><strong>Kernel state</strong></td><td>&le; 128 B</td><td><code>waymaker-core</code> state only; no page buffer.</td></tr>
+            <tr><td><strong>Incremental code flash</strong></td><td>&le; 8 KiB core + flash adapter</td><td>Measured on <code>thumbv6m-none-eabi</code> with release-size settings. This is a gate, not an unverified claim.</td></tr>
+            <tr><td><strong>Persistent flash</strong></td><td>Two erase blocks minimum</td><td>Typically 2 &times; 4 KiB, but entirely geometry-dependent.</td></tr>
+            <tr><td><strong>Effect payload</strong></td><td>Compile-time/application bound</td><td>Large data crosses workflow boundaries as durable handles, not copied byte vectors.</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout amber">
+          <strong>The workflow future is user memory</strong>
+          Rust futures contain every local that survives an <code>.await</code>. Waymaker reports future size separately and examples use handles such as <code>ImageSlot</code>, never an entire firmware image held across effect boundaries.
+        </div>
+
+        <pre><code>[profile.release]
+opt-level = <span class="str">"z"</span>
+lto = <span class="str">"fat"</span>
+codegen-units = 1
+panic = <span class="str">"abort"</span>
+strip = <span class="str">"symbols"</span></code></pre>
+
+        <p>CI records section sizes for every feature combination. Default features remain empty; adding Serde, Postcard, <code>defmt</code>, Embassy, or a CRC implementation must show its own incremental cost.</p>
+      </section>
+
+      <section id="architecture">
+        <h2><span class="n">05</span> Architecture</h2>
+        <p>The runtime begins as three crates with strict dependency direction. A procedural macro may be added later for diagnostics and version metadata, but it is not required to prove the protocol.</p>
+
+        <div class="flow" aria-label="Waymaker crate dependency flow">
+          <div class="flow-step"><span><b>waymaker-core</b>records · cursor<br>state machine · IDs</span></div>
+          <div class="arrow">&larr;</div>
+          <div class="flow-step"><span><b>waymaker-flash</b>two banks · seals<br>erase/program/barrier</span></div>
+          <div class="arrow">&larr;</div>
+          <div class="flow-step"><span><b>waymaker-embassy</b>async façade · wakeups<br>clock · dispatcher</span></div>
+        </div>
+
+        <table>
+          <thead><tr><th>Crate</th><th>Owns</th><th>Must not own</th></tr></thead>
+          <tbody>
+            <tr><td><code>waymaker-core</code></td><td>Borrowed record views, effect identity, replay cursor, transition rules, capacity errors.</td><td>Allocation, serialization framework, CRC, clock, storage driver, executor, logging.</td></tr>
+            <tr><td><code>waymaker-flash</code></td><td>Stable wire encoding, CRC/seals, bank selection, append scanning, compaction transition.</td><td>Activities, workflow types, timers, Embassy.</td></tr>
+            <tr><td><code>waymaker-embassy</code></td><td><code>Ctx</code>, activity futures, dispatcher, wakeups, optional typed codec helpers.</td><td>On-media authority or hidden global state.</td></tr>
+          </tbody>
+        </table>
+
+        <p>A host or browser adapter can be written later against the same semantic kernel. It must not expand the firmware traits to accommodate host conveniences.</p>
+      </section>
+
+      <section id="workflow">
+        <h2><span class="n">06</span> Workflow model</h2>
+        <p class="lead">A workflow is a deterministic function from recorded input and recorded effect results to the next effect request or terminal outcome.</p>
+
+        <pre><code><span class="kw">pub async fn</span> <span class="ty">ota_update</span>(
+    ctx: &amp;<span class="kw">mut</span> Ctx&lt;'_&gt;,
+    input: OtaInput,
+) -&gt; Result&lt;(), OtaError&gt; {
+    <span class="comment">// Small durable value: a handle, not the image bytes.</span>
+    <span class="kw">let</span> image: ImageSlot = ctx
+        .activity(ActivityKind::DOWNLOAD, input.url_bytes())
+        .await?;
+
+    ctx.activity(ActivityKind::VERIFY_SIGNATURE, image.as_bytes()).await?;
+    ctx.activity(ActivityKind::FLASH_IMAGE, image.as_bytes()).await?;
+
+    ctx.complete(&amp;[]).await
+}</code></pre>
+
+        <h3>Cold-start replay</h3>
+        <ol>
+          <li>Recover the active bank and its committed record prefix.</li>
+          <li>Decode the run input into caller-owned storage.</li>
+          <li>Create a fresh workflow future and replay cursor.</li>
+          <li>Poll the workflow from its beginning.</li>
+          <li>Each effect consumes the matching history records or identifies the first unresolved effect.</li>
+          <li>Stop at pending work or a terminal record.</li>
+        </ol>
+
+        <p>The future itself is disposable. Recreating it is the recovery mechanism. Within one boot, the Embassy adapter may retain and poll it normally; after reset, replay reconstructs its observable state.</p>
+
+        <h3>Explicit kernel boundary</h3>
+        <pre><code><span class="kw">pub enum</span> Resolve&lt;'a&gt; {
+    <span class="comment">// Completion already exists in committed history.</span>
+    Replayed { result: &amp;'a [u8] },
+
+    <span class="comment">// Intent is committed; dispatch or redeliver using this stable ID.</span>
+    Dispatch { id: EffectId },
+
+    <span class="comment">// Waiting for a completion or external wakeup.</span>
+    Pending { id: EffectId },
+}
+
+<span class="kw">pub struct</span> EffectRequest&lt;'a&gt; {
+    <span class="kw">pub</span> kind: ActivityKind,
+    <span class="kw">pub</span> input: &amp;'a [u8],
+}</code></pre>
+      </section>
+
+      <section id="effects">
+        <h2><span class="n">07</span> Durable effect protocol</h2>
+        <p>The first execution of an activity is an ordered protocol. Each committed record uses two barriers: a payload barrier prevents the seal from becoming durable ahead of its frame, and a commit barrier proves the seal itself is durable before the next irreversible action.</p>
+
+        <div class="protocol">
+          <div class="protocol-row"><div class="protocol-num">1</div><div class="protocol-action"><b>Write schedule frame</b><span>Effect sequence, activity kind, input length/digest, and policy metadata—but not its commit seal.</span></div><div class="protocol-state">not dispatchable</div></div>
+          <div class="protocol-row"><div class="protocol-num">2</div><div class="protocol-action"><b>Payload barrier</b><span>The complete frame body must precede any durable seal.</span></div><div class="protocol-state">uncommitted intent</div></div>
+          <div class="protocol-row"><div class="protocol-num">3</div><div class="protocol-action"><b>Write schedule seal, then barrier</b><span>The committed schedule must now survive reset.</span></div><div class="protocol-state">durable intent</div></div>
+          <div class="protocol-row"><div class="protocol-num">4</div><div class="protocol-action"><b>Dispatch physical activity</b><span>The dispatcher receives stable <code>(RunId, EffectSeq)</code> for deduplication. Replay reconstructs input and verifies its recorded digest.</span></div><div class="protocol-state">at least once</div></div>
+          <div class="protocol-row"><div class="protocol-num">5</div><div class="protocol-action"><b>Write outcome frame</b><span><code>EffectCompleted</code> or <code>EffectFailed</code> with bounded result bytes—but not its commit seal.</span></div><div class="protocol-state">not observable</div></div>
+          <div class="protocol-row"><div class="protocol-num">6</div><div class="protocol-action"><b>Payload barrier</b><span>The complete outcome frame must precede its durable seal.</span></div><div class="protocol-state">uncommitted result</div></div>
+          <div class="protocol-row"><div class="protocol-num">7</div><div class="protocol-action"><b>Write outcome seal, then barrier</b><span>The workflow may observe the result only after this barrier returns.</span></div><div class="protocol-state">replayable result</div></div>
+        </div>
+
+        <div class="callout red">
+          <strong>No exactly-once physical promise</strong>
+          Power can fail after the activity changes the world but before its completion is committed. Waymaker will redeliver the same stable effect ID. Exactly-once behavior requires an idempotent activity or a downstream system that deduplicates that ID.
+        </div>
+
+        <h3>Compact effect identity</h3>
+        <pre><code><span class="kw">pub struct</span> RunId(<span class="kw">pub</span> u64);
+<span class="kw">pub struct</span> EffectSeq(<span class="kw">pub</span> u32);
+
+<span class="comment">// Unique on a device when combined; only EffectSeq is repeated
+// in every record because RunId lives in the bank header.</span>
+<span class="kw">pub struct</span> EffectId {
+    <span class="kw">pub</span> run: RunId,
+    <span class="kw">pub</span> seq: EffectSeq,
+}</code></pre>
+
+        <p>Effect sequences never reset within a run. Wraparound is a terminal <code>IdExhausted</code> condition, not silent reuse.</p>
+      </section>
+
+      <section id="replay">
+        <h2><span class="n">08</span> Replay and determinism</h2>
+        <p>Waymaker consumes history in the same order the workflow encounters effect boundaries. That makes replay constant-memory and avoids random reads or lookup tables.</p>
+
+        <table>
+          <thead><tr><th>Next history state</th><th>Workflow call</th><th>Engine action</th></tr></thead>
+          <tbody>
+            <tr><td>Matching schedule + completion</td><td>Same effect kind and input digest</td><td>Return the recorded result and advance the cursor.</td></tr>
+            <tr><td>Matching schedule only</td><td>Same effect kind and input digest</td><td>Redeliver using the existing effect ID.</td></tr>
+            <tr><td>End of history</td><td>New effect call</td><td>Append and commit a schedule record, then dispatch.</td></tr>
+            <tr><td>Different kind, digest, or sequence</td><td>Replay divergence</td><td>Stop with <code>NondeterministicWorkflow</code>; never guess.</td></tr>
+            <tr><td>Terminal workflow record</td><td>Further execution</td><td>Return stored completion/failure without polling further.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Determinism is a contract</h3>
+        <p>Workflow code must not read hardware registers, ambient time, randomness, mutable statics, network state, or nondeterministic iteration order directly. Those values enter through recorded effects. The type system cannot prove this property for arbitrary Rust; Waymaker detects divergence at effect boundaries and later tooling may lint suspicious APIs.</p>
+
+        <h3>Workflow versioning</h3>
+        <p>Every run pins a <code>workflow_kind</code>, <code>workflow_version</code>, and input schema in its bank header. v0.1 deliberately chooses the smallest safe upgrade rule:</p>
+        <ul>
+          <li>Existing runs must continue under compatible code for their recorded version.</li>
+          <li>A firmware image that cannot replay the recorded version returns <code>IncompatibleWorkflow</code>.</li>
+          <li>Code changes that add, remove, or reorder effects require a new version or an explicit recorded version gate.</li>
+          <li>Source-location hashes are not stable identity; call-order sequencing remains authoritative.</li>
+        </ul>
+      </section>
+
+      <section id="journal">
+        <h2><span class="n">09</span> Journal and wire format</h2>
+        <p>The wire format is handwritten, fixed-endian, self-delimiting, and independent of Rust layout. User payload bytes are opaque to the kernel.</p>
+
+        <pre><code>RecordFrame
+  magic          u16 LE
+  format_version u8
+  record_kind    u8
+  effect_seq     u32 LE
+  payload_len    u16 LE
+  header_crc     u16 LE
+  payload        [payload_len]
+  payload_crc    u32 LE
+  commit_seal    storage-program unit</code></pre>
+
+        <p>The exact header size may change during implementation, but these properties may not:</p>
+        <ul>
+          <li>All lengths are validated against caller buffers and bank bounds before reading.</li>
+          <li>Unknown record kinds are skippable only when the format version permits forward compatibility.</li>
+          <li>A payload barrier completes before the commit seal is programmed; a second barrier makes that seal durable.</li>
+          <li>Recovery stops at the first unsealed, malformed, out-of-sequence, or integrity-failed frame.</li>
+          <li>CRC detects accidental corruption and torn writes; it is not authentication.</li>
+          <li>Records are padded to the device's program alignment without interpreting stale tail bytes.</li>
+        </ul>
+
+        <h3>Initial record vocabulary</h3>
+        <table>
+          <thead><tr><th>Record</th><th>Purpose</th><th>v0.1</th></tr></thead>
+          <tbody>
+            <tr><td><code>RunStarted</code></td><td>Workflow identity, version, bounded input.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>EffectScheduled</code></td><td>Durable intent and stable effect sequence.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>EffectCompleted</code></td><td>Bounded result bytes returned during replay.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>EffectFailed</code></td><td>Typed/bounded failure payload.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>TimerScheduled</code></td><td>Clock capability and deadline semantics.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>TimerFired</code></td><td>Recorded timer completion.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>RunCompleted</code></td><td>Terminal success and bounded result.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>RunFailed</code></td><td>Terminal workflow failure.</td><td><span class="status now">required</span></td></tr>
+            <tr><td><code>VersionMarker</code></td><td>Recorded upgrade branch.</td><td><span class="status later">v0.2</span></td></tr>
+            <tr><td><code>SignalReceived</code></td><td>Bounded external activation.</td><td><span class="status later">later</span></td></tr>
+            <tr><td><code>ChildStarted</code></td><td>Child-workflow composition.</td><td><span class="status no">not v0.x</span></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="banks">
+        <h2><span class="n">10</span> Two-bank lifecycle</h2>
+        <p>Waymaker owns two fixed storage banks, usually one erase block each. The bank with the highest valid generation seal is authoritative. Its journal is then scanned to the last valid committed record.</p>
+
+        <div class="bank-wrap" aria-label="Two-bank journal layout">
+          <div class="bank">
+            <div class="bank-title">BANK A · generation 41 · active</div>
+            <div class="bank-segment">header + RunStarted input</div>
+            <div class="bank-segment seal">bank generation seal</div>
+            <div class="bank-segment tail">committed effect records<br>append &rarr;</div>
+          </div>
+          <div class="swap">&#8644;</div>
+          <div class="bank">
+            <div class="bank-title" style="background:#77847f">BANK B · inactive</div>
+            <div class="bank-segment">erased / previous generation</div>
+            <div class="bank-segment seal" style="background:#f0f5f2;color:#6f7e78">no newer valid seal</div>
+            <div class="bank-segment tail">available for continue-as-new</div>
+          </div>
+        </div>
+
+        <h3><code>continue_as_new</code></h3>
+        <p>A normal async workflow cannot serialize its hidden suspension state. Waymaker therefore does not disguise storage maintenance as a magical snapshot. The workflow explicitly supplies the bounded input for its next run.</p>
+
+        <ol>
+          <li>Stop accepting new effects for the current run.</li>
+          <li>Erase the inactive bank.</li>
+          <li>Write the new bank header, new <code>RunId</code>, workflow version, and next-run input.</li>
+          <li>Barrier: the new bank payload becomes durable.</li>
+          <li>Write the higher-generation bank seal.</li>
+          <li>Barrier: the new bank becomes authoritative.</li>
+          <li>Return success to the workflow adapter and lazily erase the old bank.</li>
+        </ol>
+
+        <p>A crash before step 5 recovers the old run. A crash after step 6 recovers the new run. Recovery never combines their footprints.</p>
+
+        <div class="callout blue">
+          <strong>Capacity is explicit</strong>
+          Waymaker reserves enough tail space for a terminal record or <code>continue_as_new</code>. Ordinary effect scheduling fails early with <code>HistoryNearCapacity</code>; the runtime never overwrites committed history to make room.
+        </div>
+      </section>
+
+      <section id="time">
+        <h2><span class="n">11</span> Time and timers</h2>
+        <p>A monotonic MCU timer usually returns to zero after reset. It cannot reveal how long the device was unpowered. Waymaker therefore exposes timer semantics that match the hardware's actual clock capability.</p>
+
+        <pre><code><span class="kw">pub enum</span> TimerSpec {
+    <span class="comment">// Begins again after a reboot when no persistent time source exists.</span>
+    AfterBoot { ticks: u64 },
+
+    <span class="comment">// Survives power-off only with an RTC or externally restored epoch.</span>
+    AtPersistentTime { instant: u64 },
+}
+
+<span class="kw">pub trait</span> PersistentClock {
+    <span class="kw">type</span> Error;
+    <span class="kw">fn</span> now(&amp;<span class="kw">mut self</span>) -&gt; Result&lt;u64, <span class="ty">Self</span>::Error&gt;;
+}</code></pre>
+
+        <p>The Embassy adapter may also offer ordinary in-boot sleep, but documentation must not call it power-loss-durable. A persistent timer record includes its clock kind so recovery cannot silently reinterpret one policy as another.</p>
+      </section>
+
+      <section id="storage">
+        <h2><span class="n">12</span> Storage interface</h2>
+        <p>The flash adapter needs geometry and ordering, not a fake filesystem. It can adapt <code>embedded-storage</code> implementations without making that crate a kernel dependency.</p>
+
+        <pre><code><span class="kw">pub struct</span> Geometry {
+    <span class="kw">pub</span> capacity: u32,
+    <span class="kw">pub</span> erase_size: u32,
+    <span class="kw">pub</span> program_size: u16,
+    <span class="kw">pub</span> read_size: u16,
+}
+
+<span class="kw">pub trait</span> StableStorage {
+    <span class="kw">type</span> Error;
+
+    <span class="kw">fn</span> geometry(&amp;<span class="kw">self</span>) -&gt; Geometry;
+    <span class="kw">fn</span> read(&amp;<span class="kw">mut self</span>, offset: u32, dst: &amp;<span class="kw">mut</span> [u8]) -&gt; Result&lt;(), <span class="ty">Self</span>::Error&gt;;
+    <span class="kw">fn</span> program(&amp;<span class="kw">mut self</span>, offset: u32, src: &amp;[u8]) -&gt; Result&lt;(), <span class="ty">Self</span>::Error&gt;;
+    <span class="kw">fn</span> erase(&amp;<span class="kw">mut self</span>, offset: u32, len: u32) -&gt; Result&lt;(), <span class="ty">Self</span>::Error&gt;;
+    <span class="kw">fn</span> barrier(&amp;<span class="kw">mut self</span>) -&gt; Result&lt;(), <span class="ty">Self</span>::Error&gt;;
+}</code></pre>
+
+        <h3>Required storage contract</h3>
+        <ul>
+          <li><code>program</code> and <code>erase</code> may fail or be interrupted at any supported unit.</li>
+          <li>After <code>barrier</code> returns, all earlier successful mutations survive reset.</li>
+          <li>No later mutation may become durable before mutations ordered by a completed barrier.</li>
+          <li>The adapter validates erase/program alignment before touching media.</li>
+          <li>Flash-specific one-way bit programming rules remain the driver's responsibility.</li>
+        </ul>
+
+        <p>Disabling interrupts is not part of the durability proof. A blocking internal-flash implementation may need to do so for hardware reasons, but the protocol is expressed entirely in durable ordering and recoverable bytes.</p>
+      </section>
+
+      <section id="api">
+        <h2><span class="n">13</span> API sketch</h2>
+        <h3>Borrowed kernel records</h3>
+        <pre><code><span class="kw">pub enum</span> RecordRef&lt;'a&gt; {
+    RunStarted {
+        workflow_kind: u16,
+        workflow_version: u16,
+        input: &amp;'a [u8],
+    },
+    EffectScheduled {
+        seq: EffectSeq,
+        kind: ActivityKind,
+        input_len: u16,
+        input_crc: u32,
+    },
+    EffectCompleted {
+        seq: EffectSeq,
+        result: &amp;'a [u8],
+    },
+    EffectFailed {
+        seq: EffectSeq,
+        error: &amp;'a [u8],
+    },
+    RunCompleted { result: &amp;'a [u8] },
+    RunFailed { error: &amp;'a [u8] },
+}</code></pre>
+
+        <h3>Embassy-facing façade</h3>
+        <pre><code><span class="kw">impl</span>&lt;'a, D, J&gt; Ctx&lt;'a, D, J&gt;
+<span class="kw">where</span>
+    D: ActivityDispatcher,
+    J: Journal,
+{
+    <span class="kw">pub fn</span> activity&lt;'b, T: Decode&gt;(
+        &amp;'b <span class="kw">mut self</span>,
+        kind: ActivityKind,
+        input: &amp;'b [u8],
+    ) -&gt; ActivityFuture&lt;'b, T, D, J&gt;;
+
+    <span class="kw">pub fn</span> timer&lt;'b&gt;(
+        &amp;'b <span class="kw">mut self</span>,
+        spec: TimerSpec,
+    ) -&gt; TimerFuture&lt;'b, D, J&gt;;
+
+    <span class="kw">pub fn</span> continue_as_new&lt;'b&gt;(
+        &amp;'b <span class="kw">mut self</span>,
+        input: &amp;'b [u8],
+    ) -&gt; ContinueFuture&lt;'b, J&gt;;
+}</code></pre>
+
+        <p><code>Decode</code> is a tiny adapter trait operating over borrowed bytes and caller-owned output. A Postcard/Serde implementation is optional; the core does not require a particular codec.</p>
+
+        <h3>Activity dispatcher</h3>
+        <pre><code><span class="kw">pub trait</span> ActivityDispatcher {
+    <span class="kw">type</span> Error;
+
+    <span class="kw">async fn</span> dispatch(
+        &amp;<span class="kw">mut self</span>,
+        id: EffectId,
+        kind: ActivityKind,
+        input: &amp;[u8],
+        output: &amp;<span class="kw">mut</span> [u8],
+    ) -&gt; Result&lt;usize, <span class="ty">Self</span>::Error&gt;;
+}</code></pre>
+
+        <p>Activity names are compile-time metadata for logs and diagnostics. The runtime dispatch path uses numeric kinds and does not store names in every record.</p>
+      </section>
+
+      <section id="failure">
+        <h2><span class="n">14</span> Failure semantics</h2>
+        <table>
+          <thead><tr><th>Failure point</th><th>Recovery result</th><th>Required behavior</th></tr></thead>
+          <tbody>
+            <tr><td>During schedule frame write</td><td>Frame ignored; previous history prefix wins.</td><td>The activity was not yet dispatchable.</td></tr>
+            <tr><td>After schedule barrier, before dispatch</td><td>Schedule recovered without completion.</td><td>Redeliver the stable effect ID.</td></tr>
+            <tr><td>During physical activity</td><td>Schedule recovered without completion.</td><td>Redeliver; activity must tolerate duplicate attempt.</td></tr>
+            <tr><td>After physical activity, before completion barrier</td><td>Schedule may be the last durable record.</td><td>Redeliver with the same ID; downstream deduplication may suppress repetition.</td></tr>
+            <tr><td>During completion write</td><td>Torn completion ignored.</td><td>Redeliver; never expose partial result bytes.</td></tr>
+            <tr><td>After completion barrier</td><td>Completion must be replayed.</td><td>Never execute the completed activity again.</td></tr>
+            <tr><td>During inactive-bank erase/write</td><td>Old bank remains authoritative.</td><td>Continue the old run.</td></tr>
+            <tr><td>After new bank seal barrier</td><td>New bank is authoritative.</td><td>Never recover the old run as current.</td></tr>
+            <tr><td>History capacity reached</td><td>No mutation.</td><td>Return a capacity error or perform explicit continue-as-new.</td></tr>
+            <tr><td>Replay divergence</td><td>No further execution.</td><td>Return a deterministic fault; never reinterpret history.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Guarantees</h3>
+        <ul>
+          <li><strong>Prefix safety:</strong> recovery exposes only a legal prefix of committed records.</li>
+          <li><strong>Acknowledged durability:</strong> any record acknowledged after its barrier is recovered after reset.</li>
+          <li><strong>Durable intent:</strong> no Waymaker-dispatched effect lacks a recoverable schedule record.</li>
+          <li><strong>Stable redelivery:</strong> retries and reboot redelivery reuse the original effect identity.</li>
+          <li><strong>Bounded decoding:</strong> malformed storage cannot cause out-of-bounds reads or allocation.</li>
+        </ul>
+      </section>
+
+      <section id="testing">
+        <h2><span class="n">15</span> Testing and verification</h2>
+        <p>The persistence protocol is small enough to test exhaustively at its real semantic boundaries. Crash testing is part of the design, not a post-MVP hardening phase.</p>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>Model and property tests</h3>
+            <ul>
+              <li>Random record sequences and storage geometries.</li>
+              <li>Torn writes at every byte/program unit.</li>
+              <li>Power loss before and after every barrier.</li>
+              <li>CRC corruption, stale tails, and malformed lengths.</li>
+              <li>Sequence wrap and capacity boundaries.</li>
+              <li>Bank generation selection under partial swaps.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Firmware gates</h3>
+            <ul>
+              <li>Build on <code>thumbv6m-none-eabi</code> with no default features.</li>
+              <li>Link example firmware and record section deltas.</li>
+              <li>Measure generated workflow future sizes.</li>
+              <li>Run hardware power-cut loops against real NOR flash.</li>
+              <li>Track erase counts and per-effect write amplification.</li>
+              <li>Test watchdog resets during schedule, dispatch, and completion.</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>Core property oracle</h3>
+        <pre><code><span class="comment">// For every possible crash point:</span>
+recovered_history.is_prefix_of(committed_history)
+    &amp;&amp; acknowledged_records.all(|r| recovered_history.contains(r))
+    &amp;&amp; dispatched_effects.all(|e| recovered_history.has_schedule(e.id))
+    &amp;&amp; recovered_banks.count_authoritative() == 1</code></pre>
+
+        <p>The model distinguishes records that were merely attempted, records that may have become durable before acknowledgment, and records whose barrier returned. Recovery may include an unacknowledged complete record, but it may never lose an acknowledged one.</p>
+      </section>
+
+      <section id="roadmap">
+        <h2><span class="n">16</span> Implementation roadmap</h2>
+        <table>
+          <thead><tr><th>Rung</th><th>Deliverable</th><th>Exit criterion</th></tr></thead>
+          <tbody>
+            <tr><td><span class="status now">0.1 · protocol</span></td><td>Borrowed record codec, streaming recovery cursor, in-memory storage model, crash injector.</td><td>Exhaustive fault tests prove committed-prefix recovery.</td></tr>
+            <tr><td><span class="status now">0.2 · flash</span></td><td>Two-bank NOR adapter, record seals, barriers, capacity reserve, continue-as-new.</td><td>Power-cut tests pass on one Cortex-M0+ and one Cortex-M4 board.</td></tr>
+            <tr><td><span class="status later">0.3 · effects</span></td><td>Durable schedule/dispatch/complete protocol with stable IDs and bounded results.</td><td>No dispatch is observable without durable intent across all injected crashes.</td></tr>
+            <tr><td><span class="status later">0.4 · embassy</span></td><td>Async <code>Ctx</code>, activity dispatcher, in-boot timer, examples for provisioning and OTA.</td><td>Runtime RAM and code-flash budgets pass on <code>thumbv6m</code>.</td></tr>
+            <tr><td><span class="status later">0.5 · time</span></td><td>Persistent-clock capability and recorded timers.</td><td>RTC-backed timer survives total power loss with defined semantics.</td></tr>
+            <tr><td><span class="status no">1.0</span></td><td>Workflow version markers, stable wire format, book, hardware compatibility matrix.</td><td>Format frozen and migration policy documented.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Deferred questions</h3>
+        <ul>
+          <li>Whether the default integrity check is CRC32C or a smaller table-free CRC implementation.</li>
+          <li>Whether retry policy belongs in the Embassy façade or remains workflow code.</li>
+          <li>How much input metadata an <code>EffectScheduled</code> record stores beyond length and digest.</li>
+          <li>Whether a future explicit-state workflow API may support true storage snapshots.</li>
+          <li>How stable wire-format migration is performed after a deployed fleet outlives v1.</li>
+        </ul>
+
+        <div class="callout green">
+          <strong>North-star sentence</strong>
+          Waymaker is the smallest useful machine that can durably remember what a firmware workflow intended, what the outside world returned, and where deterministic execution must resume.
+        </div>
+      </section>
+
+      <footer class="footer">
+        <strong>Waymaker design document · Draft v0.2</strong><br>
+        Firmware-first rewrite. Fixed-size resources, explicit durability, and no promises the hardware cannot keep.
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
