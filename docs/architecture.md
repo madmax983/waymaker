@@ -1,6 +1,6 @@
 # Architecture
 
-Three diagrams, drawn from the design document. Each carries an HTML comment label that
+Four diagrams, drawn from the design document. Each carries an HTML comment label that
 `cargo xtask check-layering` reads, and each is checked against the table that owns the
 same facts — so a diagram cannot quietly fall behind the code it draws.
 
@@ -9,10 +9,14 @@ same facts — so a diagram cannot quietly fall behind the code it draws.
 | [Crate dependency flow](#crate-dependency-flow) | §05 Architecture | `xtask::policy::LAYERS` |
 | [Durable effect protocol](#durable-effect-protocol) | §07 Durable effect protocol | `xtask::docs::EFFECT_PROTOCOL_STEPS` |
 | [Two-bank swap](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::TWO_BANK_SWAP_STEPS` |
+| [The banks before and after](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::DIAGRAMS` |
 
-The check is a text scan, not a Mermaid implementation. It proves every crate, every
-permitted edge, and every protocol step the tables name appears in the right block. It does
-not prove the diagram renders, which is what the preview in a pull request is for.
+The check is a text scan, not a Mermaid implementation. It proves that every crate, every
+permitted edge and every protocol step the tables name appears in the right block, that a
+step listed twice is drawn twice, and that no edge contradicts the layering. It reads only
+what a reader sees: an indented fence, a fence quoted inside a longer one, and a Mermaid
+`%%` comment are all text rather than picture, and satisfy nothing. It does not prove the
+diagram renders, which is what the preview in a pull request is for.
 
 ## Crate dependency flow
 
@@ -24,9 +28,11 @@ drawn here.
 `waymaker-core` points at nothing at all: not at another layer, and not at a registry
 crate. Nothing points down into `waymaker-embassy`.
 
-`waymaker-size-probe` is in the picture because it is a real crate CI links on every push,
-but it is not a layer: it depends on all three at once so their linked size can be measured,
-and nothing depends on it. Its edges are dashed for that reason.
+`waymaker-size-probe` is in the picture because it is a real crate CI links on every pull
+request and on every push to `main`, but it is not a layer: it declares all three as
+*optional* dependencies, so that a variant linking none of them gives the baseline the
+code-flash budget is a delta against, and nothing depends on it. Its edges are dashed for
+that reason, and the gate ignores dashed edges — the contract is the solid ones.
 
 <!-- diagram: crate-dependency-flow -->
 
@@ -145,6 +151,8 @@ what makes the new bank authoritative, and it is written only once the payload i
 already durable.
 
 The banks themselves, before and after:
+
+<!-- diagram: two-bank-generations -->
 
 ```mermaid
 graph LR

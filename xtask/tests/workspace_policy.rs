@@ -406,7 +406,15 @@ fn run_stage(stage: &xtask::pipeline::Stage, directory: &Path) -> std::process::
         .split_whitespace()
         .skip(1) // the leading `cargo`
         .collect();
-    cargo()
+    let mut command = cargo();
+    // The workflow sets these in its job-level `env:` block, so CI runs every stage with
+    // them. `cargo doc` in particular reports a missing doc comment as a warning and exits
+    // zero without `RUSTDOCFLAGS`; a helper that left them out would run something weaker
+    // than the pipeline and still be called a stage.
+    for (key, value) in xtask::pipeline::REQUIRED_WORKFLOW_ENV {
+        command.env(key, value);
+    }
+    command
         .args(&arguments)
         .current_dir(directory)
         .output()
@@ -819,168 +827,32 @@ fn the_readme_lists_the_pipeline_the_stage_table_defines() {
 // stops warning `missing_docs`, and an undocumented public item each fail here.
 // ---------------------------------------------------------------------------------------
 
-/// Runs a pipeline stage with the workflow environment the table says it needs.
+/// The number of files in `docs/adr` that are numbered ADRs, the template included.
+fn count_adrs(root: &Path) -> usize {
+    std::fs::read_dir(root.join(xtask::docs::ADR_DIR))
+        .expect("the ADR directory should exist")
+        .filter_map(Result::ok)
+        .filter(|entry| xtask::docs::adr_number(&entry.file_name().to_string_lossy()).is_some())
+        .count()
+}
+
+/// Appends a link to `name` to the scratch record's index.
 ///
-/// `cargo doc` reports a missing doc comment as a warning and exits zero; what turns it
-/// into a failure is `RUSTDOCFLAGS`, which the workflow sets in its `env:` block. Read from
-/// [`xtask::pipeline::REQUIRED_WORKFLOW_ENV`] rather than retyped, so a test cannot prove
-/// something about an environment CI does not set.
-fn run_stage_with_workflow_env(
-    stage: &xtask::pipeline::Stage,
-    directory: &Path,
-) -> std::process::Output {
-    assert!(
-        stage.command.starts_with("cargo "),
-        "{} is not a cargo command, so this helper cannot run it",
-        stage.name
-    );
-    let arguments: Vec<&str> = stage.command.split_whitespace().skip(1).collect();
-    let mut command = cargo();
-    for (key, value) in xtask::pipeline::REQUIRED_WORKFLOW_ENV {
-        command.env(key, value);
-    }
-    command
-        .args(&arguments)
-        .current_dir(directory)
-        .output()
-        .expect("cargo should be runnable")
+/// A fixture that adds an ADR without indexing it trips `adr-index` as well as the rule it
+/// is about, which makes the assertion pass for a reason the test does not name.
+fn link_from_the_index(root: &Path, name: &str) {
+    let index = root.join(xtask::docs::ADR_DIR).join(xtask::docs::ADR_INDEX);
+    let existing = std::fs::read_to_string(&index).expect("the index should be read");
+    std::fs::write(&index, format!("{existing}\n- [scratch]({name})\n"))
+        .expect("the index should be writable");
 }
 
-fn read_doc(relative: &str) -> String {
-    let path = workspace_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{relative} should exist: {err}"))
-}
-
-#[test]
-fn claude_md_carries_every_must_not_own_row() {
-    // The design document's §05 "must not own" column is already a table in
-    // `policy::LAYERS`. CLAUDE.md quoting it is only useful if the quote is checked.
-    let claude = read_doc(xtask::docs::CLAUDE_MD_PATH);
-    for spec in xtask::policy::LAYERS {
-        assert!(
-            claude.contains(spec.name),
-            "CLAUDE.md does not mention {}",
-            spec.name
-        );
-        assert!(
-            claude.contains(spec.must_not_own),
-            "CLAUDE.md's must-not-own row for {} does not match policy::LAYERS",
-            spec.name
-        );
-    }
-}
-
-#[test]
-fn claude_md_names_every_invariant_the_gate_enforces() {
-    let claude = read_doc(xtask::docs::CLAUDE_MD_PATH);
-    for rule in xtask::RULES {
-        assert!(
-            claude.contains(rule),
-            "CLAUDE.md does not name the `{rule}` rule, so a contributor cannot tell what the gate will reject"
-        );
-    }
-}
-
-#[test]
-fn every_settled_decision_is_recorded_in_one_adr() {
-    // Issue #11: an ADR "recording the eight settled decisions from §02 of the design
-    // document". Each decision has a stable id so that CLAUDE.md, this ADR, and every
-    // later ADR can cite the same thing.
-    let adr = read_doc(&format!(
-        "{}/{}",
-        xtask::docs::ADR_DIR,
-        xtask::docs::SETTLED_DECISIONS_ADR
-    ));
-    assert_eq!(
-        xtask::docs::SETTLED_DECISIONS.len(),
-        8,
-        "design document §02 settles eight decisions"
-    );
-    for decision in xtask::docs::SETTLED_DECISIONS {
-        assert!(
-            adr.contains(decision.id),
-            "the settled-decisions ADR does not record `{}`",
-            decision.id
-        );
-        assert!(
-            adr.contains(decision.headline),
-            "the settled-decisions ADR does not carry the headline for `{}`",
-            decision.id
-        );
-    }
-}
-
-#[test]
-fn every_required_diagram_is_a_labelled_mermaid_block() {
-    let architecture = read_doc(xtask::docs::ARCHITECTURE_PATH);
-    let blocks = xtask::docs::mermaid_blocks(&architecture);
-    for spec in xtask::docs::DIAGRAMS {
-        let block = blocks
-            .iter()
-            .find(|block| block.id == spec.id)
-            .unwrap_or_else(|| panic!("no mermaid block labelled `{}`", spec.id));
-        for label in spec.required_labels {
-            assert!(
-                block.body.contains(label),
-                "the `{}` diagram does not show `{label}`",
-                spec.id
-            );
-        }
-    }
-}
-
-#[test]
-fn the_dependency_diagram_shows_every_edge_the_layering_allows() {
-    let architecture = read_doc(xtask::docs::ARCHITECTURE_PATH);
-    let blocks = xtask::docs::mermaid_blocks(&architecture);
-    let block = blocks
-        .iter()
-        .find(|block| block.id == xtask::docs::CRATE_DEPENDENCY_DIAGRAM)
-        .expect("the crate dependency diagram should exist");
-    for spec in xtask::policy::LAYERS {
-        for dependency in spec.may_depend_on {
-            assert!(
-                block
-                    .body
-                    .contains(&format!("{} --> {dependency}", spec.name)),
-                "the dependency diagram is missing the edge {} --> {dependency}",
-                spec.name
-            );
-        }
-    }
-}
-
-#[test]
-fn every_adr_is_linked_from_the_index() {
-    let index = read_doc(&format!(
-        "{}/{}",
-        xtask::docs::ADR_DIR,
-        xtask::docs::ADR_INDEX
-    ));
-    let directory = workspace_root().join(xtask::docs::ADR_DIR);
-    for entry in std::fs::read_dir(&directory).expect("the ADR directory should exist") {
-        let name = entry.expect("the entry should be readable").file_name();
-        let name = name.to_string_lossy().into_owned();
-        if name == xtask::docs::ADR_INDEX {
-            continue;
-        }
-        assert!(
-            index.contains(&name),
-            "docs/adr/{name} is not linked from the ADR index"
-        );
-    }
-}
-
-#[test]
-fn every_workspace_crate_root_warns_missing_docs() {
-    let violations =
-        xtask::check_workspace(&workspace_root()).expect("the workspace should be checkable");
-    let missing: Vec<&xtask::Violation> = violations
-        .iter()
-        .filter(|violation| violation.rule == "missing-docs")
-        .collect();
-    assert!(missing.is_empty(), "{missing:?}");
-}
+// The rules themselves are unit-tested in `xtask::docs` against documents that do not
+// exist. What is worth testing here is what those cannot reach: that the documents this
+// repository ships satisfy the rules — which `the_workspace_satisfies_its_own_layering_policy`
+// above already asserts for all 28 rules at once — and that the attribute the gate insists
+// on has teeth in a real build. Re-reading CLAUDE.md here and re-running each rule by hand
+// would be a second implementation of the rule, free to drift from the first.
 
 #[test]
 fn a_claude_md_that_drops_a_must_not_own_row_is_rejected() {
@@ -1003,16 +875,17 @@ fn a_claude_md_that_drops_a_must_not_own_row_is_rejected() {
 #[test]
 fn an_adr_without_a_status_is_rejected() {
     let scratch = scratch_workspace("adr-structure");
-    let next =
-        xtask::docs::ADR_NUMBER_START + u32::try_from(count_adrs(&scratch.root)).unwrap_or(0);
+    // The template occupies 0, so the count is the next free number: a fixture that left a
+    // gap would trip `adr-numbering` too, and the assertion would then pass for a reason
+    // the test does not name.
+    let next = u32::try_from(count_adrs(&scratch.root)).unwrap_or(0);
+    let name = format!("{next:04}-a-decision-with-no-status.md");
     std::fs::write(
-        scratch
-            .root
-            .join(xtask::docs::ADR_DIR)
-            .join(format!("{next:04}-a-decision-with-no-status.md")),
+        scratch.root.join(xtask::docs::ADR_DIR).join(&name),
         "# ADR: a decision with no status\n\n## Context\n\n## Decision\n\n## Consequences\n",
     )
     .expect("the ADR should be writable");
+    link_from_the_index(&scratch.root, &name);
 
     let output = run_xtask(&["check-layering"], &scratch.root);
     assert!(!output.status.success());
@@ -1039,15 +912,6 @@ fn a_gap_in_the_adr_numbering_is_rejected() {
     assert!(stderr.contains("adr-numbering"), "stderr: {stderr}");
 }
 
-/// How many numbered ADRs the record holds, the template included.
-fn count_adrs(root: &Path) -> usize {
-    std::fs::read_dir(root.join(xtask::docs::ADR_DIR))
-        .expect("the ADR directory should exist")
-        .filter_map(Result::ok)
-        .filter(|entry| xtask::docs::adr_number(&entry.file_name().to_string_lossy()).is_some())
-        .count()
-}
-
 #[test]
 fn a_crate_root_that_stops_warning_missing_docs_is_rejected() {
     let scratch = scratch_workspace("missing-docs-attr");
@@ -1065,7 +929,7 @@ fn a_crate_root_that_stops_warning_missing_docs_is_rejected() {
 #[test]
 fn the_docs_stage_is_clean_on_the_workspace_we_ship() {
     // Issue #11's first "done when": `missing_docs` is warned on *and clean*.
-    let output = run_stage_with_workflow_env(stage("docs"), &workspace_root());
+    let output = run_stage(stage("docs"), &workspace_root());
     assert!(
         output.status.success(),
         "the docs stage must pass on the workspace we ship: {}",
@@ -1084,7 +948,7 @@ fn an_undocumented_public_item_fails_the_docs_stage() {
     std::fs::write(&path, format!("{existing}\npub struct Undocumented;\n"))
         .expect("the crate root should be writable");
 
-    let output = run_stage_with_workflow_env(stage("docs"), &scratch.root);
+    let output = run_stage(stage("docs"), &scratch.root);
     assert!(
         !output.status.success(),
         "an undocumented public item must fail the docs stage"

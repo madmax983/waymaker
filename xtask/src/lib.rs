@@ -229,17 +229,38 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
 }
 
 /// Rule: a firmware crate present in the graph contributed both a manifest and a crate
-/// root.
+/// root, and every workspace member contributed at least one crate root.
 ///
 /// Without this, an unreadable manifest or an unrecognised library target would remove a
 /// crate from the manifest and attribute rules silently, and the gate would report
-/// success because no rule had anything to say about it.
+/// success because no rule had anything to say about it. The second half is what keeps a
+/// workspace member out of reach of the `missing-docs` rule: a member with no target the
+/// gate recognises is a member that rule never runs on.
 #[must_use]
 fn check_inputs_are_complete(
     graph: &graph::PackageGraph,
     inputs: &WorkspaceInputs,
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
+
+    for id in graph.workspace_members() {
+        let Some(package) = graph.by_id(id) else {
+            continue;
+        };
+        if !inputs
+            .docs
+            .crate_roots
+            .iter()
+            .any(|root| root.package == package.name)
+        {
+            violations.push(Violation::new(
+                "inputs-incomplete",
+                package.name.clone(),
+                "is a workspace member with no crate root the gate could read, so the \
+                 missing_docs rule did not run on it",
+            ));
+        }
+    }
 
     for spec in policy::LAYERS {
         if graph.find(spec.name).is_none() {
@@ -383,13 +404,15 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
 ///
 /// Every crate root, not only the firmware layers': `xtask` and the size probe have public
 /// items too, and issue #11 asks for `missing_docs` in *each* crate. A workspace member
-/// whose targets contribute no readable root is recorded in
-/// [`docs::DocsInputs::members_without_roots`] rather than skipped, so a crate cannot
-/// escape the rule by having no target the gate recognises.
+/// whose targets contribute no readable root is reported by `inputs-incomplete`, the rule
+/// that already exists for "a crate no rule could be run against".
 ///
 /// # Errors
 ///
-/// Returns [`CheckError`] if a file that exists cannot be read.
+/// Returns [`CheckError`] if a file that exists cannot be read, or if `docs/adr` exists and
+/// cannot be listed. A directory the gate cannot read is not a directory with nothing in
+/// it, and reporting "the record has no index" when the truth is "the record is unreadable"
+/// sends the reader to the wrong place.
 fn collect_docs_inputs(
     root: &Path,
     graph: &graph::PackageGraph,
@@ -397,55 +420,61 @@ fn collect_docs_inputs(
     let adr_dir = root.join(docs::ADR_DIR);
     let mut adrs = Vec::new();
     let mut adr_index = None;
-    if let Ok(entries) = std::fs::read_dir(&adr_dir) {
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect();
-        paths.sort();
-        for path in paths {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let contents = read_to_string(&path)?;
-            if name == docs::ADR_INDEX {
-                adr_index = Some(contents);
-            } else {
-                adrs.push(docs::AdrFile { name, contents });
+    match std::fs::read_dir(&adr_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CheckError::new(format!(
+                "could not read {}: {error}",
+                adr_dir.display()
+            )));
+        }
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    CheckError::new(format!(
+                        "could not read an entry of {}: {error}",
+                        adr_dir.display()
+                    ))
+                })?;
+                // Only Markdown. An ADR may reasonably sit beside an image it refers to,
+                // and reading that image would fail the whole gate with a UTF-8 error
+                // instead of reporting the 28 rules.
+                if entry.path().extension().is_some_and(|kind| kind == "md") {
+                    paths.push(entry.path());
+                }
+            }
+            paths.sort();
+            for path in paths {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let contents = read_to_string(&path)?;
+                if name == docs::ADR_INDEX {
+                    adr_index = Some(contents);
+                } else {
+                    adrs.push(docs::AdrFile { name, contents });
+                }
             }
         }
     }
 
     let mut crate_roots = Vec::new();
-    let mut members_without_roots = Vec::new();
-    for id in graph.workspace_members() {
-        let Some(package) = graph.by_id(id) else {
-            // `check_workspace_membership` already reports a member that is not a package.
-            continue;
-        };
-        let mut roots: Vec<PathBuf> = package.lib_source_path.iter().cloned().collect();
-        roots.extend(package.bins.iter().filter_map(|bin| bin.src_path.clone()));
-        if roots.is_empty() {
-            members_without_roots.push(package.name.clone());
-            continue;
-        }
-        for path in roots {
-            crate_roots.push(docs::CrateRoot {
-                package: package.name.clone(),
-                path: path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string(),
-                contents: read_to_string(&path)?,
-            });
-        }
+    for path in workspace_crate_roots(graph) {
+        let (package, path) = path;
+        crate_roots.push(docs::CrateRoot {
+            package,
+            path: path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string(),
+            contents: read_to_string(&path)?,
+        });
     }
     crate_roots
         .sort_by(|left, right| (&left.package, &left.path).cmp(&(&right.package, &right.path)));
-    members_without_roots.sort();
 
     Ok(docs::DocsInputs {
         claude_md: read_optional(&root.join(docs::CLAUDE_MD_PATH))?,
@@ -453,8 +482,28 @@ fn collect_docs_inputs(
         adr_index,
         adrs,
         crate_roots,
-        members_without_roots,
     })
+}
+
+/// `(package name, crate root)` for every library and binary target of every workspace
+/// member.
+fn workspace_crate_roots(graph: &graph::PackageGraph) -> Vec<(String, PathBuf)> {
+    let mut roots = Vec::new();
+    for id in graph.workspace_members() {
+        let Some(package) = graph.by_id(id) else {
+            // `check_workspace_membership` already reports a member that is not a package.
+            continue;
+        };
+        for path in package
+            .lib_source_path
+            .iter()
+            .cloned()
+            .chain(package.bins.iter().filter_map(|bin| bin.src_path.clone()))
+        {
+            roots.push((package.name.clone(), path));
+        }
+    }
+    roots
 }
 
 /// Every `.rs` file under `directory`, in a stable order.
@@ -648,7 +697,6 @@ mod tests {
                     path: "crates/waymaker-core/src/lib.rs".to_owned(),
                     contents: "pub fn advance() {}\n".to_owned(),
                 }],
-                members_without_roots: Vec::new(),
             },
         }
     }
@@ -754,11 +802,46 @@ mod tests {
             probe_manifest: Some(size::tests_support::clean_probe_manifest()),
             probe_source: Some(size::tests_support::clean_probe_source()),
             layer_sources: Vec::new(),
-            docs: docs::tests_support::clean_inputs(RULES),
+            docs: docs::DocsInputs {
+                // A root per workspace member, because `inputs-incomplete` now reports a
+                // member the `missing-docs` rule could not be run against.
+                crate_roots: [
+                    "waymaker-core",
+                    "waymaker-flash",
+                    "waymaker-embassy",
+                    "waymaker-size-probe",
+                ]
+                .into_iter()
+                .map(|package| docs::CrateRoot {
+                    package: package.to_owned(),
+                    path: format!("crates/{package}/src/lib.rs"),
+                    contents: "//! Docs.\n#![warn(missing_docs)]\n".to_owned(),
+                })
+                .collect(),
+                ..docs::tests_support::clean_inputs(RULES)
+            },
         };
 
         let violations = check_inputs(&inputs).expect("the inputs should be checkable");
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn check_inputs_holds_claude_md_to_the_real_rule_list() {
+        // `check_documentation` takes the rule list as a parameter so that it can be
+        // tested against a list of its own. Nothing otherwise pins what `check_inputs`
+        // passes: with `&[]` there, every test in this crate still passes, and CLAUDE.md
+        // could stop documenting the gate entirely.
+        let mut inputs = broken_inputs();
+        inputs.docs.claude_md =
+            Some(docs::tests_support::clean_claude_md(RULES).replace("`toolchain-targets`", ""));
+        let violations = check_inputs(&inputs).expect("checkable");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "claude-md" && v.subject == "toolchain-targets"),
+            "{violations:?}"
+        );
     }
 
     #[test]

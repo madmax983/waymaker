@@ -47,8 +47,12 @@
 use core::panic::PanicInfo;
 
 /// Required of any `no_std` binary, and never reached: nothing runs this image.
+///
+/// `const` because the workspace's nursery lints ask for it and there is no reason to
+/// refuse: a diverging `loop {}` is a legal constant evaluation, and `#[panic_handler]`
+/// only requires the signature, not the constness.
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+const fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }
 

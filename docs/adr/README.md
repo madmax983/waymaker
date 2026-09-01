@@ -12,15 +12,24 @@ be superseded.
 | [0001](0001-one-pipeline-table-and-a-per-crate-coverage-gate.md) | One pipeline table, and a per-crate coverage gate | accepted |
 | [0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md) | Size budgets are measured as deltas against a probe firmware | accepted |
 | [0003](0003-the-eight-settled-design-decisions.md) | The eight settled design decisions (design document §02) | accepted |
+| [0004](0004-the-layering-contract-is-a-table-a-gate-reads.md) | The layering contract is a table a gate reads | accepted |
+| [0005](0005-documentation-is-checked-against-the-tables-it-describes.md) | Documentation is checked against the tables it describes | accepted |
 
 ## Reading the numbers
 
-The number is the order a decision was **written down**, not the order it was taken. ADR
-0003 records the eight decisions design document §02 settled before either of the two
-before it — it was written third because the gates in 0001 and 0002 were built first. Issue
-[#11](https://github.com/madmax983/waymaker/issues/11) asked for §02 to be ADR-0001;
-renumbering two accepted ADRs and breaking the cross-link between them to free a number
-would have rewritten the one thing a decision record exists to keep stable.
+The number is the order a decision was **written down**, not the order it was taken. Two
+of these are older than their numbers suggest:
+
+- **0003** records the eight decisions design document §02 settled before any code existed.
+  It was written third because the gates in 0001 and 0002 were built first. Issue
+  [#11](https://github.com/madmax983/waymaker/issues/11) asked for §02 to be ADR-0001;
+  renumbering two accepted ADRs and breaking the cross-link between them to free a number
+  would have rewritten the one thing a decision record exists to keep stable.
+- **0004** records issue #8's decisions, which predate this record entirely — ADR 0001 cites
+  them as settled precedent. It was written when issue #11 asked for every settled decision
+  to have an ADR and this one turned out not to.
+
+In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005.
 
 ## Writing one
 

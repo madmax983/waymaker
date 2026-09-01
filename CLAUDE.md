@@ -6,9 +6,13 @@ completed effects return their recorded results, and the first unresolved effect
 next piece of work.
 
 This file is what a contributor — human or agent — works to. It states the invariants, the
-layering rules, and what each crate must not own. **Nothing here is a convention you are
-asked to remember.** Every line below is either checked by `cargo xtask check-layering`,
-named with the rule id that checks it, or explicitly flagged as unchecked.
+layering rules, and what each crate must not own.
+
+Much of it is checked rather than remembered: the must-not-own cells, the permitted
+dependency edges, the eight decision ids, the command list and all 28 rule ids below are
+compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+request when this file and those tables stop agreeing. The rest is prose, and
+[What is not checked](#what-is-not-checked) says which.
 
 - The architecture, drawn: [`docs/architecture.md`](docs/architecture.md)
 - Why things are the way they are: [`docs/adr`](docs/adr/README.md)
@@ -16,18 +20,30 @@ named with the rule id that checks it, or explicitly flagged as unchecked.
 
 ## Run this before you claim anything works
 
+Every command CI runs, in the order the stage table gives them. The `claude-md` rule
+compares this list against `xtask::pipeline::STAGES`, so a stage added to the pipeline and
+forgotten here fails the build:
+
 ```sh
-cargo xtask check-layering   # the whole policy gate, 28 rules
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+cargo build --locked --workspace --no-default-features
 cargo test --locked --workspace --no-default-features
+cargo doc --locked --workspace --no-deps --no-default-features
+cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
+cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+cargo --locked xtask size
+cargo --locked xtask check-layering
 ```
 
+`cargo doc` needs `RUSTDOCFLAGS=-D warnings` to mean what it says — that is in the
+workflow's `env:` block, and the `ci-pipeline` rule fails a build without it.
+
 `cargo xtask install-hooks` points git at `.githooks`, which runs format, lint and test
-before every commit. The hook is *generated* from the stage table in
-`xtask/src/pipeline.rs`, so "the hook and CI run the same commands" is a fact about how the
-file is produced, not a claim.
+before every commit — the three fast ones. The hook is *generated* from the same stage
+table, so "the hook and CI run the same commands" is a fact about how the file is produced,
+not a claim.
 
 ## The invariants
 
@@ -42,7 +58,7 @@ The eight decisions design document §02 settles. Each has a stable id, defined 
 | `durable-intent-before-effect` | The schedule record crosses a durability barrier before dispatch. A physical effect never precedes its committed intent. |
 | `numeric-kinds-and-borrowed-bytes` | Records are numeric kinds and borrowed bytes. Strings, `Vec`, Serde and Postcard are optional conveniences, never wire-format requirements. |
 | `async-syntax-is-an-adapter` | `waymaker-embassy` supplies the ergonomic façade. The persistence protocol depends on neither Embassy nor `Future`. |
-| `no-snapshotted-futures` | Suspended futures are never snapshotted. History is reclaimed only at an explicit `continue_as_new` boundary. |
+| `no-snapshotted-futures` | *Arbitrary* suspended futures are not snapshotted. History is reclaimed only at an explicit `continue_as_new` boundary. (§16 leaves a future explicit-state snapshot API open as a deferred question.) |
 | `two-banks-for-atomic-replacement` | A new run becomes authoritative only after its payload and generation seal are durable. |
 | `durable-timers-need-durable-time` | A resettable monotonic clock cannot claim that time elapsed while power was absent. Timer semantics match the hardware's actual clock. |
 
@@ -61,11 +77,14 @@ is `xtask::policy::LAYERS`; the diagram is
 [here](docs/architecture.md#crate-dependency-flow). Adding a crate to the workspace means
 adding a row to that table — a member no rule covers fails `workspace-membership`.
 
+The "May depend on" column is `may_depend_on` in `policy::LAYERS`, rendered the way the
+gate renders it; the `claude-md` rule compares the two.
+
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, CRC and seals, bank selection, append scanning, compaction transition | `waymaker-core` |
-| `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | `waymaker-core`, `waymaker-flash` |
+| `waymaker-flash` | Stable wire encoding, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
+| `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
 
@@ -88,13 +107,18 @@ Two crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
-  depends on all three layers at once, on purpose, and nothing depends on it.
+  declares all three layers as *optional* dependencies, on purpose — the baseline variant
+  links none of them, which is what makes the code-flash budget a delta rather than an
+  absolute — and nothing depends on it.
 
 ## Budgets
 
-Design document §04, held in `waymaker_core::budget` and gated by `cargo xtask size`. The
-numbers live in the kernel rather than in the gate, because a budget in two places is a
-budget that ends up disagreeing with itself.
+Design document §04. The first three live in `waymaker_core::budget` and are gated by
+`cargo xtask size` — the numbers are in the kernel rather than in the gate, because a budget
+in two places is a budget that ends up disagreeing with itself. The fourth, persistent
+flash, is a §04 statement with no constant and no gate behind it: there is no linked image
+with banks in it yet. Nothing compares the numbers in this table to `budget.rs`, so treat
+`budget.rs` as the source if they ever differ.
 
 | Budget | v0.1 target |
 | --- | --- |
@@ -155,11 +179,11 @@ this table is how you find out what a red build is telling you.
 | `dependency-direction` | A layer declares a dependency its row in `policy::LAYERS` does not allow. |
 | `dependency-direction-transitive` | A layer *reaches* a crate it may not depend on, through another crate. |
 | `kernel-zero-dependencies` | `waymaker-core` grows a dependency of any kind, in any table. |
-| `embassy-below-facade` | A crate other than `waymaker-embassy` reaches the Embassy ecosystem. |
+| `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
 | `workspace-membership` | A workspace member is neither a layer, declared host tooling, nor a measurement crate. |
-| `inputs-incomplete` | A crate is in the graph but contributed no manifest or no crate root, so rules silently skipped it. |
+| `inputs-incomplete` | A crate is in the graph but contributed no manifest, or a workspace member contributed no crate root, so rules silently skipped it. |
 
 ### Crates and manifests
 
@@ -168,16 +192,16 @@ this table is how you find out what a red build is telling you.
 | `crate-attributes` | A firmware crate root loses `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std/alloc`. |
 | `empty-default-features` | A firmware crate's `default` feature enables anything, so an optional cost stops being opt-in. |
 | `no-build-scripts` | A firmware crate grows a `build.rs`. |
-| `member-manifest` | A member manifest drops `[lints] workspace = true`, or the kernel grows a dependency table. |
-| `workspace-lints` | The workspace lint table drifts from what the design document requires. |
+| `member-manifest` | A member manifest drops `[lints] workspace = true`, declares a non-empty `default` feature, opts out of its own test binary with `[lib] test = false` — which would make an untested crate report "no coverable lines" and pass the coverage gate — or, for the kernel, grows a dependency table. |
+| `workspace-lints` | The workspace lint table drifts from what this project requires (`manifest::REQUIRED_CLIPPY_GROUPS` and `REQUIRED_CLIPPY_DENIALS`). The design document says nothing about lints; only the release profile comes from §04. |
 | `release-profile` | `[profile.release]` drifts from the size settings the budgets are measured against. |
-| `cargo-config-profile` | `.cargo/config.toml` rewrites the `xtask` alias or the profile, which would turn every gate into a command that exits zero. |
+| `cargo-config-profile` | `.cargo/config.toml` is missing, rewrites the `xtask` alias or the profile, declares an `[env]` key, or sets `[build] rustflags` — each of which turns a gate into a command that exits zero. |
 
 ### Pipeline and measurement
 
 | Rule | Fires when |
 | --- | --- |
-| `ci-pipeline` | The workflow drops a stage, reorders one within a job, or makes one unable to fail — an `if:`, a `continue-on-error:`, a missing `RUSTDOCFLAGS`, an `on:` block no pull request triggers. |
+| `ci-pipeline` | The workflow drops a stage, reorders one within a job, or makes one unable to fail — an `if:`, a `continue-on-error:`, a missing `RUSTDOCFLAGS`, an `on:` block no pull request triggers, a job with no `runs-on:`, or a tab in the indentation. |
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, not executable, or not byte-for-byte what the stage table renders. |
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links. |
@@ -188,24 +212,35 @@ this table is how you find out what a red build is telling you.
 
 | Rule | Fires when |
 | --- | --- |
-| `claude-md` | This file loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams. |
+| `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
 | `settled-decisions` | The §02 ADR stops recording one of the eight decisions, or its headline. |
-| `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge. |
-| `missing-docs` | A crate root loses `#![warn(missing_docs)]`, allows it back, or a workspace member has no crate root the rule could run on. |
+| `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
+| `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
 
 ## What is not checked
 
 Stated so that nobody mistakes silence for coverage:
 
-- **Prose.** The gate matches ids, crate names, `must_not_own` cells and protocol steps. The
-  sentences around them are reviewed by people.
-- **That a diagram renders.** The Mermaid check is a text scan; the pull request preview is
-  the render.
-- **That a new §02-style decision gets added to `SETTLED_DECISIONS`.** The table is the spec;
+- **Prose.** The rules match ids, crate names, `must_not_own` cells, permitted edges,
+  pipeline commands and protocol steps. The sentences around them are reviewed by people —
+  deliberately, so they stay free to be rewritten. A row that says the opposite of what it
+  means will pass as long as the anchor is in it.
+- **The "Owns" column above, and the budget numbers.** Both are transcribed from the design
+  document and from `waymaker_core::budget`, and nothing compares them. `budget.rs` is the
+  source of truth for the numbers.
+- **That a diagram renders.** The Mermaid check is a text scan — it proves every layer,
+  every permitted edge and every step is in the right block, and that no edge contradicts
+  the layering. It does not run Mermaid. The pull request preview is the render.
+- **An unlabelled diagram.** Only blocks carrying a `<!-- diagram: ... -->` label are
+  checked. Every block in `docs/architecture.md` carries one today; a new block without one
+  would be illustration that nothing keeps honest.
+- **That a new §02-style decision was added to `SETTLED_DECISIONS`.** The table is the spec;
   nothing detects a ninth decision nobody wrote down.
+- **`[lints] workspace = true` in `xtask` and the size probe.** `member-manifest` iterates
+  `policy::LAYERS`, so it covers the three firmware crates only.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).

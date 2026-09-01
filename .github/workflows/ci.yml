@@ -113,6 +113,13 @@ jobs:
       - name: Build the firmware crates for the firmware target
         run: cargo build --locked --no-default-features --target thumbv6m-none-eabi
 
+      # The size probe's binary is behind `required-features`, so the `check` job's clippy
+      # stage — `--all-targets` on the host — never compiles it. Without this step the
+      # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and
+      # `#![warn(missing_docs)]` present while no compiler has ever acted on them.
+      - name: Lint the size probe on the firmware target
+        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+
   size:
     # Design document §04: "CI records section sizes for every feature combination" and
     # the code-flash budget "is a gate, not an unverified claim". This job links the size
