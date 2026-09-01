@@ -164,38 +164,62 @@ fn a_base_reference_that_does_not_exist_is_reported_rather_than_measured() {
 
 #[test]
 fn a_base_commit_from_before_the_probe_existed_is_reported_rather_than_measured() {
-    // The very first commit of this repository has no workspace manifest, which is the
-    // shape of every base branch older than this gate. It must come back as "cannot
-    // measure", never as a set of rows that happen to match the current branch.
-    let root = workspace_root();
-    let Some(first) = first_commit(&root) else {
-        return;
-    };
-    let error = size::measure_baseline(&root, &first)
-        .expect_err("a commit with no size probe cannot be measured");
+    // Every base branch older than this gate has this shape, and the one thing it must not
+    // do is come back as a set of rows that happen to match the current branch.
+    //
+    // The fixture is built here rather than reached for in this repository's own history. A
+    // CI checkout is shallow, so `rev-list --max-parents=0 HEAD` returns the graft point —
+    // the current tree, probe and all — and the test then passes by measuring exactly what
+    // it is supposed to prove cannot be measured. It did, on the first CI run. A repository
+    // this test creates is the same on every runner and at every clone depth.
+    let repository = repository_without_a_probe("no-probe");
+
+    let error = size::measure_baseline(&repository, "HEAD")
+        .expect_err("a checkout with no size probe cannot be measured");
+
+    // Three guards can catch this, depending on what encloses the checkout, and the test
+    // accepts any of them because all three are the gate refusing to report a number:
+    // no manifest to resolve at all; a manifest resolved from an enclosing workspace, which
+    // `check_workspace_root` rejects as a measurement of a different tree; or a workspace
+    // with no probe in it. What it must never be is `Ok`.
     let message = error.to_string();
     assert!(
-        message.contains("rather than") || message.contains("no `waymaker-size-probe`"),
-        "{message}"
+        ["Cargo.toml", "rather than", "no `waymaker-size-probe`"]
+            .iter()
+            .any(|marker| message.contains(marker)),
+        "the baseline failed for a reason that is not about the missing probe: {message}"
     );
+
+    let _ = std::fs::remove_dir_all(&repository);
 }
 
-/// The repository's first commit, or `None` where there is no git history to read.
-fn first_commit(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .current_dir(root)
-        .args(["rev-list", "--max-parents=0", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .next()
-        .map(str::to_owned)
-        .filter(|commit| !commit.is_empty())
+/// A git repository with one commit and no Waymaker in it.
+fn repository_without_a_probe(label: &str) -> PathBuf {
+    let root = scratch(label);
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    git(&["init", "--quiet"]);
+    git(&["config", "user.email", "size-gate@example.invalid"]);
+    git(&["config", "user.name", "size gate"]);
+    std::fs::write(
+        root.join("README.md"),
+        "A repository from before the size gate.\n",
+    )
+    .expect("the fixture should be writable");
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "Initial commit"]);
+    root
 }
 
 #[test]
