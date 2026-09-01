@@ -68,9 +68,21 @@ function the probe genuinely should not charge for is a function that should not
 or a deliberate exception — either is a conversation in review, which is where a decision
 about what the budget covers belongs.
 
-The rule matches identifiers in code, not in prose. It has to: the first version was
-satisfied by the English word "of" appearing five times in the probe's documentation while
-`TypeSize::of` went unlinked, which is the exact failure it exists to catch.
+The rule matches identifiers in code and in call position, not in prose. It has to: the
+first version was satisfied by the English word "of" appearing five times in the probe's
+documentation while `TypeSize::of` went unlinked, which is the exact failure it exists to
+catch. It counts a trait's methods and a trait impl's methods too, which carry no `pub` at
+all — the trait's visibility is what makes them callable, and a `pub fn` scan would have let
+a whole storage backend be implemented and dead-stripped without a word.
+
+**It is a floor, not a proof.** A scanner establishes that every public function's name
+appears in the probe in call position; it cannot establish that each was called. Two layers
+declaring the same name are satisfied by one call to either, and a call behind a generic or
+a trait object is credited to the name written rather than the body that runs. Deciding
+those needs name resolution — a call graph, not a scanner. What the rule catches
+mechanically and every time is the case that arrives silently: a layer gains a function and
+nobody wires the probe up to it. That is the common case, and it is the one no other check
+sees.
 
 What remains beyond a gate is the *feature* half. A feature row whose code the probe does
 not reach comes back byte for byte identical to the row below it, and that cannot be made a

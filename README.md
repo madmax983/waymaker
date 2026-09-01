@@ -199,7 +199,11 @@ crates/waymaker-core/src/lib.rs, so the linker discards it and no row charges fo
 add a call in the probe or the size report understates waymaker-core for ever
 ```
 
-So a layer cannot grow public code that the budget quietly stops covering. What is left is
+It counts a trait's methods and a trait impl's methods too, which carry no `pub` at all. It
+is a floor rather than a proof: a scanner can see that every public function's name appears
+in the probe in call position, not that each was called, so two layers declaring the same
+name are satisfied by one call to either. What it catches every time is the case that
+arrives silently — a layer gains a function and nobody wires the probe up to it. What is left is
 the *feature* half: a feature row whose code the probe does not reach comes back identical
 to the row below it, and that cannot be a gate — a feature which genuinely costs nothing is
 indistinguishable from one the probe does not exercise. It is a **notice** instead, printed

@@ -1507,11 +1507,27 @@ pub struct PublicFunction {
     pub name: String,
 }
 
-/// Every public function the layers declare, outside their test modules.
+/// The kind of block a function is being declared inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    /// A `trait` declaration: its methods are as callable as the trait is.
+    Trait,
+    /// An `impl <Trait> for <Type>`: its methods are as callable as the trait is.
+    TraitImpl,
+    /// Anything else — an inherent `impl`, a module, a function body.
+    Other,
+}
+
+/// Every function of the layers that a caller outside the crate can reach.
 ///
-/// Scanned rather than parsed, like every other rule here: the question is which names
-/// exist, not what they mean. `#[cfg(test)]` modules are skipped by brace depth, because a
-/// test helper is not code the firmware links.
+/// `pub fn` is not the whole answer, and assuming it was left a hole big enough to drive a
+/// storage backend through: a method of a `trait`, and a method of an `impl Trait for
+/// Type`, carry no `pub` at all — the trait's visibility is what makes them callable. A
+/// layer could implement the whole storage protocol, have every byte of it dead-stripped,
+/// and this rule would have said nothing.
+///
+/// Scanned rather than parsed, like every other rule here, and `#[cfg(test)]` modules are
+/// skipped by brace depth: a test helper is not code the firmware links.
 #[must_use]
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
     let mut found = Vec::new();
@@ -1519,46 +1535,100 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
         let mut pending_test_attribute = false;
+        // `(depth the block's body starts at, what kind of block it is)`.
+        let mut blocks: Vec<(i32, Block)> = Vec::new();
 
         for line in source.contents.lines() {
             let trimmed = line.trim();
+            let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+            let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
 
             if !trimmed.starts_with("//") {
                 if trimmed.contains("#[cfg(test)]") {
                     pending_test_attribute = true;
                 }
-                if pending_test_attribute && trimmed.contains('{') {
+                if pending_test_attribute && opens > 0 {
                     test_module = Some(depth);
                     pending_test_attribute = false;
                 }
             }
 
             if test_module.is_none() && !trimmed.starts_with("//") {
+                // A method counts only as a direct child of the block that makes it
+                // callable. Without that, a nested `fn` inside a trait method's body would
+                // be required of the probe, which cannot call it.
+                let enclosing = blocks
+                    .last()
+                    .filter(|(body_depth, _)| *body_depth == depth)
+                    .map_or(Block::Other, |(_, kind)| *kind);
+
                 if let Some(name) = function_name(trimmed) {
-                    found.push(PublicFunction {
-                        crate_name: source.crate_name.clone(),
-                        path: source.path.clone(),
-                        name: name.to_owned(),
-                    });
+                    let callable = trimmed.starts_with("pub ")
+                        || matches!(enclosing, Block::Trait | Block::TraitImpl);
+                    if callable {
+                        found.push(PublicFunction {
+                            crate_name: source.crate_name.clone(),
+                            path: source.path.clone(),
+                            name: name.to_owned(),
+                        });
+                    }
+                }
+
+                if opens > 0 {
+                    blocks.push((depth.saturating_add(1), block_kind(trimmed)));
                 }
             }
 
-            depth += i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
-            depth -= i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+            depth += opens;
+            depth -= closes;
             if test_module.is_some_and(|opened| depth <= opened) {
                 test_module = None;
+            }
+            while blocks
+                .last()
+                .is_some_and(|(body_depth, _)| depth < *body_depth)
+            {
+                blocks.pop();
             }
         }
     }
     found
 }
 
-/// The name declared by a `pub fn` line, if the line declares one.
+/// What kind of block a line opens.
+///
+/// Every block is pushed, not only the interesting ones: the stack has to mirror the brace
+/// depth or a `mod` between a trait and its methods would make them look like direct
+/// children of the trait.
+fn block_kind(line: &str) -> Block {
+    let declaration = line.strip_prefix("pub ").unwrap_or(line);
+    if declaration.starts_with("trait ") {
+        return Block::Trait;
+    }
+    if declaration.starts_with("impl") && declaration.contains(" for ") {
+        // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
+        // makes its unmarked methods callable from outside.
+        return Block::TraitImpl;
+    }
+    Block::Other
+}
+
+/// The name declared by a function signature, if the line declares one.
 fn function_name(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("pub ")?;
-    // `pub const fn`, `pub async fn`, `pub unsafe fn`, `pub extern "C" fn`, and any
-    // combination: skip everything up to the `fn` keyword.
-    let rest = rest.split_once("fn ")?.1;
+    let rest = line.strip_prefix("pub ").unwrap_or(line);
+    // `const fn`, `async fn`, `unsafe fn`, `extern "C" fn`, and any combination: skip
+    // everything up to the `fn` keyword, but only where `fn` starts the token.
+    let rest = if let Some(rest) = rest.strip_prefix("fn ") {
+        rest
+    } else {
+        let (before, after) = rest.split_once(" fn ")?;
+        // Guards against `let f = |x| ...; // returns fn foo` style lines: everything
+        // before the keyword must look like modifiers rather than an expression.
+        if before.contains('(') || before.contains('=') {
+            return None;
+        }
+        after
+    };
     let name = rest
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .find(|token| !token.is_empty())?;
@@ -1581,6 +1651,15 @@ fn function_name(line: &str) -> Option<&str> {
 /// A function the probe genuinely should not charge for is a function that should not be
 /// public, or a deliberate exception; either is a conversation in review, which is where a
 /// decision about what the budget covers belongs.
+///
+/// # A floor, not a proof
+///
+/// This is a scanner, so it establishes that every public function's *name* appears in the
+/// probe in call position — not that each was called. Two layers declaring the same name
+/// are satisfied by one call to either, and a call behind a generic or a trait object is
+/// credited to the name written rather than to the body that runs. Deciding those needs a
+/// call graph. What it does catch, mechanically and every time, is the case that arrives
+/// silently: a layer gains a function and nobody wires the probe up to it.
 #[must_use]
 pub fn check_probe_reach(sources: &[LayerSource], probe: Option<&str>) -> Vec<Violation> {
     let functions = public_functions(sources);
@@ -1612,30 +1691,56 @@ pub fn check_probe_reach(sources: &[LayerSource], probe: Option<&str>) -> Vec<Vi
         .collect()
 }
 
-/// Whether `source` calls `name`, ignoring what its comments happen to say.
+/// Whether `source` calls `name`, rather than merely containing the word.
 ///
-/// Comments are stripped first, and the reason is a fail-open this rule walked straight
-/// into: `waymaker-core` declares `TypeSize::of`, and the probe's prose contains the
-/// English word "of" five times, so the rule reported the function as reached while the
-/// linker discarded it. Prose is not a call. A `//` inside a string literal is stripped
-/// too, which can only make the rule stricter — the safe direction for a rule whose whole
-/// job is to notice something missing.
+/// Two things this deliberately does not credit, both of which it once did:
+///
+/// * anything in a comment. `waymaker-core` declares `TypeSize::of`, and the probe's own
+///   documentation contains the English word "of" five times, so the rule reported the
+///   function as reached while the linker discarded it. Prose is not a call.
+/// * a bare word. A name is credited only where it stands in call or path position —
+///   preceded by `::` or `.`, or followed by `(`, `::<`, or `)`. A local variable that
+///   happens to share a function's name is not a call either.
+///
+/// # What it still cannot tell
+///
+/// Which function was called, when two layers declare the same name. `waymaker-core` and
+/// `waymaker-flash` both being free to declare `new`, one call satisfies the rule for
+/// both, and the uncalled one is still dead-stripped. Deciding that needs name resolution
+/// — a call graph, not a scanner — so this rule is a floor: it catches a public function
+/// nobody wired up, which is the common case and the one that arrives silently. It is not
+/// a proof that every function is reached, and the module documentation says so.
 fn mentions(source: &str, name: &str) -> bool {
     let code: String = source
         .lines()
         .map(|line| line.split("//").next().unwrap_or(""))
         .collect::<Vec<&str>>()
         .join("\n");
+
     let mut rest = code.as_str();
     while let Some(at) = rest.find(name) {
         let before = rest.get(..at).and_then(|text| text.chars().next_back());
         let after = rest
             .get(at.saturating_add(name.len())..)
-            .and_then(|text| text.chars().next());
-        let boundary = |character: Option<char>| {
-            character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            .unwrap_or_default();
+
+        let whole_word = before
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            && after
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+
+        // A path segment (`budget::of`, `bank.seal`) or a call (`of(`, `of::<u32>(`).
+        let in_path = rest
+            .get(..at)
+            .is_some_and(|text| text.ends_with("::") || text.ends_with('.'));
+        let called = {
+            let next = after.trim_start();
+            next.starts_with('(') || next.starts_with("::<") || next.starts_with("::")
         };
-        if boundary(before) && boundary(after) {
+
+        if whole_word && (in_path || called) {
             return true;
         }
         let Some(next) = rest.get(at.saturating_add(1)..) else {
@@ -2909,6 +3014,85 @@ mod tests {
             names,
             ["plain", "constant", "eventual", "risky", "abi", "method"]
         );
+    }
+
+    #[test]
+    fn a_trait_method_is_reachable_even_though_it_carries_no_pub() {
+        // The hole a `pub `-prefix scan leaves: a trait's methods and a trait impl's
+        // methods are as callable as the trait, and neither is written `pub`. A layer could
+        // implement the whole storage protocol and have every byte of it dead-stripped.
+        let functions = public_functions(&kernel(
+            "pub trait Storage {\n\
+            \x20   fn seal(&self, x: u32) -> u32 { x }\n\
+            \x20   fn erase(&self);\n\
+             }\n\
+             impl Storage for Bank {\n\
+            \x20   fn erase(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal", "erase", "erase"]);
+    }
+
+    #[test]
+    fn an_inherent_impls_private_method_is_not_required_of_the_probe() {
+        // The other direction: `impl Bank { fn helper() }` is private, so demanding the
+        // probe call it would be a rule nobody could satisfy.
+        let functions = public_functions(&kernel(
+            "impl Bank {\n\
+            \x20   pub fn scan(&self) {}\n\
+            \x20   fn helper(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["scan"]);
+    }
+
+    #[test]
+    fn a_function_nested_inside_a_trait_method_body_is_not_required() {
+        let functions = public_functions(&kernel(
+            "impl Storage for Bank {\n\
+            \x20   fn erase(&self) {\n\
+            \x20       fn inner() {}\n\
+            \x20   }\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["erase"]);
+    }
+
+    #[test]
+    fn a_name_that_is_only_a_local_variable_is_not_a_call() {
+        // `mentions` used to credit a bare word anywhere in the file.
+        let message = reach_violations(
+            &kernel("pub fn seal() {}\n"),
+            "fn probe() { let seal = 3; }\n",
+        );
+        assert!(message.contains("`seal`"), "{message}");
+    }
+
+    #[test]
+    fn a_call_in_path_position_counts() {
+        for probe in [
+            "fn probe() { waymaker_core::seal(); }\n",
+            "fn probe() { bank.seal(); }\n",
+            "fn probe() { seal::<u32>(); }\n",
+            "fn probe() { let f = seal(); }\n",
+        ] {
+            assert!(
+                check_probe_reach(&kernel("pub fn seal() {}\n"), Some(probe)).is_empty(),
+                "{probe} should count as a call"
+            );
+        }
     }
 
     #[test]
