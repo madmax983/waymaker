@@ -70,15 +70,59 @@ behavior requires an idempotent activity or downstream deduplication of that ID.
 ## Development
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it
-up automatically.
+up automatically, including the `thumbv6m-none-eabi` target the firmware build needs.
+
+```sh
+cargo xtask install-hooks   # once per clone: generates .githooks/pre-commit and points git at it
+```
+
+The pipeline, in order:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 cargo build  --locked --workspace --no-default-features
 cargo test   --locked --workspace --no-default-features
+cargo doc    --locked --workspace --no-deps --no-default-features
+cargo --locked xtask coverage
+cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo --locked xtask check-layering
 ```
+
+Those commands are not transcribed here by hand. They come from one table,
+[`xtask/src/pipeline.rs`](xtask/src/pipeline.rs), which is also what CI is checked against
+and what `cargo xtask install-hooks` renders the pre-commit hook from. A workflow that stops
+running a stage, a hook edited by hand, or a toolchain that stops pinning the firmware target
+each fail `cargo xtask check-layering`. The hook runs format, lint and test; the firmware
+build, the docs build and coverage are left to CI.
+
+The firmware build takes no `--workspace` and no `-p` flags: `default-members` in the
+workspace manifest is exactly the three firmware crates, so a crate added to the layering is
+built for `thumbv6m-none-eabi` without anyone remembering a flag, and `xtask`'s host-only
+dependencies never reach the target.
+
+### Coverage
+
+```sh
+cargo --locked xtask coverage              # runs cargo llvm-cov, then gates the result
+cargo --locked xtask coverage --report r.json   # gates an export produced earlier
+```
+
+The gate is **85% of lines, per crate** — not per workspace, because a workspace total is
+how an untested kernel hides behind a well-tested adapter. Every workspace member gets a row,
+including crates with nothing to cover yet, which report `n/a` rather than vanishing from the
+table. The reasoning is in
+[ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
+
+The command needs [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), which no
+rustup profile carries:
+
+```sh
+cargo install cargo-llvm-cov
+```
+
+It fails with that hint rather than passing when the tool is absent: a coverage run that did
+not happen is not a coverage run that passed.
 
 `cargo xtask check-layering` is the layering contract from design document §05, turned into
 something that fails a pull request. It reads the resolved `cargo metadata` graph rather
@@ -100,18 +144,15 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `release-profile` | `[profile.release]` drifts from design document §04 |
 | `cargo-config-profile` | `.cargo/config.toml` declares a profile, which would silently override it |
 | `workspace-lints` | the lint table stops denying `unwrap_used`, or a lint group loses its negative priority |
+| `ci-pipeline` | the CI workflow stops running a pipeline stage, moves it to another job, or runs a job's stages out of order |
+| `pre-commit-hook` | `.githooks/pre-commit` is missing, is not executable, or has drifted from the pipeline table |
+| `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 
 The contract lives in one table, [`xtask/src/policy.rs`](xtask/src/policy.rs), transcribed
-from the design document's "must not own" column. Adding a crate means adding a row.
-
-`xtask` is host tooling and is excluded from firmware-target builds by `default-members`;
-build the firmware crates for a target with:
-
-```sh
-cargo build -p waymaker-core -p waymaker-flash -p waymaker-embassy \
-  --no-default-features --target thumbv6m-none-eabi
-```
+from the design document's "must not own" column. Adding a crate means adding a row. The
+pipeline has a table of its own, [`xtask/src/pipeline.rs`](xtask/src/pipeline.rs); adding a
+stage means adding a row there and running `cargo xtask install-hooks`.
 
 ## License
 
