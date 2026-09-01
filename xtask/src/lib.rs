@@ -22,10 +22,12 @@
 #![warn(missing_docs)]
 
 pub mod coverage;
+pub mod elf;
 pub mod graph;
 pub mod manifest;
 pub mod pipeline;
 pub mod policy;
+pub mod size;
 pub mod source;
 
 use std::fmt;
@@ -54,6 +56,8 @@ pub const RULES: &[&str] = &[
     "no-build-scripts",
     "pre-commit-hook",
     "release-profile",
+    "size-probe",
+    "size-probe-reach",
     "toolchain-targets",
     "workspace-lints",
     "workspace-membership",
@@ -139,6 +143,15 @@ pub struct WorkspaceInputs {
     pub pre_commit_hook_is_executable: Option<bool>,
     /// Contents of `rust-toolchain.toml`.
     pub toolchain: Option<String>,
+    /// Contents of the size probe's manifest, when the workspace has one.
+    pub probe_manifest: Option<String>,
+    /// Contents of the size probe's crate root, when the workspace has one.
+    pub probe_source: Option<String>,
+    /// Every source file of every firmware layer, for the probe-reach rule.
+    ///
+    /// Every file, not just the crate root: a public function in a submodule costs exactly
+    /// as much flash as one in `lib.rs`.
+    pub layer_sources: Vec<size::LayerSource>,
 }
 
 /// Runs every rule against already-collected inputs.
@@ -171,6 +184,15 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         inputs.pre_commit_hook_is_executable,
     ));
     violations.extend(pipeline::check_toolchain(inputs.toolchain.as_deref()));
+    violations.extend(size::check_size_probe(
+        &graph,
+        inputs.probe_manifest.as_deref(),
+        inputs.probe_source.as_deref(),
+    ));
+    violations.extend(size::check_probe_reach(
+        &inputs.layer_sources,
+        inputs.probe_source.as_deref(),
+    ));
     for (name, contents) in &inputs.member_manifests {
         violations.extend(manifest::check_member_manifest(name, contents));
     }
@@ -285,6 +307,42 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         }
     }
 
+    let mut layer_sources = Vec::new();
+    for layer in policy::LAYERS {
+        let Some(package) = graph.find(layer.name) else {
+            continue;
+        };
+        let Some(source_root) = package
+            .lib_source_path
+            .as_ref()
+            .and_then(|path| path.parent())
+        else {
+            continue;
+        };
+        for path in rust_sources(source_root) {
+            layer_sources.push(size::LayerSource {
+                crate_name: layer.name.to_owned(),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+                contents: read_to_string(&path)?,
+            });
+        }
+    }
+
+    let probe = graph.find(size::PROBE_PACKAGE);
+    let probe_manifest = probe
+        .and_then(|package| package.manifest_path.as_ref())
+        .map(|path| read_to_string(path))
+        .transpose()?;
+    let probe_source = probe
+        .and_then(|package| package.bins.first())
+        .and_then(|bin| bin.src_path.as_ref())
+        .map(|path| read_to_string(path))
+        .transpose()?;
+
     Ok(WorkspaceInputs {
         metadata_json,
         workspace_manifest,
@@ -295,7 +353,34 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         pre_commit_hook,
         pre_commit_hook_is_executable,
         toolchain,
+        probe_manifest,
+        probe_source,
+        layer_sources,
     })
+}
+
+/// Every `.rs` file under `directory`, in a stable order.
+///
+/// Walked rather than globbed so that `xtask` keeps its two dependencies, and sorted so
+/// that a violation list does not reorder itself between runs.
+fn rust_sources(directory: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Reads a file that the workspace may legitimately not have yet.
@@ -438,6 +523,17 @@ mod tests {
             pre_commit_hook: None,
             pre_commit_hook_is_executable: None,
             toolchain: Some("[toolchain]\nchannel = \"1.97\"\n".to_owned()),
+            // The broken workspace has no size probe at all, which is itself a violation:
+            // a budget nothing links cannot be measured.
+            probe_manifest: None,
+            probe_source: None,
+            // A kernel with a public function the probe does not call: the reach rule
+            // fires, because a function nothing links is a function no budget charges for.
+            layer_sources: vec![size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub fn advance() {}\n".to_owned(),
+            }],
         }
     }
 
@@ -470,6 +566,8 @@ mod tests {
             "no-build-scripts",
             "pre-commit-hook",
             "release-profile",
+            "size-probe",
+            "size-probe-reach",
             "toolchain-targets",
             "workspace-lints",
             "workspace-membership",
@@ -530,6 +628,9 @@ mod tests {
             pre_commit_hook: Some(pipeline::render_pre_commit_hook()),
             pre_commit_hook_is_executable: Some(true),
             toolchain: Some(pipeline::tests_support::clean_toolchain()),
+            probe_manifest: Some(size::tests_support::clean_probe_manifest()),
+            probe_source: Some(size::tests_support::clean_probe_source()),
+            layer_sources: Vec::new(),
         };
 
         let violations = check_inputs(&inputs).expect("the inputs should be checkable");
@@ -592,13 +693,23 @@ mod tests {
         { "id": "embassy", "name": "waymaker-embassy", "source": null,
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null }],
-          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/e/src/lib.rs" }] }
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/e/src/lib.rs" }] },
+        { "id": "probe", "name": "waymaker-size-probe", "source": null,
+          "manifest_path": "/w/probe/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-flash", "kind": null },
+                           { "name": "waymaker-embassy", "kind": null }],
+          "features": { "probe": [], "engine": [], "facade": [] },
+          "targets": [{ "kind": ["bin"], "name": "waymaker-size-probe",
+                        "src_path": "/w/probe/src/main.rs",
+                        "required-features": ["probe"] }] }
       ],
-      "workspace_members": ["core", "flash", "embassy"],
+      "workspace_members": ["core", "flash", "embassy", "probe"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
-        { "id": "embassy", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] }
+        { "id": "embassy", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
+        { "id": "probe", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "embassy" }] }
       ] }
     }"#;
 

@@ -1,0 +1,43 @@
+[package]
+name = "waymaker-size-probe"
+description = "Example firmware linked only so that Waymaker's section sizes can be measured. Never published, never shipped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# A measurement fixture, not a library. Publishing it would put a crate on crates.io whose
+# only reason to exist is to be linked and thrown away.
+publish = false
+
+# Behind `required-features` so that the only build that ever links it is the one that
+# measures it. Without this, `cargo build --workspace` and `cargo clippy --all-targets`
+# would try to link a `#![no_main]` firmware binary for the host, where there is no
+# `#[panic_handler]` slot to fill and no entry point to leave undefined.
+[[bin]]
+name = "waymaker-size-probe"
+path = "src/main.rs"
+required-features = ["probe"]
+
+# Every layer is optional so that the same binary can be linked with none of them, which
+# is what makes an *incremental* measurement possible: the budget in design document §04
+# is a delta against a firmware that contains no Waymaker at all, not an absolute size.
+[dependencies]
+waymaker-core = { workspace = true, optional = true }
+waymaker-flash = { workspace = true, optional = true }
+waymaker-embassy = { workspace = true, optional = true }
+
+[features]
+default = []
+# Builds the binary at all. `cargo xtask size` always passes it.
+probe = []
+# The kernel plus the flash adapter: exactly what the incremental code-flash budget in
+# design document §04 is stated over.
+engine = ["dep:waymaker-core", "dep:waymaker-flash"]
+# The async façade on top of the engine, measured separately so that its cost is its own
+# line rather than part of the kernel's.
+facade = ["engine", "dep:waymaker-embassy"]
+
+[lints]
+workspace = true

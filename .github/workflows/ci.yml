@@ -1,4 +1,4 @@
-# Rung 0.0 pipeline. Issue #10 adds the size job.
+# Rung 0.0 pipeline.
 #
 # Every `run:` below comes from the stage table in `xtask/src/pipeline.rs`. That table is
 # also what `cargo xtask install-hooks` renders `.githooks/pre-commit` from, and
@@ -35,6 +35,7 @@ jobs:
   check:
     name: fmt, clippy, build, test, docs, coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -95,6 +96,7 @@ jobs:
     # `xtask`'s host-only dependencies never reach the firmware target.
     name: thumbv6m-none-eabi build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +113,57 @@ jobs:
       - name: Build the firmware crates for the firmware target
         run: cargo build --locked --no-default-features --target thumbv6m-none-eabi
 
+  size:
+    # Design document §04: "CI records section sizes for every feature combination" and
+    # the code-flash budget "is a gate, not an unverified claim". This job links the size
+    # probe once per feature combination on the firmware target, reads the section headers
+    # out of each image, and fails when a delta against the no-Waymaker baseline exceeds a
+    # budget — naming the number that did it.
+    #
+    # Its own job because it links the whole matrix twice on a pull request: once for this
+    # branch and once for the base branch it is diffed against. Nothing else in the
+    # pipeline is waiting for that, and a budget breach belongs in the checks list rather
+    # than at the end of another job's log.
+    name: size budgets
+    runs-on: ubuntu-latest
+    # Links the matrix twice on a pull request, so it gets more room than the other
+    # jobs — but not six hours of a runner, which is what no timeout means.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base-branch diff checks the base out into a worktree and measures it. A
+          # shallow clone has no base branch to check out, and the step would report "not
+          # compared" on every pull request.
+          fetch-depth: 0
+
+      # rust-toolchain.toml pins `targets = ["thumbv6m-none-eabi"]`, so the firmware target
+      # the budgets are stated for is installed with the toolchain.
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block above explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # No arguments: which base branch to diff against comes from GITHUB_BASE_REF, which
+      # GitHub sets on pull requests and leaves unset on a push to main. That keeps the
+      # command a fixed string, which is what lets the pipeline table in
+      # xtask/src/pipeline.rs compare it against this file byte for byte.
+      - name: Measure the size budgets
+        run: cargo --locked xtask size
+
+      - name: Upload the size report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-report
+          path: target/waymaker-size.json
+          # `warn` rather than `ignore`: the run where the report is missing is the run
+          # where someone wants to know why.
+          if-no-files-found: warn
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash
@@ -126,6 +179,7 @@ jobs:
     # reading a test log.
     name: layering contract
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

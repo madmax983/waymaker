@@ -4,10 +4,13 @@ members = [
     "crates/waymaker-core",
     "crates/waymaker-flash",
     "crates/waymaker-embassy",
+    "crates/waymaker-size-probe",
     "xtask",
 ]
 # `xtask` is a host tool. Firmware-target builds select the default members so that its
 # host-only dependencies never reach `thumbv6m-none-eabi`.
+# `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
+# selecting it by default would add a member the firmware build has nothing to build.
 default-members = [
     "crates/waymaker-core",
     "crates/waymaker-flash",
@@ -25,6 +28,7 @@ authors = ["Waymaker contributors"]
 [workspace.dependencies]
 waymaker-core = { path = "crates/waymaker-core", version = "0.0.0", default-features = false }
 waymaker-flash = { path = "crates/waymaker-flash", version = "0.0.0", default-features = false }
+waymaker-embassy = { path = "crates/waymaker-embassy", version = "0.0.0", default-features = false }
 
 [workspace.lints.rust]
 # Denied rather than forbidden at the workspace level on purpose. Each firmware crate

@@ -60,6 +60,17 @@ pub struct ManifestDep {
     pub kind: DepKind,
 }
 
+/// One binary target of a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinTarget {
+    /// The target name.
+    pub name: String,
+    /// The target's crate root.
+    pub src_path: Option<PathBuf>,
+    /// Features that must be selected before cargo will build it.
+    pub required_features: Vec<String>,
+}
+
 /// One package in the workspace's resolved graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
@@ -71,6 +82,12 @@ pub struct Package {
     pub manifest_deps: Vec<ManifestDep>,
     /// The features enabled by the `default` feature, empty when there is no `default`.
     pub default_features: Vec<String>,
+    /// Every feature the package declares, in name order, `default` included.
+    ///
+    /// The size matrix is derived from this rather than from a list somebody maintains:
+    /// design document §04 requires every optional feature to show its own incremental
+    /// cost, and a hand-written matrix is one a new feature can be left out of.
+    pub features: Vec<String>,
     /// Resolved graph edges, by package id.
     pub resolved_deps: Vec<PackageId>,
     /// Absolute path to the package's `Cargo.toml`, when known.
@@ -82,6 +99,8 @@ pub struct Package {
     pub source: Option<String>,
     /// Whether the package has a `build.rs`.
     pub has_build_script: bool,
+    /// The package's binary targets.
+    pub bins: Vec<BinTarget>,
 }
 
 impl Package {
@@ -95,12 +114,28 @@ impl Package {
             name: name.to_owned(),
             manifest_deps: Vec::new(),
             default_features: Vec::new(),
+            features: Vec::new(),
             resolved_deps: Vec::new(),
             manifest_path: None,
             lib_source_path: None,
             source: None,
             has_build_script: false,
+            bins: Vec::new(),
         }
+    }
+
+    /// Adds a binary target gated behind `required_features`.
+    #[must_use]
+    pub fn with_bin(mut self, name: &str, required_features: &[&str]) -> Self {
+        self.bins.push(BinTarget {
+            name: name.to_owned(),
+            src_path: None,
+            required_features: required_features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+        });
+        self
     }
 
     /// Marks the package as coming from a registry or git source rather than a path.
@@ -125,6 +160,17 @@ impl Package {
             kind,
         });
         self.resolved_deps.push(name.to_owned());
+        self
+    }
+
+    /// Sets every feature the package declares.
+    #[must_use]
+    pub fn with_features(mut self, features: &[&str]) -> Self {
+        self.features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        self.features.sort();
         self
     }
 
@@ -352,6 +398,13 @@ impl PackageGraph {
                 })
                 .unwrap_or_default();
 
+            let mut features: Vec<String> = value
+                .get("features")
+                .and_then(Value::as_object)
+                .map(|features| features.keys().cloned().collect())
+                .unwrap_or_default();
+            features.sort();
+
             let default_features = value
                 .get("features")
                 .and_then(Value::as_object)
@@ -370,6 +423,7 @@ impl PackageGraph {
             let lib_source_path = lib_target_source(value);
             let source = string_field(value, "source");
             let has_build_script = has_target_kind(value, "custom-build");
+            let bins = bin_targets(value);
 
             packages.push(Package {
                 resolved_deps: resolved.get(&id).cloned().unwrap_or_default(),
@@ -377,10 +431,12 @@ impl PackageGraph {
                 name,
                 manifest_deps,
                 default_features,
+                features,
                 manifest_path,
                 lib_source_path,
                 source,
                 has_build_script,
+                bins,
             });
         }
 
@@ -449,6 +505,31 @@ fn has_target_kind(package: &Value, wanted: &str) -> bool {
         .into_iter()
         .flatten()
         .any(|target| target_kinds(target).any(|kind| kind == wanted))
+}
+
+fn bin_targets(package: &Value) -> Vec<BinTarget> {
+    package
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target_kinds(target).any(|kind| kind == "bin"))
+        .map(|target| BinTarget {
+            name: string_field(target, "name").unwrap_or_default(),
+            src_path: string_field(target, "src_path").map(PathBuf::from),
+            required_features: target
+                .get("required-features")
+                .and_then(Value::as_array)
+                .map(|features| {
+                    features
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn lib_target_source(package: &Value) -> Option<PathBuf> {
@@ -623,12 +704,13 @@ pub fn check_workspace_membership(graph: &PackageGraph) -> Vec<Violation> {
                 ));
             };
             let known = policy::layer(&package.name).is_some()
-                || policy::HOST_TOOLS.contains(&package.name.as_str());
+                || policy::HOST_TOOLS.contains(&package.name.as_str())
+                || policy::MEASUREMENT_CRATES.contains(&package.name.as_str());
             (!known).then(|| {
                 Violation::new(
                     "workspace-membership",
                     package.name.clone(),
-                    "is a workspace member but is neither a layer nor declared host tooling; add a row to policy::LAYERS or to policy::HOST_TOOLS",
+                    "is a workspace member but is neither a layer, declared host tooling, nor a measurement fixture; add a row to policy::LAYERS, policy::HOST_TOOLS or policy::MEASUREMENT_CRATES",
                 )
             })
         })

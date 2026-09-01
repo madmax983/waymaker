@@ -129,6 +129,22 @@ pub const STAGES: &[Stage] = &[
         why: "design document §15: a change that only builds on the host is not a change that works",
     },
     Stage {
+        name: "size",
+        job: "size",
+        // Its own job because it links every feature combination on the firmware target
+        // and, on a pull request, links the base branch's too. That is minutes of work
+        // nothing else in the pipeline is waiting for, and a budget breach should be
+        // legible in the checks list rather than at the end of another job's log.
+        //
+        // The command takes no arguments so that this table can compare it against the
+        // workflow byte for byte: which base branch to diff against comes from the
+        // environment GitHub already sets, not from an interpolated `${{ }}` expression
+        // that no fixed string could match.
+        command: "cargo --locked xtask size",
+        in_hook: false,
+        why: "design document \u{a7}04: the size budgets are gates rather than unverified claims",
+    },
+    Stage {
         name: "layering",
         job: "layering",
         command: "cargo --locked xtask check-layering",
