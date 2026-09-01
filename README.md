@@ -258,11 +258,29 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
+| `claude-md` | `CLAUDE.md` loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams |
+| `adr-numbering` | an ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template |
+| `adr-structure` | an ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries a status outside the vocabulary |
+| `adr-index` | an ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist |
+| `settled-decisions` | the ADR recording design document §02 stops recording one of the eight decisions, or its headline |
+| `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge |
+| `missing-docs` | a crate root loses `#![warn(missing_docs)]`, allows it back, or a workspace member has no crate root the rule could run on |
 
 The contract lives in one table, [`xtask/src/policy.rs`](xtask/src/policy.rs), transcribed
 from the design document's "must not own" column. Adding a crate means adding a row. The
 pipeline has a table of its own, [`xtask/src/pipeline.rs`](xtask/src/pipeline.rs); adding a
-stage means adding a row there and running `cargo xtask install-hooks`.
+stage means adding a row there and running `cargo xtask install-hooks`. The documentation
+has a third, [`xtask/src/docs.rs`](xtask/src/docs.rs), which is what stops `CLAUDE.md`, the
+decision record and the architecture diagrams from drifting away from the other two.
+
+## Documentation
+
+| Document | What it is for |
+| --- | --- |
+| [`CLAUDE.md`](CLAUDE.md) | The invariants, the layering rules, the must-not-own table, and every rule the gate can fail you over. Start here. |
+| [`docs/architecture.md`](docs/architecture.md) | The crate dependency flow, the seven-step durable effect protocol, and the two-bank swap, as Mermaid diagrams. |
+| [`docs/adr/`](docs/adr/README.md) | The decision record: why each settled decision is the way it is, and what it costs. |
+| [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) | The design document everything above is taken from. |
 
 ## License
 

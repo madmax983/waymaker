@@ -16,12 +16,19 @@
 //! [`coverage`] gates each crate's line coverage on its own, because a workspace total is
 //! how an untested kernel hides behind a tested adapter.
 //!
+//! The documentation is the third contract. `CLAUDE.md`, the ADR record, and the
+//! architecture diagrams are prose that states the same invariants the tables hold, so
+//! [`docs`] compares them against those tables — a "must not own" cell, a permitted
+//! dependency edge, a settled decision, a protocol step — and fails a pull request in
+//! which the words and the gate have stopped agreeing.
+//!
 //! Every rule is a pure function over parsed input so that it can be tested against a
 //! deliberately broken workspace, not only against the real one.
 
 #![warn(missing_docs)]
 
 pub mod coverage;
+pub mod docs;
 pub mod elf;
 pub mod graph;
 pub mod manifest;
@@ -40,11 +47,16 @@ use std::process::Command;
 /// is what the wiring test compares against, and what the CLI counts when it reports
 /// success, so a new rule cannot be added without appearing in both.
 pub const RULES: &[&str] = &[
+    "adr-index",
+    "adr-numbering",
+    "adr-structure",
     "cargo-config-profile",
     "ci-pipeline",
+    "claude-md",
     "crate-attributes",
     "dependency-direction",
     "dependency-direction-transitive",
+    "diagrams",
     "embassy-below-facade",
     "empty-default-features",
     "gate-broken",
@@ -53,9 +65,11 @@ pub const RULES: &[&str] = &[
     "layer-missing",
     "layer-not-local",
     "member-manifest",
+    "missing-docs",
     "no-build-scripts",
     "pre-commit-hook",
     "release-profile",
+    "settled-decisions",
     "size-probe",
     "size-probe-reach",
     "toolchain-targets",
@@ -152,6 +166,8 @@ pub struct WorkspaceInputs {
     /// Every file, not just the crate root: a public function in a submodule costs exactly
     /// as much flash as one in `lib.rs`.
     pub layer_sources: Vec<size::LayerSource>,
+    /// `CLAUDE.md`, the decision record, the diagrams, and every crate root.
+    pub docs: docs::DocsInputs,
 }
 
 /// Runs every rule against already-collected inputs.
@@ -205,6 +221,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         })
         .collect();
     violations.extend(source::check_crate_attributes(&sources));
+    violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
     violations.dedup();
@@ -343,6 +360,8 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         .map(|path| read_to_string(path))
         .transpose()?;
 
+    let docs = collect_docs_inputs(root, &graph)?;
+
     Ok(WorkspaceInputs {
         metadata_json,
         workspace_manifest,
@@ -356,6 +375,85 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         probe_manifest,
         probe_source,
         layer_sources,
+        docs,
+    })
+}
+
+/// Reads `CLAUDE.md`, the decision record, the architecture document, and every crate root.
+///
+/// Every crate root, not only the firmware layers': `xtask` and the size probe have public
+/// items too, and issue #11 asks for `missing_docs` in *each* crate. A workspace member
+/// whose targets contribute no readable root is recorded in
+/// [`docs::DocsInputs::members_without_roots`] rather than skipped, so a crate cannot
+/// escape the rule by having no target the gate recognises.
+///
+/// # Errors
+///
+/// Returns [`CheckError`] if a file that exists cannot be read.
+fn collect_docs_inputs(
+    root: &Path,
+    graph: &graph::PackageGraph,
+) -> Result<docs::DocsInputs, CheckError> {
+    let adr_dir = root.join(docs::ADR_DIR);
+    let mut adrs = Vec::new();
+    let mut adr_index = None;
+    if let Ok(entries) = std::fs::read_dir(&adr_dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let contents = read_to_string(&path)?;
+            if name == docs::ADR_INDEX {
+                adr_index = Some(contents);
+            } else {
+                adrs.push(docs::AdrFile { name, contents });
+            }
+        }
+    }
+
+    let mut crate_roots = Vec::new();
+    let mut members_without_roots = Vec::new();
+    for id in graph.workspace_members() {
+        let Some(package) = graph.by_id(id) else {
+            // `check_workspace_membership` already reports a member that is not a package.
+            continue;
+        };
+        let mut roots: Vec<PathBuf> = package.lib_source_path.iter().cloned().collect();
+        roots.extend(package.bins.iter().filter_map(|bin| bin.src_path.clone()));
+        if roots.is_empty() {
+            members_without_roots.push(package.name.clone());
+            continue;
+        }
+        for path in roots {
+            crate_roots.push(docs::CrateRoot {
+                package: package.name.clone(),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+                contents: read_to_string(&path)?,
+            });
+        }
+    }
+    crate_roots
+        .sort_by(|left, right| (&left.package, &left.path).cmp(&(&right.package, &right.path)));
+    members_without_roots.sort();
+
+    Ok(docs::DocsInputs {
+        claude_md: read_optional(&root.join(docs::CLAUDE_MD_PATH))?,
+        architecture: read_optional(&root.join(docs::ARCHITECTURE_PATH))?,
+        adr_index,
+        adrs,
+        crate_roots,
+        members_without_roots,
     })
 }
 
@@ -534,6 +632,24 @@ mod tests {
                 path: "crates/waymaker-core/src/lib.rs".to_owned(),
                 contents: "pub fn advance() {}\n".to_owned(),
             }],
+            // No CLAUDE.md, no architecture document, no ADR index, an ADR that is
+            // numbered but structurally empty, and a crate root with no missing_docs
+            // attribute: every documentation rule fires.
+            docs: docs::DocsInputs {
+                claude_md: None,
+                architecture: None,
+                adr_index: None,
+                adrs: vec![docs::AdrFile {
+                    name: "0001-undated.md".to_owned(),
+                    contents: "no title, no status, no sections\n".to_owned(),
+                }],
+                crate_roots: vec![docs::CrateRoot {
+                    package: "waymaker-core".to_owned(),
+                    path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                    contents: "pub fn advance() {}\n".to_owned(),
+                }],
+                members_without_roots: Vec::new(),
+            },
         }
     }
 
@@ -551,11 +667,16 @@ mod tests {
         // called. If a `violations.extend(...)` line is deleted from `check_inputs`, its
         // rule id disappears from this set and the test fails.
         let expected: BTreeSet<&str> = [
+            "adr-index",
+            "adr-numbering",
+            "adr-structure",
             "cargo-config-profile",
             "ci-pipeline",
+            "claude-md",
             "crate-attributes",
             "dependency-direction",
             "dependency-direction-transitive",
+            "diagrams",
             "embassy-below-facade",
             "empty-default-features",
             "inputs-incomplete",
@@ -563,9 +684,11 @@ mod tests {
             "layer-missing",
             "layer-not-local",
             "member-manifest",
+            "missing-docs",
             "no-build-scripts",
             "pre-commit-hook",
             "release-profile",
+            "settled-decisions",
             "size-probe",
             "size-probe-reach",
             "toolchain-targets",
@@ -631,6 +754,7 @@ mod tests {
             probe_manifest: Some(size::tests_support::clean_probe_manifest()),
             probe_source: Some(size::tests_support::clean_probe_source()),
             layer_sources: Vec::new(),
+            docs: docs::tests_support::clean_inputs(RULES),
         };
 
         let violations = check_inputs(&inputs).expect("the inputs should be checkable");

@@ -35,6 +35,7 @@
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 // The linker reports that it cannot find `_start`. That is the design, not a defect: see
 // the module documentation. Allowed here so that a warning nobody can act on does not
 // train readers to ignore the size job's output.
