@@ -533,7 +533,7 @@ pub fn check_kernel_has_no_dependencies(graph: &PackageGraph) -> Vec<Violation> 
         return Vec::new();
     };
 
-    let mut violations: Vec<Violation> = package
+    let violations: Vec<Violation> = package
         .manifest_deps
         .iter()
         .map(|dep| {
