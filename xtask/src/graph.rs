@@ -110,7 +110,10 @@ impl Package {
     /// Sets the packages enabled by the `default` feature.
     #[must_use]
     pub fn with_default_features(mut self, features: &[&str]) -> Self {
-        self.default_features = features.iter().map(|feature| (*feature).to_owned()).collect();
+        self.default_features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
         self
     }
 }
@@ -181,11 +184,7 @@ impl PackageGraph {
 
         let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
         seen_ids.insert(root.id.as_str());
-        let mut queue: VecDeque<&str> = root
-            .resolved_deps
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let mut queue: VecDeque<&str> = root.resolved_deps.iter().map(String::as_str).collect();
 
         while let Some(id) = queue.pop_front() {
             if !seen_ids.insert(id) {
@@ -236,9 +235,8 @@ impl PackageGraph {
                     deps.iter()
                         .filter_map(|dep| {
                             let name = string_field(dep, "name")?;
-                            let kind = DepKind::from_metadata(
-                                dep.get("kind").and_then(Value::as_str),
-                            );
+                            let kind =
+                                DepKind::from_metadata(dep.get("kind").and_then(Value::as_str));
                             Some(ManifestDep { name, kind })
                         })
                         .collect()
@@ -700,7 +698,9 @@ mod tests {
             Some(std::path::Path::new("/w/core/src/lib.rs"))
         );
 
-        let flash = graph.find("waymaker-flash").expect("flash should be present");
+        let flash = graph
+            .find("waymaker-flash")
+            .expect("flash should be present");
         assert_eq!(flash.manifest_deps.len(), 2);
         assert_eq!(flash.manifest_deps[1].kind, DepKind::Development);
         assert_eq!(flash.default_features, ["std".to_owned()]);

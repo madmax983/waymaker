@@ -1,3 +1,54 @@
 [workspace]
 resolver = "3"
-members = ["xtask"]
+members = [
+    "crates/waymaker-core",
+    "crates/waymaker-flash",
+    "crates/waymaker-embassy",
+    "xtask",
+]
+# `xtask` is a host tool. Firmware-target builds select the default members so that its
+# host-only dependencies never reach `thumbv6m-none-eabi`.
+default-members = [
+    "crates/waymaker-core",
+    "crates/waymaker-flash",
+    "crates/waymaker-embassy",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/madmax983/waymaker"
+authors = ["Waymaker contributors"]
+
+[workspace.dependencies]
+waymaker-core = { path = "crates/waymaker-core", version = "0.0.0", default-features = false }
+waymaker-flash = { path = "crates/waymaker-flash", version = "0.0.0", default-features = false }
+
+[workspace.lints.rust]
+# No crate in the workspace has an unsafe block today. An exception requires an ADR and a
+# crate-level `#![deny(unsafe_code)]` with a documented `unsafe` module, not a quiet edit.
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Negative priority so that the individual denials below outrank the groups.
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# `clippy.toml` exempts tests; see `allow-unwrap-in-tests` and `allow-expect-in-tests`.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "warn"
+indexing_slicing = "warn"
+
+# Design document §04 Resource budgets. The incremental code-flash budget is measured
+# against these settings; changing them changes the number CI gates on.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

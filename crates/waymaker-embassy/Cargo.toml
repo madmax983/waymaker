@@ -1,0 +1,21 @@
+[package]
+name = "waymaker-embassy"
+description = "Embassy facade for Waymaker: Ctx, activity futures, dispatcher, and wakeups over the semantic kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["embedded", "no-std", "asynchronous"]
+keywords = ["durable", "workflow", "embassy", "no-std"]
+
+[dependencies]
+waymaker-core.workspace = true
+waymaker-flash.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

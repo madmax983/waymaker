@@ -1,0 +1,22 @@
+[package]
+name = "waymaker-core"
+description = "Semantic kernel for Waymaker: borrowed record views, effect identity, replay cursor, and transition rules. no_std, no_alloc, dependency-free."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["embedded", "no-std"]
+keywords = ["durable", "workflow", "embedded", "no-std"]
+
+# The kernel is dependency-free by contract. `cargo xtask check-layering` fails if any
+# dependency table appears here, including [dev-dependencies].
+
+[features]
+# Default features stay empty so that every optional cost is opt-in and shows up as its
+# own line in the size report.
+default = []
+
+[lints]
+workspace = true

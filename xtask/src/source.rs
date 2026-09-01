@@ -114,7 +114,11 @@ mod tests {
     fn allowing_unsafe_code_is_reported() {
         let sneaky = "#![no_std]\n#![forbid(unsafe_code)]\n#![allow(unsafe_code)]\n";
         let violations = check_crate_attributes(&sources("waymaker-core", sneaky));
-        assert!(violations.iter().any(|v| v.detail.contains("allows unsafe")));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("allows unsafe"))
+        );
     }
 
     #[test]

@@ -1,0 +1,3 @@
+[alias]
+# CI and a local checkout run the same command, so CI is confirmation, not discovery.
+xtask = "run --quiet --package xtask --"

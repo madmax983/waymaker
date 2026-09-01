@@ -1,0 +1,20 @@
+[package]
+name = "waymaker-flash"
+description = "NOR flash adapter for Waymaker: stable wire encoding, CRC and seals, bank selection, append scanning, and the compaction transition."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["embedded", "no-std"]
+keywords = ["durable", "workflow", "flash", "no-std"]
+
+[dependencies]
+waymaker-core.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

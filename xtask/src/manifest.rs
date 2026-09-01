@@ -193,10 +193,7 @@ pub fn check_member_manifest(name: &str, manifest: &str) -> Vec<Violation> {
         ));
     }
 
-    if LAYERS
-        .first()
-        .is_some_and(|kernel| kernel.name == name)
-    {
+    if LAYERS.first().is_some_and(|kernel| kernel.name == name) {
         for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if document
                 .get(table)
@@ -329,7 +326,11 @@ strip = "symbols"
     fn an_allowed_unwrap_is_reported() {
         let allowed = GOOD_WORKSPACE.replace("unwrap_used = \"deny\"", "unwrap_used = \"allow\"");
         let violations = check_workspace_lints(&allowed);
-        assert!(violations.iter().any(|v| v.subject == "clippy::unwrap_used"));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "clippy::unwrap_used")
+        );
     }
 
     #[test]
@@ -349,7 +350,11 @@ strip = "symbols"
     fn a_member_that_ignores_the_workspace_lints_is_reported() {
         let manifest = "[package]\nname = \"waymaker-flash\"\n";
         let violations = check_member_manifest("waymaker-flash", manifest);
-        assert!(violations.iter().any(|v| v.detail.contains("workspace = true")));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("workspace = true"))
+        );
     }
 
     #[test]
