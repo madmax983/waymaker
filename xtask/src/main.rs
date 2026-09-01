@@ -6,8 +6,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str =
-    "usage: cargo xtask <check-layering | coverage [--report FILE] | install-hooks>";
+const USAGE: &str = "usage: cargo xtask <check-layering \
+    | coverage [--report FILE] \
+    | size [--report FILE] [--json FILE] [--baseline-ref REF] [--no-baseline] \
+    | install-hooks>";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -17,6 +19,7 @@ fn main() -> ExitCode {
     match command.as_deref() {
         Some("check-layering" | "check") | None => run_check(),
         Some("coverage") => run_coverage(&rest),
+        Some("size") => run_size(&rest),
         Some("install-hooks") => run_install_hooks(),
         Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
@@ -102,6 +105,125 @@ fn parse_report_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
         }
     }
     Ok(report)
+}
+
+/// Options for `cargo xtask size`.
+#[derive(Debug, Default)]
+struct SizeOptions {
+    /// Gate a report produced earlier instead of linking the matrix again.
+    report: Option<PathBuf>,
+    /// Where to write the report this run produces.
+    json: Option<PathBuf>,
+    /// The base branch to diff against; taken from the CI environment when absent.
+    baseline_ref: Option<String>,
+    /// Skip the base-branch diff entirely.
+    no_baseline: bool,
+}
+
+/// Links the size matrix, gates it against the budgets, and diffs it against the base.
+///
+/// `--report FILE` gates a report produced earlier rather than linking the matrix again,
+/// which is what lets the command be exercised without a firmware build inside a test.
+fn run_size(args: &[String]) -> ExitCode {
+    let options = match parse_size_flags(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("xtask: {message}\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let root = workspace_root();
+    let measured = options
+        .report
+        .as_deref()
+        .map_or_else(|| xtask::size::measure(&root), xtask::size::read_report);
+    let Ok(report) = measured.inspect_err(|error| eprintln!("xtask: {error}")) else {
+        return ExitCode::FAILURE;
+    };
+
+    print!("{}", report.render());
+
+    // Written before the gate is applied, not after: the run that fails a budget is the
+    // run whose numbers somebody wants to look at.
+    let json = options
+        .json
+        .clone()
+        .unwrap_or_else(|| root.join(xtask::size::REPORT_PATH));
+    if let Err(error) = xtask::size::write_report(&json, &report) {
+        eprintln!("xtask: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {}", json.display());
+
+    print!("{}", baseline_diff(&root, &options, &report));
+
+    report.shortfall_report().map_or_else(
+        || {
+            println!("size: ok");
+            ExitCode::SUCCESS
+        },
+        |shortfall| {
+            eprintln!("{shortfall}");
+            ExitCode::FAILURE
+        },
+    )
+}
+
+/// The diff against the base branch, or a line saying why there is not one.
+///
+/// Never a failure. A base branch that cannot be measured — a shallow clone, a push
+/// rather than a pull request, a base from before this gate existed — is a missing
+/// comparison, and a missing comparison is not a budget breach. The budgets themselves
+/// are gated whether or not there is anything to compare against.
+fn baseline_diff(root: &Path, options: &SizeOptions, report: &xtask::size::SizeReport) -> String {
+    if options.no_baseline {
+        return String::new();
+    }
+    let Some(reference) = options
+        .baseline_ref
+        .clone()
+        .or_else(xtask::size::base_ref_from_environment)
+    else {
+        return "size against the base branch: not compared; no base branch was named and GITHUB_BASE_REF is unset\n".to_owned();
+    };
+
+    match xtask::size::measure_baseline(root, &reference) {
+        Ok(base) => xtask::size::render_diff(&xtask::size::diff(&base, report)),
+        Err(error) => format!("size against the base branch: not compared; {error}\n"),
+    }
+}
+
+/// Reads the arguments of `cargo xtask size`.
+fn parse_size_flags(args: &[String]) -> Result<SizeOptions, String> {
+    let mut args = args.iter();
+    let mut options = SizeOptions::default();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--report" => {
+                options.report = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "`--report` needs a path".to_owned())?,
+                ));
+            }
+            "--json" => {
+                options.json = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "`--json` needs a path".to_owned())?,
+                ));
+            }
+            "--baseline-ref" => {
+                options.baseline_ref = Some(
+                    args.next()
+                        .ok_or_else(|| "`--baseline-ref` needs a git reference".to_owned())?
+                        .clone(),
+                );
+            }
+            "--no-baseline" => options.no_baseline = true,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(options)
 }
 
 /// Generates the pre-commit hook and points git at the directory holding it.

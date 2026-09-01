@@ -15,16 +15,21 @@
 //! # Budget
 //!
 //! Kernel state is budgeted at 128 bytes, excluding any page buffer. See design document
-//! §04.
+//! §04. The budget is not a comment: [`budget`] holds the numbers, emits a `const`
+//! assertion for every registered kernel state type, and is the same table
+//! `cargo xtask size` gates the measured section deltas against.
 //!
 //! [`waymaker-flash`]: https://docs.rs/waymaker-flash
 //! [`waymaker-embassy`]: https://docs.rs/waymaker-embassy
 //!
 //! # Status
 //!
-//! Rung 0.0: the crate exists so that the layering is enforceable. The record codec,
-//! cursor, and transition rules arrive with rung 0.1.
+//! Rung 0.0: the crate exists so that the layering is enforceable, and it owns the
+//! resource budgets so that the measurement gates have one place to read them from. The
+//! record codec, cursor, and transition rules arrive with rung 0.1.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod budget;

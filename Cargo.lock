@@ -181,6 +181,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymaker-size-probe"
+version = "0.0.0"
+dependencies = [
+ "waymaker-core",
+ "waymaker-embassy",
+ "waymaker-flash",
+]
+
+[[package]]
 name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -192,6 +201,7 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "toml",
+ "waymaker-core",
 ]
 
 [[package]]

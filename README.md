@@ -42,9 +42,11 @@ convention — see [Development](#development).
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
-Prefix safety, the layering contract, the firmware build and per-crate coverage are CI
-gates today. The size and RAM budgets become gates with the size job (issue #10); until
-then the numbers above are targets from the design document, not measurements.
+Prefix safety, the layering contract, the firmware build, per-crate coverage and the size
+budgets are CI gates today. `cargo xtask size` links an example firmware once per feature
+combination and fails the build when a delta exceeds a budget, naming the number; kernel
+state is additionally a `const` assertion that fails at compile time. See
+[Size budgets](#size-budgets).
 
 ## Guarantees
 
@@ -88,6 +90,7 @@ cargo test   --locked --workspace --no-default-features
 cargo doc    --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
+cargo --locked xtask size
 cargo --locked xtask check-layering
 ```
 
@@ -140,6 +143,42 @@ The reported percentage includes each crate's inline `#[cfg(test)]` module bodie
 covered by construction. The gate is therefore a floor on a number that test code dilutes;
 see the ADR for why that is stated rather than worked around.
 
+### Size budgets
+
+```sh
+cargo --locked xtask size                    # links the matrix, gates it, diffs the base branch
+cargo --locked xtask size --no-baseline      # skip the base-branch diff
+cargo --locked xtask size --report r.json    # gates a report produced earlier
+```
+
+Design document §04 says of the code-flash budget that it "is a gate, not an unverified
+claim". The gate links [`crates/waymaker-size-probe`](crates/waymaker-size-probe) — an
+example firmware that exists only to be measured — on `thumbv6m-none-eabi` with the
+release-size profile, reads the section headers out of each image, and compares every row
+against a **baseline image that links no Waymaker at all**. The budget is incremental, so
+the measurement is a subtraction rather than an absolute size that would charge Waymaker for
+the panic handler and drift with the toolchain.
+
+| Measured | Gated against | How |
+| --- | --- | --- |
+| Incremental code flash | 8 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Engine RAM | 256 B | every allocated writable section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
+| Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix |
+
+The matrix is derived from `cargo metadata`, not written down: the `default` and `facade`
+rows, plus one row per feature every layer declares. Adding `serde`, `postcard`, `defmt` or
+a CRC choice to a crate adds a row to the report with no bookkeeping anywhere. Those
+per-feature rows are reported with their incremental cost but not gated — §04 requires an
+optional cost to be *shown*, and sets no per-feature budget — so the base-branch diff is
+what makes their growth visible in review.
+
+The report is written to `target/waymaker-size.json` and uploaded as a CI artifact. On a
+pull request the base branch is checked out into a worktree, measured with the same build of
+the gate, and diffed. A base that cannot be measured — a shallow clone, or a commit from
+before the probe existed — is reported as "not compared" rather than as a failure: a missing
+comparison is not a budget breach, and the budgets are gated either way. The reasoning is in
+[ADR 0002](docs/adr/0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md).
+
 `cargo xtask check-layering` is the layering contract from design document §05, turned into
 something that fails a pull request. It reads the resolved `cargo metadata` graph rather
 than the manifests, so a forbidden dependency cannot hide behind a target table, an
@@ -153,7 +192,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `kernel-zero-dependencies` | `waymaker-core` declares any dependency, including a dev- or build-dependency |
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
-| `workspace-membership` | a workspace member is neither a layer nor declared host tooling |
+| `workspace-membership` | a workspace member is neither a layer, declared host tooling, nor a measurement fixture |
 | `no-build-scripts` | a firmware crate has a `build.rs` |
 | `empty-default-features` | a firmware crate has a non-empty `default` feature |
 | `crate-attributes` | a crate root drops `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std`/`alloc` |
@@ -164,6 +203,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `ci-pipeline` | the CI workflow stops running a pipeline stage, moves it to another job, runs a job's stages out of order, or leaves a stage in place while making it unable to fail |
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, is not executable, or has drifted from the pipeline table |
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or a component a stage needs |
+| `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, or its crate root stops being bare-metal firmware |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 

@@ -52,6 +52,16 @@ pub const LAYERS: &[LayerSpec] = &[
 /// layering. These crates are excluded from firmware-target builds by `default-members`.
 pub const HOST_TOOLS: &[&str] = &["xtask"];
 
+/// Crates that exist to be measured rather than shipped.
+///
+/// The size probe is firmware — `#![no_std]`, `#![no_main]`, built for
+/// `thumbv6m-none-eabi` — but it is not a layer: it depends on all three of them at once,
+/// on purpose, and nothing depends on it. Listing it here is what keeps
+/// [`crate::graph::check_workspace_membership`] from reading it as a fourth layer that no
+/// rule covers, while [`crate::size::check_size_probe`] applies the rules that do belong
+/// to it.
+pub const MEASUREMENT_FIXTURES: &[&str] = &["waymaker-size-probe"];
+
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";
 
@@ -163,5 +173,24 @@ mod tests {
         for tool in HOST_TOOLS {
             assert!(layer(tool).is_none(), "{tool} must not also be a layer");
         }
+    }
+
+    #[test]
+    fn measurement_fixtures_are_neither_layers_nor_host_tools() {
+        for fixture in MEASUREMENT_FIXTURES {
+            assert!(
+                layer(fixture).is_none(),
+                "{fixture} must not also be a layer"
+            );
+            assert!(
+                !HOST_TOOLS.contains(fixture),
+                "{fixture} must not also be host tooling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_size_probe_is_the_crate_the_size_gate_links() {
+        assert!(MEASUREMENT_FIXTURES.contains(&crate::size::PROBE_PACKAGE));
     }
 }
