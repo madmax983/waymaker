@@ -33,19 +33,26 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, build, test, coverage
+    name: fmt, clippy, build, test, docs, coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
       - name: Install toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
 
       # The coverage stage shells out to a tool no rustup profile carries. Installed
       # before the pipeline starts so that a missing tool is an install failure rather
       # than a coverage run that quietly did not happen.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Format
         run: cargo fmt --all --check
@@ -73,7 +80,9 @@ jobs:
         with:
           name: coverage-report
           path: target/waymaker-coverage.json
-          if-no-files-found: ignore
+          # `warn` rather than `ignore`: the run where the report is missing is the run
+          # where someone wants to know why.
+          if-no-files-found: warn
 
   firmware:
     # Design document §15: "Build on `thumbv6m-none-eabi` with no default features." The
@@ -91,8 +100,13 @@ jobs:
 
       # rust-toolchain.toml pins `targets = ["thumbv6m-none-eabi"]`, so the target is
       # installed with the toolchain rather than by a step this job could forget.
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
       - name: Install toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
 
       - name: Build the firmware crates for the firmware target
         run: cargo build --locked --no-default-features --target thumbv6m-none-eabi
@@ -115,8 +129,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
       - name: Install toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
 
       - name: Check the layering contract
         run: cargo --locked xtask check-layering

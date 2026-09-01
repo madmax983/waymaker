@@ -107,6 +107,16 @@ fn run_xtask(args: &[&str], current_dir: &Path) -> std::process::Output {
         .expect("the xtask binary should be runnable")
 }
 
+/// A `cargo` command that does not inherit a coverage run's instrumentation.
+///
+/// These tests shell out to cargo, and `cargo llvm-cov` runs them with `RUSTC_WRAPPER` and
+/// friends set. Inherited, those make the firmware build fail for a reason that has nothing
+/// to do with the code — and, if a stale artifact happens to be lying around, make it
+/// *succeed* without compiling anything, so the test proves nothing at all.
+fn cargo() -> Command {
+    xtask::coverage::uninstrumented_cargo()
+}
+
 #[test]
 fn the_binary_reports_success_on_the_real_workspace() {
     let output = run_xtask(&["check-layering"], &workspace_root());
@@ -233,8 +243,7 @@ fn add_path_crate(root: &Path, name: &str) {
 /// The gate runs `cargo metadata --locked`, which fails closed on a stale lockfile. A
 /// contributor would have regenerated the lock before pushing; this does the same.
 fn refresh_lockfile(root: &Path) {
-    let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
-    let output = Command::new(cargo)
+    let output = cargo()
         .args(["metadata", "--format-version", "1", "--offline"])
         .current_dir(root)
         .output()
@@ -384,13 +393,19 @@ fn the_binary_exits_non_zero_on_a_broken_workspace() {
 /// The command comes from the stage table rather than being retyped, so a test cannot
 /// prove something about a command CI does not run.
 fn run_stage(stage: &xtask::pipeline::Stage, directory: &Path) -> std::process::Output {
-    let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
+    // Asserted rather than assumed: a stage that is not a bare `cargo` invocation would
+    // make this helper run something other than what CI runs, and still pass.
+    assert!(
+        stage.command.starts_with("cargo "),
+        "{} is not a cargo command, so this helper cannot run it",
+        stage.name
+    );
     let arguments: Vec<&str> = stage
         .command
         .split_whitespace()
         .skip(1) // the leading `cargo`
         .collect();
-    Command::new(cargo)
+    cargo()
         .args(&arguments)
         .current_dir(directory)
         .output()
@@ -452,11 +467,19 @@ fn a_change_that_only_works_on_the_host_fails_the_firmware_build() {
 }
 
 /// An llvm-cov export putting each named crate at `covered` of 100 lines.
+///
+/// `xtask` is the only crate in the workspace with code today, and the gate refuses a report
+/// in which a crate that has code contributed nothing, so every fixture has to account for
+/// it. Callers say what they mean for it by naming it like any other crate.
 fn coverage_export(crates: &[(&str, u64)], root: &Path) -> String {
     let files: Vec<String> = crates
         .iter()
         .map(|(name, covered)| {
-            let path = root.join("crates").join(name).join("src/lib.rs");
+            let path = if *name == "xtask" {
+                root.join("xtask/src/lib.rs")
+            } else {
+                root.join("crates").join(name).join("src/lib.rs")
+            };
             format!(
                 r#"{{"filename":"{}","summary":{{"lines":{{"count":100,"covered":{covered}}}}}}}"#,
                 path.display()
@@ -497,6 +520,7 @@ fn a_crate_below_the_gate_fails_the_coverage_command() {
             ("waymaker-core", 4),
             ("waymaker-flash", 100),
             ("waymaker-embassy", 100),
+            ("xtask", 100),
         ],
         &root,
     );
@@ -518,7 +542,7 @@ fn a_crate_below_the_gate_fails_the_coverage_command() {
 #[test]
 fn a_report_over_the_gate_passes_the_coverage_command() {
     let root = workspace_root();
-    let report = coverage_export(&[("waymaker-core", 85)], &root);
+    let report = coverage_export(&[("waymaker-core", 85), ("xtask", 100)], &root);
 
     let output = run_coverage("over-gate", &report, &root);
 
@@ -530,6 +554,23 @@ fn a_report_over_the_gate_passes_the_coverage_command() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("coverage: ok"), "stdout: {stdout}");
     assert!(stdout.contains("85.00%"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_crate_that_vanished_from_the_report_fails_the_command() {
+    // "No coverable lines" is the gate's one passing state that is not a measurement, so
+    // it is where anything hidden from the measurement lands: `[lib] test = false`, an
+    // exclusion regex, code behind a feature the coverage run does not enable. A crate that
+    // has code and reported nothing is an error, not a pass.
+    let root = workspace_root();
+    let report = coverage_export(&[("waymaker-core", 100)], &root);
+
+    let output = run_coverage("vanished", &report, &root);
+
+    assert!(!output.status.success(), "the gate must fail the build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("xtask"), "stderr: {stderr}");
+    assert!(stderr.contains("no coverable lines"), "stderr: {stderr}");
 }
 
 #[test]
@@ -702,4 +743,67 @@ fn a_toolchain_that_stops_pinning_the_firmware_target_is_rejected() {
         "dropping the firmware target from the toolchain must be rejected:\n{}",
         render(&violations)
     );
+}
+
+/// The README, which documents both tables and is checked against them.
+fn readme() -> String {
+    std::fs::read_to_string(workspace_root().join("README.md")).expect("the README should exist")
+}
+
+#[test]
+fn the_readme_documents_every_rule_the_gate_declares() {
+    // The README's rule table is the only description of the gate a reader gets before
+    // running it, and `cargo xtask check-layering` prints the count from `RULES`. The two
+    // disagreeing in front of the reader is the sort of drift this repository gates.
+    let readme = readme();
+    let table = readme
+        .split_once("| Rule | Fails when |")
+        .map(|(_, rest)| rest)
+        .expect("the README should have a rules table");
+    let documented: std::collections::BTreeSet<String> = table
+        .lines()
+        // The first line is what remains of the header line the split consumed.
+        .skip(1)
+        .take_while(|line| line.trim().starts_with('|'))
+        .filter_map(|line| line.trim().strip_prefix("| `"))
+        .filter_map(|rest| rest.split_once('`'))
+        .map(|(rule, _)| rule.to_owned())
+        .collect();
+    let declared: std::collections::BTreeSet<String> =
+        xtask::RULES.iter().map(|rule| (*rule).to_owned()).collect();
+
+    let missing: Vec<&String> = declared.difference(&documented).collect();
+    assert!(
+        missing.is_empty(),
+        "rules the README does not document: {missing:?}"
+    );
+    let extra: Vec<&String> = documented.difference(&declared).collect();
+    assert!(extra.is_empty(), "rules the README invents: {extra:?}");
+}
+
+#[test]
+fn the_readme_lists_the_pipeline_the_stage_table_defines() {
+    // README.md claims these commands are not transcribed by hand. This is what makes the
+    // claim true: the fenced block under "The pipeline, in order:" must be exactly the
+    // stage table, in order, modulo the column padding that keeps it readable.
+    let readme = readme();
+    let block = readme
+        .split_once("The pipeline, in order:")
+        .and_then(|(_, rest)| rest.split_once("```sh"))
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(block, _)| block.to_owned())
+        .expect("the README should list the pipeline in a fenced block");
+
+    let listed: Vec<String> = block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let expected: Vec<String> = xtask::pipeline::STAGES
+        .iter()
+        .map(|stage| stage.command.to_owned())
+        .collect();
+
+    assert_eq!(listed, expected);
 }

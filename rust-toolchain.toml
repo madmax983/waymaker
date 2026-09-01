@@ -7,6 +7,9 @@
 # run the firmware build too. `cargo xtask check-layering` fails if it is removed.
 [toolchain]
 channel = "1.97"
-components = ["rustfmt", "clippy"]
+# `llvm-tools-preview` is what `cargo llvm-cov` needs; without it here the tool installs it
+# itself, mid-pipeline, over the network. Pinned so the coverage stage has no hidden
+# download in it.
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
 targets = ["thumbv6m-none-eabi"]
 profile = "minimal"

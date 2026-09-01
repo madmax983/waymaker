@@ -23,8 +23,10 @@ pub const REQUIRED_INNER_ATTRIBUTES: &[&str] = &["#![no_std]", "#![forbid(unsafe
 ///
 /// `#![no_std]` is an attribute, not a guarantee: `extern crate std;` below it puts the
 /// standard library back, and `extern crate alloc;` puts the allocator back, with the
-/// attribute still sitting there for a reviewer to see. Until the firmware target is
-/// built in CI (issue #9), this scan is what stops that.
+/// attribute still sitting there for a reviewer to see. The `thumbv6m-none-eabi` build now
+/// catches the `std` half — there is no `std` to link against on that target — but not the
+/// `alloc` half, which cross-compiles perfectly well. This scan is what stops both, and it
+/// says which line did it rather than leaving a linker error to be interpreted.
 pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
 
 /// Rule: every firmware crate is `no_std` and forbids unsafe code.
@@ -78,8 +80,6 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
     violations
 }
 
-/// Collects the crate-level inner attributes, ignoring comments and normalising
-/// whitespace, so that formatting does not decide whether the rule passes.
 /// Collects the crate names in `extern crate <name>;` declarations, ignoring comments.
 fn extern_crates(contents: &str) -> Vec<String> {
     contents
@@ -94,6 +94,8 @@ fn extern_crates(contents: &str) -> Vec<String> {
         .collect()
 }
 
+/// Collects the crate-level inner attributes, ignoring comments and normalising
+/// whitespace, so that formatting does not decide whether the rule passes.
 fn inner_attributes(contents: &str) -> Vec<String> {
     contents
         .lines()

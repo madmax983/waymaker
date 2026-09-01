@@ -70,8 +70,7 @@ impl CrateCoverage {
 }
 
 /// Renders basis points as a percentage with two decimal places.
-#[must_use]
-pub fn render_basis_points(basis_points: u64) -> String {
+fn render_basis_points(basis_points: u64) -> String {
     format!("{}.{:02}%", basis_points / 100, basis_points % 100)
 }
 
@@ -193,8 +192,7 @@ pub struct CoverageError {
 
 impl CoverageError {
     /// Records why the report could not be used.
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
+    fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -235,9 +233,14 @@ pub fn crate_roots(graph: &PackageGraph) -> Vec<CrateRoot> {
 ///
 /// # Errors
 ///
-/// Returns [`CoverageError`] if the export is not the JSON shape llvm-cov produces, or if
-/// an entry reports more covered lines than it has. Both fail the gate rather than
-/// silently contributing nothing: an unreadable report is not a passing report.
+/// Returns [`CoverageError`] if the export is not the JSON shape llvm-cov produces, if an
+/// entry reports more covered lines than it has, or if it attributes no file to any crate
+/// in this workspace. All three fail the gate rather than silently contributing nothing.
+///
+/// That last one is the gate's own fail-open: bucketing is by path prefix, so a report
+/// produced in a different checkout — a downloaded CI artifact, a container with a
+/// different working directory — matches no crate, every row reads "no coverable lines",
+/// and the gate would otherwise pass with nothing measured.
 pub fn summarize(json: &str, roots: &[CrateRoot]) -> Result<CoverageReport, CoverageError> {
     let document: Value = serde_json::from_str(json)
         .map_err(|err| CoverageError::new(format!("could not parse the coverage report: {err}")))?;
@@ -256,6 +259,9 @@ pub fn summarize(json: &str, roots: &[CrateRoot]) -> Result<CoverageReport, Cove
         })
         .collect();
     crates.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut seen: Vec<&str> = Vec::new();
+    let mut attributed = 0_usize;
 
     for export in exports {
         let files = export
@@ -286,14 +292,30 @@ pub fn summarize(json: &str, roots: &[CrateRoot]) -> Result<CoverageReport, Cove
                 )));
             }
 
+            // llvm-cov emits one entry per file, but a report assembled from several runs
+            // can list the same file more than once, and summing it twice would inflate a
+            // crate past the gate.
+            if seen.contains(&filename) {
+                continue;
+            }
+            seen.push(filename);
+
             let Some(owner) = owning_crate(Path::new(filename), roots) else {
                 continue;
             };
             if let Some(entry) = crates.iter_mut().find(|entry| entry.name == owner) {
-                entry.lines += count;
-                entry.covered += covered;
+                entry.lines = entry.lines.saturating_add(count);
+                entry.covered = entry.covered.saturating_add(covered);
+                attributed = attributed.saturating_add(1);
             }
         }
+    }
+
+    if attributed == 0 {
+        return Err(CoverageError::new(format!(
+            "the coverage report attributes none of its {} file(s) to a crate in this workspace, so nothing was measured; it was probably produced somewhere else",
+            seen.len()
+        )));
     }
 
     Ok(CoverageReport { crates })
@@ -301,6 +323,76 @@ pub fn summarize(json: &str, roots: &[CrateRoot]) -> Result<CoverageReport, Cove
 
 /// Where `cargo xtask coverage` writes the export it then gates.
 pub const REPORT_PATH: &str = "target/waymaker-coverage.json";
+
+/// Environment variables `cargo llvm-cov` sets, which a child cargo must not inherit.
+///
+/// `cargo llvm-cov` installs itself as `RUSTC_WRAPPER` and passes its instructions through
+/// these variables. A cargo process spawned underneath it — a test that shells out to
+/// `cargo build --target thumbv6m-none-eabi`, say — inherits them and compiles the firmware
+/// instrumented, which fails: there is no `profiler_builtins` for that target. The prefixes
+/// cover the several names cargo-llvm-cov uses without pinning the exact set, which is an
+/// implementation detail of a tool this repository does not own.
+pub const INSTRUMENTATION_ENV_PREFIXES: &[&str] = &[
+    "CARGO_LLVM_COV",
+    "__CARGO_LLVM_COV",
+    "LLVM_PROFILE",
+    "__LLVM_PROFILE",
+    "RUSTC_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+];
+
+/// Variables that steer `llvm-cov` itself, which the coverage run must not inherit either.
+///
+/// `LLVM_COV_FLAGS` is forwarded to `llvm-cov`, so `--ignore-filename-regex` set in a
+/// workflow's `env:` block would quietly remove files from the report the gate then passes.
+/// The gate decides what it measures.
+const REPORT_STEERING_ENV: &[&str] = &["LLVM_COV_FLAGS", "LLVM_PROFDATA_FLAGS"];
+
+/// The names in `environment` that a child cargo must not inherit from a coverage run.
+///
+/// Pure so that the prefix matching is testable without a coverage run to inherit from.
+#[must_use]
+pub fn instrumentation_variables<'a, I>(environment: I) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    environment
+        .into_iter()
+        .filter(|name| {
+            INSTRUMENTATION_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect()
+}
+
+/// A `cargo` command with any coverage instrumentation stripped from its environment.
+///
+/// Use this for every cargo process spawned from a test: under `cargo llvm-cov` the
+/// inherited environment makes a firmware build fail, and — worse — makes it succeed as a
+/// stale cache hit, so the test verifies nothing and nobody notices.
+#[must_use]
+pub fn uninstrumented_cargo() -> std::process::Command {
+    let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
+    let mut command = std::process::Command::new(cargo);
+    let names: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            INSTRUMENTATION_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    for name in names {
+        command.env_remove(name);
+    }
+    // A developer's own wrapper, which cargo-llvm-cov saves before installing its own.
+    if let Some(wrapper) = std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING") {
+        command.env("RUSTC_WRAPPER", wrapper);
+    }
+    command
+}
 
 /// What to install when the coverage tool is missing.
 const INSTALL_HINT: &str = "install it with `cargo install cargo-llvm-cov`, or with taiki-e/install-action@cargo-llvm-cov in CI";
@@ -331,7 +423,42 @@ pub fn measure(root: &Path, report: Option<&Path>) -> Result<CoverageReport, Cov
         read_report(&path)?
     };
 
-    summarize(&json, &roots)
+    let summary = summarize(&json, &roots)?;
+    check_nothing_vanished(&graph, &summary)?;
+    Ok(summary)
+}
+
+/// Fails when a crate that declares code contributed no coverable lines.
+///
+/// "No coverable lines" is the gate's one passing state that is not a measurement, so it is
+/// also the state anything hidden from the measurement lands in. This is what stops it being
+/// a place to hide.
+fn check_nothing_vanished(
+    graph: &PackageGraph,
+    report: &CoverageReport,
+) -> Result<(), CoverageError> {
+    for entry in report.crates() {
+        if entry.lines != 0 {
+            continue;
+        }
+        let Some(source) = graph
+            .find(&entry.name)
+            .and_then(|package| package.lib_source_path.as_ref())
+        else {
+            continue;
+        };
+        let Ok(contents) = std::fs::read_to_string(source) else {
+            continue;
+        };
+        if declares_executable_code(&contents) {
+            return Err(CoverageError::new(format!(
+                "{} declares code in {} but contributed no coverable lines; it was not measured, which is not the same as being covered",
+                entry.name,
+                source.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_report(path: &Path) -> Result<String, CoverageError> {
@@ -354,17 +481,27 @@ fn run_llvm_cov(root: &Path, output: &Path) -> Result<(), CoverageError> {
         })?;
     }
 
-    let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
-    let status = std::process::Command::new(cargo)
+    let mut command = std::process::Command::new(
+        std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from),
+    );
+    for name in REPORT_STEERING_ENV {
+        command.env_remove(name);
+    }
+    let status = command
         .current_dir(root)
         // The same workspace and feature selection as the test stage, so the gate measures
         // what the pipeline runs rather than a differently configured build.
+        //
+        // `--summary-only` because the gate reads per-file line totals and nothing else;
+        // the full export carries every coverage segment and is two orders of magnitude
+        // larger for no gain.
         .args([
             "llvm-cov",
             "--locked",
             "--workspace",
             "--no-default-features",
             "--json",
+            "--summary-only",
             "--output-path",
         ])
         .arg(output)
@@ -382,6 +519,31 @@ fn run_llvm_cov(root: &Path, output: &Path) -> Result<(), CoverageError> {
             "cargo llvm-cov failed ({status}); if the subcommand is missing, {INSTALL_HINT}"
         )))
     }
+}
+
+/// Whether a crate root looks like it contains code the coverage run should have measured.
+///
+/// A crate reporting no coverable lines is legitimate at rung 0.0 — the firmware crates are
+/// documentation and attributes. It is also what a crate looks like when it has been hidden
+/// from the measurement: `[lib] test = false`, an exclusion regex, code behind a feature the
+/// coverage run does not enable. This distinguishes the two by the only evidence available
+/// without compiling anything: whether the crate root declares a function or an impl.
+///
+/// Deliberately shallow. It is a tripwire on "this crate vanished", not a parser; a crate
+/// whose only code lives in a module file will not trip it, and that is a smaller gap than
+/// the one it closes.
+#[must_use]
+pub fn declares_executable_code(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .any(|line| {
+            line.starts_with("fn ")
+                || line.starts_with("impl ")
+                || line.contains(" fn ")
+                || line.starts_with("impl<")
+        })
 }
 
 /// The crate whose root is the longest prefix of `file`.
@@ -487,10 +649,58 @@ mod tests {
     #[test]
     fn a_sibling_directory_with_a_shared_prefix_is_not_captured() {
         // `/w/xtask-helpers` must not be swallowed by the `/w/xtask` root.
-        let report = summarize_files(&[("/w/xtask-helpers/src/lib.rs", 50, 0)]);
+        let report = summarize_files(&[
+            ("/w/xtask-helpers/src/lib.rs", 50, 0),
+            ("/w/waymaker-core/src/lib.rs", 10, 10),
+        ]);
         assert_eq!(
             report.crate_named("xtask").expect("xtask is a crate").lines,
             0
+        );
+    }
+
+    #[test]
+    fn a_report_that_matches_no_crate_in_this_workspace_is_an_error() {
+        // The gate's own fail-open. Bucketing is by path prefix, so an export produced in
+        // another checkout matches nothing, every row reads "no coverable lines", and the
+        // gate would otherwise pass having measured not one line.
+        let error = summarize(
+            &export(&[("/some/other/checkout/src/lib.rs", 100, 0)]),
+            &roots(),
+        )
+        .expect_err("a report about somewhere else must fail closed");
+        assert!(
+            error.to_string().contains("nothing was measured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_report_is_an_error() {
+        let error =
+            summarize(&export(&[]), &roots()).expect_err("an empty report must fail closed");
+        assert!(
+            error.to_string().contains("nothing was measured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_file_listed_twice_is_counted_once() {
+        // A report stitched together from several runs can repeat a file; summing it twice
+        // would push a crate over the gate on the strength of one well-covered file.
+        let report = summarize_files(&[
+            ("/w/waymaker-core/src/lib.rs", 100, 100),
+            ("/w/waymaker-core/src/lib.rs", 100, 100),
+            ("/w/waymaker-core/src/cursor.rs", 100, 0),
+        ]);
+        let core = report
+            .crate_named("waymaker-core")
+            .expect("core is a crate");
+        assert_eq!((core.lines, core.covered), (200, 100));
+        assert_eq!(
+            report.shortfalls(MINIMUM_LINE_COVERAGE_BASIS_POINTS).len(),
+            1
         );
     }
 
@@ -520,10 +730,38 @@ mod tests {
 
     #[test]
     fn a_crate_below_the_minimum_fails_the_gate() {
-        let report = summarize_files(&[("/w/waymaker-core/src/lib.rs", 100, 84)]);
+        let report = summarize_files(&[
+            ("/w/waymaker-core/src/lib.rs", 100, 84),
+            ("/w/xtask/src/lib.rs", 100, 100),
+        ]);
         let shortfalls = report.shortfalls(MINIMUM_LINE_COVERAGE_BASIS_POINTS);
         assert_eq!(shortfalls.len(), 1);
         assert_eq!(shortfalls[0].name, "waymaker-core");
+    }
+
+    #[test]
+    fn each_row_carries_the_verdict_the_gate_reached_for_it() {
+        let report = summarize_files(&[
+            ("/w/waymaker-core/src/lib.rs", 100, 84),
+            ("/w/xtask/src/lib.rs", 100, 100),
+        ]);
+        let rendered = report.render(MINIMUM_LINE_COVERAGE_BASIS_POINTS);
+        let row = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.trim_start().starts_with(name))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(row("waymaker-core").contains("BELOW GATE"), "{rendered}");
+        assert!(row("xtask").ends_with("ok"), "{rendered}");
+        assert!(
+            row("waymaker-flash").contains("no coverable lines"),
+            "{rendered}"
+        );
+        // The total is 92% and reads `ok` while a crate is below the gate. That is the
+        // whole argument for gating per crate, printed on one screen.
+        assert!(row("TOTAL").ends_with("ok"), "{rendered}");
     }
 
     #[test]
@@ -586,11 +824,20 @@ mod tests {
 
     #[test]
     fn the_rows_are_ordered_by_crate_name() {
-        let report = summarize_files(&[]);
+        // The roots deliberately arrive out of order: a report whose rows follow the
+        // workspace's declaration order is a report whose diff churns for no reason.
+        let unsorted = ["zulu", "alpha", "mike"]
+            .into_iter()
+            .map(|name| CrateRoot {
+                name: name.to_owned(),
+                directory: PathBuf::from(format!("/w/{name}")),
+            })
+            .collect::<Vec<_>>();
+        let report = summarize(&export(&[("/w/alpha/src/lib.rs", 10, 10)]), &unsorted)
+            .expect("the export should be summarizable");
+
         let names: Vec<&str> = report.crates().iter().map(|c| c.name.as_str()).collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        assert_eq!(names, sorted);
+        assert_eq!(names, ["alpha", "mike", "zulu"]);
     }
 
     #[test]
@@ -660,6 +907,26 @@ mod tests {
         let graph =
             crate::graph::PackageGraph::from_cargo_metadata(METADATA).expect("metadata parses");
         assert!(crate_roots(&graph).is_empty());
+    }
+
+    #[test]
+    fn a_crate_root_with_a_function_declares_executable_code() {
+        assert!(declares_executable_code("pub fn counter() -> u8 { 0 }\n"));
+        assert!(declares_executable_code("fn private() {}\n"));
+        assert!(declares_executable_code(
+            "impl Cursor {\n    fn step(&self) {}\n}\n"
+        ));
+        assert!(declares_executable_code(
+            "    pub const fn zero() -> u8 { 0 }"
+        ));
+    }
+
+    #[test]
+    fn a_crate_root_of_documentation_and_attributes_declares_none() {
+        // The rung 0.0 firmware crates, which legitimately report no coverable lines.
+        let scaffolding = "//! Docs about a fn that does not exist yet.\n\
+                           #![no_std]\n#![forbid(unsafe_code)]\n";
+        assert!(!declares_executable_code(scaffolding));
     }
 
     #[test]

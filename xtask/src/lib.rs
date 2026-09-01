@@ -522,7 +522,10 @@ mod tests {
                     )
                 })
                 .collect(),
-            cargo_config: Some("[alias]\nxtask = \"run -p xtask --\"\n".to_owned()),
+            cargo_config: Some(format!(
+                "[alias]\nxtask = \"{}\"\n",
+                manifest::REQUIRED_XTASK_ALIAS
+            )),
             workflow: Some(pipeline::tests_support::clean_workflow()),
             pre_commit_hook: Some(pipeline::render_pre_commit_hook()),
             pre_commit_hook_is_executable: Some(true),
