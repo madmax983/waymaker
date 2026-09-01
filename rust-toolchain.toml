@@ -2,8 +2,14 @@
 # groups and CI runs with `-D warnings`; `nursery` in particular gains lints every six
 # weeks, so a floating channel turns an unrelated pull request red for a lint nobody in
 # the change ever saw. Bump this deliberately, with the clippy fixes in the same commit.
-# Issue #9 adds `targets = ["thumbv6m-none-eabi"]` here.
+#
+# `targets` is pinned here rather than installed by a CI step so that a local checkout can
+# run the firmware build too. `cargo xtask check-layering` fails if it is removed.
 [toolchain]
 channel = "1.97"
-components = ["rustfmt", "clippy"]
+# `llvm-tools-preview` is what `cargo llvm-cov` needs; without it here the tool installs it
+# itself, mid-pipeline, over the network. Pinned so the coverage stage has no hidden
+# download in it.
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["thumbv6m-none-eabi"]
 profile = "minimal"

@@ -28,6 +28,15 @@ pub const REQUIRED_CLIPPY_GROUPS: &[&str] = &["pedantic", "nursery"];
 /// Individual lints that must be denied workspace-wide.
 pub const REQUIRED_CLIPPY_DENIALS: &[&str] = &["unwrap_used"];
 
+/// The cargo alias every gate in this repository is invoked through.
+///
+/// `cargo xtask check-layering` and `cargo xtask coverage` are the two gates, and both go
+/// through this alias in CI, in the hook, and in the README. Editing the alias — appending
+/// `--help`, pointing it at another package — turns every one of those invocations into a
+/// no-op that exits zero, from a file no other rule reads. So the alias is pinned like the
+/// release profile is.
+pub const REQUIRED_XTASK_ALIAS: &str = "run --quiet --package xtask --";
+
 /// Rule: the release profile matches the design document exactly.
 #[must_use]
 pub fn check_release_profile(manifest: &str) -> Vec<Violation> {
@@ -174,16 +183,25 @@ pub fn check_workspace_lints(manifest: &str) -> Vec<Violation> {
     violations
 }
 
-/// Rule: `.cargo/config.toml` declares no profile.
+/// Rule: `.cargo/config.toml` changes nothing about how the workspace builds or is gated.
 ///
-/// A `[profile.*]` table in `.cargo/config.toml` overrides the manifest, so four lines in
-/// a file the release-profile rule does not read are enough to defeat the size budget the
-/// release profile exists to protect. Banning profiles there outright is simpler and more
-/// honest than reimplementing cargo's precedence.
+/// This file is read by every cargo invocation and by no other rule, which makes it the
+/// quietest place in the repository to disable something. A `[profile.*]` table overrides
+/// the manifest, so four lines here defeat the size budget the release profile exists to
+/// protect. An `[env]` table sets environment variables for every build, including the ones
+/// `cargo llvm-cov` reads to decide what to measure. `[build] rustflags` changes what every
+/// crate is compiled with. And the `xtask` alias is how both gates are invoked, so a
+/// rewritten alias turns them into commands that exit zero.
+///
+/// Banning them outright is simpler and more honest than reimplementing cargo's precedence.
 #[must_use]
 pub fn check_cargo_config(config: Option<&str>) -> Vec<Violation> {
     let Some(config) = config else {
-        return Vec::new();
+        return vec![Violation::new(
+            "cargo-config-profile",
+            ".cargo/config.toml",
+            format!("is missing, so `cargo xtask` is not aliased to `{REQUIRED_XTASK_ALIAS}`"),
+        )];
     };
     let Some(document) = parse(config) else {
         return vec![Violation::new(
@@ -193,24 +211,60 @@ pub fn check_cargo_config(config: Option<&str>) -> Vec<Violation> {
         )];
     };
 
-    document
-        .get("profile")
-        .and_then(Value::as_table)
-        .map(|profiles| {
-            profiles
-                .keys()
-                .map(|name| {
-                    Violation::new(
-                        "cargo-config-profile",
-                        ".cargo/config.toml",
-                        format!(
-                            "declares [profile.{name}], which silently overrides the release profile in Cargo.toml; profiles belong in the workspace manifest"
-                        ),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut violations = Vec::new();
+
+    if let Some(profiles) = document.get("profile").and_then(Value::as_table) {
+        for name in profiles.keys() {
+            violations.push(Violation::new(
+                "cargo-config-profile",
+                ".cargo/config.toml",
+                format!(
+                    "declares [profile.{name}], which silently overrides the release profile in Cargo.toml; profiles belong in the workspace manifest"
+                ),
+            ));
+        }
+    }
+
+    if let Some(variables) = document.get("env").and_then(Value::as_table) {
+        for name in variables.keys() {
+            violations.push(Violation::new(
+                "cargo-config-profile",
+                ".cargo/config.toml",
+                format!(
+                    "declares [env] {name}, which is set for every cargo invocation including the coverage run; environment that changes what is measured does not belong in a tracked file"
+                ),
+            ));
+        }
+    }
+
+    if document
+        .get("build")
+        .and_then(|build| build.get("rustflags"))
+        .is_some()
+    {
+        violations.push(Violation::new(
+            "cargo-config-profile",
+            ".cargo/config.toml",
+            "declares [build] rustflags, which changes how every crate in the workspace is compiled",
+        ));
+    }
+
+    let alias = document
+        .get("alias")
+        .and_then(|alias| alias.get("xtask"))
+        .and_then(Value::as_str);
+    if alias != Some(REQUIRED_XTASK_ALIAS) {
+        violations.push(Violation::new(
+            "cargo-config-profile",
+            ".cargo/config.toml",
+            format!(
+                "aliases `cargo xtask` to {}, expected `{REQUIRED_XTASK_ALIAS}`; the alias is how both gates are run, so rewriting it makes them exit zero without checking anything",
+                alias.map_or_else(|| "nothing".to_owned(), |value| format!("`{value}`"))
+            ),
+        ));
+    }
+
+    violations
 }
 
 /// Rule: every firmware crate inherits the workspace lints and declares no default
@@ -250,6 +304,27 @@ pub fn check_member_manifest(name: &str, manifest: &str) -> Vec<Violation> {
             name.to_owned(),
             "declares a non-empty `default` feature; default features must be empty",
         ));
+    }
+
+    // `[lib] test = false` stops the crate's test binary being built at all, which stops
+    // llvm-cov instrumenting it, which makes a crate full of untested code report "no
+    // coverable lines" and pass the coverage gate. It also silently stops its unit tests
+    // running. Two lines, in a table nothing else reads.
+    for key in ["test", "doctest", "harness"] {
+        let disabled = document
+            .get("lib")
+            .and_then(|lib| lib.get(key))
+            .and_then(Value::as_bool)
+            .is_some_and(|enabled| !enabled);
+        if disabled {
+            violations.push(Violation::new(
+                "member-manifest",
+                name.to_owned(),
+                format!(
+                    "declares `[lib] {key} = false`, which stops the crate being measured; a crate that opts out of testing opts out of the coverage gate"
+                ),
+            ));
+        }
     }
 
     if LAYERS.first().is_some_and(|kernel| kernel.name == name) {
@@ -496,16 +571,57 @@ strip = "symbols"
         assert!(check_member_manifest("waymaker-flash", manifest).is_empty());
     }
 
+    /// A `.cargo/config.toml` that carries the alias and nothing else.
+    fn good_cargo_config() -> String {
+        format!("[alias]\nxtask = \"{REQUIRED_XTASK_ALIAS}\"\n")
+    }
+
     #[test]
-    fn a_cargo_config_without_a_profile_passes() {
-        assert!(check_cargo_config(Some("[alias]\nxtask = \"run -p xtask --\"\n")).is_empty());
-        assert!(check_cargo_config(None).is_empty());
+    fn a_cargo_config_with_only_the_alias_passes() {
+        let violations = check_cargo_config(Some(&good_cargo_config()));
+        assert!(violations.is_empty(), "{}", details(&violations));
+    }
+
+    #[test]
+    fn a_missing_cargo_config_is_reported() {
+        // Without the file there is no `cargo xtask`, so neither gate is reachable by the
+        // command CI, the hook and the README all use.
+        assert!(!check_cargo_config(None).is_empty());
+    }
+
+    #[test]
+    fn a_rewritten_xtask_alias_is_reported() {
+        // The attack this rule exists for: `cargo xtask check-layering` and
+        // `cargo xtask coverage` both print usage and exit zero, and every command string
+        // in the workflow still matches the table byte for byte.
+        let config = "[alias]\nxtask = \"run --quiet --package xtask -- --help\"\n";
+        let violations = check_cargo_config(Some(config));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("exit zero") && v.detail.contains("--help")),
+            "{}",
+            details(&violations)
+        );
+    }
+
+    #[test]
+    fn a_missing_xtask_alias_is_reported() {
+        let violations = check_cargo_config(Some("[alias]\nlint = \"clippy\"\n"));
+        assert!(
+            violations.iter().any(|v| v.detail.contains("nothing")),
+            "{}",
+            details(&violations)
+        );
     }
 
     #[test]
     fn a_profile_in_the_cargo_config_is_reported() {
-        let config = "[alias]\nxtask = \"run\"\n\n[profile.release]\nopt-level = 3\n";
-        let violations = check_cargo_config(Some(config));
+        let config = format!(
+            "{}\n[profile.release]\nopt-level = 3\n",
+            good_cargo_config()
+        );
+        let violations = check_cargo_config(Some(&config));
         assert_eq!(violations.len(), 1, "{}", details(&violations));
         assert_eq!(violations[0].rule, "cargo-config-profile");
         assert!(violations[0].detail.contains("profile.release"));
@@ -513,9 +629,59 @@ strip = "symbols"
 
     #[test]
     fn every_profile_in_the_cargo_config_is_named() {
-        let config = "[profile.release]\nopt-level = 3\n\n[profile.dev]\ndebug = false\n";
-        let violations = check_cargo_config(Some(config));
+        let config = format!(
+            "{}\n[profile.release]\nopt-level = 3\n\n[profile.dev]\ndebug = false\n",
+            good_cargo_config()
+        );
+        let violations = check_cargo_config(Some(&config));
         assert_eq!(violations.len(), 2, "{}", details(&violations));
+    }
+
+    #[test]
+    fn an_env_table_in_the_cargo_config_is_reported() {
+        // `LLVM_COV_FLAGS = "--ignore-filename-regex=..."` here would quietly remove files
+        // from the coverage report the gate then passes.
+        let config = format!(
+            "{}\n[env]\nLLVM_COV_FLAGS = \"--ignore-filename-regex=untested\"\n",
+            good_cargo_config()
+        );
+        let violations = check_cargo_config(Some(&config));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("LLVM_COV_FLAGS")),
+            "{}",
+            details(&violations)
+        );
+    }
+
+    #[test]
+    fn build_rustflags_in_the_cargo_config_are_reported() {
+        let config = format!(
+            "{}\n[build]\nrustflags = [\"-C\", \"opt-level=3\"]\n",
+            good_cargo_config()
+        );
+        let violations = check_cargo_config(Some(&config));
+        assert!(
+            violations.iter().any(|v| v.detail.contains("rustflags")),
+            "{}",
+            details(&violations)
+        );
+    }
+
+    #[test]
+    fn a_crate_that_opts_out_of_its_own_test_binary_is_reported() {
+        // `[lib] test = false` stops llvm-cov instrumenting the crate, so a crate full of
+        // untested code reports "no coverable lines" and clears the coverage gate.
+        let manifest = "[package]\nname = \"waymaker-core\"\n\n[lints]\nworkspace = true\n\n[lib]\ntest = false\n";
+        let violations = check_member_manifest("waymaker-core", manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("stops the crate being measured")),
+            "{}",
+            details(&violations)
+        );
     }
 
     #[test]

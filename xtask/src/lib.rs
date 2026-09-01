@@ -9,13 +9,22 @@
 //! * `#![no_std]` and `#![forbid(unsafe_code)]` in every firmware crate,
 //! * the release profile and workspace lint table from the design document.
 //!
+//! It does the same for the pipeline. The stages CI runs are a table in [`pipeline`], the
+//! pre-commit hook is rendered from that table, and the rules here fail a pull request in
+//! which the committed workflow, the committed hook, or the pinned toolchain has drifted
+//! from it — so "the hook and CI run the same commands" is checked rather than promised.
+//! [`coverage`] gates each crate's line coverage on its own, because a workspace total is
+//! how an untested kernel hides behind a tested adapter.
+//!
 //! Every rule is a pure function over parsed input so that it can be tested against a
 //! deliberately broken workspace, not only against the real one.
 
 #![warn(missing_docs)]
 
+pub mod coverage;
 pub mod graph;
 pub mod manifest;
+pub mod pipeline;
 pub mod policy;
 pub mod source;
 
@@ -30,6 +39,7 @@ use std::process::Command;
 /// success, so a new rule cannot be added without appearing in both.
 pub const RULES: &[&str] = &[
     "cargo-config-profile",
+    "ci-pipeline",
     "crate-attributes",
     "dependency-direction",
     "dependency-direction-transitive",
@@ -42,7 +52,9 @@ pub const RULES: &[&str] = &[
     "layer-not-local",
     "member-manifest",
     "no-build-scripts",
+    "pre-commit-hook",
     "release-profile",
+    "toolchain-targets",
     "workspace-lints",
     "workspace-membership",
 ];
@@ -116,6 +128,17 @@ pub struct WorkspaceInputs {
     pub crate_sources: Vec<(String, String)>,
     /// Contents of `.cargo/config.toml`, when the workspace has one.
     pub cargo_config: Option<String>,
+    /// Contents of the CI workflow the pipeline stages must appear in.
+    pub workflow: Option<String>,
+    /// Contents of the committed pre-commit hook.
+    pub pre_commit_hook: Option<String>,
+    /// Whether that hook carries the execute bit, where the platform has one.
+    ///
+    /// `None` on a checkout whose filesystem does not record it, which the rule treats as
+    /// "cannot tell" rather than as a violation.
+    pub pre_commit_hook_is_executable: Option<bool>,
+    /// Contents of `rust-toolchain.toml`.
+    pub toolchain: Option<String>,
 }
 
 /// Runs every rule against already-collected inputs.
@@ -142,6 +165,12 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(manifest::check_release_profile(&inputs.workspace_manifest));
     violations.extend(manifest::check_workspace_lints(&inputs.workspace_manifest));
     violations.extend(manifest::check_cargo_config(inputs.cargo_config.as_deref()));
+    violations.extend(pipeline::check_workflow(inputs.workflow.as_deref()));
+    violations.extend(pipeline::check_pre_commit_hook(
+        inputs.pre_commit_hook.as_deref(),
+        inputs.pre_commit_hook_is_executable,
+    ));
+    violations.extend(pipeline::check_toolchain(inputs.toolchain.as_deref()));
     for (name, contents) in &inputs.member_manifests {
         violations.extend(manifest::check_member_manifest(name, contents));
     }
@@ -233,12 +262,14 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
     let graph = graph::PackageGraph::from_cargo_metadata(&metadata_json)
         .map_err(|err| CheckError::new(format!("could not parse cargo metadata: {err}")))?;
 
-    let cargo_config_path = root.join(".cargo").join("config.toml");
-    let cargo_config = if cargo_config_path.is_file() {
-        Some(read_to_string(&cargo_config_path)?)
-    } else {
-        None
-    };
+    let cargo_config = read_optional(&root.join(".cargo").join("config.toml"))?;
+    let workflow = read_optional(&root.join(pipeline::WORKFLOW_PATH))?;
+    let toolchain = read_optional(&root.join(pipeline::TOOLCHAIN_PATH))?;
+    let hook_path = root.join(pipeline::PRE_COMMIT_PATH);
+    let pre_commit_hook = read_optional(&hook_path)?;
+    let pre_commit_hook_is_executable = pre_commit_hook
+        .as_ref()
+        .and_then(|_| is_executable(&hook_path));
 
     let mut member_manifests = Vec::new();
     let mut crate_sources = Vec::new();
@@ -260,7 +291,38 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         member_manifests,
         crate_sources,
         cargo_config,
+        workflow,
+        pre_commit_hook,
+        pre_commit_hook_is_executable,
+        toolchain,
     })
+}
+
+/// Reads a file that the workspace may legitimately not have yet.
+///
+/// A missing file is `None` rather than an error: the rule that wanted it reports its
+/// absence in the same report as every other violation, instead of stopping the gate
+/// before the other rules have run.
+fn read_optional(path: &Path) -> Result<Option<String>, CheckError> {
+    if path.is_file() {
+        read_to_string(path).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether `path` carries an execute bit, or `None` where the platform has none to read.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    Some(mode & 0o111 != 0)
+}
+
+/// Whether `path` carries an execute bit, or `None` where the platform has none to read.
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> Option<bool> {
+    None
 }
 
 fn read_to_string(path: &Path) -> Result<String, CheckError> {
@@ -268,7 +330,7 @@ fn read_to_string(path: &Path) -> Result<String, CheckError> {
         .map_err(|err| CheckError::new(format!("could not read {}: {err}", path.display())))
 }
 
-fn run_cargo_metadata(root: &Path) -> Result<String, CheckError> {
+pub(crate) fn run_cargo_metadata(root: &Path) -> Result<String, CheckError> {
     let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
     let output = Command::new(cargo)
         .current_dir(root)
@@ -370,6 +432,12 @@ mod tests {
             // waymaker-flash is in the graph but contributes no source: inputs-incomplete.
             crate_sources: vec![("waymaker-core".to_owned(), "// no attributes\n".to_owned())],
             cargo_config: Some("[profile.release]\nopt-level = 3\n".to_owned()),
+            // No workflow, no hook, and a toolchain that never heard of the firmware
+            // target: ci-pipeline, pre-commit-hook and toolchain-targets all fire.
+            workflow: None,
+            pre_commit_hook: None,
+            pre_commit_hook_is_executable: None,
+            toolchain: Some("[toolchain]\nchannel = \"1.97\"\n".to_owned()),
         }
     }
 
@@ -388,6 +456,7 @@ mod tests {
         // rule id disappears from this set and the test fails.
         let expected: BTreeSet<&str> = [
             "cargo-config-profile",
+            "ci-pipeline",
             "crate-attributes",
             "dependency-direction",
             "dependency-direction-transitive",
@@ -399,7 +468,9 @@ mod tests {
             "layer-not-local",
             "member-manifest",
             "no-build-scripts",
+            "pre-commit-hook",
             "release-profile",
+            "toolchain-targets",
             "workspace-lints",
             "workspace-membership",
         ]
@@ -451,7 +522,14 @@ mod tests {
                     )
                 })
                 .collect(),
-            cargo_config: Some("[alias]\nxtask = \"run -p xtask --\"\n".to_owned()),
+            cargo_config: Some(format!(
+                "[alias]\nxtask = \"{}\"\n",
+                manifest::REQUIRED_XTASK_ALIAS
+            )),
+            workflow: Some(pipeline::tests_support::clean_workflow()),
+            pre_commit_hook: Some(pipeline::render_pre_commit_hook()),
+            pre_commit_hook_is_executable: Some(true),
+            toolchain: Some(pipeline::tests_support::clean_toolchain()),
         };
 
         let violations = check_inputs(&inputs).expect("the inputs should be checkable");

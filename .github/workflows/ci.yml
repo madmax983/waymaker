@@ -1,7 +1,12 @@
-# Rung 0.0 pipeline. Issue #9 extends this with the thumbv6m-none-eabi build, the
-# coverage gate, and the pre-commit hooks that mirror it; issue #10 adds the size job.
+# Rung 0.0 pipeline. Issue #10 adds the size job.
 #
-# The toolchain comes from rust-toolchain.toml, which both jobs and a local checkout read,
+# Every `run:` below comes from the stage table in `xtask/src/pipeline.rs`. That table is
+# also what `cargo xtask install-hooks` renders `.githooks/pre-commit` from, and
+# `cargo xtask check-layering` fails a pull request in which this file, the hook, or the
+# pinned toolchain has drifted from it. The commands are therefore not repeated here by
+# convention — they are checked.
+#
+# The toolchain comes from rust-toolchain.toml, which every job and a local checkout read,
 # so CI is confirmation rather than discovery.
 name: CI
 
@@ -28,13 +33,26 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, build, test
+    name: fmt, clippy, build, test, docs, coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
       - name: Install toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # The coverage stage shells out to a tool no rustup profile carries. Installed
+      # before the pipeline starts so that a missing tool is an install failure rather
+      # than a coverage run that quietly did not happen.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Format
         run: cargo fmt --all --check
@@ -51,13 +69,56 @@ jobs:
       - name: Docs
         run: cargo doc --locked --workspace --no-deps --no-default-features
 
+      # Per crate, not per workspace: a total is how an untested kernel hides behind a
+      # tested adapter. The gate and the per-crate table live in xtask/src/coverage.rs.
+      - name: Coverage
+        run: cargo --locked xtask coverage
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/waymaker-coverage.json
+          # `warn` rather than `ignore`: the run where the report is missing is the run
+          # where someone wants to know why.
+          if-no-files-found: warn
+
+  firmware:
+    # Design document §15: "Build on `thumbv6m-none-eabi` with no default features." The
+    # firmware target is not an occasional check — a change that only builds on the host
+    # is not a change that works, so this is its own check in the list rather than a step
+    # buried in another job's log.
+    #
+    # No `--workspace`: `default-members` is exactly the three firmware crates, so a crate
+    # added to the layering is built here without anyone remembering a `-p` flag, and
+    # `xtask`'s host-only dependencies never reach the firmware target.
+    name: thumbv6m-none-eabi build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins `targets = ["thumbv6m-none-eabi"]`, so the target is
+      # installed with the toolchain rather than by a step this job could forget.
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build the firmware crates for the firmware target
+        run: cargo build --locked --no-default-features --target thumbv6m-none-eabi
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash
     # reaches for Embassy directly or through another crate, if a crate stops being
     # no_std or starts allowing unsafe code, if a new workspace member appears that no
-    # layer rule covers, or if the release profile or lint table drifts from the design
-    # document.
+    # layer rule covers, if the release profile or lint table drifts from the design
+    # document, or if this workflow, the pre-commit hook, and the pipeline table stop
+    # agreeing with each other.
     #
     # `cargo test` also runs this gate through xtask's integration tests. This job is
     # kept separate because it is the only thing that exercises the binary a developer
@@ -68,8 +129,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block below explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
       - name: Install toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
 
       - name: Check the layering contract
         run: cargo --locked xtask check-layering

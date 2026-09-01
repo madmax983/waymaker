@@ -107,6 +107,16 @@ fn run_xtask(args: &[&str], current_dir: &Path) -> std::process::Output {
         .expect("the xtask binary should be runnable")
 }
 
+/// A `cargo` command that does not inherit a coverage run's instrumentation.
+///
+/// These tests shell out to cargo, and `cargo llvm-cov` runs them with `RUSTC_WRAPPER` and
+/// friends set. Inherited, those make the firmware build fail for a reason that has nothing
+/// to do with the code — and, if a stale artifact happens to be lying around, make it
+/// *succeed* without compiling anything, so the test proves nothing at all.
+fn cargo() -> Command {
+    xtask::coverage::uninstrumented_cargo()
+}
+
 #[test]
 fn the_binary_reports_success_on_the_real_workspace() {
     let output = run_xtask(&["check-layering"], &workspace_root());
@@ -233,8 +243,7 @@ fn add_path_crate(root: &Path, name: &str) {
 /// The gate runs `cargo metadata --locked`, which fails closed on a stale lockfile. A
 /// contributor would have regenerated the lock before pushing; this does the same.
 fn refresh_lockfile(root: &Path) {
-    let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
-    let output = Command::new(cargo)
+    let output = cargo()
         .args(["metadata", "--format-version", "1", "--offline"])
         .current_dir(root)
         .output()
@@ -368,4 +377,433 @@ fn the_binary_exits_non_zero_on_a_broken_workspace() {
         stderr.contains("design document"),
         "the report should point at the contract: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #9: the pipeline, the firmware target, and the coverage gate.
+//
+// The tests above prove the layering contract. These prove the three things issue #9 says
+// the change is done when: a change that breaks the `thumbv6m-none-eabi` build fails, a
+// change that drops coverage below the gate fails, and the hook and the pipeline run the
+// same commands.
+// ---------------------------------------------------------------------------------------
+
+/// Runs a pipeline stage's command with `cargo` in `directory`.
+///
+/// The command comes from the stage table rather than being retyped, so a test cannot
+/// prove something about a command CI does not run.
+fn run_stage(stage: &xtask::pipeline::Stage, directory: &Path) -> std::process::Output {
+    // Asserted rather than assumed: a stage that is not a bare `cargo` invocation would
+    // make this helper run something other than what CI runs, and still pass.
+    assert!(
+        stage.command.starts_with("cargo "),
+        "{} is not a cargo command, so this helper cannot run it",
+        stage.name
+    );
+    let arguments: Vec<&str> = stage
+        .command
+        .split_whitespace()
+        .skip(1) // the leading `cargo`
+        .collect();
+    cargo()
+        .args(&arguments)
+        .current_dir(directory)
+        .output()
+        .expect("cargo should be runnable")
+}
+
+fn stage(name: &str) -> &'static xtask::pipeline::Stage {
+    xtask::pipeline::STAGES
+        .iter()
+        .find(|stage| stage.name == name)
+        .expect("the stage should be in the pipeline table")
+}
+
+#[test]
+fn the_firmware_crates_build_for_the_firmware_target() {
+    let output = run_stage(stage("firmware"), &workspace_root());
+    assert!(
+        output.status.success(),
+        "the firmware build must pass on the workspace we ship: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_change_that_only_works_on_the_host_fails_the_firmware_build() {
+    // Issue #9: "A PR that breaks the `thumbv6m` build fails CI."
+    //
+    // `AtomicU64` exists in `core` on x86-64 and does not exist on `thumbv6m-none-eabi`,
+    // which has neither 64-bit atomics nor atomic compare-and-swap. It is therefore a
+    // change that a host build accepts and only the firmware build rejects — which is the
+    // whole reason the firmware build is in the pipeline.
+    let scratch = scratch_workspace("firmware-break");
+    let root = scratch.root.join("crates/waymaker-core/src/lib.rs");
+    let existing = std::fs::read_to_string(&root).expect("the crate root should be read");
+    std::fs::write(
+        &root,
+        format!(
+            "{existing}\n/// A counter the firmware target cannot provide.\n\
+             #[must_use]\npub const fn counter() -> core::sync::atomic::AtomicU64 {{\n    \
+             core::sync::atomic::AtomicU64::new(0)\n}}\n"
+        ),
+    )
+    .expect("the crate root should be writable");
+
+    let host = run_stage(stage("build"), &scratch.root);
+    assert!(
+        host.status.success(),
+        "the host build must accept it, or the test proves nothing about the target: {}",
+        String::from_utf8_lossy(&host.stderr)
+    );
+
+    let firmware = run_stage(stage("firmware"), &scratch.root);
+    assert!(
+        !firmware.status.success(),
+        "the firmware build must reject what the host build accepted"
+    );
+    let stderr = String::from_utf8_lossy(&firmware.stderr);
+    assert!(stderr.contains("AtomicU64"), "stderr: {stderr}");
+}
+
+/// An llvm-cov export putting each named crate at `covered` of 100 lines.
+///
+/// `xtask` is the only crate in the workspace with code today, and the gate refuses a report
+/// in which a crate that has code contributed nothing, so every fixture has to account for
+/// it. Callers say what they mean for it by naming it like any other crate.
+fn coverage_export(crates: &[(&str, u64)], root: &Path) -> String {
+    let files: Vec<String> = crates
+        .iter()
+        .map(|(name, covered)| {
+            let path = if *name == "xtask" {
+                root.join("xtask/src/lib.rs")
+            } else {
+                root.join("crates").join(name).join("src/lib.rs")
+            };
+            format!(
+                r#"{{"filename":"{}","summary":{{"lines":{{"count":100,"covered":{covered}}}}}}}"#,
+                path.display()
+            )
+        })
+        .collect();
+    format!(r#"{{"data":[{{"files":[{}]}}]}}"#, files.join(","))
+}
+
+/// Writes `report` to a path of its own and gates it with the real binary.
+///
+/// The filename carries the caller's label because these tests run concurrently in one
+/// process and share a workspace root; a single fixture path would let one test read
+/// another's report.
+fn run_coverage(label: &str, report: &str, root: &Path) -> std::process::Output {
+    let path = root
+        .join("target")
+        .join(format!("test-coverage-{label}.json"));
+    std::fs::create_dir_all(root.join("target")).expect("the target directory should be creatable");
+    std::fs::write(&path, report).expect("the report should be writable");
+    run_xtask(
+        &[
+            "coverage",
+            "--report",
+            path.to_str().expect("the path should be UTF-8"),
+        ],
+        root,
+    )
+}
+
+#[test]
+fn a_crate_below_the_gate_fails_the_coverage_command() {
+    // Issue #9: "A PR that drops coverage below the gate fails CI." The workspace total
+    // in this report is 68%, but it is `waymaker-core` at 4% that has to be named.
+    let root = workspace_root();
+    let report = coverage_export(
+        &[
+            ("waymaker-core", 4),
+            ("waymaker-flash", 100),
+            ("waymaker-embassy", 100),
+            ("xtask", 100),
+        ],
+        &root,
+    );
+
+    let output = run_coverage("below-gate", &report, &root);
+
+    assert!(!output.status.success(), "the gate must fail the build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("waymaker-core"), "stderr: {stderr}");
+    assert!(stderr.contains("4.00%"), "stderr: {stderr}");
+    assert!(stderr.contains("85.00%"), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("waymaker-flash"),
+        "every crate gets a row: {stdout}"
+    );
+}
+
+#[test]
+fn a_report_over_the_gate_passes_the_coverage_command() {
+    let root = workspace_root();
+    let report = coverage_export(&[("waymaker-core", 85), ("xtask", 100)], &root);
+
+    let output = run_coverage("over-gate", &report, &root);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("coverage: ok"), "stdout: {stdout}");
+    assert!(stdout.contains("85.00%"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_crate_that_vanished_from_the_report_fails_the_command() {
+    // "No coverable lines" is the gate's one passing state that is not a measurement, so
+    // it is where anything hidden from the measurement lands: `[lib] test = false`, an
+    // exclusion regex, code behind a feature the coverage run does not enable. A crate that
+    // has code and reported nothing is an error, not a pass.
+    let root = workspace_root();
+    let report = coverage_export(&[("waymaker-core", 100)], &root);
+
+    let output = run_coverage("vanished", &report, &root);
+
+    assert!(!output.status.success(), "the gate must fail the build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("xtask"), "stderr: {stderr}");
+    assert!(stderr.contains("no coverable lines"), "stderr: {stderr}");
+}
+
+#[test]
+fn an_unreadable_coverage_report_fails_the_command() {
+    // A coverage run that did not happen is not a coverage run that passed.
+    let output = run_coverage("unreadable", "not json", &workspace_root());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("coverage report"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_missing_coverage_report_fails_the_command() {
+    let output = run_xtask(
+        &["coverage", "--report", "no/such/report.json"],
+        &workspace_root(),
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn the_coverage_command_rejects_an_unknown_argument() {
+    let output = run_xtask(&["coverage", "--lenient"], &workspace_root());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown argument"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn the_coverage_command_rejects_a_report_flag_with_no_path() {
+    let output = run_xtask(&["coverage", "--report"], &workspace_root());
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("needs a path"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn the_hook_and_the_pipeline_run_the_same_commands() {
+    // Issue #9: "The hook and the pipeline run the same commands." Not by convention: the
+    // hook is rendered from the same table this reads, and the gate rejects a workflow or
+    // a hook that has drifted from it.
+    let hook = std::fs::read_to_string(workspace_root().join(xtask::pipeline::PRE_COMMIT_PATH))
+        .expect("the hook should be committed");
+    let workflow = std::fs::read_to_string(workspace_root().join(xtask::pipeline::WORKFLOW_PATH))
+        .expect("the workflow should be committed");
+    let steps = xtask::pipeline::run_steps(&workflow);
+
+    for stage in xtask::pipeline::hook_stages() {
+        assert!(
+            hook.contains(stage.command),
+            "the hook does not run {}",
+            stage.name
+        );
+        assert!(
+            steps.iter().any(|step| step.command == stage.command),
+            "the workflow does not run {}",
+            stage.name
+        );
+    }
+    assert_eq!(hook, xtask::pipeline::render_pre_commit_hook());
+}
+
+#[test]
+fn the_committed_hook_is_executable() {
+    let inputs =
+        xtask::collect_inputs(&workspace_root()).expect("the workspace inputs should be readable");
+    if cfg!(unix) {
+        assert_eq!(
+            inputs.pre_commit_hook_is_executable,
+            Some(true),
+            "git skips a hook without the execute bit"
+        );
+    }
+}
+
+#[test]
+fn install_hooks_writes_the_hook_the_gate_expects() {
+    let scratch = scratch_workspace("install-hooks");
+    std::fs::remove_file(scratch.root.join(xtask::pipeline::PRE_COMMIT_PATH))
+        .expect("the copied hook should be removable");
+
+    let output = run_xtask(&["install-hooks"], &scratch.root);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = std::fs::read_to_string(scratch.root.join(xtask::pipeline::PRE_COMMIT_PATH))
+        .expect("the hook should have been written");
+    assert_eq!(written, xtask::pipeline::render_pre_commit_hook());
+    assert!(
+        xtask::pipeline::check_pre_commit_hook(Some(&written), Some(true)).is_empty(),
+        "the generated hook must satisfy the rule that checks it"
+    );
+}
+
+#[test]
+fn a_hook_edited_by_hand_is_rejected() {
+    let scratch = scratch_workspace("hook-drift");
+    let hook = scratch.root.join(xtask::pipeline::PRE_COMMIT_PATH);
+    let existing = std::fs::read_to_string(&hook).expect("the hook should be readable");
+    std::fs::write(&hook, existing.replace("--locked", "")).expect("the hook should be writable");
+
+    let violations =
+        xtask::check_workspace(&scratch.root).expect("the policy check should be runnable");
+
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule == "pre-commit-hook"),
+        "a hand-edited hook must be rejected:\n{}",
+        render(&violations)
+    );
+}
+
+#[test]
+fn a_workflow_that_stops_building_the_firmware_target_is_rejected() {
+    let scratch = scratch_workspace("workflow-drift");
+    let workflow = scratch.root.join(xtask::pipeline::WORKFLOW_PATH);
+    let existing = std::fs::read_to_string(&workflow).expect("the workflow should be readable");
+    std::fs::write(
+        &workflow,
+        existing.replace(stage("firmware").command, "cargo build"),
+    )
+    .expect("the workflow should be writable");
+
+    let violations =
+        xtask::check_workspace(&scratch.root).expect("the policy check should be runnable");
+
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule == "ci-pipeline" && violation.subject == "firmware"),
+        "dropping the firmware build from CI must be rejected:\n{}",
+        render(&violations)
+    );
+}
+
+#[test]
+fn a_toolchain_that_stops_pinning_the_firmware_target_is_rejected() {
+    let scratch = scratch_workspace("toolchain-drift");
+    let toolchain = scratch.root.join(xtask::pipeline::TOOLCHAIN_PATH);
+    let existing = std::fs::read_to_string(&toolchain).expect("the toolchain should be readable");
+    std::fs::write(
+        &toolchain,
+        existing.replace(
+            &format!("targets = [\"{}\"]\n", xtask::pipeline::FIRMWARE_TARGET),
+            "",
+        ),
+    )
+    .expect("the toolchain should be writable");
+
+    let violations =
+        xtask::check_workspace(&scratch.root).expect("the policy check should be runnable");
+
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.rule == "toolchain-targets"),
+        "dropping the firmware target from the toolchain must be rejected:\n{}",
+        render(&violations)
+    );
+}
+
+/// The README, which documents both tables and is checked against them.
+fn readme() -> String {
+    std::fs::read_to_string(workspace_root().join("README.md")).expect("the README should exist")
+}
+
+#[test]
+fn the_readme_documents_every_rule_the_gate_declares() {
+    // The README's rule table is the only description of the gate a reader gets before
+    // running it, and `cargo xtask check-layering` prints the count from `RULES`. The two
+    // disagreeing in front of the reader is the sort of drift this repository gates.
+    let readme = readme();
+    let table = readme
+        .split_once("| Rule | Fails when |")
+        .map(|(_, rest)| rest)
+        .expect("the README should have a rules table");
+    let documented: std::collections::BTreeSet<String> = table
+        .lines()
+        // The first line is what remains of the header line the split consumed.
+        .skip(1)
+        .take_while(|line| line.trim().starts_with('|'))
+        .filter_map(|line| line.trim().strip_prefix("| `"))
+        .filter_map(|rest| rest.split_once('`'))
+        .map(|(rule, _)| rule.to_owned())
+        .collect();
+    let declared: std::collections::BTreeSet<String> =
+        xtask::RULES.iter().map(|rule| (*rule).to_owned()).collect();
+
+    let missing: Vec<&String> = declared.difference(&documented).collect();
+    assert!(
+        missing.is_empty(),
+        "rules the README does not document: {missing:?}"
+    );
+    let extra: Vec<&String> = documented.difference(&declared).collect();
+    assert!(extra.is_empty(), "rules the README invents: {extra:?}");
+}
+
+#[test]
+fn the_readme_lists_the_pipeline_the_stage_table_defines() {
+    // README.md claims these commands are not transcribed by hand. This is what makes the
+    // claim true: the fenced block under "The pipeline, in order:" must be exactly the
+    // stage table, in order, modulo the column padding that keeps it readable.
+    let readme = readme();
+    let block = readme
+        .split_once("The pipeline, in order:")
+        .and_then(|(_, rest)| rest.split_once("```sh"))
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(block, _)| block.to_owned())
+        .expect("the README should list the pipeline in a fenced block");
+
+    let listed: Vec<String> = block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let expected: Vec<String> = xtask::pipeline::STAGES
+        .iter()
+        .map(|stage| stage.command.to_owned())
+        .collect();
+
+    assert_eq!(listed, expected);
 }
