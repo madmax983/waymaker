@@ -72,6 +72,20 @@ fn baseline_worktree(root: &Path) -> PathBuf {
     root.join(format!("{BASELINE_WORKTREE_PATH}-{}", std::process::id()))
 }
 
+/// Where the base branch at `commit` links into.
+///
+/// Keyed by commit, so runs comparing different bases cannot read one another's images and
+/// runs comparing the same base can share the work.
+#[must_use]
+fn baseline_build_dir(root: &Path, commit: &str) -> PathBuf {
+    let short: String = commit
+        .chars()
+        .take(12)
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    root.join(format!("{BUILD_DIR}-base-{short}"))
+}
+
 /// The target directory the matrix builds into.
 ///
 /// Its own directory so that a size run does not evict the rest of the pipeline's build
@@ -1553,6 +1567,10 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
         let mut pending_test_attribute = false;
         // `(depth the block's body starts at, what kind of block it is)`.
         let mut blocks: Vec<(i32, Block)> = Vec::new();
+        // A `trait` or `impl` header can span lines — a `where` clause puts the opening
+        // brace on a line of its own — so the kind is remembered from the line that
+        // declares it until the line that opens it.
+        let mut pending: Option<Block> = None;
 
         for line in source.contents.lines() {
             let trimmed = line.trim();
@@ -1590,8 +1608,17 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
+                if let Some(kind) = declaration_kind(trimmed) {
+                    pending = Some(kind);
+                }
                 if opens > 0 {
-                    blocks.push((depth.saturating_add(1), block_kind(trimmed)));
+                    blocks.push((
+                        depth.saturating_add(1),
+                        pending.take().unwrap_or(Block::Other),
+                    ));
+                } else if trimmed.ends_with(';') {
+                    // A declaration that ended without a body takes its kind with it.
+                    pending = None;
                 }
             }
 
@@ -1611,22 +1638,33 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
     found
 }
 
-/// What kind of block a line opens.
+/// What a line declares, if it begins a `trait` or an `impl`.
 ///
-/// Every block is pushed, not only the interesting ones: the stack has to mirror the brace
-/// depth or a `mod` between a trait and its methods would make them look like direct
-/// children of the trait.
-fn block_kind(line: &str) -> Block {
+/// Returned from the line that *declares* the block rather than the one that opens it,
+/// because those are not always the same line: a `where` clause puts the opening brace on
+/// its own, and classifying that bare `{` would read every method of the impl as an
+/// ordinary private one and quietly drop them from the reach rule.
+///
+/// `None` for every other line, so that a block nobody declared — a `mod`, a function body
+/// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
+fn declaration_kind(line: &str) -> Option<Block> {
     let declaration = line.strip_prefix("pub ").unwrap_or(line);
+    let declaration = declaration
+        .split_once("(crate)")
+        .map_or(declaration, |(_, rest)| rest.trim_start());
     if declaration.starts_with("trait ") {
-        return Block::Trait;
+        return Some(Block::Trait);
     }
-    if declaration.starts_with("impl") && declaration.contains(" for ") {
+    if declaration.starts_with("impl") {
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
         // makes its unmarked methods callable from outside.
-        return Block::TraitImpl;
+        return Some(if declaration.contains(" for ") {
+            Block::TraitImpl
+        } else {
+            Block::Other
+        });
     }
-    Block::Other
+    None
 }
 
 /// The name declared by a function signature, if the line declares one.
@@ -1820,11 +1858,13 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
     // would put the same registry on both sides of the diff and make a pull request that
     // changes the registry look like one that did not. Unknown is the truth here, and the
     // diff says so.
-    let measured = measure_into(
-        &worktree,
-        &root.join(BUILD_DIR).with_extension("base"),
-        None,
-    );
+    // Named for the commit rather than for this process: two runs comparing *different*
+    // bases must not share a directory — cargo's lock serialises their builds but is
+    // released before the artifact is read, so one could measure the other's image and
+    // report a diff against the wrong commit. Two runs comparing the *same* base share it
+    // safely, because the same input produces the same artifact, and that is also what lets
+    // a build cache survive from one run to the next.
+    let measured = measure_into(&worktree, &baseline_build_dir(root, &commit), None);
     remove_worktree(root, &worktree);
     measured
 }
@@ -3134,6 +3174,94 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["scan"]);
+    }
+
+    #[test]
+    fn a_trait_impl_whose_header_spans_lines_is_still_a_trait_impl() {
+        // A `where` clause puts the opening brace on a line of its own. Classifying that
+        // bare `{` reads every method of the impl as an ordinary private one, so the whole
+        // implementation drops out of the reach rule and is free to be dead-stripped.
+        let functions = public_functions(&kernel(
+            "impl<T> Storage for Bank<T>\n\
+             where\n\
+            \x20   T: Copy,\n\
+             {\n\
+            \x20   fn erase(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["erase"]);
+    }
+
+    #[test]
+    fn a_trait_declaration_whose_header_spans_lines_is_still_a_trait() {
+        let functions = public_functions(&kernel(
+            "pub trait Storage<T>\n\
+             where\n\
+            \x20   T: Copy,\n\
+             {\n\
+            \x20   fn seal(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal"]);
+    }
+
+    #[test]
+    fn an_inherent_impl_with_a_multiline_header_stays_inherent() {
+        // The other direction: the remembered kind must not turn a plain `impl` into a
+        // trait impl and start demanding its private helpers.
+        let functions = public_functions(&kernel(
+            "impl<T> Bank<T>\n\
+             where\n\
+            \x20   T: Copy,\n\
+             {\n\
+            \x20   fn helper(&self) {}\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_remembered_declaration_does_not_leak_into_the_next_block() {
+        let functions = public_functions(&kernel(
+            "impl Storage for Bank\n\
+             {\n\
+            \x20   fn erase(&self) {}\n\
+             }\n\
+             mod inner {\n\
+            \x20   fn hidden() {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["erase"]);
+    }
+
+    #[test]
+    fn two_runs_against_different_bases_do_not_share_a_build_directory() {
+        // Cargo serialises the builds and releases its lock before the artifact is read,
+        // so a shared directory lets one run measure the other's image and report a diff
+        // against the wrong commit.
+        let root = Path::new("/w");
+        assert_ne!(
+            baseline_build_dir(root, "abc123def456"),
+            baseline_build_dir(root, "fed654cba321")
+        );
+        // The same base is shared on purpose: same input, same artifact, and a build cache
+        // that survives from one run to the next.
+        assert_eq!(
+            baseline_build_dir(root, "abc123def4567890"),
+            baseline_build_dir(root, "abc123def4567890")
+        );
     }
 
     #[test]
