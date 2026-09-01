@@ -237,20 +237,32 @@ fn is_balanced(fragment: &str) -> bool {
     depth == 0
 }
 
-/// Whether any of `attributes` turns `lint` on.
+/// Whether any of `attributes` turns `lint` on, unconditionally.
 ///
 /// Compared argument by argument rather than against a fixed set of whole attributes, so
 /// that `#![warn(missing_docs, unreachable_pub)]` — a correct crate root — is not rejected
 /// for having said two things in one attribute.
+///
+/// Only the outermost group counts. `#![cfg_attr(any(), warn(missing_docs))]` names the
+/// lint at a level rustc never applies, and this scanner cannot evaluate a `cfg` predicate,
+/// so a conditional enabling is not an enabling. [`silences_lint`] takes the opposite rule
+/// for the same reason: each direction answers the way that fails closed.
 pub(crate) fn enables_lint(attributes: &[String], lint: &str) -> bool {
     attributes.iter().any(|attribute| {
-        ENFORCING_LEVELS
-            .iter()
-            .any(|level| lint_arguments(attribute, level).contains(&lint))
+        ENFORCING_LEVELS.iter().any(|level| {
+            attribute
+                .strip_prefix(&format!("#![{level}("))
+                .and_then(balanced_body)
+                .is_some_and(|body| split_arguments(body).contains(&lint))
+        })
     })
 }
 
 /// Whether any of `attributes` turns `lint` off.
+///
+/// Unlike [`enables_lint`], a lint named inside a `cfg_attr` counts here: an attribute that
+/// silences a lint under some configuration is a silencing, and the scanner cannot say which
+/// configuration is built.
 ///
 /// Matching on the lint level rather than on the literal string `#![allow(` is what stops
 /// the four ways of saying the same thing — `expect` instead of `allow`, the `warnings`
@@ -508,6 +520,22 @@ mod tests {
         // `missing_docs` is allow-by-default, so it is not one of the `warnings`.
         let attributes = inner_attributes("#![warn(warnings)]\n");
         assert!(!enables_lint(&attributes, "missing_docs"));
+    }
+
+    #[test]
+    fn a_lint_enabled_only_under_a_cfg_predicate_does_not_count_as_enabled() {
+        // `any()` is false, so rustc applies no attribute at all — but the lint name is
+        // right there in the file for a scanner that flattens `cfg_attr`.
+        let attributes = inner_attributes("#![cfg_attr(any(), warn(missing_docs))]\n");
+        assert!(!enables_lint(&attributes, "missing_docs"));
+    }
+
+    #[test]
+    fn a_lint_silenced_only_under_a_cfg_predicate_still_counts_as_silenced() {
+        // The opposite answer to the test above, on purpose: each direction takes the one
+        // that fails closed.
+        let attributes = inner_attributes("#![cfg_attr(any(), allow(missing_docs))]\n");
+        assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]

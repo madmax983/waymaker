@@ -410,6 +410,27 @@ fn without_html_comments(contents: &str) -> String {
     kept
 }
 
+/// `contents` with every fenced code block removed.
+///
+/// A link or a heading inside a fence is displayed as literal text: it is an example of
+/// Markdown, not Markdown. Used where a rule asks whether a reader can follow something.
+#[must_use]
+fn without_fenced_code(contents: &str) -> String {
+    let mut kept = Vec::new();
+    let mut open_fence: Option<usize> = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let fence = fence_length(trimmed);
+        match open_fence {
+            Some(width) if fence.is_some_and(|length| length >= width) => open_fence = None,
+            Some(_) => {}
+            None if fence.is_some() => open_fence = fence,
+            None => kept.push(line),
+        }
+    }
+    kept.join("\n")
+}
+
 /// Rule: `CLAUDE.md` exists, quotes the layering table, and names every gate rule.
 ///
 /// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
@@ -593,7 +614,10 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for adr in adrs {
-        if !adr.contents.lines().any(|line| line.starts_with("# ")) {
+        // An ADR whose `- Status:` and `- Date:` sit inside an HTML comment renders with no
+        // metadata at all, and every check below would otherwise find them.
+        let contents = without_html_comments(&adr.contents);
+        if !contents.lines().any(|line| line.starts_with("# ")) {
             violations.push(Violation::new(
                 "adr-structure",
                 adr.name.clone(),
@@ -602,8 +626,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for field in ADR_REQUIRED_FIELDS {
-            if !adr
-                .contents
+            if !contents
                 .lines()
                 .any(|line| line.trim_start().starts_with(field))
             {
@@ -615,7 +638,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
             }
         }
 
-        if let Some(status) = adr_status(&adr.contents) {
+        if let Some(status) = adr_status(&contents) {
             // The template's placeholder is the one status that is allowed to be
             // unrecognised, because the template records no decision.
             let is_template = adr_number(&adr.name) == Some(0);
@@ -632,7 +655,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for heading in ADR_REQUIRED_HEADINGS {
-            if !adr.contents.lines().any(|line| line.trim_end() == *heading) {
+            if !contents.lines().any(|line| line.trim_end() == *heading) {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -665,10 +688,12 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
 
-    // Both directions read the same parsed link list. Asking only whether the file *name*
-    // appears would accept `[0001-one.md](../architecture.md)`, where the ADR is mentioned
-    // and not linked — which is the whole of what an index is for.
-    let linked = linked_markdown_files(index);
+    // Both directions read the same parsed link list, and it is parsed from what renders.
+    // Asking only whether the file *name* appears would accept
+    // `[0001-one.md](../architecture.md)`, where the ADR is mentioned and not linked; and a
+    // link inside an HTML comment or a fenced example is text about a link rather than one
+    // — which is the whole of what an index is for.
+    let linked = linked_markdown_files(&without_fenced_code(&without_html_comments(index)));
 
     let mut violations: Vec<Violation> = adrs
         .iter()
@@ -1484,6 +1509,49 @@ mod tests {
             violations.iter().any(|v| v.subject == ADR_TEMPLATE),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn adr_metadata_hidden_in_a_comment_does_not_satisfy_the_structure_rule() {
+        // The rendered decision would carry no status and no date at all.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: clean_adr("one")
+                .replace("- Status: accepted", "<!-- - Status: accepted")
+                .replace("- Date: 2026-09-01", "- Date: 2026-09-01 -->"),
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("- Status:"))
+                && violations.iter().any(|v| v.detail.contains("- Date:")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_a_reader_cannot_follow_does_not_index_an_adr() {
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        for index in [
+            "<!-- - [one](0001-one.md) -->\n",
+            "```\n- [one](0001-one.md)\n```\n",
+        ] {
+            let violations = check_adr_index(Some(index), &adrs);
+            assert!(
+                violations.iter().any(|v| v.subject == "0001-one.md"),
+                "{index} was accepted as a link: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_link_shown_only_as_an_example_is_not_a_dead_link() {
+        // The other direction of the same rule: a link inside a fenced example is text
+        // about a link, so it cannot be broken.
+        let index = "How to link one:\n\n```\n- [ghost](0007-ghost.md)\n```\n";
+        assert!(check_adr_index(Some(index), &[]).is_empty());
     }
 
     #[test]
