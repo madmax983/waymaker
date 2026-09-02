@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use waymaker_fault::{Effect, Injection, Op, Progress, injections};
+use waymaker_fault::{Injection, Interruption, Op, Progress, injections};
 use waymaker_flash::storage::Geometry;
 
 fn geometry() -> Geometry {
@@ -26,12 +26,12 @@ fn a_four_byte_program_tears_at_every_byte_inside_it() {
     let power = |progress| Injection {
         op: 0,
         progress,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     };
     let failure = |progress| Injection {
         op: 0,
         progress,
-        effect: Effect::Failure,
+        interruption: Interruption::Failure,
     };
 
     assert_eq!(
@@ -41,7 +41,7 @@ fn a_four_byte_program_tears_at_every_byte_inside_it() {
             Injection {
                 op: 0,
                 progress: Progress::None,
-                effect: Effect::PowerLoss
+                interruption: Interruption::PowerLoss
             },
             power(Progress::Bytes(1)),
             power(Progress::Bytes(2)),
@@ -68,7 +68,7 @@ fn every_program_unit_boundary_is_among_the_torn_points() {
     let program_unit = geometry().program_size();
     let torn: BTreeSet<u32> = injections(&ops, geometry())
         .into_iter()
-        .filter(|injection| injection.effect == Effect::PowerLoss)
+        .filter(|injection| injection.interruption == Interruption::PowerLoss)
         .filter_map(|injection| match injection.progress {
             Progress::Bytes(bytes) => Some(bytes),
             Progress::None | Progress::Whole => None,
@@ -89,7 +89,7 @@ fn an_erase_is_interrupted_at_erase_blocks_rather_than_at_bytes() {
     let ops = [Op::Erase { offset: 0, len: 64 }];
     let torn: Vec<Progress> = injections(&ops, geometry())
         .into_iter()
-        .filter(|injection| injection.effect == Effect::PowerLoss)
+        .filter(|injection| injection.interruption == Interruption::PowerLoss)
         .map(|injection| injection.progress)
         .collect();
     assert_eq!(
@@ -107,13 +107,13 @@ fn a_barrier_has_a_crash_point_before_it_and_a_crash_point_after_it() {
     assert!(points.contains(&Injection {
         op: 0,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     }));
     // "After the barrier" is the barrier itself having completed.
     assert!(points.contains(&Injection {
         op: 1,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     }));
     // A barrier cannot be torn: there is no half of it to land.
     assert!(
@@ -126,7 +126,7 @@ fn a_barrier_has_a_crash_point_before_it_and_a_crash_point_after_it() {
     assert_eq!(
         points
             .iter()
-            .filter(|injection| injection.op == 1 && injection.effect == Effect::Failure)
+            .filter(|injection| injection.op == 1 && injection.interruption == Interruption::Failure)
             .count(),
         1
     );
@@ -168,7 +168,7 @@ fn an_empty_sequence_still_has_the_crash_point_before_it_started() {
         vec![Injection {
             op: 0,
             progress: Progress::None,
-            effect: Effect::PowerLoss,
+            interruption: Interruption::PowerLoss,
         }]
     );
 }
@@ -191,19 +191,19 @@ fn an_operation_that_mutates_nothing_contributes_no_duplicate_worlds() {
             Injection {
                 op: 0,
                 progress: Progress::None,
-                effect: Effect::PowerLoss,
+                interruption: Interruption::PowerLoss,
             },
             // The call still fails, and the writer still reacts to it: that is a crash
             // point, and it is the only one either operation has.
             Injection {
                 op: 0,
                 progress: Progress::None,
-                effect: Effect::Failure,
+                interruption: Interruption::Failure,
             },
             Injection {
                 op: 1,
                 progress: Progress::None,
-                effect: Effect::Failure,
+                interruption: Interruption::Failure,
             },
         ]
     );
@@ -218,7 +218,7 @@ fn a_barrier_keeps_its_whole_entry_even_though_it_writes_no_bytes() {
     assert!(injections(&ops, geometry()).contains(&Injection {
         op: 0,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     }));
 }
 

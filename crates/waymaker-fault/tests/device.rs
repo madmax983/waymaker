@@ -130,7 +130,7 @@ fn every_fault_error_carries_a_distinct_message() {
         FaultError::Geometry(GeometryError::OutOfBounds),
         FaultError::BitSetWithoutErase,
         FaultError::PowerLoss,
-        FaultError::Injected,
+        FaultError::InjectedFailure,
     ];
     for error in all {
         assert!(!error.to_string().is_empty());

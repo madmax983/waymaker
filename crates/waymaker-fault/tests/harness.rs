@@ -6,8 +6,8 @@
 //! an acknowledged one."
 
 use waymaker_fault::{
-    Breach, Durability, Effect, FaultError, Harness, Injection, OneWayBits, Op, Progress, RecordId,
-    Run, Session, verify_recovery,
+    Breach, Durability, FaultError, Harness, HarnessError, Injection, Interruption, OneWayBits, Op,
+    Progress, RecordId, Run, Session, verify_recovery,
 };
 use waymaker_flash::storage::{Geometry, StableStorage};
 
@@ -29,7 +29,31 @@ fn two_records(session: &mut Session) -> Result<(), FaultError> {
 }
 
 fn runs() -> Vec<Run> {
-    Harness::new(geometry()).run(two_records)
+    drive(two_records)
+}
+
+/// Every run of `writer`, or a loud failure.
+///
+/// A writer that gives up with no faults armed enumerates almost nothing, and every
+/// assertion over the result then passes for the wrong reason — which is what
+/// [`HarnessError`] exists to stop, and why these helpers refuse rather than default.
+fn drive<W, E>(writer: W) -> Vec<Run>
+where
+    W: FnMut(&mut Session) -> Result<(), E>,
+    E: std::fmt::Debug,
+{
+    drive_with(OneWayBits::Absorbed, writer)
+}
+
+fn drive_with<W, E>(rule: OneWayBits, writer: W) -> Vec<Run>
+where
+    W: FnMut(&mut Session) -> Result<(), E>,
+    E: std::fmt::Debug,
+{
+    match Harness::with_bit_rule(geometry(), rule).run(writer) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    }
 }
 
 #[test]
@@ -78,7 +102,7 @@ fn a_record_whose_first_byte_never_landed_is_merely_attempted() {
     let run = one_run(Injection {
         op: 0,
         progress: Progress::None,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(run.ledger().state(RecordId(0)), Some(Durability::Attempted));
     assert_eq!(run.image(), &[0xFF; 64][..]);
@@ -89,7 +113,7 @@ fn a_record_torn_mid_write_is_possibly_durable_and_never_acknowledged() {
     let run = one_run(Injection {
         op: 0,
         progress: Progress::Bytes(2),
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(
         run.ledger().state(RecordId(0)),
@@ -103,7 +127,7 @@ fn a_record_written_whole_but_not_yet_ordered_is_possibly_durable() {
     let run = one_run(Injection {
         op: 0,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(
         run.ledger().state(RecordId(0)),
@@ -117,7 +141,7 @@ fn power_lost_after_a_barrier_returned_leaves_that_record_acknowledged() {
     let run = one_run(Injection {
         op: 1,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(
         run.ledger().state(RecordId(0)),
@@ -134,7 +158,7 @@ fn a_barrier_that_returns_an_error_acknowledges_nothing() {
     let run = one_run(Injection {
         op: 1,
         progress: Progress::None,
-        effect: Effect::Failure,
+        interruption: Interruption::Failure,
     });
     assert_eq!(
         run.ledger().state(RecordId(0)),
@@ -144,8 +168,7 @@ fn a_barrier_that_returns_an_error_acknowledges_nothing() {
 
 #[test]
 fn after_power_loss_nothing_else_reaches_media_however_hard_the_writer_tries() {
-    let harness = Harness::new(geometry());
-    let stubborn = harness.run(|session| {
+    let stubborn = drive(|session| {
         session.begin_record(RecordId(0));
         // Ignore the first failure entirely and keep writing, as a retry loop would.
         let first = session.program(0, &[0x00; 4]);
@@ -164,7 +187,7 @@ fn after_power_loss_nothing_else_reaches_media_however_hard_the_writer_tries() {
                 == Some(Injection {
                     op: 0,
                     progress: Progress::Bytes(1),
-                    effect: Effect::PowerLoss,
+                    interruption: Interruption::PowerLoss,
                 })
         })
         .expect("a torn first write is among the crash points");
@@ -177,8 +200,7 @@ fn after_power_loss_nothing_else_reaches_media_however_hard_the_writer_tries() {
 
 #[test]
 fn an_injected_failure_lets_the_writer_carry_on_and_the_next_op_is_recorded() {
-    let harness = Harness::new(geometry());
-    let retrying = harness.run(|session| {
+    let retrying = drive(|session| {
         session.begin_record(RecordId(0));
         if session.program(0, &[0xC0; 4]).is_err() {
             session.program(0, &[0xC0; 4])?;
@@ -193,7 +215,7 @@ fn an_injected_failure_lets_the_writer_carry_on_and_the_next_op_is_recorded() {
                 == Some(Injection {
                     op: 0,
                     progress: Progress::None,
-                    effect: Effect::Failure,
+                    interruption: Interruption::Failure,
                 })
         })
         .expect("a failed first program is among the crash points");
@@ -207,15 +229,14 @@ fn an_injected_failure_lets_the_writer_carry_on_and_the_next_op_is_recorded() {
 
 #[test]
 fn operations_issued_before_the_first_record_belong_to_no_record() {
-    let harness = Harness::new(geometry());
-    let prepared = harness.run(|session| {
+    let prepared = drive(|session| {
         session.erase(0, 32)?;
         session.begin_record(RecordId(7));
         session.program(0, &[0x11; 4])?;
         session.barrier()
     });
     let clean = prepared.first().expect("a fault-free run");
-    assert_eq!(clean.ledger().order(), [RecordId(7)]);
+    assert_eq!(clean.ledger().order().collect::<Vec<_>>(), [RecordId(7)]);
     assert_eq!(
         clean.ledger().state(RecordId(7)),
         Some(Durability::Acknowledged)
@@ -260,7 +281,7 @@ fn the_oracle_rejects_a_record_that_was_never_attempted() {
     let run = one_run(Injection {
         op: 0,
         progress: Progress::None,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(
         verify_recovery(run.ledger(), &[RecordId(0)]),
@@ -278,7 +299,7 @@ fn the_oracle_accepts_an_unacknowledged_record_either_way() {
     let run = one_run(Injection {
         op: 0,
         progress: Progress::Whole,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(verify_recovery(run.ledger(), &[]), Ok(()));
     assert_eq!(verify_recovery(run.ledger(), &[RecordId(0)]), Ok(()));
@@ -286,8 +307,7 @@ fn the_oracle_accepts_an_unacknowledged_record_either_way() {
 
 #[test]
 fn the_oracle_fails_closed_on_a_ledger_that_names_one_record_twice() {
-    let harness = Harness::new(geometry());
-    let confused = harness.run(|session| {
+    let confused = drive(|session| {
         session.begin_record(RecordId(3));
         session.program(0, &[0x01; 4])?;
         session.begin_record(RecordId(3));
@@ -359,10 +379,12 @@ fn a_session_answers_for_the_device_it_is_driving() {
     // The three observers a writer under test has while it is running, as opposed to the
     // `Run` it leaves behind: the geometry it must align against, the bytes as they stand,
     // and which crash point — if any — is armed.
-    let harness = Harness::with_bit_rule(geometry(), OneWayBits::Nor);
-    assert_eq!(harness.geometry(), geometry());
+    assert_eq!(
+        Harness::with_bit_rule(geometry(), OneWayBits::Absorbed).geometry(),
+        geometry()
+    );
 
-    let runs = harness.run(|session| {
+    let runs = drive_with(OneWayBits::Absorbed, |session| {
         assert_eq!(session.geometry(), geometry());
         session.begin_record(RecordId(0));
         session.program(0, &[0x0F; 4])?;
@@ -393,7 +415,7 @@ fn a_session_answers_for_the_device_it_is_driving() {
 fn a_session_read_after_power_loss_reports_power_loss_rather_than_bytes() {
     // A reader that could still see the device has power. Without this, a writer that
     // verified its own writes would read the pre-crash image and conclude the write landed.
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         session.begin_record(RecordId(0));
         let written = session.program(0, &[0x00; 4]);
         let mut page = [0xAA_u8; 4];
@@ -414,7 +436,7 @@ fn a_session_read_after_power_loss_reports_power_loss_rather_than_bytes() {
                 == Some(Injection {
                     op: 0,
                     progress: Progress::Bytes(2),
-                    effect: Effect::PowerLoss,
+                    interruption: Interruption::PowerLoss,
                 })
         })
         .expect("a torn first write is among the crash points");
@@ -427,19 +449,155 @@ fn a_harness_can_be_told_to_report_one_way_bit_violations() {
     // The strict rule is the one a driver bug shows up under: hardware absorbs a program
     // that asks for a bit only an erase can restore, and a `Vec<u8>` model that assigned
     // instead of masking would absorb it too, silently.
-    let strict = Harness::with_bit_rule(geometry(), OneWayBits::Rejected);
-    let runs = strict.run(|session| {
+    // A writer that trips the rule with nothing armed cannot be enumerated at all, and the
+    // harness says so rather than reporting a sweep of two runs.
+    let refused = Harness::with_bit_rule(geometry(), OneWayBits::Rejected).run(|session| {
         session.begin_record(RecordId(0));
         session.program(0, &[0x00; 4])?;
         session.program(0, &[0xFF; 4])
     });
-
-    let clean = runs.first().expect("the fault-free run");
-    // The second program was refused, so it is not an operation and has no crash points.
-    assert_eq!(clean.ops(), [Op::Program { offset: 0, len: 4 }]);
     assert_eq!(
-        clean.ledger().state(RecordId(0)),
+        refused.err(),
+        Some(HarnessError::WriterFailedWithNoFaultsArmed(
+            "BitSetWithoutErase".to_owned()
+        ))
+    );
+
+    // And the rule is live in the *injected* runs, not only in the fault-free one. This
+    // writer is legal with nothing armed — the erase restores the bits the last program
+    // needs — and illegal exactly when that erase is the one that fails.
+    let runs = drive_with(OneWayBits::Rejected, |session| {
+        session.begin_record(RecordId(0));
+        session.program(0, &[0x0F; 4])?;
+        session.erase(0, 32)?;
+        session.program(0, &[0xF0; 4])
+    });
+    assert_eq!(runs.first().map(|run| run.ops().len()), Some(3));
+
+    let unerased = runs
+        .iter()
+        .find(|run| {
+            run.injection()
+                == Some(Injection {
+                    op: 1,
+                    progress: Progress::None,
+                    interruption: Interruption::Failure,
+                })
+        })
+        .expect("an erase that failed having done nothing is among the crash points");
+    assert_eq!(
+        unerased.ops(),
+        [
+            Op::Program { offset: 0, len: 4 },
+            Op::Erase { offset: 0, len: 32 },
+        ],
+        "the last program asked for bits only an erase restores, so it never became an op"
+    );
+    assert_eq!(unerased.image().first(), Some(&0x0F));
+}
+
+#[test]
+fn a_record_torn_by_a_failed_write_is_never_acknowledged_by_a_later_barrier() {
+    // `Interruption::Failure` exists so the writer carries on past an error. If it then
+    // reaches a barrier, the barrier orders half a record — and a ledger that called that
+    // acknowledged would *require* recovery to produce a half-written frame, so a correct
+    // recovery that drops it would be reported as a breach.
+    let run = one_run(Injection {
+        op: 0,
+        progress: Progress::Bytes(2),
+        interruption: Interruption::Failure,
+    });
+    assert_eq!(run.image().get(..4), Some(&[0xA0, 0xA1, 0xFF, 0xFF][..]));
+    assert_eq!(
+        run.ledger().state(RecordId(0)),
         Some(Durability::PossiblyDurable)
+    );
+    assert_eq!(run.ledger().torn(RecordId(0)), Some(true));
+    assert_eq!(verify_recovery(run.ledger(), &[]), Ok(()));
+}
+
+#[test]
+fn the_oracle_refuses_a_recovery_that_resurrects_a_torn_record() {
+    // Design document §15: "recovery may include an unacknowledged **complete** record".
+    // Complete is the load-bearing word, and half a record is not it.
+    let run = one_run(Injection {
+        op: 0,
+        progress: Progress::Bytes(2),
+        interruption: Interruption::Failure,
+    });
+    assert_eq!(
+        verify_recovery(run.ledger(), &[RecordId(0)]),
+        Err(Breach::RecoveredATornRecord {
+            record: RecordId(0)
+        })
+    );
+}
+
+#[test]
+fn a_record_that_wrote_nothing_the_media_could_keep_is_not_acknowledged() {
+    // Two shapes that change no cell at all: programming `0xFF` over erased media, which
+    // AND-masking makes the identity, and erasing a block that is already erased — the
+    // bank-prepare shape, which is not exotic. A ledger that counted the *call* rather than
+    // the *change* would acknowledge a record with nothing on media to recover.
+    for runs in [
+        drive(|session| {
+            session.begin_record(RecordId(0));
+            session.program(0, &[0xFF; 4])?;
+            session.barrier()
+        }),
+        drive(|session| {
+            session.begin_record(RecordId(0));
+            session.erase(0, 32)?;
+            session.barrier()
+        }),
+    ] {
+        let clean = runs.first().expect("the fault-free run");
+        assert_eq!(
+            clean.ledger().state(RecordId(0)),
+            Some(Durability::Attempted)
+        );
+        assert_eq!(verify_recovery(clean.ledger(), &[]), Ok(()));
+    }
+}
+
+#[test]
+fn a_record_that_never_reached_media_does_not_occupy_a_position_in_history() {
+    // An `Attempted` record contributes nothing to media, so it cannot sit between two
+    // records recovery *did* find. A prefix check that counted it would leave a correct
+    // recovery — the two records that are really there — with no accepting answer.
+    let runs = drive(|session| {
+        // The middle record's write is allowed to fail without stopping the writer, which
+        // is the only way a hole appears between two records that both landed.
+        for record in 0..3_u32 {
+            session.begin_record(RecordId(record));
+            let landed = session.program(record.wrapping_mul(4), &[0xA0; 4]);
+            session.end_record();
+            if record != 1 {
+                landed?;
+            }
+        }
+        session.barrier()
+    });
+
+    let hole = runs
+        .iter()
+        .find(|run| {
+            run.ledger().state(RecordId(1)) == Some(Durability::Attempted)
+                && run.ledger().state(RecordId(2)) == Some(Durability::Acknowledged)
+        })
+        .expect("a failed middle write leaves a hole between two records that landed");
+    assert_eq!(
+        hole.ledger().order().collect::<Vec<_>>(),
+        [RecordId(0), RecordId(1), RecordId(2)]
+    );
+    assert_eq!(
+        hole.ledger().committed().collect::<Vec<_>>(),
+        [RecordId(0), RecordId(2)],
+        "a record that reached no media is not part of committed history"
+    );
+    assert_eq!(
+        verify_recovery(hole.ledger(), &[RecordId(0), RecordId(2)]),
+        Ok(())
     );
 }
 
@@ -450,7 +608,7 @@ fn housekeeping_after_a_record_is_closed_does_not_take_its_acknowledgment_away()
     // barrier would then leave the record with an unordered mutation in it and downgrade
     // it from acknowledged — which weakens the oracle silently, in the direction that
     // stops it catching a real loss.
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         session.begin_record(RecordId(0));
         session.program(0, &[0xA0; 4])?;
         session.barrier()?;
@@ -470,7 +628,7 @@ fn housekeeping_after_a_record_is_closed_does_not_take_its_acknowledgment_away()
             record: RecordId(0)
         })
     );
-    assert_eq!(clean.ledger().order(), [RecordId(0)]);
+    assert_eq!(clean.ledger().order().collect::<Vec<_>>(), [RecordId(0)]);
 }
 
 #[test]
@@ -478,7 +636,7 @@ fn without_end_record_a_trailing_mutation_belongs_to_the_record_that_was_open() 
     // The other side of the same rule, asserted so that the attribution is a documented
     // choice rather than an accident: operations belong to the record that was open when
     // they were issued, and a writer that does not close one is saying they are its.
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         session.begin_record(RecordId(0));
         session.program(0, &[0xA0; 4])?;
         session.barrier()?;
@@ -493,7 +651,7 @@ fn without_end_record_a_trailing_mutation_belongs_to_the_record_that_was_open() 
 
 #[test]
 fn end_record_before_any_record_is_open_changes_nothing() {
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         session.end_record();
         session.program(0, &[0xA0; 4])?;
         session.end_record();
@@ -502,7 +660,7 @@ fn end_record_before_any_record_is_open_changes_nothing() {
         session.barrier()
     });
     let clean = runs.first().expect("the fault-free run");
-    assert_eq!(clean.ledger().order(), [RecordId(9)]);
+    assert_eq!(clean.ledger().order().collect::<Vec<_>>(), [RecordId(9)]);
     assert_eq!(
         clean.ledger().state(RecordId(9)),
         Some(Durability::Acknowledged)
@@ -521,8 +679,7 @@ fn erase_both_blocks(session: &mut Session) -> Result<(), FaultError> {
 }
 
 fn erase_run(injection: Injection) -> Run {
-    let Some(run) = Harness::new(geometry())
-        .run(erase_both_blocks)
+    let Some(run) = drive(erase_both_blocks)
         .into_iter()
         .find(|run| run.injection() == Some(injection))
     else {
@@ -539,7 +696,7 @@ fn an_interrupted_erase_leaves_whole_blocks_erased_and_the_rest_untouched() {
     let run = erase_run(Injection {
         op: 3,
         progress: Progress::Bytes(32),
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     });
     assert_eq!(run.image().first(), Some(&0xFF));
     assert_eq!(run.image().get(32), Some(&0x00));
@@ -558,7 +715,7 @@ fn a_failed_erase_reports_an_error_after_the_media_has_already_changed() {
     let run = erase_run(Injection {
         op: 3,
         progress: Progress::Whole,
-        effect: Effect::Failure,
+        interruption: Interruption::Failure,
     });
     assert_eq!(run.image(), &[0xFF; 64][..]);
     // The writer stopped at the error, so the barrier after the erase was never issued.
@@ -582,7 +739,7 @@ fn a_write_torn_at_a_program_unit_boundary_lands_exactly_that_many_bytes() {
     // "Torn writes at every byte and every program unit" — this is the program-unit half,
     // asserted on the media rather than only on the enumeration.
     let unit = geometry().program_size();
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         session.begin_record(RecordId(0));
         session.program(0, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])?;
         session.barrier()
@@ -594,7 +751,7 @@ fn a_write_torn_at_a_program_unit_boundary_lands_exactly_that_many_bytes() {
                 == Some(Injection {
                     op: 0,
                     progress: Progress::Bytes(unit),
-                    effect: Effect::PowerLoss,
+                    interruption: Interruption::PowerLoss,
                 })
         })
         .expect("a tear at the program-unit boundary is among the crash points");

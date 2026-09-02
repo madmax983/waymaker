@@ -64,6 +64,21 @@ fn append(session: &mut Session, at: &mut u32, record: &RecordRef<'_>) -> Result
     Ok(())
 }
 
+/// Every run of `writer`, or a loud failure.
+///
+/// A writer that gives up with no faults armed enumerates almost nothing, and every
+/// assertion below would then pass over a journal that was never written.
+fn drive<W, E>(writer: W) -> Vec<Run>
+where
+    W: FnMut(&mut Session) -> Result<(), E>,
+    E: std::fmt::Debug,
+{
+    match Harness::new(geometry()).run(writer) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
 /// Every record `Scan` can recover from `image`, as the ids the writers assigned.
 ///
 /// A record is identified by what is *in* it — the effect sequence it names — rather than
@@ -75,7 +90,9 @@ fn recovered(image: &[u8]) -> Vec<RecordId> {
         .flatten()
         .filter_map(|record| match record {
             RecordRef::RunStarted { .. } => Some(RecordId(0)),
-            RecordRef::EffectScheduled { seq, .. } => Some(RecordId(seq.0.wrapping_mul(2) - 1)),
+            RecordRef::EffectScheduled { seq, .. } => {
+                Some(RecordId(seq.0.wrapping_mul(2).wrapping_sub(1)))
+            }
             RecordRef::EffectCompleted { seq, .. } => Some(RecordId(seq.0.wrapping_mul(2))),
             RecordRef::EffectFailed { .. }
             | RecordRef::RunCompleted { .. }
@@ -86,7 +103,7 @@ fn recovered(image: &[u8]) -> Vec<RecordId> {
 
 #[test]
 fn the_flash_journal_recovers_a_committed_prefix_at_every_crash_point() {
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         let mut at = 0;
         for seq in 1..=EFFECTS {
             session.begin_record(RecordId(seq.wrapping_mul(2) - 1));
@@ -140,7 +157,7 @@ fn a_recovery_that_drops_its_last_record_is_caught_wherever_that_record_was_ackn
     // the ones a unit test can construct by hand. This drives the real journal writer and
     // then lies about what recovery found, by one record, and asserts that at least one
     // crash point calls it.
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         let mut at = 0;
         for seq in 1..=EFFECTS {
             session.begin_record(RecordId(seq.wrapping_mul(2) - 1));
@@ -184,7 +201,7 @@ fn no_effect_is_dispatched_without_its_intent_in_recovered_history() {
     // point the recovered history still has the schedule record for everything dispatched.
     let dispatches: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
 
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         dispatches.borrow_mut().push(Vec::new());
         let mut at = 0;
 
@@ -263,7 +280,7 @@ fn a_writer_that_forgets_its_barrier_is_caught_by_the_oracle() {
     // orders the first, so at the crash point that tears the second write the first is
     // only possibly durable — and a *claim* that it was acknowledged is a breach the
     // oracle names.
-    let runs = Harness::new(geometry()).run(|session| {
+    let runs = drive(|session| {
         let mut at = 0;
         session.begin_record(RecordId(1));
         append(

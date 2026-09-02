@@ -47,6 +47,14 @@ pub enum Breach {
         /// The record recovery invented.
         record: RecordId,
     },
+    /// Recovery produced a record only part of which reached media.
+    ///
+    /// Design document §15 permits recovery to include "an unacknowledged **complete**
+    /// record". Half a record is not one, and no integrity check should have accepted it.
+    RecoveredATornRecord {
+        /// The record recovery half-read.
+        record: RecordId,
+    },
     /// Recovery lost a record whose barrier had returned.
     LostAnAcknowledgedRecord {
         /// The record that was acknowledged and is not there.
@@ -81,6 +89,11 @@ impl fmt::Display for Breach {
                 "recovery produced record {}, none of which ever reached media",
                 record.0
             ),
+            Self::RecoveredATornRecord { record } => write!(
+                formatter,
+                "recovery produced record {}, only part of which reached media",
+                record.0
+            ),
             Self::LostAnAcknowledgedRecord { record } => write!(
                 formatter,
                 "recovery lost record {}, whose barrier had returned",
@@ -97,18 +110,31 @@ impl core::error::Error for Breach {}
 /// # Errors
 ///
 /// One [`Breach`] — the first the checks below find, in the order they are written, so that
-/// the most structural failure is the one reported. A recovery that is not a prefix is
-/// described as that rather than as four missing records.
+/// the most specific diagnosis is the one reported. A recovery that produced a record which
+/// never reached media is described as that rather than as a prefix that disagrees at
+/// position one, and a recovery that is not a prefix is described as that rather than as
+/// four missing records.
 pub fn verify_recovery(ledger: &Ledger, recovered: &[RecordId]) -> Result<(), Breach> {
-    let committed = ledger.order();
-
     let mut seen = BTreeSet::new();
-    for id in &committed {
-        if !seen.insert(*id) {
-            return Err(Breach::DuplicateRecordId { record: *id });
+    for id in ledger.order() {
+        if !seen.insert(id) {
+            return Err(Breach::DuplicateRecordId { record: id });
         }
     }
 
+    // Before the prefix check, because "recovery produced a record that never reached
+    // media" is a diagnosis and "position 1 disagrees" is a symptom of it.
+    let recovered_set: BTreeSet<RecordId> = recovered.iter().copied().collect();
+    for id in &recovered_set {
+        if ledger.state(*id) == Some(Durability::Attempted) {
+            return Err(Breach::RecoveredWhatWasNeverAttempted { record: *id });
+        }
+        if ledger.torn(*id) == Some(true) {
+            return Err(Breach::RecoveredATornRecord { record: *id });
+        }
+    }
+
+    let committed: Vec<RecordId> = ledger.committed().collect();
     for (position, found) in recovered.iter().enumerate() {
         let expected = committed.get(position).copied();
         if expected != Some(*found) {
@@ -117,13 +143,6 @@ pub fn verify_recovery(ledger: &Ledger, recovered: &[RecordId]) -> Result<(), Br
                 expected,
                 found: *found,
             });
-        }
-    }
-
-    let recovered_set: BTreeSet<RecordId> = recovered.iter().copied().collect();
-    for id in &recovered_set {
-        if ledger.state(*id) == Some(Durability::Attempted) {
-            return Err(Breach::RecoveredWhatWasNeverAttempted { record: *id });
         }
     }
 

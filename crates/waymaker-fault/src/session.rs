@@ -14,10 +14,12 @@
 //! the crash point, which is the property that makes a torn-write image an image a reset
 //! could really produce.
 
+use core::fmt;
+
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 use crate::device::{Device, FaultError, OneWayBits};
-use crate::inject::{Effect, Injection, Op, Progress};
+use crate::inject::{Injection, Interruption, Op, Progress};
 use crate::model::{Durability, Ledger, RecordId};
 
 /// The storage handed to a writer under test.
@@ -26,8 +28,27 @@ pub struct Session {
     device: Device,
     injection: Option<Injection>,
     ops: Vec<Op>,
-    /// Whether operation `i` put anything at all on media. Index-aligned with `ops`.
+    /// Whether operation `i` actually changed a cell. Index-aligned with `ops`.
+    ///
+    /// The change, not the call. Programming `0xFF` over erased media offers four bytes and
+    /// alters nothing, and so does erasing a block that is already erased; a record whose
+    /// only mutation was one of those has nothing on media, and calling it durable would
+    /// oblige recovery to produce something that is not there.
     touched: Vec<bool>,
+    /// Whether operation `i` left media differing from what completing it would have left.
+    ///
+    /// A record with one of these in it is *torn*: part of what it meant to put on media is
+    /// there and the rest is not. Design document §15 permits recovery to include "an
+    /// unacknowledged **complete** record", and half a record is not one — so a torn record
+    /// can never be acknowledged, whatever barrier follows it, and recovery producing one is
+    /// a breach.
+    ///
+    /// The comparison is against the *media*, not against the byte count. A frame is padded
+    /// to the program granularity with `0xFF`, and programming `0xFF` over erased media
+    /// changes nothing — so a write interrupted inside its own padding leaves exactly the
+    /// bytes a completed write would have, and calling that torn would fail a recovery that
+    /// is entirely correct.
+    torn: Vec<bool>,
     /// Indices of barriers that completed durably.
     barriers: Vec<usize>,
     /// `(record, index of the first operation that could belong to it)`. A `None` record
@@ -43,6 +64,7 @@ impl Session {
             injection,
             ops: Vec::new(),
             touched: Vec::new(),
+            torn: Vec::new(),
             barriers: Vec::new(),
             marks: Vec::new(),
             powered: true,
@@ -113,18 +135,28 @@ impl Session {
                     .marks
                     .get(position.wrapping_add(1))
                     .map_or(self.ops.len(), |(_, next)| *next);
-                Some((id, self.durability_of(*start, end)))
+                let torn =
+                    (*start..end.max(*start)).any(|index| self.torn.get(index) == Some(&true));
+                Some((id, self.durability_of(*start, end, torn), torn))
             })
             .collect();
-        Ledger::from_entries(entries)
+        Ledger::new(entries)
     }
 
     /// The state of a record whose operations are `start..end`.
-    fn durability_of(&self, start: usize, end: usize) -> Durability {
+    fn durability_of(&self, start: usize, end: usize, torn: bool) -> Durability {
         let range = || start..end.max(start);
 
         if !range().any(|index| self.touched.get(index) == Some(&true)) {
             return Durability::Attempted;
+        }
+
+        // A barrier orders whatever is on media, and what is on media is half a record. The
+        // writer may not even know: an injected failure hands it an error and lets it carry
+        // on to the barrier. Acknowledging that would oblige recovery to produce a frame no
+        // integrity check would accept.
+        if torn {
+            return Durability::PossiblyDurable;
         }
 
         // A barrier acknowledges a record only if it completed after every one of that
@@ -159,14 +191,14 @@ impl Session {
         }
     }
 
-    /// The error an injected `effect` reports, and the power state it leaves behind.
-    const fn interrupt(&mut self, effect: Effect) -> FaultError {
-        match effect {
-            Effect::PowerLoss => {
+    /// The error an `interruption` reports, and the power state it leaves behind.
+    const fn interrupt(&mut self, interruption: Interruption) -> FaultError {
+        match interruption {
+            Interruption::PowerLoss => {
                 self.powered = false;
                 FaultError::PowerLoss
             }
-            Effect::Failure => FaultError::Injected,
+            Interruption::Failure => FaultError::InjectedFailure,
         }
     }
 }
@@ -205,11 +237,26 @@ impl StableStorage for Session {
             .armed_for(index)
             .map_or(len, |injection| Self::landed(injection.progress, len));
         let written = src.get(..landed as usize).unwrap_or(src);
-        self.device.apply_program(offset, written);
-        self.touched.push(!written.is_empty());
+        // Torn is "some of what this write meant to change is on media and the rest is
+        // not", measured against the *media* rather than against the byte count. Both
+        // halves matter: a write that changed nothing is not torn, it never started, and
+        // the bytes that did not land may be the ones that would have changed nothing —
+        // a frame is padded with `0xFF`, and programming `0xFF` over erased media is the
+        // identity, so a write interrupted inside its own padding leaves exactly what a
+        // completed write would have.
+        let landed_something = self.device.apply_program(offset, written);
+        let withheld = src.get(landed as usize..).unwrap_or_default();
+        self.touched.push(landed_something);
+        self.torn.push(
+            landed_something
+                && self
+                    .device
+                    .program_would_change(offset.wrapping_add(landed), withheld),
+        );
 
-        self.armed_for(index)
-            .map_or(Ok(()), |injection| Err(self.interrupt(injection.effect)))
+        self.armed_for(index).map_or(Ok(()), |injection| {
+            Err(self.interrupt(injection.interruption))
+        })
     }
 
     fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
@@ -223,11 +270,18 @@ impl StableStorage for Session {
         let landed = self
             .armed_for(index)
             .map_or(len, |injection| Self::landed(injection.progress, len));
-        self.device.apply_erase(offset, landed);
-        self.touched.push(landed > 0);
+        let landed_something = self.device.apply_erase(offset, landed);
+        self.touched.push(landed_something);
+        self.torn.push(
+            landed_something
+                && self
+                    .device
+                    .erase_would_change(offset.wrapping_add(landed), len.wrapping_sub(landed)),
+        );
 
-        self.armed_for(index)
-            .map_or(Ok(()), |injection| Err(self.interrupt(injection.effect)))
+        self.armed_for(index).map_or(Ok(()), |injection| {
+            Err(self.interrupt(injection.interruption))
+        })
     }
 
     fn barrier(&mut self) -> Result<(), Self::Error> {
@@ -238,21 +292,22 @@ impl StableStorage for Session {
         let index = self.ops.len();
         self.ops.push(Op::Barrier);
         self.touched.push(false);
+        self.torn.push(false);
 
         match self.armed_for(index) {
             // Power lost *after* the barrier returned: the ordering was established, so
             // everything it covered is durable and recovery is required to find it. The
             // caller never learned, which is the whole point of enumerating this crash
             // point separately from the one before the barrier.
-            Some(injection) if injection.effect == Effect::PowerLoss => {
+            Some(injection) if injection.interruption == Interruption::PowerLoss => {
                 if injection.progress == Progress::Whole {
                     self.barriers.push(index);
                 }
-                Err(self.interrupt(Effect::PowerLoss))
+                Err(self.interrupt(Interruption::PowerLoss))
             }
             // A barrier that returned an error establishes nothing a caller may rely on,
             // whatever really happened on the wire.
-            Some(injection) => Err(self.interrupt(injection.effect)),
+            Some(injection) => Err(self.interrupt(injection.interruption)),
             None => {
                 self.barriers.push(index);
                 Ok(())
@@ -300,7 +355,7 @@ impl Run {
 ///
 /// # Why the writer is a closure rather than a recorded sequence
 ///
-/// Because [`Effect::Failure`] hands the writer an error and lets it carry on, and what it
+/// Because [`Interruption::Failure`] hands the writer an error and lets it carry on, and what it
 /// does next is the thing being tested. Replaying a recorded byte log could not express a
 /// retry. The cost is that the writer is run `1 + injections` times and must be
 /// deterministic; the benefit is that "failed or interrupted `program`/`erase`" is a real
@@ -317,7 +372,7 @@ impl Harness {
     pub const fn new(geometry: Geometry) -> Self {
         Self {
             geometry,
-            bits: OneWayBits::Nor,
+            bits: OneWayBits::Absorbed,
         }
     }
 
@@ -338,28 +393,140 @@ impl Harness {
 
     /// Every run: the fault-free one first, then one per crash point, in enumeration order.
     ///
+    /// # Errors
+    ///
+    /// [`HarnessError::WriterFailedWithNoFaultsArmed`] if the writer returned an error in
+    /// the run where nothing was injected, and
+    /// [`HarnessError::WriterIsNotDeterministic`] if some run's operations before its crash
+    /// point differ from the fault-free run's.
+    ///
+    /// Both are refusals rather than results, and that is the point. The enumeration is
+    /// taken from the fault-free run's write sequence, so a writer that gives up early
+    /// there — a misaligned offset, a buffer too small, a geometry that cannot hold what it
+    /// wanted to write — produces a short sequence, a handful of crash points, and a suite
+    /// in which every assertion passes because nothing was checked. A measurement that did
+    /// not happen is not a measurement that passed.
+    ///
     /// # Postconditions
     ///
-    /// `result[0].injection().is_none()`, and `result[1..]` carries exactly
+    /// On success, `result[0].injection().is_none()`, and `result[1..]` carries exactly
     /// `injections(result[0].ops(), geometry)`, in that order — so the number of runs is a
     /// fact about the write sequence rather than a sampling budget.
-    pub fn run<W, E>(&self, mut writer: W) -> Vec<Run>
+    pub fn run<W, E>(&self, mut writer: W) -> Result<Vec<Run>, HarnessError>
+    where
+        W: FnMut(&mut Session) -> Result<(), E>,
+        E: fmt::Debug,
+    {
+        let baseline = self.fault_free(&mut writer)?;
+        let sequence = baseline.ops.clone();
+
+        let mut runs = vec![baseline];
+        for injection in crate::inject::injections(&sequence, self.geometry) {
+            runs.push(self.injected(injection, &sequence, &mut writer)?);
+        }
+        Ok(runs)
+    }
+
+    /// One run, with `injection` armed and nothing else.
+    ///
+    /// [`run`](Self::run) is this in a loop over [`injections`](crate::injections). It
+    /// exists on its own because reproducing one failure should not cost the whole
+    /// enumeration: a three-record journal is over a hundred runs, and the loop a
+    /// contributor sits in while debugging is this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run). A crash point that never fires — an `op` past the end of the
+    /// sequence, or one the writer did not reach — is reported as
+    /// [`HarnessError::WriterIsNotDeterministic`], because against a deterministic writer
+    /// that is the only way it can happen.
+    pub fn run_one<W, E>(&self, injection: Injection, mut writer: W) -> Result<Run, HarnessError>
+    where
+        W: FnMut(&mut Session) -> Result<(), E>,
+        E: fmt::Debug,
+    {
+        let baseline = self.fault_free(&mut writer)?;
+        let sequence = baseline.ops;
+        self.injected(injection, &sequence, &mut writer)
+    }
+
+    /// The run in which nothing is injected, which is where the write sequence comes from.
+    fn fault_free<W, E>(&self, writer: &mut W) -> Result<Run, HarnessError>
+    where
+        W: FnMut(&mut Session) -> Result<(), E>,
+        E: fmt::Debug,
+    {
+        let mut session = Session::new(Device::with_bit_rule(self.geometry, self.bits), None);
+        match writer(&mut session) {
+            Ok(()) => Ok(session.finish()),
+            Err(error) => Err(HarnessError::WriterFailedWithNoFaultsArmed(format!(
+                "{error:?}"
+            ))),
+        }
+    }
+
+    /// One run with `injection` armed, checked against the sequence it was enumerated from.
+    fn injected<W, E>(
+        &self,
+        injection: Injection,
+        sequence: &[Op],
+        writer: &mut W,
+    ) -> Result<Run, HarnessError>
     where
         W: FnMut(&mut Session) -> Result<(), E>,
     {
-        let mut baseline = Session::new(Device::with_bit_rule(self.geometry, self.bits), None);
-        drop(writer(&mut baseline));
-        let sequence = baseline.ops.clone();
+        let mut session = Session::new(
+            Device::with_bit_rule(self.geometry, self.bits),
+            Some(injection),
+        );
+        drop(writer(&mut session));
+        let run = session.finish();
 
-        let mut runs = vec![baseline.finish()];
-        for injection in crate::inject::injections(&sequence, self.geometry) {
-            let mut session = Session::new(
-                Device::with_bit_rule(self.geometry, self.bits),
-                Some(injection),
-            );
-            drop(writer(&mut session));
-            runs.push(session.finish());
+        // Nothing has gone wrong yet at the moment the crash point fires, so every
+        // operation up to and including it must be the one the enumeration was computed
+        // from. Where they differ, the writer is not a function of the storage it was
+        // handed, and the crash points are aimed at operations that are not there.
+        let through = injection.op.saturating_add(1);
+        let planned = sequence.get(..through);
+        let actual = run.ops.get(..through);
+        if planned.is_none() || planned != actual {
+            return Err(HarnessError::WriterIsNotDeterministic { injection });
         }
-        runs
+        Ok(run)
     }
 }
+
+/// A refusal to report crash points that were not really enumerated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HarnessError {
+    /// The writer returned an error in the run where nothing was injected.
+    ///
+    /// Carries the `Debug` rendering of that error, because the harness is generic over it
+    /// and has nowhere to put the value itself.
+    WriterFailedWithNoFaultsArmed(String),
+    /// A run's operations before its crash point differ from the fault-free run's.
+    WriterIsNotDeterministic {
+        /// The crash point whose run diverged.
+        injection: Injection,
+    },
+}
+
+impl fmt::Display for HarnessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterFailedWithNoFaultsArmed(error) => write!(
+                formatter,
+                "the writer failed with no faults armed, so the write sequence the crash \
+                 points were enumerated from is not the one it meant to issue: {error}"
+            ),
+            Self::WriterIsNotDeterministic { injection } => write!(
+                formatter,
+                "the writer issued different operations before {injection:?} than it did \
+                 with no faults armed, so the crash points are aimed at operations that are \
+                 not there"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for HarnessError {}

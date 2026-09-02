@@ -41,11 +41,13 @@
 //! use waymaker_flash::storage::{Geometry, StableStorage};
 //!
 //! let geometry = Geometry::new(64, 32, 4, 1).expect("a legal geometry");
-//! let runs = Harness::new(geometry).run(|session| {
-//!     session.begin_record(RecordId(0));
-//!     session.program(0, b"\xAA\xAA\xAA\xAA")?;
-//!     session.barrier()
-//! });
+//! let runs = Harness::new(geometry)
+//!     .run(|session| {
+//!         session.begin_record(RecordId(0));
+//!         session.program(0, b"\xAA\xAA\xAA\xAA")?;
+//!         session.barrier()
+//!     })
+//!     .expect("the writer succeeds with no faults armed");
 //!
 //! // One fault-free run, and one run per crash point.
 //! assert!(runs.len() > 1);
@@ -64,7 +66,7 @@ mod oracle;
 mod session;
 
 pub use device::{Device, ERASED, FaultError, OneWayBits};
-pub use inject::{Effect, Injection, Op, Progress, injections};
+pub use inject::{Injection, Interruption, Op, Progress, injections};
 pub use model::{Durability, Ledger, RecordId};
 pub use oracle::{Breach, verify_recovery};
-pub use session::{Harness, Run, Session};
+pub use session::{Harness, HarnessError, Run, Session};

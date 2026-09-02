@@ -11,14 +11,14 @@
 //! Because "every crash point" has to be a finite, countable thing before it can be a loop.
 //! [`crate::Harness`] runs the writer once with no faults to learn its sequence, asks this
 //! function for the list, and then re-runs the writer once per entry. A writer that reacts
-//! to an injected [`Effect::Failure`] by doing something different is not a problem for
+//! to an injected [`Interruption::Failure`] by doing something different is not a problem for
 //! that: only one injection is armed per run, and everything before it is identical by
 //! construction.
 //!
 //! # The two effects are different questions
 //!
-//! [`Effect::PowerLoss`] asks "what is on media if the world stops here" — nothing after it
-//! runs, ever. [`Effect::Failure`] asks "what does the writer do when this call returns an
+//! [`Interruption::PowerLoss`] asks "what is on media if the world stops here" — nothing after it
+//! runs, ever. [`Interruption::Failure`] asks "what does the writer do when this call returns an
 //! error" — the media may already have changed, and the writer carries on. Design document
 //! §12 requires both: `program` and `erase` "may fail **or** be interrupted".
 
@@ -112,7 +112,7 @@ pub enum Progress {
 
 /// What the interruption looks like to the writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Effect {
+pub enum Interruption {
     /// The power went away. The call returns an error and so does every call after it;
     /// nothing more reaches media, ever.
     PowerLoss,
@@ -129,7 +129,7 @@ pub struct Injection {
     /// How much of that operation reached media before the interruption.
     pub progress: Progress,
     /// Power loss, or a failed call the writer may react to.
-    pub effect: Effect,
+    pub interruption: Interruption,
 }
 
 /// Every crash point in `ops`, in a fixed order, with no duplicates.
@@ -155,7 +155,7 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
     let mut points = vec![Injection {
         op: 0,
         progress: Progress::None,
-        effect: Effect::PowerLoss,
+        interruption: Interruption::PowerLoss,
     }];
 
     for (index, op) in ops.iter().enumerate() {
@@ -163,14 +163,14 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
             points.push(Injection {
                 op: index,
                 progress: Progress::Bytes(bytes),
-                effect: Effect::PowerLoss,
+                interruption: Interruption::PowerLoss,
             });
         }
         if !op.mutates_nothing() {
             points.push(Injection {
                 op: index,
                 progress: Progress::Whole,
-                effect: Effect::PowerLoss,
+                interruption: Interruption::PowerLoss,
             });
         }
     }
@@ -179,7 +179,7 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
         points.push(Injection {
             op: index,
             progress: Progress::None,
-            effect: Effect::Failure,
+            interruption: Interruption::Failure,
         });
         if !op.failure_is_observable_after_the_fact() || op.mutates_nothing() {
             continue;
@@ -188,13 +188,13 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
             points.push(Injection {
                 op: index,
                 progress: Progress::Bytes(bytes),
-                effect: Effect::Failure,
+                interruption: Interruption::Failure,
             });
         }
         points.push(Injection {
             op: index,
             progress: Progress::Whole,
-            effect: Effect::Failure,
+            interruption: Interruption::Failure,
         });
     }
 
