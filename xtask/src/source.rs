@@ -805,7 +805,7 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     // The checksum module and anything it is split into. Codex asked for this on PR #58:
     // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
     // rule that read one file would have called it absent.
-    for scanned in checksum_sources(sources) {
+    for scanned in checksum_sources(sources, &source.contents) {
         let scanned_code = without_test_modules(&code_only(&scanned.contents));
         for name in array_items(&scanned_code) {
             violations.push(Violation::new(
@@ -825,21 +825,81 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     violations
 }
 
-/// The checksum module, plus every source under a `crc/` directory beside it.
+/// The checksum module, plus every source under a `crc/` directory beside it, minus the
+/// ones the parent declares behind `#[cfg(test)]`.
 ///
 /// Splitting `crc.rs` into `crc/mod.rs` and `crc/table.rs` is an ordinary refactor and it is
 /// how a lookup table would arrive without this rule seeing it, so the scan follows the
 /// module rather than the file.
+///
+/// Moving the tests out to `crc/tests.rs` behind `#[cfg(test)] mod tests;` is an ordinary
+/// refactor too, and Codex pointed out on PR #58 that the first version of this punished it:
+/// the child file arrives without its parent's attribute, so the bit-flip sweep's
+/// `const MESSAGE: [u8; 12]` would have been reported as a production lookup table. A rule
+/// that rejects a test-only refactor is a rule contributors learn to work around.
 #[must_use]
-fn checksum_sources(sources: &[crate::size::LayerSource]) -> Vec<&crate::size::LayerSource> {
+fn checksum_sources<'a>(
+    sources: &'a [crate::size::LayerSource],
+    parent: &str,
+) -> Vec<&'a crate::size::LayerSource> {
     let directory = INTEGRITY_CHECK_PATH.trim_end_matches(".rs");
+    let test_only = test_gated_modules(parent);
+
     sources
         .iter()
         .filter(|source| {
             let path = source.path.replace('\\', "/");
-            path.ends_with(INTEGRITY_CHECK_PATH) || path.contains(&format!("{directory}/"))
+            if path.ends_with(INTEGRITY_CHECK_PATH) {
+                return true;
+            }
+            if !path.contains(&format!("{directory}/")) {
+                return false;
+            }
+            // `crc/tests.rs` and `crc/tests/mod.rs` both belong to the module `tests`.
+            let stem = path
+                .rsplit_once(&format!("{directory}/"))
+                .map(|(_, tail)| tail)
+                .unwrap_or_default()
+                .trim_end_matches(".rs")
+                .trim_end_matches("/mod");
+            !test_only.iter().any(|name| name == stem)
         })
         .collect()
+}
+
+/// The names of modules `parent` declares out of line behind `#[cfg(test)]`.
+///
+/// Read from the raw text rather than from `code_only` output, because the attribute is what
+/// is being looked for and stripping comments cannot help with that: a `// #[cfg(test)]`
+/// line is prose, so the scan skips comment lines itself.
+#[must_use]
+fn test_gated_modules(parent: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = false;
+
+    for line in parent.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.contains("#[cfg(test)]") {
+            pending = true;
+        }
+        if !pending {
+            continue;
+        }
+        if let Some(rest) = trimmed.split_once("mod ").map(|(_, rest)| rest)
+            && let Some(name) = rest.strip_suffix(';')
+        {
+            names.push(name.trim().to_owned());
+            pending = false;
+        } else if trimmed.contains('{') || trimmed.ends_with(';') {
+            // Some other item took the attribute.
+            pending = false;
+        }
+    }
+
+    names
 }
 
 /// How many times `code` contains `token` as a whole token.
@@ -2863,6 +2923,71 @@ mod deferred_answer_pins {
         )]);
         assert!(
             violations.iter().any(|v| v.detail.contains("fn crc32")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_fixture_in_an_out_of_line_test_module_is_not_a_lookup_table() {
+        // Codex, PR #58 round 3. Moving the inline tests to `crc/tests.rs` behind
+        // `#[cfg(test)] mod tests;` is an ordinary refactor, and the submodule scan added
+        // in the round before would have reported the bit-flip sweep's
+        // `const MESSAGE: [u8; 12]` as a production table. A rule that rejects a test-only
+        // refactor is a rule contributors learn to work around.
+        for path in [
+            "crates/waymaker-flash/src/crc/tests.rs",
+            "crates/waymaker-flash/src/crc/tests/mod.rs",
+        ] {
+            let sources = vec![
+                layer(
+                    INTEGRITY_CHECK_PATH,
+                    &format!(
+                        "{}#[cfg(test)]\nmod tests;\n",
+                        tests_support::clean_checksum_module()
+                    ),
+                ),
+                crate::size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: path.to_owned(),
+                    contents: "const MESSAGE: [u8; 12] = [0; 12];\n".to_owned(),
+                },
+            ];
+            assert!(
+                check_integrity_check(&sources).is_empty(),
+                "`{path}` was read as production code"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ungated_submodule_is_still_scanned_when_a_sibling_is_test_only() {
+        // The exemption has to be per module, not "there is a cfg(test) mod somewhere".
+        let sources = vec![
+            layer(
+                INTEGRITY_CHECK_PATH,
+                &format!(
+                    "{}#[cfg(test)]\nmod tests;\nmod table;\n",
+                    tests_support::clean_checksum_module()
+                ),
+            ),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/tests.rs".to_owned(),
+                contents: "const MESSAGE: [u8; 12] = [0; 12];\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/table.rs".to_owned(),
+                contents: "pub(crate) const NIBBLE: [u32; 16] = [0; 16];\n".to_owned(),
+            },
+        ];
+        let violations = check_integrity_check(&sources);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE")),
+            "{violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("MESSAGE")),
             "{violations:?}"
         );
     }

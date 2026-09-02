@@ -529,22 +529,22 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
     let mut blocks = Vec::new();
     let mut pending_id: Option<String> = None;
     let mut collecting: Option<(String, Vec<&str>)> = None;
-    // The length of the fence that opened the block we are inside, mermaid or not. A fence
-    // is closed only by a run of at least as many backticks, which is what keeps a quoted
-    // example from being read as the real thing.
-    let mut open_fence: Option<usize> = None;
+    // The character and length of the fence that opened the block we are inside, mermaid or
+    // not. A fence is closed only by a run of at least as many of its own character, which
+    // is what keeps a quoted example from being read as the real thing.
+    let mut open_fence: Option<(u8, usize)> = None;
 
     for line in contents.lines() {
         let indent = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim();
         let fence = fence_length(trimmed);
 
-        if let Some(width) = open_fence {
-            // Inside a fence: only a long-enough closing fence ends it, and only when it
-            // is not itself indented into a code block.
-            if fence.is_some_and(|length| length >= width)
+        if let Some((marker, width)) = open_fence {
+            // Inside a fence: only a long-enough closing fence of the *same* character ends
+            // it, and only when it is not itself indented into a code block.
+            if fence.is_some_and(|(found, length)| found == marker && length >= width)
                 && indent < 4
-                && trimmed.len() == fence.unwrap_or(0)
+                && trimmed.len() == fence.map_or(0, |(_, length)| length)
             {
                 if let Some((id, body)) = collecting.take() {
                     blocks.push(MermaidBlock {
@@ -559,11 +559,11 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
             continue;
         }
 
-        if let Some(length) = fence {
+        if let Some((marker, length)) = fence {
             // An indented fence is literal text in the rendered page, so it opens nothing
             // a reader would call a diagram.
             if indent < 4 {
-                open_fence = Some(length);
+                open_fence = Some((marker, length));
                 if trimmed
                     .get(length..)
                     .is_some_and(|info| info.trim() == "mermaid")
@@ -588,10 +588,18 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
     blocks
 }
 
-/// The number of leading backticks, when `line` starts a fence of three or more.
-fn fence_length(line: &str) -> Option<usize> {
-    let length = line.bytes().take_while(|byte| *byte == b'`').count();
-    (length >= 3).then_some(length)
+/// The fence character and its run length, when `line` starts a fence of three or more.
+///
+/// Markdown fences with `~~~` as well as with backticks, and a fence is closed only by a
+/// run of its own character — Codex pointed out on PR #58 that knowing about one of them
+/// leaves a hole of exactly the shape the fence check exists to close.
+fn fence_length(line: &str) -> Option<(u8, usize)> {
+    let marker = line
+        .bytes()
+        .next()
+        .filter(|byte| matches!(byte, b'`' | b'~'))?;
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
 }
 
 /// `body` without the Mermaid `%%` comment lines, which are in the source and not in the
@@ -639,12 +647,16 @@ fn without_html_comments(contents: &str) -> String {
 #[must_use]
 fn without_fenced_code(contents: &str) -> String {
     let mut kept = Vec::new();
-    let mut open_fence: Option<usize> = None;
+    let mut open_fence: Option<(u8, usize)> = None;
     for line in contents.lines() {
         let trimmed = line.trim();
         let fence = fence_length(trimmed);
         match open_fence {
-            Some(width) if fence.is_some_and(|length| length >= width) => open_fence = None,
+            Some((marker, width))
+                if fence.is_some_and(|(found, length)| found == marker && length >= width) =>
+            {
+                open_fence = None;
+            }
             Some(_) => {}
             None if fence.is_some() => open_fence = fence,
             None => kept.push(line),
@@ -1150,21 +1162,35 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for question in DEFERRED_QUESTIONS {
-        // The question's own row, found by its backticked id so that
+        // The question's own table row, found by its backticked id so that
         // `integrity-check-algorithm` cannot be vouched for by a longer id containing it.
         //
         // A row rather than the whole file, which is what Codex caught on PR #58: three
         // global `contains` calls are satisfied by the id, the headline and a status sitting
         // in three unrelated places, so a row could state the opposite of the table and pass.
-        let Some(row) = contents
+        // And a *table* row rather than any line, which Codex caught in the round after
+        // that: prose mentioning an id above the table shadowed the row, which fails a
+        // correct file and passes one whose row has gone stale.
+        let rows: Vec<&str> = contents
             .lines()
-            .find(|line| line.contains(&format!("`{}`", question.id)))
-        else {
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", question.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
             violations.push(Violation::new(
                 "deferred-questions",
                 question.id,
-                "CLAUDE.md does not name this deferred question in backticks, so a \
-                 contributor cannot tell which design questions are still open",
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this deferred question in backticks, \
+                     so a contributor cannot tell which design questions are still open"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this deferred question, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
             ));
             continue;
         };
@@ -1174,8 +1200,8 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
                 "deferred-questions",
                 question.id,
                 format!(
-                    "CLAUDE.md's row for this question does not carry its headline, which \
-                     reads `{}`",
+                    "CLAUDE.md's table row for this question does not carry its headline, \
+                     which reads `{}`",
                     question.headline
                 ),
             ));
@@ -1186,9 +1212,9 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
                 "deferred-questions",
                 question.id,
                 format!(
-                    "CLAUDE.md's row does not say where it stands, which DEFERRED_QUESTIONS \
-                     renders as `{status}`; a row free to disagree with the table is a row \
-                     that eventually does"
+                    "CLAUDE.md's table row does not say where it stands, which \
+                     DEFERRED_QUESTIONS renders as `{status}`; a row free to disagree with \
+                     the table is a row that eventually does"
                 ),
             ));
         }
@@ -1633,11 +1659,16 @@ pub mod tests_support {
             line(&mut body, format_args!("- `{rule}`"));
         }
         line(&mut body, format_args!("All {} rules.", rules.len()));
+        line(
+            &mut body,
+            format_args!("| Id | Question | Where it stands |"),
+        );
+        line(&mut body, format_args!("| --- | --- | --- |"));
         for question in DEFERRED_QUESTIONS {
             line(
                 &mut body,
                 format_args!(
-                    "- `{}` — {} {}",
+                    "| `{}` | {} | {} |",
                     question.id,
                     question.headline,
                     question.render_status()
@@ -1884,8 +1915,8 @@ mod tests {
             return;
         };
         let split = clean_claude_md(RULES).replace(
-            &format!("`{}` — {}", question.id, question.headline),
-            &format!("`{}`\n{}", question.id, question.headline),
+            &format!("| `{}` | {} |", question.id, question.headline),
+            &format!("| `{}` | |\n| {} |", question.id, question.headline),
         );
         let violations = check_deferred_questions(Some(&split), &clean_inputs(RULES).adrs);
         assert!(
@@ -2186,6 +2217,88 @@ mod tests {
             violations
                 .iter()
                 .any(|v| v.subject == question.id && v.detail.contains(DEFERRED_QUESTION_MARKER)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_tilde_fenced_example_does_not_settle_anything() {
+        // Codex, PR #58 round 3. Markdown fences with `~~~` as well as backticks, and the
+        // scan only knew one of them — so the fix for the fenced-example hole had a hole
+        // of exactly the same shape.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-tilde-fenced.md".to_owned(),
+            contents: format!(
+                "{}\n~~~text\n{DEFERRED_QUESTION_MARKER} `{}`\n~~~\n",
+                clean_adr("tilde fenced"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a tilde-fenced example was read as a claim: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_fence_is_closed_only_by_its_own_character() {
+        // The other half of knowing about two fence characters: a backtick block must not
+        // be closed by a tilde line, or everything after it stops being fenced.
+        assert_eq!(
+            without_fenced_code("keep\n```\nhidden\n~~~\nstill hidden\n```\nkeep too"),
+            "keep\nkeep too"
+        );
+    }
+
+    #[test]
+    fn prose_naming_a_question_before_the_table_does_not_stand_in_for_its_row() {
+        // Codex, PR #58 round 3. The scan took the first line containing the backticked id,
+        // so a mention in prose above the table shadowed the row — failing the gate on a
+        // correct file, and passing it on one whose row had gone stale.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let with_prose = format!(
+            "Some prose mentioning `{}` well before the table.\n\n{}",
+            question.id,
+            clean_claude_md(RULES)
+        );
+        assert!(
+            check_deferred_questions(Some(&with_prose), &clean_inputs(RULES).adrs).is_empty(),
+            "prose above the table shadowed the row"
+        );
+    }
+
+    #[test]
+    fn a_question_whose_row_is_gone_is_reported_even_when_prose_names_it() {
+        // The direction that matters: prose that happens to repeat the headline and the
+        // status must not stand in for the row itself.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let row = format!(
+            "| `{}` | {} | {} |",
+            question.id,
+            question.headline,
+            question.render_status()
+        );
+        let prose_only = clean_claude_md(RULES).replace(
+            &row,
+            &format!(
+                "`{}` {} {} — stated in prose, in no table at all",
+                question.id,
+                question.headline,
+                question.render_status()
+            ),
+        );
+        let violations = check_deferred_questions(Some(&prose_only), &clean_inputs(RULES).adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == question.id),
             "{violations:?}"
         );
     }
