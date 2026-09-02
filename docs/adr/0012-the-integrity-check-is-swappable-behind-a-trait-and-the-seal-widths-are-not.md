@@ -59,13 +59,19 @@ Four things follow from that shape, each of them deliberate.
    is nothing to construct, nothing to pass down a call chain, and nothing to keep in sync
    between a writer and a reader. `Scan<'a, C = Catalogued>` carries its choice as a
    zero-sized `PhantomData`.
-3. **The default is the shipped answer, and it is free.** `encode`, `decode`,
-   `Scan::new` and `input_digest` are the `Catalogued` instantiations of `encode_with`,
-   `decode_with`, `Scan::with_integrity` and `input_digest_with`, as `#[inline]` wrappers.
-   Existing code did not change and the image did not grow: the `default` row of
-   `cargo xtask size` measured **7296 B** before this change and **7288 B** after, against
-   a 8192 B budget. The eight bytes are codegen noise in the probe's own arithmetic; the
-   trait itself is not there at runtime.
+3. **The default is the shipped answer, and the trait is free.** `encode`, `decode` and
+   `Scan::new` are the `Catalogued` instantiations of `encode_with`, `decode_with` and
+   `Scan::with_integrity`, as `#[inline]` wrappers, so existing code did not change and
+   there is one monomorphisation in the image. `input_digest` is the exception and stays a
+   `const fn` calling `crc32` directly, for the reason in
+   [Consequences](#consequences): a trait method cannot be `const`.
+
+   The *trait* costs nothing — holding the size probe unchanged, `cargo xtask size`
+   measures **7288 B** against **7296 B** before, and the eight bytes are codegen noise. The
+   *row* the gate prints is **7560 B**, because `size-probe-reach` makes the probe name both
+   entry points and it then runs one codec body twice. That number, its cause and what it
+   costs the budget are in [Consequences](#consequences), which is where a figure a reader
+   can check against `cargo xtask size` belongs.
 4. **The widths are not swappable.** §09's frame spends two bytes on `header_crc` and four
    on `payload_crc`, and [ADR 0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md)
    freezes the header layout across format versions so that a reader can find the end of a
@@ -75,17 +81,33 @@ Four things follow from that shape, each of them deliberate.
    `frame::FRAME_CRC_BYTES` are what say it in bytes, and `const` assertions in `frame.rs`
    fail the build if the two stop agreeing.
 
-**Swapping the check is a wire-format change, and it is loud.** A frame sealed with one
-implementation fails `decode` with `IntegrityFailed` under another, at the header, before
-`payload_len` is trusted for anything. That is the §14 answer — "frame ignored; previous
-history prefix wins" — rather than a journal walked wrong, and
+**Swapping to an implementation that computes different seals is a wire-format change, and
+it is loud.** A frame sealed with one such implementation fails `decode` with
+`IntegrityFailed` under another — at the header when the header check differs, at the
+trailer otherwise. That is the §14 answer, "frame ignored; previous history prefix wins",
+rather than a journal walked wrong, and
 `a_frame_sealed_by_one_check_is_refused_by_the_other` is the test that pins it.
 
-**The rejected candidate ships as a test, not as firmware.** CRC-32C and CRC-16/ARC are
-implemented in `crates/waymaker-flash/tests/integrity.rs` and anchored to their published
-check values (`0xE306_9283` and `0xBB3D`). They are §16's other candidate, made runnable,
-and they are the second implementation of `IntegrityCheck` that proves the swap point is
-real rather than a trait only its default has ever satisfied. They are not in `src/`,
+Swapping to a different implementation of the *same* algorithm is not a format change, and
+that distinction is the reason this is a trait rather than a hard-wired call. ADR 0010's
+"what would revisit this" predicts exactly one such implementation — a nibble table, bought
+against a latency requirement §04 does not yet state — and says that "a table is an
+implementation of an algorithm and not a different one". `every_candidate_computes_the_same_crc32c`
+is what stops that being a claim: the bitwise, nibble-table and byte-table forms of CRC-32C
+are all in `tests/integrity.rs` and all three agree over every input length up to 137.
+
+**The rejected candidate ships as a test, not as firmware.** CRC-32C is implemented in
+`crates/waymaker-flash/tests/integrity.rs` in all three forms ADR 0010 measured — bitwise,
+nibble table, byte table — and the bitwise one is anchored to its published check value
+`0xE306_9283`. That is §16's other candidate, made runnable: the `.rodata` figures issue #17
+asks to be measured (64 B and 1024 B) are properties of the two table forms and of nothing
+else, so a repository that held neither had described its own measurement rather than kept
+it. CRC-16/ARC is there too, anchored to `0xBB3D`; it is not a §16 candidate but a second
+*differing* header hook, without which no test could tell whether the codec consults
+`header_check` at all.
+
+Together they are the second implementation of `IntegrityCheck`, which proves the swap point
+is real rather than a trait only its default has ever satisfied. They are not in `src/`,
 because ADR 0010 rejected CRC-32C and a rejected algorithm compiled into firmware is an
 invitation to a wire-format fork.
 
@@ -117,14 +139,27 @@ as if it did.
 
 ## Consequences
 
-- The `integrity-check` gate rule now fails a pull request on three more things: a
-  `waymaker-flash/src/integrity.rs` that is gone, a seal whose trait signature stops
-  returning `u16` or `u32`, and a `Catalogued` no longer bound to `crc16` and `crc32`. The
-  pin is `xtask::source::SEAL_BINDINGS`. It stays one rule id, because it is one decision:
-  ADR 0010 says which loops, this says the codec still calls them at the same widths.
-- `waymaker-flash` grew five public items — `IntegrityCheck`, `Catalogued`, `encode_with`,
-  `decode_with`, `input_digest_with`, `Scan::with_integrity` — and every one of them is
-  called by the size probe, because `size-probe-reach` requires it.
+- The `integrity-check` gate rule grew two more halves, both pinned by
+  `xtask::source::SEAL_BINDINGS`, and it stays one rule id because it is one decision: ADR
+  0010 says which loops, and this says the codec still reaches them, at the same widths.
+  - **The binding.** A `waymaker-flash/src/integrity.rs` that is gone, a trait or a shipped
+    `impl` that is renamed, *declared twice* — a decoy above the real one defeated the first
+    version of this rule, so ambiguity is now a violation rather than a tie-break — a seal
+    whose signature stops returning `u16` or `u32`, or a `Catalogued` whose method body is
+    anything but one unqualified call to `crc16` or `crc32`. A token count was not enough:
+    `fast::crc32(bytes)` calling a Castagnoli loop in a sibling module satisfied it, with
+    `crc.rs` untouched so the other half passed too.
+  - **The routing.** `encode_with` and `decode_with` must compute each seal through
+    `C::header_check` and `C::frame_check` exactly once and must not name a checksum function
+    at all; `input_digest` must call `crc32` once; and the scan's `next` must walk with
+    `decode_with`. Without this the trait was pinned and nothing was obliged to call it — a
+    codec hard-wired straight back to `crc16` and `crc32`, with `integrity.rs` perfect,
+    passed all 34 rules.
+- `waymaker-flash` grew two public types (`IntegrityCheck`, `Catalogued`), four public
+  functions (`encode_with`, `decode_with`, `input_digest_with`, `Scan::with_integrity`) and
+  two public constants (`frame::HEADER_CRC_BYTES`, `frame::FRAME_CRC_BYTES`). Every one of
+  the functions, and both trait methods, is called by the size probe, because
+  `size-probe-reach` requires it; constants are outside that rule.
 - The `default` size row moved from 7296 B to **7560 B**, and about 270 B of that is the
   probe rather than the library: `size-probe-reach` wants both `encode` and `encode_with`
   named in call position, and the probe now runs the same codec body twice with its own

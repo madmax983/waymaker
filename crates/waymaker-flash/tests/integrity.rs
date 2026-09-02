@@ -10,7 +10,10 @@
 //! * **The rejected candidate, implemented rather than described.** ADR 0010 rejects
 //!   CRC-32C on the strength of a measurement; a rejection with no runnable candidate
 //!   behind it is an assertion. [`Crc32c`] is that candidate, anchored to its published
-//!   check value so it is the real algorithm and not a plausible loop.
+//!   check value so it is the real algorithm and not a plausible loop — and both
+//!   *table-driven* forms are here too, [`crc32c_nibble`] and [`crc32c_byte`], because the
+//!   64 B and 1024 B of `.rodata` issue #17 asks to be measured are properties of those two
+//!   and of nothing else.
 //! * **The failure modes confirmed.** §09 says what the checksum is for — "CRC detects
 //!   accidental corruption and torn writes" — and the two that matter on NOR are a write
 //!   torn at a program-unit boundary and a stale erased tail. Both are swept here over
@@ -38,7 +41,10 @@ use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 const ALIGNMENTS: [u16; 6] = [1, 2, 4, 8, 16, 256];
 
 /// Room for the longest frame these tests build, padded to the largest alignment above.
-const SCRATCH: usize = 1_024;
+///
+/// The largest sample is a 600-byte payload, so 616 bytes of frame and 768 once padded to
+/// 256.
+const SCRATCH: usize = 2_048;
 
 /// The catalogue's check input: every CRC specification states its result for this.
 const CHECK: &[u8] = b"123456789";
@@ -87,6 +93,71 @@ const fn crc32c(bytes: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
+/// CRC-32C folded four bits at a time against a sixteen-entry table.
+///
+/// One of the two table-driven candidates ADR 0010 measured — 52 B of `.text` and **64 B of
+/// `.rodata`**, 21 cycles per byte against the bitwise loop's 93. Present so that the
+/// `.rodata` figure issue #17 asks for is a number about code in this repository rather than
+/// a number in a paragraph, and so that ADR 0010's central claim — "a table is an
+/// implementation of an algorithm and not a different one" — is checked by
+/// [`every_candidate_computes_the_same_crc32c`] rather than asserted.
+fn crc32c_nibble(bytes: &[u8]) -> u32 {
+    // Generated from the bitwise loop rather than pasted, so the table cannot disagree with
+    // the polynomial it is meant to be a folding of.
+    let mut table = [0_u32; 16];
+    for (index, slot) in table.iter_mut().enumerate() {
+        let mut crc = u32::try_from(index).unwrap_or(0);
+        for _ in 0..4 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0x82F6_3B78
+            };
+        }
+        *slot = crc;
+    }
+
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in bytes {
+        for nibble in [u32::from(*byte) & 0xF, u32::from(*byte) >> 4] {
+            let index = usize::try_from((crc ^ nibble) & 0xF).unwrap_or(0);
+            // `get` rather than an index: a helper in an integration test is not exempt
+            // from the workspace's `indexing_slicing` denial, and a fold that silently used
+            // zero on an out-of-range index would be a candidate that agreed with nothing.
+            crc = (crc >> 4) ^ table.get(index).copied().unwrap_or(0);
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// CRC-32C folded a byte at a time against a 256-entry table.
+///
+/// The other table-driven candidate: 44 B of `.text` and **1024 B of `.rodata`** — 12.5% of
+/// design document §04's entire 8 KiB incremental code-flash budget — for 15 cycles per
+/// byte. That ratio is the whole of ADR 0010's decision, and this is the implementation the
+/// number was taken from.
+fn crc32c_byte(bytes: &[u8]) -> u32 {
+    let mut table = [0_u32; 256];
+    for (index, slot) in table.iter_mut().enumerate() {
+        let mut crc = u32::try_from(index).unwrap_or(0);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0x82F6_3B78
+            };
+        }
+        *slot = crc;
+    }
+
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in bytes {
+        let index = usize::try_from((crc ^ u32::from(*byte)) & 0xFF).unwrap_or(0);
+        crc = (crc >> 8) ^ table.get(index).copied().unwrap_or(0);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 /// CRC-16/ARC: reflected polynomial `0xA001`, initial value zero, no final xor. Published
 /// check value `0xBB3D`.
 const fn crc16_arc(bytes: &[u8]) -> u16 {
@@ -108,11 +179,12 @@ const fn crc16_arc(bytes: &[u8]) -> u16 {
     crc
 }
 
-/// The six records the sweeps run over, one per [`RecordRef`] variant.
+/// The records the sweeps run over: one per [`RecordRef`] variant, plus one long enough to
+/// span several program units at every alignment.
 ///
 /// A fixed list rather than a generator: these tests are about byte-level damage, and a
 /// failure that names a record by index is one a reader can rebuild by hand.
-const fn samples() -> [RecordRef<'static>; 6] {
+const fn samples() -> [RecordRef<'static>; 7] {
     [
         RecordRef::RunStarted {
             workflow_kind: 0xBEEF,
@@ -135,6 +207,14 @@ const fn samples() -> [RecordRef<'static>; 6] {
         },
         RecordRef::RunCompleted { result: &[] },
         RecordRef::RunFailed { error: b"why" },
+        // A record longer than one program unit at every alignment swept. Without it the
+        // torn-write sweep was vacuous at its two largest alignments: every other sample is
+        // 16-24 B, so at 16 and at 256 there is no interior boundary to tear at and the
+        // loop ran once, at `cut = 0`, which is an erased page rather than a tear.
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(11),
+            result: &[0xA5; 600],
+        },
     ]
 }
 
@@ -148,6 +228,24 @@ const fn align_or_byte(bytes: u16) -> ProgramAlign {
     match ProgramAlign::new(bytes) {
         Some(align) => align,
         None => ProgramAlign::BYTE,
+    }
+}
+
+/// The payload length a record encodes to, worked out from the record rather than from the
+/// codec.
+///
+/// §09's field list, transcribed: four bytes of workflow identity plus the input for a
+/// `RunStarted`, eight fixed bytes for an `EffectScheduled`, and the caller's bytes alone
+/// for the other four. Written out here so that a test asking "where does the frame end and
+/// the padding begin" is not asking the code under test.
+const fn payload_len(record: &RecordRef<'_>) -> usize {
+    match *record {
+        RecordRef::RunStarted { input, .. } => 4 + input.len(),
+        RecordRef::EffectScheduled { .. } => 8,
+        RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
+            result.len()
+        }
+        RecordRef::EffectFailed { error, .. } | RecordRef::RunFailed { error } => error.len(),
     }
 }
 
@@ -228,9 +326,10 @@ fn the_rejected_candidate_reproduces_its_published_check_value() {
 
 #[test]
 fn the_default_codec_is_the_shipped_check_and_nothing_else() {
-    // `encode` is documented as `encode_with::<Catalogued>`. If it ever stops being that,
-    // the wire format has changed and nothing else here would notice: every other test
-    // drives one side or the other.
+    // `encode` is documented as `encode_with::<Catalogued>`. The byte comparison cannot
+    // fail while that is literally true, so this is a guard against the *rebinding* — a
+    // wrapper pointed at some other implementation — rather than a proof of anything about
+    // the shipped bytes. `frame.rs`'s golden-frame tests are what pin those.
     let mut wired = [0_u8; SCRATCH];
     let mut generic = [0_u8; SCRATCH];
     for record in samples() {
@@ -305,6 +404,33 @@ fn an_input_digest_is_the_frame_check_of_whatever_seals_the_frame() {
 }
 
 #[test]
+fn every_candidate_computes_the_same_crc32c() {
+    // ADR 0010's decision rests on a claim it makes in one sentence and nowhere checks: "a
+    // table is an implementation of an algorithm and not a different one". If that were
+    // false, the table rows of its measurement table would be measuring something else and
+    // the 64 B / 1024 B `.rodata` figures would not be prices for the same answer. All three
+    // candidates therefore have to agree, byte for byte, over inputs that cross a nibble
+    // boundary, a byte boundary and neither.
+    assert_eq!(crc32c(CHECK), 0xE306_9283);
+    assert_eq!(crc32c_nibble(CHECK), 0xE306_9283);
+    assert_eq!(crc32c_byte(CHECK), 0xE306_9283);
+
+    let mut state = 0x0123_4567_89AB_CDEF_u64;
+    let mut sample = [0_u8; 137];
+    for length in 0..sample.len() {
+        for slot in &mut sample {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *slot = u8::try_from(state & 0xFF).unwrap_or(0);
+        }
+        let input = &sample[..length];
+        assert_eq!(crc32c_nibble(input), crc32c(input), "length {length}");
+        assert_eq!(crc32c_byte(input), crc32c(input), "length {length}");
+    }
+}
+
+#[test]
 fn a_swapped_integrity_check_round_trips_through_the_whole_codec() {
     // The swap point, driven end to end rather than at the checksum call: encode, decode,
     // and the append scan, at every alignment, for every record variant. Anything less
@@ -362,8 +488,9 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
     // and the rest of the frame erased. Every prefix but the whole frame has to be refused
     // — accepting one would hand replay a record the writer never finished committing to.
     let mut page = [0_u8; SCRATCH];
-    for record in samples() {
-        for bytes in ALIGNMENTS {
+    for bytes in ALIGNMENTS {
+        let mut torn_at_an_interior_boundary = false;
+        for record in samples() {
             let align = align_or_byte(bytes);
             page.fill(ERASED_BYTE);
             let written = frame::encode(&record, align, &mut page).unwrap();
@@ -380,16 +507,39 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
                     !reads_as_a_record(&torn[..written]),
                     "{record:?} at {bytes} torn after {cut} of {written} B decoded as a record"
                 );
-                let (yielded, _, offset) = walk(&torn[..written], align);
+                // The refusal *kind* matters and is asserted rather than discarded. A tear
+                // after nothing is an erased journal, which is a clean end of history; a
+                // tear after a program unit leaves programmed bytes behind, and calling
+                // that a clean end hands a caller an offset into cells a program cycle has
+                // already cleared.
+                let (yielded, failure, offset) = walk(&torn[..written], align);
                 assert_eq!(yielded, 0, "{record:?} at {bytes} torn after {cut} B");
                 assert_eq!(offset, 0);
+                assert_eq!(
+                    failure,
+                    if cut == 0 {
+                        None
+                    } else {
+                        Some(DecodeError::IntegrityFailed)
+                    },
+                    "{record:?} at {bytes} torn after {cut} B"
+                );
                 units += 1;
             }
 
             // The whole frame is the one prefix that is a record, which is what stops the
             // sweep above from passing for the wrong reason.
             assert!(reads_as_a_record(&page[..written]));
+            // And at least one sample must tear somewhere other than at nothing, at every
+            // alignment. Without this the sweep went vacuous at 16 and 256 the moment every
+            // sample fitted inside one program unit, and nothing said so.
+            torn_at_an_interior_boundary |= units > 1;
         }
+        assert!(
+            torn_at_an_interior_boundary,
+            "no sample spans more than one program unit at alignment {bytes}, so this sweep \
+             only ever tore a frame after nothing"
+        );
     }
 }
 
@@ -454,9 +604,21 @@ fn a_torn_write_leaves_the_committed_prefix_of_earlier_records_intact() {
         torn.fill(ERASED_BYTE);
         torn[..prefix_end + cut].copy_from_slice(&journal[..prefix_end + cut]);
 
-        let (yielded, _, stopped) = walk(&torn[..prefix_end + last_len], align);
+        let (yielded, failure, stopped) = walk(&torn[..prefix_end + last_len], align);
         assert_eq!(yielded, 2, "torn after {cut} B of the last record");
         assert_eq!(stopped, prefix_end, "torn after {cut} B of the last record");
+        // Two records and then *nothing programmed* is a clean end of history; two records
+        // and then a torn frame is not, and the difference is the one §14 turns on. Without
+        // this assertion a scan that reported every tear as a clean end passed.
+        assert_eq!(
+            failure,
+            if cut == 0 {
+                None
+            } else {
+                Some(DecodeError::IntegrityFailed)
+            },
+            "torn after {cut} B of the last record"
+        );
         cut += unit;
     }
 
@@ -519,19 +681,110 @@ fn every_bit_a_partial_program_could_clear_is_caught() {
     // subset of arbitrary bit flips, and it is the subset worth sweeping exhaustively.
     let mut page = [0_u8; SCRATCH];
     for record in samples() {
-        let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).unwrap();
-        for index in 0..written {
-            for bit in 0..8_u8 {
-                if page[index] & (1 << bit) == 0 {
-                    // Already zero: a program cycle cannot change it, so there is no
-                    // failure here to detect.
-                    continue;
+        for bytes in ALIGNMENTS {
+            let align = align_or_byte(bytes);
+            page.fill(ERASED_BYTE);
+            let padded = frame::encode(&record, align, &mut page).unwrap();
+            // The *frame*, not its padding. Padding is a run of `ERASED_BYTE` no writer
+            // programs and no reader interprets — see
+            // `damage_in_a_frames_padding_is_not_caught`, which states that limitation
+            // rather than leaving this sweep to imply it does not exist.
+            let written = FRAME_OVERHEAD_BYTES + payload_len(&record);
+            assert!(written <= padded);
+            for index in 0..written {
+                for bit in 0..8_u8 {
+                    if page[index] & (1 << bit) == 0 {
+                        // Already zero: a program cycle cannot change it, so there is no
+                        // failure here to detect.
+                        continue;
+                    }
+                    let mut damaged = page;
+                    damaged[index] &= !(1 << bit);
+                    assert!(
+                        !reads_as_a_record(&damaged[..padded]),
+                        "{record:?} at {bytes}, byte {index} bit {bit} cleared and still \
+                         decoded"
+                    );
+                    let (yielded, _, offset) = walk(&damaged[..padded], align);
+                    assert_eq!(yielded, 0);
+                    assert_eq!(offset, 0);
                 }
-                let mut damaged = page;
-                damaged[index] &= !(1 << bit);
-                assert!(
-                    !reads_as_a_record(&damaged[..written]),
-                    "{record:?} byte {index} bit {bit} cleared and still decoded"
+            }
+        }
+    }
+}
+
+#[test]
+fn damage_in_a_frames_padding_is_not_caught() {
+    // Stated on purpose, in the style `frame.rs` uses for the alignment mismatch it cannot
+    // see. Padding is outside both seals — `frame_crc` covers the header and the payload,
+    // and `Scan` strides over the pad without reading it — so a bit cleared there is
+    // invisible. That is sound as long as nothing writes the padding: `encode` fills it with
+    // `ERASED_BYTE`, which programs no cells at all. The limitation is bounded and asserted
+    // rather than left for somebody to discover from a device.
+    let align = align_or_byte(16);
+    let record = RecordRef::EffectCompleted {
+        seq: EffectSeq(1),
+        result: b"ok",
+    };
+    let mut page = [ERASED_BYTE; SCRATCH];
+    let padded = frame::encode(&record, align, &mut page).unwrap();
+    let frame_len = FRAME_OVERHEAD_BYTES + payload_len(&record);
+    assert!(
+        padded > frame_len,
+        "this record must be padded to be a test"
+    );
+
+    for index in frame_len..padded {
+        let mut damaged = page;
+        damaged[index] &= !1;
+        assert!(
+            reads_as_a_record(&damaged[..padded]),
+            "padding byte {index} is inside a seal after all, which would be an improvement"
+        );
+        assert_eq!(walk(&damaged[..padded], align), (1, None, padded));
+    }
+}
+
+#[test]
+fn only_the_header_seal_can_catch_a_header_edit_that_was_resealed_at_the_frame() {
+    // The header seal is otherwise untestable through damage, because `frame_crc` covers the
+    // header too: every corruption sweep in this file is refused by the frame seal whether
+    // or not the header seal exists. Mutation review proved the gap — deleting the header
+    // CRC check from `decode_with` left all sixteen tests here green. Resealing the frame
+    // over the edited header is what leaves the header seal as the only check that can
+    // refuse, which is also §09's reason for having two: `payload_len` has to be trusted
+    // before the frame's end can be located, so it cannot be the frame seal that vouches
+    // for it.
+    let record = RecordRef::EffectCompleted {
+        seq: EffectSeq(9),
+        result: &[1, 2, 3],
+    };
+    let mut page = [0_u8; SCRATCH];
+    let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).unwrap();
+    let covered = written - FRAME_CRC_BYTES;
+
+    for index in 0..HEADER_BYTES - HEADER_CRC_BYTES {
+        for bit in 0..8_u8 {
+            let mut damaged = page;
+            damaged[index] ^= 1 << bit;
+            let reseal = Catalogued::frame_check(&damaged[..covered]).to_le_bytes();
+            damaged[covered..written].copy_from_slice(&reseal);
+
+            // `payload_len`'s two bytes move the frame's end, so a reseal over `covered`
+            // bytes is a frame whose length field disagrees with its own extent; that is
+            // `Truncated` or `IntegrityFailed` depending on which way the length moved.
+            // Every other byte must be the header seal's refusal, and none of them may
+            // decode.
+            assert!(
+                !reads_as_a_record(&damaged[..written]),
+                "header byte {index} bit {bit} was resealed into a record"
+            );
+            if !(8..10).contains(&index) {
+                assert_eq!(
+                    frame::decode(&damaged[..written]),
+                    Err(DecodeError::IntegrityFailed),
+                    "header byte {index} bit {bit} was not refused by the header seal"
                 );
             }
         }
@@ -539,13 +792,50 @@ fn every_bit_a_partial_program_could_clear_is_caught() {
 }
 
 #[test]
-fn every_burst_error_up_to_the_check_width_is_caught() {
+fn a_wrong_magic_is_refused_even_when_both_seals_hold() {
+    // `MAGIC` is neither `0x0000` nor `0xFFFF` so that a zeroed page and an erased one are
+    // refused by the first check rather than by a checksum further in. That claim cannot be
+    // tested with a zeroed page — its seals fail too — so the magic is edited and *both*
+    // seals recomputed over the result. Only the magic check can refuse this frame.
+    let record = RecordRef::EffectCompleted {
+        seq: EffectSeq(9),
+        result: &[1, 2, 3],
+    };
+    let mut page = [0_u8; SCRATCH];
+    let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).unwrap();
+    let covered = written - FRAME_CRC_BYTES;
+    let sealed_header = HEADER_BYTES - HEADER_CRC_BYTES;
+
+    page[0] ^= 0x01;
+    let header_seal = Catalogued::header_check(&page[..sealed_header]).to_le_bytes();
+    page[sealed_header..HEADER_BYTES].copy_from_slice(&header_seal);
+    let frame_seal = Catalogued::frame_check(&page[..covered]).to_le_bytes();
+    page[covered..written].copy_from_slice(&frame_seal);
+
+    assert_eq!(
+        frame::decode(&page[..written]),
+        Err(DecodeError::IntegrityFailed)
+    );
+    assert_eq!(
+        walk(&page[..written], ProgramAlign::BYTE),
+        (0, Some(DecodeError::IntegrityFailed), 0)
+    );
+}
+
+#[test]
+fn burst_errors_are_caught_exhaustively_to_nine_bits_and_sampled_to_thirty_two() {
     // The property a CRC is chosen for, and the reason the widths in
     // `the_checksum_widths_are_the_ones_the_frame_freezes` are the ones they are: a CRC
-    // with a degree-n generator detects every error burst of n bits or fewer. Swept
-    // exhaustively over short bursts at every bit position of a real frame — a burst is
+    // with a degree-n generator detects every error burst of n bits or fewer. A burst is
     // exactly what a flash device produces when a program pulse dies partway through a
     // word.
+    //
+    // The two seals are 16 and 32 bits, so the property runs to 32 — and exhausting a
+    // 32-bit burst means 2^30 interiors per position, which is not a test anybody runs. So:
+    // exhaustive to nine bits, where every interior is reachable, and pseudo-random
+    // interiors from ten to thirty-two, which is where the guarantee is tightest and a
+    // counterexample would be most interesting. The name says exactly that, because
+    // "up to the check width" would promise the sweep the exhaustive half does not do.
     let record = RecordRef::EffectScheduled {
         seq: EffectSeq(0x0102_0304),
         kind: ActivityKind(0x1234),
@@ -569,6 +859,40 @@ fn every_burst_error_up_to_the_check_width_is_caught() {
                 if len >= 3 {
                     pattern |= interior << 1;
                 }
+                let mut damaged = page;
+                for offset in 0..len {
+                    if pattern & (1 << offset) == 0 {
+                        continue;
+                    }
+                    let bit = start + offset;
+                    damaged[bit / 8] ^= 1 << (bit % 8);
+                }
+                assert!(
+                    !reads_as_a_record(&damaged[..written]),
+                    "burst of {len} bits at {start} pattern {pattern:#x} survived"
+                );
+            }
+        }
+    }
+
+    // Ten to thirty-two bits, sampled. xorshift64 rather than a dependency: no layer of this
+    // workspace may take one, so a test of a layer does not reach for `proptest` either.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut draw = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for start in 0..frame_bits {
+        for len in 10..=32_usize {
+            if start + len > frame_bits {
+                break;
+            }
+            for _ in 0..4 {
+                let interior = u32::try_from(draw() & 0xFFFF_FFFF).unwrap_or(0);
+                let mut pattern = 1_u32 | (1 << (len - 1));
+                pattern |= (interior << 1) & ((1 << (len - 1)) - 1);
                 let mut damaged = page;
                 for offset in 0..len {
                     if pattern & (1 << offset) == 0 {

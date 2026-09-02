@@ -233,6 +233,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
+    violations.extend(source::check_integrity_routing(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -788,9 +789,13 @@ mod tests {
         assert_eq!(sorted, RULES);
     }
 
-    #[test]
-    fn check_inputs_reports_nothing_for_a_clean_workspace() {
-        let inputs = WorkspaceInputs {
+    /// Inputs describing a workspace every rule accepts.
+    ///
+    /// A function rather than a literal inside one test, so that a test about *one* rule can
+    /// take a clean workspace and break exactly one thing in it — which is the only way to
+    /// prove a rule is wired into `check_inputs` when its id is already fired by a sibling.
+    fn clean_inputs() -> WorkspaceInputs {
+        WorkspaceInputs {
             metadata_json: CLEAN_METADATA.to_owned(),
             workspace_manifest: CLEAN_WORKSPACE_MANIFEST.to_owned(),
             member_manifests: policy::LAYERS
@@ -860,6 +865,11 @@ mod tests {
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_ROUTING_PATH),
+                    contents: source::tests_support::clean_integrity_routing(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::INTEGRITY_CHECK_PATH),
                     contents: source::tests_support::clean_checksum_module(),
                 },
@@ -882,9 +892,12 @@ mod tests {
                 .collect(),
                 ..docs::tests_support::clean_inputs(RULES)
             },
-        };
+        }
+    }
 
-        let violations = check_inputs(&inputs).expect("the inputs should be checkable");
+    #[test]
+    fn check_inputs_reports_nothing_for_a_clean_workspace() {
+        let violations = check_inputs(&clean_inputs()).expect("the inputs should be checkable");
         assert!(violations.is_empty(), "{violations:?}");
     }
 
@@ -904,6 +917,46 @@ mod tests {
                 .any(|v| v.rule == "claude-md" && v.subject == "toolchain-targets"),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn check_inputs_wires_up_both_halves_of_the_integrity_pin() {
+        // `check_inputs_wires_up_every_rule` cannot see these. `integrity-check` already
+        // fires on the broken fixture from `check_integrity_check`, so deleting either of
+        // the other two `violations.extend(..)` lines leaves the rule id in the set and
+        // every test green — which is exactly what happened when review of this change
+        // commented one out: 501 tests, 0 failures, and the gate printed `ok`. So each half
+        // is asserted through a detail only it emits.
+        for (contents, path, marker) in [
+            (
+                source::tests_support::clean_integrity_binding()
+                    .replace("-> u16;", "-> u32;")
+                    .replace("-> u16 {", "-> u32 {"),
+                source::INTEGRITY_BINDING_PATH,
+                "has changed width",
+            ),
+            (
+                source::tests_support::clean_integrity_routing()
+                    .replace("C::header_check(bytes)", "crc16(bytes)"),
+                source::INTEGRITY_ROUTING_PATH,
+                "goes around the trait",
+            ),
+        ] {
+            let mut inputs = clean_inputs();
+            for layer_source in &mut inputs.layer_sources {
+                if layer_source.path.ends_with(path) {
+                    layer_source.contents.clone_from(&contents);
+                }
+            }
+            let violations = check_inputs(&inputs).expect("checkable");
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule == "integrity-check"
+                        && violation.detail.contains(marker)),
+                "the half emitting {marker:?} is not wired into check_inputs: {violations:?}"
+            );
+        }
     }
 
     #[test]

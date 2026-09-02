@@ -54,10 +54,16 @@ use crate::crc::{crc16, crc32};
 
 /// The two checksums a record frame is sealed with.
 ///
-/// One implementation ships — [`Catalogued`] — and it is the one ADR 0010 settled on. A
-/// second is a superseding ADR, because a checksum is part of the wire format: a device
-/// reflashed with a different implementation does not read journals its previous firmware
-/// wrote, and refuses them at the first record rather than misreading them.
+/// One implementation ships — [`Catalogued`] — and it is the one ADR 0010 settled on.
+///
+/// A second implementation that computes *different* seals is a superseding ADR, because a
+/// checksum is part of the wire format: a device reflashed with it does not read journals
+/// its previous firmware wrote, and refuses them at the first record rather than misreading
+/// them. A second implementation of the *same* algorithm is not — ADR 0010's own "what
+/// would revisit this" predicts exactly one, a nibble table bought against a latency
+/// requirement, and says that "a table is an implementation of an algorithm and not a
+/// different one". That one produces byte-identical seals and reads every journal already
+/// written, and it is the reason this is a trait rather than two free functions.
 ///
 /// # Implementing it
 ///
@@ -85,6 +91,7 @@ pub trait IntegrityCheck {
     /// to share an answer, and a run of leading zero bytes must change it: a partially
     /// programmed header reads back as zeroes, and a check that ignored them would accept
     /// one as a shorter header.
+    #[must_use]
     fn header_check(bytes: &[u8]) -> u16;
 
     /// The seal over the header and the payload together.
@@ -99,6 +106,7 @@ pub trait IntegrityCheck {
     /// for its input — see [`crate::frame::input_digest_with`] — so an implementation that
     /// seals frames one way and digests inputs another is not expressible here, which is
     /// the point.
+    #[must_use]
     fn frame_check(bytes: &[u8]) -> u32;
 }
 
