@@ -14,6 +14,7 @@ be superseded.
 | [0003](0003-the-eight-settled-design-decisions.md) | The eight settled design decisions (design document §02) | accepted |
 | [0004](0004-the-layering-contract-is-a-table-a-gate-reads.md) | The layering contract is a table a gate reads | accepted |
 | [0005](0005-documentation-is-checked-against-the-tables-it-describes.md) | Documentation is checked against the tables it describes | accepted |
+| [0006](0006-effect-identity-is-newtypes-and-exhaustion-is-terminal.md) | Effect identity is newtypes, and exhaustion is terminal | accepted |
 
 ## Reading the numbers
 

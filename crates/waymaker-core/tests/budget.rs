@@ -3,8 +3,8 @@
 //! These are integration tests rather than unit tests so that the numbers are exercised
 //! through the crate's public surface, which is the surface `xtask` and the size probe
 //! read them through. What the macro *builds* is tested inside `budget.rs` instead, over a
-//! registry with types in it: the real one is empty until rung 0.1, so asserting over it
-//! here would prove only that an empty slice is empty.
+//! fixture registry of known contents: the real list is free to grow as each rung adds live
+//! state, so a test that pinned its exact total would be a test about the roadmap.
 
 use waymaker_core::budget;
 

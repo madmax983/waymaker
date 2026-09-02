@@ -142,12 +142,15 @@ macro_rules! kernel_state_types {
     };
 }
 
-// Empty at rung 0.0: the record codec, cursor, and transition rules arrive with rung 0.1,
-// and an empty registry that totals zero is the honest report until they do. The caveat
-// lives here rather than in the macro's own doc comment, which is emitted verbatim for
-// whatever list is passed and would become false the moment this list stopped being empty.
+// The effect id allocator is live for the whole of a run, so it is the kernel's state and
+// is charged for here. The rest of rung 0.1 — the replay cursor, the record header view and
+// the context — joins it as each arrives. A later rung that folds the allocator into the
+// cursor must *replace* this entry rather than add beside it: the total sums independently
+// live types, so registering a cursor that contains an allocator and the allocator itself
+// would double-count 16 B against a 128 B budget. The caveat lives here rather than in the
+// macro's own doc comment, which is emitted verbatim for whatever list is passed.
 kernel_state_types! {
-    // Rung 0.1 adds the replay cursor, the record header view, and the context.
+    crate::id::EffectIdAllocator,
 }
 
 /// The assertion macro, documented beside the constants it is stated against.
@@ -184,14 +187,16 @@ mod tests {
         assert_eq!(TypeSize::of::<()>("()").size, 0);
     }
 
-    /// A registry with types in it, which the real one does not have until rung 0.1.
+    /// A registry of known contents, held still so the macro's arithmetic can be checked.
     ///
     /// The macro emits `pub` items, which are unreachable from outside a test module; that
     /// is what a fixture is, so the lint is allowed here rather than the macro weakened.
     ///
-    /// This is the only thing that exercises what `kernel_state_types!` actually builds.
-    /// Asserting over the real registry proves nothing while it is empty: the names are an
-    /// empty slice, the total is a literal zero, and every property holds vacuously.
+    /// This is what exercises what `kernel_state_types!` actually builds. Two entries whose
+    /// names and sizes this file chose are what let the tests below state an exact total,
+    /// so what is proved is the macro's arithmetic rather than whatever happens to be
+    /// registered in the real list on the day — which is free to grow without rewriting a
+    /// test that was never about it.
     #[allow(
         unreachable_pub,
         reason = "a test-only registry is reachable from its tests"

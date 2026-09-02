@@ -67,6 +67,16 @@ fn probe() -> usize {
     core::hint::black_box(kept)
 }
 
+#[cfg(feature = "engine")]
+waymaker_core::activity_kinds! {
+    pub(crate) PROBE_ACTIVITIES {
+        /// Stands in for a real activity: the probe never dispatches anything.
+        DOWNLOAD = 1,
+        /// A second kind, so the distinctness check has a pair to compare.
+        VERIFY_SIGNATURE = 2,
+    }
+}
+
 /// The kernel and the flash adapter, when they are linked in.
 ///
 /// # What a delta can and cannot charge for
@@ -79,22 +89,100 @@ fn probe() -> usize {
 /// That is not left to memory. `cargo xtask check-layering` fails on any public function
 /// of a layer this file does not call, and names it. The calls below are that rule's
 /// answer, not decoration.
+///
+/// # Why the results are folded together
+///
+/// Every value each call produces is folded into the returned `usize` and pushed through
+/// [`core::hint::black_box`], so the optimiser cannot decide the whole function is dead and
+/// report a delta of zero for code that is really there. `wrapping_add` because the sum is
+/// a keep-alive rather than a quantity, and `usize::try_from(..).unwrap_or(0)` because a
+/// `u32` sequence and a `u64` run id are both wider than a pointer on `thumbv6m-none-eabi`.
 #[cfg(feature = "engine")]
 fn engine() -> usize {
     // `use ... as _` links the crate without naming an item, which is all there is to name
-    // in it at rung 0.0. It is what makes this row genuinely "core plus the flash adapter"
-    // rather than core alone.
+    // in it until rung 0.2. It is what makes this row genuinely "core plus the flash
+    // adapter" rather than core alone.
     use waymaker_flash as _;
 
-    // Rung 0.1: the record codec, the cursor, and one replay step are called from here.
+    use waymaker_core::{
+        ActivityName, DecodeError, EffectIdAllocator, EffectSeq, KernelError, RunId,
+    };
+
     let registered = waymaker_core::budget::TypeSize::of::<u32>("u32");
-    core::hint::black_box(registered.size)
+    let mut kept = core::hint::black_box(registered.size)
         .wrapping_add(core::hint::black_box(
             waymaker_core::budget::KERNEL_STATE_TOTAL_BYTES,
         ))
         .wrapping_add(core::hint::black_box(
             waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES,
-        ))
+        ));
+
+    // Effect identity: a fresh run issues, and a resumed one at the ceiling refuses. Both
+    // paths are linked, so the delta charges for the branch that makes exhaustion terminal
+    // rather than only for the happy one.
+    let mut fresh = EffectIdAllocator::for_run(RunId(core::hint::black_box(1)));
+    kept = kept.wrapping_add(match fresh.allocate() {
+        Ok(id) => usize::try_from(id.seq.0)
+            .unwrap_or(0)
+            .wrapping_add(usize::try_from(id.run.0).unwrap_or(0)),
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        fresh
+            .peek()
+            .map_or(0, |seq| usize::try_from(seq.0).unwrap_or(0)),
+    );
+    kept = kept.wrapping_add(usize::try_from(fresh.run().0).unwrap_or(0));
+
+    let mut spent = EffectIdAllocator::resume(
+        RunId(core::hint::black_box(2)),
+        Some(core::hint::black_box(EffectSeq::MAX)),
+    );
+    kept = kept.wrapping_add(match spent.allocate() {
+        Ok(id) => usize::try_from(id.seq.0).unwrap_or(0),
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        core::hint::black_box(EffectSeq::FIRST)
+            .successor()
+            .map_or(0, |seq| usize::try_from(seq.0).unwrap_or(0)),
+    );
+
+    // Activity kinds: the rodata table, the linear lookup, and the distinctness check the
+    // macro also asserts at compile time.
+    kept = kept.wrapping_add(
+        ActivityName::lookup(PROBE_ACTIVITIES, core::hint::black_box(DOWNLOAD)).map_or(0, str::len),
+    );
+    kept = kept.wrapping_add(usize::from(ActivityName::kinds_are_distinct(
+        core::hint::black_box(PROBE_ACTIVITIES),
+    )));
+    kept = kept.wrapping_add(usize::from(core::hint::black_box(VERIFY_SIGNATURE).0));
+
+    // The error vocabulary: both `message` bodies, and the conversion that carries a decode
+    // failure across the seam with `?`.
+    kept = kept.wrapping_add(
+        core::hint::black_box(DecodeError::IntegrityFailed)
+            .message()
+            .len(),
+    );
+    kept = kept.wrapping_add(
+        KernelError::from(core::hint::black_box(DecodeError::Truncated))
+            .message()
+            .len(),
+    );
+
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a
+    // function pointer rather than by formatting something: taking the pointer keeps the
+    // impl body for measurement, while an actual `{}` would link `core::fmt::write` and
+    // charge this row for machinery the impls were written to avoid.
+    let show_kernel: fn(&KernelError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <KernelError as core::fmt::Display>::fmt;
+    let show_decode: fn(&DecodeError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <DecodeError as core::fmt::Display>::fmt;
+    core::hint::black_box(show_kernel);
+    core::hint::black_box(show_decode);
+
+    core::hint::black_box(kept)
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.
