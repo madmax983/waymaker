@@ -78,8 +78,9 @@ records in §09's table, including the five this rung does not decode. Reserving
 `TimerScheduled = 5` and `TimerFired = 6` now is what stops the timer issue renumbering
 `RunCompleted` under firmware that has already written it.
 
-**Two checksums, and the second covers the header.** `header_crc` is CRC-16/CCITT-FALSE over
-the twelve bytes before it. `payload_crc` — §09's name, kept — is CRC-32/ISO-HDLC over the
+**Two checksums, and the second covers the header.** `header_crc` sits at offset 10 and is
+CRC-16/CCITT-FALSE over the ten bytes before it — the whole header except itself, so magic,
+version, kind, sequence and `payload_len` are all inside it. `payload_crc` — §09's name, kept — is CRC-32/ISO-HDLC over the
 header *and* the payload.
 
 The two-checksum split is what makes §09's first property implementable. `payload_len` is
@@ -112,10 +113,13 @@ have nothing to stand on.
 
 **Unknown kinds decode; skipping is the scan's decision.** A frame whose `record_kind` this
 firmware does not know, but whose checksums hold, decodes to `Decoded::UnknownKind(kind)`
-with a correct `encoded_len` — which is what "self-delimiting" means, and is a fact about the
+with a correct `frame_len` — which is what "self-delimiting" means, and is a fact about the
 bytes. Whether a reader may then *skip* it is a fact about the format version, so it lives in
-`Scan`, as a lookup in `VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP`. That list is empty at
-version 1. Skipping a record asserts that the rest of history means the same thing without
+`permits_unknown_record_skip`, which reads a list that is empty at version 1. Three things
+have to change together for a version to grant it — `decode` must accept the version at all,
+the list must name it, and `Scan` must grow the arm that advances past the frame — so the
+list carries a `const` assertion that it is empty, and a version added to it is a compile
+error naming the other two. A rule that can be half-enabled is a rule that gets half-enabled. Skipping a record asserts that the rest of history means the same thing without
 it, and at v0.1 that is false for every record in §09's table: a skipped `TimerFired` is a
 timer replay believes never fired.
 
@@ -128,9 +132,11 @@ produce. A frame that is intact and still not the record it names is
 it is neither an input that ended early nor a length reaching outside a buffer.
 
 **Padding is `0xFF`, and the frame's length excludes it.** An erased NOR cell already reads
-`0xFF`, so programming the pad changes no bits. `Frame::encoded_len` is the frame's own
-length; `ProgramAlign::round_up` is what turns it into a stride, and `Scan` is what applies
-it. So padding is never interpreted, and a journal written on a device with one program
+`0xFF`, so programming the pad changes no bits. `Frame::frame_len` is the frame's own length,
+*unpadded*; `ProgramAlign::round_up` is what turns it into a stride, and `Scan` is what
+applies it. The free function `frame::encoded_len(record, align)` is the other number — what
+a writer must reserve, padding included, and what `encode` returns. Two numbers, two names:
+one word for both is how a cursor ends up advanced into a pad. So padding is never interpreted, and a journal written on a device with one program
 granularity is still readable by code that assumes another.
 
 `ProgramAlign` rejects zero and nothing else. A power of two is not required: real internal

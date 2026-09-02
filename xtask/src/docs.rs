@@ -190,6 +190,10 @@ pub const RECORD_FRAME_FIELDS: &[&str] = &[
     "effect_seq",
     "payload_len",
     "header_crc",
+    // §09's own spelling, brackets and all. Plain `payload` would be satisfied by
+    // `payload_len` sitting two labels above it — so the one field the whole frame exists to
+    // carry could vanish from the picture with this rule still green.
+    "payload [payload_len]",
     "payload_crc",
     "commit_seal",
 ];

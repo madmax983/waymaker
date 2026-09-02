@@ -1321,27 +1321,166 @@ fn a_scan_of_an_empty_or_erased_journal_yields_nothing() {
 }
 
 #[test]
-fn a_scan_of_arbitrary_bytes_always_terminates() {
-    // The scanner is the one loop in this crate, so it is the one place a malformed
-    // journal could hang rather than fail. Every step advances by at least a frame's
-    // overhead, and this walks random journals to say so.
+fn a_scan_always_terminates_and_advances() {
+    // The scanner is the one loop in this crate, so it is the one place a malformed journal
+    // could hang rather than fail.
+    //
+    // Random bytes alone cannot test that: they never carry the magic, so the scan stops on
+    // its first step every time and a step counter never exceeds one. Half the journals here
+    // are therefore built from real frames and then damaged, which is what produces scans of
+    // several steps — and the test asserts it saw them, so a generator that stopped
+    // producing them is a failure rather than a quiet return to testing nothing.
     let mut rng = Rng::new(0x5EED_0004);
-    let mut journal = [0_u8; 256];
+    let mut journal = [0_u8; 512];
+    let mut deepest = 0;
 
-    for _ in 0..2_000 {
-        for slot in &mut journal {
-            *slot = rng.next_u8();
-        }
+    for iteration in 0..2_000 {
         let align = ProgramAlign::new(ALIGNMENTS[rng.below(ALIGNMENTS.len())])
             .expect("a non-zero alignment");
+
+        if iteration % 2 == 0 {
+            for slot in &mut journal {
+                *slot = rng.next_u8();
+            }
+        } else {
+            // A run of real frames, then a few random bytes somewhere in it.
+            journal.fill(ERASED_BYTE);
+            let mut at = 0;
+            for index in 0..6_u32 {
+                let record = RecordRef::EffectCompleted {
+                    seq: EffectSeq(index),
+                    result: b"payload",
+                };
+                match frame::encode(&record, align, &mut journal[at..]) {
+                    Ok(written) => at += written,
+                    Err(_) => break,
+                }
+            }
+            for _ in 0..rng.below(4) {
+                let at = rng.below(journal.len());
+                journal[at] = rng.next_u8();
+            }
+        }
+
         let mut scan = Scan::new(&journal, align);
         let mut steps = 0;
         while scan.next().is_some() {
             steps += 1;
-            assert!(steps <= journal.len(), "the scan did not advance");
+            assert!(
+                steps <= journal.len() / FRAME_OVERHEAD_BYTES + 1,
+                "iteration {iteration}: the scan did not advance"
+            );
         }
-        assert!(scan.offset() <= journal.len());
+        deepest = deepest.max(steps);
+        assert!(scan.offset() <= journal.len(), "iteration {iteration}");
     }
+
+    assert!(
+        deepest > 1,
+        "no journal took more than one step, so nothing here tested advancing"
+    );
+}
+
+#[test]
+fn a_scan_offset_never_passes_the_end_of_its_journal() {
+    // `Scan::offset` promises "never greater than the journal's length", and the clamp that
+    // keeps that promise is reachable: a journal sliced to exactly one frame, whose padding
+    // the writer put beyond the slice, has a stride longer than the bytes on offer.
+    let align = ProgramAlign::new(16).expect("a non-zero alignment");
+    let mut page = [0_u8; SCRATCH];
+    let record = RecordRef::RunCompleted { result: b"abc" };
+    let written = frame::encode(&record, align, &mut page).expect("room");
+    let frame_len = FRAME_OVERHEAD_BYTES + 3;
+    assert!(
+        written > frame_len,
+        "the record must be padded for this to test anything"
+    );
+
+    // Hand the scan the frame and none of its padding.
+    let mut scan = Scan::new(&page[..frame_len], align);
+    assert_eq!(scan.next(), Some(Ok(record)));
+    assert_eq!(
+        scan.offset(),
+        frame_len,
+        "the offset is clamped to the journal rather than to the padded stride"
+    );
+    assert!(scan.next().is_none());
+}
+
+#[test]
+fn a_scan_reads_its_slice_as_the_whole_journal() {
+    // `Scan`'s erased-tail rule is "an erased header *and* erased to the end", which is what
+    // catches a stride mismatch — and which makes the slice a precondition rather than
+    // merely a bound: bytes after the last frame that are not erased are damage as far as
+    // this type is concerned. A caller with a bank header or a generation seal in the same
+    // erase block passes the journal region, not the block.
+    //
+    // Pinned here because it is the shape rung 0.2 arrives in, and a caller that gets it
+    // wrong sees a perfectly good journal reported as corrupt on every boot.
+    let align = ProgramAlign::new(8).expect("a non-zero alignment");
+    let mut block = [ERASED_BYTE; 256];
+    let written =
+        frame::encode(&RecordRef::RunCompleted { result: b"r" }, align, &mut block).expect("room");
+
+    // Something that is not a record living at the end of the same erase block.
+    block[252..256].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+    let mut whole_block = Scan::new(&block, align);
+    assert!(matches!(
+        whole_block.next(),
+        Some(Ok(RecordRef::RunCompleted { .. }))
+    ));
+    assert_eq!(
+        whole_block.next(),
+        Some(Err(DecodeError::IntegrityFailed)),
+        "a non-erased tail is damage, which is the price of catching a stride mismatch"
+    );
+
+    // The journal region alone reads clean, which is the contract.
+    let mut journal_only = Scan::new(&block[..252], align);
+    assert!(matches!(
+        journal_only.next(),
+        Some(Ok(RecordRef::RunCompleted { .. }))
+    ));
+    assert!(journal_only.next().is_none());
+    assert_eq!(journal_only.offset(), written);
+}
+
+#[test]
+fn a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught() {
+    // The other half of the stride mismatch, pinned because it is *not* handled. A reader
+    // striding by more than the writer used steps over whole frames and lands on erased
+    // bytes, which is an ordinary end of history in every respect the scan can see. There is
+    // nothing on media to check it against.
+    //
+    // So this test asserts the wrong answer on purpose. It is the record that the limitation
+    // is known and bounded rather than undiscovered, and it fails the day rung 0.2 puts the
+    // writer's program size in the bank header and makes the right answer possible.
+    let writer = ProgramAlign::new(8).expect("a non-zero alignment");
+    let mut journal = [ERASED_BYTE; 2_048];
+    let mut at = 0;
+    for index in 0..4_u32 {
+        let record = RecordRef::EffectCompleted {
+            seq: EffectSeq(index),
+            result: b"x",
+        };
+        at += frame::encode(&record, writer, &mut journal[at..]).expect("room");
+    }
+
+    let mut over_striding = Scan::new(&journal, ProgramAlign::new(256).expect("non-zero"));
+    assert!(matches!(
+        over_striding.next(),
+        Some(Ok(RecordRef::EffectCompleted { .. }))
+    ));
+    assert!(
+        over_striding.next().is_none(),
+        "known limitation: a larger stride steps over the remaining frames"
+    );
+    assert_ne!(
+        over_striding.offset(),
+        at,
+        "and reports an offset that is not where history ended"
+    );
 }
 
 #[test]
@@ -1452,10 +1591,23 @@ fn an_input_digest_is_what_a_schedule_record_carries() {
     // of it and this pins its round trip through the frame. Without a public producer the
     // field would be a `u32` the codec faithfully moves across the journal with nothing able
     // to put a right value in it.
+    // The algorithm is pinned, not just its behaviour. `input_digest`'s output is written
+    // to media in `EffectScheduled.input_crc`, so changing which checksum it is changes the
+    // wire format — and without this line the body could be swapped for a different CRC, or
+    // for `input.len()`, with every other test in this file still green.
+    assert_eq!(
+        frame::input_digest(b"123456789"),
+        0xCBF4_3926,
+        "the digest is CRC-32/ISO-HDLC, and this is the value its specification states"
+    );
+
     let input = b"the activity input the workflow passed";
     let digest = frame::input_digest(input);
     assert_eq!(digest, frame::input_digest(input), "pure");
     assert_ne!(digest, frame::input_digest(b"something else"));
+    // The same function the frame is sealed with, which is what makes one implementation
+    // enough: a digest computed a second way is a second polynomial to keep in step.
+    assert_eq!(frame::input_digest(input), crc32(input));
 
     let record = RecordRef::EffectScheduled {
         seq: EffectSeq(3),

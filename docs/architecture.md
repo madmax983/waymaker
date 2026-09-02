@@ -141,7 +141,7 @@ graph LR
   end
   subgraph rest["body and trailer"]
     direction LR
-    f6["+12 · N bytes<br/>payload<br/>opaque to the kernel"]
+    f6["+12 · N bytes<br/>payload [payload_len]<br/>opaque to the kernel"]
     f7["+12+N · 4B<br/>payload_crc<br/>u32 LE · frame_crc in code"]
     f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
     f6 --- f7 --- f8

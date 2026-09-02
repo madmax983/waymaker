@@ -132,9 +132,24 @@ pub const ERASED_BYTE: u8 = 0xFF;
 /// history means the same thing without it, and at v0.1 that is false for every record in
 /// §09's table: a skipped `TimerFired` is a timer replay believes never fired.
 ///
-/// A future version that does grant it says so by appearing here, and [`Scan`] starts
-/// skipping. The rule is a lookup rather than a paragraph.
+/// Three things have to change together for a version to grant skipping, and they are in
+/// three different places: [`decode`] must accept the version at all — it refuses anything
+/// but [`FORMAT_VERSION`], so a version named here that `decode` rejects can never be
+/// reached — this list must name it, and [`Scan`] must grow the arm that advances past the
+/// frame. The `const` assertion below is what stops one of the three happening on its own: a
+/// version added here is a compile error that names the other two.
 const VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP: &[u8] = &[];
+
+// A rule that can be half-enabled is a rule that gets half-enabled. `Scan` deliberately has
+// no skip arm — a branch that cannot run is a branch whose first execution is recovery after
+// a power loss — so the day this list stops being empty is the day that arm, the test that
+// reaches it, and `decode`'s acceptance of the version all have to arrive. This assertion is
+// how that day announces itself, at compile time, rather than as a journal read wrong.
+const _: () = assert!(
+    VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP.is_empty(),
+    "a format version now permits skipping an unknown record kind, so `Scan` needs the arm \
+     that advances past one, a test that reaches it, and `decode` must accept that version",
+);
 
 /// Whether a reader of a journal written at `version` may skip a record kind it does not
 /// know.
@@ -767,6 +782,15 @@ impl<'a> Scan<'a> {
     /// `journal` is the bound: this rung has no bank geometry, and a slice is a bound the
     /// type system already checks.
     ///
+    /// # `journal` is the journal region and nothing else
+    ///
+    /// A precondition rather than a convenience. The erased-tail rule below is "an erased
+    /// header *and* erased to the end of the slice", so any byte after the last frame that
+    /// is not [`ERASED_BYTE`] is damage as far as this type is concerned. A caller whose
+    /// erase block also holds a bank header or a generation seal — which is the shape rung
+    /// 0.2 arrives in — passes the journal region, not the block, or sees a sound journal
+    /// reported as corrupt on every boot.
+    ///
     /// # `align` must be the granularity the journal was *written* at
     ///
     /// Nothing on media records it. A frame says where it ends; only the device says where
@@ -778,10 +802,14 @@ impl<'a> Scan<'a> {
     /// ahead of it, and everything downstream would believe it.
     ///
     /// The check turns that into [`DecodeError::IntegrityFailed`] at the offset the reader
-    /// went wrong, which is diagnosable. It does not make the mismatch safe — a reader
-    /// given a *larger* granularity than the writer strides past frames and cannot be
-    /// caught this way at all. Rung 0.2 puts the writer's program size in the bank header,
-    /// which is where a fact about the media belongs.
+    /// went wrong, which is diagnosable. It does not make the mismatch safe, and the other
+    /// half is worse: a reader given a *larger* granularity strides *over* whole frames and
+    /// lands on erased bytes, which is an ordinary end of history in every respect this type
+    /// can see. Nothing on media contradicts it, so nothing here can catch it — the test
+    /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught` asserts the wrong
+    /// answer on purpose, so the limitation is bounded rather than undiscovered. Rung 0.2
+    /// puts the writer's program size in the bank header, which is where a fact about the
+    /// media belongs.
     #[must_use]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {
         Self {
