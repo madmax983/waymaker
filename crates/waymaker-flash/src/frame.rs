@@ -774,12 +774,18 @@ impl<'a> Reader<'a> {
 ///
 /// * Every step advances by at least [`FRAME_OVERHEAD_BYTES`], so a scan over any journal
 ///   terminates. A malformed journal is a scan that ends, never a scan that spins.
-/// * An erased tail is not damage. A journal whose next header is all [`ERASED_BYTE`]
-///   *and whose remaining bytes are all erased too*, or which has fewer bytes left than a
-///   header, has simply ended, and the scan yields [`None`] rather than an error —
-///   otherwise every first boot would look like a corrupted one. An erased run with
-///   anything but erased bytes after it is [`DecodeError::IntegrityFailed`]: see
-///   [`align`](Self::new) for why that case exists at all.
+/// * An erased tail is not damage, and only an erased one. A journal has *ended* when what
+///   is left is erased to its end — whether that is a full header of [`ERASED_BYTE`] with
+///   nothing but erased bytes after it, or fewer bytes left than a header — and the scan
+///   yields [`None`] rather than an error, because otherwise every first boot would look
+///   like a corrupted one.
+///
+///   Programmed bytes in either case are not an end. An erased run with anything but erased
+///   bytes after it is [`DecodeError::IntegrityFailed`] — see [`new`](Self::new) for the
+///   stride mismatch that case exists to catch — and a short remainder that is not erased is
+///   a torn header, reported as [`DecodeError::Truncated`]. Calling either a clean end would
+///   tell a caller history stopped where it did not, at the one boundary where being wrong
+///   means programming over cells a cycle has already cleared.
 /// * A record yielded after the first failure would be a record outside the committed
 ///   prefix, so there are none: the iterator is fused rather than skipping damage.
 /// * Out-of-sequence is *not* checked here. §09 lists it beside malformed and

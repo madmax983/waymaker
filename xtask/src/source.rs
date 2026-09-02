@@ -587,11 +587,17 @@ fn code_only(contents: &str) -> String {
 
 /// The index just past a raw string starting at `at`, or [`None`] if one does not.
 ///
-/// Recognises `r"…"`, `r#"…"#` with any number of hashes, and the `b`-prefixed byte forms.
-/// The `r` must start a token: the one in `for` is not a raw string.
+/// Recognises `r"…"` and `r#"…"#` with any number of hashes, and both prefixed forms Rust
+/// has: `br"…"` for a byte string and `cr"…"` for a C string. The `r` must start a token:
+/// the one in `for` is not a raw string.
+///
+/// The `c` form is not hypothetical tidiness. Missing it means `cr#"a " /*"#` is lexed as an
+/// ordinary string that ends at the quote inside it, leaving a `/*` that opens a block
+/// comment and swallows the rest of the file — the same false negative, arrived at from a
+/// literal form that has been stable since Rust 1.77.
 fn raw_string_end(source: &[char], at: usize) -> Option<usize> {
     let mut cursor = at;
-    if source.get(cursor).copied() == Some('b') {
+    if matches!(source.get(cursor).copied(), Some('b' | 'c')) {
         cursor = cursor.saturating_add(1);
     }
     if source.get(cursor).copied() != Some('r') {
@@ -1112,6 +1118,26 @@ mod tests {
 
         let named = kernel_source("pub const WHY: &str = \"never from_le_bytes here\";\n");
         assert!(check_kernel_owns_no_encoding(&named).is_empty());
+
+        // Every raw form Rust has, including the `c` prefix a simpler version of the
+        // scanner missed: `cr#\"a \" /*\"#` lexed as an ordinary string ending at its inner
+        // quote, leaving a `/*` that swallowed the rest of the file.
+        for literal in [
+            "r\"impl From<&[u8]> for K\"",
+            "br\"impl From<&[u8]> for K\"",
+            "cr\"impl From<&[u8]> for K\"",
+            "cr#\"a \" /* impl From<&[u8]> for K\"#",
+            "br##\"a \"# /* from_le_bytes\"##",
+        ] {
+            let with_literal = kernel_source(&format!(
+                "pub const L: &str = {literal};\nfn f(b: [u8; 2]) -> u16 {{ u16::from_le_bytes(b) }}\n"
+            ));
+            assert_eq!(
+                check_kernel_owns_no_encoding(&with_literal).len(),
+                1,
+                "the call after {literal} must still be found, and the literal must not be a finding"
+            );
+        }
 
         // A raw string, which has no escapes and ends only at its matching hashes.
         let raw = kernel_source(
