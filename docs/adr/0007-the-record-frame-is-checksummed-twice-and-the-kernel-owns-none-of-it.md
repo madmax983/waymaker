@@ -139,9 +139,19 @@ a writer must reserve, padding included, and what `encode` returns. Two numbers,
 one word for both is how a cursor ends up advanced into a pad. So padding is never interpreted, and a journal written on a device with one program
 granularity is still readable by code that assumes another.
 
-`ProgramAlign` rejects zero and nothing else. A power of two is not required: real internal
-flash reports one, but no arithmetic here needs it, and a type that refused a device's honest
-geometry would be a type a driver had to lie to.
+`ProgramAlign` accepts a power of two and nothing else. The first version of this decision
+said the opposite — zero rejected, anything else accepted, on the reasoning that no
+arithmetic needed the restriction and a type that refused a device's honest geometry is a
+type a driver has to lie to. The reasoning was wrong about the arithmetic, and it was a
+measurement rather than an argument that said so: rounding up with `%` divides by a runtime
+`u16`, and `thumbv6m-none-eabi` — Cortex-M0 and M0+ — has no divide instruction, so the
+linker pulls in `compiler_builtins`' software division. Removing it took the code-flash delta
+from 4 726 B to 4 264 B: **462 B**, more than 5% of the entire budget for the kernel and this
+adapter, spent on program granularities no flash device reports. It also left a live
+divide-by-zero panic branch, because the non-zero invariant is not visible to the optimiser
+across a call boundary. A power of two rounds up by mask in three instructions that cannot
+trap. Recorded here rather than quietly changed, because the first version of it is in this
+repository's history and a reader who finds it should find the reason it stopped being true.
 
 **Bounded decoding is structural before it is tested.** `#![forbid(unsafe_code)]` removes
 `get_unchecked`; `clippy::indexing_slicing = deny` removes `buf[a..b]`; `panic`, `unwrap_used`
@@ -181,12 +191,25 @@ deferred the same way: `Scan` takes a `&[u8]`, and that slice *is* the bound.
 
 ## Consequences
 
-The record codec costs about 4.6 KiB of the 8 KiB incremental code-flash budget, measured on
-`thumbv6m-none-eabi` through the size probe. That is more than half of §04's number for one
+The record codec costs **4 264 B** of the 8 KiB incremental code-flash budget, measured on
+`thumbv6m-none-eabi` through the size probe. That is over half of §04's number for one
 module, with the replay cursor, the transition rules, the seals, the bank swap and compaction
-still to come. It is a real constraint rather than a comfortable margin, and the first thing
-to look at if a later rung runs out of room is the two bitwise checksum loops, which trade
-code size against a speed nothing here is short of.
+still to come. It is a real constraint rather than a comfortable margin, and it is the number
+to take into the rung 0.2 kickoff rather than discover there.
+
+Two measured costs inside it are known and deliberately not paid:
+
+* **About 368 B** is the `iter_mut().zip(chain(..))` writes in `encode` and `body`, which do
+  not fully unroll at `opt-level = "z"`. The cheaper spelling is `copy_from_slice`, which
+  panics on a length mismatch — and a panicking call on the path that stages bytes for a
+  flash program is exactly what this workspace's lint table exists to keep out. The zip form
+  is total by construction. If a later rung needs those bytes, the way to have them is a
+  `split_at_mut_checked` that makes the lengths equal by type, not a panicking copy.
+* **About 976 B of the reported delta is the size probe's own code**, not the layers'. That
+  is inherent to measuring a delta through a fixture that has to keep every public function
+  alive — ADR 0002 — and it means the number above overstates what a real firmware links, in
+  the safe direction. Nothing here corrects for it: a budget that subtracted an estimate
+  would be a budget with an estimate in it.
 
 A frame is sixteen bytes of overhead. On a journal of small records — a completion carrying
 four bytes — that is 80% overhead, against a bank that is often a single erase block. §09

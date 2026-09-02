@@ -189,16 +189,29 @@ pub const fn permits_unknown_record_skip(version: u8) -> bool {
 const RUN_STARTED_PREFIX_BYTES: usize = 4;
 const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
 
-/// The device's program granularity, known to be non-zero.
+/// The device's program granularity: a power of two, and never zero.
 ///
 /// §12 gives the storage adapter a `program_size: u16`, and §09 requires records padded to
-/// it. Zero is rejected once here rather than guarded at every modulo: a zero alignment is
-/// not "no padding", it is a division by zero, and [`ProgramAlign::BYTE`] is what "no
-/// padding" is spelled as.
+/// it. Zero is rejected once here rather than guarded at every use — a zero alignment is not
+/// "no padding", it is a division by zero, and [`BYTE`](Self::BYTE) is what "no padding" is
+/// spelled as.
 ///
-/// A power of two is *not* required. Real internal flash reports one, but nothing in the
-/// arithmetic below needs it, and a type that refused a device's honest geometry would be
-/// a type a driver had to lie to.
+/// # Why a power of two is required
+///
+/// An earlier version of this type accepted any non-zero `u16`, on the reasoning that
+/// nothing in the arithmetic needed the restriction and a type that refused a device's
+/// honest geometry is a type a driver has to lie to. That reasoning was wrong about the
+/// arithmetic, and the measurement says so: rounding up with `%` and `-` divides by a
+/// runtime `u16`, and `thumbv6m-none-eabi` — Cortex-M0 and M0+ — has no divide instruction.
+/// The linker pulls in `compiler_builtins`' software division, and it is not small: around
+/// 430 B of an 8 KiB budget for the whole kernel and this adapter, spent on generality that
+/// no flash device asks for. It also leaves a live divide-by-zero panic branch, because the
+/// non-zero invariant is not visible to the optimiser across a call boundary.
+///
+/// A power of two rounds up by mask — `(len + unit - 1) & !(unit - 1)` — which is three
+/// instructions, cannot trap, and has no panic path at all. Every program size real flash
+/// reports is a power of two, so the restriction costs a driver nothing and the generality
+/// cost 430 B and a panic branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct ProgramAlign(u16);
@@ -207,14 +220,21 @@ impl ProgramAlign {
     /// One byte: every length is already aligned, so nothing is padded.
     pub const BYTE: Self = Self(1);
 
-    /// A program granularity of `bytes`, or [`None`] when `bytes` is zero.
+    /// A program granularity of `bytes`, or [`None`] unless `bytes` is a power of two.
     ///
     /// # Postconditions
     ///
-    /// `Some` exactly when `bytes != 0`, and `get()` returns what was passed.
+    /// `Some` exactly when `bytes` is a power of two — which excludes zero — and `get()`
+    /// returns what was passed. The largest accepted value is `32_768`, the largest power of
+    /// two a `u16` holds.
     #[must_use]
     pub const fn new(bytes: u16) -> Option<Self> {
-        if bytes == 0 { None } else { Some(Self(bytes)) }
+        // `is_power_of_two` is false for zero, so this is the whole invariant in one check.
+        if bytes.is_power_of_two() {
+            Some(Self(bytes))
+        } else {
+            None
+        }
     }
 
     /// The granularity, in bytes. Never zero.
@@ -231,15 +251,18 @@ impl ProgramAlign {
     /// and is less than `len + get()`. [`None`] rather than a wrap: a padded length that
     /// came back *smaller* than the frame it pads would be a writer told it had room it
     /// does not have.
+    ///
+    /// Rounded by mask rather than by `%`, which is what the power-of-two invariant is for:
+    /// an add, a not and an and, with no division to link and no divide-by-zero branch to
+    /// leave lying in a firmware image.
     #[must_use]
     pub const fn round_up(self, len: usize) -> Option<usize> {
-        let unit = self.0 as usize;
-        // `unit` is non-zero by construction, so neither operator can trap.
-        let remainder = len % unit;
-        if remainder == 0 {
-            Some(len)
-        } else {
-            len.checked_add(unit - remainder)
+        // `self.0` is a power of two, so `mask` is the low bits below it and `!mask` clears
+        // exactly them. Subtracting one cannot underflow because zero is not a power of two.
+        let mask = (self.0 as usize).wrapping_sub(1);
+        match len.checked_add(mask) {
+            Some(sum) => Some(sum & !mask),
+            None => None,
         }
     }
 }

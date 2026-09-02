@@ -127,12 +127,14 @@ impl Rng {
     }
 }
 
-/// The six alignments a test sweeps: one that pads nothing, the program sizes real
-/// internal flash reports, and a page-sized one.
-const ALIGNMENTS: [u16; 6] = [1, 2, 4, 8, 16, 256];
+/// The alignments a test sweeps: one that pads nothing, the program sizes real internal
+/// flash reports, and two page sizes. The larger granularities a page-programmed device
+/// reports get their own test, because a sweep at 32 768 would need a 64 KiB page here.
+const ALIGNMENTS: [u16; 7] = [1, 2, 4, 8, 16, 256, 512];
 
-/// Enough room for the longest frame any test below builds.
-const SCRATCH: usize = 1024;
+/// Enough room for the longest frame any test below builds, padded to the largest
+/// granularity in [`ALIGNMENTS`].
+const SCRATCH: usize = 2_048;
 
 /// How many `RecordRef` variants [`sample_record`] can draw.
 ///
@@ -1135,26 +1137,61 @@ fn padding_is_written_erased_and_never_read_back() {
 }
 
 #[test]
-fn an_alignment_must_be_non_zero() {
-    // Zero is not "no padding", it is a division by zero. Rejected once at construction
-    // rather than guarded at every use.
-    assert!(ProgramAlign::new(0).is_none());
-    assert_eq!(ProgramAlign::new(1).map(ProgramAlign::get), Some(1));
+fn an_alignment_must_be_a_power_of_two() {
+    // Zero is not "no padding", it is a division by zero, and it is rejected once at
+    // construction rather than guarded at every use. Everything else the constructor turns
+    // away is turned away for a firmware reason: rounding up by `%` on a runtime `u16`
+    // links `compiler_builtins`' software division on a chip with no divide instruction —
+    // around 430 B of an 8 KiB budget — and leaves a live divide-by-zero panic branch.
+    // A power of two rounds up by mask, in three instructions that cannot trap.
+    assert!(ProgramAlign::new(0).is_none(), "zero is a division by zero");
+    for refused in [3_u16, 5, 6, 7, 13, 255, 1_000, 65_535] {
+        assert!(
+            ProgramAlign::new(refused).is_none(),
+            "{refused} is not a power of two"
+        );
+    }
+    for accepted in ALIGNMENTS {
+        assert_eq!(
+            ProgramAlign::new(accepted).map(ProgramAlign::get),
+            Some(accepted)
+        );
+    }
     assert_eq!(ProgramAlign::BYTE.get(), 1);
-    assert_eq!(ProgramAlign::new(256).map(ProgramAlign::get), Some(256));
+    assert_eq!(
+        ProgramAlign::new(32_768).map(ProgramAlign::get),
+        Some(32_768),
+        "the largest power of two a u16 holds"
+    );
+    assert_eq!(ProgramAlign::new(4_096).map(ProgramAlign::get), Some(4_096));
+}
 
-    let align = ProgramAlign::new(8).expect("a non-zero alignment");
+#[test]
+fn rounding_up_lands_on_the_next_program_unit() {
+    let align = ProgramAlign::new(8).expect("a power of two");
     assert_eq!(align.round_up(0), Some(0));
     assert_eq!(align.round_up(1), Some(8));
+    assert_eq!(align.round_up(7), Some(8));
     assert_eq!(align.round_up(8), Some(8));
     assert_eq!(align.round_up(9), Some(16));
     // A length that cannot be rounded up without wrapping has no answer, rather than an
-    // answer that is smaller than the input.
+    // answer that is smaller than the input — which would be a writer told it had room it
+    // does not have.
     assert_eq!(align.round_up(usize::MAX), None);
     assert_eq!(ProgramAlign::BYTE.round_up(usize::MAX), Some(usize::MAX));
-    // An alignment real flash never reports is still arithmetic that has to be right.
-    let odd = ProgramAlign::new(3).expect("a non-zero alignment");
-    assert_eq!(odd.round_up(4), Some(6));
+
+    // The three postconditions, over every alignment and a spread of lengths, rather than
+    // over the handful of pairs written out above.
+    for granularity in ALIGNMENTS {
+        let align = ProgramAlign::new(granularity).expect("a power of two");
+        let unit = usize::from(granularity);
+        for len in [0_usize, 1, 15, 16, 17, 4_095, 65_551, 100_000] {
+            let padded = align.round_up(len).expect("no overflow at these lengths");
+            assert_eq!(padded % unit, 0, "{granularity}/{len}: not a whole unit");
+            assert!(padded >= len, "{granularity}/{len}: shorter than its input");
+            assert!(padded < len + unit, "{granularity}/{len}: padded too far");
+        }
+    }
 }
 
 #[test]
@@ -1298,6 +1335,47 @@ fn a_scan_will_not_skip_an_unknown_kind() {
     assert_eq!(scan.next(), Some(Err(DecodeError::UnknownRecordKind)));
     assert!(scan.next().is_none());
     assert_eq!(scan.offset(), first);
+}
+
+#[test]
+fn a_frame_whose_header_contains_an_erased_byte_is_still_a_frame() {
+    // The scan ends history when the next twelve bytes are *all* `ERASED_BYTE`. Written as
+    // `any` it would compile, pass every other test in this file, and end history at the
+    // first record whose sequence, length or checksum happened to contain a `0xFF` byte —
+    // which is one record in a handful, and which reads as an ordinary end of history.
+    //
+    // So the case is built deliberately: a sequence near the ceiling puts three `0xFF`s in
+    // the header, and the frame after it proves the scan kept going.
+    let align = ProgramAlign::BYTE;
+    let mut journal = [ERASED_BYTE; SCRATCH];
+    let speckled = RecordRef::EffectCompleted {
+        seq: EffectSeq(0xFFFF_FF01),
+        result: b"first",
+    };
+    let plain = RecordRef::RunCompleted { result: b"second" };
+
+    let mut at = frame::encode(&speckled, align, &mut journal).expect("room");
+    let header = journal.get(..HEADER_BYTES).unwrap_or_default();
+    // Counted with `fold` rather than `filter().count()`, which clippy's `naive_bytecount`
+    // answers by suggesting a crate this workspace may not have.
+    let erased = header.iter().fold(0_usize, |seen, byte| {
+        seen + usize::from(*byte == ERASED_BYTE)
+    });
+    assert!(
+        erased >= 3,
+        "this test is only a test if the header really does hold erased bytes: {header:?}"
+    );
+    assert!(
+        !header.iter().all(|byte| *byte == ERASED_BYTE),
+        "and only if they are not all of them"
+    );
+    at += frame::encode(&plain, align, &mut journal[at..]).expect("room");
+
+    let mut scan = Scan::new(&journal, align);
+    assert_eq!(scan.next(), Some(Ok(speckled)));
+    assert_eq!(scan.next(), Some(Ok(plain)));
+    assert!(scan.next().is_none());
+    assert_eq!(scan.offset(), at);
 }
 
 #[test]
@@ -1647,14 +1725,12 @@ fn no_format_version_permits_skipping_an_unknown_kind_yet() {
 }
 
 #[test]
-fn an_alignment_that_is_not_a_power_of_two_still_round_trips_and_scans() {
-    // `ProgramAlign` rejects zero and nothing else, and the type's documentation says a
-    // power of two is not required — "a type that refused a device's honest geometry would
-    // be a type a driver had to lie to". That claim is only worth making if the arithmetic
-    // behind it works, so it is exercised rather than asserted: odd strides, a prime, and
-    // the widest value a `u16` program size can hold.
-    for granularity in [3_u16, 5, 7, 13, 255, u16::MAX] {
-        let align = ProgramAlign::new(granularity).expect("a non-zero alignment");
+fn the_largest_program_granularities_round_trip_and_scan() {
+    // The alignments a page-programmed device reports, which the older sweep stopped at 256
+    // and never reached. A stride of 32 768 is where a padded length overtakes anything else
+    // in the arithmetic, and where a `u16` unit widened too late would fold back on itself.
+    for granularity in [512_u16, 4_096, 32_768] {
+        let align = ProgramAlign::new(granularity).expect("a power of two");
         let records = [
             RecordRef::RunStarted {
                 workflow_kind: 1,
@@ -1667,14 +1743,14 @@ fn an_alignment_that_is_not_a_power_of_two_still_round_trips_and_scans() {
             },
         ];
 
-        let mut journal = vec![ERASED_BYTE; 4 * usize::from(granularity) + 4_096];
+        let mut journal = vec![ERASED_BYTE; 4 * usize::from(granularity)];
         let mut at = 0;
         for record in &records {
             let written = frame::encode(record, align, &mut journal[at..]).expect("room");
             assert_eq!(
-                written % usize::from(granularity),
-                0,
-                "granularity {granularity} left a frame unpadded"
+                written,
+                usize::from(granularity),
+                "granularity {granularity}: a small frame pads to exactly one unit"
             );
             at += written;
         }
