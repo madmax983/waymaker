@@ -103,6 +103,16 @@ pub const FRAME_OVERHEAD_BYTES: usize = HEADER_BYTES + TRAILER_BYTES;
 ///
 /// A `RunStarted` input is capped four bytes lower, because the workflow identity is part
 /// of its payload.
+///
+/// # This is a format ceiling, not a firmware one
+///
+/// [`MAX_FRAME_BYTES`] is 65 551 B and design document §04 states the runtime RAM budget
+/// with a **512 B** scratch page, so the frame a device can actually stage is roughly two
+/// orders of magnitude smaller than the one `payload_len` can describe. Nothing here
+/// asserts a relationship between the two, and deliberately so: the wire format is frozen
+/// for every device Waymaker will ever run on, and the staging buffer is one device's
+/// geometry. What a caller hits first is the buffer it passed to [`encode`], which refuses
+/// with [`DecodeError::LengthOutOfBounds`] long before this number is in reach.
 pub const MAX_PAYLOAD_BYTES: usize = u16::MAX as usize;
 
 /// The longest frame there can be, before padding.
@@ -131,7 +141,13 @@ const VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP: &[u8] = &[];
 ///
 /// The rule §09 states, as a function rather than as a paragraph, so that it can be checked
 /// over every value a version byte can hold rather than at the one value this firmware
-/// writes. [`Scan`] consults it, and it is the thing a future format version changes.
+/// writes.
+///
+/// [`Scan`] does not branch on it today, and that is the point: the answer is the same for
+/// every version, so the scan stops on a kind it does not know and there is no untested arm
+/// in it. This is where the rule *lives* — a reader deciding whether a journal is safe to
+/// walk with older firmware asks here — and it is what a future format version changes,
+/// alongside the arm in [`Scan`] and the test that reaches it.
 ///
 /// # Postconditions
 ///
@@ -309,6 +325,13 @@ pub fn encoded_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize,
 ///
 /// [`DecodeError::LengthOutOfBounds`] when `out` is shorter than [`encoded_len`], or when
 /// the record cannot be encoded at all — see [`encoded_len`].
+///
+/// Those two are one error on purpose, and they are told apart by asking [`encoded_len`]
+/// first: a record that cannot be encoded fails there too, and a record that succeeds there
+/// and fails here needs a bigger buffer. A caller that retries needs the difference — the
+/// second case is worth retrying and the first never is — and one call already gives it,
+/// so a second error variant would be a second vocabulary for adapters to translate between
+/// and no more information.
 pub fn encode(
     record: &RecordRef<'_>,
     align: ProgramAlign,
@@ -320,10 +343,12 @@ pub fn encode(
         .round_up(frame_len)
         .ok_or(DecodeError::LengthOutOfBounds)?;
 
-    let Some((frame, padding)) = out.split_at_mut_checked(padded) else {
+    // Split once, before a byte moves: the whole length check for the caller's buffer, and
+    // the reason a failed encode leaves `out` untouched rather than half a frame a later
+    // flush could program. Everything past `padded` is the caller's and is not written.
+    let Some((frame, _beyond)) = out.split_at_mut_checked(padded) else {
         return Err(DecodeError::LengthOutOfBounds);
     };
-    let _ = padding;
 
     let body = body(record);
     let sequence = match record {
@@ -695,7 +720,17 @@ impl<'a> Reader<'a> {
 /// This is recovery's reader. §09: "Recovery stops at the first unsealed, malformed,
 /// out-of-sequence, or integrity-failed frame" — so the scan is *fused*. Once it has
 /// stopped it stays stopped, and [`offset`](Self::offset) is the byte the committed prefix
-/// ends at, which is where the next append goes.
+/// ends at.
+///
+/// # That offset is not yet an append point
+///
+/// It is tempting to write "and therefore where the next record goes", and at rung 0.1 that
+/// would be wrong in a way that bricks a device. Without the commit seal the scan cannot
+/// tell a torn write from damage, so it may have stopped at a frame whose header was
+/// half-programmed — and on NOR a programmed bit cannot be returned to one without erasing
+/// the block. An appender that wrote there would produce a frame that fails its own header
+/// checksum on every boot, for ever, with no way to move past it. Deciding where it is safe
+/// to append needs the seal and the barrier protocol, which is rung 0.2.
 ///
 /// # Invariants
 ///
@@ -757,7 +792,7 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// Where the committed prefix ends, and therefore where the next append goes.
+    /// The byte at which the committed prefix ends.
     ///
     /// # Postconditions
     ///
@@ -765,6 +800,9 @@ impl<'a> Scan<'a> {
     /// and its padding; after a step that yielded a failure, still at the *start* of the
     /// frame that failed — §14's "frame ignored; previous history prefix wins" is exactly
     /// that offset. Never greater than the journal's length.
+    ///
+    /// This is where history *ended*, which is not the same as where the next record may be
+    /// written: see [the note on `Scan`](Self#that-offset-is-not-yet-an-append-point).
     #[must_use]
     pub const fn offset(&self) -> usize {
         self.offset
@@ -775,60 +813,63 @@ impl<'a> Iterator for Scan<'a> {
     type Item = Result<RecordRef<'a>, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.stopped {
-                return None;
-            }
-            let rest = self.journal.get(self.offset..)?;
-            let Some(header) = rest.get(..HEADER_BYTES) else {
-                // Less than a header left: the ordinary end of a journal.
-                self.stopped = true;
-                return None;
+        if self.stopped {
+            return None;
+        }
+        let rest = self.journal.get(self.offset..)?;
+        let Some(header) = rest.get(..HEADER_BYTES) else {
+            // Less than a header left: the ordinary end of a journal.
+            self.stopped = true;
+            return None;
+        };
+        if header.iter().all(|byte| *byte == ERASED_BYTE) {
+            self.stopped = true;
+            // An erased header ends history only if everything after it is erased too.
+            // Nothing on media records the program granularity a journal was written at, so
+            // a reader handed a smaller one strides short and lands inside a frame's
+            // padding — which is a run of `ERASED_BYTE`, and which would otherwise read as
+            // a clean end of history with committed records still ahead of it. Silently
+            // returning a truncated prefix is the worst failure this type has, because
+            // everything downstream believes it.
+            return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
+                None
+            } else {
+                Some(Err(DecodeError::IntegrityFailed))
             };
-            if header.iter().all(|byte| *byte == ERASED_BYTE) {
-                self.stopped = true;
-                // An erased header ends history only if everything after it is erased too.
-                // Nothing on media records the program granularity a journal was written
-                // at, so a reader handed a smaller one strides short and lands inside a
-                // frame's padding — which is a run of `ERASED_BYTE`, and which would
-                // otherwise read as a clean end of history with committed records still
-                // ahead of it. Silently returning a truncated prefix is the worst failure
-                // this type has, because everything downstream believes it.
-                return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
-                    None
-                } else {
-                    Some(Err(DecodeError::IntegrityFailed))
-                };
-            }
+        }
 
-            let frame = match decode(rest) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    self.stopped = true;
-                    return Some(Err(error));
-                }
-            };
-            let Some(stride) = self.align.round_up(frame.frame_len) else {
+        let frame = match decode(rest) {
+            Ok(frame) => frame,
+            Err(error) => {
                 self.stopped = true;
-                return Some(Err(DecodeError::LengthOutOfBounds));
-            };
-            // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and the
-            // loop below cannot spin on a run of unknown kinds.
-            let next = self.offset.saturating_add(stride).min(self.journal.len());
+                return Some(Err(error));
+            }
+        };
+        let Some(stride) = self.align.round_up(frame.frame_len) else {
+            self.stopped = true;
+            return Some(Err(DecodeError::LengthOutOfBounds));
+        };
 
-            match frame.decoded {
-                Decoded::Record(record) => {
-                    self.offset = next;
-                    return Some(Ok(record));
-                }
-                Decoded::UnknownKind(_) => {
-                    if permits_unknown_record_skip(frame.format_version) {
-                        self.offset = next;
-                        continue;
-                    }
-                    self.stopped = true;
-                    return Some(Err(DecodeError::UnknownRecordKind));
-                }
+        match frame.decoded {
+            Decoded::Record(record) => {
+                // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
+                // scan over a finite journal is finite.
+                self.offset = self.offset.saturating_add(stride).min(self.journal.len());
+                Some(Ok(record))
+            }
+            Decoded::UnknownKind(_) => {
+                // §09 makes skipping a property of the format version, and
+                // `permits_unknown_record_skip` answers `false` for every one of the 256 a
+                // version byte can hold. So the scan stops, and there is deliberately no
+                // second arm here.
+                //
+                // An `if permits_unknown_record_skip(..) { advance; continue }` would read
+                // as the rule made mechanical, and it would be a branch no test can reach —
+                // whose first execution, years from now, is recovery after a power loss on
+                // somebody's device. The version that grants skipping adds the arm, the
+                // loop it needs, and the test that reaches it, in one change.
+                self.stopped = true;
+                Some(Err(DecodeError::UnknownRecordKind))
             }
         }
     }

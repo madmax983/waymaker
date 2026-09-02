@@ -151,9 +151,21 @@ counted in the total — it cannot be in one without being in the others.
 ### Adding a gate rule
 
 Rules live in `xtask/src/`, one module per subject, each a pure function over already-read
-input so it can be tested against a workspace that does not exist. A new rule needs its id in
-`xtask::RULES`, a `violations.extend(...)` line in `check_inputs`, and a row in the broken-
-workspace fixture — the wiring test fails if any of the three is missing.
+input so it can be tested against a workspace that does not exist. A new rule needs **five**
+things, not the three the wiring test covers:
+
+1. its id in `xtask::RULES`;
+2. a `violations.extend(...)` line in `check_inputs`;
+3. a row in the broken-workspace fixture — the wiring test fails if any of these three is
+   missing;
+4. a backticked row in [the rule table below](#what-the-gate-rejects), and the literal rule
+   count in the sentence above it, which the `claude-md` rule compares against `RULES`;
+5. a row in the README's rule table, which `the_readme_documents_every_rule_the_gate_declares`
+   compares against `RULES`.
+
+The last two are worth spelling out because they fail in different places: 4 fails
+`check-layering` itself, and 5 fails `cargo test` while `check-layering` prints `ok`. A
+contributor working from a three-item list gets a green gate and a red build.
 
 ### Adding an ADR
 

@@ -13,6 +13,10 @@
 //! * numeric kinds and borrowed bytes — the decoded record borrows the caller's page,
 //!   which [`a_decoded_record_borrows_the_callers_page`] pins.
 //!
+//! Every one of the six [`RecordRef`] variants has a golden frame: two of them would
+//! otherwise be pinned only by the encoder and the decoder agreeing with each other, which
+//! is the one comparison a golden vector exists to avoid.
+//!
 //! # Why the golden frames are not built by the encoder
 //!
 //! Every byte array in [`golden`] was produced by a reference implementation written
@@ -25,7 +29,7 @@
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 use waymaker_flash::frame::{
     self, Decoded, ERASED_BYTE, FORMAT_VERSION, FRAME_OVERHEAD_BYTES, HEADER_BYTES, MAGIC,
-    MAX_PAYLOAD_BYTES, ProgramAlign, Scan,
+    MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, ProgramAlign, Scan,
 };
 
 /// Frames written out by an independent reference implementation of §09's field list.
@@ -60,6 +64,20 @@ mod golden {
     pub const EFFECT_COMPLETED_ALIGNED: [u8; 24] = [
         0x57, 0x4D, 0x01, 0x03, 0x09, 0x00, 0x00, 0x00, 0x03, 0x00, 0x45, 0x98, 0x01, 0x02, 0x03,
         0x75, 0x07, 0xBF, 0x96, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+
+    /// `EffectFailed { seq: 0xFFFF_FFFE, error: [0x00, 0xFF, 0x80] }` at alignment 2:
+    /// nineteen bytes of frame and one byte of erased padding. A sequence near the ceiling
+    /// and a payload of the two byte values a flash page can hold on its own.
+    pub const EFFECT_FAILED: [u8; 20] = [
+        0x57, 0x4D, 0x01, 0x04, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x93, 0x06, 0x00, 0xFF, 0x80,
+        0x9F, 0x7A, 0xD7, 0x43, 0xFF,
+    ];
+
+    /// `RunFailed { error: b"why" }`, alignment 1.
+    pub const RUN_FAILED: [u8; 19] = [
+        0x57, 0x4D, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x88, 0x9B, 0x77, 0x68, 0x79,
+        0x97, 0x11, 0xEE, 0xE0,
     ];
 
     /// `RunCompleted { result: &[] }`, alignment 1: the shortest frame there is.
@@ -116,13 +134,24 @@ const ALIGNMENTS: [u16; 6] = [1, 2, 4, 8, 16, 256];
 /// Enough room for the longest frame any test below builds.
 const SCRATCH: usize = 1024;
 
+/// How many `RecordRef` variants [`sample_record`] can draw.
+///
+/// Proven equal to the number of variants there are by
+/// [`the_sweep_draws_every_record_variant`], which maps each through an exhaustive `match`.
+const SAMPLED_VARIANTS: usize = 6;
+
 /// Builds one of the six records from a generator and a borrowed payload.
 ///
 /// Returns the record and nothing else: every assertion belongs in a `#[test]`, because
 /// `clippy.toml` exempts test *bodies* from the workspace's `unwrap`, `panic` and
 /// `indexing_slicing` denials and does not exempt a helper in an integration test.
 fn sample_record<'a>(rng: &mut Rng, payload: &'a [u8]) -> RecordRef<'a> {
-    match rng.below(6) {
+    // `SAMPLED_VARIANTS` is the count this dispatch covers, and
+    // `the_sweep_draws_every_record_variant` proves by exhaustive `match` that it is every
+    // variant there is. A bare `rng.below(6)` beside a hand-written match would silently
+    // stop drawing a seventh variant the day one is added — the sweep would keep passing,
+    // over five sixths of the enum.
+    match rng.below(SAMPLED_VARIANTS) {
         0 => RecordRef::RunStarted {
             workflow_kind: u16::try_from(rng.below(0x1_0000)).unwrap_or(0),
             workflow_version: u16::try_from(rng.below(0x1_0000)).unwrap_or(0),
@@ -183,7 +212,7 @@ fn the_encoder_writes_the_golden_frames_byte_for_byte() {
     // The one test that can catch a wrong constant, a swapped field or a checksum over the
     // wrong range: the expected bytes came from a reference implementation written from
     // §09 rather than from this crate.
-    let cases: [(RecordRef<'_>, u16, &[u8]); 4] = [
+    let cases: [(RecordRef<'_>, u16, &[u8]); 6] = [
         (
             RecordRef::RunStarted {
                 workflow_kind: 0xBEEF,
@@ -210,6 +239,19 @@ fn the_encoder_writes_the_golden_frames_byte_for_byte() {
             },
             8,
             &golden::EFFECT_COMPLETED_ALIGNED,
+        ),
+        (
+            RecordRef::EffectFailed {
+                seq: EffectSeq(0xFFFF_FFFE),
+                error: &[0x00, 0xFF, 0x80],
+            },
+            2,
+            &golden::EFFECT_FAILED,
+        ),
+        (
+            RecordRef::RunFailed { error: b"why" },
+            1,
+            &golden::RUN_FAILED,
         ),
         (
             RecordRef::RunCompleted { result: &[] },
@@ -263,8 +305,59 @@ fn the_golden_frames_decode_to_the_records_they_were_built_from() {
         })
     );
     assert_eq!(
+        decoded_record(&golden::EFFECT_FAILED),
+        Some(RecordRef::EffectFailed {
+            seq: EffectSeq(0xFFFF_FFFE),
+            error: &[0x00, 0xFF, 0x80],
+        })
+    );
+    assert_eq!(
+        decoded_record(&golden::RUN_FAILED),
+        Some(RecordRef::RunFailed { error: b"why" })
+    );
+    assert_eq!(
         decoded_record(&golden::RUN_COMPLETED_EMPTY),
         Some(RecordRef::RunCompleted { result: &[] })
+    );
+}
+
+#[test]
+fn the_sweep_draws_every_record_variant() {
+    // The exhaustive `match` is the whole test: a variant added to `RecordRef` is a compile
+    // error here, and the only index it can be given is one `sample_record` does not
+    // dispatch. Without this, the round-trip sweep below would keep passing while quietly
+    // covering a shrinking fraction of the enum.
+    const fn index_of(record: &RecordRef<'_>) -> usize {
+        match record {
+            RecordRef::RunStarted { .. } => 0,
+            RecordRef::EffectScheduled { .. } => 1,
+            RecordRef::EffectCompleted { .. } => 2,
+            RecordRef::EffectFailed { .. } => 3,
+            RecordRef::RunCompleted { .. } => 4,
+            RecordRef::RunFailed { .. } => 5,
+        }
+    }
+
+    let mut rng = Rng::new(0x5EED_0006);
+    let mut drawn = [false; SAMPLED_VARIANTS];
+    for _ in 0..1_000 {
+        let record = sample_record(&mut rng, b"payload");
+        let index = index_of(&record);
+        assert!(
+            index < SAMPLED_VARIANTS,
+            "{record:?} is outside the dispatch"
+        );
+        drawn[index] = true;
+    }
+    assert!(
+        drawn.iter().all(|seen| *seen),
+        "the generator never drew {:?}",
+        drawn
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| !**seen)
+            .map(|(index, _)| index)
+            .collect::<Vec<usize>>()
     );
 }
 
@@ -765,7 +858,11 @@ fn reseal(frame_bytes: &mut [u8]) {
 ///
 /// The crate's own implementation is private, and a test that reached for it would be
 /// resealing an edited frame with the very code the frame's checksums are supposed to be
-/// an independent check on.
+/// an independent check on. Anchored to the catalogue by
+/// [`the_tests_own_checksums_reproduce_the_published_check_values`]: a second copy of one
+/// wrong polynomial agrees with the first perfectly, and every golden vector, round trip
+/// and tamper test built on the pair would be consistent with nothing outside this
+/// repository.
 fn crc16(bytes: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for byte in bytes {
@@ -795,6 +892,99 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     crc ^ 0xFFFF_FFFF
+}
+
+#[test]
+fn the_tests_own_checksums_reproduce_the_published_check_values() {
+    // This file carries its own `crc16` and `crc32` so that `reseal` does not edit a frame
+    // with the code under test. A second implementation needs an anchor of its own, or it
+    // is just a second chance to make the same mistake — these are the values every
+    // specification of these two algorithms states for `b"123456789"`.
+    assert_eq!(crc16(b"123456789"), 0x29B1, "CRC-16/CCITT-FALSE");
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "CRC-32/ISO-HDLC");
+}
+
+#[test]
+fn every_decodable_record_kind_decodes_to_a_record() {
+    // `decode_body`'s last arm is a wildcard that turns any unrecognised kind into
+    // `Decoded::UnknownKind`. That is right for a kind this firmware does not know and
+    // wrong for one it forgot: a decode arm left out when a variant is added produces a
+    // green build with a record type that can be written and never read. Coverage cannot
+    // see it — the wildcard is exercised either way — so the completeness is asserted here.
+    let cases: [(RecordKind, RecordRef<'_>); 6] = [
+        (
+            RecordKind::RUN_STARTED,
+            RecordRef::RunStarted {
+                workflow_kind: 9,
+                workflow_version: 2,
+                input: b"in",
+            },
+        ),
+        (
+            RecordKind::EFFECT_SCHEDULED,
+            RecordRef::EffectScheduled {
+                seq: EffectSeq(1),
+                kind: ActivityKind(2),
+                input_len: 3,
+                input_crc: 4,
+            },
+        ),
+        (
+            RecordKind::EFFECT_COMPLETED,
+            RecordRef::EffectCompleted {
+                seq: EffectSeq(1),
+                result: b"ok",
+            },
+        ),
+        (
+            RecordKind::EFFECT_FAILED,
+            RecordRef::EffectFailed {
+                seq: EffectSeq(1),
+                error: b"no",
+            },
+        ),
+        (
+            RecordKind::RUN_COMPLETED,
+            RecordRef::RunCompleted { result: b"r" },
+        ),
+        (RecordKind::RUN_FAILED, RecordRef::RunFailed { error: b"e" }),
+    ];
+
+    for (kind, record) in cases {
+        assert_eq!(record.kind(), kind, "{record:?} wears the wrong number");
+        let mut page = [0_u8; SCRATCH];
+        let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).expect("room");
+        assert_eq!(
+            frame::decode(&page[..written]).map(|frame| frame.decoded),
+            Ok(Decoded::Record(record)),
+            "{kind:?} encodes but does not decode back to a record"
+        );
+    }
+
+    // The reserved kinds are the complement: known numbers this firmware deliberately
+    // cannot read, so a decoder that grew an arm for one of them by accident shows up here.
+    for reserved in [
+        RecordKind::TIMER_SCHEDULED,
+        RecordKind::TIMER_FIRED,
+        RecordKind::VERSION_MARKER,
+        RecordKind::SIGNAL_RECEIVED,
+        RecordKind::CHILD_STARTED,
+    ] {
+        let mut page = [0_u8; SCRATCH];
+        let written = frame::encode(
+            &RecordRef::RunCompleted { result: b"body" },
+            ProgramAlign::BYTE,
+            &mut page,
+        )
+        .expect("room");
+        page[3] = reserved.0;
+        reseal(&mut page[..written]);
+        assert_eq!(
+            frame::decode(&page[..written]).map(|frame| frame.decoded),
+            Ok(Decoded::UnknownKind(reserved)),
+            "{reserved:?} is reserved for a later issue and must not decode yet"
+        );
+    }
 }
 
 #[test]
@@ -1302,6 +1492,79 @@ fn no_format_version_permits_skipping_an_unknown_kind_yet() {
             "version {version} grants skipping, which no version does at rung 0.1"
         );
     }
+}
+
+#[test]
+fn an_alignment_that_is_not_a_power_of_two_still_round_trips_and_scans() {
+    // `ProgramAlign` rejects zero and nothing else, and the type's documentation says a
+    // power of two is not required — "a type that refused a device's honest geometry would
+    // be a type a driver had to lie to". That claim is only worth making if the arithmetic
+    // behind it works, so it is exercised rather than asserted: odd strides, a prime, and
+    // the widest value a `u16` program size can hold.
+    for granularity in [3_u16, 5, 7, 13, 255, u16::MAX] {
+        let align = ProgramAlign::new(granularity).expect("a non-zero alignment");
+        let records = [
+            RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 1,
+                input: b"x",
+            },
+            RecordRef::EffectCompleted {
+                seq: EffectSeq(1),
+                result: b"yy",
+            },
+        ];
+
+        let mut journal = vec![ERASED_BYTE; 4 * usize::from(granularity) + 4_096];
+        let mut at = 0;
+        for record in &records {
+            let written = frame::encode(record, align, &mut journal[at..]).expect("room");
+            assert_eq!(
+                written % usize::from(granularity),
+                0,
+                "granularity {granularity} left a frame unpadded"
+            );
+            at += written;
+        }
+
+        let mut scan = Scan::new(&journal, align);
+        let walked: Vec<Result<RecordRef<'_>, DecodeError>> = scan.by_ref().collect();
+        assert_eq!(
+            walked,
+            records.map(Ok).to_vec(),
+            "granularity {granularity}"
+        );
+        assert_eq!(scan.offset(), at, "granularity {granularity}");
+    }
+}
+
+#[test]
+fn encode_and_encoded_len_together_tell_a_retryable_failure_from_a_permanent_one() {
+    // Both come back as `LengthOutOfBounds`, and a caller that retries needs the difference:
+    // a bigger buffer fixes one and nothing fixes the other. Asking `encoded_len` first is
+    // what separates them, so the pair is tested rather than left as a doc comment.
+    let retryable = RecordRef::RunCompleted { result: b"abc" };
+    assert!(frame::encoded_len(&retryable, ProgramAlign::BYTE).is_ok());
+    assert_eq!(
+        frame::encode(&retryable, ProgramAlign::BYTE, &mut [0_u8; 4]),
+        Err(DecodeError::LengthOutOfBounds),
+        "a buffer four bytes long cannot hold a nineteen-byte frame"
+    );
+
+    let permanent_payload = vec![0_u8; MAX_PAYLOAD_BYTES + 1];
+    let permanent = RecordRef::RunCompleted {
+        result: &permanent_payload,
+    };
+    assert_eq!(
+        frame::encoded_len(&permanent, ProgramAlign::BYTE),
+        Err(DecodeError::LengthOutOfBounds),
+        "no buffer makes a payload `payload_len` cannot describe encodable"
+    );
+    let mut roomy = vec![0_u8; MAX_FRAME_BYTES + 64];
+    assert_eq!(
+        frame::encode(&permanent, ProgramAlign::BYTE, &mut roomy),
+        Err(DecodeError::LengthOutOfBounds)
+    );
 }
 
 #[test]

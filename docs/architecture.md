@@ -142,7 +142,7 @@ graph LR
   subgraph rest["body and trailer"]
     direction LR
     f6["+12 · N bytes<br/>payload<br/>opaque to the kernel"]
-    f7["+12+N · 4B<br/>payload_crc<br/>u32 LE"]
+    f7["+12+N · 4B<br/>payload_crc<br/>u32 LE · frame_crc in code"]
     f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
     f6 --- f7 --- f8
   end
@@ -162,7 +162,8 @@ graph LR
   class c1,c2,c3 note;
 ```
 
-`payload_crc` covers the header as well as the payload: that binds a payload to its header,
+`payload_crc` is §09's name for the field and `frame_crc` is what `waymaker-flash` calls it,
+because it covers the header as well as the payload: that binds a payload to its header,
 and it stops a record with an empty payload having a checksum of zero, which a zeroed page
 would satisfy. `commit_seal` is a storage-program unit rather than a field, written after a
 barrier, and it is what makes a frame *committed* rather than merely present — which is why
