@@ -6,8 +6,8 @@
 //! an acknowledged one."
 
 use waymaker_fault::{
-    Breach, Durability, Effect, FaultError, Harness, Injection, Op, Progress, RecordId, Run,
-    verify_recovery,
+    Breach, Durability, Effect, FaultError, Harness, Injection, OneWayBits, Op, Progress, RecordId,
+    Run, verify_recovery,
 };
 use waymaker_flash::storage::{Geometry, StableStorage};
 
@@ -352,6 +352,95 @@ fn every_run_of_the_two_record_writer_satisfies_the_oracle_against_what_landed()
             run.injection()
         );
     }
+}
+
+#[test]
+fn a_session_answers_for_the_device_it_is_driving() {
+    // The three observers a writer under test has while it is running, as opposed to the
+    // `Run` it leaves behind: the geometry it must align against, the bytes as they stand,
+    // and which crash point — if any — is armed.
+    let harness = Harness::with_bit_rule(geometry(), OneWayBits::Nor);
+    assert_eq!(harness.geometry(), geometry());
+
+    let runs = harness.run(|session| {
+        assert_eq!(session.geometry(), geometry());
+        session.begin_record(RecordId(0));
+        session.program(0, &[0x0F; 4])?;
+
+        // With nothing armed, a writer can read back exactly what it wrote and see it in
+        // the image. Asserted only in that case, because every other run is by definition
+        // one in which something went wrong.
+        if session.injection().is_none() {
+            let mut page = [0_u8; 4];
+            assert_eq!(session.read(0, &mut page), Ok(()));
+            assert_eq!(page, [0x0F; 4]);
+            assert_eq!(session.image().first(), Some(&0x0F));
+        }
+        session.barrier()
+    });
+
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(clean.ledger().len(), 1);
+    assert!(!clean.ledger().is_empty());
+    assert_eq!(
+        clean.ledger().records().collect::<Vec<_>>(),
+        [(RecordId(0), Durability::Acknowledged)]
+    );
+    assert_eq!(clean.ledger().acknowledged().count(), 1);
+}
+
+#[test]
+fn a_session_read_after_power_loss_reports_power_loss_rather_than_bytes() {
+    // A reader that could still see the device has power. Without this, a writer that
+    // verified its own writes would read the pre-crash image and conclude the write landed.
+    let runs = Harness::new(geometry()).run(|session| {
+        session.begin_record(RecordId(0));
+        let written = session.program(0, &[0x00; 4]);
+        let mut page = [0xAA_u8; 4];
+        let seen = session.read(0, &mut page);
+        if written == Err(FaultError::PowerLoss) {
+            assert_eq!(seen, Err(FaultError::PowerLoss));
+        }
+        match (written, seen) {
+            (_, Err(error)) | (Err(error), _) => Err(error),
+            _ => Ok(()),
+        }
+    });
+
+    let torn = runs
+        .iter()
+        .find(|run| {
+            run.injection()
+                == Some(Injection {
+                    op: 0,
+                    progress: Progress::Bytes(2),
+                    effect: Effect::PowerLoss,
+                })
+        })
+        .expect("a torn first write is among the crash points");
+    // The read is not recorded as an operation, because it never happened.
+    assert_eq!(torn.ops(), [Op::Program { offset: 0, len: 4 }]);
+}
+
+#[test]
+fn a_harness_can_be_told_to_report_one_way_bit_violations() {
+    // The strict rule is the one a driver bug shows up under: hardware absorbs a program
+    // that asks for a bit only an erase can restore, and a `Vec<u8>` model that assigned
+    // instead of masking would absorb it too, silently.
+    let strict = Harness::with_bit_rule(geometry(), OneWayBits::Rejected);
+    let runs = strict.run(|session| {
+        session.begin_record(RecordId(0));
+        session.program(0, &[0x00; 4])?;
+        session.program(0, &[0xFF; 4])
+    });
+
+    let clean = runs.first().expect("the fault-free run");
+    // The second program was refused, so it is not an operation and has no crash points.
+    assert_eq!(clean.ops(), [Op::Program { offset: 0, len: 4 }]);
+    assert_eq!(
+        clean.ledger().state(RecordId(0)),
+        Some(Durability::PossiblyDurable)
+    );
 }
 
 fn one_run(injection: Injection) -> Run {
