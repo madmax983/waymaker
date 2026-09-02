@@ -9,7 +9,7 @@ This file is what a contributor — human or agent — works to. It states the i
 layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
-dependency edges, the eight decision ids, the command list and all 29 rule ids below are
+dependency edges, the eight decision ids, the command list and all 30 rule ids below are
 compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
@@ -181,7 +181,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 29 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 30 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -192,6 +192,7 @@ this table is how you find out what a red build is telling you.
 | `dependency-direction-transitive` | A layer *reaches* a crate it may not depend on, through another crate. |
 | `kernel-zero-dependencies` | `waymaker-core` grows a dependency of any kind, in any table. |
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
+| `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |

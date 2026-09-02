@@ -208,10 +208,9 @@ fn engine() -> usize {
 
 /// The streaming replay cursor: one run's history walked forwards, record by record.
 ///
-/// Split out of [`engine`] for the same reason [`record_codec`] is — it needs a shape of
-/// its own — and because the cursor is the kernel's largest state type, so a row that
-/// charged for it inside another function would make the engine figure harder to read
-/// against `cargo xtask size`'s registry.
+/// Split out of [`engine`] for readability alone: it is called unconditionally from there,
+/// so no figure the size report prints changes either way — the report's rows are one per
+/// linked feature variant plus the kernel-state registry, never one per probe function.
 ///
 /// Every public function of `waymaker_core::replay` is called here, which is
 /// `size-probe-reach`'s requirement. Both halves of `advance` are linked: a legal record
@@ -265,7 +264,7 @@ fn replay_cursor() -> usize {
             .map_or(0, |seq| usize::try_from(seq.0).unwrap_or(0)),
     );
     // Refused: an effect is unresolved, so a fresh identity would abandon the redelivery.
-    kept = kept.wrapping_add(match cursor.allocate() {
+    kept = kept.wrapping_add(match cursor.next_effect_id() {
         Ok(id) => usize::try_from(id.seq.0).unwrap_or(0),
         Err(error) => error.message().len(),
     });

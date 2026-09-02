@@ -70,6 +70,7 @@ pub const RULES: &[&str] = &[
     "no-build-scripts",
     "pre-commit-hook",
     "release-profile",
+    "replay-cursor-surface",
     "settled-decisions",
     "size-probe",
     "size-probe-reach",
@@ -223,6 +224,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         .collect();
     violations.extend(source::check_crate_attributes(&sources));
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
+    violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -741,6 +743,7 @@ mod tests {
             "no-build-scripts",
             "pre-commit-hook",
             "release-profile",
+            "replay-cursor-surface",
             "settled-decisions",
             "size-probe",
             "size-probe-reach",
@@ -805,8 +808,18 @@ mod tests {
             pre_commit_hook_is_executable: Some(true),
             toolchain: Some(pipeline::tests_support::clean_toolchain()),
             probe_manifest: Some(size::tests_support::clean_probe_manifest()),
-            probe_source: Some(size::tests_support::clean_probe_source()),
-            layer_sources: Vec::new(),
+            probe_source: Some(format!(
+                "{}{}",
+                size::tests_support::clean_probe_source(),
+                source::tests_support::clean_probe_calls()
+            )),
+            // One source, because `replay-cursor-surface` pins the cursor's public API and
+            // fails closed when the module it pins is not in the workspace at all.
+            layer_sources: vec![size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: format!("crates/{}", source::REPLAY_SURFACE_PATH),
+                contents: source::tests_support::clean_replay_surface(),
+            }],
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a
                 // member the `missing-docs` rule could not be run against.

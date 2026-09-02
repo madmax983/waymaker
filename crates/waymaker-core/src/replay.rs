@@ -18,9 +18,17 @@
 //! Bytes, and the workflow. It reads no media — the caller decodes a record into its own
 //! scratch page and hands the borrowed view over — and it computes no digest, because a
 //! kernel that hashed an activity input would be a kernel that owns a CRC. It also holds no
-//! opinion about what a *workflow* asked for: whether a request matches what history
-//! recorded is design document §08's transition table, which is issue #15's. This cursor
-//! validates history against itself.
+//! opinion about *what* a workflow asked for: whether a request's activity kind and input
+//! digest match what history recorded is design document §08's transition table, which is
+//! issue #15's. This cursor validates history against itself.
+//!
+//! One §08 verdict does live here, and it is worth naming rather than glossing:
+//! [`ReplayCursor::next_effect_id`] refuses to mint identity anywhere but
+//! [`Position::Replaying`], and refuses with
+//! [`NondeterministicWorkflow`](KernelError::NondeterministicWorkflow). That is the row
+//! "history says this effect cannot come next" — which the cursor can answer, because it is
+//! a fact about position — as distinct from "this effect is not the one history recorded",
+//! which needs the request and is #15's.
 //!
 //! # The boundary this module exists to defend
 //!
@@ -86,15 +94,22 @@ pub struct PendingEffect {
 /// history is:
 ///
 /// ```text
-/// BeforeRun --RunStarted--> Replaying --EffectScheduled--> AwaitingOutcome
-///                               ^                                |
-///                               +---EffectCompleted/Failed-------+
-///                               |
-///                               +---RunCompleted--> RunCompleted (terminal)
-///                               +---RunFailed-----> RunFailed    (terminal)
+///   BeforeRun --RunStarted--> Replaying --EffectScheduled--> AwaitingOutcome
+///                             |  |  ^                              |
+///                             |  |  +--EffectCompleted/Failed------+
+///                             |  |
+///                             |  +--RunCompleted--> RunCompleted (terminal)
+///                             +-----RunFailed-----> RunFailed    (terminal)
 ///
-/// any position --an illegal record--> Halted(error)   (sticky)
+///   any position --a record that could not follow--> Halted(MalformedHistory)
+///   Replaying    --a legal schedule past EffectSeq::MAX--> Halted(IdExhausted)
 /// ```
+///
+/// The second halting edge is drawn because it is real, not because it is reachable: it
+/// needs a run that has committed `EffectSeq::MAX` schedules, which is 2^32 records at the
+/// frame's sixteen-byte floor, or 64 GiB of journal. It is the one edge where a *legal*
+/// record halts the cursor, and a diagram that only showed illegal records reaching
+/// `Halted` would be saying something false about the code.
 ///
 /// Not `Ord`: a position is a place, not a magnitude.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -240,9 +255,11 @@ enum State {
 /// * The run never changes.
 /// * The contained allocator's next sequence is one past the highest sequence history has
 ///   committed, so a new effect continues the run rather than re-issuing identity history
-///   already holds. That is not a discipline spread over call sites: the only thing that
-///   moves the sequence on is consuming a schedule record, and it does so through
-///   [`EffectIdAllocator::allocate`], which cannot repeat or wrap.
+///   already holds. That is not a discipline spread over call sites: a *committed schedule
+///   record* is the only thing that moves it, through
+///   [`EffectIdAllocator::resume`] — which is that method's documented purpose, "continue
+///   after the highest committed sequence" — and [`next_effect_id`](Self::next_effect_id)
+///   takes `&self` so that asking cannot. A record the cursor refuses moves nothing.
 /// * At most one effect is unresolved at a time.
 /// * [`Position::Halted`] is sticky by representation: no code path leaves it.
 /// * The cursor holds no borrow of anything. It has no lifetime parameter, so this is a
@@ -339,37 +356,63 @@ impl ReplayCursor {
     ///
     /// # Postconditions
     ///
-    /// One past the highest sequence history has committed, or
-    /// [`EffectSeq::FIRST`] when it has committed none. Never
-    /// moves except through [`advance`](Self::advance) and [`allocate`](Self::allocate),
-    /// and never moves backwards.
+    /// One past the highest sequence history has committed, or [`EffectSeq::FIRST`] when it
+    /// has committed none — in every position, a halted one included. Nothing but
+    /// [`advance`](Self::advance) over an *accepted* schedule record moves it, so it never
+    /// moves backwards and a refused record leaves it alone.
     #[must_use]
     pub const fn next_seq(&self) -> Option<EffectSeq> {
         self.ids.peek()
     }
 
-    /// Mint the identity for an effect that history does not yet hold.
+    /// The identity the next effect will have, if the workflow asks for one.
     ///
-    /// §08's "end of history, new effect call" row needs a stable
-    /// `(RunId, EffectSeq)` before a schedule record can be written, and this is where it
-    /// comes from. It decides nothing: it does not write, dispatch, or judge whether the
-    /// workflow was entitled to ask.
+    /// §08's "end of history, new effect call" row needs a stable `(RunId, EffectSeq)`
+    /// before a schedule record can be written, and this is where it comes from. It
+    /// decides nothing: it does not write, dispatch, or judge whether the workflow was
+    /// entitled to ask.
+    ///
+    /// # It mints nothing, and that is the point
+    ///
+    /// This takes `&self`. A sequence is spent when its schedule record is *committed* —
+    /// which is [`advance`](Self::advance) over that record, the same call replay makes —
+    /// and not a moment earlier. §07 orders a durable intent before the physical effect, so
+    /// an identity that never reached media is an identity no dispatcher saw and no journal
+    /// remembers; a reboot would hand it out again, and it would be right to.
+    ///
+    /// Two things follow, and both are what a driver needs:
+    ///
+    /// * asking twice before the intent is committed answers the same effect, so a writer
+    ///   that has to retry a torn schedule frame reuses the identity rather than skipping
+    ///   one;
+    /// * the counter is a pure function of history, so a cursor rebuilt from the journal
+    ///   after a reset lands on the same number.
     ///
     /// # Errors
     ///
-    /// * [`KernelError::NondeterministicWorkflow`] unless the cursor is at
-    ///   [`Position::Replaying`]. Before the run starts there is no run to add an effect
-    ///   to; while an effect is unresolved the next effect is that one, redelivered under
-    ///   the identity [`pending`](Self::pending) names, and minting a fresh sequence would
-    ///   abandon it; after a terminal record the run is over. Each is history saying this
-    ///   effect cannot come next, which is §08's divergence — stop, never guess.
-    /// * The failure that halted the cursor, if one did. Recovery stops at the first bad
-    ///   record and stays stopped.
+    /// * [`KernelError::NondeterministicWorkflow`] at
+    ///   [`BeforeRun`](Position::BeforeRun),
+    ///   [`AwaitingOutcome`](Position::AwaitingOutcome),
+    ///   [`RunCompleted`](Position::RunCompleted) and [`RunFailed`](Position::RunFailed).
+    ///   Before the run starts there is no run to add an effect to; while an effect is
+    ///   unresolved the next effect is that one, redelivered under the identity
+    ///   [`pending`](Self::pending) names, and a fresh sequence would abandon it; after a
+    ///   terminal record the run is over. Each is history saying this effect cannot come
+    ///   next, which is §08's divergence — stop, never guess.
+    /// * The failure that halted the cursor, at [`Halted`](Position::Halted). Recovery
+    ///   stops at the first bad record and stays stopped, so the diagnosis a driver reports
+    ///   is the one that stopped it rather than this refusal.
     /// * [`KernelError::IdExhausted`] when the run's 32-bit sequence space is spent. §07
     ///   makes that terminal for the run; the way out is `continue_as_new`.
-    pub const fn allocate(&mut self) -> Result<EffectId, KernelError> {
+    pub const fn next_effect_id(&self) -> Result<EffectId, KernelError> {
         match self.state {
-            State::Replaying => self.ids.allocate(),
+            State::Replaying => match self.ids.peek() {
+                Some(seq) => Ok(EffectId {
+                    run: self.ids.run(),
+                    seq,
+                }),
+                None => Err(KernelError::IdExhausted),
+            },
             State::Halted(error) => Err(error),
             _ => Err(KernelError::NondeterministicWorkflow),
         }
@@ -447,20 +490,36 @@ impl ReplayCursor {
                     input_crc,
                 },
             ) => {
-                // Taken from the allocator rather than trusted from the record: the
-                // allocator is the one thing that cannot issue a sequence twice or wrap,
-                // so "history's sequences are the ones this run would have issued, in
-                // order" is checked by the same type that guarantees it going forwards.
-                // The identity is consumed before the comparison because a mismatch halts
-                // the cursor for good, and a spent sequence on a cursor that will never
-                // issue another is spent either way.
-                let id = match self.ids.allocate() {
-                    Ok(id) => id,
-                    Err(error) => return Err(error),
+                // Checked against the allocator rather than trusted from the record: the
+                // allocator is the one thing that cannot issue a sequence twice or wrap, so
+                // "history's sequences are the ones this run would have issued, in order"
+                // is checked by the same type that guarantees it going forwards.
+                //
+                // Compared before anything moves. A rejected record must leave the counter
+                // where it was, or `next_seq` on the halted cursor would report a sequence
+                // history never committed — and the run id in an `EffectId` handed to a
+                // dispatcher would be one nothing on media accounts for.
+                let Some(expected) = self.ids.peek() else {
+                    // The run has committed `EffectSeq::MAX` schedules. Unreachable at any
+                    // journal size a device has: 2^32 records at the frame's 16-byte floor
+                    // is 64 GiB. It is here because the ceiling is real, not because a test
+                    // can walk to it — see `EffectIdAllocator`, where exhaustion *is*
+                    // exercised.
+                    return Err(KernelError::IdExhausted);
                 };
-                if id.seq.0 != seq.0 {
+                if expected.0 != seq.0 {
                     return Err(KernelError::MalformedHistory);
                 }
+                // `resume` is the documented replay path — "continue *after* the highest
+                // committed sequence" — and this is a record that has just been committed,
+                // so it is exactly that call. Using it rather than `allocate` keeps one
+                // ceiling check instead of two, and keeps the counter a pure function of
+                // history: nothing but a committed schedule ever moves it.
+                self.ids = EffectIdAllocator::resume(self.ids.run(), Some(seq));
+                let id = EffectId {
+                    run: self.ids.run(),
+                    seq,
+                };
                 self.state = State::AwaitingOutcome(Scheduled {
                     seq,
                     kind,
@@ -511,11 +570,24 @@ impl ReplayCursor {
     }
 }
 
-// The cursor is the caller's, and the page is the caller's, and the point of the design is
-// that those are two different things. A cursor that had grown a page buffer could not be
-// smaller than one, so this is the cheapest possible check that it has not — and it fails
-// the build rather than a report, on the target the budget is stated for.
-const _: () = assert!(size_of::<ReplayCursor>() < crate::budget::SCRATCH_PAGE_BYTES);
+// The cursor's exact size, pinned rather than bounded.
+//
+// A bound is what a page buffer hides behind: `kernel_state_types!` already asserts
+// `size_of::<ReplayCursor>() <= 128`, which leaves 96 bytes of headroom, so a cursor that
+// grew a 64-byte scratch buffer — precisely what issue #14 forbids — would satisfy every
+// inequality in this crate. An equality notices it.
+//
+// Sixteen bytes of allocator (a `u64` run id and an `Option<EffectSeq>`) and sixteen of
+// state (the twelve-byte `Scheduled`, plus a discriminant). The number is the same on
+// `thumbv6m-none-eabi`, where a `u64` aligns to four rather than eight, because neither
+// half is bigger than its own alignment demands. If a new target makes this fail, the
+// number is the thing to check rather than the thing to raise.
+//
+// What this cannot establish, and what nothing here does: that the cursor holds no page at
+// all. A `&'static mut [u8]` is sixteen bytes and needs no lifetime parameter. What rules
+// that out is the *absence* of a lifetime parameter for a non-`'static` page, plus this
+// number being too small for an inline one — and review for the rest.
+const _: () = assert!(size_of::<ReplayCursor>() == 32);
 
 #[cfg(test)]
 mod tests {

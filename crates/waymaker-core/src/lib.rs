@@ -24,10 +24,10 @@
 //!
 //! # Status
 //!
-//! Rung 0.1 in progress: effect identity, the activity kind vocabulary, the allocator,
-//! the error vocabulary and the borrowed record views are here; the replay cursor and the
-//! transition rules follow. The bytes those views are decoded from belong to
-//! `waymaker-flash`.
+//! Rung 0.1 in progress: effect identity, the activity kind vocabulary, the allocator, the
+//! error vocabulary, the borrowed record views and the streaming replay cursor are here;
+//! §08's transition rules and divergence detection follow. The bytes those views are
+//! decoded from belong to `waymaker-flash`.
 
 #![no_std]
 #![forbid(unsafe_code)]

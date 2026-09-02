@@ -4,6 +4,8 @@
 //! delete without anything on the host noticing. Checking for them here means the deletion
 //! fails a pull request rather than surfacing later as a firmware build error.
 
+use std::collections::BTreeSet;
+
 use crate::Violation;
 use crate::policy::LAYERS;
 
@@ -464,6 +466,102 @@ pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Ve
     violations
 }
 
+/// The file whose public function surface [`REPLAY_SURFACE`] pins.
+pub const REPLAY_SURFACE_PATH: &str = "waymaker-core/src/replay.rs";
+
+/// Every public function the streaming replay cursor is allowed to have, in sorted order.
+///
+/// Issue #14's third acceptance criterion is "no API on the cursor requires random access by
+/// effect ID", and design document §02 decision 2 is the invariant behind it: "There is no
+/// `Journal::get(id)` and no in-memory event index." Absence is a hard thing to test — a
+/// method that does not exist cannot be called by a test that would fail — so the surface is
+/// pinned instead, and adding to it is a line a reviewer has to write on purpose.
+///
+/// A `fn record_at(&self, id: EffectId) -> Option<RecordRef<'_>>` is the shape this exists
+/// to stop: it needs no dependency, breaks no layering rule, passes every other gate, and
+/// would turn a constant-memory cursor into one that either seeks or indexes. On a device
+/// whose whole runtime budget is 768 bytes, an index is the difference between replay
+/// working and replay being impossible.
+///
+/// Sorted, so that the comparison below can be a set comparison and the list can be read.
+pub const REPLAY_SURFACE: &[&str] = &[
+    "advance",
+    "is_terminal",
+    "new",
+    "next_effect_id",
+    "next_seq",
+    "pending",
+    "position",
+    "run",
+];
+
+/// Rule: the replay cursor's public surface is exactly the one that was reviewed.
+///
+/// Fails in both directions, and the second is the one that matters more. A function the
+/// surface gained is a new way into the cursor that nobody weighed against §02 decision 2. A
+/// function it *lost* — including all of them, because the module was renamed or deleted —
+/// means the pin is checking nothing, and a gate that silently stops checking is the failure
+/// mode every rule here is written to avoid.
+///
+/// Scanned with the same reader `size-probe-reach` uses, so `#[cfg(test)]` helpers are
+/// skipped and a trait method counts even without `pub` on it.
+#[must_use]
+pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const KERNEL: &str = "waymaker-core";
+
+    let Some(source) = sources.iter().find(|source| {
+        source
+            .path
+            .replace('\\', "/")
+            .ends_with(REPLAY_SURFACE_PATH)
+    }) else {
+        return vec![Violation::new(
+            "replay-cursor-surface",
+            KERNEL,
+            format!(
+                "no {REPLAY_SURFACE_PATH} in the workspace, so the pinned replay surface is \
+                 checking nothing; the cursor's public API is where design document \u{a7}02 \
+                 decision 2 is enforced"
+            ),
+        )];
+    };
+
+    let declared: BTreeSet<String> = crate::size::public_functions(core::slice::from_ref(source))
+        .into_iter()
+        .map(|function| function.name)
+        .collect();
+    let pinned: BTreeSet<String> = REPLAY_SURFACE
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let mut violations = Vec::new();
+    for added in declared.difference(&pinned) {
+        violations.push(Violation::new(
+            "replay-cursor-surface",
+            KERNEL,
+            format!(
+                "{} declares `{added}`, which is not in `source::REPLAY_SURFACE`: the \
+                 cursor's public API is pinned so that a lookup by effect id cannot be added \
+                 without a reviewer writing it down — see design document \u{a7}02 decision 2",
+                source.path
+            ),
+        ));
+    }
+    for missing in pinned.difference(&declared) {
+        violations.push(Violation::new(
+            "replay-cursor-surface",
+            KERNEL,
+            format!(
+                "`source::REPLAY_SURFACE` pins `{missing}`, which {} no longer declares; a \
+                 pin nothing matches is a pin that has stopped checking",
+                source.path
+            ),
+        ));
+    }
+    violations
+}
+
 /// Whether `line` — an `impl` header with its whitespace and lifetimes already removed —
 /// implements exactly the trait `needle`.
 ///
@@ -735,6 +833,76 @@ mod tests {
         assert!(check_crate_attributes(&sources("xtask", "fn main() {}")).is_empty());
     }
 
+    /// The replay module as the pin expects it, optionally with a line appended.
+    fn replay_source(extra: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: format!("crates/{REPLAY_SURFACE_PATH}"),
+            contents: format!("{}{extra}", tests_support::clean_replay_surface()),
+        }]
+    }
+
+    #[test]
+    fn the_pinned_replay_surface_passes() {
+        assert!(check_replay_cursor_surface(&replay_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_lookup_by_effect_id_is_rejected_by_name() {
+        // The shape the rule exists for: it breaks no layering rule, needs no dependency,
+        // and turns a sequential cursor into one that seeks.
+        let violations = check_replay_cursor_surface(&replay_source(
+            "pub fn record_at(&self, id: EffectId) -> Option<RecordRef<'_>> { None }\n",
+        ));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "replay-cursor-surface");
+        assert!(
+            violations[0].detail.contains("record_at"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_pinned_name_the_module_no_longer_declares_is_rejected() {
+        // The direction that matters more: a pin nothing matches has stopped checking.
+        let thinned = tests_support::clean_replay_surface().replace("pub fn advance() {}\n", "");
+        let violations = check_replay_cursor_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: format!("crates/{REPLAY_SURFACE_PATH}"),
+            contents: thinned,
+        }]);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].detail.contains("advance"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_replay_module_fails_closed() {
+        // Renamed or deleted, the pin checks nothing — so the gate refuses rather than
+        // reporting success it did not establish.
+        let violations = check_replay_cursor_surface(&kernel_source("pub fn nothing() {}\n"));
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].detail.contains("checking nothing"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_replay_module() {
+        let violations = check_replay_cursor_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates\\waymaker-core\\src\\replay.rs".to_owned(),
+            contents: tests_support::clean_replay_surface(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
     /// One kernel source file, for the encoding rule.
     fn kernel_source(contents: &str) -> Vec<crate::size::LayerSource> {
         vec![crate::size::LayerSource {
@@ -874,5 +1042,46 @@ mod tests {
         );
         assert_eq!(erase_lifetimes("no lifetimes here"), "no lifetimes here");
         assert_eq!(erase_lifetimes(""), "");
+    }
+}
+
+/// Fixtures describing a replay module that does not exist on disk.
+#[cfg(test)]
+pub mod tests_support {
+    use super::REPLAY_SURFACE;
+
+    /// A replay module declaring exactly the pinned surface and nothing else.
+    ///
+    /// Rendered from [`REPLAY_SURFACE`] rather than written out, so that a name added to the
+    /// pin without the real module gaining it fails against the real workspace — where it
+    /// should — rather than here, where it would look like a fixture problem.
+    #[must_use]
+    pub fn clean_replay_surface() -> String {
+        let mut source = String::from("//! A replay module.\n");
+        for name in REPLAY_SURFACE {
+            source.push_str("pub fn ");
+            source.push_str(name);
+            source.push_str("() {}\n");
+        }
+        source
+    }
+
+    /// Probe source calling every name in [`REPLAY_SURFACE`], for the clean-workspace
+    /// fixture.
+    ///
+    /// `size-probe-reach` demands a call for every public function a layer declares, and
+    /// [`clean_replay_surface`] declares eight of them — so a fixture that supplied one
+    /// without the other would describe a workspace the gate rejects for a reason that has
+    /// nothing to do with what is being tested.
+    #[must_use]
+    pub fn clean_probe_calls() -> String {
+        let mut source = String::from("\nfn reaches_the_replay_surface() {\n");
+        for name in REPLAY_SURFACE {
+            source.push_str("    ");
+            source.push_str(name);
+            source.push_str("();\n");
+        }
+        source.push_str("}\n");
+        source
     }
 }

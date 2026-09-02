@@ -17,8 +17,10 @@
 //! the seam. `waymaker-core` cannot test this: it reads no bytes, by design.
 
 use waymaker_core::replay::{PendingEffect, Position, ReplayCursor, Step};
-use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
-use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign, Scan};
+use waymaker_core::{
+    ActivityKind, DecodeError, EffectId, EffectSeq, KernelError, RecordRef, RunId,
+};
+use waymaker_flash::frame::{self, ERASED_BYTE, HEADER_BYTES, ProgramAlign, Scan};
 
 /// The run these journals belong to. On media it lives once, in the bank header.
 const RUN: RunId = RunId(0xABCD_1234_5678_9012);
@@ -148,7 +150,7 @@ fn a_recovered_prefix_replays_to_the_first_unresolved_effect() {
     );
     // And the run does not get to start a fourth effect while the third is in the air.
     assert_eq!(
-        cursor.allocate(),
+        cursor.next_effect_id(),
         Err(KernelError::NondeterministicWorkflow)
     );
 }
@@ -193,7 +195,7 @@ fn an_erased_journal_replays_as_a_run_that_has_not_started() {
     // First boot and cold start are the same code path: the driver writes `RunStarted` and
     // advances over it.
     assert_eq!(
-        cursor.allocate(),
+        cursor.next_effect_id(),
         Err(KernelError::NondeterministicWorkflow)
     );
     assert!(
@@ -206,7 +208,7 @@ fn an_erased_journal_replays_as_a_run_that_has_not_started() {
             .is_ok()
     );
     assert_eq!(
-        cursor.allocate(),
+        cursor.next_effect_id(),
         Ok(EffectId {
             run: RUN,
             seq: EffectSeq::FIRST
@@ -214,11 +216,20 @@ fn an_erased_journal_replays_as_a_run_that_has_not_started() {
     );
 }
 
-#[test]
-fn a_torn_frame_ends_the_prefix_and_the_cursor_keeps_what_came_before() {
-    // §14: "During schedule frame write — frame ignored; previous history prefix wins."
+/// A journal holding `RunStarted`, one resolved effect, and one more schedule frame — with
+/// the offset the sound prefix ends at, and the offset the last frame starts at.
+fn journal_with_a_trailing_schedule() -> ([u8; JOURNAL_BYTES], usize, usize) {
     let [schedule_zero, complete_zero] = effect(0, b"in", b"out");
-    let (mut media, end) = journal(&[
+    let (prefix, prefix_end) = journal(&[
+        RecordRef::RunStarted {
+            workflow_kind: 1,
+            workflow_version: 1,
+            input: b"seed",
+        },
+        schedule_zero,
+        complete_zero,
+    ]);
+    let (media, end) = journal(&[
         RecordRef::RunStarted {
             workflow_kind: 1,
             workflow_version: 1,
@@ -233,35 +244,100 @@ fn a_torn_frame_ends_the_prefix_and_the_cursor_keeps_what_came_before() {
             input_crc: 7,
         },
     ]);
-    // Tear the last frame by flipping a byte inside it. Its checksums stop holding, so the
-    // scan refuses it and the prefix is what came before.
-    let torn = end - 1;
-    media[torn] ^= 0xFF;
+    // The two encodings must agree byte for byte about where the prefix ends, or the
+    // offsets the tests below assert against would be measuring two different journals.
+    assert_eq!(prefix.get(..prefix_end), media.get(..prefix_end));
+    (media, prefix_end, end)
+}
 
+/// Replays `media` and reports the scan's stopping offset, its failure if any, and the
+/// cursor it left behind.
+fn replay(media: &[u8]) -> (usize, Option<DecodeError>, ReplayCursor) {
     let mut cursor = ReplayCursor::new(RUN);
-    let mut scan = Scan::new(&media, align());
+    let mut scan = Scan::new(media, align());
     let mut failure = None;
     for step in &mut scan {
         match step {
             Ok(record) => {
-                cursor.advance(record).expect("the sound prefix is legal");
+                let Ok(_) = cursor.advance(record) else {
+                    unreachable!("the sound prefix of these journals is legal history")
+                };
             }
             Err(error) => failure = Some(error),
         }
     }
+    (scan.offset(), failure, cursor)
+}
 
-    assert!(failure.is_some(), "the torn frame was accepted");
-    // Effect zero is committed and resolved; the torn schedule never happened.
+#[test]
+fn a_frame_damaged_in_its_payload_ends_the_prefix_where_the_damage_starts() {
+    // §09: "CRC detects accidental corruption and torn writes." The byte flipped here is in
+    // the *payload* — the schedule record's activity kind — rather than in the trailing
+    // checksum, which is what `end - 1` would have hit and which is the easiest possible
+    // tear to catch. The payload is what a reader would go on to believe.
+    let (mut media, prefix_end, _) = journal_with_a_trailing_schedule();
+    let payload_byte = prefix_end + HEADER_BYTES;
+    media[payload_byte] ^= 0xFF;
+
+    let (offset, failure, cursor) = replay(&media);
+
+    assert_eq!(failure, Some(DecodeError::IntegrityFailed));
+    // §14: "frame ignored; previous history prefix wins" — and the offset is where that
+    // prefix ends, which is the assertion that says so.
+    assert_eq!(offset, prefix_end);
     assert_eq!(cursor.position(), Position::Replaying);
     assert_eq!(cursor.pending(), None);
     assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
     assert_eq!(
-        cursor.allocate(),
+        cursor.next_effect_id(),
         Ok(EffectId {
             run: RUN,
             seq: EffectSeq(1)
         })
     );
+}
+
+#[test]
+fn a_schedule_frame_that_never_landed_leaves_the_prefix_untouched_and_reports_nothing() {
+    // The failure §14 actually names — "During schedule frame write: frame ignored;
+    // previous history prefix wins" — which is a write that did not land, not a bit flip.
+    // Erased bytes after a sound prefix are the ordinary end of a journal, so the right
+    // outcome is *no error at all*: a test that insisted on one would be asserting that a
+    // clean power cut looks like corruption.
+    let (media, prefix_end, end) = journal_with_a_trailing_schedule();
+    let mut erased = media;
+    for byte in erased.get_mut(prefix_end..end).unwrap_or(&mut []) {
+        *byte = ERASED_BYTE;
+    }
+
+    let (offset, failure, cursor) = replay(&erased);
+
+    assert_eq!(failure, None);
+    assert_eq!(offset, prefix_end);
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
+}
+
+#[test]
+fn a_half_programmed_frame_ends_the_prefix_rather_than_being_read() {
+    // The other half of the same power cut: the header landed and the payload did not, so
+    // the frame is neither sound nor erased. It must stop the scan rather than be
+    // interpreted, or a reader believes a record the writer never finished.
+    let (media, prefix_end, end) = journal_with_a_trailing_schedule();
+    let mut torn = media;
+    for byte in torn
+        .get_mut(prefix_end + HEADER_BYTES..end)
+        .unwrap_or(&mut [])
+    {
+        *byte = ERASED_BYTE;
+    }
+
+    let (offset, failure, cursor) = replay(&torn);
+
+    assert!(failure.is_some(), "a half-programmed frame was accepted");
+    assert_eq!(offset, prefix_end);
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.pending(), None);
 }
 
 #[test]
@@ -299,32 +375,103 @@ fn history_that_could_not_have_been_written_is_refused() {
 
 #[test]
 fn the_digest_a_schedule_records_is_the_one_replay_will_compare() {
-    // The two crates have to agree on what a digest *is* or §08's divergence check compares
-    // two numbers nobody computed. The cursor carries the recorded digest through
-    // untouched — it computes none, because the kernel owns no CRC — so this is where the
-    // two halves are pinned together.
-    let input = b"the activity input";
-    let (media, _) = journal(&[
-        RecordRef::RunStarted {
-            workflow_kind: 1,
-            workflow_version: 1,
-            input: b"",
-        },
-        RecordRef::EffectScheduled {
-            seq: EffectSeq(0),
+    // The two crates have to agree on what a digest *is*, or §08's divergence check compares
+    // two numbers nobody computed. What is checked here is that the cursor carries the
+    // recorded digest across the journal round trip *unchanged* — it computes none, because
+    // the kernel owns no CRC — and that the value discriminates: a different input recovers
+    // a different number, so a digest function that collapsed to a constant would be caught
+    // here rather than only in `tests/frame.rs`, where the value itself is pinned.
+    let recovered = |input: &[u8]| {
+        let (media, _) = journal(&[
+            RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 1,
+                input: b"",
+            },
+            RecordRef::EffectScheduled {
+                seq: EffectSeq(0),
+                kind: DOWNLOAD,
+                input_len: u16::try_from(input.len()).unwrap_or(u16::MAX),
+                input_crc: frame::input_digest(input),
+            },
+        ]);
+        let mut cursor = ReplayCursor::new(RUN);
+        for step in Scan::new(&media, align()) {
+            let record = step.expect("every frame in this journal is sound");
+            cursor.advance(record).expect("this history is legal");
+        }
+        cursor.pending().expect("an effect is unresolved")
+    };
+
+    let first = recovered(b"the activity input");
+    assert_eq!(first.input_crc, frame::input_digest(b"the activity input"));
+    assert_eq!(usize::from(first.input_len), 18);
+
+    let second = recovered(b"a different input!");
+    assert_eq!(second.input_len, first.input_len, "same length, on purpose");
+    assert_ne!(
+        second.input_crc, first.input_crc,
+        "two different inputs of the same length recovered the same digest"
+    );
+}
+
+#[test]
+fn an_effect_appended_past_the_prefix_recovers_under_the_identity_it_was_dispatched_with() {
+    // §14's stable redelivery, driven the way a real adapter drives it: recover, mint an
+    // identity for the effect the workflow asks for next, commit its schedule (§07 steps
+    // 1-3), and lose power before the outcome. The identity a fresh cursor recovers must be
+    // the one the dispatcher was handed, not the next one along.
+    //
+    // This is the path the first version of this branch got wrong: minting used to *spend*
+    // the sequence, so advancing over the record just written was refused as out-of-order
+    // history and the live path could not record a single effect.
+    let (media, end) = journal(&[RecordRef::RunStarted {
+        workflow_kind: 1,
+        workflow_version: 1,
+        input: b"seed",
+    }]);
+
+    let (_, _, mut live) = replay(&media);
+    let dispatched = live
+        .next_effect_id()
+        .expect("history ended, so the next effect is a new one");
+    assert_eq!(dispatched.seq, EffectSeq::FIRST);
+
+    // Step 1-3: the schedule frame for that identity reaches media, then the cursor is
+    // advanced over the record that is now committed.
+    let input = b"payload";
+    let schedule = RecordRef::EffectScheduled {
+        seq: dispatched.seq,
+        kind: DOWNLOAD,
+        input_len: 7,
+        input_crc: frame::input_digest(input),
+    };
+    let mut appended = media;
+    let Some(rest) = appended.get_mut(end..) else {
+        unreachable!("the journal region has room for one more frame")
+    };
+    let Ok(written) = frame::encode(&schedule, align(), rest) else {
+        unreachable!("the journal region has room for one more frame")
+    };
+    assert!(written > 0);
+    assert_eq!(
+        live.advance(schedule),
+        Ok(Step::EffectScheduled(PendingEffect {
+            id: dispatched,
             kind: DOWNLOAD,
-            input_len: 18,
+            input_len: 7,
             input_crc: frame::input_digest(input),
-        },
-    ]);
+        }))
+    );
 
-    let mut cursor = ReplayCursor::new(RUN);
-    for step in Scan::new(&media, align()) {
-        let record = step.expect("every frame in this journal is sound");
-        cursor.advance(record).expect("this history is legal");
-    }
-
-    let pending = cursor.pending().expect("an effect is unresolved");
-    assert_eq!(pending.input_crc, frame::input_digest(input));
-    assert_eq!(usize::from(pending.input_len), input.len());
+    // Step 4 dispatched, and the power went. A fresh cursor over the same bytes recovers the
+    // same effect, under the same id.
+    let (_, failure, recovered) = replay(&appended);
+    assert_eq!(failure, None);
+    assert_eq!(recovered.position(), Position::AwaitingOutcome);
+    assert_eq!(
+        recovered.pending().map(|effect| effect.id),
+        Some(dispatched)
+    );
+    assert_eq!(recovered.pending(), live.pending());
 }

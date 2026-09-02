@@ -121,9 +121,12 @@ pub struct EffectId {
 
 /// The one thing in the kernel that mints effect identity for a run.
 ///
-/// This is live kernel state for the whole of a run, so it is registered in
-/// [`kernel_state_types!`](crate::budget) and charged against the 128 B budget in design
-/// document §04.
+/// This is live kernel state for the whole of a run, and it is charged against the 128 B
+/// budget in design document §04 *through* [`ReplayCursor`](crate::ReplayCursor), which
+/// contains it. It is deliberately not registered in
+/// [`kernel_state_types!`](crate::budget) on its own: that registry sums types that are
+/// independently live, so a row here beside the cursor's would spend the same sixteen
+/// bytes twice.
 ///
 /// # Invariants
 ///

@@ -185,14 +185,18 @@ beginning** and replayed. The future is disposable, and recreating it *is* the r
 mechanism — which is why nothing here snapshots a suspended future
 ([`no-snapshotted-futures`](../CLAUDE.md#the-invariants)).
 
-The two shaded columns are the seam. The scan on the left turns a bank into a committed
-prefix and belongs to `waymaker-flash`; the cursor on the right decides what each record
-meant for the run and belongs to `waymaker-core`. Between them sits one 512-byte scratch
-page the **caller** owns: a record is decoded into it, handed to the cursor as borrowed
-bytes, and the page is free again the moment the step has been dealt with. That is what
-makes replay constant-memory — the cursor has no lifetime parameter, so it cannot be
-holding the page — and it is checked by `const _: () = assert!(size_of::<ReplayCursor>() <
-SCRATCH_PAGE_BYTES)` rather than asserted in prose.
+The shaded notes hanging off steps 1, 2 and 5 are the seam. The scan turns a bank into a
+committed prefix and belongs to `waymaker-flash`; the cursor decides what each record meant
+for the run and belongs to `waymaker-core`. Between them sits one 512-byte scratch page the
+**caller** owns: a record is decoded into it, handed to the cursor as borrowed bytes, and
+the page is free again the moment the step has been dealt with.
+
+That is what makes replay constant-memory, and it rests on the type rather than on a
+measurement: `ReplayCursor` has no lifetime parameter, so it has nowhere to put a borrow of
+a page that is not `'static`. What *is* checked mechanically is the cursor's exact size —
+`const _: () = assert!(size_of::<ReplayCursor>() == 32)` — which is what catches a cursor
+that grows an inline buffer. A bound would not: the 128-byte kernel-state budget leaves 96
+bytes of room for one.
 
 <!-- diagram: cold-start-replay -->
 

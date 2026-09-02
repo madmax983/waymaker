@@ -104,8 +104,11 @@ impl DecodeError {
 /// # Invariants
 ///
 /// Every variant is a refusal rather than a retry hint. [`IdExhausted`](Self::IdExhausted)
-/// and the two replay refusals are terminal for the run; §08 is explicit that a replay
-/// mismatch stops rather than guesses.
+/// and the three replay refusals — [`NondeterministicWorkflow`](Self::NondeterministicWorkflow),
+/// [`IncompatibleWorkflow`](Self::IncompatibleWorkflow) and
+/// [`MalformedHistory`](Self::MalformedHistory) — are terminal for the run; §08 is explicit
+/// that a replay mismatch stops rather than guesses, and §09 that recovery stops at the
+/// first record it cannot account for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KernelError {
     /// The run's 32-bit effect sequence space is spent. Terminal for the run: the way out
