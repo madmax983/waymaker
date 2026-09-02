@@ -188,6 +188,22 @@ Neither error enum is `#[non_exhaustive]` — ADR 0006 — so every adapter that
 exhaustively got a compile error naming the case it now has to think about, which is the
 point.
 
+**The seal will change the stride, and version 1 journals are not forward compatible.** §07
+writes a frame, waits on a payload barrier, and only then programs the seal — so the seal has
+to be in a program unit of its own, or programming it would rewrite bytes the barrier has
+already made durable. That means a rung-0.2 frame occupies `round_up(frame_len, align) +
+program_size` bytes where a rung-0.1 frame occupies `round_up(frame_len, align)`, and a
+reader that expects seals cannot walk a journal written without them.
+
+That is a deliberate break rather than an oversight, and `format_version` is what makes it a
+diagnosable one: a v2 reader meeting a v1 frame refuses with `UnsupportedFormatVersion`
+rather than walking off the end of a record. Nothing has shipped, no device holds a v1
+journal, and the alternative — reserving space now and writing something seal-shaped into it
+— would mean inventing the seal's encoding a rung early *and* writing a seal that no barrier
+stands behind, which is precisely the "documentation must not call it power-loss-durable"
+failure §11 warns about in another context. The space is not reserved; the version byte is
+the mechanism.
+
 The choice to reserve record kinds `5`, `6`, `9`, `10` and `11` means the timer issue,
 `VersionMarker` and `SignalReceived` each add a body behind a number that is already spent.
 It also means a firmware built today meets a `TimerScheduled` written by a firmware built
