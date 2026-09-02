@@ -710,7 +710,7 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
     // The reverse direction: a link to an ADR that was renamed or never landed reads as a
     // decision the project took, and clicking it is the only way to find out otherwise.
     for target in linked {
-        if adr_number(&target).is_some() && !adrs.iter().any(|adr| adr.name == target) {
+        if adr_number(file_name(&target)).is_some() && !adrs.iter().any(|adr| adr.name == target) {
             violations.push(Violation::new(
                 "adr-index",
                 target,
@@ -722,7 +722,11 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
     violations
 }
 
-/// Every `*.md` target of a Markdown link in `contents`, without any directory part.
+/// Every `*.md` target of a Markdown link in `contents`, as written.
+///
+/// The directory part is kept: `missing/0001-one.md` is a broken link, not a link to
+/// `0001-one.md`, and comparing basenames would count it as indexing the real ADR while
+/// leaving a link a reader cannot follow in the file.
 ///
 /// Handles the four spellings this record actually uses or could grow into — a bare target,
 /// an angle-bracketed one, a target followed by a `"title"`, and a reference definition
@@ -757,8 +761,13 @@ fn linked_markdown_files(contents: &str) -> Vec<String> {
         }
     }
 
-    found.retain(|name| name.ends_with(".md"));
+    found.retain(|target| file_name(target).ends_with(".md"));
     found
+}
+
+/// The last path segment of `target`.
+fn file_name(target: &str) -> &str {
+    target.rsplit('/').next().unwrap_or(target)
 }
 
 /// The file name a Markdown link target names, stripped of angle brackets and a title.
@@ -773,7 +782,7 @@ fn link_target(target: &str) -> Option<String> {
         .split_once(['"', '\''])
         .map_or(target, |(before, _)| before)
         .trim();
-    target.rsplit('/').next().map(str::to_owned)
+    (!target.is_empty()).then(|| target.to_owned())
 }
 
 /// Rule: the ADR recording design document §02 records all eight decisions.
@@ -952,21 +961,52 @@ fn check_dependency_diagram(blocks: &[MermaidBlock]) -> Vec<Violation> {
 
 /// Every `a --> b` edge in `body` whose head or tail is a layer.
 ///
-/// Only solid arrows, and only between two names the layering knows about: the size probe's
-/// dashed edges are drawn for the reader and are not part of the contract, and a node label
-/// containing an arrow is not an edge.
+/// Only solid arrows: the size probe's dashed `-.->` edges are drawn for the reader and are
+/// not part of the contract, and `-.->` does not contain `-->`.
+///
+/// Inline node shapes are stripped first. `waymaker-core[Kernel] --> waymaker-embassy[Facade]`
+/// is valid Mermaid drawing exactly the same arrow, so a parser that skipped any line with a
+/// bracket in it would ignore a forbidden edge written that way — and a label containing the
+/// text `-->` would be read as one.
 fn drawn_edges(body: &str) -> Vec<(String, String)> {
-    body.lines()
-        .map(str::trim)
-        .filter(|line| !line.contains('[') && !line.contains('"'))
-        .filter_map(|line| line.split_once("-->"))
-        .filter_map(|(from, to)| {
-            let from = from.trim().to_owned();
-            let to = to.trim().trim_end_matches(';').to_owned();
-            (crate::policy::layer(&from).is_some() || crate::policy::layer(&to).is_some())
-                .then_some((from, to))
-        })
-        .collect()
+    let mut edges = Vec::new();
+    for line in body.lines() {
+        let bare = strip_node_shapes(line);
+        // `a --> b --> c` is two edges, so consecutive segments are paired rather than the
+        // line being split once.
+        let nodes: Vec<&str> = bare.split("-->").map(str::trim).collect();
+        for pair in nodes.windows(2) {
+            let (Some(from), Some(to)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let from = from.trim_end_matches(';').trim().to_owned();
+            let to = to.trim_end_matches(';').trim().to_owned();
+            if crate::policy::layer(&from).is_some() || crate::policy::layer(&to).is_some() {
+                edges.push((from, to));
+            }
+        }
+    }
+    edges
+}
+
+/// `line` with every Mermaid node label and edge label removed.
+///
+/// `[...]`, `(...)`, `{...}` and `|...|` all carry text that is not structure. Dropping them
+/// leaves the node ids and the arrows between them.
+fn strip_node_shapes(line: &str) -> String {
+    let mut kept = String::new();
+    let mut depth: u32 = 0;
+    let mut in_pipe = false;
+    for character in line.chars() {
+        match character {
+            '[' | '(' | '{' => depth = depth.saturating_add(1),
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => in_pipe = !in_pipe,
+            _ if depth == 0 && !in_pipe => kept.push(character),
+            _ => {}
+        }
+    }
+    kept
 }
 
 /// Rule: every crate root in the workspace warns on an undocumented public item.
@@ -1562,6 +1602,29 @@ mod tests {
     }
 
     #[test]
+    fn a_link_into_a_directory_that_does_not_exist_is_a_dead_link() {
+        // `missing/0001-one.md` is not `0001-one.md`: comparing basenames would call a
+        // broken link an index entry, and the real ADR unindexed.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some("- [one](missing/0001-one.md)\n"), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "0001-one.md" && v.detail.contains("no link")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "missing/0001-one.md"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_link_to_something_other_than_an_adr_is_not_reported() {
         // The index links the design document and the architecture page too; only the
         // links that look like ADR file names are the index's own record.
@@ -1803,6 +1866,45 @@ mod tests {
                 .any(|v| v.detail.contains("more than one mermaid block")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn an_edge_written_with_inline_node_shapes_is_still_an_edge() {
+        // `a[Label] --> b[Label]` is valid Mermaid and draws the same arrow. A parser that
+        // skipped any line with a bracket in it would ignore a forbidden edge written that
+        // way, while the rendered picture contradicted the layering.
+        let architecture = clean_architecture().replace(
+            "  waymaker-flash --> waymaker-core",
+            "  waymaker-flash --> waymaker-core\n  waymaker-core[Kernel] --> waymaker-embassy[Facade]",
+        );
+        let violations = check_diagrams(Some(&architecture));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("waymaker-core --> waymaker-embassy")
+                    && v.detail.contains("does not permit")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_permitted_edge_written_with_inline_node_shapes_counts() {
+        let architecture = clean_architecture().replace(
+            "  waymaker-flash --> waymaker-core",
+            "  waymaker-flash[Flash] --> waymaker-core[Core]",
+        );
+        let violations = check_diagrams(Some(&architecture));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_dashed_edge_is_not_part_of_the_contract() {
+        // The size probe's edges are drawn for the reader, not enforced.
+        let architecture = format!(
+            "{}\n  waymaker-size-probe -.-> waymaker-core\n",
+            clean_architecture()
+        );
+        assert!(check_diagrams(Some(&architecture)).is_empty());
     }
 
     #[test]

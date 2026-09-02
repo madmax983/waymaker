@@ -126,10 +126,10 @@ pub const EVERY_WARNING: &str = "warnings";
 pub(crate) fn inner_attributes(contents: &str) -> Vec<String> {
     let mut attributes = Vec::new();
     let mut open: Option<String> = None;
-    let mut in_block_comment = false;
+    let mut comment_depth = 0u32;
 
     for raw in contents.lines() {
-        let uncommented = strip_block_comments(raw, &mut in_block_comment);
+        let uncommented = strip_block_comments(raw, &mut comment_depth);
         let line = uncommented.trim();
         let code = strip_line_comment(line);
         match open.as_mut() {
@@ -154,22 +154,38 @@ pub(crate) fn inner_attributes(contents: &str) -> Vec<String> {
     attributes
 }
 
-/// `line` with any `/* ... */` comment removed, carrying the open state across lines.
+/// `line` with any `/* ... */` comment removed, carrying the open depth across lines.
 ///
 /// A commented-out attribute must not count as present. `//` was already handled; a block
 /// comment was not, and commenting an attribute out with `/* */` is the more natural thing
 /// to do to three lines of it — which would leave the gate reading an attribute the
 /// compiler never sees.
-fn strip_block_comments(line: &str, in_comment: &mut bool) -> String {
+///
+/// A *depth*, not a flag: Rust nests block comments, so the `*/` that closes an inner one
+/// leaves the outer one open. A scanner that reopened there would read everything after the
+/// inner close as live code — which is where an attribute would most plausibly sit.
+fn strip_block_comments(line: &str, depth: &mut u32) -> String {
     let mut kept = String::new();
     let mut rest = line;
     loop {
-        if *in_comment {
-            let Some((_, after)) = rest.split_once("*/") else {
-                return kept;
-            };
-            rest = after;
-            *in_comment = false;
+        if *depth > 0 {
+            let open = rest.find("/*");
+            let close = rest.find("*/");
+            match (open, close) {
+                (Some(open), Some(close)) if open < close => {
+                    *depth = depth.saturating_add(1);
+                    rest = rest.get(open.saturating_add(2)..).unwrap_or_default();
+                }
+                (_, Some(close)) => {
+                    *depth = depth.saturating_sub(1);
+                    rest = rest.get(close.saturating_add(2)..).unwrap_or_default();
+                }
+                (Some(open), None) => {
+                    *depth = depth.saturating_add(1);
+                    rest = rest.get(open.saturating_add(2)..).unwrap_or_default();
+                }
+                (None, None) => return kept,
+            }
             continue;
         }
         let Some((before, after)) = rest.split_once("/*") else {
@@ -180,7 +196,7 @@ fn strip_block_comments(line: &str, in_comment: &mut bool) -> String {
         // A space so that `a/*x*/b` does not become the identifier `ab`.
         kept.push(' ');
         rest = after;
-        *in_comment = true;
+        *depth = 1;
     }
 }
 
@@ -487,6 +503,14 @@ mod tests {
             violations.iter().any(|v| v.detail.contains("no_std")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn a_nested_block_comment_stays_open_until_its_outer_close() {
+        // Rust nests block comments. A scanner tracking a boolean rather than a depth
+        // reopens at the inner `*/`, and reads the attribute below it as live code.
+        let nested = "/* off:\n/* note */\n#![warn(missing_docs)]\n*/\n#![no_std]\n";
+        assert_eq!(inner_attributes(nested), ["#![no_std]"]);
     }
 
     #[test]
