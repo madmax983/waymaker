@@ -133,6 +133,147 @@ pub const SETTLED_DECISIONS: &[SettledDecision] = &[
     },
 ];
 
+/// The line an ADR carries to claim one of §16's deferred questions.
+///
+/// A marker rather than a heuristic on the prose. "This ADR is about the integrity check"
+/// is a thing a reader concludes and a thing a rule cannot; a line that says which question
+/// id the ADR closes is a thing both can read, and it is what makes the
+/// `deferred-questions` rule able to fail in the direction that matters — an ADR that
+/// answers a question the table still lists as open.
+///
+/// The id follows on the same line, optionally in backticks. Markers inside an HTML comment
+/// do not count, for the reason every rule in this module strips them: a claim a reader
+/// cannot see is not a record.
+pub const DEFERRED_QUESTION_MARKER: &str = "Settles deferred question:";
+
+/// Whether one of §16's questions has been answered, and by what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionStatus {
+    /// Nobody has answered it yet.
+    Open {
+        /// The roadmap rung that will, from design document §16's rung table.
+        owned_by: &'static str,
+        /// What would settle it — the evidence, not the opinion.
+        ///
+        /// Written down so that "deferred" means "waiting for a specific thing" rather
+        /// than "nobody got to it". A question with no exit criterion is a question that
+        /// stays open by default.
+        settled_when: &'static str,
+    },
+    /// Answered, and recorded in this ADR.
+    Settled {
+        /// The ADR file name, inside [`ADR_DIR`].
+        adr: &'static str,
+    },
+}
+
+/// One of the questions design document §16 leaves open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredQuestion {
+    /// Stable identifier, cited by `CLAUDE.md` and by the ADR that settles it.
+    pub id: &'static str,
+    /// The question itself, quoted from §16 closely enough to be recognisable.
+    pub headline: &'static str,
+    /// Whether it has been answered.
+    pub status: QuestionStatus,
+}
+
+impl DeferredQuestion {
+    /// How `CLAUDE.md` must state where this question stands, on the question's own row.
+    ///
+    /// Rendered rather than described, for the reason `LAYERS::render_allowed` is: a
+    /// contributor reading the file reads the string the gate reads, or the gate says so.
+    /// Codex caught the first version of this rule searching the whole file for the id and
+    /// the headline and nothing else, which let a row call a settled question open, name
+    /// the wrong rung, or point at the wrong ADR.
+    ///
+    /// A settled question renders its ADR's file name, so the row a reader lands on is one
+    /// click from the answer.
+    #[must_use]
+    pub fn render_status(&self) -> String {
+        match self.status {
+            QuestionStatus::Settled { adr } => format!("Settled by {adr}"),
+            QuestionStatus::Open {
+                owned_by,
+                settled_when,
+            } => format!("Open, owned by {owned_by}. Settles when {settled_when}"),
+        }
+    }
+}
+
+/// The five questions design document §16 leaves open, and where each one stands.
+///
+/// Issue [#16](https://github.com/madmax983/waymaker/issues/16) tracks them: "each needs an
+/// answer before the wire format freezes at 1.0", and "each gets its own ADR when settled".
+/// This list is the spec, in the same sense [`SETTLED_DECISIONS`] is: a sixth question
+/// added to §16 without a row here is a question nothing tracks, and a row deleted is a
+/// question that stopped being open without anyone deciding it.
+///
+/// Two of the five are settled here because the code already answers them and the evidence
+/// exists: §09's frame has been carrying a checksum and an `EffectScheduled` digest since
+/// rung 0.1. The other three are not settled, and deliberately: each names the rung that
+/// owns it and the evidence that would close it. An ADR written for a question whose
+/// implementation does not exist yet is a snapshot of an opinion, which is the one thing
+/// [the record](https://github.com/madmax983/waymaker/blob/main/docs/adr/README.md) says a
+/// decision record must never be.
+pub const DEFERRED_QUESTIONS: &[DeferredQuestion] = &[
+    DeferredQuestion {
+        id: "integrity-check-algorithm",
+        headline: "Whether the default integrity check is CRC32C or a smaller table-free CRC \
+                   implementation.",
+        status: QuestionStatus::Settled {
+            adr: INTEGRITY_CHECK_ADR,
+        },
+    },
+    DeferredQuestion {
+        id: "retry-policy-placement",
+        headline: "Whether retry policy belongs in the Embassy façade or remains workflow \
+                   code.",
+        status: QuestionStatus::Open {
+            owned_by: "rung 0.4 · embassy",
+            settled_when: "the dispatcher exists and the cost of a recorded retry \
+                           representation can be measured against reimplementing backoff in \
+                           every workflow",
+        },
+    },
+    DeferredQuestion {
+        id: "effect-scheduled-metadata",
+        headline: "How much input metadata an EffectScheduled record stores beyond length \
+                   and digest.",
+        status: QuestionStatus::Settled {
+            adr: EFFECT_SCHEDULED_METADATA_ADR,
+        },
+    },
+    DeferredQuestion {
+        id: "explicit-state-snapshots",
+        headline: "Whether a future explicit-state workflow API may support true storage \
+                   snapshots.",
+        status: QuestionStatus::Open {
+            owned_by: "after rung 1.0",
+            settled_when: "a non-async, explicit-state API has been designed far enough that \
+                           the snapshot it would take can be described in records, without \
+                           relaxing the no-snapshotted-futures decision for the async façade",
+        },
+    },
+    DeferredQuestion {
+        id: "wire-format-migration",
+        headline: "How stable wire-format migration is performed after a deployed fleet \
+                   outlives v1.",
+        status: QuestionStatus::Open {
+            owned_by: "rung 1.0",
+            settled_when: "the version-marker record of §09 is implemented and a fleet with \
+                           two format versions in it can be described end to end",
+        },
+    },
+];
+
+/// The ADR that settles the `integrity-check-algorithm` question.
+pub const INTEGRITY_CHECK_ADR: &str = "0010-the-integrity-check-is-catalogued-and-table-free.md";
+
+/// The ADR that settles the `effect-scheduled-metadata` question.
+pub const EFFECT_SCHEDULED_METADATA_ADR: &str =
+    "0011-a-scheduled-effect-records-a-length-and-a-digest.md";
+
 /// A diagram the architecture document must carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagramSpec {
@@ -388,22 +529,22 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
     let mut blocks = Vec::new();
     let mut pending_id: Option<String> = None;
     let mut collecting: Option<(String, Vec<&str>)> = None;
-    // The length of the fence that opened the block we are inside, mermaid or not. A fence
-    // is closed only by a run of at least as many backticks, which is what keeps a quoted
-    // example from being read as the real thing.
-    let mut open_fence: Option<usize> = None;
+    // The character and length of the fence that opened the block we are inside, mermaid or
+    // not. A fence is closed only by a run of at least as many of its own character, which
+    // is what keeps a quoted example from being read as the real thing.
+    let mut open_fence: Option<(u8, usize)> = None;
 
     for line in contents.lines() {
         let indent = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim();
         let fence = fence_length(trimmed);
 
-        if let Some(width) = open_fence {
-            // Inside a fence: only a long-enough closing fence ends it, and only when it
-            // is not itself indented into a code block.
-            if fence.is_some_and(|length| length >= width)
+        if let Some((marker, width)) = open_fence {
+            // Inside a fence: only a long-enough closing fence of the *same* character ends
+            // it, and only when it is not itself indented into a code block.
+            if fence.is_some_and(|(found, length)| found == marker && length >= width)
                 && indent < 4
-                && trimmed.len() == fence.unwrap_or(0)
+                && trimmed.len() == fence.map_or(0, |(_, length)| length)
             {
                 if let Some((id, body)) = collecting.take() {
                     blocks.push(MermaidBlock {
@@ -418,11 +559,11 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
             continue;
         }
 
-        if let Some(length) = fence {
+        if let Some((marker, length)) = fence {
             // An indented fence is literal text in the rendered page, so it opens nothing
             // a reader would call a diagram.
             if indent < 4 {
-                open_fence = Some(length);
+                open_fence = Some((marker, length));
                 if trimmed
                     .get(length..)
                     .is_some_and(|info| info.trim() == "mermaid")
@@ -447,10 +588,18 @@ fn mermaid_blocks(contents: &str) -> Vec<MermaidBlock> {
     blocks
 }
 
-/// The number of leading backticks, when `line` starts a fence of three or more.
-fn fence_length(line: &str) -> Option<usize> {
-    let length = line.bytes().take_while(|byte| *byte == b'`').count();
-    (length >= 3).then_some(length)
+/// The fence character and its run length, when `line` starts a fence of three or more.
+///
+/// Markdown fences with `~~~` as well as with backticks, and a fence is closed only by a
+/// run of its own character — Codex pointed out on PR #58 that knowing about one of them
+/// leaves a hole of exactly the shape the fence check exists to close.
+fn fence_length(line: &str) -> Option<(u8, usize)> {
+    let marker = line
+        .bytes()
+        .next()
+        .filter(|byte| matches!(byte, b'`' | b'~'))?;
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
 }
 
 /// `body` without the Mermaid `%%` comment lines, which are in the source and not in the
@@ -498,12 +647,16 @@ fn without_html_comments(contents: &str) -> String {
 #[must_use]
 fn without_fenced_code(contents: &str) -> String {
     let mut kept = Vec::new();
-    let mut open_fence: Option<usize> = None;
+    let mut open_fence: Option<(u8, usize)> = None;
     for line in contents.lines() {
         let trimmed = line.trim();
         let fence = fence_length(trimmed);
         match open_fence {
-            Some(width) if fence.is_some_and(|length| length >= width) => open_fence = None,
+            Some((marker, width))
+                if fence.is_some_and(|(found, length)| found == marker && length >= width) =>
+            {
+                open_fence = None;
+            }
             Some(_) => {}
             None if fence.is_some() => open_fence = fence,
             None => kept.push(line),
@@ -904,6 +1057,262 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
         .collect()
 }
 
+/// Every `Settles deferred question:` claim in `contents`, in source order.
+///
+/// `contents` is expected to have had its HTML comments and its fenced code blocks stripped
+/// already: a marker a reader cannot see claims nothing, and a marker inside a fence is an
+/// example of the syntax rather than a use of it — `docs/adr/README.md` contains exactly
+/// such an example. The id is the rest of the line, trimmed of whitespace and of the
+/// backticks a Markdown author naturally puts round an identifier.
+#[must_use]
+fn deferred_question_claims(contents: &str) -> Vec<&str> {
+    contents
+        .lines()
+        .filter_map(|line| line.split_once(DEFERRED_QUESTION_MARKER))
+        .map(|(_, rest)| rest.trim().trim_matches('`').trim())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Rule: §16's deferred questions are tracked, and a settled one has an accepted ADR.
+///
+/// Three things, and the second and third are the ones that make this more than a list.
+///
+/// * `CLAUDE.md` carries every question — its id, its headline, and the count — so a
+///   contributor can see what is undecided without opening the design document.
+/// * A question the table calls **settled** has an ADR that exists, is `accepted`, and says
+///   so with [`DEFERRED_QUESTION_MARKER`]. An ADR that is merely *about* the subject does
+///   not count: that is a judgement about prose, and prose is what this rule exists to stop
+///   standing in for a record.
+/// * A question the table calls **open** has no ADR claiming it, and no ADR claims a
+///   question the table has never heard of. This is the direction a list like this normally
+///   rots in — somebody settles a question, writes the ADR, and leaves the row saying
+///   nobody has.
+///
+/// What it does not check, so nobody reads more into a green build than is there: whether
+/// the ADR's answer is any *good*, and whether §16 of the design document still lists these
+/// five. The design document is a checked-in HTML file that predates the table; the table is
+/// the spec, and a sixth question is a row somebody writes.
+#[must_use]
+fn check_deferred_questions(claude_md: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
+    // Every claim in the record, with the ADR that made it, so both directions below can be
+    // answered from one pass.
+    let mut claims: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // Comments *and* fences. Codex raised the second on PR #58: an ADR that documents the
+    // marker syntax in a fenced example would otherwise be read as claiming the question,
+    // and — worse — an ADR that kept the example while losing its real marker would still
+    // satisfy the settled check. `check_adr_index` already reads documents this way.
+    let stripped: Vec<(&str, String)> = adrs
+        .iter()
+        .map(|adr| {
+            (
+                adr.name.as_str(),
+                without_fenced_code(&without_html_comments(&adr.contents)),
+            )
+        })
+        .collect();
+    for (name, contents) in &stripped {
+        for id in deferred_question_claims(contents) {
+            claims.entry(id).or_default().push(name);
+        }
+    }
+
+    let mut violations = check_questions_are_written_down(claude_md);
+    violations.extend(check_questions_match_the_record(adrs, &claims));
+
+    for (id, names) in &claims {
+        if DEFERRED_QUESTIONS.iter().any(|question| question.id == *id) {
+            continue;
+        }
+        for name in names {
+            violations.push(Violation::new(
+                "deferred-questions",
+                (*name).to_owned(),
+                format!(
+                    "settles `{id}`, which is not a question in DEFERRED_QUESTIONS; either \
+                     the id is a typo or §16 grew a question nothing tracks"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// The half of `deferred-questions` that reads `CLAUDE.md`.
+///
+/// A contributor should be able to see what is undecided without opening the design
+/// document, so every question's id, its headline and the count have to be in the file a
+/// contributor is pointed at first.
+#[must_use]
+fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        // `claude-md` already reports the missing file. Saying it twice would make the
+        // report longer without making it more informative, and the record half of this
+        // rule still runs.
+        return vec![Violation::new(
+            "deferred-questions",
+            CLAUDE_MD_PATH,
+            "the repository has no CLAUDE.md, so the deferred questions are recorded \
+             nowhere a contributor reads",
+        )];
+    };
+
+    let contents = without_html_comments(contents);
+    let mut violations = Vec::new();
+
+    for question in DEFERRED_QUESTIONS {
+        // The question's own table row, found by its backticked id so that
+        // `integrity-check-algorithm` cannot be vouched for by a longer id containing it.
+        //
+        // A row rather than the whole file, which is what Codex caught on PR #58: three
+        // global `contains` calls are satisfied by the id, the headline and a status sitting
+        // in three unrelated places, so a row could state the opposite of the table and pass.
+        // And a *table* row rather than any line, which Codex caught in the round after
+        // that: prose mentioning an id above the table shadowed the row, which fails a
+        // correct file and passes one whose row has gone stale.
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", question.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "deferred-questions",
+                question.id,
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this deferred question in backticks, \
+                     so a contributor cannot tell which design questions are still open"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this deferred question, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+
+        if !row.contains(question.headline) {
+            violations.push(Violation::new(
+                "deferred-questions",
+                question.id,
+                format!(
+                    "CLAUDE.md's table row for this question does not carry its headline, \
+                     which reads `{}`",
+                    question.headline
+                ),
+            ));
+        }
+        let status = question.render_status();
+        if !row.contains(&status) {
+            violations.push(Violation::new(
+                "deferred-questions",
+                question.id,
+                format!(
+                    "CLAUDE.md's table row does not say where it stands, which \
+                     DEFERRED_QUESTIONS renders as `{status}`; a row free to disagree with \
+                     the table is a row that eventually does"
+                ),
+            ));
+        }
+    }
+
+    let count = format!("{} deferred question", DEFERRED_QUESTIONS.len());
+    if !contents.contains(&count) {
+        violations.push(Violation::new(
+            "deferred-questions",
+            "question count",
+            format!("CLAUDE.md does not say `{count}s`, which is what §16 leaves open"),
+        ));
+    }
+
+    violations
+}
+
+/// The half of `deferred-questions` that reads the decision record.
+///
+/// `claims` maps a question id to every ADR carrying [`DEFERRED_QUESTION_MARKER`] for it.
+/// A settled question needs exactly one, accepted; an open question needs none.
+#[must_use]
+fn check_questions_match_the_record(
+    adrs: &[AdrFile],
+    claims: &BTreeMap<&str, Vec<&str>>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+
+    for question in DEFERRED_QUESTIONS {
+        let claimed_by = claims.get(question.id).map_or(&[][..], Vec::as_slice);
+        match question.status {
+            QuestionStatus::Settled { adr } => {
+                let Some(file) = adrs.iter().find(|file| file.name == adr) else {
+                    violations.push(Violation::new(
+                        "deferred-questions",
+                        question.id,
+                        format!(
+                            "is settled by {adr}, which is not in {ADR_DIR}; a question \
+                             whose record is missing is a question nobody can read the \
+                             answer to"
+                        ),
+                    ));
+                    continue;
+                };
+                if !claimed_by.contains(&adr) {
+                    violations.push(Violation::new(
+                        "deferred-questions",
+                        question.id,
+                        format!(
+                            "is settled by {adr}, which carries no `{DEFERRED_QUESTION_MARKER} \
+                             {}` line; an ADR that is merely about the subject is not a \
+                             record that it was decided",
+                            question.id
+                        ),
+                    ));
+                }
+                if let Some(status) = adr_status(&file.contents)
+                    && status != "accepted"
+                {
+                    violations.push(Violation::new(
+                        "deferred-questions",
+                        question.id,
+                        format!(
+                            "is settled by {adr}, whose status is `{status}`; a question \
+                             answered by a draft is not answered"
+                        ),
+                    ));
+                }
+                for extra in claimed_by.iter().filter(|name| **name != adr) {
+                    violations.push(Violation::new(
+                        "deferred-questions",
+                        question.id,
+                        format!(
+                            "is claimed by {extra} as well as by {adr}; which one settled it \
+                             would depend on the order the record is read in"
+                        ),
+                    ));
+                }
+            }
+            QuestionStatus::Open { .. } => {
+                for name in claimed_by {
+                    violations.push(Violation::new(
+                        "deferred-questions",
+                        question.id,
+                        format!(
+                            "is open in DEFERRED_QUESTIONS, but {name} already claims to \
+                             settle it; the table is what CLAUDE.md is checked against, so \
+                             it is the table that is stale"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    violations
+}
+
 /// Rule: every diagram issue #11 asks for exists, is Mermaid, and shows every step.
 #[must_use]
 fn check_diagrams(architecture: Option<&str>) -> Vec<Violation> {
@@ -1142,6 +1551,10 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
     violations.extend(check_adr_structure(&inputs.adrs));
     violations.extend(check_adr_index(inputs.adr_index.as_deref(), &inputs.adrs));
     violations.extend(check_settled_decisions(&inputs.adrs));
+    violations.extend(check_deferred_questions(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+    ));
     violations.extend(check_diagrams(inputs.architecture.as_deref()));
     violations.extend(check_missing_docs(&inputs.crate_roots));
     violations
@@ -1153,8 +1566,8 @@ pub mod tests_support {
     use std::fmt::Write as _;
 
     use super::{
-        AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DIAGRAMS, DocsInputs, SETTLED_DECISIONS,
-        SETTLED_DECISIONS_ADR,
+        AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
+        DIAGRAMS, DocsInputs, QuestionStatus, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, adr_number,
     };
     use crate::policy::LAYERS;
 
@@ -1246,7 +1659,89 @@ pub mod tests_support {
             line(&mut body, format_args!("- `{rule}`"));
         }
         line(&mut body, format_args!("All {} rules.", rules.len()));
+        line(
+            &mut body,
+            format_args!("| Id | Question | Where it stands |"),
+        );
+        line(&mut body, format_args!("| --- | --- | --- |"));
+        for question in DEFERRED_QUESTIONS {
+            line(
+                &mut body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    question.id,
+                    question.headline,
+                    question.render_status()
+                ),
+            );
+        }
+        line(
+            &mut body,
+            format_args!("All {} deferred questions.", DEFERRED_QUESTIONS.len()),
+        );
         body
+    }
+
+    /// The ADRs a clean record holds: one per number from 1 to the highest the tables name.
+    ///
+    /// Rendered rather than written out, because `adr-numbering` refuses a gap and
+    /// `DEFERRED_QUESTIONS` names ADRs by number. A fixture with a hand-written list would
+    /// have to be renumbered by hand every time a question is settled, which is exactly the
+    /// drift these rules exist to catch.
+    ///
+    /// # Panics
+    ///
+    /// If a table names an ADR that is not a numbered `NNNN-slug.md` file. That is the gate
+    /// misdescribing its own record, and a fixture that quietly worked around it would hide
+    /// the one thing worth knowing.
+    #[must_use]
+    pub fn clean_adrs() -> Vec<AdrFile> {
+        let mut bodies: std::collections::BTreeMap<u32, (String, String)> =
+            std::collections::BTreeMap::new();
+
+        let settled_number =
+            adr_number(SETTLED_DECISIONS_ADR).expect("the settled-decisions ADR is numbered");
+        bodies.insert(
+            settled_number,
+            (
+                SETTLED_DECISIONS_ADR.to_owned(),
+                clean_settled_decisions_adr(),
+            ),
+        );
+
+        for question in DEFERRED_QUESTIONS {
+            let QuestionStatus::Settled { adr } = question.status else {
+                continue;
+            };
+            let number = adr_number(adr).expect("a settled question names a numbered ADR");
+            let body = format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} `{}`\n",
+                clean_adr(question.id),
+                question.id
+            );
+            bodies.insert(number, (adr.to_owned(), body));
+        }
+
+        let highest = bodies.keys().copied().max().unwrap_or(0);
+        for number in super::ADR_NUMBER_START..=highest {
+            bodies
+                .entry(number)
+                .or_insert_with(|| (format!("{number:04}-filler.md"), clean_adr("filler")));
+        }
+
+        let mut adrs = vec![AdrFile {
+            name: super::ADR_TEMPLATE.to_owned(),
+            contents: "# ADR NNNN: title\n\n- Status: proposed | accepted\n\
+                       - Date: YYYY-MM-DD\n\n## Context\n\n## Decision\n\n\
+                       ## Consequences\n"
+                .to_owned(),
+        }];
+        adrs.extend(
+            bodies
+                .into_values()
+                .map(|(name, contents)| AdrFile { name, contents }),
+        );
+        adrs
     }
 
     /// Documentation inputs that every rule passes.
@@ -1255,31 +1750,14 @@ pub mod tests_support {
         DocsInputs {
             claude_md: Some(clean_claude_md(rules)),
             architecture: Some(clean_architecture()),
-            adr_index: Some(format!(
-                "# Decisions\n\n- [template](0000-template.md)\n- [one](0001-one.md)\n\
-                 - [two](0002-two.md)\n- [three]({SETTLED_DECISIONS_ADR})\n"
-            )),
-            adrs: vec![
-                AdrFile {
-                    name: "0000-template.md".to_owned(),
-                    contents: "# ADR NNNN: title\n\n- Status: proposed | accepted\n\
-                               - Date: YYYY-MM-DD\n\n## Context\n\n## Decision\n\n\
-                               ## Consequences\n"
-                        .to_owned(),
-                },
-                AdrFile {
-                    name: "0001-one.md".to_owned(),
-                    contents: clean_adr("one"),
-                },
-                AdrFile {
-                    name: "0002-two.md".to_owned(),
-                    contents: clean_adr("two"),
-                },
-                AdrFile {
-                    name: SETTLED_DECISIONS_ADR.to_owned(),
-                    contents: clean_settled_decisions_adr(),
-                },
-            ],
+            adr_index: Some({
+                let mut index = String::from("# Decisions\n\n");
+                for adr in clean_adrs() {
+                    line(&mut index, format_args!("- [{0}]({0})", adr.name));
+                }
+                index
+            }),
+            adrs: clean_adrs(),
             crate_roots: vec![CrateRoot {
                 package: "waymaker-core".to_owned(),
                 path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -1307,6 +1785,533 @@ mod tests {
     fn clean_documentation_passes_every_rule() {
         let violations = check_documentation(&clean_inputs(RULES), RULES);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    // Issue #16: the five deferred questions of design document §16.
+
+    /// A settled question's id, or `None` if every question in the table is open.
+    fn a_settled_question() -> Option<&'static DeferredQuestion> {
+        DEFERRED_QUESTIONS
+            .iter()
+            .find(|question| matches!(question.status, QuestionStatus::Settled { .. }))
+    }
+
+    /// An open question, or `None` if every question in the table has been settled.
+    fn an_open_question() -> Option<&'static DeferredQuestion> {
+        DEFERRED_QUESTIONS
+            .iter()
+            .find(|question| matches!(question.status, QuestionStatus::Open { .. }))
+    }
+
+    #[test]
+    fn the_deferred_question_table_has_the_five_questions_section_sixteen_leaves_open() {
+        // §16 lists five. A sixth added to the design document without a row here is the
+        // drift this table exists to make impossible; a row deleted is a question that
+        // stopped being tracked.
+        assert_eq!(DEFERRED_QUESTIONS.len(), 5);
+
+        let mut ids: Vec<&str> = DEFERRED_QUESTIONS.iter().map(|q| q.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two questions share an id");
+
+        // Several tests below pick a settled or an open question and return early if there
+        // is none. Internal review of PR #58 pointed out where that ends: settle the last
+        // three questions — the plan for rungs 0.4 and 1.0 — and those tests go silently
+        // green while this one still counts five. Asserted here so that the day the mix
+        // changes, the failure is this line rather than a quiet loss of coverage.
+        assert!(
+            DEFERRED_QUESTIONS
+                .iter()
+                .any(|question| matches!(question.status, QuestionStatus::Settled { .. })),
+            "no settled question, so the settled-side tests test nothing"
+        );
+        assert!(
+            DEFERRED_QUESTIONS
+                .iter()
+                .any(|question| matches!(question.status, QuestionStatus::Open { .. })),
+            "no open question, so the open-side tests test nothing"
+        );
+    }
+
+    #[test]
+    fn clean_documentation_passes_the_deferred_question_rule() {
+        let violations = check_deferred_questions(
+            clean_claude_md(RULES).as_str().into(),
+            &clean_inputs(RULES).adrs,
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_missing_claude_md_leaves_the_deferred_questions_unreported() {
+        let violations = check_deferred_questions(None, &clean_inputs(RULES).adrs);
+        assert_eq!(rule_ids(&violations), vec!["deferred-questions"]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_claude_md_that_drops_a_question_id_is_reported() {
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let dropped =
+            clean_claude_md(RULES).replace(&format!("`{}`", question.id), "(this one, whatever)");
+        let violations = check_deferred_questions(Some(&dropped), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "deferred-questions" && v.subject == question.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_md_that_drops_a_question_headline_is_reported() {
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let dropped = clean_claude_md(RULES).replace(question.headline, "something else");
+        let violations = check_deferred_questions(Some(&dropped), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("headline")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_md_row_that_contradicts_the_table_is_reported() {
+        // Codex review, PR #58. The first version searched the whole file for the id and
+        // the headline, so a row could say a settled question was open, name the wrong
+        // owner, or point at the wrong ADR, and the rule would still pass — which is the
+        // exact drift this rule exists to catch, in the file it exists to check.
+        for question in DEFERRED_QUESTIONS {
+            let clean = clean_claude_md(RULES);
+            let broken = clean.replace(&question.render_status(), "whatever it likes");
+            assert_ne!(
+                broken, clean,
+                "the fixture should state every question's status"
+            );
+            let violations = check_deferred_questions(Some(&broken), &clean_inputs(RULES).adrs);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.subject == question.id && v.detail.contains("where it stands")),
+                "`{}` was not held to its status: {violations:?}",
+                question.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_stated_across_two_rows_is_reported() {
+        // The id on one line and the headline on another is two half-rows, not a row. A
+        // reader following the table gets nothing from it, and a global search would have
+        // called it fine.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let split = clean_claude_md(RULES).replace(
+            &format!("| `{}` | {} |", question.id, question.headline),
+            &format!("| `{}` | |\n| {} |", question.id, question.headline),
+        );
+        let violations = check_deferred_questions(Some(&split), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("headline")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn every_question_renders_a_status_a_reader_can_act_on() {
+        // A settled question's rendering has to name the ADR, because "settled" without a
+        // record is the thing this whole rule is against.
+        for question in DEFERRED_QUESTIONS {
+            let rendered = question.render_status();
+            match question.status {
+                QuestionStatus::Settled { adr } => {
+                    assert!(rendered.contains(adr), "{rendered}");
+                }
+                QuestionStatus::Open { owned_by, .. } => {
+                    assert!(rendered.contains(owned_by), "{rendered}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_question_documented_only_inside_an_html_comment_is_reported() {
+        // Same reason every rule in this module strips comments, and nothing pinned it
+        // here: a block of ids a reader never sees is not documentation.
+        let hidden = format!("<!--\n{}\n-->\n", clean_claude_md(RULES));
+        let violations = check_deferred_questions(Some(&hidden), &clean_inputs(RULES).adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "question count"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_unbackticked_question_id_does_not_count() {
+        // The backticks are deliberate — they stop a longer id being vouched for by a
+        // shorter one — and the drop-the-id test could not tell the two rules apart,
+        // because it deleted the backticked form altogether.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let bare = clean_claude_md(RULES).replace(&format!("`{}`", question.id), question.id);
+        let violations = check_deferred_questions(Some(&bare), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("backticks")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_md_that_states_the_wrong_number_of_questions_is_reported() {
+        let wrong = clean_claude_md(RULES).replace(
+            &format!("{} deferred question", DEFERRED_QUESTIONS.len()),
+            "two deferred question",
+        );
+        let violations = check_deferred_questions(Some(&wrong), &clean_inputs(RULES).adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "question count"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_question_whose_adr_is_missing_is_reported() {
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let QuestionStatus::Settled { adr } = question.status else {
+            unreachable!("filtered above");
+        };
+        let adrs: Vec<AdrFile> = clean_inputs(RULES)
+            .adrs
+            .into_iter()
+            .filter(|file| file.name != adr)
+            .collect();
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains(adr)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_question_whose_adr_does_not_claim_it_is_reported() {
+        // The half that matters: an ADR can be *about* a question without saying so, and a
+        // rule that only checked the file existed would be satisfied by any ADR at all.
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let QuestionStatus::Settled { adr } = question.status else {
+            unreachable!("filtered above");
+        };
+        let adrs: Vec<AdrFile> = clean_inputs(RULES)
+            .adrs
+            .into_iter()
+            .map(|mut file| {
+                if file.name == adr {
+                    file.contents = clean_adr("an adr that claims nothing");
+                }
+                file
+            })
+            .collect();
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains(DEFERRED_QUESTION_MARKER)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_question_whose_adr_is_not_accepted_is_reported() {
+        // A `proposed` ADR is a draft. A question answered by a draft is not answered.
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let QuestionStatus::Settled { adr } = question.status else {
+            unreachable!("filtered above");
+        };
+        let adrs: Vec<AdrFile> = clean_inputs(RULES)
+            .adrs
+            .into_iter()
+            .map(|mut file| {
+                if file.name == adr {
+                    file.contents = file
+                        .contents
+                        .replace("- Status: accepted", "- Status: proposed");
+                }
+                file
+            })
+            .collect();
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("proposed")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_question_an_adr_has_already_answered_is_reported() {
+        // The table going stale in the other direction: somebody wrote the ADR and left
+        // the row saying nobody had.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-premature.md".to_owned(),
+            contents: format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} {}\n",
+                clean_adr("premature"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("0099-premature.md")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_adr_claiming_a_question_the_table_does_not_declare_is_reported() {
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-invented.md".to_owned(),
+            contents: format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} `a-question-nobody-asked`\n",
+                clean_adr("invented")
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "0099-invented.md"
+                    && v.detail.contains("a-question-nobody-asked")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn two_adrs_claiming_one_question_are_reported() {
+        // Which one settled it becomes a matter of file order, which is how a decision
+        // ends up with two records that can disagree.
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-second-claim.md".to_owned(),
+            contents: format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} {}\n",
+                clean_adr("second claim"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains("0099-second-claim.md")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_an_html_comment_does_not_settle_anything() {
+        // Same reason every other rule here strips comments: a claim a reader cannot see
+        // is not a record.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden.md".to_owned(),
+            // The marker on a line of its own inside a multi-line comment. Written on one
+            // line, the id parsed as `retry-policy-placement -->`, matched no row, and was
+            // reported under a different subject — so the assertion below held even with
+            // the comment-stripping deleted, which is the one thing this test exists to
+            // catch. Internal review of PR #58.
+            contents: format!(
+                "{}\n<!--\n{DEFERRED_QUESTION_MARKER} {}\n-->\n",
+                clean_adr("hidden"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker a reader cannot see settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
+        // Codex, PR #58. An ADR explaining how the marker works must not be read as using
+        // it — and the direction that matters more is the other one: an ADR that kept the
+        // example while losing its real marker would still have passed the settled check.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-explains-the-syntax.md".to_owned(),
+            contents: format!(
+                "{}\n```text\n{DEFERRED_QUESTION_MARKER} `{}`\n```\n",
+                clean_adr("explains the syntax"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "an example was read as a claim: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_question_whose_marker_is_only_an_example_is_reported() {
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let QuestionStatus::Settled { adr } = question.status else {
+            unreachable!("filtered above");
+        };
+        let adrs: Vec<AdrFile> = clean_inputs(RULES)
+            .adrs
+            .into_iter()
+            .map(|mut file| {
+                if file.name == adr {
+                    file.contents = format!(
+                        "{}\n```text\n{DEFERRED_QUESTION_MARKER} `{}`\n```\n",
+                        clean_adr(question.id),
+                        question.id
+                    );
+                }
+                file
+            })
+            .collect();
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains(DEFERRED_QUESTION_MARKER)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_tilde_fenced_example_does_not_settle_anything() {
+        // Codex, PR #58 round 3. Markdown fences with `~~~` as well as backticks, and the
+        // scan only knew one of them — so the fix for the fenced-example hole had a hole
+        // of exactly the same shape.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-tilde-fenced.md".to_owned(),
+            contents: format!(
+                "{}\n~~~text\n{DEFERRED_QUESTION_MARKER} `{}`\n~~~\n",
+                clean_adr("tilde fenced"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a tilde-fenced example was read as a claim: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_fence_is_closed_only_by_its_own_character() {
+        // The other half of knowing about two fence characters: a backtick block must not
+        // be closed by a tilde line, or everything after it stops being fenced.
+        assert_eq!(
+            without_fenced_code("keep\n```\nhidden\n~~~\nstill hidden\n```\nkeep too"),
+            "keep\nkeep too"
+        );
+    }
+
+    #[test]
+    fn prose_naming_a_question_before_the_table_does_not_stand_in_for_its_row() {
+        // Codex, PR #58 round 3. The scan took the first line containing the backticked id,
+        // so a mention in prose above the table shadowed the row — failing the gate on a
+        // correct file, and passing it on one whose row had gone stale.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let with_prose = format!(
+            "Some prose mentioning `{}` well before the table.\n\n{}",
+            question.id,
+            clean_claude_md(RULES)
+        );
+        assert!(
+            check_deferred_questions(Some(&with_prose), &clean_inputs(RULES).adrs).is_empty(),
+            "prose above the table shadowed the row"
+        );
+    }
+
+    #[test]
+    fn a_question_whose_row_is_gone_is_reported_even_when_prose_names_it() {
+        // The direction that matters: prose that happens to repeat the headline and the
+        // status must not stand in for the row itself.
+        let Some(question) = DEFERRED_QUESTIONS.first() else {
+            return;
+        };
+        let row = format!(
+            "| `{}` | {} | {} |",
+            question.id,
+            question.headline,
+            question.render_status()
+        );
+        let prose_only = clean_claude_md(RULES).replace(
+            &row,
+            &format!(
+                "`{}` {} {} — stated in prose, in no table at all",
+                question.id,
+                question.headline,
+                question.render_status()
+            ),
+        );
+        let violations = check_deferred_questions(Some(&prose_only), &clean_inputs(RULES).adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == question.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn check_documentation_runs_the_deferred_question_rule() {
+        let mut inputs = clean_inputs(RULES);
+        inputs.claude_md = None;
+        let violations = check_documentation(&inputs, RULES);
+        assert!(
+            violations.iter().any(|v| v.rule == "deferred-questions"),
+            "{violations:?}"
+        );
     }
 
     #[test]
@@ -2095,6 +3100,7 @@ mod tests {
                 "adr-index",
                 "adr-numbering",
                 "claude-md",
+                "deferred-questions",
                 "diagrams",
                 "settled-decisions"
             ]

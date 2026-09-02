@@ -100,7 +100,13 @@ impl RecordKind {
 ///   rather than the input itself. §07 orders a durable intent before the effect and §08
 ///   compares what replay asks for against what history recorded; a length and a CRC are
 ///   enough to catch a divergent call, and storing the input twice would spend the
-///   journal's scarcest resource on bytes the workflow reconstructs anyway.
+///   journal's scarcest resource on bytes the workflow reconstructs anyway. *Which* four
+///   fields it carries is design document §16's third deferred question, settled by
+///   [ADR 0011](https://github.com/madmax983/waymaker/blob/main/docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md):
+///   a sequence, a kind, a length and a digest, and nothing else. A fifth field is 17% more
+///   journal on every effect for the life of the format, so the `effect-scheduled-fields`
+///   gate rule fails a build that adds one — and one that removes one, because that is a
+///   wire-format change on a record firmware in the field has already written.
 ///
 /// # Why the derives stop where they do
 ///
