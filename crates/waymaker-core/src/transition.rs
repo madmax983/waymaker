@@ -599,13 +599,21 @@ impl ReplayMachine {
             Phase::Settled | Phase::AwaitingOutcome => {}
         }
 
-        // The one source of identity in the kernel, and the position gate with it. The gate
-        // runs before `next` is looked at, so it outranks every row of the table — including
-        // row 5, which is why a terminal record met at an exhausted sequence space reports
-        // `IdExhausted` rather than `Finished`. That needs 2^32 committed schedules, so it
-        // is stated rather than reachable.
+        // The one source of identity in the kernel, and the position gate with it.
+        //
+        // An `Option`, because a spent sequence space stops a *new* effect and nothing
+        // else. The cursor accepts a terminal record at `Replaying` without allocating
+        // anything, so a run that legally committed `EffectSeq::MAX` effects and then
+        // finished must still be able to report its recorded outcome: row 5 needs no
+        // identity, and taking one from it would lose a completion the journal holds. Rows
+        // 2 and 3 do need one, and refuse below when there is none.
+        //
+        // That history needs 2^32 committed schedules — 64 GiB at the frame's sixteen-byte
+        // floor — so no test here walks to it, and the `None` arms below are uncovered for
+        // the same reason `EffectSeq::MAX` is exercised in `EffectIdAllocator` rather than
+        // through a cursor. The ceiling is real; the walk is not.
         let expected = match self.cursor.next_effect_id() {
-            Ok(id) => id,
+            Ok(id) => Some(id),
             // History says no effect can come next: before the run starts, while an effect
             // is unresolved, or after a terminal record. The workflow is running ahead of
             // what the journal can account for, which is terminal for the same reason a
@@ -613,15 +621,20 @@ impl ReplayMachine {
             Err(KernelError::NondeterministicWorkflow) => {
                 return Err(self.diverge(Divergence::Boundary));
             }
-            // `IdExhausted` is not a workflow fault, so it is not recorded as one. It is
-            // already sticky: the allocator has no path back from a spent sequence space,
-            // and §07 makes that terminal for the run.
+            // Not a workflow fault, so not recorded as one, and already sticky: the
+            // allocator has no path back from a spent sequence space and §07 makes that
+            // terminal for the run.
+            Err(KernelError::IdExhausted) => None,
             Err(error) => return Err(error),
         };
 
         match next {
-            // Row 3.
-            Next::EndOfHistory => Ok(Intent::Schedule { id: expected }),
+            // Row 3. A new effect, so it is the one row that cannot proceed without an
+            // identity to give it.
+            Next::EndOfHistory => match expected {
+                Some(id) => Ok(Intent::Schedule { id }),
+                None => Err(KernelError::IdExhausted),
+            },
             Next::Record(record) => match record {
                 // Rows 1, 2 and 4: history holds a schedule, and whether it is *this*
                 // effect's is the whole of the divergence check.
@@ -631,6 +644,11 @@ impl ReplayMachine {
                     input_len,
                     input_crc,
                 } => {
+                    // The recorded schedule has to be compared against the identity the run
+                    // would issue next, so this row needs one too.
+                    let Some(expected) = expected else {
+                        return Err(KernelError::IdExhausted);
+                    };
                     let recorded = PendingEffect {
                         id: EffectId {
                             run: expected.run,
