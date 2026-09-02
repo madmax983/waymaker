@@ -433,14 +433,30 @@ fn the_cursor_is_exactly_the_state_it_declares() {
 }
 
 #[test]
-fn the_cursor_is_registered_against_the_kernel_state_budget() {
+fn the_cursor_is_charged_for_through_the_machine_that_contains_it() {
+    // The cursor is live kernel state and has to be budgeted, but not on its own: the
+    // replay machine of design document §08 contains it, and `kernel_state_types!` sums
+    // types that are *independently* live. Registering both would spend the same 32 B twice
+    // against a 128 B budget, so the machine replaced the cursor's row rather than joining
+    // it — which is what this checks, in both directions.
+    assert!(
+        !waymaker_core::budget::KERNEL_STATE_TYPES
+            .iter()
+            .any(|entry| entry.name.contains("ReplayCursor")),
+        "the cursor is registered beside the machine that contains it"
+    );
     let registered = waymaker_core::budget::KERNEL_STATE_TYPES
         .iter()
-        .find(|entry| entry.name.contains("ReplayCursor"));
-    let registered = registered.expect("the cursor is live kernel state and must be budgeted");
-    // Against the pinned constant rather than against `size_of` again: the registry records
-    // `size_of` itself, so comparing the two would be comparing an expression with itself.
-    assert_eq!(registered.size, CURSOR_BYTES);
+        .find(|entry| entry.name.contains("ReplayMachine"));
+    let registered = registered.expect("the machine is live kernel state and must be budgeted");
+    // Compared against the pinned constant rather than against `size_of` again: the registry
+    // records `size_of` itself, so comparing the two would be comparing an expression with
+    // itself.
+    assert!(
+        registered.size >= CURSOR_BYTES,
+        "the machine is {} bytes and contains a {CURSOR_BYTES} byte cursor",
+        registered.size
+    );
 }
 
 /// The bytes a driver holds live while replaying: the cursor, and one scratch page.

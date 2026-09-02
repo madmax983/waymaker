@@ -181,7 +181,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 30 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 31 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -193,6 +193,7 @@ this table is how you find out what a red build is telling you.
 | `kernel-zero-dependencies` | `waymaker-core` grows a dependency of any kind, in any table. |
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
+| `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
@@ -276,9 +277,14 @@ the append scan that turns a bank into a committed prefix — see
 decision 2 (issue #14): a position that advances through one run's committed history a
 record at a time, refuses an ordering no execution could have produced, and holds no borrow
 of the caller's 512 B scratch page — see
-[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md).
+[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md). On top of it sits
+§08's transition table (issue #15): `ReplayMachine` is the cursor plus the one thing the
+cursor cannot know — what the workflow just asked for — and it is the only place
+`NondeterministicWorkflow` comes from. Divergence is terminal, and refused before the record
+it disagreed with is consumed, so a diverging replay cannot dispatch; see
+[ADR 0009](docs/adr/0009-the-transition-table-is-a-machine-that-owns-the-cursor.md).
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
-The §08 transition rules and divergence detection are the rest of rung 0.1; the commit seal
-and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
-before the code they govern, which is the point: a gate retrofitted after coverage has
-slipped is a gate that ratifies the slip.
+Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
+seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The
+gates went in before the code they govern, which is the point: a gate retrofitted after
+coverage has slipped is a gate that ratifies the slip.

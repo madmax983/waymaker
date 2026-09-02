@@ -221,6 +221,23 @@ pub const RECORD_FRAME_FIELDS: &[&str] = &[
     "commit_seal",
 ];
 
+/// The five rows of the replay transition table, from design document §08.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted: §08's
+/// table has five "next history state" rows, and a picture with four in it is a picture
+/// that has lost one — most likely the fourth, which is the only row whose engine action
+/// is to stop.
+///
+/// Spelled as §08 spells them. "Matching schedule only" is a row of its own rather than a
+/// substring of "Matching schedule + completion", so both have to be drawn.
+pub const TRANSITION_TABLE_ROWS: &[&str] = &[
+    "Matching schedule + completion",
+    "Matching schedule only",
+    "End of history",
+    "Different kind, digest, or sequence",
+    "Terminal workflow record",
+];
+
 /// Every diagram issue #11 asks for.
 pub const DIAGRAMS: &[DiagramSpec] = &[
     DiagramSpec {
@@ -256,6 +273,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the six-step cold-start replay sequence",
         required_labels: COLD_START_STEPS,
         source_section: "§06 Cold-start replay",
+    },
+    DiagramSpec {
+        id: "replay-transition",
+        title: "the five-row replay transition table",
+        required_labels: TRANSITION_TABLE_ROWS,
+        source_section: "§08 Replay and determinism",
     },
     DiagramSpec {
         id: "two-bank-generations",
@@ -1773,6 +1796,7 @@ mod tests {
         assert_eq!(EFFECT_PROTOCOL_STEPS.len(), 7);
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
         assert_eq!(COLD_START_STEPS.len(), 6);
+        assert_eq!(TRANSITION_TABLE_ROWS.len(), 5);
     }
 
     #[test]

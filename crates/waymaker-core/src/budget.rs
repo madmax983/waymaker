@@ -142,21 +142,22 @@ macro_rules! kernel_state_types {
     };
 }
 
-// The replay cursor is live for the whole of a run, so it is the kernel's state and is
-// charged for here. It *contains* the effect id allocator, which is why the allocator has no
-// row of its own: this total sums types that are independently live, so registering both
-// would spend the same 16 B twice against a 128 B budget. That fold was the instruction the
-// previous version of this comment left for whoever added the cursor, and it is recorded in
-// ADR 0008; the same rule applies to whatever contains the cursor next — replace the entry,
-// never add beside it.
+// The replay machine is live for the whole of a run, so it is the kernel's state and is
+// charged for here. It *contains* the replay cursor, which contains the effect id
+// allocator, which is why neither has a row of its own: this total sums types that are
+// independently live, so registering a container beside its contents would spend the same
+// bytes twice against a 128 B budget. That fold is the instruction the previous version of
+// this comment left for whoever added the cursor, and then the machine; it is recorded in
+// ADR 0008 and ADR 0009, and the same rule applies to whatever contains the machine next —
+// replace the entry, never add beside it.
 //
-// The record view is live while the cursor resolves one record against what the workflow
+// The record view is live while the machine resolves one record against what the workflow
 // asks for next, so it is charged here too. It holds a fat pointer into the caller's page
 // rather than the bytes themselves, which is why its size is target-dependent and is
 // budgeted through this registry rather than pinned to a literal beside its declaration.
 // The context joins them at rung 0.4.
 kernel_state_types! {
-    crate::replay::ReplayCursor,
+    crate::transition::ReplayMachine,
     crate::record::RecordRef<'static>,
 }
 
