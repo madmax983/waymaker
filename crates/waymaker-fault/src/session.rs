@@ -13,6 +13,12 @@
 //! see the device has power. A writer with a retry loop in it therefore cannot walk past
 //! the crash point, which is the property that makes a torn-write image an image a reset
 //! could really produce.
+//!
+//! The operation the power loss is armed on is the exception, and only when it *completed*:
+//! it returns `Ok(())` and the session dies behind it. "Power lost after the barrier
+//! returned" has to mean the writer saw the barrier return, or a writer that does
+//! `barrier()?` and then dispatches never dispatches in any run — and design document §02
+//! decision 3 is precisely about what is on media when it does.
 
 use core::fmt;
 
@@ -35,20 +41,27 @@ pub struct Session {
     /// only mutation was one of those has nothing on media, and calling it durable would
     /// oblige recovery to produce something that is not there.
     touched: Vec<bool>,
-    /// Whether operation `i` left media differing from what completing it would have left.
+    /// What operation `i` meant to put on media and did not.
     ///
-    /// A record with one of these in it is *torn*: part of what it meant to put on media is
-    /// there and the rest is not. Design document §15 permits recovery to include "an
-    /// unacknowledged **complete** record", and half a record is not one — so a torn record
-    /// can never be acknowledged, whatever barrier follows it, and recovery producing one is
-    /// a breach.
+    /// A record with any of these still outstanding when the run ends is *torn*: part of
+    /// what it meant to put on media is there and the rest is not. Design document §15
+    /// permits recovery to include "an unacknowledged **complete** record", and half a
+    /// record is not one — so a torn record can never be acknowledged, whatever barrier
+    /// follows it, and recovery producing one is a breach.
     ///
-    /// The comparison is against the *media*, not against the byte count. A frame is padded
-    /// to the program granularity with `0xFF`, and programming `0xFF` over erased media
-    /// changes nothing — so a write interrupted inside its own padding leaves exactly the
-    /// bytes a completed write would have, and calling that torn would fail a recovery that
-    /// is entirely correct.
-    torn: Vec<bool>,
+    /// Two things this deliberately is not. It is not a byte count: a frame is padded to
+    /// the program granularity with `0xFF`, and programming `0xFF` over erased media
+    /// changes nothing, so a write interrupted inside its own padding leaves exactly the
+    /// bytes a completed write would have. And it is not judged when the operation runs but
+    /// when the run *ends*, because what one write failed to put on media a retry may have
+    /// put there since — a per-operation verdict would call a record torn that is whole.
+    missing: Vec<Missing>,
+    /// A digest of what operation `i` programmed, for the determinism check.
+    ///
+    /// [`Op`] carries offsets, lengths and barriers and not the bytes, so a writer that
+    /// keeps the shape and changes the contents would evaluate every crash point against a
+    /// history the enumeration was not taken from.
+    payloads: Vec<u64>,
     /// Indices of barriers that completed durably.
     barriers: Vec<usize>,
     /// `(record, index of the first operation that could belong to it)`. A `None` record
@@ -64,7 +77,8 @@ impl Session {
             injection,
             ops: Vec::new(),
             touched: Vec::new(),
-            torn: Vec::new(),
+            missing: Vec::new(),
+            payloads: Vec::new(),
             barriers: Vec::new(),
             marks: Vec::new(),
             powered: true,
@@ -116,6 +130,30 @@ impl Session {
         self.injection
     }
 
+    /// What a run has to reproduce, up to and including operation `through`.
+    ///
+    /// The shape *and* the contents *and* the record boundaries. `Op` alone carries offsets,
+    /// lengths and barriers, so a writer that keeps the shape and changes the bytes — or
+    /// renumbers its records — would have every crash point evaluated against a history the
+    /// enumeration was not taken from, with nothing to say so.
+    fn trace(&self, through: usize) -> Trace {
+        let end = through.min(self.ops.len());
+        Trace {
+            ops: self.ops.get(..end).unwrap_or_default().to_vec(),
+            payloads: self.payloads.get(..end).unwrap_or_default().to_vec(),
+            // Strictly before, not up to: a mark at `end` declares the record the
+            // operations *after* the crash point belong to, and the injected run has not
+            // got that far. Comparing it would read a writer that stopped where it was told
+            // to as one that changed its mind.
+            marks: self
+                .marks
+                .iter()
+                .filter(|(_, at)| *at < end)
+                .copied()
+                .collect(),
+        }
+    }
+
     /// Turns the session into the run it performed.
     pub(crate) fn finish(self) -> Run {
         let ledger = self.ledger();
@@ -139,8 +177,11 @@ impl Session {
                     .marks
                     .get(position.wrapping_add(1))
                     .map_or(self.ops.len(), |(_, next)| *next);
-                let torn =
-                    (*start..end.max(*start)).any(|index| self.torn.get(index) == Some(&true));
+                let torn = (*start..end.max(*start)).any(|index| {
+                    self.missing
+                        .get(index)
+                        .is_some_and(|missing| missing.outstanding(&self.device))
+                });
                 Some((id, self.durability_of(*start, end, torn), torn))
             })
             .collect();
@@ -192,6 +233,25 @@ impl Session {
             Progress::None => 0,
             Progress::Bytes(bytes) if bytes < len => bytes,
             Progress::Bytes(_) | Progress::Whole => len,
+        }
+    }
+
+    /// What an operation that ran to completion returns, given the crash point armed on it.
+    ///
+    /// Under [`Interruption::PowerLoss`] this is `Ok(())` and *then* the power is gone.
+    /// That is what "power lost after the operation returned" means, and it is not the same
+    /// world as an operation that reported a failure: design document §02 decision 3 has a
+    /// writer do `barrier()?` and then dispatch, so a barrier handing back an error means
+    /// the dispatch never happens — and the one crash point where an effect is in flight
+    /// when the power goes would be missing from every sweep. The writer learns at its next
+    /// storage call, or never, which is exactly how a device behaves.
+    const fn completed(&mut self, injection: Injection) -> Result<(), FaultError> {
+        match injection.interruption {
+            Interruption::PowerLoss => {
+                self.powered = false;
+                Ok(())
+            }
+            Interruption::Failure => Err(FaultError::InjectedFailure),
         }
     }
 
@@ -248,18 +308,25 @@ impl StableStorage for Session {
         // a frame is padded with `0xFF`, and programming `0xFF` over erased media is the
         // identity, so a write interrupted inside its own padding leaves exactly what a
         // completed write would have.
-        let landed_something = self.device.apply_program(offset, written);
+        self.touched
+            .push(self.device.apply_program(offset, written));
+        self.payloads.push(digest(src));
         let withheld = src.get(landed as usize..).unwrap_or_default();
-        self.touched.push(landed_something);
-        self.torn.push(
-            landed_something
-                && self
-                    .device
-                    .program_would_change(offset.wrapping_add(landed), withheld),
-        );
+        self.missing.push(if withheld.is_empty() {
+            Missing::Nothing
+        } else {
+            Missing::Program {
+                offset: offset.wrapping_add(landed),
+                bytes: withheld.to_vec(),
+            }
+        });
 
         self.armed_for(index).map_or(Ok(()), |injection| {
-            Err(self.interrupt(injection.interruption))
+            if injection.progress == Progress::Whole {
+                self.completed(injection)
+            } else {
+                Err(self.interrupt(injection.interruption))
+            }
         })
     }
 
@@ -274,17 +341,23 @@ impl StableStorage for Session {
         let landed = self
             .armed_for(index)
             .map_or(len, |injection| Self::landed(injection.progress, len));
-        let landed_something = self.device.apply_erase(offset, landed);
-        self.touched.push(landed_something);
-        self.torn.push(
-            landed_something
-                && self
-                    .device
-                    .erase_would_change(offset.wrapping_add(landed), len.wrapping_sub(landed)),
-        );
+        self.touched.push(self.device.apply_erase(offset, landed));
+        self.payloads.push(0);
+        self.missing.push(if landed == len {
+            Missing::Nothing
+        } else {
+            Missing::Erase {
+                offset: offset.wrapping_add(landed),
+                len: len.wrapping_sub(landed),
+            }
+        });
 
         self.armed_for(index).map_or(Ok(()), |injection| {
-            Err(self.interrupt(injection.interruption))
+            if injection.progress == Progress::Whole {
+                self.completed(injection)
+            } else {
+                Err(self.interrupt(injection.interruption))
+            }
         })
     }
 
@@ -296,28 +369,80 @@ impl StableStorage for Session {
         let index = self.ops.len();
         self.ops.push(Op::Barrier);
         self.touched.push(false);
-        self.torn.push(false);
+        self.payloads.push(0);
+        self.missing.push(Missing::Nothing);
 
         match self.armed_for(index) {
-            // Power lost *after* the barrier returned: the ordering was established, so
-            // everything it covered is durable and recovery is required to find it. The
-            // caller never learned, which is the whole point of enumerating this crash
-            // point separately from the one before the barrier.
-            Some(injection) if injection.interruption == Interruption::PowerLoss => {
-                if injection.progress == Progress::Whole {
-                    self.barriers.push(index);
-                }
-                Err(self.interrupt(Interruption::PowerLoss))
-            }
             // A barrier that returned an error establishes nothing a caller may rely on,
             // whatever really happened on the wire.
-            Some(injection) => Err(self.interrupt(injection.interruption)),
+            Some(injection) if injection.progress != Progress::Whole => {
+                Err(self.interrupt(injection.interruption))
+            }
+            // The barrier completed. Whether the power then went away or the call merely
+            // reported a failure, the ordering it established is on media.
+            Some(injection) => {
+                self.barriers.push(index);
+                self.completed(injection)
+            }
             None => {
                 self.barriers.push(index);
                 Ok(())
             }
         }
     }
+}
+
+/// What one run has to reproduce for its crash point to mean what it says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Trace {
+    ops: Vec<Op>,
+    payloads: Vec<u64>,
+    marks: Vec<(Option<RecordId>, usize)>,
+}
+
+/// What an operation meant to put on media and did not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Missing {
+    /// Nothing: the operation did everything it set out to do.
+    Nothing,
+    /// Bytes a program did not write.
+    Program {
+        /// Where the unwritten bytes would have gone.
+        offset: u32,
+        /// The bytes themselves, so that "is this still missing" can be asked later.
+        bytes: Vec<u8>,
+    },
+    /// A region an erase did not reach.
+    Erase {
+        /// Where the unerased region starts.
+        offset: u32,
+        /// How long it is.
+        len: u32,
+    },
+}
+
+impl Missing {
+    /// Whether what this operation withheld is *still* absent from `device`.
+    ///
+    /// Asked at the end of the run rather than when the operation ran, so that bytes a
+    /// failed write did not put on media but a retry did are not counted as missing.
+    fn outstanding(&self, device: &Device) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Program { offset, bytes } => device.program_would_change(*offset, bytes),
+            Self::Erase { offset, len } => device.erase_would_change(*offset, *len),
+        }
+    }
+}
+
+/// FNV-1a over `bytes`, so that a payload can be compared between runs without keeping it.
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
 }
 
 /// One execution of a writer, with at most one crash point in it.
@@ -425,10 +550,11 @@ impl Harness {
         let baseline = self.fault_free(&mut writer)?;
         let sequence = baseline.ops.clone();
 
-        let mut runs = vec![baseline];
+        let mut runs = Vec::new();
         for injection in crate::inject::injections(&sequence, self.geometry) {
-            runs.push(self.injected(injection, &sequence, &mut writer)?);
+            runs.push(self.injected(injection, &baseline, &mut writer)?);
         }
+        runs.insert(0, baseline.finish());
         Ok(runs)
     }
 
@@ -452,19 +578,18 @@ impl Harness {
         E: fmt::Debug,
     {
         let baseline = self.fault_free(&mut writer)?;
-        let sequence = baseline.ops;
-        self.injected(injection, &sequence, &mut writer)
+        self.injected(injection, &baseline, &mut writer)
     }
 
     /// The run in which nothing is injected, which is where the write sequence comes from.
-    fn fault_free<W, E>(&self, writer: &mut W) -> Result<Run, HarnessError>
+    fn fault_free<W, E>(&self, writer: &mut W) -> Result<Session, HarnessError>
     where
         W: FnMut(&mut Session) -> Result<(), E>,
         E: fmt::Debug,
     {
         let mut session = Session::new(Device::with_bit_rule(self.geometry, self.bits), None);
         match writer(&mut session) {
-            Ok(()) => Ok(session.finish()),
+            Ok(()) => Ok(session),
             Err(error) => Err(HarnessError::WriterFailedWithNoFaultsArmed(format!(
                 "{error:?}"
             ))),
@@ -475,7 +600,7 @@ impl Harness {
     fn injected<W, E>(
         &self,
         injection: Injection,
-        sequence: &[Op],
+        baseline: &Session,
         writer: &mut W,
     ) -> Result<Run, HarnessError>
     where
@@ -486,19 +611,21 @@ impl Harness {
             Some(injection),
         );
         drop(writer(&mut session));
-        let run = session.finish();
 
-        // Nothing has gone wrong yet at the moment the crash point fires, so every
-        // operation up to and including it must be the one the enumeration was computed
-        // from. Where they differ, the writer is not a function of the storage it was
-        // handed, and the crash points are aimed at operations that are not there.
+        // Nothing has gone wrong yet at the moment the crash point fires, so everything up
+        // to and including it — the operations, the bytes they carried, and the record
+        // boundaries around them — must be what the enumeration was computed from. Where
+        // they differ, the writer is not a function of the storage it was handed, and the
+        // crash points are aimed at operations that are not there.
+        //
+        // Clamped to the sequence's length rather than requiring one more operation than
+        // it has: the one crash point that precedes everything is `op: 0` even for an
+        // empty sequence, which is a sweep the enumeration explicitly supports.
         let through = injection.op.saturating_add(1);
-        let planned = sequence.get(..through);
-        let actual = run.ops.get(..through);
-        if planned.is_none() || planned != actual {
+        if session.trace(through) != baseline.trace(through) {
             return Err(HarnessError::WriterIsNotDeterministic { injection });
         }
-        Ok(run)
+        Ok(session.finish())
     }
 }
 

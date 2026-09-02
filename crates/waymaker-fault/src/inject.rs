@@ -126,8 +126,19 @@ pub enum Progress {
 /// What the interruption looks like to the writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Interruption {
-    /// The power went away. The call returns an error and so does every call after it;
-    /// nothing more reaches media, ever.
+    /// The power went away.
+    ///
+    /// Where the operation ran to completion — [`Progress::Whole`] — the call returns
+    /// `Ok(())` first, because that is what "power lost *after* the operation returned"
+    /// means, and the writer learns at its next storage call or never. Design document §02
+    /// decision 3 is why the difference matters: a writer does `barrier()?` and *then*
+    /// dispatches, so a completed barrier that handed back an error would mean no run ever
+    /// reached the state where an effect is in flight and the power goes.
+    ///
+    /// Where it did not complete, the call returns [`FaultError::PowerLoss`], as does every
+    /// call after it. Either way, nothing more reaches media.
+    ///
+    /// [`FaultError::PowerLoss`]: crate::FaultError::PowerLoss
     PowerLoss,
     /// The call returns an error and the writer carries on. Design document §12's "program
     /// and erase may fail".
@@ -158,8 +169,10 @@ pub struct Injection {
 ///
 /// * `(0, None, PowerLoss)` — the world stopping before the sequence began;
 /// * `(i, Bytes(n), PowerLoss)` for every interior tear point of every operation;
-/// * `(i, Whole, PowerLoss)` for every operation that can change media — which is also
-///   "power loss *before* operation `i + 1`", so the two are one entry rather than two;
+/// * `(i, Whole, PowerLoss)` for every operation that can change media — the operation
+///   completes and returns, the power then goes, and the writer meets it at its next
+///   storage call. That is also "power loss *before* operation `i + 1`", so the two are one
+///   entry rather than two;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
 ///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
 ///   or for an operation that moves no bytes.

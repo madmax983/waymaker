@@ -23,7 +23,8 @@ use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_fault::{
-    Breach, Durability, FaultError, Harness, RecordId, Run, Session, verify_recovery,
+    Breach, Durability, FaultError, Harness, Interruption, Progress, RecordId, Run, Session,
+    verify_recovery,
 };
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -322,6 +323,27 @@ fn no_effect_is_dispatched_without_its_intent_in_recovered_history() {
     assert!(
         dispatched_at_all > 0,
         "no run dispatched anything, so the invariant held vacuously"
+    );
+
+    // And the crash point the invariant is really about is reachable: a run in which the
+    // schedule barrier returned, the effect was dispatched, and the power went before
+    // anything else was written. A `Whole` power loss that handed the writer an error
+    // instead would make this set empty and the sweep would say nothing about §02
+    // decision 3.
+    let dispatched_then_lost = runs
+        .iter()
+        .zip(log.iter())
+        .filter(|(run, dispatched)| {
+            !dispatched.is_empty()
+                && run.injection().is_some_and(|injection| {
+                    injection.interruption == Interruption::PowerLoss
+                        && injection.progress == Progress::Whole
+                })
+        })
+        .count();
+    assert!(
+        dispatched_then_lost > 0,
+        "no run lost power after a dispatch, so the durable-intent sweep is incomplete"
     );
 }
 

@@ -149,8 +149,15 @@ fn power_lost_after_a_barrier_returned_leaves_that_record_acknowledged() {
         run.ledger().state(RecordId(0)),
         Some(Durability::Acknowledged)
     );
-    // The second record never began.
-    assert_eq!(run.ledger().state(RecordId(1)), None);
+    // The barrier returned, so the writer went on and declared the second record. Its write
+    // met a device with no power left, so none of it reached media.
+    assert_eq!(run.ledger().state(RecordId(1)), Some(Durability::Attempted));
+    assert_eq!(run.ops(), [Op::Program { offset: 0, len: 4 }, Op::Barrier]);
+    assert_eq!(
+        verify_recovery(run.ledger(), &[RecordId(0)]),
+        Ok(()),
+        "the acknowledged record is required and the attempted one is not"
+    );
 }
 
 #[test]
