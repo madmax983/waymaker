@@ -31,19 +31,25 @@
 //! settles it against measurements taken on `thumbv6m-none-eabi`. Two of them decide it.
 //!
 //! The polynomial is free. CRC-32C and CRC-32/ISO-HDLC compile to the same 52 bytes and the
-//! same 78 instructions per byte, because this target has no CRC instruction and the
-//! polynomial is an immediate either way. With cost equal, the choice falls to which
-//! algorithm a host can check a device's journal against without reimplementing anything,
-//! and CRC-32/ISO-HDLC is zlib's, gzip's and PNG's.
+//! same instruction stream apart from one literal-pool word, because this target has no CRC
+//! instruction and the polynomial is an immediate either way. With cost equal, the choice
+//! falls to which algorithm a host can check a device's journal against without
+//! reimplementing anything, and CRC-32/ISO-HDLC is zlib's, gzip's and PNG's.
 //!
 //! The table is not free: 64 B of rodata for a nibble table, 1 KiB for a byte table,
 //! against an 8 KiB *total* incremental code-flash budget for the kernel and this adapter
-//! together. What it buys is ~107 cycles per byte down to ~22 or ~16 — which at 48 MHz is
-//! ~54 µs for a 24-byte scheduled-effect record and ~1.14 ms for a full 512-byte page. So
-//! it is not, as this comment previously claimed, a cost nobody can measure; it is a cost
-//! against which §04 states no latency budget at all. Both stay bitwise until a profile of
-//! a real workload says otherwise, and that would be a superseding ADR — the
-//! `integrity-check` gate rule fails a build that adds a table here without one.
+//! together. What it buys is 93 cycles per byte down to 21 or 15. At 48 MHz that is ~60 µs
+//! to seal a scheduled-effect record — 20 bytes under [`crc32`] and 10 under [`crc16`],
+//! since neither seal covers itself — and ~1.0 ms for a full 512-byte page. So it is not,
+//! as this comment once claimed, a cost nobody can measure; it is a cost against which §04
+//! states no latency budget at all. Both stay bitwise until a profile of a real workload
+//! says otherwise, and that would be a superseding ADR — the `integrity-check` gate rule
+//! fails a build that adds a table here, or a local array, without one.
+//!
+//! One property the choice gives up, recorded because it is the only place the two
+//! candidates genuinely differ: ISO-HDLC is primitive, so its Hamming distance falls from 4
+//! to 3 past a dataword of about 11.2 KiB, where CRC-32C's does not. The largest extent
+//! sealed here is a 512-byte page.
 
 /// CRC-16/CCITT-FALSE over `bytes`.
 ///

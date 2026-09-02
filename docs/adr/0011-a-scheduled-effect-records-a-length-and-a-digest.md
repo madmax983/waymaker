@@ -2,6 +2,9 @@
 
 - Status: accepted
 - Date: 2026-09-02
+- Issue: [#16](https://github.com/madmax983/waymaker/issues/16)
+- Supersedes: none
+- Related: [0010](0010-the-integrity-check-is-catalogued-and-table-free.md)
 
 Settles deferred question: `effect-scheduled-metadata`
 
@@ -24,8 +27,8 @@ The record has carried four fields since rung 0.1, and they cost eight bytes of 
 
 On media that is 12 bytes of frame header, 8 of payload and a 4-byte frame CRC: **24 bytes
 per scheduled effect**, before program alignment. A single extra `u32` is 28 bytes — 17%
-more journal, 17% more erase pressure, and 17% less history before `continue_as_new` — for
-the life of the format on every device that ships it.
+more journal and 17% more erase pressure, and so about 14% fewer records in a bank before
+`continue_as_new` — for the life of the format on every device that ships it.
 
 Three constraints bound what the record has to carry.
 

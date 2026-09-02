@@ -52,6 +52,10 @@ number, fill it in, and add a row to the table above.
 - adds an ADR that this index does not link, or links one that does not exist
   (`adr-index`).
 
+A decision that is revisited gets a **new** ADR that names what it supersedes. Editing an
+accepted ADR to say something else turns the record into a snapshot of today's opinion,
+which is the one thing it must never be.
+
 ## Answering a deferred question
 
 Design document §16 leaves five questions open, and
@@ -67,10 +71,6 @@ and the table's row for that id changes from `Open` to `Settled` naming the ADR 
 claim it, and an open question an ADR already answers, each fail a pull request. The marker
 is a line rather than a judgement about the prose, because "this ADR is about the integrity
 check" is a thing a reader concludes and a thing a rule cannot.
-
-A decision that is revisited gets a **new** ADR that names what it supersedes. Editing an
-accepted ADR to say something else turns the record into a snapshot of today's opinion,
-which is the one thing it must never be.
 
 ## See also
 

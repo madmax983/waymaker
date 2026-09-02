@@ -22,6 +22,14 @@ streaming replay cursor, and the §08 transition table that decides at each effe
 whether history answers the workflow's question or the world has to. `waymaker-flash` holds
 the record codec those views are decoded from. Timers and the two timer records are the rest
 of 0.1; the commit seal and the bank swap arrive with 0.2.
+
+Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
+rather than only in the design document. Two are settled: the integrity check
+([ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)) and the
+metadata a scheduled effect records
+([ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md)). The other
+three carry the rung that owns them and the evidence that would close them.
+
 See [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) for the
 full document, and the issue tracker for the build-out.
 

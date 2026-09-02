@@ -2,6 +2,9 @@
 
 - Status: accepted
 - Date: 2026-09-02
+- Issue: [#16](https://github.com/madmax983/waymaker/issues/16)
+- Supersedes: none
+- Related: [0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md), [0011](0011-a-scheduled-effect-records-a-length-and-a-digest.md)
 
 Settles deferred question: `integrity-check-algorithm`
 
@@ -13,16 +16,25 @@ integrity check is CRC32C or a smaller table-free CRC implementation". Issue
 measured code size and cycles per byte".
 
 `waymaker-flash` has been computing two checksums since rung 0.1 — CRC-16/CCITT-FALSE over
-the twelve-byte header, CRC-32/ISO-HDLC over the whole frame — both bitwise, and
+the first ten bytes of the twelve-byte header, CRC-32/ISO-HDLC over the header and payload
+— both bitwise, and
 [ADR 0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md)
 records *why there are two*. It does not record why they are *these* two. That is the gap
 this ADR closes, and it has to close before 1.0: a checksum is part of the wire format, and
 the format freezes there.
 
 §09 states the job: "CRC detects accidental corruption and torn writes; it is not
-authentication." Nothing here needs a cryptographic digest, and nothing here needs the
-error-detection properties of one polynomial over another at the record lengths involved —
-both candidates are degree-32 CRCs with Hamming distance 4 well past a 64 KiB payload.
+authentication." Nothing here needs a cryptographic digest. The two candidates' error detection is *not*
+identical, though, and the difference runs the other way from what one might assume:
+CRC-32C has `(x+1)` as a factor and so detects every odd-weight error out to ~2³¹ bits,
+while CRC-32/ISO-HDLC is primitive and does not — its first undetected 3-bit error is at a
+dataword of 91,607 bits, about **11.2 KiB**, beyond which it drops from Hamming distance 4
+to 3. (Both figures reproduce Koopman's published bounds.) That matters against
+`MAX_FRAME_BYTES`, which is 65,551, and does not matter at the extents this format actually
+checksums: 20 bytes for an `EffectScheduled` record and at most 508 for a scratch page,
+where ISO-HDLC gives HD ≥ 5. The decision below is taken knowing this, and
+["What would revisit this"](#what-would-revisit-this) names it as the one thing that would
+reopen it.
 
 ### The measurement
 
@@ -30,20 +42,32 @@ Four candidates, each compiled as a standalone function for `thumbv6m-none-eabi`
 release profile design document §04 pins (`opt-level = "z"`, `lto = "fat"`,
 `codegen-units = 1`), with `rustc 1.97.1` — the version `rust-toolchain.toml` pins.
 Sizes are `llvm-nm --print-size` on the resulting archive; instruction counts are read off
-`llvm-objdump -d`; cycle counts apply published Cortex-M0+ timings to those instructions
-(ALU 1 cycle, `ldr` 2, taken branch 3, untaken branch 1).
+`llvm-objdump -d`; cycle counts apply the Cortex-M0+ instruction timings in
+[the RP2040 datasheet's Table 81](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf)
+to those instructions — ALU 1 cycle, `ldr`/`ldrb` 2, **taken branch 2**, untaken branch 1.
+The taken-branch figure is worth stating explicitly: 3 is the Cortex-M0/M3 number, and the
+M0+'s two-stage pipeline makes it 2. An earlier draft of this ADR used 3 and inflated every
+cycle figure below by about 13%.
 
 | Candidate | `.text` | `.rodata` | Total | Instructions/byte | Cycles/byte (M0+) |
 | --- | --- | --- | --- | --- | --- |
-| CRC-32/ISO-HDLC, bitwise (**shipped**) | 52 B | 0 B | **52 B** | 78 | ~107 |
-| CRC-32C (Castagnoli), bitwise | 52 B | 0 B | 52 B | 78 | ~107 |
-| CRC-32C, 16-entry nibble table | 52 B | 64 B | 116 B | 17 | ~22 |
-| CRC-32C, 256-entry byte table | 44 B | 1024 B | 1068 B | 12 | ~16 |
-| CRC-16/CCITT-FALSE, bitwise (**shipped**) | 60 B | 0 B | 60 B | 78 | ~107 |
+| CRC-32/ISO-HDLC, bitwise (**shipped**) | 52 B | 0 B | **52 B** | 74–82, mean 78 | **93** |
+| CRC-32C (Castagnoli), bitwise | 52 B | 0 B | 52 B | 74–82, mean 78 | 93 |
+| CRC-32C, 16-entry nibble table | 52 B | 64 B | 116 B | 17 | 21 |
+| CRC-32C, 256-entry byte table | 44 B | 1024 B | 1068 B | 12 | 15 |
+| CRC-16/CCITT-FALSE, bitwise (**shipped**) | 60 B | 0 B | 60 B | 83–91, mean 87 | **102** |
 
-The cycle figures are a static model over the real instruction stream, not a run on
-silicon. They are load-free in the bitwise cases, so the model has little room to be wrong;
-the two table rows depend on flash wait states and are a floor.
+Three things about those numbers. The instruction count for a bitwise loop is
+data-dependent — the polynomial xor is branched over when the bit is clear — so it is a
+range with a mean, not a figure. The **cycle** count is not: at 2 cycles for a taken branch
+the two paths cost the same, so 93 and 102 are exact rather than averaged. And CRC-16 is
+*not* the same loop as CRC-32, which an earlier draft assumed: LLVM tests the top bit with
+`sxth`/`cmp`/`bpl` rather than a shift, one instruction more per bit, which makes the
+16-bit checksum the more expensive of the two per byte.
+
+The figures are a static model over the real instruction stream, not a run on silicon. The
+bitwise rows are load-free, so the model has little room to be wrong; the two table rows
+depend on flash wait states and are a floor.
 
 Two things fall out, and the first is the one that makes the question as §16 asks it the
 wrong question.
@@ -53,27 +77,55 @@ the same 78 instructions per byte. Cortex-M0+ has no CRC instruction, so the pol
 an immediate either way. §16 offers "CRC32C **or** a smaller table-free CRC" as a trade;
 on this target there is no trade, because the table — not the polynomial — is what costs.
 
-**The table is where the decision is.** A nibble table buys 4.9× for 64 B of rodata; a byte
-table buys 6.7× for 1024 B, which is 12.5% of §04's entire 8 KiB incremental code-flash
+**The table is where the decision is.** A nibble table buys 4.4× for 64 B of rodata; a byte
+table buys 6.2× for 1024 B, which is 12.5% of §04's entire 8 KiB incremental code-flash
 budget for the kernel and the flash adapter together.
 
 ### What a checksum actually costs at these speeds
 
 Worth writing down, because the `crc` module previously asserted that a few hundred
 shift-and-xor iterations "cost nothing anybody can measure", and the measurement does not
-support that at the top of the range. At 48 MHz and ~107 cycles per byte:
+support that at the top of the range.
 
-- a 24-byte `EffectScheduled` record: ~2,600 cycles, ~54 µs;
-- a full 512-byte scratch page: ~54,800 cycles, ~1.14 ms.
+The bytes checksummed are not the bytes written, which an earlier draft conflated. A record
+is sealed twice and neither seal covers itself: `frame_crc` covers `HEADER_BYTES +
+payload_len`, and `header_crc` covers `HEADER_BYTES - 2`. So for an `EffectScheduled`
+record that is 20 bytes of CRC-32 and 10 of CRC-16, not the 24 bytes the record occupies.
+At 48 MHz — an ordinary M0+ clock for an RP2040 or SAMD21 class part, and a figure §04
+does not state, so it is an assumption of this ADR rather than a requirement:
+
+- an `EffectScheduled` record — 20 B × 93 + 10 B × 102 — is **2,880 cycles, ~60 µs**;
+- a full 512-byte page — at most 508 B covered, plus the header — is **~48,300 cycles,
+  ~1.0 ms**.
 
 For comparison, a typical SPI NOR page program is quoted at 0.4–0.7 ms and up to 3 ms. So
 the checksum is a small fraction of the barrier it precedes for a small record, and roughly
 the same order as the program itself for a full page. Not free; not dominant.
 
+### Reproducing it
+
+The candidates are five standalone functions, each the loop named in the table over a
+`&[u8]`, compiled as a `staticlib` for the firmware target under the workspace's release
+profile:
+
+```sh
+cargo build --release --target thumbv6m-none-eabi     # with [profile.release] as §04 pins
+llvm-nm --print-size --size-sort --defined-only target/thumbv6m-none-eabi/release/lib*.a
+llvm-objdump -d --triple=thumbv6m-none-eabi target/thumbv6m-none-eabi/release/lib*.a
+```
+
+The bodies are the two in `crates/waymaker-flash/src/crc.rs` plus three variants of them:
+the same reflected loop with `0x82F6_3B78` for CRC-32C, and CRC-32C folded four bits and
+eight bits at a time against a `[u32; 16]` and a `[u32; 256]` generated by the same loop.
+CI does not re-run this — there is no cycles budget for it to gate, which is
+[the point](#what-would-revisit-this) — so these numbers are a dated measurement rather
+than a checked one, and they are stated here precisely enough to be checked by hand.
+
 ## Decision
 
-**The integrity check is CRC-32/ISO-HDLC over the frame and CRC-16/CCITT-FALSE over the
-header, both computed bitwise with no lookup table.** CRC-32C is rejected.
+**The integrity check is CRC-32/ISO-HDLC over the header and payload, and
+CRC-16/CCITT-FALSE over the header's first ten bytes, both computed bitwise with no lookup
+table.** CRC-32C is rejected.
 
 Three reasons, in the order the evidence supports them.
 
@@ -101,11 +153,20 @@ is paid on every record and covers ten bytes.
 
 ### What would revisit this
 
-Not a preference, and not a benchmark of the checksum on its own. A profile of a real
-workload on real flash, against a latency requirement §04 does not currently state, showing
-the checksum on the critical path. If that arrives, the answer is most likely the nibble
-table — 4.9× for 64 B — and it is a **superseding ADR**, not an edit to this one and not a
-quiet commit.
+Two things, and neither is a preference.
+
+A profile of a real workload on real flash, against a latency requirement §04 does not
+currently state, showing the checksum on the critical path. If that arrives the answer is
+most likely the nibble table — 4.4× for 64 B — and it stays CRC-32/ISO-HDLC, because a
+table is an implementation of an algorithm and not a different one.
+
+Or a record whose checksummed extent goes past **11.2 KiB**, where ISO-HDLC's Hamming
+distance falls from 4 to 3 and CRC-32C's does not. Today the largest thing sealed in one go
+is a 512-byte scratch page, two orders of magnitude short of it; `MAX_FRAME_BYTES` is
+65,551 and nothing writes a record near it. A rung that starts to would be choosing between
+CRC-32C and a smaller maximum record, and that is a different decision from this one.
+
+Either is a **superseding ADR**, not an edit to this one and not a quiet commit.
 
 ## Consequences
 
