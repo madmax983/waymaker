@@ -271,8 +271,13 @@ of design document §09 (issue #13). `waymaker-flash` now owns the bytes those v
 decoded from: §09's handwritten, fixed-endian, self-delimiting frame, its two checksums, and
 the append scan that turns a bank into a committed prefix — see
 [ADR 0007](docs/adr/0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md).
+`waymaker-core` also owns the streaming replay cursor of design document §06 and §02
+decision 2 (issue #14): a position that advances through one run's committed history a
+record at a time, refuses an ordering no execution could have produced, and holds no borrow
+of the caller's 512 B scratch page — see
+[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md).
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
-The replay cursor and the transition rules are the rest of rung 0.1; the commit seal and the
-bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
+The §08 transition rules and divergence detection are the rest of rung 0.1; the commit seal
+and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
 before the code they govern, which is the point: a gate retrofitted after coverage has
 slipped is a gate that ratifies the slip.

@@ -175,6 +175,22 @@ pub const TWO_BANK_SWAP_STEPS: &[&str] = &[
     "lazily erase the old bank",
 ];
 
+/// The six steps of cold-start replay, from design document §06.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted: §06 is a
+/// six-step sequence, and a picture with five in it is a picture that has lost one. Steps 3
+/// and 4 name the workflow future, which is rung 0.4's; the drawing carries them anyway,
+/// because a recovery sequence with the polling left out is a sequence that reads as though
+/// history were replayed by something other than the workflow itself.
+pub const COLD_START_STEPS: &[&str] = &[
+    "Recover the active bank",
+    "Decode the run input",
+    "Create a fresh workflow future and replay cursor",
+    "Poll the workflow from its beginning",
+    "Each effect consumes the matching history records",
+    "Stop at pending work or a terminal record",
+];
+
 /// The fields of the record frame, from design document §09.
 ///
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
@@ -227,6 +243,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the record frame",
         required_labels: RECORD_FRAME_FIELDS,
         source_section: "§09 Journal and wire format",
+    },
+    DiagramSpec {
+        id: "cold-start-replay",
+        title: "the six-step cold-start replay sequence",
+        required_labels: COLD_START_STEPS,
+        source_section: "§06 Cold-start replay",
     },
     DiagramSpec {
         id: "two-bank-generations",
@@ -1743,6 +1765,7 @@ mod tests {
     fn the_effect_protocol_has_seven_steps_and_the_swap_has_seven() {
         assert_eq!(EFFECT_PROTOCOL_STEPS.len(), 7);
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
+        assert_eq!(COLD_START_STEPS.len(), 6);
     }
 
     #[test]

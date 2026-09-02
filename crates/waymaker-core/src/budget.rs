@@ -154,7 +154,7 @@ macro_rules! kernel_state_types {
 // rather than the bytes themselves, which is why its size is target-dependent and is
 // budgeted through this registry rather than pinned to a literal beside its declaration.
 kernel_state_types! {
-    crate::id::EffectIdAllocator,
+    crate::replay::ReplayCursor,
     crate::record::RecordRef<'static>,
 }
 

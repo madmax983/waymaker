@@ -201,6 +201,103 @@ fn engine() -> usize {
     core::hint::black_box(show_decode);
 
     kept = kept.wrapping_add(record_codec());
+    kept = kept.wrapping_add(replay_cursor());
+
+    core::hint::black_box(kept)
+}
+
+/// The streaming replay cursor: one run's history walked forwards, record by record.
+///
+/// Split out of [`engine`] for the same reason [`record_codec`] is — it needs a shape of
+/// its own — and because the cursor is the kernel's largest state type, so a row that
+/// charged for it inside another function would make the engine figure harder to read
+/// against `cargo xtask size`'s registry.
+///
+/// Every public function of `waymaker_core::replay` is called here, which is
+/// `size-probe-reach`'s requirement. Both halves of `advance` are linked: a legal record
+/// and one that halts the cursor, so the incremental delta charges for the refusal that
+/// makes recovery stop at a bad record rather than only for the happy path.
+///
+/// There is no scratch page here on purpose. The cursor borrows nothing, so a probe that
+/// declared a page would put the caller's buffer into `.bss` and charge the engine's
+/// runtime-RAM row for memory §04 excludes from it.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn replay_cursor() -> usize {
+    use waymaker_core::replay::{Position, ReplayCursor, Step};
+    use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
+
+    let mut cursor = ReplayCursor::new(RunId(core::hint::black_box(3)));
+    let mut kept = usize::try_from(cursor.run().0).unwrap_or(0);
+    kept = kept.wrapping_add(usize::from(cursor.position().is_terminal()));
+
+    kept = kept.wrapping_add(
+        match cursor.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(Step::RunStarted { input, .. }) => input.len(),
+            Ok(step) => usize::from(matches!(step, Step::RunCompleted { .. })),
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        match cursor.advance(RecordRef::EffectScheduled {
+            seq: core::hint::black_box(EffectSeq::FIRST),
+            kind: ActivityKind(core::hint::black_box(1)),
+            input_len: core::hint::black_box(2),
+            input_crc: core::hint::black_box(9),
+        }) {
+            Ok(Step::EffectScheduled(pending)) => usize::from(pending.kind.0),
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        cursor
+            .pending()
+            .map_or(0, |pending| usize::from(pending.input_len)),
+    );
+    kept = kept.wrapping_add(
+        cursor
+            .next_seq()
+            .map_or(0, |seq| usize::try_from(seq.0).unwrap_or(0)),
+    );
+    // Refused: an effect is unresolved, so a fresh identity would abandon the redelivery.
+    kept = kept.wrapping_add(match cursor.allocate() {
+        Ok(id) => usize::try_from(id.seq.0).unwrap_or(0),
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        match cursor.advance(RecordRef::EffectCompleted {
+            seq: core::hint::black_box(EffectSeq::FIRST),
+            result: core::hint::black_box(b"out"),
+        }) {
+            Ok(Step::EffectCompleted { result, .. }) => result.len(),
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    // The halting path: a record that cannot legally follow, and the sticky refusal after.
+    kept = kept.wrapping_add(
+        match cursor.advance(RecordRef::EffectFailed {
+            seq: core::hint::black_box(EffectSeq::MAX),
+            error: core::hint::black_box(b"no"),
+        }) {
+            Ok(Step::EffectFailed { error, .. }) => error.len(),
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(match cursor.position() {
+        Position::Halted(error) => error.message().len(),
+        Position::BeforeRun
+        | Position::Replaying
+        | Position::AwaitingOutcome
+        | Position::RunCompleted
+        | Position::RunFailed => 0,
+    });
 
     core::hint::black_box(kept)
 }
