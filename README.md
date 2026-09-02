@@ -15,8 +15,10 @@ deterministic workflow durable.**
 
 ## Status
 
-Rung 0.0. The design is settled at draft v0.2 and the three crates exist as `no_std`
-scaffolding with the layering mechanically enforced. No protocol code has been written yet.
+Rung 0.1, in progress. The design is settled at draft v0.2, the three crates exist as
+`no_std` libraries with the layering mechanically enforced, and `waymaker-core` now holds
+effect identity, activity kinds and the error vocabulary. The record codec and the replay
+cursor are the rest of 0.1 and are not written yet.
 See [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) for the
 full document, and the issue tracker for the build-out.
 
@@ -220,7 +222,8 @@ So the row is automatic, a public function the probe stops reaching fails the bu
 feature row measuring nothing is named on every run. The probe's `engine` and `facade`
 functions in
 [`crates/waymaker-size-probe/src/main.rs`](crates/waymaker-size-probe/src/main.rs) are where
-the calls go, and they carry a marker for the rung that fills them in.
+the calls go. `engine` calls the kernel surface that exists; `facade` still carries a marker
+for the rung that fills it in.
 
 The report — absolute sizes, per-section deltas, and each row's cost over the row it is an
 increment on — is written to `target/waymaker-size.json` and uploaded as a CI artifact. On a

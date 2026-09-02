@@ -24,12 +24,18 @@
 //!
 //! # Status
 //!
-//! Rung 0.0: the crate exists so that the layering is enforceable, and it owns the
-//! resource budgets so that the measurement gates have one place to read them from. The
-//! record codec, cursor, and transition rules arrive with rung 0.1.
+//! Rung 0.1 in progress: effect identity, the activity kind vocabulary, the allocator and
+//! the error vocabulary are here; the record codec, cursor and transition rules follow.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod activity;
 pub mod budget;
+pub mod error;
+pub mod id;
+
+pub use activity::{ActivityKind, ActivityName};
+pub use error::{DecodeError, KernelError};
+pub use id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
