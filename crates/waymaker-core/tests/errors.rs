@@ -10,22 +10,55 @@ use core::error::Error;
 
 use waymaker_core::{DecodeError, KernelError};
 
-/// Every `DecodeError`, listed so that a variant added without a message fails this file.
-const DECODE_ERRORS: [DecodeError; 5] = [
-    DecodeError::Truncated,
-    DecodeError::LengthOutOfBounds,
-    DecodeError::UnknownRecordKind,
-    DecodeError::UnsupportedFormatVersion,
-    DecodeError::IntegrityFailed,
+/// Every `DecodeError` beside the exact text it must report.
+///
+/// The text is pinned here, in a second place, on purpose: `message()` and `Display` agree
+/// by construction, so comparing one with the other could not notice two variants whose
+/// strings had been swapped — and a swapped message is a firmware log line naming the wrong
+/// refusal.
+const DECODE_ERRORS: [(DecodeError, &str); 5] = [
+    (
+        DecodeError::Truncated,
+        "the input ended before the frame it claimed",
+    ),
+    (
+        DecodeError::LengthOutOfBounds,
+        "a length field points past its buffer",
+    ),
+    (DecodeError::UnknownRecordKind, "an unknown record kind"),
+    (
+        DecodeError::UnsupportedFormatVersion,
+        "an unsupported record format version",
+    ),
+    (
+        DecodeError::IntegrityFailed,
+        "a seal did not match the bytes it covers",
+    ),
 ];
 
-/// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm.
-const KERNEL_ERRORS: [KernelError; 5] = [
-    KernelError::IdExhausted,
-    KernelError::HistoryNearCapacity,
-    KernelError::NondeterministicWorkflow,
-    KernelError::IncompatibleWorkflow,
-    KernelError::Decode(DecodeError::IntegrityFailed),
+/// Every `KernelError` beside its exact text, with one wrapped decode failure standing for
+/// the `Decode` arm — whose text is the decoder's own, passed through unchanged.
+const KERNEL_ERRORS: [(KernelError, &str); 5] = [
+    (
+        KernelError::IdExhausted,
+        "the run's effect sequence space is spent",
+    ),
+    (
+        KernelError::HistoryNearCapacity,
+        "history has reached its reserved tail",
+    ),
+    (
+        KernelError::NondeterministicWorkflow,
+        "replay diverged from recorded history",
+    ),
+    (
+        KernelError::IncompatibleWorkflow,
+        "this firmware cannot replay this workflow",
+    ),
+    (
+        KernelError::Decode(DecodeError::IntegrityFailed),
+        "a seal did not match the bytes it covers",
+    ),
 ];
 
 #[test]
@@ -33,11 +66,13 @@ fn errors_display_their_message() {
     // `Display` is the message and nothing else: no interpolation, no allocation, no
     // second copy of the wording to drift from the first. `to_string` is available here
     // because integration tests link `std`; the kernel itself never calls it.
-    for error in DECODE_ERRORS {
-        assert_eq!(error.to_string(), error.message(), "{error:?}");
+    for (error, expected) in DECODE_ERRORS {
+        assert_eq!(error.message(), expected, "{error:?}");
+        assert_eq!(error.to_string(), expected, "{error:?}");
     }
-    for error in KERNEL_ERRORS {
-        assert_eq!(error.to_string(), error.message(), "{error:?}");
+    for (error, expected) in KERNEL_ERRORS {
+        assert_eq!(error.message(), expected, "{error:?}");
+        assert_eq!(error.to_string(), expected, "{error:?}");
     }
 }
 
@@ -46,18 +81,18 @@ fn an_error_is_a_core_error() {
     // `core::error::Error` rather than `std::error::Error`: the kernel is `no_std`, and
     // the point of implementing it is that a host adapter can put these in a `Box<dyn
     // Error>` without the kernel knowing that hosts exist.
-    for error in DECODE_ERRORS {
+    for (error, expected) in DECODE_ERRORS {
         let erased: &dyn Error = &error;
         assert!(erased.source().is_none(), "{error:?}");
-        assert_eq!(erased.to_string(), error.message());
+        assert_eq!(erased.to_string(), expected);
     }
-    for error in KERNEL_ERRORS {
+    for (error, expected) in KERNEL_ERRORS {
         let erased: &dyn Error = &error;
         // `Decode` wraps a `DecodeError` but does not report it as a source: the message
         // already passes through, and a source chain the kernel cannot allocate to walk
         // would be a courtesy to nobody.
         assert!(erased.source().is_none(), "{error:?}");
-        assert_eq!(erased.to_string(), error.message());
+        assert_eq!(erased.to_string(), expected);
     }
 }
 
@@ -74,5 +109,10 @@ fn the_error_enums_stay_small() {
     // variants fit in the discriminant values `DecodeError` leaves spare, so `Decode` is
     // free. That is an optimisation rather than a guarantee, which is why the compile-time
     // pin above allows two and only this runtime check insists on one.
-    assert_eq!(core::mem::size_of::<KernelError>(), 1);
+    assert_eq!(
+        core::mem::size_of::<KernelError>(),
+        1,
+        "one byte on the pinned toolchain; a layout change here is a toolchain bump to \
+         review, not a bug"
+    );
 }

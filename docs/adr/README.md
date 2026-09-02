@@ -30,7 +30,7 @@ of these are older than their numbers suggest:
   them as settled precedent. It was written when issue #11 asked for every settled decision
   to have an ADR and this one turned out not to.
 
-In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005.
+In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006.
 
 ## Writing one
 

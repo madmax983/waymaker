@@ -32,8 +32,13 @@ cannot be arithmetic'd past, not a comment saying it will not happen.
 The kernel that holds this has no dependencies —
 [`kernel-is-dependency-free`](0003-the-eight-settled-design-decisions.md#kernel-is-dependency-free) —
 no allocator, no `panic!`, no `unwrap`, no `unsafe`, an 8 KiB incremental code-flash budget
-and 128 B of live kernel state. The design available is therefore types and const assertions,
-which is most of what this decision is.
+and 128 B of live kernel state. That is enforced rather than remembered: `kernel-zero-dependencies`
+fails a build in which `waymaker-core` grows a dependency of any kind, in any table, and
+`member-manifest` fails one in which the kernel's manifest grows a dependency table at all.
+So `thiserror` is not available here, whatever CLAUDE.md says about libraries in general —
+the `Display` and `core::error::Error` impls below are hand-written because the rule that
+keeps the kernel dependency-free leaves no other way to have them. The design available is
+therefore types and const assertions, which is most of what this decision is.
 
 ## Decision
 
@@ -152,9 +157,9 @@ wildcard arm that silently absorbs it.
 Both hand-written `Display` impls and the `From<DecodeError> for KernelError` impl are trait
 methods in a layer crate, which `size-probe-reach` counts (see
 [ADR 0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md)): the probe
-therefore takes a function pointer to `<KernelError as Display>::fmt` and pushes it through
-`black_box`, which retains the impl body for measurement without linking the formatting
-machinery the impl was written to avoid.
+therefore takes a function pointer to each of `<KernelError as Display>::fmt` and
+`<DecodeError as Display>::fmt` and pushes both through `black_box`, which retains the impl
+bodies for measurement without linking the formatting machinery they were written to avoid.
 
 ## Consequences
 
@@ -184,6 +189,13 @@ machinery the impl was written to avoid.
   probe is now a small program rather than a stub, which is what makes the 8 KiB delta a
   measurement of the kernel — and it is also a second place to update whenever the kernel
   gains a function.
+- **The diagnostic text is most of what this rung costs in `.rodata`, and none of it is
+  optional.** `cargo xtask size` measures the engine row at 920 B of flash, 444 B of it
+  `.rodata`, and the error messages are 333 bytes of literal text before the `message()`
+  match arms that point at them. Every image pays for the wording at 0.1, console or no
+  console. An opt-in `diagnostics` feature — `message()` collapsing to the variant name, or
+  to nothing — is the obvious later trim, and is deliberately not this issue's work: 920 B
+  of an 8 KiB budget is a number to record, not yet a problem to solve.
 - **`Display` is deliberately worse than it could be.** The messages are short static
   literals with no context in them: no sequence number in `IdExhausted`, no offset in
   `Truncated`. A caller that wants those has the values in hand at the point it built the
@@ -192,13 +204,15 @@ machinery the impl was written to avoid.
 
 ## Alternatives considered
 
-- **`EffectSeq(NonZeroU32)`.** Genuinely attractive: the niche makes `Option<EffectSeq>` free,
-  so the allocator's exhaustion representation would cost nothing at all, and `0` becomes
-  available as a "no effect" sentinel on the wire. Rejected for now on two grounds — it
-  deviates from the shape the issue and §07 state literally (`pub u32`), and choosing a wire
-  sentinel is `waymaker-flash`'s decision to make, not the kernel's. The `Option<EffectSeq>`
-  in the allocator costs 4 bytes of padding today, and buying a niche with a design constraint
-  on a layer above is the wrong trade at rung 0.1.
+- **`EffectSeq(NonZeroU32)`.** Attractive at first glance: the niche makes `Option<EffectSeq>`
+  four bytes rather than eight, and `0` becomes available as a "no effect" sentinel on the
+  wire. It buys nothing where it was supposed to. `RunId`'s alignment of 8 rounds
+  `EffectIdAllocator` up to 16 B whether the option is four bytes or eight, so the niche is
+  handed straight back as tail padding and the exhaustion representation costs exactly what
+  it costs now. What remains is the wire sentinel, and that is `waymaker-flash`'s decision to
+  make rather than the kernel's — as well as a deviation from the shape the issue and §07
+  state literally (`pub u32`). Buying a niche that pays nothing with a design constraint on
+  the layer above is the wrong trade at rung 0.1.
 - **`{ next: u32, exhausted: bool }`.** Rejected: it can represent a state that must not
   exist. Two fields that must agree are two fields that eventually will not.
 - **A `next()` or `successor_mut()` method on `EffectSeq` that mints the following id.**

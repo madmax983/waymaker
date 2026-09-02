@@ -58,6 +58,11 @@ pub enum DecodeError {
     /// A format version this firmware cannot replay.
     UnsupportedFormatVersion,
     /// A seal or digest did not match its bytes; the check itself lives in the adapter.
+    ///
+    /// A frame whose leading magic does not match is reported here too, rather than through
+    /// a variant of its own: the magic is the cheapest seal a frame carries, and a reader
+    /// that could tell a wrong magic from a failed CRC would learn nothing it could act on.
+    /// Either way the bytes are not the record they claim to be, and the adapter stops.
     IntegrityFailed,
 }
 
@@ -184,7 +189,11 @@ const _: () = assert!(core::mem::size_of::<KernelError>() <= 2);
 mod tests {
     use super::*;
 
-    /// Every `DecodeError`, listed so that a variant added without a message fails here.
+    /// Every `DecodeError`, in declaration order.
+    ///
+    /// A fixed-length array cannot notice a variant that was never put in it, so the list
+    /// is not trusted on its own: `the_variant_lists_are_complete` maps each entry through
+    /// an exhaustive `match` and fails the moment the enum has an arm this array does not.
     const DECODE_ERRORS: [DecodeError; 5] = [
         DecodeError::Truncated,
         DecodeError::LengthOutOfBounds,
@@ -193,7 +202,8 @@ mod tests {
         DecodeError::IntegrityFailed,
     ];
 
-    /// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm.
+    /// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm,
+    /// kept complete the same way as [`DECODE_ERRORS`].
     const KERNEL_ERRORS: [KernelError; 5] = [
         KernelError::IdExhausted,
         KernelError::HistoryNearCapacity,
@@ -204,6 +214,53 @@ mod tests {
 
     /// The longest a message may be, so that it fits a firmware log line whole.
     const MESSAGE_LIMIT: usize = 60;
+
+    /// The position of each `DecodeError` in [`DECODE_ERRORS`], by exhaustive `match`.
+    ///
+    /// Adding a variant without extending the array forces a new arm here, and the only
+    /// index it can be given is one the array does not have.
+    const fn decode_index(error: DecodeError) -> usize {
+        match error {
+            DecodeError::Truncated => 0,
+            DecodeError::LengthOutOfBounds => 1,
+            DecodeError::UnknownRecordKind => 2,
+            DecodeError::UnsupportedFormatVersion => 3,
+            DecodeError::IntegrityFailed => 4,
+        }
+    }
+
+    /// The position of each `KernelError` in [`KERNEL_ERRORS`], by exhaustive `match`.
+    const fn kernel_index(error: KernelError) -> usize {
+        match error {
+            KernelError::IdExhausted => 0,
+            KernelError::HistoryNearCapacity => 1,
+            KernelError::NondeterministicWorkflow => 2,
+            KernelError::IncompatibleWorkflow => 3,
+            KernelError::Decode(_) => 4,
+        }
+    }
+
+    #[test]
+    fn the_variant_lists_are_complete() {
+        // Every index in `0..len` is produced exactly once, in order, which is only
+        // possible when the array lists each variant the `match` knows once. A variant the
+        // enum gains is a compile error in the `match`; an entry the array loses is a
+        // failure here.
+        assert!(
+            DECODE_ERRORS
+                .iter()
+                .copied()
+                .map(decode_index)
+                .eq(0..DECODE_ERRORS.len())
+        );
+        assert!(
+            KERNEL_ERRORS
+                .iter()
+                .copied()
+                .map(kernel_index)
+                .eq(0..KERNEL_ERRORS.len())
+        );
+    }
 
     #[test]
     fn every_message_is_non_empty_and_distinct() {

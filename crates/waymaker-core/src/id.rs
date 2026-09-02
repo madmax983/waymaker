@@ -28,8 +28,8 @@
 //! identity of the run's first effect and replay would resolve it against a recorded
 //! result belonging to something else. §07 settles that as terminal: "Wraparound is a
 //! terminal `IdExhausted` condition, not silent reuse." Here that is a fact about the
-//! representation — an exhausted allocator holds [`None`], and no code path puts a value
-//! back — rather than a comment saying it will not happen. See
+//! representation — an exhausted allocator holds [`None`], and within one allocator no
+//! code path puts a value back — rather than a comment saying it will not happen. See
 //! [ADR 0006](https://github.com/madmax983/waymaker/blob/main/docs/adr/0006-effect-identity-is-newtypes-and-exhaustion-is-terminal.md).
 
 use crate::error::KernelError;
@@ -48,10 +48,12 @@ pub struct RunId(pub u64);
 ///
 /// # Invariants
 ///
-/// Within one run, sequences are issued in strictly increasing order, each at most once,
-/// and they never reset. Both facts are properties of [`EffectIdAllocator`], which is the
-/// only thing that issues them; this type is the value, and the only arithmetic it offers
-/// is [`successor`](Self::successor), which cannot wrap.
+/// None that this type enforces: the field is public, so any `u32` fits in one. "Issued in
+/// strictly increasing order, each at most once, and never reset" is a property of
+/// [`EffectIdAllocator`], which is the only thing that *issues* sequences. Direct
+/// construction stays available for the decoders in `waymaker-flash`, which reconstruct a
+/// sequence already committed to media rather than mint a new one. The only arithmetic
+/// this type offers is [`successor`](Self::successor), which cannot wrap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct EffectSeq(pub u32);
@@ -101,8 +103,9 @@ impl EffectSeq {
 /// # Invariants
 ///
 /// Field order is load-bearing: the derived [`Ord`] is lexicographic in declaration order,
-/// so `run` comes first and two ids from the same run compare by their sequences. A later
-/// run always sorts after an earlier one, whatever sequences either reached.
+/// so `run` comes first. Ids from the same run compare by sequence; ids from different runs
+/// compare by run id, and the kernel does not promise that a run id increases with time, so
+/// the order is total and stable rather than chronological.
 ///
 /// This is 16 bytes for 12 bytes of data — [`RunId`]'s alignment of 8 pulls in four bytes
 /// of tail padding. That is accepted rather than fought: the wire format is written field
@@ -170,7 +173,11 @@ impl EffectIdAllocator {
     /// # Preconditions
     ///
     /// `last_committed` is the highest sequence this run durably committed, or [`None`] if
-    /// it committed nothing.
+    /// it committed nothing. This is the only operation that can move a run's next sequence
+    /// backwards, so it is the one place where "issued at most once" is the caller's
+    /// obligation rather than the allocator's: passing anything but the true highest
+    /// committed sequence reissues identity history already holds, which is the reuse §07
+    /// forbids arriving by the back door.
     ///
     /// # Postconditions
     ///
@@ -220,6 +227,14 @@ impl EffectIdAllocator {
     /// Once [`EffectSeq::MAX`] has been issued the allocator is exhausted for ever: this
     /// returns [`KernelError::IdExhausted`] and keeps doing so, and `peek()` stays
     /// [`None`]. It never wraps back to [`EffectSeq::FIRST`].
+    ///
+    /// An id is minted *before* its schedule record is durable.
+    /// [`durable-intent-before-effect`](https://github.com/madmax983/waymaker/blob/main/docs/adr/0003-the-eight-settled-design-decisions.md#durable-intent-before-effect)
+    /// orders the record before the *effect*, not before the id. So an append that fails
+    /// within one power cycle leaves the sequence spent and a gap in history, and this type
+    /// offers no un-mint: whether a failed schedule is terminal for the run is the cursor's
+    /// decision at rung 0.2. Across a reboot the gap closes by itself, because recovery
+    /// calls [`resume`](Self::resume) with the highest sequence that actually committed.
     ///
     /// # Errors
     ///
@@ -372,11 +387,12 @@ mod tests {
                 Err(KernelError::IdExhausted),
                 "attempt {attempt}"
             );
-            assert_eq!(allocator.peek(), None, "attempt {attempt}");
-            assert_ne!(
+            // `None` is the whole check: a wrapped allocator would hold `Some(FIRST)`
+            // here, and `None` excludes that and every other sequence in one assertion.
+            assert_eq!(
                 allocator.peek(),
-                Some(EffectSeq::FIRST),
-                "attempt {attempt} wrapped to the first sequence"
+                None,
+                "attempt {attempt} left a sequence to issue, so the space wrapped"
             );
             assert_eq!(allocator.run(), RUN, "attempt {attempt}");
         }
@@ -423,11 +439,15 @@ mod tests {
                 committed != u32::MAX,
                 "committed {committed}"
             );
-            assert_eq!(
-                allocator.peek(),
-                EffectSeq(committed).successor(),
-                "committed {committed}"
-            );
+            // Spelled out rather than written as `successor()`, which is what `resume`
+            // itself calls: a test that restates the body under test would pass a joint
+            // mistake in both.
+            let expected = if committed == u32::MAX {
+                None
+            } else {
+                Some(EffectSeq(committed + 1))
+            };
+            assert_eq!(allocator.peek(), expected, "committed {committed}");
         }
     }
 
@@ -448,8 +468,10 @@ mod tests {
 
     #[test]
     fn effect_ids_order_by_run_then_seq() {
-        // The derive reads fields in declaration order, so `run` must stay first. A later
-        // run always sorts after an earlier one, whatever sequences either reached.
+        // The derive reads fields in declaration order, so `run` must stay first: ids from
+        // one run compare by sequence, and ids from different runs compare by run id. Run
+        // id 1 sorts before run id 2 numerically, which is all that is claimed here — the
+        // kernel does not promise a run id increases with time.
         let early_run_last_seq = EffectId {
             run: RunId(1),
             seq: EffectSeq::MAX,

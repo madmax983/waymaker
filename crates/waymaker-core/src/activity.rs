@@ -3,7 +3,7 @@
 //! Design document §13: "Activity names are compile-time metadata for logs and
 //! diagnostics. The runtime dispatch path uses numeric kinds and does not store names in
 //! every record." That is
-//! [`numeric-kinds-and-borrowed-bytes`](https://github.com/madmax983/waymaker/blob/main/docs/adr/0003-the-eight-settled-design-decisions.md)
+//! [`numeric-kinds-and-borrowed-bytes`](https://github.com/madmax983/waymaker/blob/main/docs/adr/0003-the-eight-settled-design-decisions.md#numeric-kinds-and-borrowed-bytes)
 //! applied to activities: a name in every record is flash spent per effect on something
 //! only a developer reads, in a journal whose capacity is the resource the whole design is
 //! careful with.
@@ -31,7 +31,12 @@
 ///
 /// The field is public so that a wire encoder reaches the integer directly; the kernel
 /// grows no accessor for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Not [`Ord`]: the numbers are labels a firmware author picks, so one kind is not less
+/// than another, and a derived ordering would let a call site read meaning into an
+/// arbitrary numbering. [`Hash`] stays, because a dispatcher keying a table on a kind is
+/// asking whether two kinds are the same, which is what [`Eq`] already says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ActivityKind(pub u16);
 
@@ -47,6 +52,9 @@ pub struct ActivityKind(pub u16);
 /// A table is expected to have distinct kinds; [`kinds_are_distinct`](Self::kinds_are_distinct)
 /// is `const` so that a table can prove it at compile time, and
 /// [`activity_kinds!`](crate::activity_kinds) emits exactly that assertion.
+///
+/// The derives stop at `Clone`, `Copy`, `Debug`, `PartialEq` and `Eq`: a table entry is
+/// compared and printed, never hashed or sorted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActivityName {
     /// The number the dispatch path and the journal use.
@@ -77,6 +85,8 @@ impl ActivityName {
     pub const fn lookup(table: &[Self], kind: ActivityKind) -> Option<&'static str> {
         let mut rest = table;
         while let Some((entry, tail)) = rest.split_first() {
+            // The `u16`s rather than the newtypes: derived `PartialEq` is not `const`, so
+            // tidying this to `entry.kind == kind` would not compile in a `const fn`.
             if entry.kind.0 == kind.0 {
                 return Some(entry.name);
             }
@@ -104,6 +114,8 @@ impl ActivityName {
         while let Some((entry, tail)) = rest.split_first() {
             let mut others = tail;
             while let Some((other, next)) = others.split_first() {
+                // Compared as `u16`s for the same reason as in `lookup`: derived
+                // `PartialEq` is not `const`.
                 if entry.kind.0 == other.kind.0 {
                     return false;
                 }
@@ -133,7 +145,10 @@ impl ActivityName {
 /// ```
 ///
 /// The visibility applies to the constants and to the table alike; each kind may carry its
-/// own attributes, which is where its doc comment goes.
+/// own attributes, which is where its doc comment goes. Those attributes are for
+/// documentation and lints: `#[cfg]` on an individual kind is not supported, because the
+/// table below still names the constant the `cfg` removed and the expansion stops
+/// compiling.
 ///
 /// # Examples
 ///
@@ -156,9 +171,13 @@ impl ActivityName {
 /// );
 /// ```
 ///
-/// Every path in the expansion is written `$crate::…`, so the macro works from a crate that
-/// has imported nothing from `waymaker-core` — which is how firmware invokes it, and how
-/// the tests do.
+/// Every path in the expansion is written `$crate::…`, and every macro it invokes is
+/// written `::core::…`, so this works from a crate that has imported nothing from
+/// `waymaker-core` — which is how firmware invokes it, and how the tests do. The leading
+/// `::` is the same precaution [`assert_kernel_state_size!`](crate::assert_kernel_state_size)
+/// takes for `::core::mem::size_of`: an unqualified `assert!`, `concat!` or `stringify!`
+/// resolves at the *call site*, so a firmware crate that shadowed one of them would be
+/// told its table is broken by a macro it did not write.
 #[macro_export]
 macro_rules! activity_kinds {
     (
@@ -171,9 +190,9 @@ macro_rules! activity_kinds {
             $vis const $name: $crate::ActivityKind = $crate::ActivityKind($value);
         )*
 
-        #[doc = concat!(
+        #[doc = ::core::concat!(
             "Every activity kind declared alongside `",
-            stringify!($table),
+            ::core::stringify!($table),
             "`, paired with the name it was declared as.",
         )]
         ///
@@ -183,16 +202,16 @@ macro_rules! activity_kinds {
             $(
                 $crate::ActivityName {
                     kind: $name,
-                    name: stringify!($name),
+                    name: ::core::stringify!($name),
                 }
             ),*
         ];
 
-        const _: () = assert!(
+        const _: () = ::core::assert!(
             $crate::ActivityName::kinds_are_distinct($table),
-            concat!(
+            ::core::concat!(
                 "two activity kinds in `",
-                stringify!($table),
+                ::core::stringify!($table),
                 "` share a number, so a log line would name the wrong activity",
             ),
         );
@@ -310,6 +329,13 @@ mod tests {
         assert_eq!(
             ActivityName::lookup(CLASHING, ActivityKind(8)),
             Some("EIGHT")
+        );
+        // First match is the documented postcondition, and the twins are not adjacent, so
+        // this also pins the scan direction: a lookup that kept going and returned the
+        // last match would answer `SEVEN_AGAIN`.
+        assert_eq!(
+            ActivityName::lookup(CLASHING, ActivityKind(7)),
+            Some("SEVEN")
         );
     }
 
