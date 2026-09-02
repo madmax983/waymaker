@@ -7,7 +7,7 @@
 
 use waymaker_fault::{
     Breach, Durability, Effect, FaultError, Harness, Injection, OneWayBits, Op, Progress, RecordId,
-    Run, verify_recovery,
+    Run, Session, verify_recovery,
 };
 use waymaker_flash::storage::{Geometry, StableStorage};
 
@@ -19,7 +19,7 @@ fn geometry() -> Geometry {
 }
 
 /// Two records, each one program followed by a barrier.
-fn two_records(session: &mut waymaker_fault::Session) -> Result<(), FaultError> {
+fn two_records(session: &mut Session) -> Result<(), FaultError> {
     session.begin_record(RecordId(0));
     session.program(0, &[0xA0, 0xA1, 0xA2, 0xA3])?;
     session.barrier()?;
@@ -440,6 +440,101 @@ fn a_harness_can_be_told_to_report_one_way_bit_violations() {
     assert_eq!(
         clean.ledger().state(RecordId(0)),
         Some(Durability::PossiblyDurable)
+    );
+}
+
+/// Two blocks programmed, then erased in one call — so an erase has an interior.
+fn erase_both_blocks(session: &mut Session) -> Result<(), FaultError> {
+    session.begin_record(RecordId(0));
+    session.program(0, &[0x00; 4])?;
+    session.program(32, &[0x00; 4])?;
+    session.barrier()?;
+    session.begin_record(RecordId(1));
+    session.erase(0, 64)?;
+    session.barrier()
+}
+
+fn erase_run(injection: Injection) -> Run {
+    let Some(run) = Harness::new(geometry())
+        .run(erase_both_blocks)
+        .into_iter()
+        .find(|run| run.injection() == Some(injection))
+    else {
+        unreachable!("{injection:?} is not among the crash points")
+    };
+    run
+}
+
+#[test]
+fn an_interrupted_erase_leaves_whole_blocks_erased_and_the_rest_untouched() {
+    // Design document §12: an erase "may fail or be interrupted at any supported unit",
+    // and the supported unit is the erase block. One of two blocks came back; the other
+    // still holds what was programmed into it.
+    let run = erase_run(Injection {
+        op: 3,
+        progress: Progress::Bytes(32),
+        effect: Effect::PowerLoss,
+    });
+    assert_eq!(run.image().first(), Some(&0xFF));
+    assert_eq!(run.image().get(32), Some(&0x00));
+    // The erase touched media, so the record that issued it is not merely attempted — and
+    // its barrier never returned, so it is not acknowledged either.
+    assert_eq!(
+        run.ledger().state(RecordId(1)),
+        Some(Durability::PossiblyDurable)
+    );
+}
+
+#[test]
+fn a_failed_erase_reports_an_error_after_the_media_has_already_changed() {
+    // The other half of "may fail **or** be interrupted": the call returns an error, the
+    // erase happened anyway, and the writer carries on none the wiser.
+    let run = erase_run(Injection {
+        op: 3,
+        progress: Progress::Whole,
+        effect: Effect::Failure,
+    });
+    assert_eq!(run.image(), &[0xFF; 64][..]);
+    // The writer stopped at the error, so the barrier after the erase was never issued.
+    assert_eq!(
+        run.ops(),
+        [
+            Op::Program { offset: 0, len: 4 },
+            Op::Program { offset: 32, len: 4 },
+            Op::Barrier,
+            Op::Erase { offset: 0, len: 64 },
+        ]
+    );
+    assert_eq!(
+        run.ledger().state(RecordId(1)),
+        Some(Durability::PossiblyDurable)
+    );
+}
+
+#[test]
+fn a_write_torn_at_a_program_unit_boundary_lands_exactly_that_many_bytes() {
+    // "Torn writes at every byte and every program unit" — this is the program-unit half,
+    // asserted on the media rather than only on the enumeration.
+    let unit = geometry().program_size();
+    let runs = Harness::new(geometry()).run(|session| {
+        session.begin_record(RecordId(0));
+        session.program(0, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])?;
+        session.barrier()
+    });
+    let torn = runs
+        .iter()
+        .find(|run| {
+            run.injection()
+                == Some(Injection {
+                    op: 0,
+                    progress: Progress::Bytes(unit),
+                    effect: Effect::PowerLoss,
+                })
+        })
+        .expect("a tear at the program-unit boundary is among the crash points");
+    assert_eq!(
+        torn.image().get(..8),
+        Some(&[0x11, 0x22, 0x33, 0x44, 0xFF, 0xFF, 0xFF, 0xFF][..])
     );
 }
 
