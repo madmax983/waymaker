@@ -18,9 +18,15 @@
 //!
 //! # What this module owns
 //!
-//! The bytes, and only the bytes: the constants above, the two checksums (private, in the
-//! crate's `crc` module), [`encode`], [`decode`] and the append [`Scan`] that walks a
-//! journal.
+//! The bytes, and only the bytes: the constants above, the seal widths, [`encode`],
+//! [`decode`], [`input_digest`] and the append [`Scan`] that walks a journal, each with a
+//! sibling generic over the integrity check.
+//!
+//! It does **not** own the checksums. Which algorithm seals a frame is
+//! [`crate::integrity`]'s, behind the [`IntegrityCheck`] trait, and everything here takes
+//! it as a type parameter defaulted to [`Catalogued`] — see
+//! [ADR 0012](https://github.com/madmax983/waymaker/blob/main/docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md).
+//! The *widths* are still this module's, because they are positions in the frame.
 //! The meaning of a record — what a completion is, which number a kind wears — belongs to
 //! `waymaker-core`, which is why [`RecordKind`] and [`RecordRef`] are imported rather than
 //! declared here.
@@ -76,9 +82,12 @@
 //!
 //! [`StableStorage`]: https://github.com/madmax983/waymaker/blob/main/docs/design/waymaker-design-v0.2.html
 
+use core::marker::PhantomData;
+
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 
-use crate::crc::{crc16, crc32};
+use crate::crc::crc32;
+use crate::integrity::{Catalogued, IntegrityCheck};
 
 /// The two bytes every frame begins with: `0x57 0x4D`, which reads as `WM` on media.
 ///
@@ -95,6 +104,30 @@ pub const HEADER_BYTES: usize = 12;
 
 /// Bytes after the payload: the frame checksum.
 pub const TRAILER_BYTES: usize = 4;
+
+/// Width of `header_crc` on media, in bytes.
+///
+/// Issue [#17](https://github.com/madmax983/waymaker/issues/17) asks for the two seal
+/// widths to be settled as a result of the algorithm choice, and this is the header's.
+/// Sixteen bits rather than thirty-two because it is paid on every record and covers ten
+/// bytes: [ADR 0010](https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+/// gives the reasoning, and
+/// [ADR 0012](https://github.com/madmax983/waymaker/blob/main/docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md)
+/// is what freezes it.
+///
+/// It is the width of [`IntegrityCheck::header_check`]'s return type. The trait's signature
+/// is what fixes that, the `integrity-check` gate rule is what holds the two together — the
+/// return type is not an associated constant and `header_check` is not `const`, so there is
+/// no compile-time link to be had — and the assertions at the foot of this module check that
+/// the frame layout still spends exactly this many bytes on it.
+pub const HEADER_CRC_BYTES: usize = size_of::<u16>();
+
+/// Width of the frame checksum on media, in bytes — §09 names the field `payload_crc`.
+///
+/// Thirty-two bits, over the header *and* the payload. The width is what
+/// [`IntegrityCheck::frame_check`] returns, and it is the whole of [`TRAILER_BYTES`]: a
+/// frame's last four bytes are its seal and nothing else.
+pub const FRAME_CRC_BYTES: usize = size_of::<u32>();
 
 /// Everything in a frame that is not payload.
 pub const FRAME_OVERHEAD_BYTES: usize = HEADER_BYTES + TRAILER_BYTES;
@@ -329,6 +362,29 @@ pub const fn input_digest(input: &[u8]) -> u32 {
     crc32(input)
 }
 
+/// The digest a schedule record carries, under a chosen integrity check.
+///
+/// [`input_digest`] is this at `C = Catalogued`, kept separate because it is a `const fn`
+/// and a trait method cannot be one — a golden digest in a test or a table in firmware
+/// still costs nothing at runtime.
+///
+/// The two must agree, and
+/// [`an_input_digest_is_the_frame_check_of_whatever_seals_the_frame`] is the test that says
+/// so: a build that sealed frames with one check and digested activity inputs with another
+/// would record a digest no replay of it could reproduce, and §08's divergence comparison
+/// would fail on every effect.
+///
+/// # Postconditions
+///
+/// Pure and total, exactly as [`IntegrityCheck::frame_check`] is.
+///
+/// [`an_input_digest_is_the_frame_check_of_whatever_seals_the_frame`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/tests/integrity.rs
+#[must_use]
+#[inline]
+pub fn input_digest_with<C: IntegrityCheck>(input: &[u8]) -> u32 {
+    C::frame_check(input)
+}
+
 /// Bytes `record` occupies once written and padded to `align`.
 ///
 /// This is what a writer reserves before it commits to appending, so that §10's "the
@@ -370,7 +426,34 @@ pub fn encoded_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize,
 /// second case is worth retrying and the first never is — and one call already gives it,
 /// so a second error variant would be a second vocabulary for adapters to translate between
 /// and no more information.
+#[inline]
 pub fn encode(
+    record: &RecordRef<'_>,
+    align: ProgramAlign,
+    out: &mut [u8],
+) -> Result<usize, DecodeError> {
+    encode_with::<Catalogued>(record, align, out)
+}
+
+/// Writes `record` into `out` as a frame sealed with `C`, returning the bytes written.
+///
+/// [`encode`] is this at `C = Catalogued`, which is the check ADR 0010 settled on and the
+/// only one this firmware writes. A `C` that computes different seals writes a journal this
+/// firmware refuses at its first record: swapping to one is a wire-format change, not a
+/// configuration one. A `C` that computes the *same* seals by another route — ADR 0010's
+/// predicted nibble table — writes byte-identical frames, which is why that one would not
+/// be.
+///
+/// # Postconditions
+///
+/// As [`encode`], and additionally: the header's last [`HEADER_CRC_BYTES`] bytes are
+/// `C::header_check` of the ten before them, and the frame's last [`FRAME_CRC_BYTES`] are
+/// `C::frame_check` of everything before them. Nothing else in the frame depends on `C`.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_with<C: IntegrityCheck>(
     record: &RecordRef<'_>,
     align: ProgramAlign,
     out: &mut [u8],
@@ -421,7 +504,7 @@ pub fn encode(
         len_low,
         len_high,
     ];
-    let [crc_low, crc_high] = crc16(&sealed_header).to_le_bytes();
+    let [crc_low, crc_high] = C::header_check(&sealed_header).to_le_bytes();
     let header: [u8; HEADER_BYTES] = [
         magic_low,
         magic_high,
@@ -454,7 +537,7 @@ pub fn encode(
     // `crc32(&[])` — and `crc32` of nothing is a fixed number, so a bug that reached it
     // would produce a frame that looks checksummed rather than one that is refused.
     let sealed = frame.get(..covered).ok_or(DecodeError::LengthOutOfBounds)?;
-    let frame_crc = crc32(sealed);
+    let frame_crc = C::frame_check(sealed);
     for (slot, byte) in frame.iter_mut().skip(covered).zip(frame_crc.to_le_bytes()) {
         *slot = byte;
     }
@@ -492,7 +575,28 @@ pub fn encode(
 /// [`DecodeError::UnknownRecordKind`] is *not* among them: an unrecognised kind on an
 /// otherwise sound frame is [`Decoded::UnknownKind`], because the frame is still
 /// self-delimiting and the decision about skipping it belongs to [`Scan`].
+#[inline]
 pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
+    decode_with::<Catalogued>(bytes)
+}
+
+/// Reads the frame at the front of `bytes`, verifying it against `C`.
+///
+/// [`decode`] is this at `C = Catalogued`. A frame whose seals were computed by a different
+/// algorithm is refused with [`DecodeError::IntegrityFailed`] — at the header when the
+/// header check differs, and at the trailer otherwise — which is what makes a firmware
+/// reflashed with another check refuse an old journal loudly rather than walk it wrong.
+/// "Refused" is a CRC's kind of certainty rather than a proof: a wrong header seal collides
+/// with the right one about once in 2^16, and the frame seal behind it about once in 2^32.
+///
+/// # Postconditions
+///
+/// As [`decode`], with `C::header_check` and `C::frame_check` in place of the shipped pair.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
     // `first_chunk` gives a `&[u8; 12]`, which destructures. Every header field is then
     // named rather than offset-counted, and the read cannot fail once the chunk is in
     // hand — so the only bounds check on this path is the one that decides whether a
@@ -521,7 +625,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
     if u16::from_le_bytes([magic_low, magic_high]) != MAGIC {
         return Err(DecodeError::IntegrityFailed);
     }
-    if crc16(&sealed_header) != u16::from_le_bytes([crc_low, crc_high]) {
+    if C::header_check(&sealed_header) != u16::from_le_bytes([crc_low, crc_high]) {
         return Err(DecodeError::IntegrityFailed);
     }
     // Only now is the length a number the writer wrote rather than a number that was
@@ -544,7 +648,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
     ) else {
         return Err(DecodeError::Truncated);
     };
-    if crc32(sealed) != u32::from_le_bytes(*trailer) {
+    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
         return Err(DecodeError::IntegrityFailed);
     }
 
@@ -797,15 +901,26 @@ impl<'a> Reader<'a> {
 /// A scan is a position, and a copied position is two readers of one journal that each
 /// believe they are the only one. `Clone` stays, because forking a scan deliberately — to
 /// look ahead without losing where you were — is a thing a caller may want to write down.
+///
+/// # Why the integrity check is a type parameter
+///
+/// So that a scan cannot verify with a different check from the one that sealed what it is
+/// walking. The parameter defaults to [`Catalogued`], so `Scan<'_>` is the shipped check
+/// and every existing caller keeps meaning what it meant; a caller that wants another
+/// writes it down at the type, where it is visible in every signature the scan passes
+/// through rather than at one call site.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Scan<'a> {
+pub struct Scan<'a, C: IntegrityCheck = Catalogued> {
     journal: &'a [u8],
     align: ProgramAlign,
     offset: usize,
     stopped: bool,
+    /// The check this scan verifies with. Zero-sized: [`IntegrityCheck`]'s methods take no
+    /// `self`, so there is nothing to carry and the field costs no bytes.
+    check: PhantomData<C>,
 }
 
-impl<'a> Scan<'a> {
+impl<'a> Scan<'a, Catalogued> {
     /// A scan of `journal`, whose frames were padded to `align`.
     ///
     /// `journal` is the bound: this rung has no bank geometry, and a slice is a bound the
@@ -840,12 +955,32 @@ impl<'a> Scan<'a> {
     /// puts the writer's program size in the bank header, which is where a fact about the
     /// media belongs.
     #[must_use]
+    #[inline]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {
+        Self::with_integrity(journal, align)
+    }
+}
+
+impl<'a, C: IntegrityCheck> Scan<'a, C> {
+    /// A scan of `journal` whose frames were sealed with `C` and padded to `align`.
+    ///
+    /// [`new`](Scan::new) is this at `C = Catalogued`. Everything
+    /// [`new`](Scan::new) documents about `journal` and `align` applies here unchanged —
+    /// the slice is the bound, and the alignment must be the one the journal was *written*
+    /// at.
+    ///
+    /// A scan with the wrong `C` does not misread a journal: it stops at the first frame
+    /// with [`DecodeError::IntegrityFailed`], because a seal computed by one algorithm is
+    /// overwhelmingly unlikely to verify under another — see [`decode_with`] for what
+    /// "overwhelmingly" is worth here.
+    #[must_use]
+    pub const fn with_integrity(journal: &'a [u8], align: ProgramAlign) -> Self {
         Self {
             journal,
             align,
             offset: 0,
             stopped: false,
+            check: PhantomData,
         }
     }
 
@@ -868,7 +1003,7 @@ impl<'a> Scan<'a> {
     }
 }
 
-impl<'a> Iterator for Scan<'a> {
+impl<'a, C: IntegrityCheck> Iterator for Scan<'a, C> {
     type Item = Result<RecordRef<'a>, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -905,7 +1040,7 @@ impl<'a> Iterator for Scan<'a> {
             };
         }
 
-        let frame = match decode(rest) {
+        let frame = match decode_with::<C>(rest) {
             Ok(frame) => frame,
             Err(error) => {
                 self.stopped = true;
@@ -956,11 +1091,18 @@ impl<'a> Iterator for Scan<'a> {
     }
 }
 
-impl core::iter::FusedIterator for Scan<'_> {}
+impl<C: IntegrityCheck> core::iter::FusedIterator for Scan<'_, C> {}
 
 // The frame's fixed parts are arithmetic the rest of this module trusts, so they are
 // checked where a mistake in them is a compile error rather than a test run.
 const _: () = assert!(HEADER_BYTES == 12);
+// The seal widths issue #17 asks to be settled, checked against the layout that spends
+// them: the header's last two bytes and the whole of the trailer. A width changed in one
+// place and not the other is a frame whose fields have moved.
+const _: () = assert!(HEADER_CRC_BYTES == 2);
+const _: () = assert!(FRAME_CRC_BYTES == 4);
+const _: () = assert!(TRAILER_BYTES == FRAME_CRC_BYTES);
+const _: () = assert!(HEADER_BYTES == 10 + HEADER_CRC_BYTES);
 const _: () = assert!(FRAME_OVERHEAD_BYTES == 16);
 const _: () = assert!(MAX_FRAME_BYTES == 65_551);
 const _: () = assert!(MAGIC != 0x0000 && MAGIC != 0xFFFF);

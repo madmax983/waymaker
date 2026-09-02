@@ -12,7 +12,9 @@
 //!
 //! # Status
 //!
-//! Rung 0.1 in progress: [`frame`] is the record codec — §09's handwritten, fixed-endian,
+//! Rung 0.1 in progress: [`integrity`] is the seal the codec verifies with — ADR 0010's
+//! catalogued, table-free pair, bound behind a trait so the choice stays swappable and the
+//! widths do not. [`frame`] is the record codec — §09's handwritten, fixed-endian,
 //! self-delimiting, bounds-validated frame, its two checksums, and the append scan that
 //! turns a bank into a committed prefix. The commit seal, the barriers and the bank swap
 //! arrive with rung 0.2; [`frame`]'s documentation says what that leaves deferred and what
@@ -24,5 +26,7 @@
 
 mod crc;
 pub mod frame;
+pub mod integrity;
 
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
+pub use integrity::{Catalogued, IntegrityCheck};

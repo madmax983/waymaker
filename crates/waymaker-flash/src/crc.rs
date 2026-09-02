@@ -8,14 +8,20 @@
 //!
 //! # What this module owns
 //!
-//! Two functions over borrowed bytes. Nothing else: no table, no state, no trait.
+//! Two functions over borrowed bytes. Nothing else: no table, no state, and no trait — the
+//! trait that makes the *choice* of algorithm swappable is [`crate::integrity`]'s, and
+//! keeping it one module away is what leaves this file as two loops a reader can check
+//! against a catalogue.
 //!
 //! # Why they are `pub(crate)` rather than `pub`
 //!
 //! A public function of a layer has an enforced cost — `size-probe-reach` requires the
 //! size probe to call every one of them by name, so public surface is charged for whether
 //! or not anybody uses it. Nothing outside this crate needs to compute a frame's checksum,
-//! so neither function is public and both are exercised through [`crate::frame`].
+//! so neither function is public. Both are reached through
+//! [`Catalogued`](crate::integrity::Catalogued), which is the crate's one binding of a seal
+//! to an algorithm; `crc32` additionally through [`crate::frame::input_digest`], which is a
+//! `const fn` and so cannot go through a trait method.
 //!
 //! Clippy's `redundant_pub_crate` asks for `pub` here, on the reasoning that this module is
 //! private so the two spellings mean the same thing. They do to the compiler and they do

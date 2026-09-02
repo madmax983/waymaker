@@ -590,6 +590,7 @@ fn transition_table() -> usize {
 fn record_codec() -> usize {
     use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
     use waymaker_flash::frame::{self, Decoded, ProgramAlign, Scan};
+    use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 
     let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
         return 0;
@@ -597,6 +598,22 @@ fn record_codec() -> usize {
     let mut kept = usize::from(align.get());
     kept = kept.wrapping_add(
         usize::try_from(frame::input_digest(core::hint::black_box(b"in"))).unwrap_or(0),
+    );
+    // The integrity check's own surface. `Catalogued`'s two methods are what `encode` and
+    // `decode` already reach and what `input_digest` already is, so these three calls add
+    // no body to the image — they name the functions `size-probe-reach` requires to be
+    // named, and the size report is what says the trait costs nothing.
+    kept = kept.wrapping_add(usize::from(Catalogued::header_check(
+        core::hint::black_box(b"in"),
+    )));
+    kept = kept.wrapping_add(
+        usize::try_from(Catalogued::frame_check(core::hint::black_box(b"in"))).unwrap_or(0),
+    );
+    kept = kept.wrapping_add(
+        usize::try_from(frame::input_digest_with::<Catalogued>(
+            core::hint::black_box(b"in"),
+        ))
+        .unwrap_or(0),
     );
     kept = kept.wrapping_add(usize::from(frame::permits_unknown_record_skip(
         core::hint::black_box(1),
@@ -614,15 +631,26 @@ fn record_codec() -> usize {
         Ok(len) => len,
         Err(error) => error.message().len(),
     });
-    let written = match frame::encode(&record, align, &mut page) {
+    let written = match frame::encode_with::<Catalogued>(&record, align, &mut page) {
         Ok(written) => written,
         Err(error) => return kept.wrapping_add(error.message().len()),
     };
     kept = kept.wrapping_add(written);
+    // `encode` is the `Catalogued` instantiation of `encode_with`, so this second call
+    // reaches the same body rather than a second copy of the codec — a second
+    // monomorphisation would show up in the size report as several hundred bytes. Folded
+    // with `unwrap_or` rather than a `match` on the error, because the error path is
+    // already charged for by the call above and charging the probe's own arithmetic twice
+    // is how a delta stops being a measurement of the library.
+    kept = kept.wrapping_add(frame::encode(&record, align, &mut page).unwrap_or(0));
 
     // Both arms of the decode: a record and a frame this firmware cannot interpret. The
     // second is the forward-compatibility branch, and a delta that only charged for the
     // first would understate every future firmware that meets an unknown kind.
+    kept = kept.wrapping_add(
+        frame::decode_with::<Catalogued>(page.get(..written).unwrap_or_default())
+            .map_or(0, |frame| frame.frame_len),
+    );
     kept = kept.wrapping_add(
         match frame::decode(page.get(..written).unwrap_or_default()) {
             Ok(frame) => match frame.decoded {
@@ -635,7 +663,8 @@ fn record_codec() -> usize {
         },
     );
 
-    let mut scan = Scan::new(&page, align);
+    let mut scan = Scan::<Catalogued>::with_integrity(&page, align);
+    kept = kept.wrapping_add(Scan::new(&page, align).offset());
     for step in &mut scan {
         kept = kept.wrapping_add(match step {
             Ok(record) => usize::from(record.kind().0),

@@ -111,7 +111,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -222,7 +222,7 @@ this table is how you find out what a red build is telling you.
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
-| `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
+| `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts: `encode_with` or `decode_with` stops computing a seal through `C::header_check`/`C::frame_check` exactly once, names a checksum function directly, `input_digest` stops calling `crc32` once, or the scan's `next` stops walking with `decode_with` — a trait nothing is obliged to call is a swap point that selects nothing. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
@@ -297,9 +297,21 @@ Stated so that nobody mistakes silence for coverage:
   `effect-scheduled-fields` compares *names*. ADR 0011's actual claim is 24 bytes per
   scheduled effect, and widening an existing field rather than adding one is invisible to
   it; `waymaker-flash`'s frame tests are what hold the layout.
-- **A lookup table outside the checksum module.** `integrity-check` reads
-  `waymaker-flash/src/crc.rs` and nothing else, so a table in a sibling module that `crc.rs`
-  calls is out of its scope.
+- **A lookup table outside the checksum module.** `integrity-check`'s table scan reads
+  `waymaker-flash/src/crc.rs` and the modules it is split into, so a table in a sibling
+  module that `crc.rs` calls is out of its scope.
+- **That a seal a body computes is the seal it stores.** `integrity-check`'s binding and
+  routing halves are scanners, and three rounds of review on pull request #60 spent
+  themselves on the same seam: a scanner cannot resolve a name or trace a value. What they
+  now hold is the *shape* — one unqualified call in a delegation, an unaliased depth-zero
+  import of it, no local definition shadowing it, and an invocation of `C::header_check` /
+  `C::frame_check` whose answer is used where it is computed. What is left uncovered is a
+  named binding read by something other than the expression that stores the seal, and the
+  reason that is tolerable is that it is not silent: `unused_variables` plus `-D warnings`
+  fails CI on a binding nothing reads, which is why an *underscore-prefixed* binding is
+  refused and a plain one is not. `waymaker-flash`'s golden frames and
+  `tests/integrity.rs` are what hold the behaviour; these rules hold what a reviewer can
+  check by eye.
 - **`[lints] workspace = true` in `xtask` and the size probe.** `member-manifest` iterates
   `policy::LAYERS`, so it covers the three firmware crates only.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
@@ -339,6 +351,19 @@ rather than on preference — and the metadata a scheduled effect carries is
 at a sequence, a kind, a length and a digest. Each answer has a rule holding it: a checksum
 that changed polynomial or grew a table fails `integrity-check`, and a fifth field on
 `EffectScheduled` fails `effect-scheduled-fields`.
+Issue #17 then asked ADR 0010's answer to be *held* rather than assumed:
+[ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md)
+puts the two seals behind `waymaker-flash`'s `IntegrityCheck` trait, binds the shipped
+answer to `Catalogued`, and settles the widths as the trait's own return types — sixteen
+bits over the header, thirty-two over the header and payload, which is what §09's frame
+spends. The trait itself costs nothing — 7288 B against 7296 B before, with the probe held still —
+and the `default` row reads 7560 B because `size-probe-reach` makes the probe name both
+entry points and run one codec body twice. The rejected CRC-32C candidate is implemented in
+`waymaker-flash`'s integrity tests, in all three forms ADR 0010 measured, so the rejection is
+a comparison rather than an assertion, and the failure modes §09 names — a write torn at a
+program-unit boundary, a stale erased tail, a partial program that can only clear bits — are
+swept there rather than argued. What a CRC still is not is authentication, and that is a
+passing test too.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The
