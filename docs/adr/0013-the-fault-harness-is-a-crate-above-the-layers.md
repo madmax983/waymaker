@@ -63,19 +63,51 @@ enumeration is a `Vec`; and it has no third-party dependencies, so the workspace
 it is.
 
 **Crash points are a pure function.** `injections(&[Op], Geometry)` takes a recorded write
-sequence and returns the complete list: `(0, None, PowerLoss)`, every interior tear point of
+sequence and returns the complete list *for that sequence*: `(0, None, PowerLoss)`, every interior tear point of
 every operation, `(i, Whole, PowerLoss)` for each operation — which is also "power loss
 before operation `i + 1`", so the two are one entry — and the failure points of each
 operation that can fail after the fact. There is no seed and no sampling budget.
 
+**The enumeration is exact for the fault-free sequence and is not a fixpoint.** `Harness`
+runs the writer once with nothing armed to learn the sequence, then once per crash point.
+Everything before an injection is identical by construction, so each crash point is aimed at
+the operation it names — but an operation a writer performs *only* because a call failed, a
+retry being the obvious one, exists in no fault-free sequence and therefore has no crash
+points of its own. Iterating to a fixpoint over the sequences a reacting writer can produce
+is a larger machine than issue #18 asks for; the limitation is written down here and in
+CLAUDE.md's "What is not checked" rather than left for someone to discover.
+
+**A writer that fails with nothing armed, or that is not a function of the storage it was
+handed, is refused.** `Harness::run` returns a `Result`. A writer that gives up in the
+fault-free run produces a short sequence, a handful of crash points, and a suite in which
+every assertion passes because nothing was checked; a writer carrying state between runs
+aims its crash points at operations that are not there. Both are the shape CLAUDE.md's "a
+measurement that did not happen is not a measurement that passed" is about, so neither is a
+value a caller can ignore.
+
 **A program tears at every byte; an erase is interrupted at erase blocks.** §15 asks for
 "every byte/program unit" for writes, and the unit boundaries are a subset of the byte
 boundaries. No device erases byte by byte, so offering byte granularity there would invent
-failure modes rather than cover them.
+failure modes rather than cover them. The cost is that a *partially erased block* — one
+whose cells were left half-restored and may drift — is not representable at all: an erase is
+modelled as whole blocks back to `0xFF` and an untouched suffix. §09's stale-tail family
+lives partly there, and what the model does cover of it — erased bytes with real frames
+behind them — is swept in `tests/committed_prefix.rs`.
 
 **The three record states are computed as the writer runs, not reconstructed from bytes.**
 `Attempted`, `PossiblyDurable` and `Acknowledged` differ by *when the power went away
-relative to a barrier*, which is not a question an image can answer.
+relative to a barrier*, which is not a question an image can answer. They are the three §15
+names and there is no fourth: *tornness* — part of what a record meant to put on media is
+there and the rest is not — is kept beside the state rather than as a state, because §15
+permits recovery to include "an unacknowledged **complete** record" and complete is the
+load-bearing word. A torn record is `PossiblyDurable`, is never acknowledged by a later
+barrier, and may not be produced by recovery.
+
+Tornness is measured against the media, not the byte count. A frame is padded to the program
+granularity with `0xFF`, and programming `0xFF` over erased media changes nothing, so a
+write interrupted inside its own padding leaves exactly what a completed write would have —
+and calling that torn would fail a recovery that is entirely correct. By the same token a
+write that changed no cell did not start.
 
 **§15's core property oracle is a function**, `verify_recovery`, and it fails closed: a
 recovery that is not a prefix, one that produces a record which never reached media, one
@@ -84,15 +116,25 @@ distinct breaches rather than four ways to pass quietly.
 
 ## Consequences
 
-The harness names no record type, no frame constant and no activity kind. Three unrelated
-writers are driven through it unmodified — `waymaker-flash`'s §09 record codec, §11's
-durable-intent effect shape, and a writer with a byte layout of its own — and rung 0.3 adds
-a fourth by writing a closure, not by editing this crate.
+The harness names no record type, no frame constant and no activity kind. Three writers are
+driven through it unmodified — `waymaker-flash`'s §09 record codec, §11's durable-intent
+effect shape, and a writer with a byte layout of its own — and rung 0.3 adds a fourth by
+writing a closure, not by editing this crate. Two of the three share an `append` helper and
+the same `frame::encode`/`Scan` pair, so what they demonstrate together is that the harness
+is indifferent to the *protocol* rather than to the encoding; the third is what shows it is
+indifferent to the encoding too.
+
+What "reusable by `waymaker-flash`" cannot mean here is a test *in* `waymaker-flash` using
+it. That would be a dependency a layer may not have, so the criterion is met by the harness
+being generic over the writer and by those tests living with the harness. The crate
+documentation says so where a reader will meet it, not only here.
 
 The size probe now links a driver that validates and returns, so the delta charges for the
-geometry arithmetic §12 obliges every port to run and not for a model of media. The
-incremental code-flash figure moves from 7560 B to 8180 B against the 8192 B budget, which
-leaves 12 B. That is a real result and it is reported rather than absorbed: rung 0.2's banks,
+geometry arithmetic §12 obliges every port to run and not for a model of media. That is
+directional rather than exact: of the 620 B the change adds, about 24 B is the probe's own
+driver — measured by replacing it with direct calls to the three validators — and the rest
+is `storage.rs`. The incremental code-flash figure moves from 7560 B to 8180 B against the
+8192 B budget, which leaves 12 B. That is a real result and it is reported rather than absorbed: rung 0.2's banks,
 seals and barriers do not fit, and the budget conversation §04 implies has to happen before
 they are written.
 

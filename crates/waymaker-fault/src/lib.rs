@@ -11,8 +11,10 @@
 //! * [`Device`] — a [`StableStorage`](waymaker_flash::storage::StableStorage) whose bytes
 //!   behave the way NOR flash behaves: erased is `0xFF`, programming can only clear bits,
 //!   and every operation is validated against its geometry before media is touched.
-//! * [`Op`], [`Injection`] and [`injections`] — a write sequence, and the *complete*,
-//!   deterministic list of points at which it can go wrong. Enumerated, never sampled.
+//! * [`Op`], [`Injection`] and [`injections`] — a write sequence, and the complete,
+//!   deterministic list of points at which *that sequence* can go wrong. Enumerated, never
+//!   sampled. It is not a fixpoint: an operation a writer performs only because a call
+//!   failed exists in no fault-free sequence and has no crash points of its own.
 //! * [`Session`] — the storage a writer under test is handed: it records the sequence, it
 //!   carries at most one injection, and after a power loss it is dead.
 //! * [`Ledger`] and [`Durability`] — §15's three record states: merely attempted, possibly
@@ -27,7 +29,12 @@
 //! under test is any closure over any `StableStorage`, and the harness sees offsets and
 //! lengths. `waymaker-flash`'s journal and the effect protocol are two such writers, and
 //! [`tests/`](https://github.com/madmax983/waymaker/tree/main/crates/waymaker-fault/tests)
-//! drives both through it unmodified.
+//! drives both through it unmodified, alongside a third with a byte layout of its own.
+//!
+//! What "reusable" cannot mean is a test *inside* `waymaker-flash` using this crate: that
+//! would be a dependency a layer may not have, in any dependency kind, and the workspace
+//! gate refuses it. The harness is generic over the writer instead, and the tests that drive
+//! it live here.
 //!
 //! # Why it is a crate rather than a module in `waymaker-flash`
 //!

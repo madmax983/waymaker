@@ -34,8 +34,11 @@ crate. Nothing points down into `waymaker-embassy`.
 `waymaker-size-probe` is in the picture because it is a real crate CI links on every pull
 request and on every push to `main`, but it is not a layer: it declares all three as
 *optional* dependencies, so that a variant linking none of them gives the baseline the
-code-flash budget is a delta against, and nothing depends on it. Its edges are dashed for
-that reason, and the gate ignores dashed edges — the contract is the solid ones.
+code-flash budget is a delta against, and nothing depends on it. `waymaker-fault` — the
+in-memory storage model and crash injector — is in it for the same reason: it is a
+workspace member, it depends on `waymaker-flash` for the storage contract, and nothing
+depends on it, in any dependency kind. Both crates' edges are dashed, and the gate ignores
+dashed edges — the contract is the solid ones.
 
 <!-- diagram: crate-dependency-flow -->
 
@@ -45,6 +48,7 @@ graph TD
   waymaker-flash["waymaker-flash<br/>two banks · wire encoding · CRC and seals · compaction"]
   waymaker-core["waymaker-core<br/>records · replay cursor · effect identity · transition rules"]
   waymaker-size-probe["waymaker-size-probe<br/>linked to be measured, never shipped"]
+  waymaker-fault["waymaker-fault<br/>storage model · crash injector · never flashed"]
 
   waymaker-embassy --> waymaker-core
   waymaker-embassy --> waymaker-flash
@@ -53,11 +57,12 @@ graph TD
   waymaker-size-probe -.-> waymaker-embassy
   waymaker-size-probe -.-> waymaker-flash
   waymaker-size-probe -.-> waymaker-core
+  waymaker-fault -.-> waymaker-flash
 
   classDef layer fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef tool fill:#f5f5f5,stroke:#999999,color:#333333;
   class waymaker-embassy,waymaker-flash,waymaker-core layer;
-  class waymaker-size-probe tool;
+  class waymaker-size-probe,waymaker-fault tool;
 ```
 
 What each layer must not own is the other half of the contract, and it lives in

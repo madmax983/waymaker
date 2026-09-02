@@ -2826,6 +2826,9 @@ mod tests {
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
         assert_eq!(COLD_START_STEPS.len(), 6);
         assert_eq!(TRANSITION_TABLE_ROWS.len(), 5);
+        // Four fault families from design document §15 and issue #18's injection list,
+        // plus the three record states the same issue asks the model to distinguish.
+        assert_eq!(CRASH_INJECTION_LABELS.len(), 7);
     }
 
     #[test]

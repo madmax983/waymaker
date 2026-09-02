@@ -277,30 +277,26 @@ fn check_inputs_are_complete(
         }
     }
 
-    for spec in policy::LAYERS {
-        if graph.find(spec.name).is_none() {
+    for member in policy::checked_members() {
+        if graph.find(member).is_none() {
             // Already reported as a missing layer.
             continue;
         }
         if !inputs
             .member_manifests
             .iter()
-            .any(|(name, _)| name == spec.name)
+            .any(|(name, _)| name == member)
         {
             violations.push(Violation::new(
                 "inputs-incomplete",
-                spec.name,
+                member,
                 "the crate is in the workspace but its manifest could not be located, so the manifest rules did not run on it",
             ));
         }
-        if !inputs
-            .crate_sources
-            .iter()
-            .any(|(name, _)| name == spec.name)
-        {
+        if !inputs.crate_sources.iter().any(|(name, _)| name == member) {
             violations.push(Violation::new(
                 "inputs-incomplete",
-                spec.name,
+                member,
                 "the crate is in the workspace but has no library root, so the #![no_std] and unsafe rules did not run on it",
             ));
         }
@@ -348,15 +344,15 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
 
     let mut member_manifests = Vec::new();
     let mut crate_sources = Vec::new();
-    for layer in policy::LAYERS {
-        let Some(package) = graph.find(layer.name) else {
+    for name in policy::checked_members() {
+        let Some(package) = graph.find(name) else {
             continue;
         };
         if let Some(path) = package.manifest_path.as_ref() {
-            member_manifests.push((layer.name.to_owned(), read_to_string(path)?));
+            member_manifests.push((name.to_owned(), read_to_string(path)?));
         }
         if let Some(path) = package.lib_source_path.as_ref() {
-            crate_sources.push((layer.name.to_owned(), read_to_string(path)?));
+            crate_sources.push((name.to_owned(), read_to_string(path)?));
         }
     }
 

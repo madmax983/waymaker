@@ -31,10 +31,16 @@ pub const REQUIRED_INNER_ATTRIBUTES: &[&str] = &["#![no_std]", "#![forbid(unsafe
 /// says which line did it rather than leaving a linker error to be interpreted.
 pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
 
-/// Rule: every firmware crate is `no_std` and forbids unsafe code.
+/// Rule: every firmware crate is `no_std` and forbids unsafe code, and every test-support
+/// crate forbids unsafe code.
 ///
 /// A crate named in [`LAYERS`] but absent from `sources` is not reported here; the graph
 /// rules already report it as a missing layer.
+///
+/// A test-support crate is deliberately held to less: it is host code, so `#![no_std]` and
+/// the `extern crate std` scan would be wrong for it. `#![forbid(unsafe_code)]` is not —
+/// nothing about modelling media in a `Vec<u8>` needs it, and a harness the layers are
+/// tested against is the last place an unreviewed `unsafe` block should be able to appear.
 #[must_use]
 pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -55,14 +61,6 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
             }
         }
 
-        if silences_lint(&attributes, "unsafe_code") {
-            violations.push(Violation::new(
-                "crate-attributes",
-                spec.name,
-                "src/lib.rs allows unsafe code; a documented exception belongs in an ADR",
-            ));
-        }
-
         for name in extern_crates(source.contents) {
             if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
                 violations.push(Violation::new(
@@ -73,6 +71,30 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
                     ),
                 ));
             }
+        }
+    }
+
+    for member in crate::policy::checked_members() {
+        let Some(source) = sources.iter().find(|source| source.name == member) else {
+            continue;
+        };
+        let attributes = inner_attributes(source.contents);
+        if !attributes
+            .iter()
+            .any(|line| line == "#![forbid(unsafe_code)]")
+        {
+            violations.push(Violation::new(
+                "crate-attributes",
+                member,
+                "src/lib.rs is missing `#![forbid(unsafe_code)]`",
+            ));
+        }
+        if silences_lint(&attributes, "unsafe_code") {
+            violations.push(Violation::new(
+                "crate-attributes",
+                member,
+                "src/lib.rs allows unsafe code; a documented exception belongs in an ADR",
+            ));
         }
     }
 
@@ -2901,11 +2923,11 @@ mod tests {
     }
 
     #[test]
-    fn the_two_surface_pins_do_not_read_each_others_module() {
-        // The hazard of one shared body behind two rule ids: a pin pointed at the wrong file
-        // would report the other module's functions and look, from a green build, exactly
-        // like a pin that is working. Each rule is handed only the other's source, and each
-        // has to fail closed rather than find something it can compare.
+    fn no_surface_pin_reads_another_pin_s_module() {
+        // The hazard of one shared body behind three rule ids: a pin pointed at the wrong
+        // file would report another module's functions and look, from a green build,
+        // exactly like a pin that is working. Each rule is handed only the others' sources,
+        // and each has to fail closed rather than find something it can compare.
         let replay_only = vec![crate::size::LayerSource {
             crate_name: "waymaker-core".to_owned(),
             path: format!("crates/{REPLAY_SURFACE_PATH}"),
@@ -2932,6 +2954,29 @@ mod tests {
             "{}",
             missing_replay[0].detail
         );
+
+        // And the third pin, which reads a different crate's module and must not be
+        // satisfied by either of the kernel's.
+        let storage_only = storage_source("");
+        assert!(check_storage_contract(&storage_only).is_empty());
+        for handed in [&replay_only, &transition_only] {
+            let missing_storage = check_storage_contract(handed);
+            assert_eq!(missing_storage.len(), 1);
+            assert_eq!(missing_storage[0].rule, "storage-contract");
+            assert_eq!(missing_storage[0].subject, "waymaker-flash");
+            assert!(
+                missing_storage[0].detail.contains("checking nothing"),
+                "{}",
+                missing_storage[0].detail
+            );
+        }
+        for other in [
+            check_replay_cursor_surface(&storage_only),
+            check_transition_surface(&storage_only),
+        ] {
+            assert_eq!(other.len(), 1);
+            assert!(other[0].detail.contains("checking nothing"), "{other:?}");
+        }
     }
 
     #[test]
@@ -2942,6 +2987,47 @@ mod tests {
             contents: tests_support::clean_transition_surface(),
         }]);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_storage_module() {
+        let violations = check_storage_contract(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: STORAGE_CONTRACT_PATH.replace('/', "\\"),
+            contents: tests_support::clean_storage_contract(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_test_support_crate_must_forbid_unsafe_code_but_need_not_be_no_std() {
+        // The exemption a test-support crate has is narrow and specific: it is host code,
+        // so `#![no_std]` would be wrong for it. `#![forbid(unsafe_code)]` is not — a
+        // harness the layers are tested against is the last place an unreviewed `unsafe`
+        // block should be able to appear.
+        let clean = sources("waymaker-fault", "//! Docs.\n#![forbid(unsafe_code)]\n");
+        assert!(check_crate_attributes(&clean).is_empty());
+
+        let unforbidden = check_crate_attributes(&sources("waymaker-fault", "//! Docs.\n"));
+        assert_eq!(unforbidden.len(), 1);
+        assert_eq!(unforbidden[0].rule, "crate-attributes");
+        assert_eq!(unforbidden[0].subject, "waymaker-fault");
+        assert!(
+            unforbidden[0].detail.contains("forbid(unsafe_code)"),
+            "{}",
+            unforbidden[0].detail
+        );
+
+        let allowed = check_crate_attributes(&sources(
+            "waymaker-fault",
+            "//! Docs.\n#![forbid(unsafe_code)]\n#![allow(unsafe_code)]\n",
+        ));
+        assert!(
+            allowed
+                .iter()
+                .any(|violation| violation.detail.contains("allows unsafe code")),
+            "{allowed:?}"
+        );
     }
 
     #[test]

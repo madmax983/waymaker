@@ -69,7 +69,9 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// Crates that exist to test the layers, and are never linked into firmware.
 ///
 /// Not host tooling — [`HOST_TOOLS`] is the gate itself — and not a measurement crate: a
-/// test-support crate is a library the tests of other crates depend on. `waymaker-fault` is
+/// test-support crate is a library that exists to test the layers, generic over the writer
+/// under test rather than over the crate calling it, and the tests that drive it live with
+/// it. `waymaker-fault` is
 /// the in-memory storage model and crash injector of issue
 /// [#18](https://github.com/madmax983/waymaker/issues/18): it depends on `waymaker-flash`
 /// for design document §12's storage contract, models media in `Vec<u8>`, and is kept out
@@ -96,6 +98,23 @@ pub const EMBASSY_FACADE: &str = "waymaker-embassy";
 /// `waymaker-embassy` matches `waymaker-embassy` exactly rather than by prefix, so the
 /// façade crate is not mistaken for an Embassy crate by the prefix scan.
 pub const EMBASSY_PREFIXES: &[&str] = &["embassy"];
+
+/// Every workspace crate the manifest and crate-root rules apply to.
+///
+/// The three layers plus the test-support crates. Not the size probe, which has
+/// [`crate::size::check_size_probe`] of its own, and not `xtask`, which is the gate.
+///
+/// A rule that iterates [`LAYERS`] alone leaves a test-support crate free to drop
+/// `[lints] workspace = true`, grow a `build.rs`, or set `[lib] test = false` — the last of
+/// which makes a crate report "no coverable lines" and pass the coverage gate. The
+/// exemptions a test-support crate really has are narrow and specific: it is not
+/// `#![no_std]`, and it may use `std`.
+pub fn checked_members() -> impl Iterator<Item = &'static str> {
+    LAYERS
+        .iter()
+        .map(|layer| layer.name)
+        .chain(TEST_SUPPORT_CRATES.iter().copied())
+}
 
 /// Returns the layer specification for `name`, if `name` is one of the firmware crates.
 #[must_use]
@@ -198,6 +217,23 @@ mod tests {
     fn host_tools_are_not_layers() {
         for tool in HOST_TOOLS {
             assert!(layer(tool).is_none(), "{tool} must not also be a layer");
+        }
+    }
+
+    #[test]
+    fn the_checked_members_are_the_layers_and_the_test_support_crates() {
+        let checked: Vec<&str> = checked_members().collect();
+        for spec in LAYERS {
+            assert!(checked.contains(&spec.name), "{} is not checked", spec.name);
+        }
+        for name in TEST_SUPPORT_CRATES {
+            assert!(checked.contains(name), "{name} is not checked");
+        }
+        for name in HOST_TOOLS.iter().chain(MEASUREMENT_CRATES) {
+            assert!(
+                !checked.contains(name),
+                "{name} has rules of its own and is not checked here"
+            );
         }
     }
 

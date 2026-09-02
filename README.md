@@ -20,8 +20,15 @@ Rung 0.1, in progress. The design is settled at draft v0.2, the three crates exi
 effect identity, activity kinds, the error vocabulary, the borrowed record views, the
 streaming replay cursor, and the §08 transition table that decides at each effect boundary
 whether history answers the workflow's question or the world has to. `waymaker-flash` holds
-the record codec those views are decoded from. Timers and the two timer records are the rest
-of 0.1; the commit seal and the bank swap arrive with 0.2.
+the record codec those views are decoded from, and design document §12's storage contract —
+the geometry that decides whether an offset and a length are legal, and the four operations
+and one barrier every port implements. Above the layers, `waymaker-fault` is the in-memory
+storage model and the crash injector: media that starts erased and only clears bits, and the
+complete list of points at which a write sequence can be interrupted — every byte of a
+program, every erase block of an erase, before and after every barrier — enumerated rather
+than sampled, with §15's recovery oracle as a function
+([ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)). Timers and the
+two timer records are the rest of 0.1; the commit seal and the bank swap arrive with 0.2.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check
@@ -41,12 +48,17 @@ full document, and the issue tracker for the build-out.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | Allocation, serialization framework, CRC, clock, storage driver, executor, logging |
-| `waymaker-flash` | Stable wire encoding, CRC/seals, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
+| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | On-media authority or hidden global state |
 
 Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `waymaker-core`.
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
+
+Three workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+firmware linked only so that its section sizes can be measured, and `waymaker-fault` is the
+crash harness. None of them is built for a firmware target, and no layer may depend on any
+of them.
 
 ## Budgets
 
@@ -263,10 +275,10 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
 | `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, nor declared test support |
-| `no-build-scripts` | a firmware crate has a `build.rs` |
-| `empty-default-features` | a firmware crate has a non-empty `default` feature |
-| `crate-attributes` | a crate root drops `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std`/`alloc` |
-| `member-manifest` | a firmware crate stops inheriting the workspace lints, or opts out of its own test binary |
+| `no-build-scripts` | a layer or a test-support crate has a `build.rs` |
+| `empty-default-features` | a layer or a test-support crate has a non-empty `default` feature |
+| `crate-attributes` | a firmware crate root drops `#![no_std]` or declares `extern crate std`/`alloc`, or any crate the layering covers drops `#![forbid(unsafe_code)]` or allows unsafe code |
+| `member-manifest` | a layer or a test-support crate stops inheriting the workspace lints, or opts out of its own test binary |
 | `release-profile` | `[profile.release]` drifts from design document §04 |
 | `cargo-config-profile` | `.cargo/config.toml` declares a profile, an `[env]` table or `[build] rustflags`, or stops aliasing `cargo xtask` to the gate |
 | `workspace-lints` | the lint table stops denying `unwrap_used`, or a lint group loses its negative priority |

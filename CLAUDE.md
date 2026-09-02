@@ -240,10 +240,10 @@ this table is how you find out what a red build is telling you.
 
 | Rule | Fires when |
 | --- | --- |
-| `crate-attributes` | A firmware crate root loses `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std/alloc`. |
-| `empty-default-features` | A firmware crate's `default` feature enables anything, so an optional cost stops being opt-in. |
-| `no-build-scripts` | A firmware crate grows a `build.rs`. |
-| `member-manifest` | A member manifest drops `[lints] workspace = true`, declares a non-empty `default` feature, opts out of its own test binary with `[lib] test = false` — which would make an untested crate report "no coverable lines" and pass the coverage gate — or, for the kernel, grows a dependency table. |
+| `crate-attributes` | A firmware crate root loses `#![no_std]` or `#![forbid(unsafe_code)]` or declares `extern crate std/alloc`; or any crate the layering covers — the three layers and the test-support crates — loses `#![forbid(unsafe_code)]` or allows unsafe code. A test-support crate is host code, so `#![no_std]` is not asked of it; an unreviewed `unsafe` block in the harness the layers are tested against is. |
+| `empty-default-features` | A layer's or a test-support crate's `default` feature enables anything, so an optional cost stops being opt-in. |
+| `no-build-scripts` | A layer or a test-support crate grows a `build.rs`. |
+| `member-manifest` | A layer's or a test-support crate's manifest drops `[lints] workspace = true`, declares a non-empty `default` feature, opts out of its own test binary with `[lib] test = false` — which would make an untested crate report "no coverable lines" and pass the coverage gate — or, for the kernel, grows a dependency table. |
 | `workspace-lints` | The workspace lint table drifts from what this project requires (`manifest::REQUIRED_CLIPPY_GROUPS` and `REQUIRED_CLIPPY_DENIALS`). The design document says nothing about lints; only the release profile comes from §04. |
 | `release-profile` | `[profile.release]` drifts from the size settings the budgets are measured against. |
 | `cargo-config-profile` | `.cargo/config.toml` is missing, rewrites the `xtask` alias or the profile, declares an `[env]` key, or sets `[build] rustflags` — each of which turns a gate into a command that exits zero. |
@@ -323,8 +323,20 @@ Stated so that nobody mistakes silence for coverage:
   refused and a plain one is not. `waymaker-flash`'s golden frames and
   `tests/integrity.rs` are what hold the behaviour; these rules hold what a reviewer can
   check by eye.
-- **`[lints] workspace = true` in `xtask` and the size probe.** `member-manifest` iterates
-  `policy::LAYERS`, so it covers the three firmware crates only.
+- **`[lints] workspace = true` in `xtask` and the size probe.** The manifest and crate-root
+  rules iterate `policy::checked_members` — the three layers plus the test-support crates —
+  so those two are outside them. The size probe has `size-probe` of its own; `xtask` is the
+  gate.
+- **A host convenience added to the storage contract from another file.** `storage-contract`
+  pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
+  in a sibling module adds a method to every port's type with the rule silent, the same way
+  `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **Crash points of operations that exist only after an injected failure.** `injections` is
+  computed from the *fault-free* write sequence, so a retry a writer performs only because a
+  call failed has no crash points of its own — it is never torn, interrupted or power-lost
+  in any run. Everything before the injection point is identical by construction, which is
+  what makes the enumeration exact for that sequence; it is not a fixpoint over the
+  sequences a reacting writer can produce.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
@@ -368,8 +380,11 @@ puts the two seals behind `waymaker-flash`'s `IntegrityCheck` trait, binds the s
 answer to `Catalogued`, and settles the widths as the trait's own return types — sixteen
 bits over the header, thirty-two over the header and payload, which is what §09's frame
 spends. The trait itself costs nothing — 7288 B against 7296 B before, with the probe held still —
-and the `default` row reads 7560 B because `size-probe-reach` makes the probe name both
-entry points and run one codec body twice. The rejected CRC-32C candidate is implemented in
+and the `default` row reads 8180 B of the 8192 B budget, because `size-probe-reach` makes
+the probe name every entry point, run one codec body twice, and link a driver that goes
+through §12's three validators. Twelve bytes of headroom is a real result, and
+[ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md) says so rather
+than absorbing it: rung 0.2's banks, seals and barriers do not fit in it. The rejected CRC-32C candidate is implemented in
 `waymaker-flash`'s integrity tests, in all three forms ADR 0010 measured, so the rejection is
 a comparison rather than an assertion, and the failure modes §09 names — a write torn at a
 program-unit boundary, a stale erased tail, a partial program that can only clear bits — are

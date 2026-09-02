@@ -73,6 +73,10 @@ impl Session {
 
     /// Declares that the operations from here on belong to `id`.
     ///
+    /// Operations issued *before* the first call belong to no record and are invisible to
+    /// the [`Ledger`] — a bank prepared, a scratch page cleared. That is deliberate: a
+    /// record is what recovery has to account for, and setup is not one.
+    ///
     /// # Preconditions
     ///
     /// `id` is distinct within one run. A repeated id is not rejected here — there is
@@ -412,6 +416,7 @@ impl Harness {
     /// On success, `result[0].injection().is_none()`, and `result[1..]` carries exactly
     /// `injections(result[0].ops(), geometry)`, in that order — so the number of runs is a
     /// fact about the write sequence rather than a sampling budget.
+    #[must_use = "running the whole enumeration and dropping it measures nothing"]
     pub fn run<W, E>(&self, mut writer: W) -> Result<Vec<Run>, HarnessError>
     where
         W: FnMut(&mut Session) -> Result<(), E>,
@@ -440,6 +445,7 @@ impl Harness {
     /// sequence, or one the writer did not reach — is reported as
     /// [`HarnessError::WriterIsNotDeterministic`], because against a deterministic writer
     /// that is the only way it can happen.
+    #[must_use = "the run is the result"]
     pub fn run_one<W, E>(&self, injection: Injection, mut writer: W) -> Result<Run, HarnessError>
     where
         W: FnMut(&mut Session) -> Result<(), E>,

@@ -21,6 +21,14 @@
 //! runs, ever. [`Interruption::Failure`] asks "what does the writer do when this call returns an
 //! error" — the media may already have changed, and the writer carries on. Design document
 //! §12 requires both: `program` and `erase` "may fail **or** be interrupted".
+//!
+//! # None of these enums is `#[non_exhaustive]`
+//!
+//! For the reason [`waymaker_core::DecodeError`] is not, and this crate follows the
+//! workspace: every match on them is in this workspace, and an exhaustive match is how the
+//! compiler tells whoever adds a variant which call sites now have a case to think about.
+//! `#[non_exhaustive]` would replace that list with a wildcard arm that silently absorbs it
+//! — which, for a harness whose whole job is to enumerate, is the wrong default twice over.
 
 use waymaker_flash::storage::Geometry;
 
@@ -105,6 +113,11 @@ pub enum Progress {
     /// None of it. The operation is interrupted before it touches anything.
     None,
     /// The first `n` bytes of it, where `0 < n < len`.
+    ///
+    /// [`injections`] never produces an `n` outside that range. A hand-built one passed to
+    /// [`Harness::run_one`](crate::Harness::run_one) is clamped rather than refused: zero
+    /// means [`None`](Self::None) and anything at or past the length means
+    /// [`Whole`](Self::Whole), which are the worlds those values describe.
     Bytes(u32),
     /// All of it.
     Whole,
@@ -124,7 +137,11 @@ pub enum Interruption {
 /// One crash point: which operation, how far into it, and what the writer sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Injection {
-    /// Index into the recorded write sequence.
+    /// The operation this happens to, as an index into the recorded write sequence.
+    ///
+    /// For the one crash point that precedes the whole sequence — `(0, None, PowerLoss)` —
+    /// this is zero and indexes nothing, because "before operation zero" and "before an
+    /// empty sequence" are the same world.
     pub op: usize,
     /// How much of that operation reached media before the interruption.
     pub progress: Progress,

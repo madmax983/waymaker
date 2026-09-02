@@ -9,8 +9,9 @@ repository.workspace = true
 authors.workspace = true
 categories = ["development-tools::testing"]
 keywords = ["durable", "workflow", "fault-injection", "testing"]
-# Test support, not a shipped library. It exists to be depended on by the tests of the
-# crates below it, and by nothing that is ever flashed.
+# Test support, not a shipped library. It sits above the layers: it depends on
+# `waymaker-flash` for the storage contract, and no layer may depend on it in any dependency
+# kind — the tests that drive it live here, with it. Nothing that is ever flashed sees it.
 publish = false
 
 [dependencies]

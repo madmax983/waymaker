@@ -5,11 +5,13 @@
 //! returned. Recovery may include an unacknowledged complete record, but it may never lose
 //! an acknowledged one."
 
+use std::cell::{Cell, RefCell};
+
 use waymaker_fault::{
-    Breach, Durability, FaultError, Harness, HarnessError, Injection, Interruption, OneWayBits, Op,
-    Progress, RecordId, Run, Session, verify_recovery,
+    Breach, Durability, FaultError, Harness, HarnessError, Injection, Interruption, Ledger,
+    OneWayBits, Op, Progress, RecordId, Run, Session, verify_recovery,
 };
-use waymaker_flash::storage::{Geometry, StableStorage};
+use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 fn geometry() -> Geometry {
     let Ok(geometry) = Geometry::new(64, 32, 4, 1) else {
@@ -415,33 +417,170 @@ fn a_session_answers_for_the_device_it_is_driving() {
 fn a_session_read_after_power_loss_reports_power_loss_rather_than_bytes() {
     // A reader that could still see the device has power. Without this, a writer that
     // verified its own writes would read the pre-crash image and conclude the write landed.
+    //
+    // Asserted on one named crash point rather than under an `if` on the value being
+    // tested: an assertion guarded by its own subject is one a wrong answer switches off.
+    let seen = RefCell::new(Vec::new());
+    let read_back = Cell::new([0_u8; 4]);
+    let torn = Harness::new(geometry())
+        .run_one(
+            Injection {
+                op: 0,
+                progress: Progress::Bytes(2),
+                interruption: Interruption::PowerLoss,
+            },
+            |session| {
+                seen.borrow_mut().clear();
+                session.begin_record(RecordId(0));
+                seen.borrow_mut().push(session.program(0, &[0x00; 4]));
+                let mut page = [0xAA_u8; 4];
+                seen.borrow_mut().push(session.read(0, &mut page));
+                seen.borrow_mut().push(session.barrier());
+                read_back.set(page);
+                Ok::<(), FaultError>(())
+            },
+        )
+        .expect("the writer succeeds with no faults armed");
+
+    assert_eq!(
+        seen.into_inner(),
+        [
+            Err(FaultError::PowerLoss),
+            Err(FaultError::PowerLoss),
+            Err(FaultError::PowerLoss),
+        ]
+    );
+    // The caller's buffer was left exactly as it was handed over.
+    assert_eq!(read_back.get(), [0xAA; 4]);
+    // Only the program is an operation: nothing after the power loss happened.
+    assert_eq!(torn.ops(), [Op::Program { offset: 0, len: 4 }]);
+    assert_eq!(torn.image().get(..4), Some(&[0x00, 0x00, 0xFF, 0xFF][..]));
+}
+
+#[test]
+fn a_session_refuses_an_operation_the_geometry_forbids_without_recording_it() {
+    // A refused call never reached media, so it is not an operation a crash point can be
+    // inside — and if it were recorded, every injection index after it would be aimed one
+    // operation late.
+    let refusals = RefCell::new(Vec::new());
     let runs = drive(|session| {
+        refusals.borrow_mut().clear();
         session.begin_record(RecordId(0));
-        let written = session.program(0, &[0x00; 4]);
-        let mut page = [0xAA_u8; 4];
-        let seen = session.read(0, &mut page);
-        if written == Err(FaultError::PowerLoss) {
-            assert_eq!(seen, Err(FaultError::PowerLoss));
-        }
-        match (written, seen) {
-            (_, Err(error)) | (Err(error), _) => Err(error),
-            _ => Ok(()),
-        }
+        refusals.borrow_mut().push(session.program(1, &[0x00; 4]));
+        refusals.borrow_mut().push(session.program(0, &[0x00; 3]));
+        refusals.borrow_mut().push(session.erase(0, 4));
+        refusals.borrow_mut().push(session.erase(64, 32));
+        session.program(0, &[0x00; 4])?;
+        session.barrier()
     });
 
-    let torn = runs
-        .iter()
-        .find(|run| {
-            run.injection()
-                == Some(Injection {
-                    op: 0,
-                    progress: Progress::Bytes(2),
-                    interruption: Interruption::PowerLoss,
-                })
-        })
-        .expect("a torn first write is among the crash points");
-    // The read is not recorded as an operation, because it never happened.
-    assert_eq!(torn.ops(), [Op::Program { offset: 0, len: 4 }]);
+    assert_eq!(
+        refusals.into_inner(),
+        [
+            Err(FaultError::Geometry(GeometryError::MisalignedOffset)),
+            Err(FaultError::Geometry(GeometryError::MisalignedLength)),
+            Err(FaultError::Geometry(GeometryError::MisalignedLength)),
+            Err(FaultError::Geometry(GeometryError::OutOfBounds)),
+        ]
+    );
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(
+        clean.ops(),
+        [Op::Program { offset: 0, len: 4 }, Op::Barrier],
+        "four refused calls are not four operations"
+    );
+    // And none of them touched media: only the one legal write is there.
+    assert_eq!(
+        clean.image().get(..8),
+        Some(&[0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF][..])
+    );
+}
+
+#[test]
+fn a_barrier_that_did_not_complete_acknowledges_nothing_even_under_power_loss() {
+    // `injections` only ever offers a barrier's `Whole` under power loss, because "before
+    // the barrier" is the previous operation's `Whole`. `run_one` can still be handed the
+    // other one, and the answer has to be the conservative one: a barrier the power cut
+    // short established no ordering.
+    let run = Harness::new(geometry())
+        .run_one(
+            Injection {
+                op: 1,
+                progress: Progress::None,
+                interruption: Interruption::PowerLoss,
+            },
+            |session| {
+                session.begin_record(RecordId(0));
+                session.program(0, &[0x00; 4])?;
+                session.barrier()
+            },
+        )
+        .expect("the writer succeeds with no faults armed");
+    assert_eq!(
+        run.ledger().state(RecordId(0)),
+        Some(Durability::PossiblyDurable)
+    );
+    assert_eq!(verify_recovery(run.ledger(), &[]), Ok(()));
+}
+
+#[test]
+fn a_writer_that_is_not_a_function_of_its_storage_is_refused() {
+    // The enumeration is taken from the fault-free run, so a writer carrying state between
+    // runs aims its crash points at operations that are not there. It is the failure that
+    // would quietly hollow out every suite built on this one, so it is an error rather
+    // than a result.
+    let calls = Cell::new(0_u32);
+    let outcome = Harness::new(geometry()).run(|session| {
+        let call = calls.get();
+        calls.set(call.wrapping_add(1));
+        session.begin_record(RecordId(0));
+        if call % 2 == 0 {
+            session.program(0, &[0x00; 4])?;
+        }
+        session.program(4, &[0x00; 4])?;
+        session.barrier()
+    });
+    assert!(
+        matches!(outcome, Err(HarnessError::WriterIsNotDeterministic { .. })),
+        "{:?}",
+        outcome.map(|runs| runs.len())
+    );
+}
+
+#[test]
+fn an_erase_is_recorded_at_the_offset_it_was_issued_at() {
+    let runs = drive(|session| {
+        session.begin_record(RecordId(0));
+        session.erase(32, 32)?;
+        session.barrier()
+    });
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(
+        clean.ops(),
+        [
+            Op::Erase {
+                offset: 32,
+                len: 32
+            },
+            Op::Barrier
+        ]
+    );
+}
+
+#[test]
+fn a_session_reports_which_crash_point_is_armed() {
+    let armed = RefCell::new(Vec::new());
+    let runs = drive(|session| {
+        armed.borrow_mut().push(session.injection());
+        session.begin_record(RecordId(0));
+        session.program(0, &[0x00; 4])?;
+        session.barrier()
+    });
+    let reported = armed.into_inner();
+    let carried: Vec<Option<Injection>> = runs.iter().map(Run::injection).collect();
+    assert_eq!(reported, carried);
+    assert_eq!(reported.first(), Some(&None));
+    assert!(reported.iter().skip(1).all(Option::is_some));
 }
 
 #[test]
@@ -759,6 +898,76 @@ fn a_write_torn_at_a_program_unit_boundary_lands_exactly_that_many_bytes() {
         torn.image().get(..8),
         Some(&[0x11, 0x22, 0x33, 0x44, 0xFF, 0xFF, 0xFF, 0xFF][..])
     );
+}
+
+#[test]
+fn the_oracle_reports_the_most_specific_diagnosis_when_two_are_true_at_once() {
+    // The doc promises "the first the checks below find, in the order they are written".
+    // A ledger with an unrecoverable record recovered *and* an acknowledged one lost trips
+    // two checks; the useful sentence is the one about the record that was invented.
+    let ledger = Ledger::new(vec![
+        (RecordId(0), Durability::Acknowledged, false),
+        (RecordId(1), Durability::Attempted, false),
+    ]);
+    assert_eq!(
+        verify_recovery(&ledger, &[RecordId(1)]),
+        Err(Breach::RecoveredWhatWasNeverAttempted {
+            record: RecordId(1)
+        })
+    );
+}
+
+#[test]
+fn a_ledger_reports_the_first_of_two_records_that_share_an_id() {
+    let ledger = Ledger::new(vec![
+        (RecordId(4), Durability::Attempted, false),
+        (RecordId(4), Durability::Acknowledged, false),
+    ]);
+    assert_eq!(ledger.state(RecordId(4)), Some(Durability::Attempted));
+    assert_eq!(ledger.torn(RecordId(4)), Some(false));
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(
+        verify_recovery(&ledger, &[]),
+        Err(Breach::DuplicateRecordId {
+            record: RecordId(4)
+        })
+    );
+}
+
+#[test]
+fn a_prefix_breach_says_what_history_has_where_recovery_disagreed() {
+    // The `Some(expected)` arm of `NotAPrefix`'s message, which the round-trip through a
+    // harness run never reaches: it needs a recovery that is wrong rather than short.
+    let ledger = Ledger::new(vec![
+        (RecordId(0), Durability::Acknowledged, false),
+        (RecordId(1), Durability::PossiblyDurable, false),
+    ]);
+    let breach = verify_recovery(&ledger, &[RecordId(1)]);
+    assert_eq!(
+        breach,
+        Err(Breach::NotAPrefix {
+            position: 0,
+            expected: Some(RecordId(0)),
+            found: RecordId(1),
+        })
+    );
+    let Err(breach) = breach else {
+        unreachable!("just asserted to be an error")
+    };
+    assert!(
+        breach.to_string().contains("where history has record 0"),
+        "{breach}"
+    );
+}
+
+#[test]
+fn an_empty_ledger_is_empty_and_requires_nothing() {
+    let ledger = Ledger::default();
+    assert!(ledger.is_empty());
+    assert_eq!(ledger.len(), 0);
+    assert_eq!(ledger.state(RecordId(0)), None);
+    assert_eq!(ledger.torn(RecordId(0)), None);
+    assert_eq!(verify_recovery(&ledger, &[]), Ok(()));
 }
 
 fn one_run(injection: Injection) -> Run {

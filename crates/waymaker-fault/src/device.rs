@@ -110,6 +110,22 @@ impl Device {
         }
     }
 
+    /// A device holding `image`, as a reset would find it.
+    ///
+    /// `None` if `image` is not exactly `geometry.capacity()` bytes: a device that is not
+    /// the size it says it is would let a caller read past the end of the one it modelled.
+    /// This is how a [`crate::Run`]'s image is handed back to code that expects a
+    /// [`StableStorage`] — a recovery path expressed against the contract rather than
+    /// against a slice, which is the shape bank selection arrives in.
+    #[must_use]
+    pub fn restored(geometry: Geometry, image: Vec<u8>) -> Option<Self> {
+        (image.len() == geometry.capacity() as usize).then_some(Self {
+            geometry,
+            media: image,
+            bits: OneWayBits::Absorbed,
+        })
+    }
+
     /// The bytes as they stand, which is what a reader after a reset would see.
     #[must_use]
     pub fn image(&self) -> &[u8] {

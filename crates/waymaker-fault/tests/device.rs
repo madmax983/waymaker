@@ -125,6 +125,25 @@ fn a_stale_tail_is_erased_bytes_rather_than_absent_bytes() {
 }
 
 #[test]
+fn a_device_can_be_restored_from_an_image_of_exactly_its_capacity() {
+    let mut written = Device::new(geometry());
+    written.program(0, &[0x5A; 4]).unwrap();
+    let image = written.into_image();
+
+    let mut restored = Device::restored(geometry(), image.clone())
+        .expect("an image of exactly the capacity is a device");
+    assert_eq!(restored.image(), &image[..]);
+    let mut page = [0_u8; 4];
+    restored.read(0, &mut page).unwrap();
+    assert_eq!(page, [0x5A; 4]);
+
+    // A device that is not the size it says it is would let a caller read past the end of
+    // the one it modelled.
+    assert!(Device::restored(geometry(), vec![0xFF; 63]).is_none());
+    assert!(Device::restored(geometry(), vec![0xFF; 65]).is_none());
+}
+
+#[test]
 fn every_fault_error_carries_a_distinct_message() {
     let all = [
         FaultError::Geometry(GeometryError::OutOfBounds),

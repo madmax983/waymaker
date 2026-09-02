@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
+use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_fault::{
     Breach, Durability, FaultError, Harness, RecordId, Run, Session, verify_recovery,
 };
@@ -62,6 +62,57 @@ fn append(session: &mut Session, at: &mut u32, record: &RecordRef<'_>) -> Result
     session.program(*at, bytes)?;
     *at = at.wrapping_add(u32::try_from(written).unwrap_or(u32::MAX));
     Ok(())
+}
+
+#[test]
+fn a_scan_stops_at_a_stale_tail_an_interrupted_erase_left_behind() {
+    // §09's and §15's stale-tail hazard, which is the one fault family a fresh device
+    // cannot show: an erase that came back for one block and not the next leaves erased
+    // bytes with real frames *behind* them. A reader that treated an erased header as the
+    // end of history and stopped counting would report a clean journal and silently drop
+    // everything after the hole.
+    let two_blocks = {
+        let Ok(geometry) = Geometry::new(256, 128, 4, 1) else {
+            unreachable!("256 is two whole 128-byte blocks of 4-byte units")
+        };
+        geometry
+    };
+
+    let runs = match Harness::new(two_blocks).run(|session| {
+        // Fill past the first erase block, so that erasing one leaves frames in the other.
+        let mut at = 0;
+        for seq in 1..=8 {
+            append(
+                session,
+                &mut at,
+                &RecordRef::EffectScheduled {
+                    seq: EffectSeq(seq),
+                    kind: DOWNLOAD,
+                    input_len: 0,
+                    input_crc: 0,
+                },
+            )?;
+        }
+        session.barrier()?;
+        session.erase(0, 128)
+    }) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    };
+
+    let stale = runs
+        .iter()
+        .find(|run| {
+            run.image().first() == Some(&0xFF) && run.image().iter().any(|byte| *byte != 0xFF)
+        })
+        .expect("some crash point erases the first block and leaves the second");
+
+    // The scan meets an erased header with data behind it, and refuses rather than
+    // reporting a clean end of history.
+    let mut scan = Scan::new(stale.image(), align());
+    assert_eq!(scan.next(), Some(Err(DecodeError::IntegrityFailed)));
+    assert_eq!(scan.offset(), 0);
+    assert!(recovered(stale.image()).is_empty());
 }
 
 /// Every run of `writer`, or a loud failure.

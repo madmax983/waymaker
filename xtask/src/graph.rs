@@ -665,12 +665,11 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
     violations
 }
 
-/// Rule: every firmware crate has empty default features.
+/// Rule: every layer and every test-support crate has empty default features.
 #[must_use]
 pub fn check_empty_default_features(graph: &PackageGraph) -> Vec<Violation> {
-    LAYERS
-        .iter()
-        .filter_map(|spec| graph.find(spec.name))
+    policy::checked_members()
+        .filter_map(|name| graph.find(name))
         .filter(|package| !package.default_features.is_empty())
         .map(|package| {
             Violation::new(
@@ -743,22 +742,21 @@ pub fn check_layers_are_local(graph: &PackageGraph) -> Vec<Violation> {
         .collect()
 }
 
-/// Rule: no firmware crate has a build script.
+/// Rule: no layer and no test-support crate has a build script.
 ///
 /// A `build.rs` needs no build-dependencies to run arbitrary host code on every build and
 /// inject `cfg`s and environment into the crate it belongs to. In the kernel that is
 /// hidden global state, which is exactly what the layering contract excludes.
 #[must_use]
 pub fn check_no_build_scripts(graph: &PackageGraph) -> Vec<Violation> {
-    LAYERS
-        .iter()
-        .filter_map(|spec| graph.find(spec.name))
+    policy::checked_members()
+        .filter_map(|name| graph.find(name))
         .filter(|package| package.has_build_script)
         .map(|package| {
             Violation::new(
                 "no-build-scripts",
                 package.name.clone(),
-                "has a build.rs; a firmware crate must not run host code at build time",
+                "has a build.rs; a crate the layering covers must not run host code at build time",
             )
         })
         .collect()
@@ -1388,15 +1386,70 @@ mod tests {
             Package::new("waymaker-flash"),
             Package::new("waymaker-embassy"),
             Package::new("xtask"),
+            Package::new("waymaker-fault"),
         ])
         .with_workspace_members(&[
             "waymaker-core",
             "waymaker-flash",
             "waymaker-embassy",
             "xtask",
+            "waymaker-fault",
         ]);
 
         assert!(check_workspace_membership(&graph).is_empty());
+    }
+
+    #[test]
+    fn a_layer_that_dev_depends_on_a_test_support_crate_is_reported() {
+        // `policy::TEST_SUPPORT_CRATES` says this is still a violation, and the harness
+        // depends on `waymaker-flash`, so the allowance it would need is also a cycle.
+        // Asserted against the rule rather than against the table it reads.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-fault", DepKind::Development),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-fault").with_dependency("waymaker-flash", DepKind::Normal),
+        ]);
+
+        let violations = check_dependency_direction(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "dependency-direction"
+                    && violation.subject == "waymaker-flash"
+                    && violation.detail.contains("waymaker-fault")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_support_crate_with_a_build_script_is_reported() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy"),
+            Package::new("waymaker-fault").with_build_script(),
+        ]);
+        let violations = check_no_build_scripts(&graph);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].subject, "waymaker-fault");
+    }
+
+    #[test]
+    fn a_test_support_crate_with_a_non_empty_default_feature_is_reported() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy"),
+            Package::new("waymaker-fault").with_default_features(&["slow"]),
+        ]);
+        let violations = check_empty_default_features(&graph);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].subject, "waymaker-fault");
     }
 
     #[test]

@@ -75,10 +75,14 @@ fn every_program_unit_boundary_is_among_the_torn_points() {
         })
         .collect();
 
+    // The unit boundaries, named rather than implied: 4, 8 and 12 for a four-byte program
+    // unit. Asserted as their own set so that a change to the geometry which stopped them
+    // being tear points would fail here and not only in the line below.
+    let boundaries: BTreeSet<u32> = (1..4).map(|unit| unit * program_unit).collect();
+    assert_eq!(boundaries, BTreeSet::from([4, 8, 12]));
+    assert!(boundaries.is_subset(&torn));
+    // And every byte, which is the superset §15 asks for.
     assert_eq!(torn, (1..16).collect::<BTreeSet<u32>>());
-    for boundary in (1..4).map(|unit| unit * program_unit) {
-        assert!(torn.contains(&boundary), "missing unit boundary {boundary}");
-    }
 }
 
 #[test]
