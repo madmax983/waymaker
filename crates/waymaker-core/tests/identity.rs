@@ -42,17 +42,31 @@ fn size_and_alignment_of_every_identity_type_is_pinned() {
 }
 
 #[test]
-fn the_allocator_is_registered_kernel_state() {
+fn the_allocator_is_charged_for_through_the_cursor_that_contains_it() {
     // The allocator is live for the whole of a run, so it is kernel state and has to be
-    // charged for. Found by suffix rather than by exact string because the registry
-    // records the type as it is written in the `kernel_state_types!` list, and the path
-    // written there is not this test's business.
-    let entry = budget::KERNEL_STATE_TYPES
+    // charged for — but it is no longer charged for on its own. The replay cursor contains
+    // it, and `kernel_state_types!` sums types that are *independently* live, so
+    // registering both would spend 16 B of a 128 B budget twice. The fold was anticipated
+    // in `budget.rs`; this is the test that it was done as that comment requires, rather
+    // than by adding a row beside the old one.
+    let cursor = budget::KERNEL_STATE_TYPES
         .iter()
-        .find(|entry| entry.name.ends_with("EffectIdAllocator"))
-        .expect("the effect id allocator is live kernel state and must be registered");
+        .find(|entry| entry.name.ends_with("ReplayCursor"))
+        .expect("the replay cursor is live kernel state and must be registered");
 
-    assert_eq!(entry.size, 16, "{} is {} bytes", entry.name, entry.size);
+    assert!(
+        !budget::KERNEL_STATE_TYPES
+            .iter()
+            .any(|entry| entry.name.ends_with("EffectIdAllocator")),
+        "the allocator is registered beside the cursor that contains it, so its bytes are \
+         counted twice"
+    );
+    assert!(
+        cursor.size >= core::mem::size_of::<EffectIdAllocator>(),
+        "the cursor is {} bytes and contains a {} byte allocator",
+        cursor.size,
+        core::mem::size_of::<EffectIdAllocator>()
+    );
 
     let total: usize = budget::KERNEL_STATE_TYPES
         .iter()

@@ -104,8 +104,11 @@ impl DecodeError {
 /// # Invariants
 ///
 /// Every variant is a refusal rather than a retry hint. [`IdExhausted`](Self::IdExhausted)
-/// and the two replay refusals are terminal for the run; §08 is explicit that a replay
-/// mismatch stops rather than guesses.
+/// and the three replay refusals — [`NondeterministicWorkflow`](Self::NondeterministicWorkflow),
+/// [`IncompatibleWorkflow`](Self::IncompatibleWorkflow) and
+/// [`MalformedHistory`](Self::MalformedHistory) — are terminal for the run; §08 is explicit
+/// that a replay mismatch stops rather than guesses, and §09 that recovery stops at the
+/// first record it cannot account for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KernelError {
     /// The run's 32-bit effect sequence space is spent. Terminal for the run: the way out
@@ -120,6 +123,22 @@ pub enum KernelError {
     NondeterministicWorkflow,
     /// This firmware cannot replay the workflow kind and version the bank header pins.
     IncompatibleWorkflow,
+    /// The committed records are not a legal history of any run.
+    ///
+    /// §09 stops recovery at "the first unsealed, malformed, out-of-sequence, or
+    /// integrity-failed frame", and this is the third of those four. It is a fact about
+    /// how records sit *beside each other* rather than about any one frame, so it cannot
+    /// be a [`DecodeError`]: every frame involved decoded perfectly. An outcome with no
+    /// schedule before it, a schedule while an earlier effect is unresolved, an effect
+    /// sequence that skips or repeats, a second `RunStarted`, a record after a terminal
+    /// one — each is history that no execution could have produced.
+    ///
+    /// Distinct from [`NondeterministicWorkflow`](Self::NondeterministicWorkflow), which
+    /// is the *workflow* disagreeing with history that is itself sound. Two different
+    /// faults with two different causes: one is a damaged or forged journal, the other is
+    /// changed code. A firmware log line that could not tell them apart would send an
+    /// engineer to the wrong place.
+    MalformedHistory,
     /// A record could not be decoded within its bounds.
     Decode(DecodeError),
 }
@@ -141,6 +160,7 @@ impl KernelError {
             Self::HistoryNearCapacity => "history has reached its reserved tail",
             Self::NondeterministicWorkflow => "replay diverged from recorded history",
             Self::IncompatibleWorkflow => "this firmware cannot replay this workflow",
+            Self::MalformedHistory => "committed history is not a legal record sequence",
             Self::Decode(error) => error.message(),
         }
     }
@@ -216,11 +236,12 @@ mod tests {
 
     /// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm,
     /// kept complete the same way as [`DECODE_ERRORS`].
-    const KERNEL_ERRORS: [KernelError; 5] = [
+    const KERNEL_ERRORS: [KernelError; 6] = [
         KernelError::IdExhausted,
         KernelError::HistoryNearCapacity,
         KernelError::NondeterministicWorkflow,
         KernelError::IncompatibleWorkflow,
+        KernelError::MalformedHistory,
         KernelError::Decode(DecodeError::IntegrityFailed),
     ];
 
@@ -249,7 +270,8 @@ mod tests {
             KernelError::HistoryNearCapacity => 1,
             KernelError::NondeterministicWorkflow => 2,
             KernelError::IncompatibleWorkflow => 3,
-            KernelError::Decode(_) => 4,
+            KernelError::MalformedHistory => 4,
+            KernelError::Decode(_) => 5,
         }
     }
 

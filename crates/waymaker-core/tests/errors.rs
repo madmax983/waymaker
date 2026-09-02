@@ -42,7 +42,7 @@ const DECODE_ERRORS: [(DecodeError, &str); 6] = [
 
 /// Every `KernelError` beside its exact text, with one wrapped decode failure standing for
 /// the `Decode` arm — whose text is the decoder's own, passed through unchanged.
-const KERNEL_ERRORS: [(KernelError, &str); 5] = [
+const KERNEL_ERRORS: [(KernelError, &str); 6] = [
     (
         KernelError::IdExhausted,
         "the run's effect sequence space is spent",
@@ -54,6 +54,10 @@ const KERNEL_ERRORS: [(KernelError, &str); 5] = [
     (
         KernelError::NondeterministicWorkflow,
         "replay diverged from recorded history",
+    ),
+    (
+        KernelError::MalformedHistory,
+        "committed history is not a legal record sequence",
     ),
     (
         KernelError::IncompatibleWorkflow,

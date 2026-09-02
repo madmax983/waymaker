@@ -1,6 +1,6 @@
 # Architecture
 
-Five diagrams, drawn from the design document. Each carries an HTML comment label that
+Six diagrams, drawn from the design document. Each carries an HTML comment label that
 `cargo xtask check-layering` reads, and each is checked against the table that owns the
 same facts — so a diagram cannot quietly fall behind the code it draws.
 
@@ -9,6 +9,7 @@ same facts — so a diagram cannot quietly fall behind the code it draws.
 | [Crate dependency flow](#crate-dependency-flow) | §05 Architecture | `xtask::policy::LAYERS` |
 | [Durable effect protocol](#durable-effect-protocol) | §07 Durable effect protocol | `xtask::docs::EFFECT_PROTOCOL_STEPS` |
 | [Record frame](#record-frame) | §09 Journal and wire format | `xtask::docs::RECORD_FRAME_FIELDS` |
+| [Cold-start replay](#cold-start-replay) | §06 Cold-start replay | `xtask::docs::COLD_START_STEPS` |
 | [Two-bank swap](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::TWO_BANK_SWAP_STEPS` |
 | [The banks before and after](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::DIAGRAMS` |
 
@@ -176,6 +177,67 @@ Everything after the frame is padding, up to the device's program granularity fr
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
 interpreted: the decoder reports the frame's own length, and the scan is what applies the
 stride.
+
+## Cold-start replay
+
+Design document §06. A workflow is not resumed after a reset; it is **re-created from its
+beginning** and replayed. The future is disposable, and recreating it *is* the recovery
+mechanism — which is why nothing here snapshots a suspended future
+([`no-snapshotted-futures`](../CLAUDE.md#the-invariants)).
+
+The shaded notes hanging off steps 1, 2 and 5 are the seam. The scan turns a bank into a
+committed prefix and belongs to `waymaker-flash`; the cursor decides what each record meant
+for the run and belongs to `waymaker-core`. Between them sits one 512-byte scratch page the
+**caller** owns: a record is decoded into it, handed to the cursor as borrowed bytes, and
+the page is free again the moment the step has been dealt with.
+
+That is what makes replay constant-memory, and it rests on the type rather than on a
+measurement: `ReplayCursor` has no lifetime parameter, so it has nowhere to put a borrow of
+a page that is not `'static`. What *is* checked mechanically is the cursor's exact size —
+`const _: () = assert!(size_of::<ReplayCursor>() == 32)` — which is what catches a cursor
+that grows an inline buffer. A bound would not: the 128-byte kernel-state budget leaves 96
+bytes of room for one.
+
+<!-- diagram: cold-start-replay -->
+
+```mermaid
+flowchart TD
+  s1["1 · Recover the active bank<br/>and its committed record prefix"]
+  s2["2 · Decode the run input<br/>into caller-owned storage"]
+  s3["3 · Create a fresh workflow future and replay cursor"]
+  s4["4 · Poll the workflow from its beginning"]
+  s5["5 · Each effect consumes the matching history records<br/>or identifies the first unresolved effect"]
+  s6["6 · Stop at pending work or a terminal record"]
+
+  s1 --> s2 --> s3 --> s4 --> s5 --> s6
+  s5 -- "more history" --> s4
+
+  page(["one caller-owned 512 B scratch page"])
+  scan(["waymaker-flash · Scan → committed prefix"])
+  cursor(["waymaker-core · ReplayCursor::advance"])
+
+  s1 -.- scan
+  s2 -.- page
+  s5 -.- cursor
+
+  classDef step fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
+  class s1,s2,s3,s4,s5,s6 step;
+  class page,scan,cursor note;
+```
+
+Step 5 is where history stops answering. An effect whose schedule *and* outcome are both
+committed is replayed from the record; an effect whose schedule is committed and whose
+outcome is not is the run's **first unresolved effect**, and it is redelivered under the
+identity it already had — §14's stable redelivery, and the reason `PendingEffect` carries an
+`EffectId` rather than a fresh one.
+
+Recovery stops at the first record that could not legally follow the ones before it, and
+stays stopped. `Scan` refuses a frame whose checksums do not hold; `ReplayCursor` refuses an
+ordering no execution could have produced — an outcome with no schedule, a sequence that
+skips or repeats, anything after a terminal record — with `KernelError::MalformedHistory`.
+Between them that is §09's "recovery stops at the first unsealed, malformed, out-of-sequence,
+or integrity-failed frame", split along the line that decides which crate owns bytes.
 
 ## Two-bank swap
 

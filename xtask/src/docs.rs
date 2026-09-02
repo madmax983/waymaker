@@ -175,6 +175,29 @@ pub const TWO_BANK_SWAP_STEPS: &[&str] = &[
     "lazily erase the old bank",
 ];
 
+/// The six steps of cold-start replay, from design document §06.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted: §06 is a
+/// six-step sequence, and a picture with five in it is a picture that has lost one.
+///
+/// Two of these steps draw code that does not exist yet, which is deliberate and is worth
+/// stating so the diagram is not read as a claim about today's workspace. Steps 3 and 4 name
+/// the workflow future, which is rung 0.4's; a recovery sequence with the polling left out
+/// would read as though history were replayed by something other than the workflow itself.
+/// And step 5's first clause, "consumes the matching history records", is the §08 transition
+/// table of issue #15 — rung 0.1 implements its second clause, "identifies the first
+/// unresolved effect". This is the one diagram whose table was written in the same commit as
+/// the drawing, so unlike the other five it does not yet hold the code to an independent
+/// source.
+pub const COLD_START_STEPS: &[&str] = &[
+    "Recover the active bank",
+    "Decode the run input",
+    "Create a fresh workflow future and replay cursor",
+    "Poll the workflow from its beginning",
+    "Each effect consumes the matching history records",
+    "Stop at pending work or a terminal record",
+];
+
 /// The fields of the record frame, from design document §09.
 ///
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
@@ -227,6 +250,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the record frame",
         required_labels: RECORD_FRAME_FIELDS,
         source_section: "§09 Journal and wire format",
+    },
+    DiagramSpec {
+        id: "cold-start-replay",
+        title: "the six-step cold-start replay sequence",
+        required_labels: COLD_START_STEPS,
+        source_section: "§06 Cold-start replay",
     },
     DiagramSpec {
         id: "two-bank-generations",
@@ -1740,9 +1769,10 @@ mod tests {
     }
 
     #[test]
-    fn the_effect_protocol_has_seven_steps_and_the_swap_has_seven() {
+    fn each_step_list_has_the_number_of_steps_its_design_document_section_states() {
         assert_eq!(EFFECT_PROTOCOL_STEPS.len(), 7);
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
+        assert_eq!(COLD_START_STEPS.len(), 6);
     }
 
     #[test]

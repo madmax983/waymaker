@@ -16,6 +16,7 @@ be superseded.
 | [0005](0005-documentation-is-checked-against-the-tables-it-describes.md) | Documentation is checked against the tables it describes | accepted |
 | [0006](0006-effect-identity-is-newtypes-and-exhaustion-is-terminal.md) | Effect identity is newtypes, and exhaustion is terminal | accepted |
 | [0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md) | The record frame is checksummed twice, and the kernel owns none of it | accepted |
+| [0008](0008-the-replay-cursor-is-pumped-by-its-caller.md) | The replay cursor is pumped by its caller and holds no page | accepted |
 
 ## Reading the numbers
 
@@ -31,7 +32,7 @@ of these are older than their numbers suggest:
   them as settled precedent. It was written when issue #11 asked for every settled decision
   to have an ADR and this one turned out not to.
 
-In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007.
+In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008.
 
 ## Writing one
 

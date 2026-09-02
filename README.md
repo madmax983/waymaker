@@ -260,6 +260,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, is not executable, or has drifted from the pipeline table |
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or a component a stage needs |
 | `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
+| `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
