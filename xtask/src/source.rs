@@ -658,6 +658,210 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
     },
 ];
 
+/// The file that binds the shipped integrity check to an algorithm.
+///
+/// Separate from [`INTEGRITY_CHECK_PATH`], which is where the two loops live. This is where
+/// the codec is told which loops to use, and the two can drift apart in a way neither pin
+/// would see on its own: a `crc.rs` whose parameters are untouched, bound to nothing, is a
+/// checksum module the codec no longer calls.
+pub const INTEGRITY_BINDING_PATH: &str = "waymaker-flash/src/integrity.rs";
+
+/// The trait the frame's two seals go through.
+pub const INTEGRITY_TRAIT: &str = "trait IntegrityCheck";
+
+/// The implementation this firmware ships, and the one ADR 0010 settled on.
+pub const INTEGRITY_SHIPPED_IMPL: &str = "impl IntegrityCheck for Catalogued";
+
+/// One seal: what the trait returns for it, and what the shipped implementation computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealBinding {
+    /// The trait method, by name.
+    pub method: &'static str,
+    /// The return type, spelled as the signature spells it. This *is* the seal's width on
+    /// media.
+    pub width: &'static str,
+    /// The function in the checksum module the shipped implementation must delegate to.
+    pub delegates_to: &'static str,
+    /// What the seal covers, for a violation message.
+    pub covers: &'static str,
+}
+
+/// The two seals, their widths, and what the shipped implementation computes them with.
+///
+/// Issue [#17](https://github.com/madmax983/waymaker/issues/17) asks for two things this
+/// table holds together. The check has to stay *swappable* — hence a trait, and hence a rule
+/// that reads the trait rather than the codec — and the frame's `header_crc` and
+/// `payload_crc` **widths** have to be settled *as a result*, which they are: they are the
+/// return types below, and §09's frame spends exactly that many bytes on each. A width is
+/// not an implementation detail. Sixteen bits to thirty-two on the header is two more bytes
+/// per record on media for the life of the format, and the frame's own `const` assertions
+/// only catch it if someone changes the constants to match.
+///
+/// The delegation column is the other half. A trait anything may implement is a trait the
+/// *shipped* answer can quietly leave: `Catalogued` rebound to a different loop passes every
+/// round-trip test in this repository, exactly as a changed polynomial does, and
+/// [ADR 0010](https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+/// is the decision that would have been undone without a line in a diff saying so.
+pub const SEAL_BINDINGS: &[SealBinding] = &[
+    SealBinding {
+        method: "header_check",
+        width: "u16",
+        delegates_to: "crc16",
+        covers: "the header's first ten bytes",
+    },
+    SealBinding {
+        method: "frame_check",
+        width: "u32",
+        delegates_to: "crc32",
+        covers: "the header and the payload",
+    },
+];
+
+/// Rule: the shipped integrity check is bound to ADR 0010's algorithms, at ADR 0012's
+/// widths.
+///
+/// Reported under `integrity-check`, the same id as [`check_integrity_check`], because it is
+/// the same decision: that rule says the loops are still the catalogued table-free ones,
+/// this one says the codec still calls them and still spends the same bytes on media. A
+/// contributor reading a failure does not care which half of the pin caught it.
+///
+/// Scanned rather than parsed, like every rule here, over code with its comments and string
+/// literals stripped — this module's own documentation names both functions repeatedly, and
+/// a rule satisfied by prose is a rule that passes when the code is gone.
+#[must_use]
+pub fn check_integrity_binding(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, INTEGRITY_BINDING_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "no {INTEGRITY_BINDING_PATH} in the workspace, so nothing binds the frame \
+                 seals to an algorithm; issue #17 requires the integrity check to live behind \
+                 a trait so the choice stays swappable, and a binding that is gone is a pin \
+                 checking nothing"
+            ),
+        )];
+    };
+
+    let code = without_test_modules(&code_only(&source.contents));
+    let mut violations = Vec::new();
+
+    let declaration = braced_body(&code, INTEGRITY_TRAIT);
+    if declaration.is_none() {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_BINDING_PATH} declares no `{INTEGRITY_TRAIT}`, so the seal widths \
+                 are pinned against nothing"
+            ),
+        ));
+    }
+    let shipped = braced_body(&code, INTEGRITY_SHIPPED_IMPL);
+    if shipped.is_none() {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_BINDING_PATH} declares no `{INTEGRITY_SHIPPED_IMPL}`, so nothing \
+                 says which algorithm this firmware seals with"
+            ),
+        ));
+    }
+
+    for seal in SEAL_BINDINGS {
+        if let Some(body) = declaration {
+            match signature(body, seal.method) {
+                None => violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{INTEGRITY_TRAIT}` declares no `{}`, so the seal over {} has no \
+                         width to be pinned at",
+                        seal.method, seal.covers
+                    ),
+                )),
+                Some(found) if !returns(&found, seal.width) => {
+                    violations.push(Violation::new(
+                        RULE,
+                        ADAPTER,
+                        format!(
+                            "`{}` returns something other than `{}`, so the seal over {} has \
+                             changed width; that is bytes on media for the life of the \
+                             format, not an implementation detail",
+                            seal.method, seal.width, seal.covers
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        if let Some(body) = shipped {
+            match braced_body(body, &format!("fn {}", seal.method)) {
+                None => violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{INTEGRITY_SHIPPED_IMPL}` does not implement `{}`, so the shipped \
+                         seal over {} is bound to nothing",
+                        seal.method, seal.covers
+                    ),
+                )),
+                Some(body) if count_tokens(body, seal.delegates_to) != 1 => {
+                    violations.push(Violation::new(
+                        RULE,
+                        ADAPTER,
+                        format!(
+                            "`Catalogued::{}` does not call `{}` exactly once, so the shipped \
+                             seal over {} is no longer ADR 0010's; a rebound checksum passes \
+                             every round-trip test in this repository and fails against every \
+                             journal already on a device",
+                            seal.method, seal.delegates_to, seal.covers
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    violations
+}
+
+/// The text of the signature `fn <name>` opens, up to its `;` or its body.
+fn signature(code: &str, name: &str) -> Option<String> {
+    let header = format!("fn {name}");
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+    let after = code.match_indices(&header).find_map(|(index, _)| {
+        let before_is_boundary = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        let rest = code.get(index.saturating_add(header.len())..)?;
+        let after_is_boundary = rest.chars().next().is_none_or(|c| !continues(c));
+        (before_is_boundary && after_is_boundary).then_some(rest)
+    })?;
+    let end = after
+        .find(|character| character == ';' || character == '{')
+        .unwrap_or(after.len());
+    after.get(..end).map(str::to_owned)
+}
+
+/// Whether a signature's return type is `width`, at a token boundary.
+///
+/// `-> u16` and `-> u32` differ by one character, so this is a token comparison rather than
+/// a `contains`: `u3` must not be satisfied by `u32`, and a `-> u16` in a parameter's
+/// closure type must not vouch for the return.
+fn returns(signature: &str, width: &str) -> bool {
+    signature
+        .rsplit_once("->")
+        .is_some_and(|(_, tail)| tail.trim() == width)
+}
+
 /// Rule: a scheduled effect records exactly the metadata ADR 0011 settled on.
 ///
 /// Scanned rather than parsed, like every rule in this module, and scanned over code with
@@ -2491,6 +2695,86 @@ mod deferred_answer_pins {
     // `integrity-check`: ADR 0010's answer, pinned.
 
     #[test]
+    fn the_real_integrity_binding_matches_the_pin() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(INTEGRITY_BINDING_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the binding module should exist");
+        let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &contents)]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clean_integrity_binding_passes() {
+        assert!(
+            check_integrity_binding(&[layer(
+                INTEGRITY_BINDING_PATH,
+                &tests_support::clean_integrity_binding()
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_missing_integrity_binding_fails_closed() {
+        let violations = check_integrity_binding(&[]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "integrity-check");
+    }
+
+    #[test]
+    fn a_widened_seal_is_reported() {
+        // The widths are what issue #17 settles alongside the algorithm. A `header_check`
+        // that returned a `u32` would be a different frame: two bytes more per record, on
+        // media, for the life of the format.
+        let source = tests_support::clean_integrity_binding().replace(
+            "fn header_check(bytes: &[u8]) -> u16;",
+            "fn header_check(bytes: &[u8]) -> u32;",
+        );
+        let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("u16")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_rebound_shipped_check_is_reported() {
+        // The whole point of the binding: the trait may be implemented by anything, and
+        // the type this firmware ships must still be ADR 0010's two functions.
+        let source =
+            tests_support::clean_integrity_binding().replace("crc32(bytes)", "crc32c(bytes)");
+        let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("crc32")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_binding_without_the_trait_fails_closed() {
+        let source =
+            tests_support::clean_integrity_binding().replace("trait IntegrityCheck", "trait Other");
+        let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+        assert!(!violations.is_empty(), "a trait that is gone pins nothing");
+    }
+
+    #[test]
+    fn a_binding_without_the_shipped_impl_fails_closed() {
+        let source = tests_support::clean_integrity_binding().replace(
+            "impl IntegrityCheck for Catalogued",
+            "impl IntegrityCheck for Other",
+        );
+        let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+        assert!(!violations.is_empty(), "an impl that is gone pins nothing");
+    }
+
+    #[test]
     fn the_real_checksum_module_matches_the_pin() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -3024,7 +3308,8 @@ pub mod tests_support {
     use std::collections::BTreeSet;
 
     use super::{
-        EFFECT_SCHEDULED_FIELDS, INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, TRANSITION_SURFACE,
+        EFFECT_SCHEDULED_FIELDS, INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, SEAL_BINDINGS,
+        TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -3102,6 +3387,34 @@ pub mod tests_support {
         source
     }
 
+    /// A binding module the pin accepts, for tests about everything else.
+    ///
+    /// Rendered from [`SEAL_BINDINGS`] rather than written out, so a seal added to the table
+    /// arrives in the fixture too and a fixture cannot pass a pin the real module fails.
+    #[must_use]
+    pub fn clean_integrity_binding() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! The swap point.\n\npub trait IntegrityCheck {\n");
+        for seal in SEAL_BINDINGS {
+            let _ = writeln!(
+                source,
+                "    fn {}(bytes: &[u8]) -> {};",
+                seal.method, seal.width
+            );
+        }
+        source.push_str("}\n\npub struct Catalogued;\n\nimpl IntegrityCheck for Catalogued {\n");
+        for seal in SEAL_BINDINGS {
+            let _ = writeln!(
+                source,
+                "    fn {}(bytes: &[u8]) -> {} {{ {}(bytes) }}",
+                seal.method, seal.width, seal.delegates_to
+            );
+        }
+        source.push_str("}\n");
+        source
+    }
+
     /// Probe source calling every name both pins list, for the clean-workspace fixture.
     ///
     /// `size-probe-reach` demands a call for every public function a layer declares, and the
@@ -3109,12 +3422,20 @@ pub mod tests_support {
     /// that supplied one without the other would describe a workspace the gate rejects for a
     /// reason that has nothing to do with what is being tested.
     ///
-    /// Deduplicated, because the two pins share five names — `new`, `run`, `position`,
+    /// Deduplicated, because the pins share five names — `new`, `run`, `position`,
     /// `pending` and `advance` — and a second call to one would be a second identical line
     /// rather than a second reachable function.
     #[must_use]
     pub fn clean_probe_calls() -> String {
-        let names: BTreeSet<&&str> = REPLAY_SURFACE.iter().chain(TRANSITION_SURFACE).collect();
+        // The seal methods too: `size-probe-reach` counts a trait's methods as public
+        // whether or not they carry `pub`, so a fixture binding module the probe fixture
+        // does not call is a clean workspace the gate rejects.
+        let seals = SEAL_BINDINGS.iter().map(|seal| &seal.method);
+        let names: BTreeSet<&&str> = REPLAY_SURFACE
+            .iter()
+            .chain(TRANSITION_SURFACE)
+            .chain(seals)
+            .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {
             source.push_str("    ");

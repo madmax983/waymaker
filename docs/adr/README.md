@@ -20,6 +20,7 @@ be superseded.
 | [0009](0009-the-transition-table-is-a-machine-that-owns-the-cursor.md) | The transition table is a machine that owns the cursor, and divergence is terminal | accepted |
 | [0010](0010-the-integrity-check-is-catalogued-and-table-free.md) | The integrity check is catalogued and table-free | accepted |
 | [0011](0011-a-scheduled-effect-records-a-length-and-a-digest.md) | A scheduled effect records a length and a digest, and nothing more | accepted |
+| [0012](0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md) | The integrity check is swappable behind a trait, and the seal widths are not | accepted |
 
 ## Reading the numbers
 

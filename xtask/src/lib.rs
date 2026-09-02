@@ -232,6 +232,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
+    violations.extend(source::check_integrity_binding(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -847,6 +848,15 @@ mod tests {
                     crate_name: "waymaker-core".to_owned(),
                     path: format!("crates/{}", source::EFFECT_SCHEDULED_PATH),
                     contents: source::tests_support::clean_record_module(),
+                },
+                // And the binding issue #17's answer is held by: the trait the seals go
+                // through, and the type the shipped algorithms are bound to. It fails
+                // closed when the module is absent, for the same reason as the three
+                // above.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_BINDING_PATH),
+                    contents: source::tests_support::clean_integrity_binding(),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),

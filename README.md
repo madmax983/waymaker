@@ -28,7 +28,10 @@ rather than only in the design document. Two are settled: the integrity check
 ([ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)) and the
 metadata a scheduled effect records
 ([ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md)). The other
-three carry the rung that owns them and the evidence that would close them.
+three carry the rung that owns them and the evidence that would close them. The integrity
+check also lives behind a trait rather than being hard-wired into the codec
+([ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md)),
+so the algorithm stays swappable while the seal widths on media do not.
 
 See [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) for the
 full document, and the issue tracker for the build-out.
@@ -275,7 +278,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
-| `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or it or one of its submodules grows a lookup table outside `#[cfg(test)]` |
+| `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`, or the binding drifts — the integrity-check trait is gone, a seal changes width, or the shipped implementation stops delegating to the algorithm ADR 0010 settled on |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 | `claude-md` | `CLAUDE.md` loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams |
