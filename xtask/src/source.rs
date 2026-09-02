@@ -432,7 +432,7 @@ pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Ve
     let mut violations = Vec::new();
 
     for source in sources.iter().filter(|source| source.crate_name == KERNEL) {
-        let code = strip_comments(&source.contents);
+        let code = code_only(&source.contents);
         for (construct, why) in KERNEL_FORBIDDEN_CONSTRUCTS {
             if code.contains(construct) {
                 violations.push(Violation::new(
@@ -442,11 +442,12 @@ pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Ve
                 ));
             }
         }
+        let headers = impl_headers(&code);
         for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
             let needle = marker.replace(' ', "");
-            let implemented = code.lines().any(|line| {
-                let line = erase_lifetimes(line).replace(' ', "");
-                implements_trait(&line, &needle)
+            let implemented = headers.iter().any(|header| {
+                let header = erase_lifetimes(header).replace(' ', "");
+                implements_trait(&header, &needle)
             });
             if implemented {
                 violations.push(Violation::new(
@@ -626,16 +627,229 @@ fn implements_trait(line: &str, needle: &str) -> bool {
     } else {
         rest
     };
-    after_generics.starts_with(needle)
+    strip_path_qualifiers(after_generics).starts_with(needle)
 }
 
-/// Drops `//` comments so that prose describing a construct is not read as the construct.
-fn strip_comments(contents: &str) -> String {
-    contents
-        .lines()
-        .map(|line| line.split("//").next().unwrap_or(""))
-        .collect::<Vec<&str>>()
-        .join("\n")
+/// The code in `contents`, with every comment and every literal's contents blanked out.
+///
+/// One pass, character by character, tracking whether it is inside a line comment, a block
+/// comment (which nests in Rust), a string, a raw string, or a character literal.
+/// Newlines survive so a reader can still count lines; everything else that is not code is
+/// dropped.
+///
+/// # Why a real lexical pass rather than a substring scan
+///
+/// Because the two rules below decide whether the kernel may grow a decoder, and a gate a
+/// comment can switch off is worse than no gate. Each of these was a live defect in a
+/// simpler version of this function, and each has a test:
+///
+/// * `// see for example: /*` — an unmatched block-comment opener inside a *line* comment.
+///   Stripping block comments first swallowed the rest of the file, so a `from_le_bytes`
+///   after it was not reported. A false negative in a rule, which is the direction that
+///   does not announce itself.
+/// * `"impl TryFrom<&[u8]> for RecordRef {"` in a diagnostic string. Scanning flattened
+///   text found an implementation header inside a literal and failed the build for one.
+/// * `'"'` — a character literal holding a quote, which opened a string that never closed.
+/// * `/* /* */ */` — Rust block comments nest, and a scan that stopped at the first `*/`
+///   would treat the tail as code.
+fn code_only(contents: &str) -> String {
+    let source: Vec<char> = contents.chars().collect();
+    let mut code = String::with_capacity(contents.len());
+    let mut at = 0;
+    let mut block_depth: usize = 0;
+
+    while let Some(current) = source.get(at).copied() {
+        let next = source.get(at.saturating_add(1)).copied();
+
+        if block_depth > 0 {
+            if current == '*' && next == Some('/') {
+                block_depth = block_depth.saturating_sub(1);
+                at = at.saturating_add(2);
+            } else if current == '/' && next == Some('*') {
+                block_depth = block_depth.saturating_add(1);
+                at = at.saturating_add(2);
+            } else {
+                if current == '\n' {
+                    code.push('\n');
+                }
+                at = at.saturating_add(1);
+            }
+            continue;
+        }
+
+        // A line comment reaches the newline and no further, so a `/*` inside one opens
+        // nothing.
+        if current == '/' && next == Some('/') {
+            while source.get(at).copied().is_some_and(|c| c != '\n') {
+                at = at.saturating_add(1);
+            }
+            continue;
+        }
+        if current == '/' && next == Some('*') {
+            block_depth = 1;
+            at = at.saturating_add(2);
+            continue;
+        }
+        if let Some(after) = raw_string_end(&source, at) {
+            at = after;
+            continue;
+        }
+        if current == '"' {
+            at = string_end(&source, at.saturating_add(1));
+            continue;
+        }
+        if current == '\'' && is_character_literal(&source, at) {
+            at = character_literal_end(&source, at.saturating_add(1));
+            continue;
+        }
+
+        code.push(current);
+        at = at.saturating_add(1);
+    }
+    code
+}
+
+/// The index just past a raw string starting at `at`, or [`None`] if one does not.
+///
+/// Recognises `r"…"` and `r#"…"#` with any number of hashes, and both prefixed forms Rust
+/// has: `br"…"` for a byte string and `cr"…"` for a C string. The `r` must start a token:
+/// the one in `for` is not a raw string.
+///
+/// The `c` form is not hypothetical tidiness. Missing it means `cr#"a " /*"#` is lexed as an
+/// ordinary string that ends at the quote inside it, leaving a `/*` that opens a block
+/// comment and swallows the rest of the file — the same false negative, arrived at from a
+/// literal form that has been stable since Rust 1.77.
+fn raw_string_end(source: &[char], at: usize) -> Option<usize> {
+    let mut cursor = at;
+    if matches!(source.get(cursor).copied(), Some('b' | 'c')) {
+        cursor = cursor.saturating_add(1);
+    }
+    if source.get(cursor).copied() != Some('r') {
+        return None;
+    }
+    let starts_token = at
+        .checked_sub(1)
+        .and_then(|before| source.get(before).copied())
+        .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+    if !starts_token {
+        return None;
+    }
+
+    cursor = cursor.saturating_add(1);
+    let mut hashes: usize = 0;
+    while source.get(cursor).copied() == Some('#') {
+        hashes = hashes.saturating_add(1);
+        cursor = cursor.saturating_add(1);
+    }
+    if source.get(cursor).copied() != Some('"') {
+        return None;
+    }
+    cursor = cursor.saturating_add(1);
+
+    // A raw string has no escapes: it ends at the first quote followed by as many hashes as
+    // it opened with.
+    while let Some(character) = source.get(cursor).copied() {
+        cursor = cursor.saturating_add(1);
+        if character != '"' {
+            continue;
+        }
+        let closed = (0..hashes)
+            .all(|offset| source.get(cursor.saturating_add(offset)).copied() == Some('#'));
+        if closed {
+            return Some(cursor.saturating_add(hashes));
+        }
+    }
+    Some(cursor)
+}
+
+/// The index just past an ordinary string whose opening quote was before `at`.
+fn string_end(source: &[char], mut at: usize) -> usize {
+    while let Some(character) = source.get(at).copied() {
+        at = at.saturating_add(1);
+        match character {
+            '\\' => at = at.saturating_add(1),
+            '"' => return at,
+            _ => {}
+        }
+    }
+    at
+}
+
+/// Whether the quote at `at` opens a character literal rather than a lifetime.
+///
+/// `'a'` is a literal and `'a` is a lifetime, and the difference matters: `'"'` is ordinary
+/// Rust, and reading it as a lifetime opens a string that never closes.
+fn is_character_literal(source: &[char], at: usize) -> bool {
+    match source.get(at.saturating_add(1)).copied() {
+        // An escape is always a literal: no lifetime begins with a backslash.
+        Some('\\') => true,
+        // Otherwise it is a literal exactly when a closing quote follows the single
+        // character — `'a'` — and a lifetime when an identifier continues instead.
+        Some(_) => source.get(at.saturating_add(2)).copied() == Some('\''),
+        None => false,
+    }
+}
+
+/// The index just past a character literal whose opening quote was before `at`.
+fn character_literal_end(source: &[char], mut at: usize) -> usize {
+    while let Some(character) = source.get(at).copied() {
+        at = at.saturating_add(1);
+        match character {
+            '\\' => at = at.saturating_add(1),
+            '\'' => return at,
+            _ => {}
+        }
+    }
+    at
+}
+
+/// Every `impl` header in `code`, flattened to one line each.
+///
+/// `rustfmt` breaks a long header across lines — `impl<'a>` on one and
+/// `TryFrom<&'a [u8]> for RecordRef<'a>` on the next — and a scan that looked at lines
+/// individually would find no line carrying both `impl` and the trait. So the whole file is
+/// flattened first and each header is taken from its `impl` token to the `{` or `;` that
+/// ends it. Ordinary formatting cannot hide a header from this.
+fn impl_headers(code: &str) -> Vec<String> {
+    let flattened = code.split_whitespace().collect::<Vec<&str>>().join(" ");
+    let mut headers = Vec::new();
+    let mut rest = flattened.as_str();
+
+    while let Some(at) = rest.find("impl") {
+        let preceded_by_identifier = rest
+            .get(..at)
+            .and_then(|before| before.chars().next_back())
+            .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        let from_impl = rest.get(at..).unwrap_or_default();
+        if !preceded_by_identifier {
+            let brace = from_impl.find('{').unwrap_or(from_impl.len());
+            let end = from_impl.find(';').map_or(brace, |semi| semi.min(brace));
+            headers.push(from_impl.get(..end).unwrap_or_default().to_owned());
+        }
+        rest = from_impl.get("impl".len()..).unwrap_or_default();
+    }
+    headers
+}
+
+/// Path qualifiers that a trait may be written with and that mean nothing to this scan.
+///
+/// `impl core::convert::TryFrom<&[u8]> for RecordRef<'_>` is the ordinary fully qualified
+/// spelling of the very thing the rule rejects, and a bare `starts_with` would not see it.
+const TRAIT_PATH_PREFIXES: &[&str] = &["::", "core::", "std::", "convert::"];
+
+/// Drops leading path qualification from a whitespace-free trait position.
+fn strip_path_qualifiers(mut trait_position: &str) -> &str {
+    let mut stripped = true;
+    while stripped {
+        stripped = false;
+        for prefix in TRAIT_PATH_PREFIXES {
+            if let Some(rest) = trait_position.strip_prefix(prefix) {
+                trait_position = rest;
+                stripped = true;
+            }
+        }
+    }
+    trait_position
 }
 
 /// Removes `'a`-style lifetimes so an `impl` header can be matched without them.
@@ -1022,6 +1236,202 @@ mod tests {
 ",
         );
         assert_eq!(check_kernel_owns_no_encoding(&elided).len(), 1);
+    }
+
+    #[test]
+    fn a_qualified_trait_path_is_still_the_trait() {
+        // `impl core::convert::TryFrom<&[u8]> for RecordRef<'_>` is the ordinary fully
+        // qualified spelling of the exact thing this rule rejects. A decoder written that
+        // way need contain none of the endianness names above — it only has to wrap the
+        // borrowed slice — so a scan that compared the trait position literally would let
+        // the whole rule through.
+        for qualified in [
+            "impl core::convert::TryFrom<&[u8]> for RecordRef<'_> {",
+            "impl ::core::convert::TryFrom<&[u8]> for RecordRef<'_> {",
+            "impl std::convert::From<&[u8]> for RecordKind {",
+            "impl convert::From<&[u8]> for RecordKind {",
+        ] {
+            assert_eq!(
+                check_kernel_owns_no_encoding(&kernel_source(qualified)).len(),
+                1,
+                "{qualified}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_rustfmt_split_across_lines_is_still_one_header() {
+        // `rustfmt` breaks a long header, and neither line then carries both `impl` and the
+        // trait. Ordinary formatting must not be a way past the rule.
+        let split = kernel_source(
+            "impl<'a>\n    TryFrom<&'a [u8]>\n    for RecordRef<'a>\n{\n    type Error = ();\n}\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&split).len(), 1);
+
+        let split_and_qualified = kernel_source(
+            "impl<'a>\n    core::convert::TryFrom<&'a [u8]>\n    for RecordRef<'a>\n{\n}\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&split_and_qualified).len(), 1);
+    }
+
+    #[test]
+    fn a_block_comment_about_a_construct_is_not_the_construct() {
+        // The same rule as for `//`, and the same reason: a rule that failed a build over a
+        // migration note is a rule somebody writes an `allow` next to.
+        let noted = kernel_source(
+            "/* the old code used u32::from_le_bytes here */\npub struct RecordKind(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&noted).is_empty());
+
+        let multi_line = kernel_source(
+            "/*\n * A decoder would need to_le_bytes, and lives one layer up.\n */\npub struct K(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&multi_line).is_empty());
+
+        // A `//` inside a block comment does not end it, and a `/*` inside a line comment
+        // opens nothing — so the two passes have to happen in that order.
+        let nested = kernel_source("/* // from_le_bytes */\npub struct K(pub u8);\n");
+        assert!(check_kernel_owns_no_encoding(&nested).is_empty());
+        let mentioned = kernel_source("// a /* from_le_bytes */ in a line comment\n");
+        assert!(check_kernel_owns_no_encoding(&mentioned).is_empty());
+
+        // And a construct in real code beside a comment is still reported.
+        let both =
+            kernel_source("/* not code */\nfn read(b: [u8; 4]) -> u32 { u32::from_le_bytes(b) }\n");
+        assert_eq!(check_kernel_owns_no_encoding(&both).len(), 1);
+    }
+
+    #[test]
+    fn a_block_opener_inside_a_line_comment_opens_nothing() {
+        // The defect this rule had, and the direction that does not announce itself. An
+        // unmatched `/*` inside a line comment used to swallow the rest of the file, so
+        // real encoding code after it went unreported — a gate switched off by a comment.
+        let sneaky = kernel_source(
+            "// see for example: /*\nfn read(b: [u8; 4]) -> u32 { u32::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&sneaky).len(), 1);
+
+        // The same shape one line further down, and with a `//` inside a block comment,
+        // which likewise opens nothing.
+        let mixed = kernel_source(
+            "/* a // inside a block */\n// and a /* inside a line\nfn f(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&mixed).len(), 1);
+    }
+
+    #[test]
+    fn a_construct_inside_a_literal_is_not_a_construct() {
+        // The other direction: a diagnostic string that quotes the very thing the rule
+        // rejects must not fail a build. The kernel's own documentation quotes both.
+        let quoted = kernel_source(
+            "pub const HELP: &str = \"impl TryFrom<&[u8]> for RecordRef {\";\npub struct K(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&quoted).is_empty());
+
+        let named = kernel_source("pub const WHY: &str = \"never from_le_bytes here\";\n");
+        assert!(check_kernel_owns_no_encoding(&named).is_empty());
+
+        // Every raw form Rust has, including the `c` prefix a simpler version of the
+        // scanner missed: `cr#\"a \" /*\"#` lexed as an ordinary string ending at its inner
+        // quote, leaving a `/*` that swallowed the rest of the file.
+        for literal in [
+            "r\"impl From<&[u8]> for K\"",
+            "br\"impl From<&[u8]> for K\"",
+            "cr\"impl From<&[u8]> for K\"",
+            "cr#\"a \" /* impl From<&[u8]> for K\"#",
+            "br##\"a \"# /* from_le_bytes\"##",
+        ] {
+            let with_literal = kernel_source(&format!(
+                "pub const L: &str = {literal};\nfn f(b: [u8; 2]) -> u16 {{ u16::from_le_bytes(b) }}\n"
+            ));
+            assert_eq!(
+                check_kernel_owns_no_encoding(&with_literal).len(),
+                1,
+                "the call after {literal} must still be found, and the literal must not be a finding"
+            );
+        }
+
+        // A raw string, which has no escapes and ends only at its matching hashes.
+        let raw = kernel_source(
+            "pub const R: &str = r#\"impl From<&[u8]> for K { \"quoted\" }\"#;\npub struct K(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&raw).is_empty());
+
+        // And real code after every one of them is still reported.
+        let after = kernel_source(
+            "pub const R: &str = r\"impl From<&[u8]> for K\";\nfn f(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&after).len(), 1);
+    }
+
+    #[test]
+    fn a_character_literal_holding_a_quote_does_not_open_a_string() {
+        // `'\"'` is ordinary Rust — `matches!(c, '\"')` — and reading its quote as the start
+        // of a string swallows the rest of the file, which is the same false negative as
+        // the line-comment case.
+        let quote_char = kernel_source(
+            "fn is_quote(c: char) -> bool { c == '\"' }\nfn f(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&quote_char).len(), 1);
+
+        // A lifetime is not a character literal, and an escape always is.
+        let lifetime =
+            kernel_source("pub enum RecordRef<'a> { RunCompleted { result: &'a [u8] } }\n");
+        assert!(check_kernel_owns_no_encoding(&lifetime).is_empty());
+        let escaped = kernel_source(
+            "fn nl(c: char) -> bool { c == '\\n' }\nfn f(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&escaped).len(), 1);
+    }
+
+    #[test]
+    fn block_comments_nest_the_way_rust_says_they_do() {
+        // A scan that stopped at the first `*/` would read the tail of a nested comment as
+        // code, and report a construct nobody wrote.
+        let nested = kernel_source(
+            "/* outer /* inner */ still a comment: from_le_bytes */\npub struct K(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&nested).is_empty());
+
+        // And the code after the outer close is code again.
+        let after = kernel_source(
+            "/* outer /* inner */ */\nfn f(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&after).len(), 1);
+    }
+
+    #[test]
+    fn code_only_keeps_the_code_and_the_line_count() {
+        // The pass itself, so its behaviour is pinned where it is easiest to read.
+        assert_eq!(
+            code_only("let x = 1; // note\nlet y = 2;"),
+            "let x = 1; \nlet y = 2;"
+        );
+        assert_eq!(code_only("a /* b */ c"), "a  c");
+        assert_eq!(code_only("a /* b\nc */ d"), "a \n d");
+        assert_eq!(code_only("let s = \"text\";"), "let s = ;");
+        assert_eq!(code_only("let c = 'x';"), "let c = ;");
+        assert_eq!(
+            code_only("fn f<'a>(x: &'a u8) {}"),
+            "fn f<'a>(x: &'a u8) {}"
+        );
+        // An unterminated block comment does not compile, so nothing after it is code.
+        assert_eq!(code_only("code /* and then nothing"), "code ");
+    }
+
+    #[test]
+    fn an_impl_that_is_not_at_a_token_boundary_is_not_an_impl() {
+        // `impl_headers` scans a flattened file, so it has to tell the keyword from a word
+        // that ends in it.
+        let headers = impl_headers("fn reimpl() {} impl Foo for Bar {}");
+        assert_eq!(headers, ["impl Foo for Bar "]);
+        assert!(impl_headers("struct NoImplHere;").is_empty());
+        // A header ended by `;` rather than `{` — a trait impl cannot be written that way,
+        // but the scan must not swallow the rest of the file looking for a brace.
+        assert_eq!(
+            impl_headers("impl Foo for Bar; fn f() {}"),
+            ["impl Foo for Bar"]
+        );
     }
 
     #[test]

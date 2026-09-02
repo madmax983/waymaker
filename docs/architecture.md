@@ -121,7 +121,8 @@ kernel, which is why the whole of this picture lives in `waymaker-flash` and non
 `waymaker-core`.
 
 Two checksums rather than one, and the order they are checked in is the point. `header_crc`
-covers the twelve bytes before it, so `payload_len` is known to be the number the writer
+covers the ten bytes before it — the whole header except itself, `payload_len` included —
+so `payload_len` is known to be the number the writer
 wrote **before** it is used to find where the frame ends — which is what §09's "all lengths
 are validated against caller buffers and bank bounds before reading" asks for. A single
 checksum over the whole frame could not: finding it would mean trusting the length first.

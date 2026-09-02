@@ -136,8 +136,16 @@ it is neither an input that ended early nor a length reaching outside a buffer.
 *unpadded*; `ProgramAlign::round_up` is what turns it into a stride, and `Scan` is what
 applies it. The free function `frame::encoded_len(record, align)` is the other number — what
 a writer must reserve, padding included, and what `encode` returns. Two numbers, two names:
-one word for both is how a cursor ends up advanced into a pad. So padding is never interpreted, and a journal written on a device with one program
-granularity is still readable by code that assumes another.
+one word for both is how a cursor ends up advanced into a pad. So padding is never interpreted.
+
+What that does *not* buy is a journal readable at any granularity. `Scan` must be given the
+granularity the journal was **written** at, because nothing on media records it: a smaller
+one strides short into a frame's padding, and a larger one strides over whole frames onto
+erased bytes, which is an ordinary end of history in every respect the scan can see. The
+first is caught — an erased header is the end of history only if the journal is erased to
+its end — and the second is not, and cannot be until rung 0.2 puts the writer's program size
+in the bank header. `a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught` asserts
+the wrong answer on purpose so the limitation is bounded rather than undiscovered.
 
 `ProgramAlign` accepts a power of two and nothing else. The first version of this decision
 said the opposite — zero rejected, anything else accepted, on the reasoning that no
