@@ -23,14 +23,27 @@
 //! layer file is a function the probe is required to call. So the lint is allowed on each,
 //! with this as the reason.
 //!
-//! # Why there is no table
+//! # Why these two algorithms, and why there is no table
 //!
-//! A byte-at-a-time table is 1 KiB of rodata and a nibble table is 64 B, against an 8 KiB
-//! *total* incremental code-flash budget for the kernel and this adapter together — and
-//! the thing being checksummed is a record on its way to a flash page, where a program
-//! cycle costs tens of microseconds and a few hundred shift-and-xor iterations cost
-//! nothing anybody can measure. So both are bitwise. If a profile ever says otherwise, the
-//! decision is a table here and a number in the size report, not a guess.
+//! Design document §16 left this open — "whether the default integrity check is CRC32C or a
+//! smaller table-free CRC implementation" — and
+//! [ADR 0010](https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+//! settles it against measurements taken on `thumbv6m-none-eabi`. Two of them decide it.
+//!
+//! The polynomial is free. CRC-32C and CRC-32/ISO-HDLC compile to the same 52 bytes and the
+//! same 78 instructions per byte, because this target has no CRC instruction and the
+//! polynomial is an immediate either way. With cost equal, the choice falls to which
+//! algorithm a host can check a device's journal against without reimplementing anything,
+//! and CRC-32/ISO-HDLC is zlib's, gzip's and PNG's.
+//!
+//! The table is not free: 64 B of rodata for a nibble table, 1 KiB for a byte table,
+//! against an 8 KiB *total* incremental code-flash budget for the kernel and this adapter
+//! together. What it buys is ~107 cycles per byte down to ~22 or ~16 — which at 48 MHz is
+//! ~54 µs for a 24-byte scheduled-effect record and ~1.14 ms for a full 512-byte page. So
+//! it is not, as this comment previously claimed, a cost nobody can measure; it is a cost
+//! against which §04 states no latency budget at all. Both stay bitwise until a profile of
+//! a real workload says otherwise, and that would be a superseding ADR — the
+//! `integrity-check` gate rule fails a build that adds a table here without one.
 
 /// CRC-16/CCITT-FALSE over `bytes`.
 ///

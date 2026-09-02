@@ -9,7 +9,7 @@ This file is what a contributor — human or agent — works to. It states the i
 layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
-dependency edges, the eight decision ids, the command list and all 30 rule ids below are
+dependency edges, the eight decision ids, the command list, the five deferred questions and all 34 rule ids below are
 compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
@@ -69,6 +69,34 @@ Two more that are not from §02 but hold everywhere:
 - **A measurement that did not happen is not a measurement that passed.** Every gate fails
   closed: a missing tool, an unreadable report, a crate that contributed nothing, an
   unparseable input.
+
+## What is still undecided
+
+Design document §16 leaves five questions open, and issue
+[#16](https://github.com/madmax983/waymaker/issues/16) is explicit about the deadline: "each
+needs an answer before the wire format freezes at 1.0". They are held as a table in
+`xtask::docs::DEFERRED_QUESTIONS`, so an open question is as checked as a settled one — the
+`deferred-questions` rule compares that table against this section, and against the ADR
+record in both directions.
+
+All 5 deferred questions, with the id to cite when a change touches one:
+
+| Id | Question | Where it stands |
+| --- | --- | --- |
+| `integrity-check-algorithm` | Whether the default integrity check is CRC32C or a smaller table-free CRC implementation. | Settled by [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md): CRC-32/ISO-HDLC and CRC-16/CCITT-FALSE, both table-free. The polynomial turned out to be free on `thumbv6m` and the table not to be. |
+| `retry-policy-placement` | Whether retry policy belongs in the Embassy façade or remains workflow code. | Open, owned by rung **0.4 · embassy**. Settles when the dispatcher exists and a recorded retry representation can be measured against every workflow reimplementing backoff. |
+| `effect-scheduled-metadata` | How much input metadata an EffectScheduled record stores beyond length and digest. | Settled by [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md): `seq`, `kind`, `input_len`, `input_crc`, and nothing else. |
+| `explicit-state-snapshots` | Whether a future explicit-state workflow API may support true storage snapshots. | Open, owned by **after 1.0**. Settles when such an API is designed far enough that its snapshot can be described in records, without relaxing `no-snapshotted-futures` for the async façade. |
+| `wire-format-migration` | How stable wire-format migration is performed after a deployed fleet outlives v1. | Open, owned by rung **1.0**. Settles when §09's version-marker record exists and a fleet running two format versions can be described end to end. |
+
+An ADR that answers one carries `Settles deferred question:` and the id; the row in
+`DEFERRED_QUESTIONS` moves from `Open` to `Settled` in the same change. Writing the ADR
+without moving the row, or moving the row without the ADR, each fail the build — which is
+the point, because this is the list that normally rots in exactly those two ways.
+
+Deciding one of these early is not a favour. An ADR written for a question whose
+implementation does not exist is a snapshot of an opinion, which is the one thing
+[the record](docs/adr/README.md) says a decision record must never be.
 
 ## The layering
 
@@ -181,7 +209,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 31 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 34 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -193,6 +221,8 @@ this table is how you find out what a red build is telling you.
 | `kernel-zero-dependencies` | `waymaker-core` grows a dependency of any kind, in any table. |
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
+| `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
+| `integrity-check` | `waymaker-flash`'s checksum module loses one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — or grows a `const`/`static` array outside `#[cfg(test)]`. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
@@ -232,6 +262,7 @@ this table is how you find out what a red build is telling you.
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
 | `settled-decisions` | The §02 ADR stops recording one of the eight decisions, or its headline. |
+| `deferred-questions` | A question in `docs::DEFERRED_QUESTIONS` is missing from this file, the count is wrong, a settled one's ADR is absent, unaccepted or does not carry its `Settles deferred question:` marker, an open one is already claimed by an ADR, or an ADR claims a question the table never declared. |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
 | `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
 

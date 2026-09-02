@@ -54,13 +54,16 @@ pub const RULES: &[&str] = &[
     "ci-pipeline",
     "claude-md",
     "crate-attributes",
+    "deferred-questions",
     "dependency-direction",
     "dependency-direction-transitive",
     "diagrams",
+    "effect-scheduled-fields",
     "embassy-below-facade",
     "empty-default-features",
     "gate-broken",
     "inputs-incomplete",
+    "integrity-check",
     "kernel-owns-no-encoding",
     "kernel-zero-dependencies",
     "layer-missing",
@@ -227,6 +230,8 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
+    violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
+    violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -730,12 +735,15 @@ mod tests {
             "ci-pipeline",
             "claude-md",
             "crate-attributes",
+            "deferred-questions",
             "dependency-direction",
             "dependency-direction-transitive",
             "diagrams",
+            "effect-scheduled-fields",
             "embassy-below-facade",
             "empty-default-features",
             "inputs-incomplete",
+            "integrity-check",
             "kernel-owns-no-encoding",
             "kernel-zero-dependencies",
             "layer-missing",
@@ -829,6 +837,21 @@ mod tests {
                     crate_name: "waymaker-core".to_owned(),
                     path: format!("crates/{}", source::TRANSITION_SURFACE_PATH),
                     contents: source::tests_support::clean_transition_surface(),
+                },
+                // And two more, for the two pins issue #16's answers are held by:
+                // `effect-scheduled-fields` for the metadata ADR 0011 settled, and
+                // `integrity-check` for the checksum ADR 0010 settled. Both fail closed
+                // when the module they pin is absent, so a fixture without them describes
+                // a workspace the gate rejects for a reason no test here is about.
+                size::LayerSource {
+                    crate_name: "waymaker-core".to_owned(),
+                    path: format!("crates/{}", source::EFFECT_SCHEDULED_PATH),
+                    contents: source::tests_support::clean_record_module(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_CHECK_PATH),
+                    contents: source::tests_support::clean_checksum_module(),
                 },
             ],
             docs: docs::DocsInputs {

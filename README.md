@@ -266,6 +266,8 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
+| `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
+| `integrity-check` | `waymaker-flash`'s checksum module loses a catalogued polynomial or initial value, or grows a lookup table outside `#[cfg(test)]` |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 | `claude-md` | `CLAUDE.md` loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams |
@@ -273,6 +275,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `adr-structure` | an ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries a status outside the vocabulary |
 | `adr-index` | an ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist |
 | `settled-decisions` | the ADR recording design document §02 stops recording one of the eight decisions, or its headline |
+| `deferred-questions` | one of design document §16's five open questions loses its row in `CLAUDE.md`, a settled one's ADR is missing, unaccepted or does not claim it, or an ADR settles one the table still calls open |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge |
 | `missing-docs` | a crate root loses `#![warn(missing_docs)]`, allows it back, or a workspace member has no crate root the rule could run on |
 

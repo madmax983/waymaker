@@ -570,6 +570,347 @@ pub fn check_transition_surface(sources: &[crate::size::LayerSource]) -> Vec<Vio
     )
 }
 
+/// The file whose `EffectScheduled` field set [`EFFECT_SCHEDULED_FIELDS`] pins.
+pub const EFFECT_SCHEDULED_PATH: &str = "waymaker-core/src/record.rs";
+
+/// Every field `RecordRef::EffectScheduled` is allowed to carry, in sorted order.
+///
+/// Design document §16's third deferred question is "how much input metadata an
+/// `EffectScheduled` record stores beyond length and digest", and issue #16 states the cost
+/// that makes it a question: "every extra field is paid per effect, per record, in flash and
+/// in write amplification". ADR 0011 answers it — the sequence, the activity kind, the input
+/// length and a CRC-32 of the input, and nothing else — and this is that answer in a form a
+/// build can fail over.
+///
+/// A `deadline_ms`, a `priority`, a `retry_count` or a copy of the input itself is the shape
+/// this exists to stop. None of them breaks a layering rule, none needs a dependency, and
+/// each is four more bytes on every scheduled effect for the life of the format.
+///
+/// The pin fails in both directions. A field *removed* is a wire-format change on a record
+/// firmware in the field has already written; it is not a thing to discover from a failing
+/// round-trip test in `waymaker-flash`.
+///
+/// Sorted, so that the comparison below can be a set comparison and the list can be read.
+pub const EFFECT_SCHEDULED_FIELDS: &[&str] = &["input_crc", "input_len", "kind", "seq"];
+
+/// The file whose contents [`INTEGRITY_CHECK_PARAMETERS`] pins.
+pub const INTEGRITY_CHECK_PATH: &str = "waymaker-flash/src/crc.rs";
+
+/// The catalogued parameters the two checksums are required to keep.
+///
+/// Design document §16's first deferred question is "whether the default integrity check is
+/// CRC32C or a smaller table-free CRC implementation". ADR 0010 answers it with measurements
+/// taken on `thumbv6m-none-eabi`: the polynomial costs nothing either way — both bitwise
+/// loops assemble to 52 bytes — so the choice falls to which algorithm a host can check a
+/// device's journal against without reimplementing anything, and that is CRC-32/ISO-HDLC.
+///
+/// Pinned as the literal each parameter appears as, because the parameter *is* the
+/// algorithm: a reflected polynomial quietly changed from `0xEDB8_8320` to `0x82F6_3B78` is
+/// a different CRC that passes every round-trip test in this repository, and fails against
+/// every zlib in the world.
+pub const INTEGRITY_CHECK_PARAMETERS: &[(&str, &str)] = &[
+    ("CRC-16/CCITT-FALSE polynomial", "0x1021"),
+    ("CRC-16/CCITT-FALSE initial value", "0xFFFF"),
+    ("CRC-32/ISO-HDLC reflected polynomial", "0xEDB8_8320"),
+    ("CRC-32/ISO-HDLC initial and final xor", "0xFFFF_FFFF"),
+];
+
+/// Rule: a scheduled effect records exactly the metadata ADR 0011 settled on.
+///
+/// Scanned rather than parsed, like every rule in this module, and scanned over code with
+/// its comments and string literals stripped, so that a doc comment — which is full of
+/// colons — cannot add a field and a
+/// commented-out one cannot keep the pin green. The declaration is found by locating the
+/// `enum RecordRef` body first: `Self::EffectScheduled { .. }` appears in every `match` over
+/// the enum, and a scan that took the first mention would pin a pattern.
+#[must_use]
+pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "effect-scheduled-fields";
+    const KERNEL: &str = "waymaker-core";
+    const ENUM: &str = "enum RecordRef";
+    const VARIANT: &str = "EffectScheduled";
+
+    let Some(source) = find_source(sources, EFFECT_SCHEDULED_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {EFFECT_SCHEDULED_PATH} in the workspace, so the pinned field set is \
+                 checking nothing; \u{a7}16's third deferred question is how much metadata a \
+                 scheduled effect carries, and every extra field is paid per effect for the \
+                 life of the format"
+            ),
+        )];
+    };
+
+    let code = code_only(&source.contents);
+    let Some(body) = braced_body(&code, ENUM) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares no `{ENUM}`, so the pinned field set is \
+                 checking nothing"
+            ),
+        )];
+    };
+    let Some(variant) = braced_body(body, VARIANT) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{ENUM}` in {EFFECT_SCHEDULED_PATH} has no `{VARIANT}` variant with a field \
+                 list, so the pinned field set is checking nothing"
+            ),
+        )];
+    };
+
+    let declared = field_names(variant);
+    let pinned: BTreeSet<&str> = EFFECT_SCHEDULED_FIELDS.iter().copied().collect();
+    let found: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+    let mut violations = Vec::new();
+
+    for added in found.difference(&pinned) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`RecordRef::{VARIANT}` declares `{added}`, which is not in \
+                 EFFECT_SCHEDULED_FIELDS; ADR 0011 settled the metadata a scheduled effect \
+                 carries, and a field added here is paid per effect, per record, in flash \
+                 and in write amplification"
+            ),
+        ));
+    }
+    for removed in pinned.difference(&found) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`RecordRef::{VARIANT}` no longer declares `{removed}`, which \
+                 EFFECT_SCHEDULED_FIELDS pins; a field dropped is a wire-format change on a \
+                 record firmware in the field has already written"
+            ),
+        ));
+    }
+
+    violations
+}
+
+/// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
+///
+/// Two things. The algorithm parameters have to still be there, because a polynomial is the
+/// algorithm and a changed one passes every round-trip test in this repository. And the
+/// module has to declare no lookup table, because ADR 0010's measurement is what makes a
+/// table a decision: 64 bytes of rodata for a nibble table, 1024 for a byte table, against
+/// an 8 KiB incremental code-flash budget for the kernel and this adapter together.
+///
+/// `#[cfg(test)]` modules are skipped. `crc.rs` already holds a `const MESSAGE: [u8; 12]`
+/// for its bit-flip sweep, and a rule that could not tell a test fixture from a lookup table
+/// would be a rule that punishes testing.
+#[must_use]
+pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, INTEGRITY_CHECK_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "no {INTEGRITY_CHECK_PATH} in the workspace, so the integrity check is \
+                 checking nothing; \u{a7}16's first deferred question is which checksum the \
+                 format uses, and ADR 0010 answers it with a measurement"
+            ),
+        )];
+    };
+
+    let code = code_only(&without_test_modules(&source.contents));
+    let mut violations = Vec::new();
+
+    for (name, literal) in INTEGRITY_CHECK_PARAMETERS {
+        if !code.contains(literal) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} no longer contains `{literal}`, the {name}; a \
+                     checksum whose parameters changed is a different checksum, and it \
+                     passes every round-trip test in this repository"
+                ),
+            ));
+        }
+    }
+
+    for name in array_items(&code) {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_CHECK_PATH} declares `{name}` as an array, which is a lookup \
+                 table; ADR 0010 measured what one costs — 64 B of rodata for a nibble \
+                 table, 1024 B for a byte table, against an 8 KiB incremental code-flash \
+                 budget — so adding one is a superseding ADR, not an optimisation"
+            ),
+        ));
+    }
+
+    violations
+}
+
+/// The layer source whose path ends with `path`, if the workspace contributed one.
+///
+/// Path separators are normalised first: the gate runs on Windows too, and a pin that
+/// silently found nothing there would be a pin that passes by not looking.
+#[must_use]
+fn find_source<'a>(
+    sources: &'a [crate::size::LayerSource],
+    path: &str,
+) -> Option<&'a crate::size::LayerSource> {
+    sources
+        .iter()
+        .find(|source| source.path.replace('\\', "/").ends_with(path))
+}
+
+/// The body of the first `{ ... }` block opened after `header` appears in `code`.
+///
+/// Returns `None` when `header` is absent or opens no brace that closes before the end of
+/// the input, so a caller that cannot find what it pins reports that rather than pinning
+/// nothing.
+#[must_use]
+fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
+    let after = code.split_once(header).map(|(_, rest)| rest)?;
+    let open = after.find('{')?;
+    let body = after.get(open + 1..)?;
+
+    let mut depth = 1_u32;
+    for (index, character) in body.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return body.get(..index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `name:` field names declared directly in `body`, ignoring anything nested.
+///
+/// A path-qualified type is the case worth naming: `seq: crate::id::EffectSeq` must not read
+/// as a field called `crate`, so a `:` that is part of a `::` never ends a field name.
+#[must_use]
+fn field_names(body: &str) -> Vec<String> {
+    let characters: Vec<char> = body.chars().collect();
+    let mut names = Vec::new();
+    let mut depth = 0_u32;
+    let mut token = String::new();
+
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters.get(index).copied().unwrap_or(' ');
+        match character {
+            '{' | '(' | '[' | '<' => {
+                depth += 1;
+                token.clear();
+            }
+            '}' | ')' | ']' | '>' => {
+                depth = depth.saturating_sub(1);
+                token.clear();
+            }
+            ':' if depth == 0 => {
+                let doubled = characters.get(index + 1).copied() == Some(':');
+                if !doubled && !token.is_empty() {
+                    names.push(token.clone());
+                }
+                token.clear();
+                if doubled {
+                    index += 1;
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => token.push(c),
+            _ => token.clear(),
+        }
+        index += 1;
+    }
+
+    names
+}
+
+/// The names of `const` and `static` items in `code` whose type is an array.
+///
+/// Matched on the item header — `const NAME: [` or `static NAME: [` — which is what a lookup
+/// table looks like however it is initialised: a literal, a `const` block, or a call. A
+/// local `let` binding is not an item and is not matched; a table has to outlive the call
+/// to be a table.
+#[must_use]
+fn array_items(code: &str) -> Vec<String> {
+    code.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start();
+            let rest = rest
+                .strip_prefix("const ")
+                .or_else(|| rest.strip_prefix("static "))?;
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+            let (name, after) = rest.split_once(':')?;
+            after.trim_start().starts_with('[').then(|| {
+                name.trim()
+                    .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                    .to_owned()
+            })
+        })
+        .collect()
+}
+
+/// `contents` with every `#[cfg(test)]` block blanked out, line for line.
+///
+/// The same brace-depth scan `crate::size::public_functions` uses, for the same reason: a
+/// test helper is not code the firmware links. Lines are replaced rather than removed so
+/// that a line number reported against this text still lines up with the file.
+#[must_use]
+fn without_test_modules(contents: &str) -> String {
+    let mut kept = String::with_capacity(contents.len());
+    let mut depth: i32 = 0;
+    let mut test_block: Option<i32> = None;
+    let mut pending = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+        let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+
+        if !trimmed.starts_with("//") {
+            if trimmed.contains("#[cfg(test)]") {
+                pending = true;
+            }
+            if pending && opens > 0 {
+                test_block = Some(depth);
+                pending = false;
+            }
+        }
+
+        if test_block.is_none() && !pending {
+            kept.push_str(line);
+        }
+        kept.push('\n');
+
+        depth += opens - closes;
+        if let Some(started_at) = test_block
+            && depth <= started_at
+        {
+            test_block = None;
+        }
+    }
+
+    kept
+}
+
 /// The body both surface pins share: `path` declares exactly `pinned`, no more and no less.
 ///
 /// One function rather than two near-copies, because the failure this guards against is a
@@ -1679,12 +2020,293 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod deferred_answer_pins {
+    use super::*;
+
+    fn layer(path: &str, contents: &str) -> crate::size::LayerSource {
+        crate::size::LayerSource {
+            crate_name: path.split('/').next().unwrap_or("waymaker-core").to_owned(),
+            path: format!("crates/{path}"),
+            contents: contents.to_owned(),
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // `effect-scheduled-fields`: ADR 0011's answer, pinned.
+    // -----------------------------------------------------------------------------------
+
+    fn record_source(variant_body: &str) -> Vec<crate::size::LayerSource> {
+        vec![layer(
+            EFFECT_SCHEDULED_PATH,
+            &format!(
+                "pub enum RecordRef<'a> {{\n    RunStarted {{ input: &'a [u8] }},\n    \
+                 EffectScheduled {{{variant_body}}},\n    RunFailed {{ error: &'a [u8] }},\n}}\n"
+            ),
+        )]
+    }
+
+    /// The pinned field set, rendered as a variant body.
+    fn pinned_body() -> String {
+        EFFECT_SCHEDULED_FIELDS
+            .iter()
+            .map(|field| format!(" {field}: u32,"))
+            .collect::<Vec<String>>()
+            .concat()
+    }
+
+    #[test]
+    fn the_pinned_field_set_is_sorted_and_free_of_duplicates() {
+        let mut sorted = EFFECT_SCHEDULED_FIELDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, EFFECT_SCHEDULED_FIELDS);
+    }
+
+    #[test]
+    fn the_real_record_module_matches_the_pin() {
+        // The pin against the workspace it pins. Every other test here builds a fixture; if
+        // only those existed, the pin could describe a record that does not exist.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(EFFECT_SCHEDULED_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the record module should exist");
+        let violations = check_effect_scheduled_fields(&[layer(EFFECT_SCHEDULED_PATH, &contents)]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_variant_declaring_exactly_the_pinned_fields_passes() {
+        assert!(
+            check_effect_scheduled_fields(&record_source(&pinned_body())).is_empty(),
+            "the pinned set must be accepted"
+        );
+    }
+
+    #[test]
+    fn a_field_added_to_the_variant_is_reported() {
+        // §16: "every extra field is paid per effect, per record, in flash and in write
+        // amplification". That is the whole reason this is pinned.
+        let body = format!("{} deadline_ms: u32,", pinned_body());
+        let violations = check_effect_scheduled_fields(&record_source(&body));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "effect-scheduled-fields" && v.detail.contains("deadline_ms")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_removed_from_the_variant_is_reported() {
+        let Some(first) = EFFECT_SCHEDULED_FIELDS.first() else {
+            return;
+        };
+        let body = pinned_body().replace(&format!(" {first}: u32,"), "");
+        let violations = check_effect_scheduled_fields(&record_source(&body));
+        assert!(
+            violations.iter().any(|v| v.detail.contains(*first)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_record_module_fails_closed() {
+        let violations = check_effect_scheduled_fields(&[]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "effect-scheduled-fields");
+    }
+
+    #[test]
+    fn a_record_module_with_no_enum_fails_closed() {
+        // The pin checking nothing is the failure every rule here is written to avoid.
+        let violations =
+            check_effect_scheduled_fields(&[layer(EFFECT_SCHEDULED_PATH, "pub struct Nothing;\n")]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].detail.contains("RecordRef"), "{violations:?}");
+    }
+
+    #[test]
+    fn an_enum_without_the_variant_fails_closed() {
+        let violations = check_effect_scheduled_fields(&[layer(
+            EFFECT_SCHEDULED_PATH,
+            "pub enum RecordRef<'a> {\n    RunStarted { input: &'a [u8] },\n}\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("EffectScheduled"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_named_only_in_a_comment_or_a_string_does_not_count() {
+        // Every scan in this module reads `code_only`, and this is why: a doc comment on a
+        // field is full of colons, and a rule that read them would pin the prose.
+        let body = format!(
+            "{} /* deadline_ms: u32, */ \n /// deadline_ms: u32,\n",
+            pinned_body()
+        );
+        assert!(
+            check_effect_scheduled_fields(&record_source(&body)).is_empty(),
+            "a commented-out field is not a field"
+        );
+    }
+
+    #[test]
+    fn a_pattern_match_on_the_variant_is_not_read_as_its_declaration() {
+        // `RecordRef::EffectScheduled { .. }` appears in every `match` over the enum. The
+        // scan has to find the declaration, not the first mention.
+        let source = format!(
+            "pub enum RecordRef<'a> {{\n    EffectScheduled {{{}}},\n}}\n\
+             impl RecordRef<'_> {{\n    pub const fn kind(&self) -> u8 {{\n        \
+             match self {{ Self::EffectScheduled {{ .. }} => 2 }}\n    }}\n}}\n",
+            pinned_body()
+        );
+        assert!(
+            check_effect_scheduled_fields(&[layer(EFFECT_SCHEDULED_PATH, &source)]).is_empty(),
+            "a match arm is not a declaration"
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_field_type_does_not_add_a_field() {
+        // `seq: crate::id::EffectSeq` must not be read as a field called `crate`.
+        let body = EFFECT_SCHEDULED_FIELDS
+            .iter()
+            .map(|field| format!(" {field}: crate::id::Thing,"))
+            .collect::<Vec<String>>()
+            .concat();
+        assert!(
+            check_effect_scheduled_fields(&record_source(&body)).is_empty(),
+            "a path-qualified type is not a field"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // `integrity-check`: ADR 0010's answer, pinned.
+    // -----------------------------------------------------------------------------------
+
+    /// A checksum module carrying every pinned parameter and no table.
+    fn clean_checksums() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! Two checksums.\n");
+        for (index, (name, literal)) in INTEGRITY_CHECK_PARAMETERS.iter().enumerate() {
+            let _ = writeln!(
+                source,
+                "// {name}\npub(crate) const fn parameter_{index}() -> u32 {{ {literal} }}"
+            );
+        }
+        source
+    }
+
+    #[test]
+    fn the_real_checksum_module_matches_the_pin() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(INTEGRITY_CHECK_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the checksum module should exist");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &contents)]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_table_free_checksum_module_passes() {
+        assert!(
+            check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &clean_checksums())]).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_missing_checksum_module_fails_closed() {
+        let violations = check_integrity_check(&[]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "integrity-check");
+    }
+
+    #[test]
+    fn a_lookup_table_is_reported() {
+        // ADR 0010's measured decision: a 256-entry table is 1024 B of rodata against an
+        // 8 KiB incremental budget, and a nibble table 64 B. Either is a decision, not an
+        // optimisation somebody slips in.
+        let source = format!(
+            "{}static TABLE: [u32; 256] = [0; 256];\n",
+            clean_checksums()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("TABLE")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_lookup_table_is_reported_too() {
+        let source = format!("{}const NIBBLE: [u32; 16] = [0; 16];\n", clean_checksums());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_in_a_test_module_is_not_a_lookup_table() {
+        // `crc.rs` already holds a `const MESSAGE: [u8; 12]` fixture for the bit-flip
+        // sweep. A test fixture is not code the firmware links, and a rule that could not
+        // tell the difference would be a rule that punishes testing.
+        let source = format!(
+            "{}#[cfg(test)]\nmod tests {{\n    const MESSAGE: [u8; 12] = [0; 12];\n}}\n",
+            clean_checksums()
+        );
+        assert!(
+            check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]).is_empty(),
+            "a test fixture is not a lookup table"
+        );
+    }
+
+    #[test]
+    fn a_dropped_algorithm_parameter_is_reported() {
+        // The other half of the answer: §16 asked *which* CRC, and the catalogued
+        // polynomial is what makes the answer checkable against an implementation nothing
+        // in this repository produced.
+        let Some((name, literal)) = INTEGRITY_CHECK_PARAMETERS.first() else {
+            return;
+        };
+        let source = clean_checksums().replace(literal, "0xDEAD_BEEF");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains(name) && v.detail.contains(literal)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_named_only_in_a_comment_does_not_count() {
+        let Some((_, literal)) = INTEGRITY_CHECK_PARAMETERS.first() else {
+            return;
+        };
+        let source = clean_checksums().replace(literal, &format!("/* {literal} */ 0xDEAD_BEEF"));
+        assert!(
+            !check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]).is_empty(),
+            "a polynomial in a comment is not a polynomial"
+        );
+    }
+}
+
 /// Fixtures describing a replay module that does not exist on disk.
 #[cfg(test)]
 pub mod tests_support {
     use std::collections::BTreeSet;
 
-    use super::{REPLAY_SURFACE, TRANSITION_SURFACE};
+    use super::{
+        EFFECT_SCHEDULED_FIELDS, INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, TRANSITION_SURFACE,
+    };
 
     /// A module declaring exactly `pinned` and nothing else.
     ///
@@ -1711,6 +2333,43 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_transition_surface() -> String {
         surface("A transition module.", TRANSITION_SURFACE)
+    }
+
+    /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
+    ///
+    /// Rendered from the pin for the same reason the surfaces above are: a field added to
+    /// the pin without the real record gaining it should fail against the real workspace,
+    /// not here.
+    #[must_use]
+    pub fn clean_record_module() -> String {
+        use std::fmt::Write as _;
+
+        let mut fields = String::new();
+        for field in EFFECT_SCHEDULED_FIELDS {
+            let _ = writeln!(fields, "        {field}: u32,");
+        }
+        format!(
+            "//! A record module.\npub enum RecordRef<'a> {{\n    EffectScheduled {{\n{fields}\
+             \x20   }},\n}}\n"
+        )
+    }
+
+    /// A checksum module carrying every pinned parameter and declaring no lookup table.
+    ///
+    /// `pub(crate)`, like the real one, so that `size-probe-reach` does not demand a probe
+    /// call for a fixture.
+    #[must_use]
+    pub fn clean_checksum_module() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! Two checksums.\n");
+        for (index, (name, literal)) in INTEGRITY_CHECK_PARAMETERS.iter().enumerate() {
+            let _ = writeln!(
+                source,
+                "// {name}\npub(crate) const fn parameter_{index}() -> u32 {{ {literal} }}"
+            );
+        }
+        source
     }
 
     /// Probe source calling every name both pins list, for the clean-workspace fixture.

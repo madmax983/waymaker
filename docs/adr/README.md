@@ -18,6 +18,8 @@ be superseded.
 | [0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md) | The record frame is checksummed twice, and the kernel owns none of it | accepted |
 | [0008](0008-the-replay-cursor-is-pumped-by-its-caller.md) | The replay cursor is pumped by its caller and holds no page | accepted |
 | [0009](0009-the-transition-table-is-a-machine-that-owns-the-cursor.md) | The transition table is a machine that owns the cursor, and divergence is terminal | accepted |
+| [0010](0010-the-integrity-check-is-catalogued-and-table-free.md) | The integrity check is catalogued and table-free | accepted |
+| [0011](0011-a-scheduled-effect-records-a-length-and-a-digest.md) | A scheduled effect records a length and a digest, and nothing more | accepted |
 
 ## Reading the numbers
 
@@ -34,7 +36,7 @@ of these are older than their numbers suggest:
   to have an ADR and this one turned out not to.
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
-→ 0009.
+→ 0009 → 0010 → 0011.
 
 ## Writing one
 
@@ -49,6 +51,22 @@ number, fill it in, and add a row to the table above.
   `deprecated` / `superseded` (`adr-structure`);
 - adds an ADR that this index does not link, or links one that does not exist
   (`adr-index`).
+
+## Answering a deferred question
+
+Design document §16 leaves five questions open, and
+[`xtask::docs::DEFERRED_QUESTIONS`](../../xtask/src/docs.rs) is the table that tracks them.
+An ADR that settles one carries the line
+
+```text
+Settles deferred question: `the-question-id`
+```
+
+and the table's row for that id changes from `Open` to `Settled` naming the ADR file. The
+`deferred-questions` rule checks both directions: a settled question whose ADR does not
+claim it, and an open question an ADR already answers, each fail a pull request. The marker
+is a line rather than a judgement about the prose, because "this ADR is about the integrity
+check" is a thing a reader concludes and a thing a rule cannot.
 
 A decision that is revisited gets a **new** ADR that names what it supersedes. Editing an
 accepted ADR to say something else turns the record into a snapshot of today's opinion,
