@@ -685,11 +685,12 @@ pub fn check_empty_default_features(graph: &PackageGraph) -> Vec<Violation> {
         .collect()
 }
 
-/// Rule: every workspace member is either a firmware layer or declared host tooling.
+/// Rule: every workspace member is a firmware layer, declared host tooling, a measurement
+/// crate, or declared test support.
 ///
-/// Without this, a fourth crate added to the workspace is subject to no rule at all: it
-/// can be `std`, depend on Embassy, and skip the workspace lints, because every other
-/// rule iterates [`LAYERS`] and simply never looks at it.
+/// Without this, a fifth crate added to the workspace is subject to no rule at all: it can
+/// be `std`, depend on Embassy, and skip the workspace lints, because every other rule
+/// iterates [`LAYERS`] and simply never looks at it.
 #[must_use]
 pub fn check_workspace_membership(graph: &PackageGraph) -> Vec<Violation> {
     graph
@@ -705,12 +706,13 @@ pub fn check_workspace_membership(graph: &PackageGraph) -> Vec<Violation> {
             };
             let known = policy::layer(&package.name).is_some()
                 || policy::HOST_TOOLS.contains(&package.name.as_str())
-                || policy::MEASUREMENT_CRATES.contains(&package.name.as_str());
+                || policy::MEASUREMENT_CRATES.contains(&package.name.as_str())
+                || policy::TEST_SUPPORT_CRATES.contains(&package.name.as_str());
             (!known).then(|| {
                 Violation::new(
                     "workspace-membership",
                     package.name.clone(),
-                    "is a workspace member but is neither a layer, declared host tooling, nor a measurement fixture; add a row to policy::LAYERS, policy::HOST_TOOLS or policy::MEASUREMENT_CRATES",
+                    "is a workspace member but is neither a layer, declared host tooling, a measurement fixture, nor declared test support; add a row to policy::LAYERS, policy::HOST_TOOLS, policy::MEASUREMENT_CRATES or policy::TEST_SUPPORT_CRATES",
                 )
             })
         })

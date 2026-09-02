@@ -77,6 +77,7 @@ pub const RULES: &[&str] = &[
     "settled-decisions",
     "size-probe",
     "size-probe-reach",
+    "storage-contract",
     "toolchain-targets",
     "transition-surface",
     "workspace-lints",
@@ -230,6 +231,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
+    violations.extend(source::check_storage_contract(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
@@ -759,6 +761,7 @@ mod tests {
             "settled-decisions",
             "size-probe",
             "size-probe-reach",
+            "storage-contract",
             "toolchain-targets",
             "transition-surface",
             "workspace-lints",
@@ -858,6 +861,13 @@ mod tests {
                 // through, and the type the shipped algorithms are bound to. It fails
                 // closed when the module is absent, for the same reason as the three
                 // above.
+                // And the storage contract of §12, which `storage-contract` pins for the
+                // same reason: renamed or deleted, the pin checks nothing.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
+                    contents: source::tests_support::clean_storage_contract(),
+                },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::INTEGRITY_BINDING_PATH),

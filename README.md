@@ -262,7 +262,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `kernel-owns-no-encoding` | a `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>` — which needs no dependency for the previous rule to catch |
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
-| `workspace-membership` | a workspace member is neither a layer, declared host tooling, nor a measurement fixture |
+| `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, nor declared test support |
 | `no-build-scripts` | a firmware crate has a `build.rs` |
 | `empty-default-features` | a firmware crate has a non-empty `default` feature |
 | `crate-attributes` | a crate root drops `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std`/`alloc` |
@@ -276,6 +276,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
 | `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
+| `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or the codec stops routing its seals through the trait |

@@ -365,6 +365,55 @@ Capacity is explicit. Waymaker reserves enough tail space for a terminal record 
 `continue_as_new`, so ordinary effect scheduling fails early with `HistoryNearCapacity`; the
 runtime never overwrites committed history to make room.
 
+## Crash injection
+
+Design document §15. Every guarantee drawn above is a statement about what survives a reset,
+so the way they are checked is a picture too: a write sequence is recorded once with nothing
+going wrong, and then re-run once for every point at which it could have.
+
+<!-- diagram: crash-injection -->
+
+```mermaid
+flowchart LR
+  writer(["a writer over any StableStorage"])
+  record["Record the write sequence<br/>program · erase · barrier"]
+  enumerate["Enumerate every crash point"]
+  rerun["Re-run the writer, one injection armed"]
+  image["The media a reset would find"]
+  oracle{{"verify_recovery"}}
+
+  writer --> record --> enumerate --> rerun --> image --> oracle
+
+  subgraph faults ["What is enumerated, never sampled"]
+    f1["Torn write at every byte"]
+    f2["Interrupted erase at every erase block"]
+    f3["Power loss before and after every barrier"]
+    f4["Failed program or erase, writer carries on"]
+  end
+  enumerate --- faults
+
+  subgraph states ["What each record ended as"]
+    s1["Attempted<br/>recovery must not produce it"]
+    s2["PossiblyDurable<br/>either answer is legal"]
+    s3["Acknowledged<br/>recovery must produce it"]
+  end
+  oracle --- states
+
+  classDef step fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
+  classDef stopnode fill:#ffe9e9,stroke:#c0392b,color:#3f1212;
+  class writer,record,enumerate,rerun,image,oracle step;
+  class f1,f2,f3,f4,s2 note;
+  class s1,s3 stopnode;
+```
+
+The model lives in `waymaker-fault`, which is a workspace member and not a layer: it depends
+on `waymaker-flash` for §12's storage contract, models media in `Vec<u8>`, and is excluded
+from `default-members` so that no firmware target ever builds it. It names no record type,
+which is what lets the same harness drive the record codec, the effect protocol, and a
+writer with a byte layout of its own — see
+[ADR 0013](adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
+
 ## See also
 
 - [CLAUDE.md](../CLAUDE.md) — the invariants and layering rules a contributor works to.

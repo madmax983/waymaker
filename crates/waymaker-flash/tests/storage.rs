@@ -39,17 +39,45 @@ fn a_zero_unit_is_not_a_geometry() {
 }
 
 #[test]
-fn units_that_do_not_nest_are_not_a_geometry() {
-    // A capacity that is not whole erase blocks, an erase block that is not whole program
-    // units, and a program unit that is not whole read units. Each would leave a byte of
-    // media no legal operation could name.
+fn a_unit_that_is_not_a_power_of_two_is_not_a_geometry() {
+    // Not a taste: every alignment check in this module is `offset & (unit - 1)`, and that
+    // identity holds only for powers of two. `thumbv6m-none-eabi` has no divider, so a
+    // geometry that permitted a 12-byte program unit would link `__aeabi_uidivmod` and
+    // cost 408 B of an 8 KiB budget to describe a device nobody sells.
     for candidate in [
-        Geometry::new(8000, 4096, 8, 1),
         Geometry::new(8192, 4096, 12, 8),
         Geometry::new(8192, 4096, 8, 3),
+        Geometry::new(8192, 3000, 8, 1),
+    ] {
+        assert_eq!(candidate, Err(GeometryError::UnitIsNotAPowerOfTwo));
+    }
+}
+
+#[test]
+fn units_that_do_not_nest_are_not_a_geometry() {
+    // A capacity that is not whole erase blocks, an erase block smaller than a program
+    // unit, and a program unit smaller than a read unit. Each would leave a byte of media
+    // no legal operation could name.
+    for candidate in [
+        Geometry::new(8000, 4096, 8, 1),
+        Geometry::new(8192, 4, 8, 1),
+        Geometry::new(8192, 4096, 1, 4),
     ] {
         assert_eq!(candidate, Err(GeometryError::UnitsDoNotNest));
     }
+}
+
+#[test]
+fn a_capacity_need_not_be_a_power_of_two_as_long_as_it_is_whole_blocks() {
+    let Ok(geometry) = Geometry::new(12288, 4096, 8, 1) else {
+        unreachable!("12288 is three whole 4096-byte blocks")
+    };
+    assert_eq!(geometry.erase_blocks(), 3);
+    assert_eq!(geometry.validate_erase(8192, 4096), Ok(()));
+    assert_eq!(
+        geometry.validate_erase(8192, 8192),
+        Err(GeometryError::OutOfBounds)
+    );
 }
 
 #[test]
@@ -144,6 +172,7 @@ fn an_offset_and_a_length_that_overflow_are_out_of_bounds_rather_than_wrapping()
 fn every_geometry_error_carries_a_message_and_they_are_all_different() {
     let all = [
         GeometryError::ZeroUnit,
+        GeometryError::UnitIsNotAPowerOfTwo,
         GeometryError::UnitsDoNotNest,
         GeometryError::MisalignedOffset,
         GeometryError::MisalignedLength,

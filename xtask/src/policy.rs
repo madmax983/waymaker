@@ -66,6 +66,28 @@ pub const HOST_TOOLS: &[&str] = &["xtask"];
 /// to it.
 pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 
+/// Crates that exist to test the layers, and are never linked into firmware.
+///
+/// Not host tooling — [`HOST_TOOLS`] is the gate itself — and not a measurement crate: a
+/// test-support crate is a library the tests of other crates depend on. `waymaker-fault` is
+/// the in-memory storage model and crash injector of issue
+/// [#18](https://github.com/madmax983/waymaker/issues/18): it depends on `waymaker-flash`
+/// for design document §12's storage contract, models media in `Vec<u8>`, and is kept out
+/// of `default-members` so that no firmware target ever builds it.
+///
+/// Why the category exists rather than the crate being a fourth layer: a layer's public
+/// functions must all be reached by the size probe, so an exhaustive host-side crash
+/// enumerator listed in [`LAYERS`] would be charged against an 8 KiB code-flash budget it
+/// has nothing to do with. See
+/// [ADR 0013](https://github.com/madmax983/waymaker/blob/main/docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
+///
+/// What this category does *not* license is a layer depending on one of these, in any
+/// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
+/// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
+/// `waymaker-fault` is still a violation. The harness sits above the layers and the tests
+/// that drive it live with it.
+pub const TEST_SUPPORT_CRATES: &[&str] = &["waymaker-fault"];
+
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";
 
@@ -176,6 +198,40 @@ mod tests {
     fn host_tools_are_not_layers() {
         for tool in HOST_TOOLS {
             assert!(layer(tool).is_none(), "{tool} must not also be a layer");
+        }
+    }
+
+    #[test]
+    fn test_support_crates_are_none_of_the_other_three_categories() {
+        for crate_name in TEST_SUPPORT_CRATES {
+            assert!(
+                layer(crate_name).is_none(),
+                "{crate_name} must not also be a layer"
+            );
+            assert!(
+                !HOST_TOOLS.contains(crate_name),
+                "{crate_name} must not also be host tooling"
+            );
+            assert!(
+                !MEASUREMENT_CRATES.contains(crate_name),
+                "{crate_name} must not also be a measurement crate"
+            );
+        }
+    }
+
+    #[test]
+    fn no_layer_may_reach_a_test_support_crate_in_any_dependency_kind() {
+        // The harness depends on `waymaker-flash`. If a layer were also allowed to depend
+        // on the harness the workspace would have a cycle, and the reason it does not is
+        // that this allowance does not exist — asserted rather than remembered.
+        for spec in LAYERS {
+            for allowed in spec.allowed_dependencies() {
+                assert!(
+                    !TEST_SUPPORT_CRATES.contains(&allowed),
+                    "{} may depend on the test-support crate {allowed}",
+                    spec.name
+                );
+            }
         }
     }
 
