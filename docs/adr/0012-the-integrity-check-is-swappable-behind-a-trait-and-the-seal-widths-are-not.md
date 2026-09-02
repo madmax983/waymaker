@@ -98,11 +98,17 @@ are all in `tests/integrity.rs` and all three agree over every input length up t
 
 **The rejected candidate ships as a test, not as firmware.** CRC-32C is implemented in
 `crates/waymaker-flash/tests/integrity.rs` in all three forms ADR 0010 measured — bitwise,
-nibble table, byte table — and the bitwise one is anchored to its published check value
-`0xE306_9283`. That is §16's other candidate, made runnable: the `.rodata` figures issue #17
-asks to be measured (64 B and 1024 B) are properties of the two table forms and of nothing
-else, so a repository that held neither had described its own measurement rather than kept
-it. CRC-16/ARC is there too, anchored to `0xBB3D`; it is not a §16 candidate but a second
+nibble table, byte table, the last two with their fold tables as `static` arrays generated at
+compile time — and the bitwise one is anchored to its published check value `0xE306_9283`.
+That is §16's other candidate, made runnable: the `.rodata` figures issue #17 asks to be
+measured (64 B and 1024 B) are properties of the two table forms and of nothing else, so a
+repository that held neither had described its own measurement rather than kept it. What
+they are not is the compilation unit those figures were read off — that is a `staticlib` for
+`thumbv6m-none-eabi`, and ADR 0010's
+["Reproducing it"](0010-the-integrity-check-is-catalogued-and-table-free.md#reproducing-it)
+now says so rather than implying `cargo build` reaches a test target. Turning the
+measurement into a gated row is
+[issue #61](https://github.com/madmax983/waymaker/issues/61). CRC-16/ARC is there too, anchored to `0xBB3D`; it is not a §16 candidate but a second
 *differing* header hook, without which no test could tell whether the codec consults
 `header_check` at all.
 

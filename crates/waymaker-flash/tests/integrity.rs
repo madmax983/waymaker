@@ -93,7 +93,7 @@ const fn crc32c(bytes: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-/// CRC-32C folded four bits at a time against a sixteen-entry table.
+/// CRC-32C folded four bits at a time against a sixteen-entry `static` table.
 ///
 /// One of the two table-driven candidates ADR 0010 measured — 52 B of `.text` and **64 B of
 /// `.rodata`**, 21 cycles per byte against the bitwise loop's 93. Present so that the
@@ -102,60 +102,86 @@ const fn crc32c(bytes: &[u8]) -> u32 {
 /// implementation of an algorithm and not a different one" — is checked by
 /// [`every_candidate_computes_the_same_crc32c`] rather than asserted.
 fn crc32c_nibble(bytes: &[u8]) -> u32 {
-    // Generated from the bitwise loop rather than pasted, so the table cannot disagree with
-    // the polynomial it is meant to be a folding of.
-    let mut table = [0_u32; 16];
-    for (index, slot) in table.iter_mut().enumerate() {
-        let mut crc = u32::try_from(index).unwrap_or(0);
-        for _ in 0..4 {
-            crc = if crc & 1 == 0 {
-                crc >> 1
-            } else {
-                (crc >> 1) ^ 0x82F6_3B78
-            };
-        }
-        *slot = crc;
-    }
-
     let mut crc: u32 = 0xFFFF_FFFF;
     for byte in bytes {
         for nibble in [u32::from(*byte) & 0xF, u32::from(*byte) >> 4] {
             let index = usize::try_from((crc ^ nibble) & 0xF).unwrap_or(0);
-            // `get` rather than an index: a helper in an integration test is not exempt
-            // from the workspace's `indexing_slicing` denial, and a fold that silently used
-            // zero on an out-of-range index would be a candidate that agreed with nothing.
-            crc = (crc >> 4) ^ table.get(index).copied().unwrap_or(0);
+            crc = (crc >> 4) ^ fold(&CRC32C_NIBBLE_TABLE, index);
         }
     }
     crc ^ 0xFFFF_FFFF
 }
 
-/// CRC-32C folded a byte at a time against a 256-entry table.
+/// CRC-32C folded a byte at a time against a 256-entry `static` table.
 ///
 /// The other table-driven candidate: 44 B of `.text` and **1024 B of `.rodata`** — 12.5% of
 /// design document §04's entire 8 KiB incremental code-flash budget — for 15 cycles per
 /// byte. That ratio is the whole of ADR 0010's decision, and this is the implementation the
 /// number was taken from.
 fn crc32c_byte(bytes: &[u8]) -> u32 {
-    let mut table = [0_u32; 256];
-    for (index, slot) in table.iter_mut().enumerate() {
-        let mut crc = u32::try_from(index).unwrap_or(0);
-        for _ in 0..8 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in bytes {
+        let index = usize::try_from((crc ^ u32::from(*byte)) & 0xFF).unwrap_or(0);
+        crc = (crc >> 8) ^ fold(&CRC32C_BYTE_TABLE, index);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// `table[index]`, or zero — which cannot happen, because every caller masks the index to
+/// the table's length.
+///
+/// A helper in an integration test is not exempt from the workspace's `indexing_slicing`
+/// denial, and a fold that silently used zero would be a candidate that agreed with nothing —
+/// which is why `every_candidate_computes_the_same_crc32c` compares all three.
+fn fold<const N: usize>(table: &[u32; N], index: usize) -> u32 {
+    table.get(index).copied().unwrap_or(0)
+}
+
+/// The nibble table, folded four bits at a time. **64 B of `.rodata`.**
+///
+/// A `static` generated at compile time from the bitwise loop, rather than a `let mut` built
+/// on every call: Codex pointed out on PR #60 that a table constructed at runtime is not the
+/// lookup table ADR 0010's `.rodata` figures describe, and it was right — the first version
+/// of these candidates measured nothing of the sort.
+static CRC32C_NIBBLE_TABLE: [u32; 16] = crc32c_table();
+
+/// The byte table. **1024 B of `.rodata`** — 12.5% of design document §04's entire 8 KiB
+/// incremental code-flash budget, which is the number ADR 0010's decision turns on.
+static CRC32C_BYTE_TABLE: [u32; 256] = crc32c_table();
+
+/// A CRC-32C fold table of `N` entries, generated from the bitwise loop.
+///
+/// Generated rather than pasted so that a table cannot disagree with the polynomial it is
+/// meant to be a folding of, and `const` so that it is `.rodata` rather than a computation.
+/// `N` decides how many bits are folded at a time: 16 entries is four bits, 256 is eight.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the index is the loop counter, bounded by the array's own length"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "`N` is 16 or 256, so the entry index cannot exceed a u32; `try_from` is not \
+              available in a const fn"
+)]
+const fn crc32c_table<const N: usize>() -> [u32; N] {
+    let mut table = [0_u32; N];
+    let bits = if N == 16 { 4 } else { 8 };
+    let mut index = 0;
+    while index < N {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < bits {
             crc = if crc & 1 == 0 {
                 crc >> 1
             } else {
                 (crc >> 1) ^ 0x82F6_3B78
             };
+            bit += 1;
         }
-        *slot = crc;
+        table[index] = crc;
+        index += 1;
     }
-
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for byte in bytes {
-        let index = usize::try_from((crc ^ u32::from(*byte)) & 0xFF).unwrap_or(0);
-        crc = (crc >> 8) ^ table.get(index).copied().unwrap_or(0);
-    }
-    crc ^ 0xFFFF_FFFF
+    table
 }
 
 /// CRC-16/ARC: reflected polynomial `0xA001`, initial value zero, no final xor. Published
