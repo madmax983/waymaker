@@ -440,11 +440,12 @@ pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Ve
                 ));
             }
         }
+        let headers = impl_headers(&code);
         for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
             let needle = marker.replace(' ', "");
-            let implemented = code.lines().any(|line| {
-                let line = erase_lifetimes(line).replace(' ', "");
-                implements_trait(&line, &needle)
+            let implemented = headers.iter().any(|header| {
+                let header = erase_lifetimes(header).replace(' ', "");
+                implements_trait(&header, &needle)
             });
             if implemented {
                 violations.push(Violation::new(
@@ -502,16 +503,95 @@ fn implements_trait(line: &str, needle: &str) -> bool {
     } else {
         rest
     };
-    after_generics.starts_with(needle)
+    strip_path_qualifiers(after_generics).starts_with(needle)
 }
 
-/// Drops `//` comments so that prose describing a construct is not read as the construct.
+/// Drops comments so that prose describing a construct is not read as the construct.
+///
+/// Both forms. `waymaker-core` explains at length what it does *not* do, and a migration
+/// note left behind as `/* the old code used u32::from_le_bytes */` is documentation rather
+/// than encoding — a scan that read it would fail a build for a comment, which is how a
+/// rule gets an `allow` written next to it.
+///
+/// Block comments are removed first, because a `//` inside one is not a line comment, and
+/// line comments second, because a `/*` inside one opens nothing.
 fn strip_comments(contents: &str) -> String {
-    contents
+    let mut without_blocks = String::with_capacity(contents.len());
+    let mut rest = contents;
+    while let Some(open) = rest.find("/*") {
+        without_blocks.push_str(rest.get(..open).unwrap_or_default());
+        let after = rest.get(open.saturating_add(2)..).unwrap_or_default();
+        // Newlines are kept so that the line-comment pass below still sees line boundaries,
+        // and so a violation's line count does not shift under a block comment.
+        // An unterminated block comment does not compile, so the rest of the file is not
+        // code either way: it is all skipped and nothing is left to scan.
+        let (skipped, tail) = after.find("*/").map_or((after, ""), |close| {
+            (
+                after.get(..close).unwrap_or_default(),
+                after.get(close.saturating_add(2)..).unwrap_or_default(),
+            )
+        });
+        for _ in skipped.matches('\n') {
+            without_blocks.push('\n');
+        }
+        rest = tail;
+    }
+    without_blocks.push_str(rest);
+
+    without_blocks
         .lines()
         .map(|line| line.split("//").next().unwrap_or(""))
         .collect::<Vec<&str>>()
         .join("\n")
+}
+
+/// Every `impl` header in `code`, flattened to one line each.
+///
+/// `rustfmt` breaks a long header across lines — `impl<'a>` on one and
+/// `TryFrom<&'a [u8]> for RecordRef<'a>` on the next — and a scan that looked at lines
+/// individually would find no line carrying both `impl` and the trait. So the whole file is
+/// flattened first and each header is taken from its `impl` token to the `{` or `;` that
+/// ends it. Ordinary formatting cannot hide a header from this.
+fn impl_headers(code: &str) -> Vec<String> {
+    let flattened = code.split_whitespace().collect::<Vec<&str>>().join(" ");
+    let mut headers = Vec::new();
+    let mut rest = flattened.as_str();
+
+    while let Some(at) = rest.find("impl") {
+        let preceded_by_identifier = rest
+            .get(..at)
+            .and_then(|before| before.chars().next_back())
+            .is_some_and(|character| character.is_alphanumeric() || character == '_');
+        let from_impl = rest.get(at..).unwrap_or_default();
+        if !preceded_by_identifier {
+            let brace = from_impl.find('{').unwrap_or(from_impl.len());
+            let end = from_impl.find(';').map_or(brace, |semi| semi.min(brace));
+            headers.push(from_impl.get(..end).unwrap_or_default().to_owned());
+        }
+        rest = from_impl.get("impl".len()..).unwrap_or_default();
+    }
+    headers
+}
+
+/// Path qualifiers that a trait may be written with and that mean nothing to this scan.
+///
+/// `impl core::convert::TryFrom<&[u8]> for RecordRef<'_>` is the ordinary fully qualified
+/// spelling of the very thing the rule rejects, and a bare `starts_with` would not see it.
+const TRAIT_PATH_PREFIXES: &[&str] = &["::", "core::", "std::", "convert::"];
+
+/// Drops leading path qualification from a whitespace-free trait position.
+fn strip_path_qualifiers(mut trait_position: &str) -> &str {
+    let mut stripped = true;
+    while stripped {
+        stripped = false;
+        for prefix in TRAIT_PATH_PREFIXES {
+            if let Some(rest) = trait_position.strip_prefix(prefix) {
+                trait_position = rest;
+                stripped = true;
+            }
+        }
+    }
+    trait_position
 }
 
 /// Removes `'a`-style lifetimes so an `impl` header can be matched without them.
@@ -810,6 +890,84 @@ mod tests {
 ",
         );
         assert_eq!(check_kernel_owns_no_encoding(&elided).len(), 1);
+    }
+
+    #[test]
+    fn a_qualified_trait_path_is_still_the_trait() {
+        // `impl core::convert::TryFrom<&[u8]> for RecordRef<'_>` is the ordinary fully
+        // qualified spelling of the exact thing this rule rejects. A decoder written that
+        // way need contain none of the endianness names above — it only has to wrap the
+        // borrowed slice — so a scan that compared the trait position literally would let
+        // the whole rule through.
+        for qualified in [
+            "impl core::convert::TryFrom<&[u8]> for RecordRef<'_> {",
+            "impl ::core::convert::TryFrom<&[u8]> for RecordRef<'_> {",
+            "impl std::convert::From<&[u8]> for RecordKind {",
+            "impl convert::From<&[u8]> for RecordKind {",
+        ] {
+            assert_eq!(
+                check_kernel_owns_no_encoding(&kernel_source(qualified)).len(),
+                1,
+                "{qualified}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_rustfmt_split_across_lines_is_still_one_header() {
+        // `rustfmt` breaks a long header, and neither line then carries both `impl` and the
+        // trait. Ordinary formatting must not be a way past the rule.
+        let split = kernel_source(
+            "impl<'a>\n    TryFrom<&'a [u8]>\n    for RecordRef<'a>\n{\n    type Error = ();\n}\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&split).len(), 1);
+
+        let split_and_qualified = kernel_source(
+            "impl<'a>\n    core::convert::TryFrom<&'a [u8]>\n    for RecordRef<'a>\n{\n}\n",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&split_and_qualified).len(), 1);
+    }
+
+    #[test]
+    fn a_block_comment_about_a_construct_is_not_the_construct() {
+        // The same rule as for `//`, and the same reason: a rule that failed a build over a
+        // migration note is a rule somebody writes an `allow` next to.
+        let noted = kernel_source(
+            "/* the old code used u32::from_le_bytes here */\npub struct RecordKind(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&noted).is_empty());
+
+        let multi_line = kernel_source(
+            "/*\n * A decoder would need to_le_bytes, and lives one layer up.\n */\npub struct K(pub u8);\n",
+        );
+        assert!(check_kernel_owns_no_encoding(&multi_line).is_empty());
+
+        // A `//` inside a block comment does not end it, and a `/*` inside a line comment
+        // opens nothing — so the two passes have to happen in that order.
+        let nested = kernel_source("/* // from_le_bytes */\npub struct K(pub u8);\n");
+        assert!(check_kernel_owns_no_encoding(&nested).is_empty());
+        let mentioned = kernel_source("// a /* from_le_bytes */ in a line comment\n");
+        assert!(check_kernel_owns_no_encoding(&mentioned).is_empty());
+
+        // And a construct in real code beside a comment is still reported.
+        let both =
+            kernel_source("/* not code */\nfn read(b: [u8; 4]) -> u32 { u32::from_le_bytes(b) }\n");
+        assert_eq!(check_kernel_owns_no_encoding(&both).len(), 1);
+    }
+
+    #[test]
+    fn an_impl_that_is_not_at_a_token_boundary_is_not_an_impl() {
+        // `impl_headers` scans a flattened file, so it has to tell the keyword from a word
+        // that ends in it.
+        let headers = impl_headers("fn reimpl() {} impl Foo for Bar {}");
+        assert_eq!(headers, ["impl Foo for Bar "]);
+        assert!(impl_headers("struct NoImplHere;").is_empty());
+        // A header ended by `;` rather than `{` — a trait impl cannot be written that way,
+        // but the scan must not swallow the rest of the file looking for a brace.
+        assert_eq!(
+            impl_headers("impl Foo for Bar; fn f() {}"),
+            ["impl Foo for Bar"]
+        );
     }
 
     #[test]

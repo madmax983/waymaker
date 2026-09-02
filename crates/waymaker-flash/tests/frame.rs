@@ -1460,11 +1460,13 @@ fn a_scan_always_terminates_and_advances() {
 }
 
 #[test]
-fn a_scan_offset_never_passes_the_end_of_its_journal() {
-    // `Scan::offset` promises "never greater than the journal's length", and the clamp that
-    // keeps that promise is reachable: a journal sliced to exactly one frame, whose padding
-    // the writer put beyond the slice, has a stride longer than the bytes on offer.
-    let align = ProgramAlign::new(16).expect("a non-zero alignment");
+fn a_frame_whose_padding_does_not_fit_the_journal_is_a_truncation() {
+    // `encode` reserves the whole padded length before it writes a byte, so a journal that
+    // ends after a frame's checksum but before its padding is a journal shorter than the
+    // frame it appears to hold. Accepting the record would advance to an offset that is not
+    // on a program boundary — not a place anything may be written — so the scan fails closed
+    // and `Scan::offset`'s "always a whole number of program units" stays true.
+    let align = ProgramAlign::new(16).expect("a power of two");
     let mut page = [0_u8; SCRATCH];
     let record = RecordRef::RunCompleted { result: b"abc" };
     let written = frame::encode(&record, align, &mut page).expect("room");
@@ -1474,15 +1476,72 @@ fn a_scan_offset_never_passes_the_end_of_its_journal() {
         "the record must be padded for this to test anything"
     );
 
-    // Hand the scan the frame and none of its padding.
-    let mut scan = Scan::new(&page[..frame_len], align);
-    assert_eq!(scan.next(), Some(Ok(record)));
-    assert_eq!(
-        scan.offset(),
-        frame_len,
-        "the offset is clamped to the journal rather than to the padded stride"
-    );
-    assert!(scan.next().is_none());
+    // Every cut between the end of the frame and the end of its padding.
+    for cut in frame_len..written {
+        let mut scan = Scan::new(&page[..cut], align);
+        assert_eq!(
+            scan.next(),
+            Some(Err(DecodeError::Truncated)),
+            "a journal cut to {cut} bytes holds a frame whose padding is not there"
+        );
+        assert!(scan.next().is_none());
+        assert_eq!(
+            scan.offset(),
+            0,
+            "the append point is the frame's own start"
+        );
+    }
+
+    // And the whole padded frame walks, so the refusal above is about the missing padding
+    // rather than about the frame.
+    let mut whole = Scan::new(&page[..written], align);
+    assert_eq!(whole.next(), Some(Ok(record)));
+    assert_eq!(whole.offset(), written);
+    assert_eq!(whole.offset() % usize::from(align.get()), 0);
+}
+
+#[test]
+fn a_torn_short_header_at_the_end_of_a_journal_is_not_a_clean_end() {
+    // The other end of the same rule. Fewer bytes left than a header is the ordinary end of
+    // a journal when they are erased — and a torn header when they are not. Reporting an end
+    // of history there would hand a caller an offset pointing into cells a program cycle has
+    // already cleared, which on NOR cannot be written again without erasing the block.
+    let align = ProgramAlign::BYTE;
+    let mut journal = [ERASED_BYTE; 64];
+    let written = frame::encode(
+        &RecordRef::RunCompleted { result: b"r" },
+        align,
+        &mut journal,
+    )
+    .expect("room");
+
+    // Erased short remainder: the ordinary end.
+    let clean_end = written + HEADER_BYTES - 1;
+    let mut clean = Scan::new(&journal[..clean_end], align);
+    assert!(matches!(
+        clean.next(),
+        Some(Ok(RecordRef::RunCompleted { .. }))
+    ));
+    assert!(clean.next().is_none());
+    assert_eq!(clean.offset(), written);
+
+    // The same remainder with one programmed byte in it: a torn header.
+    for at in 0..HEADER_BYTES - 1 {
+        let mut torn = journal;
+        torn[written + at] = 0x00;
+        let mut scan = Scan::new(&torn[..clean_end], align);
+        assert!(matches!(
+            scan.next(),
+            Some(Ok(RecordRef::RunCompleted { .. }))
+        ));
+        assert_eq!(
+            scan.next(),
+            Some(Err(DecodeError::Truncated)),
+            "a programmed byte {at} into a short remainder is a torn header"
+        );
+        assert!(scan.next().is_none());
+        assert_eq!(scan.offset(), written);
+    }
 }
 
 #[test]

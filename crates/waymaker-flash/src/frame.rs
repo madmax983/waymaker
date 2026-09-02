@@ -850,7 +850,9 @@ impl<'a> Scan<'a> {
     /// Zero before the first step; after a step that yielded a record, past that record
     /// and its padding; after a step that yielded a failure, still at the *start* of the
     /// frame that failed — §14's "frame ignored; previous history prefix wins" is exactly
-    /// that offset. Never greater than the journal's length.
+    /// that offset. Always a whole number of program units, and never greater than the
+    /// journal's length: a frame whose padding does not fit in the journal is a truncation
+    /// rather than a record, so no step can end anywhere but on a boundary.
     ///
     /// This is where history *ended*, which is not the same as where the next record may be
     /// written: see [the note on `Scan`](Self#that-offset-is-not-yet-an-append-point).
@@ -869,9 +871,17 @@ impl<'a> Iterator for Scan<'a> {
         }
         let rest = self.journal.get(self.offset..)?;
         let Some(header) = rest.get(..HEADER_BYTES) else {
-            // Less than a header left: the ordinary end of a journal.
+            // Fewer bytes left than a header. Erased is the ordinary end of a journal;
+            // programmed bytes are a torn header, and the same rule applies to them as to a
+            // full one — reporting an end of history there hands a caller an offset that
+            // points into cells a program cycle has already cleared, which on NOR cannot be
+            // written again without erasing the block.
             self.stopped = true;
-            return None;
+            return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
+                None
+            } else {
+                Some(Err(DecodeError::Truncated))
+            };
         };
         if header.iter().all(|byte| *byte == ERASED_BYTE) {
             self.stopped = true;
@@ -900,12 +910,26 @@ impl<'a> Iterator for Scan<'a> {
             self.stopped = true;
             return Some(Err(DecodeError::LengthOutOfBounds));
         };
+        // A frame whose padded stride runs past the end of the journal could not have been
+        // written into it: `encode` reserves the whole padded length before it writes a
+        // byte, and refuses when the buffer is one short. So the journal is shorter than
+        // the frame it appears to hold, which is a truncation and not a record — and
+        // accepting it would advance to an offset that is not on a program boundary, which
+        // is not a place anything may be written.
+        let Some(next) = self
+            .offset
+            .checked_add(stride)
+            .filter(|next| *next <= self.journal.len())
+        else {
+            self.stopped = true;
+            return Some(Err(DecodeError::Truncated));
+        };
 
         match frame.decoded {
             Decoded::Record(record) => {
                 // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
                 // scan over a finite journal is finite.
-                self.offset = self.offset.saturating_add(stride).min(self.journal.len());
+                self.offset = next;
                 Some(Ok(record))
             }
             Decoded::UnknownKind(_) => {
