@@ -1,0 +1,23 @@
+[package]
+name = "waymaker-fault"
+description = "In-memory storage model and exhaustive crash injector for Waymaker. Test support: never linked into firmware, never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["development-tools::testing"]
+keywords = ["durable", "workflow", "fault-injection", "testing"]
+# Test support, not a shipped library. It exists to be depended on by the tests of the
+# crates below it, and by nothing that is ever flashed.
+publish = false
+
+[dependencies]
+waymaker-flash.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
