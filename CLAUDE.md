@@ -252,9 +252,14 @@ Stated so that nobody mistakes silence for coverage:
 Rung 0.1, in progress. The three firmware crates exist so the layering is enforceable and the
 budgets have one place to be read from. `waymaker-core` now owns effect identity — `RunId`,
 `EffectSeq` and `EffectId` — the activity-kind vocabulary, the `EffectIdAllocator` that is
-the only thing permitted to mint a sequence, and the capacity and decode error vocabulary the
-kernel refuses work with (issue #12). The kernel-state registry has its first entry, so the
-128 B budget is now a number about something. The record codec, cursor and transition rules
-are the rest of rung 0.1; the seals and bank swap arrive with 0.2, and the async `Ctx` and
-dispatcher with 0.4. The gates went in before the code they govern, which is the point: a
-gate retrofitted after coverage has slipped is a gate that ratifies the slip.
+the only thing permitted to mint a sequence, the capacity and decode error vocabulary the
+kernel refuses work with (issue #12), and the borrowed record views and record-kind numbering
+of design document §09 (issue #13). `waymaker-flash` now owns the bytes those views are
+decoded from: §09's handwritten, fixed-endian, self-delimiting frame, its two checksums, and
+the append scan that turns a bank into a committed prefix — see
+[ADR 0007](docs/adr/0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md).
+The kernel-state registry has two entries, so the 128 B budget is a number about something.
+The replay cursor and the transition rules are the rest of rung 0.1; the commit seal and the
+bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
+before the code they govern, which is the point: a gate retrofitted after coverage has
+slipped is a gate that ratifies the slip.

@@ -1,0 +1,195 @@
+# ADR 0007: The record frame is checksummed twice, and the kernel owns none of it
+
+- Status: accepted
+- Date: 2026-09-02
+- Issue: [#13](https://github.com/madmax983/waymaker/issues/13)
+- Supersedes: nothing
+- Related: [ADR 0003](0003-the-eight-settled-design-decisions.md), [ADR 0004](0004-the-layering-contract-is-a-table-a-gate-reads.md), [ADR 0006](0006-effect-identity-is-newtypes-and-exhaustion-is-terminal.md)
+
+## Context
+
+Design document §09 gives the journal a frame and four properties that may not change:
+
+> - All lengths are validated against caller buffers and bank bounds before reading.
+> - Unknown record kinds are skippable only when the format version permits forward
+>   compatibility.
+> - Records are padded to the device's program alignment without interpreting stale tail
+>   bytes.
+> - CRC detects accidental corruption and torn writes; it is not authentication.
+
+and the frame itself:
+
+```text
+magic u16 LE | format_version u8 | record_kind u8 | effect_seq u32 LE
+payload_len u16 LE | header_crc u16 LE | payload [payload_len] | payload_crc u32 LE
+commit_seal (storage-program unit)
+```
+
+§13 gives the decoding target, `RecordRef<'a>`, as borrowed views over the caller's bytes.
+
+Three constraints shape everything below, and none of them is negotiable here.
+
+**The kernel may not own a byte of it.** §05's must-not-own table names *serialization
+framework* and *CRC* among the things `waymaker-core` may not have, and
+[`kernel-is-dependency-free`](0003-the-eight-settled-design-decisions.md#kernel-is-dependency-free)
+leaves it with no crate to borrow either from. `waymaker-flash`'s Owns cell is "stable wire
+encoding, CRC and seals". So the seam is not a matter of taste: the *view* is the kernel's
+and the *bytes* are the adapter's, and `cargo xtask check-layering` fails a build that
+blurs it.
+
+**Neither layer may take a dependency, including a dev-dependency.** `may_depend_on_external`
+is empty for both, and the gate reads every dependency table. So the round-trip and fuzz
+tests issue #13 asks for cannot use `proptest`, `quickcheck` or `arbitrary`, and the two
+checksums cannot come from the `crc` crate.
+
+**Public surface has an enforced price.** `size-probe-reach` fails a build for any public
+function of a layer the size probe does not call, because a function nothing calls is
+dead-stripped and the 8 KiB code-flash budget then measures a smaller firmware than the one
+that ships. Every `pub fn` added here is a call added to the probe, on purpose.
+
+The failure this frame exists to prevent is specific. A device loses power mid-append; on
+the next boot something walks the bank and decides what history is. If that walk can be
+made to read past the end of a buffer, loop for ever, or accept a half-written record as
+committed, the workflow resumes from a history that never happened — and a durable workflow
+engine that resumes from fiction is worse than one that refuses to resume at all.
+
+## Decision
+
+**The seam.** `waymaker-core::record` owns `RecordRef<'a>` and `RecordKind`, a `u8` newtype
+carrying §09's numbering. `waymaker-flash::frame` owns the magic, the header, both
+checksums, the padding, `encode`, `decode` and the append `Scan`. Nothing in the kernel
+calls `from_le_bytes`.
+
+`RecordKind` is a newtype rather than an `enum`, for the same reason `ActivityKind` is one:
+the number *is* the wire format, and an `enum` could not hold a number this firmware does
+not know — which is a thing the format has to be able to talk about. It names all eleven
+records in §09's table, including the five this rung does not decode. Reserving
+`TimerScheduled = 5` and `TimerFired = 6` now is what stops the timer issue renumbering
+`RunCompleted` under firmware that has already written it.
+
+**Two checksums, and the second covers the header.** `header_crc` is CRC-16/CCITT-FALSE over
+the twelve bytes before it. `payload_crc` — §09's name, kept — is CRC-32/ISO-HDLC over the
+header *and* the payload.
+
+The two-checksum split is what makes §09's first property implementable. `payload_len` is
+read out of the bytes being validated, so a decoder that checked one checksum over the whole
+frame would have to trust the length in order to find the checksum that would tell it
+whether the length could be trusted. The header checksum breaks that circle: it is at a
+fixed offset, it is verified first, and only then is `payload_len` a number the writer wrote
+rather than a number that was found.
+
+Covering the header in the second checksum costs twelve bytes of checksumming per record and
+buys two things. A payload cannot be transplanted onto another frame's header and still
+check out. And a record with an empty payload gets a checksum that depends on which record it
+is — CRC-32 of nothing is zero, and a field that is zero for a whole class of records is a
+field a zeroed page satisfies.
+
+Both algorithms are catalogued, and both are tested against their published check values
+(`0x29B1` and `0xCBF43926` for `b"123456789"`). That is deliberate: an encoder and a decoder
+sharing one wrong checksum round-trip perfectly, and the published value is the only thing in
+reach that was not written here. Both are bitwise and table-free. A byte-at-a-time table is
+1 KiB of rodata and a nibble table 64 B, against an 8 KiB budget for the kernel and this
+adapter together, to save a few hundred shift-and-xor iterations next to a flash program
+cycle that costs tens of microseconds.
+
+**The header layout is frozen across format versions.** `decode` verifies the header
+checksum *before* it reads `format_version`, which is only sound if every version of this
+format puts the same twelve bytes at the front. That is the commitment: a version bump may
+change what a payload means, never where a frame ends. Without it a reader meeting a version
+it does not know could not say how far to skip, and §09's forward-compatibility rule would
+have nothing to stand on.
+
+**Unknown kinds decode; skipping is the scan's decision.** A frame whose `record_kind` this
+firmware does not know, but whose checksums hold, decodes to `Decoded::UnknownKind(kind)`
+with a correct `encoded_len` — which is what "self-delimiting" means, and is a fact about the
+bytes. Whether a reader may then *skip* it is a fact about the format version, so it lives in
+`Scan`, as a lookup in `VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP`. That list is empty at
+version 1. Skipping a record asserts that the rest of history means the same thing without
+it, and at v0.1 that is false for every record in §09's table: a skipped `TimerFired` is a
+timer replay believes never fired.
+
+**Run-scoped records write a zero sequence, and the decoder insists on it.** `RunStarted`,
+`RunCompleted` and `RunFailed` have no effect to number. The alternative — ignoring the field
+for those kinds — would let two byte sequences decode to one record, and a format meant to be
+frozen is easier to reason about when the decoder rejects everything the encoder cannot
+produce. A frame that is intact and still not the record it names is
+`DecodeError::MalformedRecord`, a variant added to the kernel's vocabulary for exactly this:
+it is neither an input that ended early nor a length reaching outside a buffer.
+
+**Padding is `0xFF`, and the frame's length excludes it.** An erased NOR cell already reads
+`0xFF`, so programming the pad changes no bits. `Frame::encoded_len` is the frame's own
+length; `ProgramAlign::round_up` is what turns it into a stride, and `Scan` is what applies
+it. So padding is never interpreted, and a journal written on a device with one program
+granularity is still readable by code that assumes another.
+
+`ProgramAlign` rejects zero and nothing else. A power of two is not required: real internal
+flash reports one, but no arithmetic here needs it, and a type that refused a device's honest
+geometry would be a type a driver had to lie to.
+
+**Bounded decoding is structural before it is tested.** `#![forbid(unsafe_code)]` removes
+`get_unchecked`; `clippy::indexing_slicing = deny` removes `buf[a..b]`; `panic`, `unwrap_used`
+and `expect_used` are denied, so the panicking recoveries are gone too. What is left is
+`slice::get`, `first_chunk`, `split_at_checked` and iterators, all total. So an out-of-bounds
+read is not expressible in this crate; the hazards that *are* expressible are a panic — and
+`panic = "abort"` in the release profile makes a panic a bricked device — an overflow in
+offset arithmetic, and a scan that fails to advance. Every offset sum is bounded by
+`MAX_FRAME_BYTES`, every step of the scan advances by at least `FRAME_OVERHEAD_BYTES`, and
+the tests below are what say so from the outside.
+
+**The tests are built to be falsifiable.** Four decisions, each aimed at a way a thorough-
+looking test suite proves nothing:
+
+- The golden frames were produced by a reference implementation written separately, from
+  §09's field list rather than from `frame.rs`. A golden vector generated by the code under
+  test proves only that the code agrees with itself.
+- The property tests use a hand-rolled xorshift generator, because no dependency is
+  available. Payload lengths of zero, one and the maximum are drawn explicitly rather than
+  left to a uniform draw that visits them rarely, and the sweep asserts it saw them.
+- The fuzz is in two halves. Damaging a frame *without* resealing it tests the checksums, and
+  nothing gets through. But a checksum doing its job is exactly why that sweep can never
+  reach the version check, the kind check or the body checks — so the second half reseals
+  after damaging, and asserts a non-zero count for each of those refusals. A fuzz test that
+  is turned away at the front door every time is decorative, and the counters are what stop
+  this one being that.
+- Round-trip is not the only direction: the same golden bytes are decoded as well as encoded,
+  so an encoder and decoder that agree with each other and not with §09 fail.
+
+**Deferred, visibly.** The commit seal is a storage-program unit and needs §12's barrier
+protocol, which arrives at rung 0.2. Until then `Scan` treats a frame whose checksums hold as
+history, so a torn write at the tail of a journal is not distinguishable from damage there.
+Both stop the scan at the same offset, which is what §14 requires either way — "frame
+ignored; previous history prefix wins" — so the deferral costs correctness nothing today;
+what the seal will add is the ability to say which of the two happened. Bank bounds are
+deferred the same way: `Scan` takes a `&[u8]`, and that slice *is* the bound.
+
+## Consequences
+
+The record codec costs about 4.6 KiB of the 8 KiB incremental code-flash budget, measured on
+`thumbv6m-none-eabi` through the size probe. That is more than half of §04's number for one
+module, with the replay cursor, the transition rules, the seals, the bank swap and compaction
+still to come. It is a real constraint rather than a comfortable margin, and the first thing
+to look at if a later rung runs out of room is the two bitwise checksum loops, which trade
+code size against a speed nothing here is short of.
+
+A frame is sixteen bytes of overhead. On a journal of small records — a completion carrying
+four bytes — that is 80% overhead, against a bank that is often a single erase block. §09
+chose the fields; this decision adds nothing to them, but the arithmetic is worth stating
+where somebody sizing a bank will find it.
+
+`Scan` carries one branch that no test can reach: the arm that skips an unknown kind, which
+is unreachable while `VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP` is empty. It is kept because
+the alternative is a paragraph, and a paragraph is what a future version bump would have to
+remember to read. The same goes for a handful of refusals in `decode` that are unreachable by
+construction and are spelled as refusals rather than as `unwrap`. Both show up as the six
+uncovered lines in `waymaker-flash`, against a gate of 85% and a measured 98.5%.
+
+Adding `DecodeError::MalformedRecord` widened the kernel's error vocabulary to six variants.
+Neither error enum is `#[non_exhaustive]` — ADR 0006 — so every adapter that matches it
+exhaustively got a compile error naming the case it now has to think about, which is the
+point.
+
+The choice to reserve record kinds `5`, `6`, `9`, `10` and `11` means the timer issue,
+`VersionMarker` and `SignalReceived` each add a body behind a number that is already spent.
+It also means a firmware built today meets a `TimerScheduled` written by a firmware built
+tomorrow and stops cleanly with `UnknownRecordKind`, rather than mistaking it for something
+else — which is what the reservation is for.
