@@ -105,7 +105,8 @@ fn engine() -> usize {
     use waymaker_flash as _;
 
     use waymaker_core::{
-        ActivityName, DecodeError, EffectIdAllocator, EffectSeq, KernelError, RunId,
+        ActivityName, DecodeError, EffectIdAllocator, EffectSeq, KernelError, RecordKind,
+        RecordRef, RunId,
     };
 
     let registered = waymaker_core::budget::TypeSize::of::<u32>("u32");
@@ -170,6 +171,16 @@ fn engine() -> usize {
             .message()
             .len(),
     );
+
+    // The borrowed record view: the kind mapping the encoder reads, over a record whose
+    // payload the optimiser cannot see through.
+    let completed = RecordRef::RunCompleted {
+        result: core::hint::black_box(b"done"),
+    };
+    kept = kept.wrapping_add(usize::from(completed.kind().0));
+    kept = kept.wrapping_add(usize::from(
+        core::hint::black_box(RecordKind::EFFECT_SCHEDULED).0,
+    ));
 
     // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a
     // function pointer rather than by formatting something: taking the pointer keeps the

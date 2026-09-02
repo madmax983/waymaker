@@ -149,8 +149,13 @@ macro_rules! kernel_state_types {
 // live types, so registering a cursor that contains an allocator and the allocator itself
 // would double-count 16 B against a 128 B budget. The caveat lives here rather than in the
 // macro's own doc comment, which is emitted verbatim for whatever list is passed.
+// The record view is live while the cursor resolves one record against what the workflow
+// asks for next, so it is charged here too. It holds a fat pointer into the caller's page
+// rather than the bytes themselves, which is why its size is target-dependent and is
+// budgeted through this registry rather than pinned to a literal beside its declaration.
 kernel_state_types! {
     crate::id::EffectIdAllocator,
+    crate::record::RecordRef<'static>,
 }
 
 /// The assertion macro, documented beside the constants it is stated against.
