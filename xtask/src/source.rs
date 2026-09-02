@@ -526,16 +526,42 @@ pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<
         )];
     };
 
-    let declared: BTreeSet<String> = crate::size::public_functions(core::slice::from_ref(source))
-        .into_iter()
-        .map(|function| function.name)
-        .collect();
+    let mut declarations: Vec<String> =
+        crate::size::public_functions(core::slice::from_ref(source))
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+    declarations.sort_unstable();
+
+    let mut violations = Vec::new();
+
+    // Counted, not merely collected. A set would fold a *second* declaration of a pinned
+    // name into the first, so `pub fn advance(id: EffectId) -> Option<RecordRef<'_>>`
+    // alongside `ReplayCursor::advance` would leave this rule reporting no difference at
+    // all — and `size-probe-reach` matches calls by name too, so the new body would be
+    // dead-stripped with both gates green. The pin is a list of names, so a name used twice
+    // is a name the pin can no longer speak about, whatever the second one turns out to be.
+    for (index, name) in declarations.iter().enumerate() {
+        if declarations.get(index.wrapping_add(1)) == Some(name) {
+            violations.push(Violation::new(
+                "replay-cursor-surface",
+                KERNEL,
+                format!(
+                    "{} declares `{name}` more than once: the pin is a list of names, so a \
+                     second declaration under a name already on it is invisible to this rule \
+                     and to `size-probe-reach`; give it a name of its own",
+                    source.path
+                ),
+            ));
+        }
+    }
+
+    let declared: BTreeSet<String> = declarations.into_iter().collect();
     let pinned: BTreeSet<String> = REPLAY_SURFACE
         .iter()
         .map(|name| (*name).to_owned())
         .collect();
 
-    let mut violations = Vec::new();
     for added in declared.difference(&pinned) {
         violations.push(Violation::new(
             "replay-cursor-surface",
@@ -858,6 +884,24 @@ mod tests {
         assert_eq!(violations[0].rule, "replay-cursor-surface");
         assert!(
             violations[0].detail.contains("record_at"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_second_declaration_under_a_pinned_name_is_rejected() {
+        // The hole a set would leave: a lookup by effect id, named after a function already
+        // on the pin. Set difference sees nothing added and nothing missing, and
+        // `size-probe-reach` credits the probe's existing `advance(` call, so both gates
+        // stay green while the cursor grows the one method it must never have.
+        let violations = check_replay_cursor_surface(&replay_source(
+            "pub fn advance(id: EffectId) -> Option<RecordRef<'static>> { None }\n",
+        ));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "replay-cursor-surface");
+        assert!(
+            violations[0].detail.contains("more than once"),
             "{}",
             violations[0].detail
         );
