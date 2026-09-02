@@ -1047,9 +1047,11 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
 
 /// Every `Settles deferred question:` claim in `contents`, in source order.
 ///
-/// `contents` is expected to have had its HTML comments stripped already, so that a marker
-/// a reader cannot see claims nothing. The id is the rest of the line, trimmed of whitespace
-/// and of the backticks a Markdown author naturally puts round an identifier.
+/// `contents` is expected to have had its HTML comments and its fenced code blocks stripped
+/// already: a marker a reader cannot see claims nothing, and a marker inside a fence is an
+/// example of the syntax rather than a use of it — `docs/adr/README.md` contains exactly
+/// such an example. The id is the rest of the line, trimmed of whitespace and of the
+/// backticks a Markdown author naturally puts round an identifier.
 #[must_use]
 fn deferred_question_claims(contents: &str) -> Vec<&str> {
     contents
@@ -1084,9 +1086,18 @@ fn check_deferred_questions(claude_md: Option<&str>, adrs: &[AdrFile]) -> Vec<Vi
     // Every claim in the record, with the ADR that made it, so both directions below can be
     // answered from one pass.
     let mut claims: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // Comments *and* fences. Codex raised the second on PR #58: an ADR that documents the
+    // marker syntax in a fenced example would otherwise be read as claiming the question,
+    // and — worse — an ADR that kept the example while losing its real marker would still
+    // satisfy the settled check. `check_adr_index` already reads documents this way.
     let stripped: Vec<(&str, String)> = adrs
         .iter()
-        .map(|adr| (adr.name.as_str(), without_html_comments(&adr.contents)))
+        .map(|adr| {
+            (
+                adr.name.as_str(),
+                without_fenced_code(&without_html_comments(&adr.contents)),
+            )
+        })
         .collect();
     for (name, contents) in &stripped {
         for id in deferred_question_claims(contents) {
@@ -2121,6 +2132,61 @@ mod tests {
         assert!(
             violations.is_empty(),
             "a marker a reader cannot see settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
+        // Codex, PR #58. An ADR explaining how the marker works must not be read as using
+        // it — and the direction that matters more is the other one: an ADR that kept the
+        // example while losing its real marker would still have passed the settled check.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-explains-the-syntax.md".to_owned(),
+            contents: format!(
+                "{}\n```text\n{DEFERRED_QUESTION_MARKER} `{}`\n```\n",
+                clean_adr("explains the syntax"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "an example was read as a claim: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_question_whose_marker_is_only_an_example_is_reported() {
+        let Some(question) = a_settled_question() else {
+            return;
+        };
+        let QuestionStatus::Settled { adr } = question.status else {
+            unreachable!("filtered above");
+        };
+        let adrs: Vec<AdrFile> = clean_inputs(RULES)
+            .adrs
+            .into_iter()
+            .map(|mut file| {
+                if file.name == adr {
+                    file.contents = format!(
+                        "{}\n```text\n{DEFERRED_QUESTION_MARKER} `{}`\n```\n",
+                        clean_adr(question.id),
+                        question.id
+                    );
+                }
+                file
+            })
+            .collect();
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == question.id && v.detail.contains(DEFERRED_QUESTION_MARKER)),
+            "{violations:?}"
         );
     }
 

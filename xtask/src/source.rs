@@ -596,7 +596,24 @@ pub const EFFECT_SCHEDULED_FIELDS: &[&str] = &["input_crc", "input_len", "kind",
 /// The file whose contents [`INTEGRITY_CHECK_PARAMETERS`] pins.
 pub const INTEGRITY_CHECK_PATH: &str = "waymaker-flash/src/crc.rs";
 
-/// The catalogued parameters the two checksums are required to keep.
+/// One catalogued parameter, and where in the checksum module it has to appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumParameter {
+    /// The function whose body must contain it, by name.
+    pub function: &'static str,
+    /// What the literal is to the algorithm, for a violation message.
+    pub role: &'static str,
+    /// The literal, spelled as the source spells it.
+    pub literal: &'static str,
+    /// How many times that body must contain it.
+    ///
+    /// Two for CRC-32's `0xFFFF_FFFF`, which is both its initial value and its final xor.
+    /// Codex caught the reason this is a count rather than a presence check on PR #58:
+    /// change one of the two and the other still satisfies "the file contains it".
+    pub occurrences: usize,
+}
+
+/// The catalogued parameters the two checksums are required to keep, per function.
 ///
 /// Design document §16's first deferred question is "whether the default integrity check is
 /// CRC32C or a smaller table-free CRC implementation". ADR 0010 answers it with measurements
@@ -608,11 +625,37 @@ pub const INTEGRITY_CHECK_PATH: &str = "waymaker-flash/src/crc.rs";
 /// algorithm: a reflected polynomial quietly changed from `0xEDB8_8320` to `0x82F6_3B78` is
 /// a different CRC that passes every round-trip test in this repository, and fails against
 /// every zlib in the world.
-pub const INTEGRITY_CHECK_PARAMETERS: &[(&str, &str)] = &[
-    ("CRC-16/CCITT-FALSE polynomial", "0x1021"),
-    ("CRC-16/CCITT-FALSE initial value", "0xFFFF"),
-    ("CRC-32/ISO-HDLC reflected polynomial", "0xEDB8_8320"),
-    ("CRC-32/ISO-HDLC initial and final xor", "0xFFFF_FFFF"),
+///
+/// Scoped to a function body and counted, which two rounds of review were needed to get
+/// right. A bare `contains` over the file let `0xFFFF_FFFF` vouch for `0xFFFF` — so CRC-16's
+/// initial value could not be lost — and then let CRC-32's initial value vouch for its own
+/// final xor. A pin that cannot fail is worse than no pin, because the report says it
+/// checked.
+pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
+    ChecksumParameter {
+        function: "crc16",
+        role: "CRC-16/CCITT-FALSE polynomial",
+        literal: "0x1021",
+        occurrences: 1,
+    },
+    ChecksumParameter {
+        function: "crc16",
+        role: "CRC-16/CCITT-FALSE initial value",
+        literal: "0xFFFF",
+        occurrences: 1,
+    },
+    ChecksumParameter {
+        function: "crc32",
+        role: "CRC-32/ISO-HDLC reflected polynomial",
+        literal: "0xEDB8_8320",
+        occurrences: 1,
+    },
+    ChecksumParameter {
+        function: "crc32",
+        role: "CRC-32/ISO-HDLC initial value and final xor",
+        literal: "0xFFFF_FFFF",
+        occurrences: 2,
+    },
 ];
 
 /// Rule: a scheduled effect records exactly the metadata ADR 0011 settled on.
@@ -725,65 +768,102 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
         )];
     };
 
-    // `code_only` first, then the test-module scan: the scan counts braces and looks
-    // for an attribute, and both are wrong on raw text — see `without_test_modules`.
+    // `code_only` first, then the test-module scan: the scan counts braces and looks for an
+    // attribute, and both are wrong on raw text — see `without_test_modules`.
     let code = without_test_modules(&code_only(&source.contents));
     let mut violations = Vec::new();
 
-    for (name, literal) in INTEGRITY_CHECK_PARAMETERS {
-        if !contains_token(&code, literal) {
+    for parameter in INTEGRITY_CHECK_PARAMETERS {
+        let header = format!("fn {}", parameter.function);
+        let Some(body) = braced_body(&code, &header) else {
             violations.push(Violation::new(
                 RULE,
                 ADAPTER,
                 format!(
-                    "{INTEGRITY_CHECK_PATH} no longer contains `{literal}`, the {name}; a \
-                     checksum whose parameters changed is a different checksum, and it \
-                     passes every round-trip test in this repository"
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so the {} is pinned \
+                     against nothing",
+                    parameter.role
+                ),
+            ));
+            continue;
+        };
+        let found = count_tokens(body, parameter.literal);
+        if found != parameter.occurrences {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{}` in {INTEGRITY_CHECK_PATH} uses `{}` {found} time(s) where the {} \
+                     is {} — a checksum whose parameters changed is a different checksum, \
+                     and it passes every round-trip test in this repository",
+                    parameter.function, parameter.literal, parameter.role, parameter.occurrences
                 ),
             ));
         }
     }
 
-    for name in array_items(&code) {
-        violations.push(Violation::new(
-            RULE,
-            ADAPTER,
-            format!(
-                "{INTEGRITY_CHECK_PATH} declares `{name}` as an array, which is a lookup \
-                 table; ADR 0010 measured what one costs — 64 B of rodata for a nibble \
-                 table, 1024 B for a byte table, against an 8 KiB incremental code-flash \
-                 budget — so adding one is a superseding ADR, not an optimisation"
-            ),
-        ));
+    // The checksum module and anything it is split into. Codex asked for this on PR #58:
+    // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
+    // rule that read one file would have called it absent.
+    for scanned in checksum_sources(sources) {
+        let scanned_code = without_test_modules(&code_only(&scanned.contents));
+        for name in array_items(&scanned_code) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} declares `{name}` as an array, which is a lookup table; ADR 0010 \
+                     measured what one costs — 64 B of rodata for a nibble table, 1024 B \
+                     for a byte table, against an 8 KiB incremental code-flash budget — so \
+                     adding one is a superseding ADR, not an optimisation",
+                    scanned.path.replace('\\', "/")
+                ),
+            ));
+        }
     }
 
     violations
 }
 
-/// Whether `code` contains `token` as a whole token rather than as part of a longer one.
+/// The checksum module, plus every source under a `crc/` directory beside it.
 ///
-/// Internal review of PR #58 found the reason this exists: a plain `contains` let
-/// `0xFFFF_FFFF`, CRC-32's initial value, vouch for `0xFFFF`, CRC-16's — so the CRC-16 pin
-/// could not fail, and changing the initial value to `0x0000` passed the gate. A pin that
-/// cannot fail is worse than no pin, because the report says it checked.
-///
-/// A boundary is any character that cannot continue an identifier or a numeric literal, so
-/// `0xFFFF` is found in `= 0xFFFF;` and not in `0xFFFF_FFFF`.
+/// Splitting `crc.rs` into `crc/mod.rs` and `crc/table.rs` is an ordinary refactor and it is
+/// how a lookup table would arrive without this rule seeing it, so the scan follows the
+/// module rather than the file.
 #[must_use]
-fn contains_token(code: &str, token: &str) -> bool {
+fn checksum_sources(sources: &[crate::size::LayerSource]) -> Vec<&crate::size::LayerSource> {
+    let directory = INTEGRITY_CHECK_PATH.trim_end_matches(".rs");
+    sources
+        .iter()
+        .filter(|source| {
+            let path = source.path.replace('\\', "/");
+            path.ends_with(INTEGRITY_CHECK_PATH) || path.contains(&format!("{directory}/"))
+        })
+        .collect()
+}
+
+/// How many times `code` contains `token` as a whole token.
+///
+/// Counted rather than merely found, because CRC-32 uses `0xFFFF_FFFF` twice — as its
+/// initial value and as its final xor — and Codex pointed out on PR #58 that a presence
+/// check lets either one vouch for the other.
+#[must_use]
+fn count_tokens(code: &str, token: &str) -> usize {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
 
-    code.match_indices(token).any(|(index, _)| {
-        let before_is_boundary = code
-            .get(..index)
-            .and_then(|before| before.chars().next_back())
-            .is_none_or(|character| !continues(character));
-        let after_is_boundary = code
-            .get(index + token.len()..)
-            .and_then(|after| after.chars().next())
-            .is_none_or(|character| !continues(character));
-        before_is_boundary && after_is_boundary
-    })
+    code.match_indices(token)
+        .filter(|(index, _)| {
+            let before_is_boundary = code
+                .get(..*index)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|character| !continues(character));
+            let after_is_boundary = code
+                .get(index + token.len()..)
+                .and_then(|after| after.chars().next())
+                .is_none_or(|character| !continues(character));
+            before_is_boundary && after_is_boundary
+        })
+        .count()
 }
 
 /// The layer source whose path ends with `path`, if the workspace contributed one.
@@ -2505,18 +2585,23 @@ mod deferred_answer_pins {
         // could not see it because it only exercised `.first()`.
         //
         // Swept over every parameter rather than one, which is the whole lesson.
-        for (name, literal) in INTEGRITY_CHECK_PARAMETERS {
-            let without: String = tests_support::clean_checksum_module()
-                .lines()
-                .filter(|line| !line.contains(&format!("{literal} }}")))
-                .collect::<Vec<&str>>()
-                .join("\n");
+        for parameter in INTEGRITY_CHECK_PARAMETERS {
+            // One occurrence removed, not all of them: for CRC-32's `0xFFFF_FFFF` that is
+            // the case Codex raised — change the initial value and the final xor still
+            // satisfies a presence check.
+            let clean = tests_support::clean_checksum_module();
+            let without = clean.replacen(&format!(" {}", parameter.literal), " 0xDEAD_BEEF", 1);
+            assert_ne!(
+                without, clean,
+                "the fixture should carry `{}`",
+                parameter.literal
+            );
             let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &without)]);
             assert!(
-                violations
-                    .iter()
-                    .any(|v| v.detail.contains(name) && v.detail.contains(literal)),
-                "losing the {name} (`{literal}`) was not reported: {violations:?}"
+                violations.iter().any(|v| v.detail.contains(parameter.role)),
+                "losing one `{}` from `{}` was not reported: {violations:?}",
+                parameter.literal,
+                parameter.function
             );
         }
     }
@@ -2525,12 +2610,7 @@ mod deferred_answer_pins {
     fn a_longer_literal_does_not_vouch_for_a_shorter_one() {
         // The specific shape of the bug above, stated on its own so a future rewrite of the
         // matcher has to keep it: `0xFFFF` must not be found inside `0xFFFF_FFFF`.
-        let source = tests_support::clean_checksum_module().replace("{ 0xFFFF }", "{ 0x0000 }");
-        assert_ne!(
-            source,
-            tests_support::clean_checksum_module(),
-            "the fixture should carry `0xFFFF` on its own as well as inside `0xFFFF_FFFF`"
-        );
+        let source = tests_support::clean_checksum_module().replace(" 0xFFFF ", " 0x0000 ");
         assert!(
             source.contains("0xFFFF_FFFF"),
             "the longer literal has to survive, or the test proves nothing"
@@ -2741,33 +2821,74 @@ mod deferred_answer_pins {
     }
 
     #[test]
-    fn a_dropped_algorithm_parameter_is_reported() {
-        // The other half of the answer: §16 asked *which* CRC, and the catalogued
-        // polynomial is what makes the answer checkable against an implementation nothing
-        // in this repository produced.
-        let Some((name, literal)) = INTEGRITY_CHECK_PARAMETERS.first() else {
+    fn a_parameter_named_only_in_a_comment_does_not_count() {
+        let Some(parameter) = INTEGRITY_CHECK_PARAMETERS.first() else {
             return;
         };
-        let source = tests_support::clean_checksum_module().replace(literal, "0xDEAD_BEEF");
+        let source = tests_support::clean_checksum_module().replace(
+            &format!(" {}", parameter.literal),
+            &format!(" /* {} */ 0xDEAD_BEEF", parameter.literal),
+        );
+        assert!(
+            !check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]).is_empty(),
+            "a polynomial in a comment is not a polynomial"
+        );
+    }
+
+    #[test]
+    fn a_parameter_outside_its_own_function_does_not_count() {
+        // Codex, PR #58: the pin was a presence check over the whole file, so CRC-32's
+        // initial value vouched for its own final xor, and any unrelated constant could
+        // keep a literal alive after its real use changed.
+        let source = format!(
+            "{}\npub(crate) const LEFTOVER: u32 = 0xEDB8_8320;\n",
+            tests_support::clean_checksum_module().replace(" 0xEDB8_8320", " 0xDEAD_BEEF")
+        );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations
                 .iter()
-                .any(|v| v.detail.contains(name) && v.detail.contains(literal)),
+                .any(|v| v.detail.contains("reflected polynomial")),
+            "a literal parked outside the function satisfied the pin: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_checksum_function_is_reported() {
+        // The fail-closed direction: no `fn crc32` means the parameters are pinned against
+        // nothing, and that has to be loud rather than green.
+        let violations = check_integrity_check(&[layer(
+            INTEGRITY_CHECK_PATH,
+            "//! Nothing here.\npub(crate) const fn crc16(b: &[u8]) -> u16 { 0x1021 0xFFFF }\n",
+        )]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("fn crc32")),
             "{violations:?}"
         );
     }
 
     #[test]
-    fn a_parameter_named_only_in_a_comment_does_not_count() {
-        let Some((_, literal)) = INTEGRITY_CHECK_PARAMETERS.first() else {
-            return;
-        };
-        let source = tests_support::clean_checksum_module()
-            .replace(literal, &format!("/* {literal} */ 0xDEAD_BEEF"));
+    fn a_lookup_table_in_a_checksum_submodule_is_reported() {
+        // Codex, PR #58. Splitting `crc.rs` into `crc/mod.rs` and `crc/table.rs` is an
+        // ordinary refactor, and it was how a table would arrive with the rule none the
+        // wiser — it read one path and called everything else absent.
+        let sources = vec![
+            layer(
+                INTEGRITY_CHECK_PATH,
+                &tests_support::clean_checksum_module(),
+            ),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/table.rs".to_owned(),
+                contents: "pub(crate) const NIBBLE: [u32; 16] = [0; 16];\n".to_owned(),
+            },
+        ];
+        let violations = check_integrity_check(&sources);
         assert!(
-            !check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]).is_empty(),
-            "a polynomial in a comment is not a polynomial"
+            violations
+                .iter()
+                .any(|v| v.detail.contains("NIBBLE") && v.detail.contains("crc/table.rs")),
+            "a table in a checksum submodule went unseen: {violations:?}"
         );
     }
 }
@@ -2833,13 +2954,24 @@ pub mod tests_support {
     /// call for a fixture.
     #[must_use]
     pub fn clean_checksum_module() -> String {
+        use std::collections::BTreeMap;
         use std::fmt::Write as _;
 
+        // Grouped by function and repeated as many times as the pin expects, because the
+        // pin is now a count inside one body rather than a presence check over the file.
+        let mut bodies: BTreeMap<&str, String> = BTreeMap::new();
+        for parameter in INTEGRITY_CHECK_PARAMETERS {
+            let body = bodies.entry(parameter.function).or_default();
+            for _ in 0..parameter.occurrences {
+                let _ = write!(body, " {}", parameter.literal);
+            }
+        }
+
         let mut source = String::from("//! Two checksums.\n");
-        for (index, (name, literal)) in INTEGRITY_CHECK_PARAMETERS.iter().enumerate() {
+        for (function, body) in bodies {
             let _ = writeln!(
                 source,
-                "// {name}\npub(crate) const fn parameter_{index}() -> u32 {{ {literal} }}"
+                "pub(crate) const fn {function}(bytes: &[u8]) -> u32 {{{body} }}"
             );
         }
         source
