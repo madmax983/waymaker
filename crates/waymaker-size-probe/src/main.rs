@@ -99,11 +99,6 @@ waymaker_core::activity_kinds! {
 /// `u32` sequence and a `u64` run id are both wider than a pointer on `thumbv6m-none-eabi`.
 #[cfg(feature = "engine")]
 fn engine() -> usize {
-    // `use ... as _` links the crate without naming an item, which is all there is to name
-    // in it until rung 0.2. It is what makes this row genuinely "core plus the flash
-    // adapter" rather than core alone.
-    use waymaker_flash as _;
-
     use waymaker_core::{
         ActivityName, DecodeError, EffectIdAllocator, EffectSeq, KernelError, RecordKind,
         RecordRef, RunId,
@@ -193,7 +188,90 @@ fn engine() -> usize {
     core::hint::black_box(show_kernel);
     core::hint::black_box(show_decode);
 
+    kept = kept.wrapping_add(record_codec());
+
     core::hint::black_box(kept)
+}
+
+/// The record codec: encode a frame, decode it back, and walk it with the append scan.
+///
+/// Split out of [`engine`] rather than appended to it because it needs a page to write
+/// into, and a `let` array in the middle of that function would read as state rather than
+/// as a buffer. Every public function of `waymaker-flash::frame` is called from here —
+/// that is `size-probe-reach`'s requirement, and it is also what makes the flash adapter's
+/// share of the code-flash delta a real number rather than the cost of naming the crate.
+///
+/// The page is deliberately not a `static`: the runtime RAM row measures `.data` and
+/// `.bss`, and a scratch buffer here is the caller-owned page §04 excludes from the
+/// engine's own budget.
+#[cfg(feature = "engine")]
+fn record_codec() -> usize {
+    use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
+    use waymaker_flash::frame::{self, Decoded, ProgramAlign, Scan};
+
+    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
+        return 0;
+    };
+    let mut kept = usize::from(align.get());
+    kept = kept.wrapping_add(align.round_up(core::hint::black_box(21)).unwrap_or(0));
+
+    let mut page = [0_u8; 64];
+    let record = RecordRef::EffectScheduled {
+        seq: EffectSeq(core::hint::black_box(1)),
+        kind: ActivityKind(core::hint::black_box(2)),
+        input_len: core::hint::black_box(3),
+        input_crc: core::hint::black_box(4),
+    };
+    kept = kept.wrapping_add(match frame::encoded_len(&record, align) {
+        Ok(len) => len,
+        Err(error) => error.message().len(),
+    });
+    let written = match frame::encode(&record, align, &mut page) {
+        Ok(written) => written,
+        Err(error) => return kept.wrapping_add(error.message().len()),
+    };
+    kept = kept.wrapping_add(written);
+
+    // Both arms of the decode: a record and a frame this firmware cannot interpret. The
+    // second is the forward-compatibility branch, and a delta that only charged for the
+    // first would understate every future firmware that meets an unknown kind.
+    kept = kept.wrapping_add(
+        match frame::decode(page.get(..written).unwrap_or_default()) {
+            Ok(frame) => match frame.decoded {
+                Decoded::Record(decoded) => usize::from(decoded.kind().0)
+                    .wrapping_add(frame.encoded_len)
+                    .wrapping_add(usize::from(frame.format_version)),
+                Decoded::UnknownKind(kind) => usize::from(kind.0),
+            },
+            Err(error) => error.message().len(),
+        },
+    );
+
+    let mut scan = Scan::new(&page, align);
+    for step in &mut scan {
+        kept = kept.wrapping_add(match step {
+            Ok(record) => usize::from(record.kind().0),
+            Err(error) => error.message().len(),
+        });
+    }
+    // One more step after the walk. `Scan` is fused, so this is the path a caller takes
+    // when it keeps asking after history has ended — and it is also the call
+    // `size-probe-reach` reads, because a `for` loop names no method for a scanner to
+    // find.
+    kept = kept.wrapping_add(match scan.next() {
+        Some(Ok(record)) => usize::from(record.kind().0),
+        Some(Err(error)) => error.message().len(),
+        None => 0,
+    });
+    kept = kept.wrapping_add(scan.offset());
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+const fn record_codec() -> usize {
+    0
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.

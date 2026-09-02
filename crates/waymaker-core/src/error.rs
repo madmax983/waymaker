@@ -57,6 +57,16 @@ pub enum DecodeError {
     UnknownRecordKind,
     /// A format version this firmware cannot replay.
     UnsupportedFormatVersion,
+    /// A frame is intact and is still not the record it names.
+    ///
+    /// Distinct from [`Truncated`](Self::Truncated), which is about the *input* ending
+    /// early, and from [`LengthOutOfBounds`](Self::LengthOutOfBounds), which is about a
+    /// length reaching outside a buffer. This one is a frame whose checksums hold and
+    /// whose body does not fit the kind in its header: a schedule record whose body is not
+    /// the fixed size a schedule record has, or a run-scoped record carrying an effect
+    /// sequence the encoder never writes. A decoder that read on anyway would be reading
+    /// fields that are not there.
+    MalformedRecord,
     /// A seal or digest did not match its bytes; the check itself lives in the adapter.
     ///
     /// A frame whose leading magic does not match is reported here too, rather than through
@@ -83,6 +93,7 @@ impl DecodeError {
             Self::LengthOutOfBounds => "a length field points past its buffer",
             Self::UnknownRecordKind => "an unknown record kind",
             Self::UnsupportedFormatVersion => "an unsupported record format version",
+            Self::MalformedRecord => "a record body does not fit its kind",
             Self::IntegrityFailed => "a seal did not match the bytes it covers",
         }
     }
@@ -194,11 +205,12 @@ mod tests {
     /// A fixed-length array cannot notice a variant that was never put in it, so the list
     /// is not trusted on its own: `the_variant_lists_are_complete` maps each entry through
     /// an exhaustive `match` and fails the moment the enum has an arm this array does not.
-    const DECODE_ERRORS: [DecodeError; 5] = [
+    const DECODE_ERRORS: [DecodeError; 6] = [
         DecodeError::Truncated,
         DecodeError::LengthOutOfBounds,
         DecodeError::UnknownRecordKind,
         DecodeError::UnsupportedFormatVersion,
+        DecodeError::MalformedRecord,
         DecodeError::IntegrityFailed,
     ];
 
@@ -225,7 +237,8 @@ mod tests {
             DecodeError::LengthOutOfBounds => 1,
             DecodeError::UnknownRecordKind => 2,
             DecodeError::UnsupportedFormatVersion => 3,
-            DecodeError::IntegrityFailed => 4,
+            DecodeError::MalformedRecord => 4,
+            DecodeError::IntegrityFailed => 5,
         }
     }
 

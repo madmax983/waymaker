@@ -16,7 +16,7 @@ use waymaker_core::{DecodeError, KernelError};
 /// by construction, so comparing one with the other could not notice two variants whose
 /// strings had been swapped — and a swapped message is a firmware log line naming the wrong
 /// refusal.
-const DECODE_ERRORS: [(DecodeError, &str); 5] = [
+const DECODE_ERRORS: [(DecodeError, &str); 6] = [
     (
         DecodeError::Truncated,
         "the input ended before the frame it claimed",
@@ -29,6 +29,10 @@ const DECODE_ERRORS: [(DecodeError, &str); 5] = [
     (
         DecodeError::UnsupportedFormatVersion,
         "an unsupported record format version",
+    ),
+    (
+        DecodeError::MalformedRecord,
+        "a record body does not fit its kind",
     ),
     (
         DecodeError::IntegrityFailed,
