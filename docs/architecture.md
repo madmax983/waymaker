@@ -128,27 +128,48 @@ checksum over the whole frame could not: finding it would mean trusting the leng
 <!-- diagram: record-frame -->
 
 ```mermaid
-packet-beta
-  0-15: "magic (u16 LE)"
-  16-23: "format_version"
-  24-31: "record_kind"
-  32-63: "effect_seq (u32 LE)"
-  64-79: "payload_len (u16 LE)"
-  80-95: "header_crc (u16 LE)"
-  96-159: "payload [payload_len]"
-  160-191: "payload_crc (u32 LE)"
-  192-223: "commit_seal (rung 0.2)"
+graph LR
+  subgraph header["header · 12 bytes · covered by header_crc"]
+    direction LR
+    f0["+0 · 2B<br/>magic<br/>u16 LE"]
+    f1["+2 · 1B<br/>format_version"]
+    f2["+3 · 1B<br/>record_kind"]
+    f3["+4 · 4B<br/>effect_seq<br/>u32 LE"]
+    f4["+8 · 2B<br/>payload_len<br/>u16 LE"]
+    f5["+10 · 2B<br/>header_crc<br/>u16 LE"]
+    f0 --- f1 --- f2 --- f3 --- f4 --- f5
+  end
+  subgraph rest["body and trailer"]
+    direction LR
+    f6["+12 · N bytes<br/>payload<br/>opaque to the kernel"]
+    f7["+12+N · 4B<br/>payload_crc<br/>u32 LE"]
+    f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
+    f6 --- f7 --- f8
+  end
+  header --> rest
+
+  c1(["header_crc covers +0..+10"])
+  c2(["payload_crc covers +0..+12+N — the header as well as the payload"])
+  c3(["commit_seal · a storage-program unit, not a field · rung 0.2"])
+
+  f5 -.- c1
+  f7 -.- c2
+  f8 -.- c3
+
+  classDef field fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
+  class f0,f1,f2,f3,f4,f5,f6,f7,f8 field;
+  class c1,c2,c3 note;
 ```
 
-The last two boxes are not the same kind of thing. `payload_crc` is a field this rung
-writes, and covers the header as well as the payload: that binds a payload to its header,
+`payload_crc` covers the header as well as the payload: that binds a payload to its header,
 and it stops a record with an empty payload having a checksum of zero, which a zeroed page
 would satisfy. `commit_seal` is a storage-program unit rather than a field, written after a
-barrier, and it is what makes a frame *committed* rather than merely present — it arrives
-with the barrier protocol at rung 0.2. Until then the append scan treats a frame whose
-checksums hold as history, so a torn write at the tail of a journal is not distinguishable
-from damage there. Both stop the scan in the same place, which is what §14 requires either
-way.
+barrier, and it is what makes a frame *committed* rather than merely present — which is why
+it hangs off the picture rather than sitting in it. It arrives with the barrier protocol at
+rung 0.2. Until then the append scan treats a frame whose checksums hold as history, so a
+torn write at the tail of a journal is not distinguishable from damage there. Both stop the
+scan in the same place, which is what §14 requires either way.
 
 Everything after the frame is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
