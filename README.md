@@ -17,8 +17,11 @@ deterministic workflow durable.**
 
 Rung 0.1, in progress. The design is settled at draft v0.2, the three crates exist as
 `no_std` libraries with the layering mechanically enforced, and `waymaker-core` now holds
-effect identity, activity kinds and the error vocabulary. The record codec and the replay
-cursor are the rest of 0.1 and are not written yet.
+effect identity, activity kinds, the error vocabulary, the borrowed record views, the
+streaming replay cursor, and the §08 transition table that decides at each effect boundary
+whether history answers the workflow's question or the world has to. `waymaker-flash` holds
+the record codec those views are decoded from. Timers and the two timer records are the rest
+of 0.1; the commit seal and the bank swap arrive with 0.2.
 See [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) for the
 full document, and the issue tracker for the build-out.
 
@@ -261,6 +264,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or a component a stage needs |
 | `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
 | `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
+| `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |

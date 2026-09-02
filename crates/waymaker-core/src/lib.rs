@@ -39,9 +39,11 @@ pub mod error;
 pub mod id;
 pub mod record;
 pub mod replay;
+pub mod transition;
 
 pub use activity::{ActivityKind, ActivityName};
 pub use error::{DecodeError, KernelError};
 pub use id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
 pub use record::{RecordKind, RecordRef};
 pub use replay::{PendingEffect, Position, ReplayCursor, Step};
+pub use transition::{Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve};

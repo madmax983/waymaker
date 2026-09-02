@@ -17,6 +17,7 @@ be superseded.
 | [0006](0006-effect-identity-is-newtypes-and-exhaustion-is-terminal.md) | Effect identity is newtypes, and exhaustion is terminal | accepted |
 | [0007](0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md) | The record frame is checksummed twice, and the kernel owns none of it | accepted |
 | [0008](0008-the-replay-cursor-is-pumped-by-its-caller.md) | The replay cursor is pumped by its caller and holds no page | accepted |
+| [0009](0009-the-transition-table-is-a-machine-that-owns-the-cursor.md) | The transition table is a machine that owns the cursor, and divergence is terminal | accepted |
 
 ## Reading the numbers
 
@@ -32,7 +33,8 @@ of these are older than their numbers suggest:
   them as settled precedent. It was written when issue #11 asked for every settled decision
   to have an ADR and this one turned out not to.
 
-In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008.
+In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
+→ 0009.
 
 ## Writing one
 

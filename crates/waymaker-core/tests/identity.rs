@@ -42,29 +42,32 @@ fn size_and_alignment_of_every_identity_type_is_pinned() {
 }
 
 #[test]
-fn the_allocator_is_charged_for_through_the_cursor_that_contains_it() {
+fn the_allocator_is_charged_for_through_the_machine_that_contains_it() {
     // The allocator is live for the whole of a run, so it is kernel state and has to be
-    // charged for — but it is no longer charged for on its own. The replay cursor contains
-    // it, and `kernel_state_types!` sums types that are *independently* live, so
-    // registering both would spend 16 B of a 128 B budget twice. The fold was anticipated
-    // in `budget.rs`; this is the test that it was done as that comment requires, rather
-    // than by adding a row beside the old one.
-    let cursor = budget::KERNEL_STATE_TYPES
+    // charged for — but it is not charged for on its own. The replay cursor contains it and
+    // the replay machine contains the cursor, and `kernel_state_types!` sums types that are
+    // *independently* live, so registering a container beside its contents would spend the
+    // same bytes twice against a 128 B budget. The fold was anticipated in `budget.rs`;
+    // this is the test that it was done as that comment requires — by replacing the row,
+    // never by adding one beside it.
+    let machine = budget::KERNEL_STATE_TYPES
         .iter()
-        .find(|entry| entry.name.ends_with("ReplayCursor"))
-        .expect("the replay cursor is live kernel state and must be registered");
+        .find(|entry| entry.name.ends_with("ReplayMachine"))
+        .expect("the replay machine is live kernel state and must be registered");
 
+    for contained in ["EffectIdAllocator", "ReplayCursor"] {
+        assert!(
+            !budget::KERNEL_STATE_TYPES
+                .iter()
+                .any(|entry| entry.name.ends_with(contained)),
+            "{contained} is registered beside the machine that contains it, so its bytes \
+             are counted twice"
+        );
+    }
     assert!(
-        !budget::KERNEL_STATE_TYPES
-            .iter()
-            .any(|entry| entry.name.ends_with("EffectIdAllocator")),
-        "the allocator is registered beside the cursor that contains it, so its bytes are \
-         counted twice"
-    );
-    assert!(
-        cursor.size >= core::mem::size_of::<EffectIdAllocator>(),
-        "the cursor is {} bytes and contains a {} byte allocator",
-        cursor.size,
+        machine.size >= core::mem::size_of::<EffectIdAllocator>(),
+        "the machine is {} bytes and contains a {} byte allocator",
+        machine.size,
         core::mem::size_of::<EffectIdAllocator>()
     );
 

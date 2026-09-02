@@ -495,6 +495,37 @@ pub const REPLAY_SURFACE: &[&str] = &[
     "run",
 ];
 
+/// The file whose public function surface [`TRANSITION_SURFACE`] pins.
+pub const TRANSITION_SURFACE_PATH: &str = "waymaker-core/src/transition.rs";
+
+/// Every public function the replay machine of design document §08 is allowed to have.
+///
+/// Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of
+/// history, no best-effort recovery". Every word of that is an *absence*, and a test cannot
+/// call a function that is not there — so the surface is pinned, and a way back out of a
+/// refusal is a line a reviewer has to write on purpose.
+///
+/// A `pub fn reset(&mut self)`, `clear_divergence`, `resume`, or a `force` argument on
+/// `intent` is the shape this exists to stop: each breaks no layering rule, needs no
+/// dependency, passes every other gate, and turns "stop, never guess" into a suggestion.
+/// The same pin fails in the other direction, which is the half that matters more: a name
+/// the module no longer declares means the machine was renamed or deleted and the pin has
+/// stopped checking anything.
+///
+/// Sorted, so that the comparison below can be a set comparison and the list can be read.
+pub const TRANSITION_SURFACE: &[&str] = &[
+    "advance",
+    "diverged",
+    "divergence_from",
+    "intent",
+    "message",
+    "new",
+    "outcome",
+    "pending",
+    "position",
+    "run",
+];
+
 /// Rule: the replay cursor's public surface is exactly the one that was reviewed.
 ///
 /// Fails in both directions, and the second is the one that matters more. A function the
@@ -507,21 +538,61 @@ pub const REPLAY_SURFACE: &[&str] = &[
 /// skipped and a trait method counts even without `pub` on it.
 #[must_use]
 pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    check_pinned_surface(
+        "replay-cursor-surface",
+        REPLAY_SURFACE_PATH,
+        REPLAY_SURFACE,
+        sources,
+        "the cursor's public API is where design document \u{a7}02 decision 2 is enforced, so \
+         a lookup by effect id cannot be added without a reviewer writing it down",
+    )
+}
+
+/// Rule: the replay machine's public surface is exactly the one that was reviewed.
+///
+/// The same shape as [`check_replay_cursor_surface`] and for a different invariant: §08's
+/// divergence is terminal, and "there is no way back" is an absence no test can call.
+#[must_use]
+pub fn check_transition_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    check_pinned_surface(
+        "transition-surface",
+        TRANSITION_SURFACE_PATH,
+        TRANSITION_SURFACE,
+        sources,
+        "the machine's public API is where design document \u{a7}08's \"stop, never guess\" is \
+         enforced, so a way out of a divergence cannot be added without a reviewer writing \
+         it down",
+    )
+}
+
+/// The body both surface pins share: `path` declares exactly `pinned`, no more and no less.
+///
+/// One function rather than two near-copies, because the failure this guards against is a
+/// pin that quietly stops checking — and two implementations is exactly how one of them
+/// ends up with the fails-closed branch and the other without it.
+///
+/// Scanned with the same reader `size-probe-reach` uses, so `#[cfg(test)]` helpers are
+/// skipped and a trait method counts even without `pub` on it.
+#[must_use]
+fn check_pinned_surface(
+    rule: &'static str,
+    path: &str,
+    pinned: &[&str],
+    sources: &[crate::size::LayerSource],
+    purpose: &str,
+) -> Vec<Violation> {
     const KERNEL: &str = "waymaker-core";
 
-    let Some(source) = sources.iter().find(|source| {
-        source
-            .path
-            .replace('\\', "/")
-            .ends_with(REPLAY_SURFACE_PATH)
-    }) else {
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.path.replace('\\', "/").ends_with(path))
+    else {
         return vec![Violation::new(
-            "replay-cursor-surface",
+            rule,
             KERNEL,
             format!(
-                "no {REPLAY_SURFACE_PATH} in the workspace, so the pinned replay surface is \
-                 checking nothing; the cursor's public API is where design document \u{a7}02 \
-                 decision 2 is enforced"
+                "no {path} in the workspace, so the pinned surface is checking nothing; \
+                 {purpose}"
             ),
         )];
     };
@@ -544,7 +615,7 @@ pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<
     for (index, name) in declarations.iter().enumerate() {
         if declarations.get(index.wrapping_add(1)) == Some(name) {
             violations.push(Violation::new(
-                "replay-cursor-surface",
+                rule,
                 KERNEL,
                 format!(
                     "{} declares `{name}` more than once: the pin is a list of names, so a \
@@ -557,30 +628,25 @@ pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<
     }
 
     let declared: BTreeSet<String> = declarations.into_iter().collect();
-    let pinned: BTreeSet<String> = REPLAY_SURFACE
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    let pinned: BTreeSet<String> = pinned.iter().map(|name| (*name).to_owned()).collect();
 
     for added in declared.difference(&pinned) {
         violations.push(Violation::new(
-            "replay-cursor-surface",
+            rule,
             KERNEL,
             format!(
-                "{} declares `{added}`, which is not in `source::REPLAY_SURFACE`: the \
-                 cursor's public API is pinned so that a lookup by effect id cannot be added \
-                 without a reviewer writing it down — see design document \u{a7}02 decision 2",
+                "{} declares `{added}`, which the pinned surface does not list: {purpose}",
                 source.path
             ),
         ));
     }
     for missing in pinned.difference(&declared) {
         violations.push(Violation::new(
-            "replay-cursor-surface",
+            rule,
             KERNEL,
             format!(
-                "`source::REPLAY_SURFACE` pins `{missing}`, which {} no longer declares; a \
-                 pin nothing matches is a pin that has stopped checking",
+                "the pinned surface lists `{missing}`, which {} no longer declares; a pin \
+                 nothing matches is a pin that has stopped checking",
                 source.path
             ),
         ));
@@ -1092,17 +1158,18 @@ mod tests {
 /// Fixtures describing a replay module that does not exist on disk.
 #[cfg(test)]
 pub mod tests_support {
-    use super::REPLAY_SURFACE;
+    use std::collections::BTreeSet;
 
-    /// A replay module declaring exactly the pinned surface and nothing else.
+    use super::{REPLAY_SURFACE, TRANSITION_SURFACE};
+
+    /// A module declaring exactly `pinned` and nothing else.
     ///
-    /// Rendered from [`REPLAY_SURFACE`] rather than written out, so that a name added to the
-    /// pin without the real module gaining it fails against the real workspace — where it
-    /// should — rather than here, where it would look like a fixture problem.
-    #[must_use]
-    pub fn clean_replay_surface() -> String {
-        let mut source = String::from("//! A replay module.\n");
-        for name in REPLAY_SURFACE {
+    /// Rendered from the pin rather than written out, so that a name added to a pin without
+    /// the real module gaining it fails against the real workspace — where it should —
+    /// rather than here, where it would look like a fixture problem.
+    fn surface(title: &str, pinned: &[&str]) -> String {
+        let mut source = format!("//! {title}\n");
+        for name in pinned {
             source.push_str("pub fn ");
             source.push_str(name);
             source.push_str("() {}\n");
@@ -1110,17 +1177,33 @@ pub mod tests_support {
         source
     }
 
-    /// Probe source calling every name in [`REPLAY_SURFACE`], for the clean-workspace
-    /// fixture.
+    /// A replay module declaring exactly [`REPLAY_SURFACE`] and nothing else.
+    #[must_use]
+    pub fn clean_replay_surface() -> String {
+        surface("A replay module.", REPLAY_SURFACE)
+    }
+
+    /// A transition module declaring exactly [`TRANSITION_SURFACE`] and nothing else.
+    #[must_use]
+    pub fn clean_transition_surface() -> String {
+        surface("A transition module.", TRANSITION_SURFACE)
+    }
+
+    /// Probe source calling every name both pins list, for the clean-workspace fixture.
     ///
-    /// `size-probe-reach` demands a call for every public function a layer declares, and
-    /// [`clean_replay_surface`] declares eight of them — so a fixture that supplied one
-    /// without the other would describe a workspace the gate rejects for a reason that has
-    /// nothing to do with what is being tested.
+    /// `size-probe-reach` demands a call for every public function a layer declares, and the
+    /// two clean surfaces above declare a dozen between them — so a fixture that supplied
+    /// one without the other would describe a workspace the gate rejects for a reason that
+    /// has nothing to do with what is being tested.
+    ///
+    /// Deduplicated, because the two pins share five names — `new`, `run`, `position`,
+    /// `pending` and `advance` — and a second call to one would be a second identical line
+    /// rather than a second reachable function.
     #[must_use]
     pub fn clean_probe_calls() -> String {
-        let mut source = String::from("\nfn reaches_the_replay_surface() {\n");
-        for name in REPLAY_SURFACE {
+        let names: BTreeSet<&&str> = REPLAY_SURFACE.iter().chain(TRANSITION_SURFACE).collect();
+        let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
+        for name in names {
             source.push_str("    ");
             source.push_str(name);
             source.push_str("();\n");

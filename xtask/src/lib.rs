@@ -75,6 +75,7 @@ pub const RULES: &[&str] = &[
     "size-probe",
     "size-probe-reach",
     "toolchain-targets",
+    "transition-surface",
     "workspace-lints",
     "workspace-membership",
 ];
@@ -225,6 +226,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_crate_attributes(&sources));
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
+    violations.extend(source::check_transition_surface(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -748,6 +750,7 @@ mod tests {
             "size-probe",
             "size-probe-reach",
             "toolchain-targets",
+            "transition-surface",
             "workspace-lints",
             "workspace-membership",
         ]
@@ -813,13 +816,21 @@ mod tests {
                 size::tests_support::clean_probe_source(),
                 source::tests_support::clean_probe_calls()
             )),
-            // One source, because `replay-cursor-surface` pins the cursor's public API and
-            // fails closed when the module it pins is not in the workspace at all.
-            layer_sources: vec![size::LayerSource {
-                crate_name: "waymaker-core".to_owned(),
-                path: format!("crates/{}", source::REPLAY_SURFACE_PATH),
-                contents: source::tests_support::clean_replay_surface(),
-            }],
+            // Two sources, because both surface pins fail closed when the module they pin
+            // is not in the workspace at all: `replay-cursor-surface` for the cursor's
+            // public API, `transition-surface` for the replay machine's.
+            layer_sources: vec![
+                size::LayerSource {
+                    crate_name: "waymaker-core".to_owned(),
+                    path: format!("crates/{}", source::REPLAY_SURFACE_PATH),
+                    contents: source::tests_support::clean_replay_surface(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-core".to_owned(),
+                    path: format!("crates/{}", source::TRANSITION_SURFACE_PATH),
+                    contents: source::tests_support::clean_transition_surface(),
+                },
+            ],
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a
                 // member the `missing-docs` rule could not be run against.

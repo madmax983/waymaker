@@ -1,6 +1,6 @@
 # Architecture
 
-Six diagrams, drawn from the design document. Each carries an HTML comment label that
+Seven diagrams, drawn from the design document. Each carries an HTML comment label that
 `cargo xtask check-layering` reads, and each is checked against the table that owns the
 same facts — so a diagram cannot quietly fall behind the code it draws.
 
@@ -10,6 +10,7 @@ same facts — so a diagram cannot quietly fall behind the code it draws.
 | [Durable effect protocol](#durable-effect-protocol) | §07 Durable effect protocol | `xtask::docs::EFFECT_PROTOCOL_STEPS` |
 | [Record frame](#record-frame) | §09 Journal and wire format | `xtask::docs::RECORD_FRAME_FIELDS` |
 | [Cold-start replay](#cold-start-replay) | §06 Cold-start replay | `xtask::docs::COLD_START_STEPS` |
+| [The replay transition table](#the-replay-transition-table) | §08 Replay and determinism | `xtask::docs::TRANSITION_TABLE_ROWS` |
 | [Two-bank swap](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::TWO_BANK_SWAP_STEPS` |
 | [The banks before and after](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::DIAGRAMS` |
 
@@ -238,6 +239,69 @@ ordering no execution could have produced — an outcome with no schedule, a seq
 skips or repeats, anything after a terminal record — with `KernelError::MalformedHistory`.
 Between them that is §09's "recovery stops at the first unsealed, malformed, out-of-sequence,
 or integrity-failed frame", split along the line that decides which crate owns bytes.
+
+## The replay transition table
+
+Design document §08. Step 5 above says "each effect consumes the matching history records";
+this is the decision behind it. At every effect boundary the workflow reaches, exactly one
+of five things is true, and the answer decides whether history returns a result or the
+world has to produce one.
+
+`ReplayCursor` cannot make this decision: it validates history against *itself*, and the
+question here is history against **what the workflow just asked for**. `ReplayMachine` is
+the cursor plus that question, and it is the only place `NondeterministicWorkflow` can come
+from.
+
+<!-- diagram: replay-transition -->
+
+```mermaid
+flowchart TD
+  ask(["the workflow reaches an effect boundary<br/>kind + input digest"])
+
+  r5{"Terminal workflow record?"}
+  r3{"End of history?"}
+  r4{"Different kind, digest, or sequence?"}
+  r1{"Matching schedule + completion?"}
+
+  fin["return the stored completion/failure<br/>poll no further"]
+  sched["Append and commit a schedule record, then dispatch"]
+  stop["stop with NondeterministicWorkflow<br/>never guess"]
+  replay["return the recorded result<br/>and advance the cursor"]
+  redeliver["Matching schedule only<br/>redeliver using the existing effect ID"]
+
+  ask --> r5
+  r5 -- yes --> fin
+  r5 -- no --> r3
+  r3 -- yes --> sched
+  r3 -- no --> r4
+  r4 -- yes --> stop
+  r4 -- no --> r1
+  r1 -- yes --> replay
+  r1 -- no --> redeliver
+
+  classDef step fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef stopnode fill:#ffe9e9,stroke:#c0392b,color:#3f1212;
+  classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
+  class ask,r5,r3,r4,r1 step;
+  class stop stopnode;
+  class fin,sched,replay,redeliver note;
+```
+
+The divergence branch is drawn red because it is the one edge with no way back.
+`ReplayMachine` refuses **before** the cursor consumes the record it disagreed with, so two
+things hold that a driver can rely on: no `EffectId` escapes, which is what makes "a
+diverging replay never dispatches" structural rather than a promise; and history stands
+where the divergence found it, so the diagnosis can name the record. The refusal is sticky —
+`transition-surface` pins the machine’s public API precisely so that a `reset` or a
+`clear_divergence` cannot arrive without a reviewer writing it down.
+
+Determinism itself is a contract no type can enforce. Workflow code must not read hardware
+registers, ambient time, randomness, mutable statics, network state, or anything with a
+nondeterministic iteration order; those values enter through recorded effects. §08 is
+explicit that the type system cannot prove this for arbitrary Rust — Waymaker detects
+divergence where it becomes *observable*, at effect boundaries, and a lint for suspicious
+APIs is later tooling.
+
 
 ## Two-bank swap
 

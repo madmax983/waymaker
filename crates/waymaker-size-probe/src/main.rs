@@ -202,6 +202,7 @@ fn engine() -> usize {
 
     kept = kept.wrapping_add(record_codec());
     kept = kept.wrapping_add(replay_cursor());
+    kept = kept.wrapping_add(transition_table());
 
     core::hint::black_box(kept)
 }
@@ -299,6 +300,193 @@ fn replay_cursor() -> usize {
     });
 
     core::hint::black_box(kept)
+}
+
+/// The transition table of design document §08: history against what the workflow asked.
+///
+/// Split out of [`engine`] for the same reason [`replay_cursor`] is — readability — and
+/// called unconditionally from there, so no figure the size report prints changes either
+/// way.
+///
+/// Together with [`transition_divergence`] this calls every public function of
+/// `waymaker_core::transition`, which is `size-probe-reach`'s requirement. Five of them
+/// share a name with a function of the cursor the machine contains (`new`, `run`,
+/// `position`, `pending`, `advance`), and that rule matches calls by name, so one call
+/// would credit both; they are all called for real here anyway, because a delta that
+/// charged for the cursor's `advance` and dead-stripped the machine's would understate
+/// every firmware that uses one.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn transition_table() -> usize {
+    use waymaker_core::replay::Step;
+    use waymaker_core::transition::{EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve};
+    use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
+
+    let request = EffectRequest {
+        kind: ActivityKind(core::hint::black_box(1)),
+        input_len: core::hint::black_box(2),
+        input_crc: core::hint::black_box(9),
+    };
+    let mut machine = ReplayMachine::new(RunId(core::hint::black_box(4)));
+    let mut kept = usize::try_from(machine.run().0).unwrap_or(0);
+    kept = kept.wrapping_add(usize::from(machine.position().is_terminal()));
+
+    kept = kept.wrapping_add(
+        match machine.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(Step::RunStarted { input, .. }) => input.len(),
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
+    // Row 3: history ended, so the driver is told to commit a schedule record.
+    kept = kept.wrapping_add(match machine.intent(request, Next::EndOfHistory) {
+        Ok(Intent::Schedule { id } | Intent::Recorded { id }) => {
+            usize::try_from(id.seq.0).unwrap_or(0)
+        }
+        Ok(Intent::Finished {
+            outcome: Outcome::Completed(bytes) | Outcome::Failed(bytes),
+        }) => bytes.len(),
+        Err(error) => error.message().len(),
+    });
+
+    // Rows 1 and 2: the matching schedule, then its recorded completion.
+    kept = kept.wrapping_add(
+        match machine.intent(
+            request,
+            Next::Record(RecordRef::EffectScheduled {
+                seq: core::hint::black_box(EffectSeq::FIRST),
+                kind: ActivityKind(core::hint::black_box(1)),
+                input_len: core::hint::black_box(2),
+                input_crc: core::hint::black_box(9),
+            }),
+        ) {
+            Ok(Intent::Recorded { id } | Intent::Schedule { id }) => {
+                usize::try_from(id.seq.0).unwrap_or(0)
+            }
+            Ok(Intent::Finished { .. }) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        machine
+            .pending()
+            .map_or(0, |pending| usize::from(pending.input_len)),
+    );
+    kept = kept.wrapping_add(
+        match machine.outcome(Next::Record(RecordRef::EffectCompleted {
+            seq: core::hint::black_box(EffectSeq::FIRST),
+            result: core::hint::black_box(b"out"),
+        })) {
+            Ok(Resolve::Replayed {
+                outcome: Outcome::Completed(bytes) | Outcome::Failed(bytes),
+                ..
+            }) => bytes.len(),
+            Ok(Resolve::Redeliver { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+            Err(error) => error.message().len(),
+        },
+    );
+
+    kept = kept.wrapping_add(transition_divergence());
+    core::hint::black_box(kept)
+}
+
+/// Row 4 of the table: the refusal, its sticky diagnosis, and the pure rule behind it.
+///
+/// A function of its own rather than more lines in [`transition_table`], because the
+/// branch §08 exists for is the one a delta most easily fails to charge for: an image that
+/// linked only the happy path would be measuring an engine that never stops.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn transition_divergence() -> usize {
+    use waymaker_core::replay::{PendingEffect, Position};
+    use waymaker_core::transition::{Divergence, EffectRequest, Next, ReplayMachine};
+    use waymaker_core::{ActivityKind, EffectId, EffectSeq, RecordRef, RunId};
+
+    const RUN: RunId = RunId(4);
+    const FIRST: EffectId = EffectId {
+        run: RUN,
+        seq: EffectSeq::FIRST,
+    };
+
+    let request = EffectRequest {
+        kind: ActivityKind(core::hint::black_box(1)),
+        input_len: core::hint::black_box(2),
+        input_crc: core::hint::black_box(9),
+    };
+    let mut machine = ReplayMachine::new(RunId(core::hint::black_box(RUN.0)));
+    let mut kept = match machine.advance(RecordRef::RunStarted {
+        workflow_kind: core::hint::black_box(1),
+        workflow_version: core::hint::black_box(1),
+        input: core::hint::black_box(b"in"),
+    }) {
+        Ok(_) => 0,
+        Err(error) => error.message().len(),
+    };
+
+    let divergent = EffectRequest {
+        kind: ActivityKind(core::hint::black_box(0xFFFF)),
+        ..request
+    };
+    kept = kept.wrapping_add(
+        match machine.intent(
+            divergent,
+            Next::Record(RecordRef::EffectScheduled {
+                seq: core::hint::black_box(EffectSeq::FIRST),
+                kind: ActivityKind(core::hint::black_box(1)),
+                input_len: core::hint::black_box(2),
+                input_crc: core::hint::black_box(9),
+            }),
+        ) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        machine
+            .diverged()
+            .map_or(0, |flavour| flavour.message().len()),
+    );
+    kept = kept.wrapping_add(usize::from(
+        core::hint::black_box(Divergence::Sequence) == Divergence::Digest,
+    ));
+    kept = kept.wrapping_add(match machine.position() {
+        Position::Halted(error) => error.message().len(),
+        Position::BeforeRun
+        | Position::Replaying
+        | Position::AwaitingOutcome
+        | Position::RunCompleted
+        | Position::RunFailed => 0,
+    });
+
+    // The divergence rule on its own: the one public function of the module that a machine
+    // does not reach on a caller's behalf.
+    kept = kept.wrapping_add(
+        request
+            .divergence_from(
+                &PendingEffect {
+                    id: core::hint::black_box(FIRST),
+                    kind: ActivityKind(core::hint::black_box(1)),
+                    input_len: core::hint::black_box(2),
+                    input_crc: core::hint::black_box(9),
+                },
+                core::hint::black_box(FIRST),
+            )
+            .map_or(0, |flavour| flavour.message().len()),
+    );
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn transition_table() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The record codec: encode a frame, decode it back, and walk it with the append scan.

@@ -181,7 +181,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 30 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 31 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -218,6 +218,7 @@ this table is how you find out what a red build is telling you.
 | `ci-pipeline` | The workflow drops a stage, reorders one within a job, or makes one unable to fail — an `if:`, a `continue-on-error:`, a missing `RUSTDOCFLAGS`, an `on:` block no pull request triggers, a job with no `runs-on:`, or a tab in the indentation. |
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, not executable, or not byte-for-byte what the stage table renders. |
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. |
+| `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links. |
 | `size-probe-reach` | A layer grows a public function the probe does not reach, so no budget charges for it. |
 | `gate-broken` | The gate's own expected values do not parse. A gate must not be able to silently uncheck one of its rules. |
@@ -276,9 +277,14 @@ the append scan that turns a bank into a committed prefix — see
 decision 2 (issue #14): a position that advances through one run's committed history a
 record at a time, refuses an ordering no execution could have produced, and holds no borrow
 of the caller's 512 B scratch page — see
-[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md).
+[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md). On top of it sits
+§08's transition table (issue #15): `ReplayMachine` is the cursor plus the one thing the
+cursor cannot know — what the workflow just asked for — and it is the only place
+`NondeterministicWorkflow` comes from. Divergence is terminal, and refused before the record
+it disagreed with is consumed, so a diverging replay cannot dispatch; see
+[ADR 0009](docs/adr/0009-the-transition-table-is-a-machine-that-owns-the-cursor.md).
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
-The §08 transition rules and divergence detection are the rest of rung 0.1; the commit seal
-and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
-before the code they govern, which is the point: a gate retrofitted after coverage has
-slipped is a gate that ratifies the slip.
+Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
+seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The
+gates went in before the code they govern, which is the point: a gate retrofitted after
+coverage has slipped is a gate that ratifies the slip.
