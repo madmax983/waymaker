@@ -174,6 +174,55 @@ fn an_empty_sequence_still_has_the_crash_point_before_it_started() {
 }
 
 #[test]
+fn an_operation_that_mutates_nothing_contributes_no_duplicate_worlds() {
+    // A zero-length program is a legal call — `validate_program(offset, 0)` is `Ok` — and
+    // it changes nothing. So "power loss after it" is the same world as "power loss before
+    // it", and "it failed having done everything" is the same world as "it failed having
+    // done nothing". Enumerating those would be counting one crash point twice, which is
+    // the one thing an exhaustive list must not do.
+    let ops = [
+        Op::Program { offset: 0, len: 0 },
+        Op::Erase { offset: 0, len: 0 },
+    ];
+    let points = injections(&ops, geometry());
+    assert_eq!(
+        points,
+        vec![
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                effect: Effect::PowerLoss,
+            },
+            // The call still fails, and the writer still reacts to it: that is a crash
+            // point, and it is the only one either operation has.
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                effect: Effect::Failure,
+            },
+            Injection {
+                op: 1,
+                progress: Progress::None,
+                effect: Effect::Failure,
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_barrier_keeps_its_whole_entry_even_though_it_writes_no_bytes() {
+    // The exception to the rule above. A barrier moves no bytes, but "after it returned"
+    // and "before it ran" are different worlds — that difference is the whole of
+    // acknowledgment.
+    let ops = [Op::Barrier];
+    assert!(injections(&ops, geometry()).contains(&Injection {
+        op: 0,
+        progress: Progress::Whole,
+        effect: Effect::PowerLoss,
+    }));
+}
+
+#[test]
 fn a_single_unit_operation_has_no_interior_tear_points() {
     let ops = [
         Op::Program { offset: 0, len: 1 },

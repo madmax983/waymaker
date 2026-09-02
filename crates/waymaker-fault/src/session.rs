@@ -30,8 +30,9 @@ pub struct Session {
     touched: Vec<bool>,
     /// Indices of barriers that completed durably.
     barriers: Vec<usize>,
-    /// `(record, index of the first operation that could belong to it)`.
-    marks: Vec<(RecordId, usize)>,
+    /// `(record, index of the first operation that could belong to it)`. A `None` record
+    /// is a *close*: it ends the span before it and starts one that belongs to nothing.
+    marks: Vec<(Option<RecordId>, usize)>,
     powered: bool,
 }
 
@@ -57,7 +58,24 @@ impl Session {
     /// wrong answer — but [`crate::verify_recovery`] refuses a ledger that contains one, so
     /// it fails at the assertion rather than silently.
     pub fn begin_record(&mut self, id: RecordId) {
-        self.marks.push((id, self.ops.len()));
+        self.marks.push((Some(id), self.ops.len()));
+    }
+
+    /// Declares that the operations from here on belong to no record.
+    ///
+    /// The counterpart of [`begin_record`](Self::begin_record), and the reason it exists is
+    /// a silent weakening rather than a missing convenience. An operation belongs to
+    /// whichever record was open when it was issued, so housekeeping after a record's
+    /// barrier — an erase of the other bank, a scratch write — would otherwise fall inside
+    /// that record and leave it with an unordered mutation in it. The record would drop
+    /// from [`Durability::Acknowledged`] to [`Durability::PossiblyDurable`], and
+    /// [`crate::verify_recovery`] would stop *requiring* a record recovery must not lose.
+    /// That is the direction a check must never fail in, and it would show up as nothing at
+    /// all.
+    ///
+    /// Calling it with no record open is a no-op that costs nothing.
+    pub fn end_record(&mut self) {
+        self.marks.push((None, self.ops.len()));
     }
 
     /// The bytes as they stand, which is what a reader after a reset would see.
@@ -89,12 +107,13 @@ impl Session {
             .marks
             .iter()
             .enumerate()
-            .map(|(position, (id, start))| {
+            .filter_map(|(position, (id, start))| {
+                let id = (*id)?;
                 let end = self
                     .marks
                     .get(position.wrapping_add(1))
                     .map_or(self.ops.len(), |(_, next)| *next);
-                (*id, self.durability_of(*start, end))
+                Some((id, self.durability_of(*start, end)))
             })
             .collect();
         Ledger::from_entries(entries)

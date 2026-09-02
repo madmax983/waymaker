@@ -78,6 +78,25 @@ impl Op {
     const fn failure_is_observable_after_the_fact(self) -> bool {
         !matches!(self, Self::Barrier)
     }
+
+    /// Whether this operation leaves media exactly as it found it, whatever happens.
+    ///
+    /// A zero-length program or erase is a legal call — `validate_program(offset, 0)` is
+    /// `Ok`, and a writer with nothing to append is not a writer with a bug — and it moves
+    /// no bytes. So "power loss after it" is the same world as "power loss before it", and
+    /// "it failed having done everything" is the same world as "it failed having done
+    /// nothing". Both are dropped, because an exhaustive list that counts one crash point
+    /// twice is no longer a count of anything.
+    ///
+    /// A barrier is deliberately not in here. It moves no bytes either, and "after it
+    /// returned" is a different world from "before it ran" — that difference is the whole
+    /// of acknowledgment.
+    const fn mutates_nothing(self) -> bool {
+        matches!(
+            self,
+            Self::Program { len: 0, .. } | Self::Erase { len: 0, .. }
+        )
+    }
 }
 
 /// How much of an operation reached media.
@@ -122,10 +141,11 @@ pub struct Injection {
 ///
 /// * `(0, None, PowerLoss)` — the world stopping before the sequence began;
 /// * `(i, Bytes(n), PowerLoss)` for every interior tear point of every operation;
-/// * `(i, Whole, PowerLoss)` for every operation — which is also "power loss *before*
-///   operation `i + 1`", so the two are one entry rather than two;
+/// * `(i, Whole, PowerLoss)` for every operation that can change media — which is also
+///   "power loss *before* operation `i + 1`", so the two are one entry rather than two;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
-///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier.
+///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
+///   or for an operation that moves no bytes.
 ///
 /// "Power loss before and after every barrier" falls out of the third bullet: *after* the
 /// barrier at `b` is `(b, Whole, PowerLoss)`, and *before* it is the previous operation's
@@ -146,11 +166,13 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
                 effect: Effect::PowerLoss,
             });
         }
-        points.push(Injection {
-            op: index,
-            progress: Progress::Whole,
-            effect: Effect::PowerLoss,
-        });
+        if !op.mutates_nothing() {
+            points.push(Injection {
+                op: index,
+                progress: Progress::Whole,
+                effect: Effect::PowerLoss,
+            });
+        }
     }
 
     for (index, op) in ops.iter().enumerate() {
@@ -159,7 +181,7 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
             progress: Progress::None,
             effect: Effect::Failure,
         });
-        if !op.failure_is_observable_after_the_fact() {
+        if !op.failure_is_observable_after_the_fact() || op.mutates_nothing() {
             continue;
         }
         for bytes in op.tear_points(geometry) {

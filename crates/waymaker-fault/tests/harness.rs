@@ -443,6 +443,72 @@ fn a_harness_can_be_told_to_report_one_way_bit_violations() {
     );
 }
 
+#[test]
+fn housekeeping_after_a_record_is_closed_does_not_take_its_acknowledgment_away() {
+    // Without `end_record`, a writer cannot say a record is finished, and any operation it
+    // issues afterwards falls inside that record's span. An unrelated erase after the
+    // barrier would then leave the record with an unordered mutation in it and downgrade
+    // it from acknowledged — which weakens the oracle silently, in the direction that
+    // stops it catching a real loss.
+    let runs = Harness::new(geometry()).run(|session| {
+        session.begin_record(RecordId(0));
+        session.program(0, &[0xA0; 4])?;
+        session.barrier()?;
+        session.end_record();
+        // Housekeeping that belongs to no record.
+        session.erase(32, 32)
+    });
+
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(
+        clean.ledger().state(RecordId(0)),
+        Some(Durability::Acknowledged)
+    );
+    assert_eq!(
+        verify_recovery(clean.ledger(), &[]),
+        Err(Breach::LostAnAcknowledgedRecord {
+            record: RecordId(0)
+        })
+    );
+    assert_eq!(clean.ledger().order(), [RecordId(0)]);
+}
+
+#[test]
+fn without_end_record_a_trailing_mutation_belongs_to_the_record_that_was_open() {
+    // The other side of the same rule, asserted so that the attribution is a documented
+    // choice rather than an accident: operations belong to the record that was open when
+    // they were issued, and a writer that does not close one is saying they are its.
+    let runs = Harness::new(geometry()).run(|session| {
+        session.begin_record(RecordId(0));
+        session.program(0, &[0xA0; 4])?;
+        session.barrier()?;
+        session.erase(32, 32)
+    });
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(
+        clean.ledger().state(RecordId(0)),
+        Some(Durability::PossiblyDurable)
+    );
+}
+
+#[test]
+fn end_record_before_any_record_is_open_changes_nothing() {
+    let runs = Harness::new(geometry()).run(|session| {
+        session.end_record();
+        session.program(0, &[0xA0; 4])?;
+        session.end_record();
+        session.begin_record(RecordId(9));
+        session.program(4, &[0xB0; 4])?;
+        session.barrier()
+    });
+    let clean = runs.first().expect("the fault-free run");
+    assert_eq!(clean.ledger().order(), [RecordId(9)]);
+    assert_eq!(
+        clean.ledger().state(RecordId(9)),
+        Some(Durability::Acknowledged)
+    );
+}
+
 /// Two blocks programmed, then erased in one call — so an erase has an interior.
 fn erase_both_blocks(session: &mut Session) -> Result<(), FaultError> {
     session.begin_record(RecordId(0));
