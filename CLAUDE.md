@@ -297,9 +297,21 @@ Stated so that nobody mistakes silence for coverage:
   `effect-scheduled-fields` compares *names*. ADR 0011's actual claim is 24 bytes per
   scheduled effect, and widening an existing field rather than adding one is invisible to
   it; `waymaker-flash`'s frame tests are what hold the layout.
-- **A lookup table outside the checksum module.** `integrity-check` reads
-  `waymaker-flash/src/crc.rs` and nothing else, so a table in a sibling module that `crc.rs`
-  calls is out of its scope.
+- **A lookup table outside the checksum module.** `integrity-check`'s table scan reads
+  `waymaker-flash/src/crc.rs` and the modules it is split into, so a table in a sibling
+  module that `crc.rs` calls is out of its scope.
+- **That a seal a body computes is the seal it stores.** `integrity-check`'s binding and
+  routing halves are scanners, and three rounds of review on pull request #60 spent
+  themselves on the same seam: a scanner cannot resolve a name or trace a value. What they
+  now hold is the *shape* — one unqualified call in a delegation, an unaliased depth-zero
+  import of it, no local definition shadowing it, and an invocation of `C::header_check` /
+  `C::frame_check` whose answer is used where it is computed. What is left uncovered is a
+  named binding read by something other than the expression that stores the seal, and the
+  reason that is tolerable is that it is not silent: `unused_variables` plus `-D warnings`
+  fails CI on a binding nothing reads, which is why an *underscore-prefixed* binding is
+  refused and a plain one is not. `waymaker-flash`'s golden frames and
+  `tests/integrity.rs` are what hold the behaviour; these rules hold what a reviewer can
+  check by eye.
 - **`[lints] workspace = true` in `xtask` and the size probe.** `member-manifest` iterates
   `policy::LAYERS`, so it covers the three firmware crates only.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
