@@ -163,6 +163,39 @@ fn a_matching_schedule_with_no_outcome_redelivers_the_existing_effect_id() {
 }
 
 #[test]
+fn a_run_torn_at_its_third_effect_redelivers_that_effect() {
+    // §14's redelivery contract is that the dispatcher sees the identity it was already
+    // given. Tearing at sequence 0 cannot show that: there the right answer and "always the
+    // run's first effect" are the same number, so a machine that redelivered `EffectSeq(0)`
+    // for every torn effect would pass. This tears at the third.
+    let mut machine = started();
+    for seq in 0..2_u32 {
+        assert_eq!(
+            machine.intent(REQUEST, Next::Record(schedule(seq))),
+            Ok(Intent::Recorded { id: effect(seq) })
+        );
+        assert!(
+            machine
+                .outcome(Next::Record(RecordRef::EffectCompleted {
+                    seq: EffectSeq(seq),
+                    result: b"out",
+                }))
+                .is_ok()
+        );
+    }
+
+    assert_eq!(
+        machine.intent(REQUEST, Next::Record(schedule(2))),
+        Ok(Intent::Recorded { id: effect(2) })
+    );
+    assert_eq!(
+        machine.outcome(Next::EndOfHistory),
+        Ok(Resolve::Redeliver { id: effect(2) })
+    );
+    assert_eq!(machine.pending().map(|open| open.id), Some(effect(2)));
+}
+
+#[test]
 fn a_redelivered_effect_resolves_when_its_outcome_is_finally_committed() {
     let mut machine = started();
     assert!(machine.intent(REQUEST, Next::Record(schedule(0))).is_ok());
@@ -357,17 +390,56 @@ fn a_matching_request_diverges_from_nothing() {
     );
 }
 
+/// Every flavour paired with the text it must carry.
+///
+/// Pinned in a second place, exactly as `tests/errors.rs` pins the two error enums' and for
+/// the same reason it gives: distinct-and-non-empty is satisfied by two messages that have
+/// been swapped, and a swapped message names the wrong refusal in the one place — a firmware
+/// log with no debugger attached — where nobody can go and check.
+const EVERY_DIVERGENCE: [(Divergence, &str); 4] = [
+    (
+        Divergence::Sequence,
+        "the effect is not the one history recorded here",
+    ),
+    (
+        Divergence::Kind,
+        "a different activity kind than history recorded",
+    ),
+    (
+        Divergence::Digest,
+        "a different activity input than history recorded",
+    ),
+    (
+        Divergence::Boundary,
+        "an effect boundary history cannot account for",
+    ),
+];
+
 #[test]
-fn every_divergence_has_its_own_message() {
-    let messages = [
-        Divergence::Sequence.message(),
-        Divergence::Kind.message(),
-        Divergence::Digest.message(),
-    ];
-    for (left_index, left) in messages.iter().enumerate() {
-        assert!(!left.is_empty());
-        for (right_index, right) in messages.iter().enumerate() {
-            assert_eq!(left_index == right_index, left == right, "{left}");
+fn every_divergence_carries_the_message_it_was_given() {
+    for (flavour, expected) in EVERY_DIVERGENCE {
+        assert_eq!(flavour.message(), expected, "{flavour:?}");
+    }
+}
+
+#[test]
+fn every_divergence_message_is_non_empty_ascii_and_distinct() {
+    // The postcondition `Divergence::message` states: short enough for a firmware log line,
+    // ASCII so it survives one, and distinct so a log can say which of four causes happened.
+    const MESSAGE_LIMIT: usize = 60;
+
+    for (left_index, (left, _)) in EVERY_DIVERGENCE.iter().enumerate() {
+        let message = left.message();
+        assert!(!message.is_empty(), "{left:?} has no message");
+        assert!(message.is_ascii(), "{left:?}: {message}");
+        assert!(message.len() < MESSAGE_LIMIT, "{left:?}: {message}");
+
+        for (right_index, (right, _)) in EVERY_DIVERGENCE.iter().enumerate() {
+            assert_eq!(
+                left_index == right_index,
+                message == right.message(),
+                "{left:?} and {right:?} share a message"
+            );
         }
     }
 }
@@ -447,6 +519,23 @@ fn a_diverging_replay_never_dispatches_an_effect() {
         }
     }
 
+    // The half that matters, and the half a re-asked *divergent* request cannot establish:
+    // a machine that forgot the divergence would still refuse the request above, because the
+    // check is recomputed every time and still fails. So the run is asked for something
+    // history would happily answer — the very next schedule, matching in every field — and
+    // the refusal has to hold for that too. Without a sticky divergence this loop hands out
+    // an identity.
+    for _ in 0..4 {
+        match machine.intent(REQUEST, Next::Record(schedule(2))) {
+            Ok(Intent::Schedule { id } | Intent::Recorded { id }) => dispatched.push(id),
+            Ok(Intent::Finished { .. }) | Err(_) => {}
+        }
+        match machine.intent(REQUEST, Next::EndOfHistory) {
+            Ok(Intent::Schedule { id } | Intent::Recorded { id }) => dispatched.push(id),
+            Ok(Intent::Finished { .. }) | Err(_) => {}
+        }
+    }
+
     assert!(
         dispatched.is_empty(),
         "dispatched after divergence: {dispatched:?}"
@@ -493,7 +582,50 @@ fn a_terminal_failure_ends_the_run_at_an_effect_boundary() {
 }
 
 #[test]
+fn a_second_run_started_at_an_effect_boundary_halts_the_machine() {
+    // The third arm of `intent`'s record match, and the one an outcome record does not
+    // reach: a run cannot start twice.
+    let mut machine = started();
+    assert_eq!(
+        machine.intent(
+            REQUEST,
+            Next::Record(RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 2,
+                input: b"again",
+            })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+}
+
+#[test]
+fn an_effect_failure_with_no_schedule_before_it_halts_the_machine() {
+    let mut machine = started();
+    assert_eq!(
+        machine.intent(
+            REQUEST,
+            Next::Record(RecordRef::EffectFailed {
+                seq: EffectSeq(0),
+                error: b"no",
+            })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
 fn a_finished_run_is_never_polled_again() {
+    // §08 row 5's "without polling further", enforced rather than advised.
     let mut machine = started();
     assert!(
         machine
@@ -507,6 +639,7 @@ fn a_finished_run_is_never_polled_again() {
         machine.intent(REQUEST, Next::EndOfHistory),
         Err(KernelError::NondeterministicWorkflow)
     );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
     assert_eq!(
         machine.intent(REQUEST, Next::Record(schedule(0))),
         Err(KernelError::NondeterministicWorkflow)
@@ -519,12 +652,24 @@ fn a_finished_run_is_never_polled_again() {
 
 #[test]
 fn an_effect_boundary_cannot_be_opened_before_the_run_starts() {
+    // The workflow is executing without the input its own `RunStarted` record carries, so
+    // nothing it does next can be justified by history.
     let mut machine = ReplayMachine::new(RUN);
     assert_eq!(
         machine.intent(REQUEST, Next::EndOfHistory),
         Err(KernelError::NondeterministicWorkflow)
     );
     assert_eq!(machine.position(), Position::BeforeRun);
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+    // Terminal, so the run cannot be talked back into starting.
+    assert_eq!(
+        machine.advance(RecordRef::RunStarted {
+            workflow_kind: 1,
+            workflow_version: 2,
+            input: b"input",
+        }),
+        Err(KernelError::NondeterministicWorkflow)
+    );
 }
 
 #[test]
@@ -543,6 +688,82 @@ fn a_second_boundary_cannot_open_while_one_is_unresolved() {
     assert_eq!(
         machine.intent(REQUEST, Next::Record(schedule(1))),
         Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+}
+
+#[test]
+fn a_boundary_opened_over_a_dispatched_effect_is_terminal() {
+    // The path a driver takes on §08 row 3: history ended, so the driver committed the
+    // schedule record itself and advanced over it, and the effect is now in flight. If the
+    // workflow reaches its *next* boundary before that result arrives, it passed an `.await`
+    // without one — and a run continuing from there appends effects the journal cannot
+    // justify, so the next cold start could not replay it.
+    //
+    // The refusal therefore has to survive the outcome finally arriving. Before it was
+    // recorded it did not: the completion resolved the effect and the very next request was
+    // answered with a fresh identity.
+    let mut machine = started();
+    assert_eq!(
+        machine.intent(REQUEST, Next::EndOfHistory),
+        Ok(Intent::Schedule { id: effect(0) })
+    );
+    assert!(machine.advance(schedule(0)).is_ok());
+
+    assert_eq!(
+        machine.intent(REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+
+    assert_eq!(
+        machine.advance(RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"out",
+        }),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(
+        machine.intent(REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+}
+
+#[test]
+fn a_driver_asking_out_of_turn_is_refused_but_is_not_divergence() {
+    // The line this module draws: only a claim the *workflow* made can be a divergence. An
+    // `outcome` with no boundary open, and an `advance` with one still open, are the driver
+    // asking out of turn — nothing is consumed, the workflow claimed nothing, and the
+    // correct call still works afterwards. Making these terminal would end a run over a call
+    // that changed nothing.
+    let mut machine = started();
+    assert_eq!(
+        machine.outcome(Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), None);
+
+    assert!(machine.intent(REQUEST, Next::Record(schedule(0))).is_ok());
+    assert_eq!(
+        machine.advance(RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"out",
+        }),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), None);
+
+    // And the boundary still closes correctly afterwards.
+    assert_eq!(
+        machine.outcome(Next::Record(RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"out",
+        })),
+        Ok(Resolve::Replayed {
+            id: effect(0),
+            outcome: Outcome::Completed(b"out"),
+        })
     );
 }
 

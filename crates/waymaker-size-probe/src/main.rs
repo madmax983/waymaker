@@ -391,7 +391,92 @@ fn transition_table() -> usize {
         },
     );
 
+    kept = kept.wrapping_add(transition_recovery());
     kept = kept.wrapping_add(transition_divergence());
+    core::hint::black_box(kept)
+}
+
+/// Rows 2 and 5: a torn effect redelivered, and a terminal record met at a boundary.
+///
+/// A function of its own rather than more lines in [`transition_table`], which clippy's
+/// line budget would refuse anyway. Row 2 is the branch a firmware takes after every reset
+/// that lands mid-effect — §14's redelivery — and row 5 is the one that stops the workflow
+/// being polled again. A delta that linked neither would charge for a replay that always
+/// finds its answer, which is not the engine this is.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn transition_recovery() -> usize {
+    use waymaker_core::transition::{EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve};
+    use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
+
+    let request = EffectRequest {
+        kind: ActivityKind(core::hint::black_box(1)),
+        input_len: core::hint::black_box(2),
+        input_crc: core::hint::black_box(9),
+    };
+    let mut kept = core::hint::black_box(0_usize);
+    // Row 2: the intent is committed and no outcome is, so the effect is redelivered under
+    // the identity it already had. Linked because §14's redelivery is the branch a firmware
+    // takes after every reset that lands mid-effect, and a delta that charged only for the
+    // replayed path would understate exactly the recovery this engine exists for.
+    let mut torn = ReplayMachine::new(RunId(core::hint::black_box(5)));
+    kept = kept.wrapping_add(
+        match torn.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        match torn.intent(
+            request,
+            Next::Record(RecordRef::EffectScheduled {
+                seq: core::hint::black_box(EffectSeq::FIRST),
+                kind: ActivityKind(core::hint::black_box(1)),
+                input_len: core::hint::black_box(2),
+                input_crc: core::hint::black_box(9),
+            }),
+        ) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(match torn.outcome(Next::EndOfHistory) {
+        Ok(Resolve::Redeliver { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+        Ok(Resolve::Replayed { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
+
+    // Row 5: a terminal run record met at an effect boundary.
+    let mut finished = ReplayMachine::new(RunId(core::hint::black_box(6)));
+    kept = kept.wrapping_add(
+        match finished.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        match finished.intent(
+            request,
+            Next::Record(RecordRef::RunFailed {
+                error: core::hint::black_box(b"bad"),
+            }),
+        ) {
+            Ok(Intent::Finished {
+                outcome: Outcome::Completed(bytes) | Outcome::Failed(bytes),
+            }) => bytes.len(),
+            Ok(Intent::Schedule { .. } | Intent::Recorded { .. }) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
     core::hint::black_box(kept)
 }
 

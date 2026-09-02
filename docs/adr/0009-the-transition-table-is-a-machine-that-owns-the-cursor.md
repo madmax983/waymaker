@@ -89,7 +89,31 @@ is two calls.**
    out: no `EffectId` escapes, so nothing can be dispatched; and history stands where the
    divergence found it, so a diagnosis can name the record.
 
-6. **The absence is gated.** `transition-surface` pins the machine's public function
+   **Every `intent` that answers `NondeterministicWorkflow` records one**, including the
+   position gate's — the workflow reaching a boundary before its own `RunStarted`, while an
+   effect is unresolved, or after a terminal record. Those get a fourth flavour,
+   `Divergence::Boundary`, rather than being folded into `Sequence`: there is no recorded
+   schedule at such a position to differ from, and reporting "the effect is not the one
+   history recorded here" for a position where history recorded nothing would be the
+   misleading log this record keeps arguing against. They are terminal for a stronger reason
+   than driver error: a run that continues from one appends effects the journal cannot
+   justify, so the *next* cold start could not replay it. Refusing is what keeps history
+   replayable.
+
+   The line is drawn at who made the claim. A refusal from `outcome` with no boundary open,
+   or from `advance` with one still open, is the **driver** asking out of turn: the workflow
+   claimed nothing, nothing is consumed, and the correct call still succeeds afterwards.
+   Those are refusals, not divergence, and `diverged()` says so.
+
+6. **A halted cursor's error outranks every refusal the machine has of its own.** Checked
+   before the phase in all three entry points. Otherwise a record that halts the cursor
+   mid-boundary leaves the phase set, and the next call answers `NondeterministicWorkflow` —
+   reporting changed workflow code for a damaged journal, which is the one confusion
+   `KernelError`'s own documentation is written to prevent. A halted cursor and a diverged
+   phase cannot both be set, because `next_effect_id` refuses on a halted cursor before the
+   divergence check is reached, so deferring costs no exactness.
+
+7. **The absence is gated.** `transition-surface` pins the machine's public function
    surface against `xtask::source::TRANSITION_SURFACE`, in both directions. A `reset`, a
    `clear_divergence`, a `resume`, or a `force` argument on `intent` would break no layering
    rule, need no dependency and pass every other gate; the pin makes each of them a line a
@@ -116,9 +140,19 @@ replay return the wrong answer is. A lint for suspicious APIs is later tooling, 
   `advance` between the two — so a driver bug is a refusal rather than a mislabelled result.
   It is still surface a façade has to get right, and rung 0.4's `Ctx` is where that stops
   being the firmware author's problem.
-- The incremental code-flash delta rose from 5140 B to 6456 B of the 8192 B budget, and
+- The incremental code-flash delta rose from 5140 B to 7204 B of the 8192 B budget, and
   kernel state from 56 B to 64 B of 128 B. Both are measured by `cargo xtask size` against
-  a probe that reaches every new public function, including the refusal branch.
+  a probe that reaches every new public function and every row of the table, refusal
+  included. **988 B of the code-flash budget are left**, which is the number to look at
+  before the timer records are added: rung 0.1 is not finished, and the next change to this
+  crate is the one that has to prove it still fits.
+- `Divergence::Sequence` cannot be produced by any *workflow* behaviour, and its
+  documentation now says so rather than implying a protection the machine does not give. A
+  workflow call carries no sequence, so what reaches that check is an out-of-order journal
+  or a driver feeding the wrong record. The same fault is `MalformedHistory` when the cursor
+  meets it outside a boundary — two diagnoses for one fault, which §08's table asks for by
+  putting "sequence" in the divergence row, and which is written down rather than left to be
+  discovered in a log.
 - The gate list grew to 31 rules. That is a cost — five places to edit for one rule, per
   CLAUDE.md's checklist — accepted for the reason the record keeps giving: an invariant with
   nothing that fails a build over it is a comment.
@@ -144,3 +178,12 @@ replay return the wrong answer is. A lint for suspicious APIs is later tooling, 
   row-1 result hands back have to be live at the moment they are returned.
 - **A `const` table of `(state, input) -> action` rows with a lookup.** Rejected as the
   same table written twice: an exhaustive `match` *is* the table, and the compiler checks it.
+- **Leaving the position gate's refusals non-terminal**, and narrowing `diverged()`'s
+  documented postcondition to "divergence found by comparing a request against a record"
+  instead. Considered seriously, because making them terminal ends a run over what may be a
+  façade bug, and because a rung-0.4 async façade that re-polls a workflow future would hit
+  the half-open case. Rejected: the two-call protocol already forces a façade to hold
+  per-boundary state — it must keep the `EffectId` it dispatched under and the result bytes —
+  so re-entering `intent` on one boundary is a façade defect rather than a shape the design
+  needs. And the harm of continuing is not hypothetical: the run appends effects no replay
+  could reproduce.

@@ -39,6 +39,39 @@
 //! only in whether the *second* record is there, which is precisely why the second call
 //! exists.
 //!
+//! # The loop a driver writes
+//!
+//! The five rows read as a table; this is what they are to the code that uses them. `next`
+//! is whatever the driver's scan of the committed prefix produced at the cursor's position.
+//!
+//! ```text
+//! loop {
+//!     let request = EffectRequest { kind, input_len, input_crc };   // the workflow asked
+//!     match machine.intent(request, next)? {
+//!         Intent::Finished { outcome } => break outcome,            // row 5
+//!         Intent::Schedule { id } => {                              // row 3
+//!             append_and_seal(schedule_record(id, request));        // §07 steps 1-3
+//!             machine.advance(schedule_record(id, request))?;
+//!             let result = dispatch(id, input);                     // §07 step 4
+//!             append_and_seal(outcome_record(id, result));          // §07 steps 5-7
+//!             machine.advance(outcome_record(id, result))?;
+//!         }
+//!         Intent::Recorded { id } => match machine.outcome(next)? {
+//!             Resolve::Replayed { outcome, .. } => hand_back(outcome),   // row 1
+//!             Resolve::Redeliver { id } => {                            // row 2
+//!                 let result = dispatch(id, input);       // the intent is already durable
+//!                 append_and_seal(outcome_record(id, result));
+//!                 machine.advance(outcome_record(id, result))?;
+//!             }
+//!         },
+//!     }
+//! }
+//! ```
+//!
+//! Three vocabularies for one boundary — [`Step`], [`Intent`], [`Resolve`] — because the
+//! three answer different questions: what a record meant, what history says about a call,
+//! and what history holds for a call it recognises. Row 4 is the `?`.
+//!
 //! # Determinism is a contract
 //!
 //! §08 states it and nothing in Rust can enforce it. Workflow code must not read:
@@ -166,26 +199,69 @@ pub enum Resolve<'a> {
     },
 }
 
-/// The way a workflow's request disagreed with the schedule history recorded.
+/// The way a workflow disagreed with history.
 ///
-/// §08 names three — "different kind, digest, or sequence" — and every one of them is the
-/// same refusal, [`KernelError::NondeterministicWorkflow`]. This is the diagnosis beside
-/// it, kept because the three have three different causes: a reordered call, a renamed
-/// activity, and a changed input are three different things for an engineer to go and
-/// look at.
+/// §08 names three — "different kind, digest, or sequence" — and there is a fourth here
+/// that §08 implies rather than lists. Every one of them is the same refusal,
+/// [`KernelError::NondeterministicWorkflow`]. This is the diagnosis beside it, kept because
+/// the four have four different causes: a reordered call, a renamed activity, a changed
+/// input and a workflow running ahead of its own history are four different things for an
+/// engineer to go and look at.
 ///
-/// Not [`Ord`]: three causes, not three magnitudes.
+/// Not [`Ord`]: four causes, not four magnitudes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Divergence {
-    /// The recorded schedule is not the one that comes next in this run.
+    /// The recorded schedule's sequence is not the one the run would issue next.
     ///
-    /// Either its sequence is not the sequence the run would issue, or it belongs to
-    /// another run — which two banks make a thing that can be read.
+    /// # What this actually diagnoses
+    ///
+    /// Not changed workflow code, despite the error it produces. A workflow call carries no
+    /// sequence — the engine assigns it — so a workflow cannot ask for the wrong one. What
+    /// reaches this is history out of order, or a driver that fed the record after the one
+    /// it should have. §08's table nonetheless puts "sequence" in the divergence row, so
+    /// that is the refusal a boundary reports, and this flavour is what tells a reader the
+    /// refusal was about *position* rather than about the call.
+    ///
+    /// One consequence is worth knowing before it is met in a log: the same out-of-order
+    /// journal is diagnosed twice over, depending on where it is noticed. Met at an effect
+    /// boundary it is this, and the cursor is left where it stood; met by
+    /// [`ReplayMachine::advance`] outside one it is [`KernelError::MalformedHistory`], and
+    /// the cursor halts. Both are terminal. §09's "recovery stops at the first
+    /// out-of-sequence frame" is the second; this row of §08's table is the first.
+    ///
+    /// # The run half of the comparison
+    ///
+    /// [`EffectRequest::divergence_from`] compares the whole [`EffectId`], run id included,
+    /// so a [`PendingEffect`] built from another run is caught. Through
+    /// [`ReplayMachine::intent`] that half cannot fire, and saying so is better than leaving
+    /// an implied protection: §07 keeps the run id in the bank header rather than in every
+    /// record, so a schedule record carries only a sequence and the machine can only pair it
+    /// with its own run. Noticing that a *bank* belongs to another generation is the seal
+    /// check in `waymaker-flash`, not this. The run-id clause guards a caller that reaches
+    /// for the pure function with a [`PendingEffect`] it got from somewhere else.
     Sequence,
     /// The activity kind differs from the one history recorded.
     Kind,
     /// The input digest differs: a different length, a different checksum, or both.
     Digest,
+    /// The workflow reached an effect boundary where history says none can come next.
+    ///
+    /// Not one of §08's three, because there is no recorded schedule here to differ from —
+    /// which is exactly why it needs a flavour of its own. Reporting
+    /// [`Sequence`](Self::Sequence) would put "the effect is not the one history recorded
+    /// here" in a log for a position where history recorded nothing at all.
+    ///
+    /// Three positions produce it, and each is the workflow running ahead of what the
+    /// journal can account for: before the run's own `RunStarted` was consumed, so the
+    /// workflow is executing without its recorded input; while an effect is unresolved, so
+    /// the workflow passed an `.await` without a result; and after a terminal record, which
+    /// is §08 row 5's "without polling further" enforced rather than advised.
+    ///
+    /// Each is terminal for the same reason the other three are, and it is a stronger reason
+    /// than "a driver made a mistake": a run that continues from here appends effects the
+    /// journal cannot justify, so the *next* cold start could not replay it. Refusing is
+    /// what keeps history replayable.
+    Boundary,
 }
 
 impl Divergence {
@@ -202,6 +278,7 @@ impl Divergence {
             Self::Sequence => "the effect is not the one history recorded here",
             Self::Kind => "a different activity kind than history recorded",
             Self::Digest => "a different activity input than history recorded",
+            Self::Boundary => "an effect boundary history cannot account for",
         }
     }
 }
@@ -315,7 +392,9 @@ enum Phase {
 /// * A halted cursor's error outranks every refusal the machine has of its own, so the
 ///   diagnosis a driver reports is always the record that stopped recovery.
 /// * A divergence is sticky by representation: the private phase has a diverged state and
-///   no code path leaves it.
+///   no code path leaves it. Every [`intent`](Self::intent) that answers
+///   [`KernelError::NondeterministicWorkflow`] records one, so the refusal cannot be
+///   forgotten by a later call that happens to be answerable.
 /// * The machine holds no borrow of anything. It has no lifetime parameter, so one 512-byte
 ///   scratch page is enough however long history is.
 ///
@@ -385,13 +464,21 @@ impl ReplayMachine {
     ///
     /// # Postconditions
     ///
-    /// `Some` from the first refused request onwards, and always the *first* one: the
+    /// `Some` from the first [`intent`](Self::intent) that returned
+    /// [`KernelError::NondeterministicWorkflow`] onwards, and always the *first* one: the
     /// diagnosis a driver reports is the disagreement that stopped replay rather than
-    /// whatever the workflow asked for next. [`None`] for a machine halted by
-    /// [`KernelError::MalformedHistory`], which is a fault in the journal rather than in
-    /// the workflow — §08's divergence and §09's out-of-sequence recovery stop are two
-    /// different faults, and a log line that could not tell them apart would send an
-    /// engineer to the wrong place.
+    /// whatever the workflow asked for next. Every such refusal is recorded, so a driver
+    /// that consults this to decide whether §08's "stop, never guess" applies is never told
+    /// `None` after one.
+    ///
+    /// [`None`] in two cases that are deliberately not divergence. A machine halted by
+    /// [`KernelError::MalformedHistory`] is a fault in the *journal* rather than in the
+    /// workflow — §08's divergence and §09's recovery stop are two different faults, and a
+    /// log line that could not tell them apart would send an engineer to the wrong place.
+    /// And a refusal from [`outcome`](Self::outcome) with no boundary open, or from
+    /// [`advance`](Self::advance) with one still open, is the *driver* asking out of turn:
+    /// the workflow made no claim, nothing is consumed, and a correct call still succeeds
+    /// afterwards. Only a claim the workflow made can be a divergence.
     #[must_use]
     pub const fn diverged(&self) -> Option<Divergence> {
         match self.phase {
@@ -419,6 +506,16 @@ impl ReplayMachine {
             Position::Halted(error) => Some(error),
             _ => None,
         }
+    }
+
+    /// Records `divergence` and hands back §08's refusal.
+    ///
+    /// One place, so that "a divergence is sticky" cannot be true of the arms that remember
+    /// to set the phase and false of the ones that only return the error — which is exactly
+    /// the shape the first version of this module got wrong.
+    const fn diverge(&mut self, divergence: Divergence) -> KernelError {
+        self.phase = Phase::Diverged(divergence);
+        KernelError::NondeterministicWorkflow
     }
 
     /// Consume a committed record outside an effect boundary.
@@ -466,6 +563,10 @@ impl ReplayMachine {
     ///   as advice.
     /// * A refused request consumes nothing.
     ///
+    /// One rule covers all four, and a driver that keeps its scan in step with the cursor
+    /// needs only this one: [`Next::EndOfHistory`] consumes nothing, an [`Ok`] consumed the
+    /// record, and an [`Err`] did not. [`outcome`](Self::outcome) obeys the same rule.
+    ///
     /// # Errors
     ///
     /// * [`KernelError::NondeterministicWorkflow`] when the request disagrees with the
@@ -486,24 +587,35 @@ impl ReplayMachine {
             return Err(error);
         }
         match self.phase {
-            // Two refusals with one body, and deliberately not split into two arms saying
-            // the same thing. `Diverged` is sticky and is checked before anything else, so
-            // that the diagnosis a driver reports is the disagreement that stopped replay;
-            // `AwaitingOutcome` is a boundary that is already open, which means the workflow
-            // moved on without the result it asked for. Neither is something a
-            // deterministic replay can do, and neither consumes the record.
-            Phase::Diverged(_) | Phase::AwaitingOutcome => {
-                return Err(KernelError::NondeterministicWorkflow);
-            }
-            Phase::Settled => {}
+            // Already diverged. Checked before anything else and *not* re-recorded, so the
+            // diagnosis a driver reports stays the disagreement that stopped replay.
+            Phase::Diverged(_) => return Err(KernelError::NondeterministicWorkflow),
+            // A boundary already open is *not* an arm here, deliberately. Setting the phase
+            // to `AwaitingOutcome` requires having advanced the cursor over a schedule
+            // record, so the cursor is at `Position::AwaitingOutcome` too and its own gate
+            // below refuses — with the same recorded `Boundary` divergence. A second check
+            // here would be a branch no test could distinguish from the one that does the
+            // work, which is how a guard ends up believed in and not exercised.
+            Phase::Settled | Phase::AwaitingOutcome => {}
         }
 
-        // The one source of identity in the kernel, and the position gate with it: this
-        // refuses before the run starts, while an effect is unresolved, after a terminal
-        // record, and once the cursor has halted — each of which is history saying that
-        // this effect cannot come next.
+        // The one source of identity in the kernel, and the position gate with it. The gate
+        // runs before `next` is looked at, so it outranks every row of the table — including
+        // row 5, which is why a terminal record met at an exhausted sequence space reports
+        // `IdExhausted` rather than `Finished`. That needs 2^32 committed schedules, so it
+        // is stated rather than reachable.
         let expected = match self.cursor.next_effect_id() {
             Ok(id) => id,
+            // History says no effect can come next: before the run starts, while an effect
+            // is unresolved, or after a terminal record. The workflow is running ahead of
+            // what the journal can account for, which is terminal for the same reason a
+            // mismatched schedule is.
+            Err(KernelError::NondeterministicWorkflow) => {
+                return Err(self.diverge(Divergence::Boundary));
+            }
+            // `IdExhausted` is not a workflow fault, so it is not recorded as one. It is
+            // already sticky: the allocator has no path back from a spent sequence space,
+            // and §07 makes that terminal for the run.
             Err(error) => return Err(error),
         };
 
@@ -701,6 +813,40 @@ mod tests {
         Phase::AwaitingOutcome,
         Phase::Diverged(Divergence::Kind),
     ];
+
+    /// Every `Divergence`, in declaration order.
+    const EVERY_DIVERGENCE: [Divergence; 4] = [
+        Divergence::Sequence,
+        Divergence::Kind,
+        Divergence::Digest,
+        Divergence::Boundary,
+    ];
+
+    /// The position of each flavour in [`EVERY_DIVERGENCE`], by exhaustive `match`.
+    ///
+    /// Adding a variant without extending the array forces a new arm here, and the only
+    /// index it can be given is one the array does not have. The same guard `error.rs` puts
+    /// on its two enums, and for the same reason: a fixed-length array cannot notice a
+    /// variant that was never put in it.
+    const fn divergence_index(divergence: Divergence) -> usize {
+        match divergence {
+            Divergence::Sequence => 0,
+            Divergence::Kind => 1,
+            Divergence::Digest => 2,
+            Divergence::Boundary => 3,
+        }
+    }
+
+    #[test]
+    fn the_divergence_list_is_complete() {
+        assert!(
+            EVERY_DIVERGENCE
+                .iter()
+                .copied()
+                .map(divergence_index)
+                .eq(0..EVERY_DIVERGENCE.len())
+        );
+    }
 
     #[test]
     fn only_a_diverged_phase_reports_a_divergence() {

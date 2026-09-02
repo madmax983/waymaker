@@ -505,12 +505,16 @@ pub const TRANSITION_SURFACE_PATH: &str = "waymaker-core/src/transition.rs";
 /// call a function that is not there — so the surface is pinned, and a way back out of a
 /// refusal is a line a reviewer has to write on purpose.
 ///
-/// A `pub fn reset(&mut self)`, `clear_divergence`, `resume`, or a `force` argument on
-/// `intent` is the shape this exists to stop: each breaks no layering rule, needs no
-/// dependency, passes every other gate, and turns "stop, never guess" into a suggestion.
-/// The same pin fails in the other direction, which is the half that matters more: a name
-/// the module no longer declares means the machine was renamed or deleted and the pin has
-/// stopped checking anything.
+/// A `pub fn reset(&mut self)`, `clear_divergence` or `resume` is the shape this exists to
+/// stop: each breaks no layering rule, needs no dependency, passes every other gate, and
+/// turns "stop, never guess" into a suggestion. The same pin fails in the other direction,
+/// which is the half that matters more: a name the module no longer declares means the
+/// machine was renamed or deleted and the pin has stopped checking anything.
+///
+/// What it does **not** catch, so that nobody reads more into a green build than is there:
+/// this compares *names*. A `force: bool` added to `intent`, or any other change of
+/// signature or behaviour behind a name already on the list, is invisible to it and is a
+/// reviewer's job. The pin raises the cost of a new door, not of widening an existing one.
 ///
 /// Sorted, so that the comparison below can be a set comparison and the list can be read.
 pub const TRANSITION_SURFACE: &[&str] = &[
