@@ -1003,6 +1003,116 @@ mod tests {
         );
     }
 
+    /// One transition-module source, for the second surface pin.
+    fn transition_source(extra: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: format!("crates/{TRANSITION_SURFACE_PATH}"),
+            contents: format!("{}{extra}", tests_support::clean_transition_surface()),
+        }]
+    }
+
+    #[test]
+    fn the_pinned_transition_surface_passes() {
+        assert!(check_transition_surface(&transition_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_way_out_of_a_divergence_is_rejected_by_name() {
+        // The shape the rule exists for: it breaks no layering rule, needs no dependency,
+        // and turns design document §08's "stop, never guess" into a suggestion.
+        for escape in [
+            "pub fn clear_divergence(&mut self) {}\n",
+            "pub fn reset(&mut self) {}\n",
+            "pub fn resume(&mut self) {}\n",
+        ] {
+            let violations = check_transition_surface(&transition_source(escape));
+            assert_eq!(violations.len(), 1, "{escape}");
+            assert_eq!(violations[0].rule, "transition-surface");
+            assert!(
+                violations[0].detail.contains("stop, never guess"),
+                "{}",
+                violations[0].detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_transition_name_the_module_no_longer_declares_is_rejected() {
+        // The direction that matters more: a pin nothing matches has stopped checking, and
+        // a machine whose refusal nobody guards is a machine that will grow a way out.
+        let thinned =
+            tests_support::clean_transition_surface().replace("pub fn diverged() {}\n", "");
+        let violations = check_transition_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: format!("crates/{TRANSITION_SURFACE_PATH}"),
+            contents: thinned,
+        }]);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "transition-surface");
+        assert!(
+            violations[0].detail.contains("diverged"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_transition_module_fails_closed() {
+        let violations = check_transition_surface(&kernel_source("pub fn nothing() {}\n"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "transition-surface");
+        assert!(
+            violations[0].detail.contains("checking nothing"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn the_two_surface_pins_do_not_read_each_others_module() {
+        // The hazard of one shared body behind two rule ids: a pin pointed at the wrong file
+        // would report the other module's functions and look, from a green build, exactly
+        // like a pin that is working. Each rule is handed only the other's source, and each
+        // has to fail closed rather than find something it can compare.
+        let replay_only = vec![crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: format!("crates/{REPLAY_SURFACE_PATH}"),
+            contents: tests_support::clean_replay_surface(),
+        }];
+        let transition_only = transition_source("");
+
+        assert!(check_replay_cursor_surface(&replay_only).is_empty());
+        assert!(check_transition_surface(&transition_only).is_empty());
+
+        let missing_transition = check_transition_surface(&replay_only);
+        assert_eq!(missing_transition.len(), 1);
+        assert_eq!(missing_transition[0].rule, "transition-surface");
+        assert!(
+            missing_transition[0].detail.contains("checking nothing"),
+            "{}",
+            missing_transition[0].detail
+        );
+        let missing_replay = check_replay_cursor_surface(&transition_only);
+        assert_eq!(missing_replay.len(), 1);
+        assert_eq!(missing_replay[0].rule, "replay-cursor-surface");
+        assert!(
+            missing_replay[0].detail.contains("checking nothing"),
+            "{}",
+            missing_replay[0].detail
+        );
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_transition_module() {
+        let violations = check_transition_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates\\waymaker-core\\src\\transition.rs".to_owned(),
+            contents: tests_support::clean_transition_surface(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
     #[test]
     fn a_windows_path_separator_still_finds_the_replay_module() {
         let violations = check_replay_cursor_surface(&[crate::size::LayerSource {
