@@ -35,6 +35,7 @@
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 // The linker reports that it cannot find `_start`. That is the design, not a defect: see
 // the module documentation. Allowed here so that a warning nobody can act on does not
 // train readers to ignore the size job's output.
@@ -46,8 +47,12 @@
 use core::panic::PanicInfo;
 
 /// Required of any `no_std` binary, and never reached: nothing runs this image.
+///
+/// `const` because the workspace's nursery lints ask for it and there is no reason to
+/// refuse: a diverging `loop {}` is a legal constant evaluation, and `#[panic_handler]`
+/// only requires the signature, not the constness.
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+const fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }
 

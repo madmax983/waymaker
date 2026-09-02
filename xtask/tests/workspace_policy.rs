@@ -5,9 +5,10 @@
 //! passes, a copy of it with one forbidden line added does not, and the binary a
 //! developer and CI actually run reports it and exits non-zero.
 
-// `clippy.toml` exempts `#[test]` bodies from `expect_used`, but not the free helper
-// functions an integration-test crate needs. Every function in this file is test code.
-#![allow(clippy::expect_used)]
+// `clippy.toml` exempts `#[test]` bodies from `expect_used` and `panic`, but not the free
+// helper functions an integration-test crate needs. Every function in this file is test
+// code, and a helper that cannot fail loudly is a helper that hides a broken fixture.
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -405,7 +406,15 @@ fn run_stage(stage: &xtask::pipeline::Stage, directory: &Path) -> std::process::
         .split_whitespace()
         .skip(1) // the leading `cargo`
         .collect();
-    cargo()
+    let mut command = cargo();
+    // The workflow sets these in its job-level `env:` block, so CI runs every stage with
+    // them. `cargo doc` in particular reports a missing doc comment as a warning and exits
+    // zero without `RUSTDOCFLAGS`; a helper that left them out would run something weaker
+    // than the pipeline and still be called a stage.
+    for (key, value) in xtask::pipeline::REQUIRED_WORKFLOW_ENV {
+        command.env(key, value);
+    }
+    command
         .args(&arguments)
         .current_dir(directory)
         .output()
@@ -806,4 +815,144 @@ fn the_readme_lists_the_pipeline_the_stage_table_defines() {
         .collect();
 
     assert_eq!(listed, expected);
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #11: the documentation scaffolding.
+//
+// `CLAUDE.md`, the ADR record, and the architecture diagrams are contracts in prose. The
+// tests above prove the layering and the pipeline cannot drift from their tables; these
+// prove the same of the documentation. A "must not own" row that stops matching
+// `policy::LAYERS`, an ADR with no status, a gap in the ADR numbering, a crate root that
+// stops warning `missing_docs`, and an undocumented public item each fail here.
+// ---------------------------------------------------------------------------------------
+
+/// The number of files in `docs/adr` that are numbered ADRs, the template included.
+fn count_adrs(root: &Path) -> usize {
+    std::fs::read_dir(root.join(xtask::docs::ADR_DIR))
+        .expect("the ADR directory should exist")
+        .filter_map(Result::ok)
+        .filter(|entry| xtask::docs::adr_number(&entry.file_name().to_string_lossy()).is_some())
+        .count()
+}
+
+/// Appends a link to `name` to the scratch record's index.
+///
+/// A fixture that adds an ADR without indexing it trips `adr-index` as well as the rule it
+/// is about, which makes the assertion pass for a reason the test does not name.
+fn link_from_the_index(root: &Path, name: &str) {
+    let index = root.join(xtask::docs::ADR_DIR).join(xtask::docs::ADR_INDEX);
+    let existing = std::fs::read_to_string(&index).expect("the index should be read");
+    std::fs::write(&index, format!("{existing}\n- [scratch]({name})\n"))
+        .expect("the index should be writable");
+}
+
+// The rules themselves are unit-tested in `xtask::docs` against documents that do not
+// exist. What is worth testing here is what those cannot reach: that the documents this
+// repository ships satisfy the rules — which `the_workspace_satisfies_its_own_layering_policy`
+// above already asserts for all 28 rules at once — and that the attribute the gate insists
+// on has teeth in a real build. Re-reading CLAUDE.md here and re-running each rule by hand
+// would be a second implementation of the rule, free to drift from the first.
+
+#[test]
+fn a_claude_md_that_drops_a_must_not_own_row_is_rejected() {
+    let scratch = scratch_workspace("claude-md");
+    let path = scratch.root.join(xtask::docs::CLAUDE_MD_PATH);
+    let existing = std::fs::read_to_string(&path).expect("CLAUDE.md should be read");
+    let kernel = xtask::policy::layer("waymaker-core").expect("the kernel is a layer");
+    std::fs::write(
+        &path,
+        existing.replace(kernel.must_not_own, "whatever it likes"),
+    )
+    .expect("CLAUDE.md should be writable");
+
+    let output = run_xtask(&["check-layering"], &scratch.root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("claude-md"), "stderr: {stderr}");
+}
+
+#[test]
+fn an_adr_without_a_status_is_rejected() {
+    let scratch = scratch_workspace("adr-structure");
+    // The template occupies 0, so the count is the next free number: a fixture that left a
+    // gap would trip `adr-numbering` too, and the assertion would then pass for a reason
+    // the test does not name.
+    let next = u32::try_from(count_adrs(&scratch.root)).unwrap_or(0);
+    let name = format!("{next:04}-a-decision-with-no-status.md");
+    std::fs::write(
+        scratch.root.join(xtask::docs::ADR_DIR).join(&name),
+        "# ADR: a decision with no status\n\n## Context\n\n## Decision\n\n## Consequences\n",
+    )
+    .expect("the ADR should be writable");
+    link_from_the_index(&scratch.root, &name);
+
+    let output = run_xtask(&["check-layering"], &scratch.root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("adr-structure"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_gap_in_the_adr_numbering_is_rejected() {
+    let scratch = scratch_workspace("adr-numbering");
+    std::fs::write(
+        scratch
+            .root
+            .join(xtask::docs::ADR_DIR)
+            .join("0099-a-decision-from-the-future.md"),
+        "# ADR 0099: a decision from the future\n\n- Status: accepted\n- Date: 2026-09-01\n\n\
+         ## Context\n\nx\n\n## Decision\n\nx\n\n## Consequences\n\nx\n",
+    )
+    .expect("the ADR should be writable");
+
+    let output = run_xtask(&["check-layering"], &scratch.root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("adr-numbering"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_crate_root_that_stops_warning_missing_docs_is_rejected() {
+    let scratch = scratch_workspace("missing-docs-attr");
+    let path = scratch.root.join("crates/waymaker-core/src/lib.rs");
+    let existing = std::fs::read_to_string(&path).expect("the crate root should be read");
+    std::fs::write(&path, existing.replace("#![warn(missing_docs)]\n", ""))
+        .expect("the crate root should be writable");
+
+    let output = run_xtask(&["check-layering"], &scratch.root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-docs"), "stderr: {stderr}");
+}
+
+#[test]
+fn the_docs_stage_is_clean_on_the_workspace_we_ship() {
+    // Issue #11's first "done when": `missing_docs` is warned on *and clean*.
+    let output = run_stage(stage("docs"), &workspace_root());
+    assert!(
+        output.status.success(),
+        "the docs stage must pass on the workspace we ship: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn an_undocumented_public_item_fails_the_docs_stage() {
+    // The attribute rule proves `#![warn(missing_docs)]` is present. This proves the
+    // attribute has teeth: with the workflow's RUSTDOCFLAGS, a public item with no doc
+    // comment fails the pipeline rather than adding a line nobody reads.
+    let scratch = scratch_workspace("missing-docs-teeth");
+    let path = scratch.root.join("crates/waymaker-core/src/lib.rs");
+    let existing = std::fs::read_to_string(&path).expect("the crate root should be read");
+    std::fs::write(&path, format!("{existing}\npub struct Undocumented;\n"))
+        .expect("the crate root should be writable");
+
+    let output = run_stage(stage("docs"), &scratch.root);
+    assert!(
+        !output.status.success(),
+        "an undocumented public item must fail the docs stage"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing documentation"), "stderr: {stderr}");
 }

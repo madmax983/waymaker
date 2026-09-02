@@ -129,6 +129,23 @@ pub const STAGES: &[Stage] = &[
         why: "design document §15: a change that only builds on the host is not a change that works",
     },
     Stage {
+        name: "probe-lint",
+        job: "firmware",
+        // The size probe's binary is behind `required-features`, so the `lint` stage above
+        // — which is `--all-targets --no-default-features` on the host — never compiles it.
+        // Its crate root carries `#![no_std]`, `#![forbid(unsafe_code)]` and
+        // `#![warn(missing_docs)]` like every other, and without this stage none of the
+        // three is ever checked by a compiler: the layering gate would report the
+        // attributes present while an undocumented public item sat underneath them.
+        //
+        // On the firmware target and with the features on, because that is the only
+        // configuration in which a `#![no_main]` crate with a `#[panic_handler]` links at
+        // all. `facade` implies `engine`, so this covers all three layers.
+        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings",
+        in_hook: false,
+        why: "the probe's crate attributes are checked by the layering gate and by no compiler without this",
+    },
+    Stage {
         name: "size",
         job: "size",
         // Its own job because it links every feature combination on the firmware target

@@ -3,6 +3,11 @@
 //! Running it locally and running it in CI are the same command, so CI is confirmation
 //! rather than discovery.
 
+// Every crate root in the workspace carries this, the host tooling included: `xtask` is the
+// crate with the most code in it, and a rule that skipped the gate's own binary would be a
+// rule with a hole in exactly the place a reader looks first.
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
