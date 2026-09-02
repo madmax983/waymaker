@@ -315,11 +315,11 @@ fn every_record_round_trips_at_every_alignment() {
         // The frame's own length excludes the padding, which is what makes the format
         // self-delimiting independently of the device it was written on.
         assert_eq!(
-            decoded.encoded_len,
+            decoded.frame_len,
             FRAME_OVERHEAD_BYTES + payload_len_of(&record),
             "iteration {iteration}"
         );
-        assert!(decoded.encoded_len <= written, "iteration {iteration}");
+        assert!(decoded.frame_len <= written, "iteration {iteration}");
     }
 
     assert!(
@@ -452,47 +452,81 @@ fn a_truncated_frame_is_refused_at_every_length() {
     // a sample: a bounds check that only covers inputs shorter than the header leaves the
     // payload and the trailer unguarded, and that is exactly the shape of the bug this
     // sweep exists to find.
-    let mut page = [0_u8; SCRATCH];
-    let written = frame::encode(
-        &RecordRef::EffectFailed {
-            seq: EffectSeq(2),
-            error: b"a longer payload, so the sweep has something to walk through",
-        },
-        ProgramAlign::BYTE,
-        &mut page,
-    )
-    .expect("room for the frame");
+    for alignment in ALIGNMENTS {
+        let align = ProgramAlign::new(alignment).expect("a non-zero alignment");
+        let mut page = [0_u8; SCRATCH];
+        let written = frame::encode(
+            &RecordRef::EffectFailed {
+                seq: EffectSeq(2),
+                error: b"a longer payload, so the sweep has something to walk through",
+            },
+            align,
+            &mut page,
+        )
+        .expect("room for the frame");
+        let frame_len = FRAME_OVERHEAD_BYTES + 60;
 
-    for length in 0..written {
-        assert!(
-            frame::decode(&page[..length]).is_err(),
-            "a {length}-byte prefix of a {written}-byte frame decoded"
-        );
+        for length in 0..frame_len {
+            assert!(
+                frame::decode(&page[..length]).is_err(),
+                "alignment {alignment}: a {length}-byte prefix decoded"
+            );
+        }
+        // A frame is complete at `frame_len`, before its padding: the padding belongs to
+        // the device rather than to the frame, so a reader must not need it to decode.
+        assert!(frame::decode(&page[..frame_len]).is_ok(), "{alignment}");
+        assert!(frame::decode(&page[..written]).is_ok(), "{alignment}");
     }
-    assert!(frame::decode(&page[..written]).is_ok());
 }
 
 #[test]
-fn a_single_bit_flip_is_never_read_as_the_same_record() {
+fn a_single_bit_flip_anywhere_in_a_frame_is_refused() {
     // What the two checksums are for. Swept over every bit of the frame rather than
     // sampled: a checksum computed over the wrong range shows up as some region where a
     // flip changes nothing, and a sample can miss the region.
-    let mut page = [0_u8; SCRATCH];
-    let record = RecordRef::EffectCompleted {
-        seq: EffectSeq(0x1234_5678),
-        result: b"twenty-nine bytes of payload!",
-    };
-    let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).expect("room");
+    //
+    // The assertion is `is_none()`, not "not the record we started with". Every byte of a
+    // frame is inside `crc16(0..10)`, or is the header checksum, or is inside
+    // `crc32(0..12+N)`, or is the frame checksum — so a flip anywhere must be *refused*,
+    // and nothing weaker is the property. Asserting only that the result differs from the
+    // original would pass for a flip in a payload byte that changed the record into a
+    // different, happily-decoded one, which is exactly a decoder with no payload checksum.
+    //
+    // Swept at every alignment, because the padded frame is a different code path in the
+    // encoder and a test that only ever ran at alignment one would never enter it.
+    for alignment in ALIGNMENTS {
+        let align = ProgramAlign::new(alignment).expect("a non-zero alignment");
+        let mut page = [0_u8; SCRATCH];
+        let record = RecordRef::EffectCompleted {
+            seq: EffectSeq(0x1234_5678),
+            result: b"twenty-nine bytes of payload!",
+        };
+        let written = frame::encode(&record, align, &mut page).expect("room");
+        let frame_len = FRAME_OVERHEAD_BYTES + 29;
 
-    for index in 0..written {
-        for bit in 0..8 {
-            let mut damaged = page;
-            damaged[index] ^= 1 << bit;
-            assert_ne!(
-                decoded_record(&damaged[..written]),
-                Some(record),
-                "byte {index} bit {bit} was accepted as the original record"
-            );
+        for index in 0..frame_len {
+            for bit in 0..8 {
+                let mut damaged = page;
+                damaged[index] ^= 1 << bit;
+                assert!(
+                    decoded_record(&damaged[..written]).is_none(),
+                    "alignment {alignment}, byte {index} bit {bit} still decoded"
+                );
+            }
+        }
+
+        // The pad is the complement of that claim: a flip there changes nothing, because
+        // nothing reads it.
+        for index in frame_len..written {
+            for bit in 0..8 {
+                let mut stale = page;
+                stale[index] ^= 1 << bit;
+                assert_eq!(
+                    decoded_record(&stale[..written]),
+                    Some(record),
+                    "alignment {alignment}, pad byte {index} bit {bit} was interpreted"
+                );
+            }
         }
     }
 }
@@ -707,7 +741,16 @@ fn reseal(frame_bytes: &mut [u8]) {
         *slot = byte;
     }
 
-    let covered = frame_bytes.len().saturating_sub(4);
+    // The covered range comes from the `payload_len` in the header, never from the length
+    // of the slice handed in. Deriving it from the slice would be right only when there is
+    // no padding, so the first tamper test written at an alignment above one would reseal
+    // over the pad and pass for the wrong reason — and it would look like it was testing
+    // the padded path.
+    let payload_len = frame_bytes
+        .get(HEADER_BYTES - 4..HEADER_BYTES - 2)
+        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+        .map_or(0, |bytes| usize::from(u16::from_le_bytes(bytes)));
+    let covered = HEADER_BYTES.saturating_add(payload_len);
     let frame_crc = crc32(frame_bytes.get(..covered).unwrap_or_default());
     for (slot, byte) in frame_bytes
         .iter_mut()
@@ -791,18 +834,34 @@ fn a_body_that_does_not_fit_its_kind_is_refused() {
     // be the record it claims. `EffectScheduled` is exactly eight bytes of body and
     // `RunStarted` is at least four; anything else is a decoder reading fields that are
     // not there.
+    // Every rejection is paired with its nearest *accepted* neighbour, reached through the
+    // identical tamper path. Without the accepted rows, a decoder that refused every
+    // kind-substituted frame — or refused every frame at all — would pass this test, and the
+    // table would look like it was checking body shapes when it was checking nothing.
     for (kind, payload, expected) in [
         (
             RecordKind::EFFECT_SCHEDULED,
             7_usize,
-            DecodeError::MalformedRecord,
+            Err(DecodeError::MalformedRecord),
         ),
+        (RecordKind::EFFECT_SCHEDULED, 8, Ok(())),
         (
             RecordKind::EFFECT_SCHEDULED,
             9,
-            DecodeError::MalformedRecord,
+            Err(DecodeError::MalformedRecord),
         ),
-        (RecordKind::RUN_STARTED, 3, DecodeError::MalformedRecord),
+        (
+            RecordKind::RUN_STARTED,
+            3,
+            Err(DecodeError::MalformedRecord),
+        ),
+        (RecordKind::RUN_STARTED, 4, Ok(())),
+        (RecordKind::RUN_STARTED, 5, Ok(())),
+        // A body of any length fits a completion, which is what makes the two rejections
+        // above real constraints rather than a decoder that refuses short payloads
+        // everywhere.
+        (RecordKind::EFFECT_COMPLETED, 0, Ok(())),
+        (RecordKind::EFFECT_COMPLETED, 3, Ok(())),
     ] {
         let mut page = [0_u8; SCRATCH];
         let filler = vec![0_u8; payload];
@@ -816,8 +875,8 @@ fn a_body_that_does_not_fit_its_kind_is_refused() {
         page[3] = kind.0;
         reseal(&mut page[..written]);
         assert_eq!(
-            frame::decode(&page[..written]),
-            Err(expected),
+            frame::decode(&page[..written]).map(|_| ()),
+            expected,
             "kind {kind:?} with a {payload}-byte body"
         );
     }
@@ -846,7 +905,7 @@ fn an_unknown_kind_is_self_delimiting() {
         Ok(frame::Frame {
             format_version: FORMAT_VERSION,
             decoded: Decoded::UnknownKind(RecordKind::TIMER_SCHEDULED),
-            encoded_len: written,
+            frame_len: written,
         })
     );
 }
@@ -874,7 +933,7 @@ fn padding_is_written_erased_and_never_read_back() {
     );
 
     let decoded = frame::decode(&page[..written]).expect("a valid frame");
-    assert_eq!(decoded.encoded_len, frame_len);
+    assert_eq!(decoded.frame_len, frame_len);
     assert_eq!(decoded.decoded, Decoded::Record(record));
 
     // Stale bytes where the pad is: still the same record, because nothing reads them.
@@ -1120,4 +1179,174 @@ fn a_scan_survives_a_journal_that_ends_mid_frame() {
         assert!(scan.next().is_none());
         assert_eq!(scan.offset(), 0);
     }
+}
+
+#[test]
+fn the_golden_frames_hold_the_fields_section_09_puts_at_those_offsets() {
+    // The golden arrays are opaque blobs everywhere else in this file, and a blob compared
+    // with a blob cannot show a reader — or a reviewer — that the bytes are the right ones.
+    // Here each is taken apart at literal offsets against §09's field list, so a paste error
+    // or a vector regenerated from a broken encoder is visible without running anything.
+    let g = golden::RUN_STARTED;
+    assert_eq!(&g[0..2], b"WM", "magic, low byte first");
+    assert_eq!(g[2], 1, "format_version");
+    assert_eq!(g[3], 1, "record_kind: RunStarted");
+    assert_eq!(
+        u32::from_le_bytes([g[4], g[5], g[6], g[7]]),
+        0,
+        "effect_seq"
+    );
+    assert_eq!(
+        u16::from_le_bytes([g[8], g[9]]),
+        6,
+        "payload_len: four bytes of workflow identity plus two of input"
+    );
+    assert_eq!(
+        u16::from_le_bytes([g[10], g[11]]),
+        crc16(&g[0..10]),
+        "header_crc covers exactly the ten bytes before it, payload_len included"
+    );
+    assert_eq!(u16::from_le_bytes([g[12], g[13]]), 0xBEEF, "workflow_kind");
+    assert_eq!(u16::from_le_bytes([g[14], g[15]]), 7, "workflow_version");
+    assert_eq!(&g[16..18], b"hi", "input");
+    assert_eq!(
+        u32::from_le_bytes([g[18], g[19], g[20], g[21]]),
+        crc32(&g[0..18]),
+        "payload_crc covers the header as well as the payload"
+    );
+    assert_eq!(
+        g.len(),
+        22,
+        "sixteen bytes of overhead plus a six-byte payload"
+    );
+
+    let s = golden::EFFECT_SCHEDULED;
+    assert_eq!(&s[0..2], b"WM");
+    assert_eq!(s[3], 2, "record_kind: EffectScheduled");
+    assert_eq!(
+        u32::from_le_bytes([s[4], s[5], s[6], s[7]]),
+        0x0102_0304,
+        "effect_seq is little-endian on media, whatever the host is"
+    );
+    assert_eq!(
+        u16::from_le_bytes([s[8], s[9]]),
+        8,
+        "a schedule body is a fixed eight bytes"
+    );
+    assert_eq!(u16::from_le_bytes([s[12], s[13]]), 0x1234, "activity kind");
+    assert_eq!(u16::from_le_bytes([s[14], s[15]]), 0x40, "input_len");
+    assert_eq!(
+        u32::from_le_bytes([s[16], s[17], s[18], s[19]]),
+        0xDEAD_BEEF,
+        "input_crc"
+    );
+
+    let e = golden::RUN_COMPLETED_EMPTY;
+    assert_eq!(e[3], 7, "record_kind: RunCompleted");
+    assert_eq!(u16::from_le_bytes([e[8], e[9]]), 0, "an empty payload");
+    assert_eq!(e.len(), FRAME_OVERHEAD_BYTES, "the shortest frame there is");
+    // The whole reason the frame checksum covers the header: over an empty payload alone it
+    // would be `crc32(&[])`, the same fixed number for every terminal record with no result.
+    assert_ne!(
+        u32::from_le_bytes([e[12], e[13], e[14], e[15]]),
+        crc32(&[]),
+        "an empty payload must not have a checksum a zeroed page could hold"
+    );
+}
+
+#[test]
+fn an_input_digest_is_what_a_schedule_record_carries() {
+    // `EffectScheduled` records an activity input as a length and a digest rather than as
+    // bytes, and §08 compares what replay asks for against what history recorded. That is a
+    // check only if both sides compute the digest the same way, so there is one definition
+    // of it and this pins its round trip through the frame. Without a public producer the
+    // field would be a `u32` the codec faithfully moves across the journal with nothing able
+    // to put a right value in it.
+    let input = b"the activity input the workflow passed";
+    let digest = frame::input_digest(input);
+    assert_eq!(digest, frame::input_digest(input), "pure");
+    assert_ne!(digest, frame::input_digest(b"something else"));
+
+    let record = RecordRef::EffectScheduled {
+        seq: EffectSeq(3),
+        kind: ActivityKind(1),
+        input_len: u16::try_from(input.len()).expect("a short input"),
+        input_crc: digest,
+    };
+    let mut page = [0_u8; SCRATCH];
+    let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).expect("room");
+
+    let Some(RecordRef::EffectScheduled {
+        input_crc,
+        input_len,
+        ..
+    }) = decoded_record(&page[..written])
+    else {
+        panic!("the frame holds a schedule record")
+    };
+    assert_eq!(input_crc, frame::input_digest(input));
+    assert_eq!(usize::from(input_len), input.len());
+    // The divergence §08 stops: replay reconstructs a different input for the same effect.
+    assert_ne!(input_crc, frame::input_digest(b"a different input"));
+}
+
+#[test]
+fn no_format_version_permits_skipping_an_unknown_kind_yet() {
+    // The rule §09 states, checked over every value a version byte can hold rather than at
+    // the one value this firmware writes. `Scan` consults the same function, so a version
+    // that quietly granted skipping would be visible here before it was visible as a journal
+    // read wrong.
+    for version in 0..=u8::MAX {
+        assert!(
+            !frame::permits_unknown_record_skip(version),
+            "version {version} grants skipping, which no version does at rung 0.1"
+        );
+    }
+}
+
+#[test]
+fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
+    // Nothing on media says what program granularity a journal was written at. A reader
+    // given a smaller one strides short and lands inside a frame's padding — a run of
+    // `ERASED_BYTE` — which, without the erased-to-the-end-of-the-journal rule, would read
+    // as the ordinary end of history with committed records still ahead of it. Silently
+    // returning a truncated prefix is the worst thing this type can do, because everything
+    // downstream believes it.
+    let writer = ProgramAlign::new(64).expect("a non-zero alignment");
+    let mut journal = [ERASED_BYTE; SCRATCH];
+    let mut at = 0;
+    for record in [
+        RecordRef::RunStarted {
+            workflow_kind: 1,
+            workflow_version: 1,
+            input: b"a",
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"b",
+        },
+        RecordRef::RunCompleted { result: b"c" },
+    ] {
+        at += frame::encode(&record, writer, &mut journal[at..]).expect("room");
+    }
+
+    // Each frame is seventeen to nineteen bytes padded out to sixty-four, so a reader
+    // striding by one lands forty-odd bytes into a pad: far more than a header of
+    // `ERASED_BYTE`.
+    let mut mismatched = Scan::new(&journal, ProgramAlign::BYTE);
+    assert!(matches!(
+        mismatched.next(),
+        Some(Ok(RecordRef::RunStarted { .. }))
+    ));
+    assert_eq!(
+        mismatched.next(),
+        Some(Err(DecodeError::IntegrityFailed)),
+        "a short stride must be refused, never read as the end of history"
+    );
+    assert!(mismatched.next().is_none());
+
+    // The same journal at the granularity it was written with walks all three records.
+    let matched: Vec<Result<RecordRef<'_>, DecodeError>> = Scan::new(&journal, writer).collect();
+    assert_eq!(matched.len(), 3, "{matched:?}");
+    assert!(matched.iter().all(Result::is_ok));
 }

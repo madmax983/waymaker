@@ -60,6 +60,17 @@ const fn panic(_info: &PanicInfo<'_>) -> ! {
 ///
 /// [`core::hint::black_box`] is what stops the optimiser from folding the whole thing
 /// away and reporting a delta of zero for code that is really there.
+///
+/// # Why the two halves are `#[inline(never)]`
+///
+/// So that each row of the size report measures its own layer. With `lto = "fat"` the
+/// optimiser is free to inline [`engine`] into this function and then make different
+/// choices depending on whether [`facade`] is there to inline beside it — which showed up
+/// as a facade image eight bytes *smaller* than the engine image it strictly contains.
+/// That is codegen noise rather than a measurement, and at rung 0.1 the façade contributes
+/// no code of its own, so noise is all the difference between the two rows was. Keeping
+/// both out of line compiles the engine identically in every variant, so a variant that
+/// adds a feature adds bytes.
 fn probe() -> usize {
     let mut kept = core::hint::black_box(0_usize);
     kept = kept.wrapping_add(engine());
@@ -98,6 +109,7 @@ waymaker_core::activity_kinds! {
 /// a keep-alive rather than a quantity, and `usize::try_from(..).unwrap_or(0)` because a
 /// `u32` sequence and a `u64` run id are both wider than a pointer on `thumbv6m-none-eabi`.
 #[cfg(feature = "engine")]
+#[inline(never)]
 fn engine() -> usize {
     use waymaker_core::{
         ActivityName, DecodeError, EffectIdAllocator, EffectSeq, KernelError, RecordKind,
@@ -205,6 +217,7 @@ fn engine() -> usize {
 /// `.bss`, and a scratch buffer here is the caller-owned page §04 excludes from the
 /// engine's own budget.
 #[cfg(feature = "engine")]
+#[inline(never)]
 fn record_codec() -> usize {
     use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
     use waymaker_flash::frame::{self, Decoded, ProgramAlign, Scan};
@@ -213,6 +226,12 @@ fn record_codec() -> usize {
         return 0;
     };
     let mut kept = usize::from(align.get());
+    kept = kept.wrapping_add(
+        usize::try_from(frame::input_digest(core::hint::black_box(b"in"))).unwrap_or(0),
+    );
+    kept = kept.wrapping_add(usize::from(frame::permits_unknown_record_skip(
+        core::hint::black_box(1),
+    )));
     kept = kept.wrapping_add(align.round_up(core::hint::black_box(21)).unwrap_or(0));
 
     let mut page = [0_u8; 64];
@@ -239,7 +258,7 @@ fn record_codec() -> usize {
         match frame::decode(page.get(..written).unwrap_or_default()) {
             Ok(frame) => match frame.decoded {
                 Decoded::Record(decoded) => usize::from(decoded.kind().0)
-                    .wrapping_add(frame.encoded_len)
+                    .wrapping_add(frame.frame_len)
                     .wrapping_add(usize::from(frame.format_version)),
                 Decoded::UnknownKind(kind) => usize::from(kind.0),
             },
@@ -270,14 +289,16 @@ fn record_codec() -> usize {
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.
 #[cfg(not(feature = "engine"))]
-const fn record_codec() -> usize {
-    0
+#[inline(never)]
+fn record_codec() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.
 #[cfg(not(feature = "engine"))]
-const fn engine() -> usize {
-    0
+#[inline(never)]
+fn engine() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The Embassy façade, when it is linked in.
@@ -286,6 +307,7 @@ const fn engine() -> usize {
 /// reaches, and rung 0.4 must add the dispatcher step here for the `facade` row to mean
 /// anything.
 #[cfg(feature = "facade")]
+#[inline(never)]
 fn facade() -> usize {
     use waymaker_embassy as _;
 
@@ -295,8 +317,9 @@ fn facade() -> usize {
 
 /// Nothing, in an image built without the façade.
 #[cfg(not(feature = "facade"))]
-const fn facade() -> usize {
-    0
+#[inline(never)]
+fn facade() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The one symbol the linker is told to keep.

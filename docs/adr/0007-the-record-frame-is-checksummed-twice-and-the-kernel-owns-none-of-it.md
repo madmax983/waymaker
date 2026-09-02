@@ -34,8 +34,19 @@ framework* and *CRC* among the things `waymaker-core` may not have, and
 [`kernel-is-dependency-free`](0003-the-eight-settled-design-decisions.md#kernel-is-dependency-free)
 leaves it with no crate to borrow either from. `waymaker-flash`'s Owns cell is "stable wire
 encoding, CRC and seals". So the seam is not a matter of taste: the *view* is the kernel's
-and the *bytes* are the adapter's, and `cargo xtask check-layering` fails a build that
-blurs it.
+and the *bytes* are the adapter's.
+
+That rule had a hole, and this change closes it. `kernel-zero-dependencies` stops the kernel
+*importing* a serialization framework or a CRC crate; nothing stopped it *writing* one. A
+hand-rolled `const fn crc32(bytes: &[u8]) -> u32` and a `u32::from_le_bytes` in a decode loop
+add no dependency, no manifest entry and no graph edge, so every rule the gate had would have
+passed while the layering claim quietly became prose. `kernel-owns-no-encoding` is the
+twenty-ninth rule, and it fails a build for the six endianness conversions and for an
+`impl From<&[u8]>` or `TryFrom<&[u8]>` in a kernel source — the last of which is the cheapest
+way in, because it needs no `pub`, and `size-probe-reach` already credits `try_from` from
+elsewhere in the probe. It is a floor rather than a proof: a determined author can still
+write a shift-and-or loop the scan does not recognise. What it makes impossible is the
+accidental arrival, which is the one that gets merged.
 
 **Neither layer may take a dependency, including a dev-dependency.** `may_depend_on_external`
 is empty for both, and the gate reads every dependency table. So the round-trip and fuzz
@@ -179,9 +190,23 @@ where somebody sizing a bank will find it.
 `Scan` carries one branch that no test can reach: the arm that skips an unknown kind, which
 is unreachable while `VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP` is empty. It is kept because
 the alternative is a paragraph, and a paragraph is what a future version bump would have to
-remember to read. The same goes for a handful of refusals in `decode` that are unreachable by
-construction and are spelled as refusals rather than as `unwrap`. Both show up as the six
-uncovered lines in `waymaker-flash`, against a gate of 85% and a measured 98.5%.
+remember to read — and the *rule* is testable even though the branch is not, which is what
+`permits_unknown_record_skip` is for: it is checked over all 256 values a version byte can
+hold. The same goes for a handful of refusals in `decode` that are unreachable by
+construction and are spelled as refusals rather than as `unwrap`. Both show up as the
+uncovered lines in `waymaker-flash`, against a gate of 85%.
+
+`Scan` also takes the program granularity as a parameter, and nothing on media records what
+the writer used. A reader given a *smaller* one strides short and lands inside a frame's
+padding — a run of `ERASED_BYTE` — which would otherwise read as the ordinary end of history
+with committed records still ahead of it. Silently returning a truncated prefix is the worst
+failure this type has, because everything downstream believes it, so the erased-tail rule is
+"an erased header *and* erased to the end of the journal", and a mismatch is
+`IntegrityFailed` at the offset the reader went wrong. That costs one pass over the tail on
+the terminating step, once per recovery. It does not make the mismatch safe — a reader given
+a *larger* granularity strides past frames and cannot be caught this way — which is a second
+reason rung 0.2 puts the writer's program size in the bank header, where a fact about the
+media belongs.
 
 Adding `DecodeError::MalformedRecord` widened the kernel's error vocabulary to six variants.
 Neither error enum is `#[non_exhaustive]` — ADR 0006 — so every adapter that matches it

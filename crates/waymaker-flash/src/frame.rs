@@ -126,6 +126,34 @@ pub const ERASED_BYTE: u8 = 0xFF;
 /// skipping. The rule is a lookup rather than a paragraph.
 const VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP: &[u8] = &[];
 
+/// Whether a reader of a journal written at `version` may skip a record kind it does not
+/// know.
+///
+/// The rule §09 states, as a function rather than as a paragraph, so that it can be checked
+/// over every value a version byte can hold rather than at the one value this firmware
+/// writes. [`Scan`] consults it, and it is the thing a future format version changes.
+///
+/// # Postconditions
+///
+/// `false` for every `version` at rung 0.1, [`FORMAT_VERSION`] included. Skipping a record
+/// asserts that the rest of history means the same thing without it, and at v0.1 that is
+/// false for every record in §09's table: a skipped `TimerFired` is a timer replay believes
+/// never fired.
+#[must_use]
+pub const fn permits_unknown_record_skip(version: u8) -> bool {
+    // Walked with `split_first` rather than `<[u8]>::contains`, which is not `const`. The
+    // list is empty today, so this returns `false` without looking at anything; when a
+    // version grants skipping it is one entry and one iteration.
+    let mut rest = VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP;
+    while let Some((permitted, tail)) = rest.split_first() {
+        if *permitted == version {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
 /// How far the payload of the two fixed-shape records extends.
 const RUN_STARTED_PREFIX_BYTES: usize = 4;
 const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
@@ -213,7 +241,38 @@ pub struct Frame<'a> {
     /// Padding is a property of the device the journal was written on rather than of the
     /// frame, so it is not counted here — [`ProgramAlign::round_up`] is what turns this
     /// into a stride, and [`Scan`] is what applies it.
-    pub encoded_len: usize,
+    ///
+    /// # This is not a cursor advance
+    ///
+    /// [`encode`] returns the *padded* length and this is the *unpadded* one, so
+    /// `offset += frame.frame_len` lands a reader inside the pad of the frame it just
+    /// read. That is why the field is not called `encoded_len`, and why [`Scan`] exists:
+    /// applying the stride needs the device's program granularity, which is not on media
+    /// and is therefore not something a single frame can tell you.
+    pub frame_len: usize,
+}
+
+/// The digest a schedule record carries for the activity input it was scheduled with.
+///
+/// [`waymaker_core::RecordRef::EffectScheduled`] records an
+/// activity input as a length and a digest rather than as bytes — §07 orders a durable
+/// intent before the effect, and §08 compares what replay asks for against what history
+/// recorded, for which a length and a digest are enough. That only works if both sides
+/// compute the digest the same way, so there is exactly one definition of it and this is
+/// it: the same CRC-32/ISO-HDLC the frame is sealed with.
+///
+/// Without this the field would be a `u32` the codec faithfully moves from one side of the
+/// journal to the other with nothing able to produce a right value for it, and a divergence
+/// check that compares two numbers nobody computed is a check that passes.
+///
+/// # Postconditions
+///
+/// Pure and total. `input_digest(&[])` is the CRC of the empty input, which is a fixed
+/// number — a scheduled activity with no input has a digest like any other, and comparing
+/// it is still the §08 check.
+#[must_use]
+pub const fn input_digest(input: &[u8]) -> u32 {
+    crc32(input)
 }
 
 /// Bytes `record` occupies once written and padded to `align`.
@@ -327,7 +386,12 @@ pub fn encode(
         *slot = byte;
     }
     let covered = HEADER_BYTES.saturating_add(payload_len);
-    let frame_crc = crc32(frame.get(..covered).unwrap_or_default());
+    // `ok_or` rather than `unwrap_or_default`. The slice is `padded >= frame_len > covered`
+    // bytes long so this cannot fail, but the fail-open spelling would seal the frame with
+    // `crc32(&[])` — and `crc32` of nothing is a fixed number, so a bug that reached it
+    // would produce a frame that looks checksummed rather than one that is refused.
+    let sealed = frame.get(..covered).ok_or(DecodeError::LengthOutOfBounds)?;
+    let frame_crc = crc32(sealed);
     for (slot, byte) in frame.iter_mut().skip(covered).zip(frame_crc.to_le_bytes()) {
         *slot = byte;
     }
@@ -341,7 +405,7 @@ pub fn encode(
 /// Reads the frame at the front of `bytes`.
 ///
 /// Trailing bytes are ignored: a journal is a run of frames, so `bytes` is normally the
-/// rest of the bank and [`Frame::encoded_len`] is what says where this record stopped.
+/// rest of the bank and [`Frame::frame_len`] is what says where this record stopped.
 ///
 /// # Postconditions
 ///
@@ -408,7 +472,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
     // Both sums are bounded by `MAX_FRAME_BYTES`, so neither can overflow a `usize` on any
     // target this crate builds for; `saturating_add` says so without depending on it.
     let covered = HEADER_BYTES.saturating_add(payload_len);
-    let encoded_len = covered.saturating_add(TRAILER_BYTES);
+    let frame_len = covered.saturating_add(TRAILER_BYTES);
     let (Some(sealed), Some(trailer)) = (
         bytes.get(..covered),
         bytes
@@ -437,7 +501,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
     Ok(Frame {
         format_version: version,
         decoded,
-        encoded_len,
+        frame_len,
     })
 }
 
@@ -637,10 +701,12 @@ impl<'a> Reader<'a> {
 ///
 /// * Every step advances by at least [`FRAME_OVERHEAD_BYTES`], so a scan over any journal
 ///   terminates. A malformed journal is a scan that ends, never a scan that spins.
-/// * An erased tail is not damage. A journal whose next header is all
-///   [`ERASED_BYTE`], or which has fewer bytes left than a header, has simply ended, and
-///   the scan yields [`None`] rather than an error — otherwise every first boot would look
-///   like a corrupted one.
+/// * An erased tail is not damage. A journal whose next header is all [`ERASED_BYTE`]
+///   *and whose remaining bytes are all erased too*, or which has fewer bytes left than a
+///   header, has simply ended, and the scan yields [`None`] rather than an error —
+///   otherwise every first boot would look like a corrupted one. An erased run with
+///   anything but erased bytes after it is [`DecodeError::IntegrityFailed`]: see
+///   [`align`](Self::new) for why that case exists at all.
 /// * A record yielded after the first failure would be a record outside the committed
 ///   prefix, so there are none: the iterator is fused rather than skipping damage.
 /// * Out-of-sequence is *not* checked here. §09 lists it beside malformed and
@@ -665,6 +731,22 @@ impl<'a> Scan<'a> {
     ///
     /// `journal` is the bound: this rung has no bank geometry, and a slice is a bound the
     /// type system already checks.
+    ///
+    /// # `align` must be the granularity the journal was *written* at
+    ///
+    /// Nothing on media records it. A frame says where it ends; only the device says where
+    /// the next one begins, so a reader given a smaller granularity than the writer used
+    /// strides short and lands inside a frame's padding. That padding is a run of
+    /// [`ERASED_BYTE`], which is why the erased-tail rule above is "erased header *and*
+    /// erased to the end of the journal" rather than "erased header": without the second
+    /// half, a mismatch would report a clean end of history with committed records still
+    /// ahead of it, and everything downstream would believe it.
+    ///
+    /// The check turns that into [`DecodeError::IntegrityFailed`] at the offset the reader
+    /// went wrong, which is diagnosable. It does not make the mismatch safe — a reader
+    /// given a *larger* granularity than the writer strides past frames and cannot be
+    /// caught this way at all. Rung 0.2 puts the writer's program size in the bank header,
+    /// which is where a fact about the media belongs.
     #[must_use]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {
         Self {
@@ -705,7 +787,18 @@ impl<'a> Iterator for Scan<'a> {
             };
             if header.iter().all(|byte| *byte == ERASED_BYTE) {
                 self.stopped = true;
-                return None;
+                // An erased header ends history only if everything after it is erased too.
+                // Nothing on media records the program granularity a journal was written
+                // at, so a reader handed a smaller one strides short and lands inside a
+                // frame's padding — which is a run of `ERASED_BYTE`, and which would
+                // otherwise read as a clean end of history with committed records still
+                // ahead of it. Silently returning a truncated prefix is the worst failure
+                // this type has, because everything downstream believes it.
+                return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
+                    None
+                } else {
+                    Some(Err(DecodeError::IntegrityFailed))
+                };
             }
 
             let frame = match decode(rest) {
@@ -715,7 +808,7 @@ impl<'a> Iterator for Scan<'a> {
                     return Some(Err(error));
                 }
             };
-            let Some(stride) = self.align.round_up(frame.encoded_len) else {
+            let Some(stride) = self.align.round_up(frame.frame_len) else {
                 self.stopped = true;
                 return Some(Err(DecodeError::LengthOutOfBounds));
             };
@@ -729,7 +822,7 @@ impl<'a> Iterator for Scan<'a> {
                     return Some(Ok(record));
                 }
                 Decoded::UnknownKind(_) => {
-                    if VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP.contains(&frame.format_version) {
+                    if permits_unknown_record_skip(frame.format_version) {
                         self.offset = next;
                         continue;
                     }
@@ -787,7 +880,7 @@ mod tests {
     fn version_one_permits_no_skipping() {
         // The forward-compatibility rule, read straight off the list `Scan` consults.
         assert!(VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP.is_empty());
-        assert!(!VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP.contains(&FORMAT_VERSION));
+        assert!(!permits_unknown_record_skip(FORMAT_VERSION));
     }
 
     #[test]

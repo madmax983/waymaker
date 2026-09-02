@@ -61,6 +61,7 @@ pub const RULES: &[&str] = &[
     "empty-default-features",
     "gate-broken",
     "inputs-incomplete",
+    "kernel-owns-no-encoding",
     "kernel-zero-dependencies",
     "layer-missing",
     "layer-not-local",
@@ -221,6 +222,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         })
         .collect();
     violations.extend(source::check_crate_attributes(&sources));
+    violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -679,7 +681,9 @@ mod tests {
             layer_sources: vec![size::LayerSource {
                 crate_name: "waymaker-core".to_owned(),
                 path: "crates/waymaker-core/src/lib.rs".to_owned(),
-                contents: "pub fn advance() {}\n".to_owned(),
+                contents:
+                    "pub fn advance() {}\nfn read(b: &[u8]) -> u32 { u32::from_le_bytes(b) }\n"
+                        .to_owned(),
             }],
             // No CLAUDE.md, no architecture document, no ADR index, an ADR that is
             // numbered but structurally empty, and a crate root with no missing_docs
@@ -728,6 +732,7 @@ mod tests {
             "embassy-below-facade",
             "empty-default-features",
             "inputs-incomplete",
+            "kernel-owns-no-encoding",
             "kernel-zero-dependencies",
             "layer-missing",
             "layer-not-local",

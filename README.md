@@ -245,6 +245,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `layer-missing` | a crate the layering table names is not in the workspace at all |
 | `dependency-direction-transitive` | it reaches one through another crate; the report names the edge that admitted it |
 | `kernel-zero-dependencies` | `waymaker-core` declares any dependency, including a dev- or build-dependency |
+| `kernel-owns-no-encoding` | a `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>` — which needs no dependency for the previous rule to catch |
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
 | `workspace-membership` | a workspace member is neither a layer, declared host tooling, nor a measurement fixture |
