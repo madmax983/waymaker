@@ -16,6 +16,12 @@ publish = false
 [dependencies]
 waymaker-flash.workspace = true
 
+# Only the tests need the kernel: the harness itself names no record type, which is what
+# makes it reusable by anything that writes through `StableStorage`. A normal dependency
+# here would be the harness knowing what a record is.
+[dev-dependencies]
+waymaker-core.workspace = true
+
 [features]
 default = []
 

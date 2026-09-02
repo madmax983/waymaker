@@ -177,6 +177,7 @@ dependencies = [
 name = "waymaker-fault"
 version = "0.0.0"
 dependencies = [
+ "waymaker-core",
  "waymaker-flash",
 ]
 
