@@ -368,6 +368,168 @@ fn split_arguments(body: &str) -> Vec<&str> {
     arguments
 }
 
+/// Byte-decoding constructs the kernel may not contain.
+///
+/// Design document §05 puts *serialization framework* and *CRC* in `waymaker-core`'s
+/// must-not-own cell, and `kernel-zero-dependencies` already stops the kernel *importing*
+/// either. It cannot stop the kernel *writing* one: a hand-rolled `const fn crc32(bytes:
+/// &[u8]) -> u32` and a `u32::from_le_bytes` in a decode loop add no dependency, no
+/// manifest entry and no graph edge, so every existing rule passes and the layering claim
+/// quietly becomes prose.
+///
+/// These are the shapes that claim actually rules out. Each is a *conversion between bytes
+/// and a value*, which is the thing the kernel delegates: the kernel names record kinds and
+/// holds borrowed slices, and `waymaker-flash` is what turns bytes into either.
+pub const KERNEL_FORBIDDEN_CONSTRUCTS: &[(&str, &str)] = &[
+    (
+        "from_le_bytes",
+        "decoding an integer from bytes is the wire format, which belongs to waymaker-flash",
+    ),
+    (
+        "from_be_bytes",
+        "the kernel reads no bytes, in any endianness",
+    ),
+    (
+        "from_ne_bytes",
+        "native endianness is not a wire format at all, and the kernel has neither",
+    ),
+    (
+        "to_le_bytes",
+        "encoding an integer to bytes is the wire format, which belongs to waymaker-flash",
+    ),
+    (
+        "to_be_bytes",
+        "the kernel writes no bytes, in any endianness",
+    ),
+    (
+        "to_ne_bytes",
+        "native endianness is not a wire format at all, and the kernel has neither",
+    ),
+];
+
+/// Trait implementations that would make the kernel a decoder without a single `pub fn`.
+///
+/// `impl TryFrom<&[u8]> for RecordRef<'_>` needs no dependency, no `pub`, and is credited by
+/// `size-probe-reach` the moment anything in the probe writes `try_from(` — which
+/// `usize::try_from` already does. It is the cheapest way for a serialization framework to
+/// arrive in `waymaker-core`, so it is named rather than left to review.
+pub const KERNEL_FORBIDDEN_IMPL_MARKERS: &[&str] = &["From<&[u8]>", "TryFrom<&[u8]>"];
+
+/// Rule: the kernel converts nothing between bytes and values.
+///
+/// Scanned rather than parsed, like every other rule here, and comments are stripped first
+/// so that this file's own prose — and `waymaker-core`'s, which explains at length what it
+/// does *not* do — is not read as code.
+///
+/// This is a floor and says so. It catches the shapes a decoder is actually written in; a
+/// determined author could still hand-roll a shift-and-or loop the scan does not recognise.
+/// What it makes impossible is the *accidental* arrival, which is the one that gets merged.
+#[must_use]
+pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const KERNEL: &str = "waymaker-core";
+    let mut violations = Vec::new();
+
+    for source in sources.iter().filter(|source| source.crate_name == KERNEL) {
+        let code = strip_comments(&source.contents);
+        for (construct, why) in KERNEL_FORBIDDEN_CONSTRUCTS {
+            if code.contains(construct) {
+                violations.push(Violation::new(
+                    "kernel-owns-no-encoding",
+                    KERNEL,
+                    format!("{} uses `{construct}`: {why}", source.path),
+                ));
+            }
+        }
+        for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
+            let needle = marker.replace(' ', "");
+            let implemented = code.lines().any(|line| {
+                let line = erase_lifetimes(line).replace(' ', "");
+                implements_trait(&line, &needle)
+            });
+            if implemented {
+                violations.push(Violation::new(
+                    "kernel-owns-no-encoding",
+                    KERNEL,
+                    format!(
+                        "{} implements `{marker}`: a decoder needs no `pub fn` and no \
+                         dependency, so this is how a serialization framework arrives in the \
+                         kernel unnoticed",
+                        source.path
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+/// Whether `line` — an `impl` header with its whitespace and lifetimes already removed —
+/// implements exactly the trait `needle`.
+///
+/// Matched against the *start* of the trait position rather than anywhere in the line, for
+/// two reasons. `TryFrom<&[u8]>` contains `From<&[u8]>`, so a substring test reports one
+/// `impl` as two violations and tells a reader that a single line broke two rules — which is
+/// the kind of noise that gets a gate switched off. And a trait named in a `where` clause or
+/// a doc link is not an implementation of it.
+fn implements_trait(line: &str, needle: &str) -> bool {
+    let Some(rest) = line.strip_prefix("impl") else {
+        return false;
+    };
+    // An optional generic parameter list sits between `impl` and the trait. Skipped by
+    // depth rather than by finding the first `>`, so that `impl<T:Into<u8>>` does not stop
+    // at the inner one.
+    let after_generics = if rest.starts_with('<') {
+        let mut depth = 0_usize;
+        let mut end = None;
+        for (index, character) in rest.char_indices() {
+            match character {
+                '<' => depth = depth.saturating_add(1),
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index.saturating_add(1));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end.and_then(|at| rest.get(at..)) {
+            Some(after) => after,
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    after_generics.starts_with(needle)
+}
+
+/// Drops `//` comments so that prose describing a construct is not read as the construct.
+fn strip_comments(contents: &str) -> String {
+    contents
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Removes `'a`-style lifetimes so an `impl` header can be matched without them.
+fn erase_lifetimes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find('\'') {
+        out.push_str(rest.get(..at).unwrap_or_default());
+        let after = rest.get(at.saturating_add(1)..).unwrap_or_default();
+        let end = after
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        rest = after.get(end..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +733,146 @@ mod tests {
     #[test]
     fn a_crate_that_is_not_a_layer_is_ignored() {
         assert!(check_crate_attributes(&sources("xtask", "fn main() {}")).is_empty());
+    }
+
+    /// One kernel source file, for the encoding rule.
+    fn kernel_source(contents: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/record.rs".to_owned(),
+            contents: contents.to_owned(),
+        }]
+    }
+
+    #[test]
+    fn a_kernel_that_reads_no_bytes_passes_the_encoding_rule() {
+        // What the kernel actually looks like: numeric kinds, borrowed slices, and not one
+        // conversion between the two.
+        let clean = kernel_source(
+            "pub struct RecordKind(pub u8);
+             pub enum RecordRef<'a> { RunCompleted { result: &'a [u8] } }
+",
+        );
+        assert!(check_kernel_owns_no_encoding(&clean).is_empty());
+    }
+
+    #[test]
+    fn every_endianness_conversion_in_the_kernel_is_reported() {
+        // All six, individually: a rule that listed five would let the sixth through, and
+        // `to_ne_bytes` is the one that is not even a wire format.
+        for (construct, _) in KERNEL_FORBIDDEN_CONSTRUCTS {
+            let source = kernel_source(&format!(
+                "fn read(bytes: [u8; 4]) -> u32 {{ u32::{construct}(bytes) }}
+"
+            ));
+            let violations = check_kernel_owns_no_encoding(&source);
+            assert_eq!(violations.len(), 1, "{construct}");
+            assert_eq!(violations[0].rule, "kernel-owns-no-encoding");
+            assert!(violations[0].detail.contains(construct), "{construct}");
+        }
+    }
+
+    #[test]
+    fn prose_about_a_construct_is_not_the_construct() {
+        // `waymaker-core` explains at length what it does *not* do, and its record module
+        // names `from_le_bytes` in a comment saying the kernel never calls it. A scan that
+        // read comments would report the crate for documenting its own rule.
+        let commented = kernel_source(
+            "// Nothing here calls from_le_bytes: the wire format is one layer up.
+             pub struct RecordKind(pub u8); // not to_le_bytes either
+",
+        );
+        assert!(check_kernel_owns_no_encoding(&commented).is_empty());
+    }
+
+    #[test]
+    fn a_byte_decoding_trait_impl_in_the_kernel_is_reported() {
+        // The cheapest way in: no dependency, no `pub`, and `size-probe-reach` already
+        // credits `try_from` from the probe's `usize::try_from`.
+        for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
+            let source = kernel_source(&format!(
+                "impl<'a> {marker} for RecordRef<'a> {{
+    type Error = ();
+}}
+"
+            ));
+            let violations = check_kernel_owns_no_encoding(&source);
+            assert_eq!(violations.len(), 1, "{marker}");
+            assert!(violations[0].detail.contains(marker), "{marker}");
+        }
+
+        // The lifetime-erased form is what the scan matches, so the elided spelling is
+        // caught too.
+        let elided = kernel_source(
+            "impl TryFrom<&[u8]> for RecordKind {
+    type Error = ();
+}
+",
+        );
+        assert_eq!(check_kernel_owns_no_encoding(&elided).len(), 1);
+    }
+
+    #[test]
+    fn a_conversion_outside_the_kernel_is_not_the_kernels_problem() {
+        // `waymaker-flash` owns the wire format, so `from_le_bytes` is what it is *for*.
+        let adapter = vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/frame.rs".to_owned(),
+            contents: "fn read(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }
+"
+            .to_owned(),
+        }];
+        assert!(check_kernel_owns_no_encoding(&adapter).is_empty());
+    }
+
+    #[test]
+    fn a_mention_of_a_trait_that_is_not_an_impl_header_is_not_reported() {
+        // A doc link or a where-clause bound naming the trait is not an implementation of
+        // it, and reporting one would train a reader to reach for an allow.
+        let mention = kernel_source(
+            "pub fn takes<T>(_value: T) where T: Sized {}
+             pub struct Holder(pub u8);
+",
+        );
+        assert!(check_kernel_owns_no_encoding(&mention).is_empty());
+    }
+
+    #[test]
+    fn a_longer_trait_name_does_not_report_the_shorter_one_it_contains() {
+        // `TryFrom<&[u8]>` contains `From<&[u8]>`. Reporting one `impl` twice would tell a
+        // reader that one line broke two rules, which is the kind of noise that gets a gate
+        // switched off.
+        let source = kernel_source("impl TryFrom<&[u8]> for RecordKind {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
+        assert!(implements_trait("implTryFrom<&[u8]>forT", "TryFrom<&[u8]>"));
+        assert!(!implements_trait("implTryFrom<&[u8]>forT", "From<&[u8]>"));
+        assert!(implements_trait("implFrom<&[u8]>forT", "From<&[u8]>"));
+        // A generic parameter list is skipped by depth, so a nested `>` does not end it.
+        assert!(implements_trait(
+            "impl<T:Into<u8>>From<&[u8]>forT",
+            "From<&[u8]>"
+        ));
+        assert!(implements_trait(
+            "impl<>TryFrom<&[u8]>forT",
+            "TryFrom<&[u8]>"
+        ));
+        // A trait named anywhere but the trait position is not an implementation of it.
+        assert!(!implements_trait(
+            "implTforUwhereT:From<&[u8]>",
+            "From<&[u8]>"
+        ));
+        assert!(!implements_trait("fnf()->From<&[u8]>", "From<&[u8]>"));
+        // An unbalanced header is not credited as an impl of anything.
+        assert!(!implements_trait("impl<T", "From<&[u8]>"));
+    }
+
+    #[test]
+    fn lifetimes_are_erased_without_losing_the_rest_of_the_line() {
+        assert_eq!(
+            erase_lifetimes("impl<'a> Foo<&'a [u8]> for Bar"),
+            "impl<> Foo<& [u8]> for Bar"
+        );
+        assert_eq!(erase_lifetimes("no lifetimes here"), "no lifetimes here");
+        assert_eq!(erase_lifetimes(""), "");
     }
 }

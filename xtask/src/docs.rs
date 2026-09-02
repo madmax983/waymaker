@@ -175,6 +175,29 @@ pub const TWO_BANK_SWAP_STEPS: &[&str] = &[
     "lazily erase the old bank",
 ];
 
+/// The fields of the record frame, from design document §09.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
+/// as §09 names them rather than as `waymaker-flash` spells them: the diagram is a picture
+/// of the design document's frame, and a field that quietly disappeared from it would be a
+/// field the picture stopped accounting for. `commit_seal` is in the list even though rung
+/// 0.1 does not write one — a deferred field left out of the drawing is a deferral that
+/// stops being visible.
+pub const RECORD_FRAME_FIELDS: &[&str] = &[
+    "magic",
+    "format_version",
+    "record_kind",
+    "effect_seq",
+    "payload_len",
+    "header_crc",
+    // §09's own spelling, brackets and all. Plain `payload` would be satisfied by
+    // `payload_len` sitting two labels above it — so the one field the whole frame exists to
+    // carry could vanish from the picture with this rule still green.
+    "payload [payload_len]",
+    "payload_crc",
+    "commit_seal",
+];
+
 /// Every diagram issue #11 asks for.
 pub const DIAGRAMS: &[DiagramSpec] = &[
     DiagramSpec {
@@ -198,6 +221,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the two-bank swap",
         required_labels: TWO_BANK_SWAP_STEPS,
         source_section: "§10 Two-bank lifecycle",
+    },
+    DiagramSpec {
+        id: "record-frame",
+        title: "the record frame",
+        required_labels: RECORD_FRAME_FIELDS,
+        source_section: "§09 Journal and wire format",
     },
     DiagramSpec {
         id: "two-bank-generations",

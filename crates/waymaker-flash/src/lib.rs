@@ -12,9 +12,17 @@
 //!
 //! # Status
 //!
-//! Rung 0.0: the crate exists so that the layering is enforceable. The record seals,
-//! barriers, and bank swap arrive with rung 0.2.
+//! Rung 0.1 in progress: [`frame`] is the record codec — §09's handwritten, fixed-endian,
+//! self-delimiting, bounds-validated frame, its two checksums, and the append scan that
+//! turns a bank into a committed prefix. The commit seal, the barriers and the bank swap
+//! arrive with rung 0.2; [`frame`]'s documentation says what that leaves deferred and what
+//! the deferral costs.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+mod crc;
+pub mod frame;
+
+pub use frame::{Decoded, Frame, ProgramAlign, Scan};

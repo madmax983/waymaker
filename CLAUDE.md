@@ -9,7 +9,7 @@ This file is what a contributor — human or agent — works to. It states the i
 layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
-dependency edges, the eight decision ids, the command list and all 28 rule ids below are
+dependency edges, the eight decision ids, the command list and all 29 rule ids below are
 compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
@@ -151,9 +151,21 @@ counted in the total — it cannot be in one without being in the others.
 ### Adding a gate rule
 
 Rules live in `xtask/src/`, one module per subject, each a pure function over already-read
-input so it can be tested against a workspace that does not exist. A new rule needs its id in
-`xtask::RULES`, a `violations.extend(...)` line in `check_inputs`, and a row in the broken-
-workspace fixture — the wiring test fails if any of the three is missing.
+input so it can be tested against a workspace that does not exist. A new rule needs **five**
+things, not the three the wiring test covers:
+
+1. its id in `xtask::RULES`;
+2. a `violations.extend(...)` line in `check_inputs`;
+3. a row in the broken-workspace fixture — the wiring test fails if any of these three is
+   missing;
+4. a backticked row in [the rule table below](#what-the-gate-rejects), and the literal rule
+   count in the sentence above it, which the `claude-md` rule compares against `RULES`;
+5. a row in the README's rule table, which `the_readme_documents_every_rule_the_gate_declares`
+   compares against `RULES`.
+
+The last two are worth spelling out because they fail in different places: 4 fails
+`check-layering` itself, and 5 fails `cargo test` while `check-layering` prints `ok`. A
+contributor working from a three-item list gets a green gate and a red build.
 
 ### Adding an ADR
 
@@ -169,7 +181,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 28 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 29 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -179,6 +191,7 @@ this table is how you find out what a red build is telling you.
 | `dependency-direction` | A layer declares a dependency its row in `policy::LAYERS` does not allow. |
 | `dependency-direction-transitive` | A layer *reaches* a crate it may not depend on, through another crate. |
 | `kernel-zero-dependencies` | `waymaker-core` grows a dependency of any kind, in any table. |
+| `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
@@ -252,9 +265,14 @@ Stated so that nobody mistakes silence for coverage:
 Rung 0.1, in progress. The three firmware crates exist so the layering is enforceable and the
 budgets have one place to be read from. `waymaker-core` now owns effect identity — `RunId`,
 `EffectSeq` and `EffectId` — the activity-kind vocabulary, the `EffectIdAllocator` that is
-the only thing permitted to mint a sequence, and the capacity and decode error vocabulary the
-kernel refuses work with (issue #12). The kernel-state registry has its first entry, so the
-128 B budget is now a number about something. The record codec, cursor and transition rules
-are the rest of rung 0.1; the seals and bank swap arrive with 0.2, and the async `Ctx` and
-dispatcher with 0.4. The gates went in before the code they govern, which is the point: a
-gate retrofitted after coverage has slipped is a gate that ratifies the slip.
+the only thing permitted to mint a sequence, the capacity and decode error vocabulary the
+kernel refuses work with (issue #12), and the borrowed record views and record-kind numbering
+of design document §09 (issue #13). `waymaker-flash` now owns the bytes those views are
+decoded from: §09's handwritten, fixed-endian, self-delimiting frame, its two checksums, and
+the append scan that turns a bank into a committed prefix — see
+[ADR 0007](docs/adr/0007-the-record-frame-is-checksummed-twice-and-the-kernel-owns-none-of-it.md).
+The kernel-state registry has two entries, so the 128 B budget is a number about something.
+The replay cursor and the transition rules are the rest of rung 0.1; the commit seal and the
+bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The gates went in
+before the code they govern, which is the point: a gate retrofitted after coverage has
+slipped is a gate that ratifies the slip.

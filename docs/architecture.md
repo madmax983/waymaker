@@ -1,6 +1,6 @@
 # Architecture
 
-Four diagrams, drawn from the design document. Each carries an HTML comment label that
+Five diagrams, drawn from the design document. Each carries an HTML comment label that
 `cargo xtask check-layering` reads, and each is checked against the table that owns the
 same facts — so a diagram cannot quietly fall behind the code it draws.
 
@@ -8,6 +8,7 @@ same facts — so a diagram cannot quietly fall behind the code it draws.
 | --- | --- | --- |
 | [Crate dependency flow](#crate-dependency-flow) | §05 Architecture | `xtask::policy::LAYERS` |
 | [Durable effect protocol](#durable-effect-protocol) | §07 Durable effect protocol | `xtask::docs::EFFECT_PROTOCOL_STEPS` |
+| [Record frame](#record-frame) | §09 Journal and wire format | `xtask::docs::RECORD_FRAME_FIELDS` |
 | [Two-bank swap](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::TWO_BANK_SWAP_STEPS` |
 | [The banks before and after](#two-bank-swap) | §10 Two-bank lifecycle | `xtask::docs::DIAGRAMS` |
 
@@ -110,6 +111,71 @@ Step 4 is the one that cannot be made atomic. Power can fail after the activity 
 the world and before its outcome is committed, so Waymaker redelivers the same stable
 effect id. **There is no exactly-once physical promise**: exactly-once behavior needs an
 idempotent activity, or a downstream system that deduplicates that id.
+
+## Record frame
+
+Design document §09. The unit a journal is made of: handwritten, fixed-endian,
+self-delimiting, and independent of Rust layout. User payload bytes are opaque to the
+kernel, which is why the whole of this picture lives in `waymaker-flash` and none of it in
+`waymaker-core`.
+
+Two checksums rather than one, and the order they are checked in is the point. `header_crc`
+covers the twelve bytes before it, so `payload_len` is known to be the number the writer
+wrote **before** it is used to find where the frame ends — which is what §09's "all lengths
+are validated against caller buffers and bank bounds before reading" asks for. A single
+checksum over the whole frame could not: finding it would mean trusting the length first.
+
+<!-- diagram: record-frame -->
+
+```mermaid
+graph LR
+  subgraph header["header · 12 bytes · covered by header_crc"]
+    direction LR
+    f0["+0 · 2B<br/>magic<br/>u16 LE"]
+    f1["+2 · 1B<br/>format_version"]
+    f2["+3 · 1B<br/>record_kind"]
+    f3["+4 · 4B<br/>effect_seq<br/>u32 LE"]
+    f4["+8 · 2B<br/>payload_len<br/>u16 LE"]
+    f5["+10 · 2B<br/>header_crc<br/>u16 LE"]
+    f0 --- f1 --- f2 --- f3 --- f4 --- f5
+  end
+  subgraph rest["body and trailer"]
+    direction LR
+    f6["+12 · N bytes<br/>payload [payload_len]<br/>opaque to the kernel"]
+    f7["+12+N · 4B<br/>payload_crc<br/>u32 LE · frame_crc in code"]
+    f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
+    f6 --- f7 --- f8
+  end
+  header --> rest
+
+  c1(["header_crc covers +0..+10"])
+  c2(["payload_crc covers +0..+12+N — the header as well as the payload"])
+  c3(["commit_seal · a storage-program unit, not a field · rung 0.2"])
+
+  f5 -.- c1
+  f7 -.- c2
+  f8 -.- c3
+
+  classDef field fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
+  class f0,f1,f2,f3,f4,f5,f6,f7,f8 field;
+  class c1,c2,c3 note;
+```
+
+`payload_crc` is §09's name for the field and `frame_crc` is what `waymaker-flash` calls it,
+because it covers the header as well as the payload: that binds a payload to its header,
+and it stops a record with an empty payload having a checksum of zero, which a zeroed page
+would satisfy. `commit_seal` is a storage-program unit rather than a field, written after a
+barrier, and it is what makes a frame *committed* rather than merely present — which is why
+it hangs off the picture rather than sitting in it. It arrives with the barrier protocol at
+rung 0.2. Until then the append scan treats a frame whose checksums hold as history, so a
+torn write at the tail of a journal is not distinguishable from damage there. Both stop the
+scan in the same place, which is what §14 requires either way.
+
+Everything after the frame is padding, up to the device's program granularity from §12's
+`Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
+interpreted: the decoder reports the frame's own length, and the scan is what applies the
+stride.
 
 ## Two-bank swap
 
