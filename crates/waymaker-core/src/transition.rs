@@ -312,6 +312,8 @@ enum Phase {
 ///   diverging replay cannot dispatch. That is structural rather than a discipline: the
 ///   machine owns the cursor, and the cursor is the only source of identity.
 /// * A refused request consumes no record. History stands where the divergence found it.
+/// * A halted cursor's error outranks every refusal the machine has of its own, so the
+///   diagnosis a driver reports is always the record that stopped recovery.
 /// * A divergence is sticky by representation: the private phase has a diverged state and
 ///   no code path leaves it.
 /// * The machine holds no borrow of anything. It has no lifetime parameter, so one 512-byte
@@ -398,6 +400,27 @@ impl ReplayMachine {
         }
     }
 
+    /// The refusal that outranks the machine's own, when history has already stopped.
+    ///
+    /// §09 stops recovery at the first record it cannot account for, and the diagnosis a
+    /// driver reports has to be *that* record's. The machine has refusals of its own — a
+    /// divergence, a boundary already open, a boundary not open — and every one of them
+    /// would otherwise overwrite the cursor's, turning a damaged journal into a report of
+    /// changed workflow code. `KernelError`'s own documentation calls those two different
+    /// faults with two different causes, and this is what keeps them apart at the point a
+    /// driver reads them.
+    ///
+    /// Checked before the phase in every entry point, which costs nothing in exactness: a
+    /// halted cursor and a diverged phase cannot both be set, because
+    /// [`ReplayCursor::next_effect_id`] refuses on a halted cursor before the divergence
+    /// check is ever reached.
+    const fn halted(&self) -> Option<KernelError> {
+        match self.cursor.position() {
+            Position::Halted(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Consume a committed record outside an effect boundary.
     ///
     /// The pump for everything the table does not decide: the `RunStarted` record that
@@ -416,6 +439,9 @@ impl ReplayMachine {
     ///   a record that could not legally follow, [`KernelError::IdExhausted`] at the end of
     ///   the sequence space, and on any later call the failure that stopped the cursor.
     pub const fn advance<'a>(&mut self, record: RecordRef<'a>) -> Result<Step<'a>, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
         match self.phase {
             Phase::Diverged(_) | Phase::AwaitingOutcome => {
                 Err(KernelError::NondeterministicWorkflow)
@@ -456,6 +482,9 @@ impl ReplayMachine {
         request: EffectRequest,
         next: Next<'a>,
     ) -> Result<Intent<'a>, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
         match self.phase {
             // Two refusals with one body, and deliberately not split into two arms saying
             // the same thing. `Diverged` is sticky and is checked before anything else, so
@@ -589,16 +618,13 @@ impl ReplayMachine {
     ///   terminal record while an effect is unresolved. That halts the cursor.
     /// * On a halted cursor, the failure that stopped it.
     pub const fn outcome<'a>(&mut self, next: Next<'a>) -> Result<Resolve<'a>, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
         match self.phase {
-            Phase::Diverged(_) => return Err(KernelError::NondeterministicWorkflow),
-            Phase::Settled => {
-                // No boundary is open. A halted cursor's diagnosis wins, so that a driver
-                // reporting the fault reports the record that stopped recovery rather than
-                // the call that noticed.
-                return match self.cursor.position() {
-                    Position::Halted(error) => Err(error),
-                    _ => Err(KernelError::NondeterministicWorkflow),
-                };
+            // No boundary is open, or the machine has diverged.
+            Phase::Diverged(_) | Phase::Settled => {
+                return Err(KernelError::NondeterministicWorkflow);
             }
             Phase::AwaitingOutcome => {}
         }

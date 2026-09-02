@@ -1302,9 +1302,9 @@ pub mod tests_support {
     /// Probe source calling every name both pins list, for the clean-workspace fixture.
     ///
     /// `size-probe-reach` demands a call for every public function a layer declares, and the
-    /// two clean surfaces above declare a dozen between them — so a fixture that supplied
-    /// one without the other would describe a workspace the gate rejects for a reason that
-    /// has nothing to do with what is being tested.
+    /// two clean surfaces above declare thirteen distinct names between them — so a fixture
+    /// that supplied one without the other would describe a workspace the gate rejects for a
+    /// reason that has nothing to do with what is being tested.
     ///
     /// Deduplicated, because the two pins share five names — `new`, `run`, `position`,
     /// `pending` and `advance` — and a second call to one would be a second identical line

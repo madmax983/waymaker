@@ -591,6 +591,86 @@ fn a_record_that_could_not_follow_halts_the_machine() {
 }
 
 #[test]
+fn a_malformed_outcome_keeps_its_diagnosis_through_the_half_open_boundary() {
+    // A completion naming an effect that is not the open one. Every frame decoded; it is
+    // how they sit beside each other that is impossible, so this is `MalformedHistory` and
+    // not divergence.
+    //
+    // The half-open boundary is what makes this worth a test of its own. The machine has
+    // refusals of its own for a boundary left open, and if one of them answered here a
+    // driver would be told the *workflow* changed when the *journal* is damaged — two
+    // faults with two causes, and a log line that confused them sends an engineer to the
+    // wrong place.
+    let mut machine = started();
+    assert!(machine.intent(REQUEST, Next::Record(schedule(0))).is_ok());
+    assert_eq!(
+        machine.outcome(Next::Record(RecordRef::EffectCompleted {
+            seq: EffectSeq(1),
+            result: b"out",
+        })),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+
+    // Every entry point, because each has a refusal of its own that could have won.
+    assert_eq!(
+        machine.intent(REQUEST, Next::EndOfHistory),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.outcome(Next::EndOfHistory),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.advance(schedule(1)),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_second_schedule_while_an_effect_is_unresolved_halts_the_machine() {
+    // The other way an open boundary meets an impossible record: history holding two
+    // schedules with no outcome between them.
+    let mut machine = started();
+    assert!(machine.intent(REQUEST, Next::Record(schedule(0))).is_ok());
+    assert_eq!(
+        machine.outcome(Next::Record(schedule(1))),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+    assert_eq!(
+        machine.intent(REQUEST, Next::EndOfHistory),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_terminal_record_while_an_effect_is_unresolved_halts_the_machine() {
+    let mut machine = started();
+    assert!(machine.intent(REQUEST, Next::Record(schedule(0))).is_ok());
+    assert_eq!(
+        machine.outcome(Next::Record(RecordRef::RunCompleted { result: b"done" })),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        machine.advance(RecordRef::RunFailed { error: b"x" }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
 fn the_machine_reports_the_run_it_replays() {
     let machine = ReplayMachine::new(RUN);
     assert_eq!(machine.run(), RUN);

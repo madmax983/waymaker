@@ -223,7 +223,7 @@ pub const RECORD_FRAME_FIELDS: &[&str] = &[
 
 /// The five rows of the replay transition table, from design document §08.
 ///
-/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted: §08’s
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted: §08's
 /// table has five "next history state" rows, and a picture with four in it is a picture
 /// that has lost one — most likely the fourth, which is the only row whose engine action
 /// is to stop.
@@ -278,7 +278,7 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         id: "replay-transition",
         title: "the five-row replay transition table",
         required_labels: TRANSITION_TABLE_ROWS,
-        source_section: "\u{a7}08 Replay and determinism",
+        source_section: "§08 Replay and determinism",
     },
     DiagramSpec {
         id: "two-bank-generations",
@@ -1796,6 +1796,7 @@ mod tests {
         assert_eq!(EFFECT_PROTOCOL_STEPS.len(), 7);
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
         assert_eq!(COLD_START_STEPS.len(), 6);
+        assert_eq!(TRANSITION_TABLE_ROWS.len(), 5);
     }
 
     #[test]
