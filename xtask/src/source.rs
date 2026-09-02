@@ -793,109 +793,68 @@ pub fn check_integrity_binding(sources: &[crate::size::LayerSource]) -> Vec<Viol
     );
 
     for seal in SEAL_BINDINGS {
-        // The name in the delegation resolves against whatever is in scope, and a scanner
-        // does not resolve names. Pinning the import is the other half of what makes
-        // `crc16(bytes)` mean the function ADR 0010 settled on rather than something a
-        // `use` line was pointed at.
-        if !imports_from_checksum_module(&code, seal.delegates_to) {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{INTEGRITY_BINDING_PATH} does not import `{}` from `{CHECKSUM_MODULE}`, \
-                     so the call that computes the seal over {} may resolve to any function \
-                     of that name",
-                    seal.delegates_to, seal.covers
-                ),
-            ));
-        }
-
-        if let Some(body) = declaration {
-            match signature(body, seal.method) {
-                None => violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "`{INTEGRITY_TRAIT}` declares no `{}`, so the seal over {} has no \
-                         width to be pinned at",
-                        seal.method, seal.covers
-                    ),
-                )),
-                Some(found) => {
-                    if let Some(returned) = return_type(&found) {
-                        if returned != seal.width {
-                            violations.push(Violation::new(
-                                RULE,
-                                ADAPTER,
-                                format!(
-                                    "`{}` returns `{returned}` rather than `{}`, so the seal \
-                                     over {} has changed width; that is bytes on media for \
-                                     the life of the format, not an implementation detail",
-                                    seal.method, seal.width, seal.covers
-                                ),
-                            ));
-                        }
-                    } else {
-                        violations.push(Violation::new(
-                            RULE,
-                            ADAPTER,
-                            format!(
-                                "`{}` declares no return type, so the seal over {} has no \
-                                 width to be pinned at",
-                                seal.method, seal.covers
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some(body) = shipped {
-            match braced_body(body, &format!("fn {}", seal.method)) {
-                None => violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "`{INTEGRITY_SHIPPED_IMPL}` does not implement `{}`, so the shipped \
-                         seal over {} is bound to nothing",
-                        seal.method, seal.covers
-                    ),
-                )),
-                Some(body) => violations.extend(delegation(body, seal, RULE, ADAPTER)),
-            }
-        }
+        violations.extend(seal_binding_violations(seal, &code, declaration, shipped));
     }
-
     violations
 }
 
 /// The module a shipped seal's algorithm must be imported from.
 pub const CHECKSUM_MODULE: &str = "crate::crc";
 
-/// Whether `code` brings `name` into scope from [`CHECKSUM_MODULE`].
+/// Whether `code` brings `name` into scope from [`CHECKSUM_MODULE`], unconditionally.
 ///
 /// Both spellings a `use` can take: `use crate::crc::crc16;` and
-/// `use crate::crc::{crc16, crc32};`. An alias — `use other::thing as crc16;` — is not one of
-/// them, and that is deliberate: an alias is exactly the rename this pin exists to see.
+/// `use crate::crc::{crc16, crc32};`. Three things do not count, and each is a way the
+/// import could be there while the name resolves elsewhere:
+///
+/// * **An alias.** `use other::thing as crc16;` is exactly the rename this pin exists to see.
+/// * **An attributed `use`.** Codex caught this on PR #60: `#[cfg(any())] use
+///   crate::crc::{crc16, crc32};` is an import that never exists, and beside a local `fn
+///   crc16` it is a textual proof of a resolution that does not happen. Any attribute at all
+///   disqualifies it — a `cfg` this rule tried to evaluate would be a rule pretending to be
+///   a compiler.
+/// * **A local definition of the same name**, which is checked by the caller: an import that
+///   is shadowed by an item in the same file brings nothing into scope at the call.
 fn imports_from_checksum_module(code: &str, name: &str) -> bool {
     let prefix = format!("use {CHECKSUM_MODULE}::");
-    code.match_indices(&prefix).any(|(at, _)| {
-        let Some(rest) = code.get(at.saturating_add(prefix.len())..) else {
-            return false;
+    let mut attributed = false;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let Some(at) = trimmed.find(&prefix) else {
+            // An attribute on its own line applies to the item that follows it.
+            attributed = trimmed.starts_with("#[");
+            continue;
+        };
+        // `#[cfg(..)] use crate::crc::..;` on one line, or an attribute on the line above.
+        if attributed || at > 0 {
+            attributed = false;
+            continue;
+        }
+        attributed = false;
+        let Some(rest) = trimmed.get(at.saturating_add(prefix.len())..) else {
+            continue;
         };
         let Some(end) = rest.find(';') else {
-            return false;
+            continue;
         };
         let Some(imported) = rest.get(..end) else {
-            return false;
+            continue;
         };
-        // `as` is a rename, and a renamed import is the case this refuses to vouch for.
-        !imported.contains(" as ")
+        if !imported.contains(" as ")
             && imported
                 .trim_matches(|character: char| character == '{' || character == '}')
                 .split(',')
                 .any(|item| item.trim() == name)
-    })
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// The body of the one `header` in `code`, or `None` with a violation pushed.
@@ -1106,6 +1065,109 @@ fn calls(code: &str) -> Vec<Call> {
     found
 }
 
+/// Everything one seal's binding has to satisfy, in `integrity.rs`.
+///
+/// Split out of [`check_integrity_binding`] so that each half of the rule stays readable:
+/// this one is about the shipped algorithm, and the caller is about the shape of the file
+/// the algorithm is bound in.
+fn seal_binding_violations(
+    seal: &SealBinding,
+    code: &str,
+    declaration: Option<&str>,
+    shipped: Option<&str>,
+) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    // The name in the delegation resolves against whatever is in scope, and a scanner
+    // does not resolve names. Pinning the import is the other half of what makes
+    // `crc16(bytes)` mean the function ADR 0010 settled on rather than something a
+    // `use` line was pointed at.
+    if !imports_from_checksum_module(code, seal.delegates_to) {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_BINDING_PATH} does not import `{}` from `{CHECKSUM_MODULE}` \
+                 unconditionally and unaliased, so the call that computes the seal over \
+                 {} may resolve to any function of that name",
+                seal.delegates_to, seal.covers
+            ),
+        ));
+    }
+    // And the import must not be shadowed by an item in the same file. An import that is
+    // there and a local `fn crc16` beside it is a call that resolves to the local one.
+    if count_tokens(code, &format!("fn {}", seal.delegates_to)) != 0 {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_BINDING_PATH} declares its own `{}`, which shadows the import \
+                 and makes the seal over {} whatever that local function computes",
+                seal.delegates_to, seal.covers
+            ),
+        ));
+    }
+
+    if let Some(body) = declaration {
+        match signature(body, seal.method) {
+            None => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{INTEGRITY_TRAIT}` declares no `{}`, so the seal over {} has no \
+                     width to be pinned at",
+                    seal.method, seal.covers
+                ),
+            )),
+            Some(found) => {
+                if let Some(returned) = return_type(&found) {
+                    if returned != seal.width {
+                        violations.push(Violation::new(
+                            RULE,
+                            ADAPTER,
+                            format!(
+                                "`{}` returns `{returned}` rather than `{}`, so the seal \
+                                 over {} has changed width; that is bytes on media for \
+                                 the life of the format, not an implementation detail",
+                                seal.method, seal.width, seal.covers
+                            ),
+                        ));
+                    }
+                } else {
+                    violations.push(Violation::new(
+                        RULE,
+                        ADAPTER,
+                        format!(
+                            "`{}` declares no return type, so the seal over {} has no \
+                             width to be pinned at",
+                            seal.method, seal.covers
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(body) = shipped {
+        match braced_body(body, &format!("fn {}", seal.method)) {
+            None => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{INTEGRITY_SHIPPED_IMPL}` does not implement `{}`, so the shipped \
+                     seal over {} is bound to nothing",
+                    seal.method, seal.covers
+                ),
+            )),
+            Some(body) => violations.extend(delegation(body, seal, RULE, ADAPTER)),
+        }
+    }
+
+    violations
+}
+
 /// Rule: the codec reaches its seals through the trait rather than around it.
 ///
 /// Reported under `integrity-check` like the other two halves. This is the one that stops
@@ -1134,52 +1196,8 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     let checksums: Vec<&str> = SEAL_BINDINGS.iter().map(|seal| seal.delegates_to).collect();
 
     for function in SEALING_FUNCTIONS {
-        let Some(body) = braced_body(&code, &format!("fn {function}")) else {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{INTEGRITY_ROUTING_PATH} declares no `fn {function}`, so the codec's \
-                     route to its seals is pinned against nothing"
-                ),
-            ));
-            continue;
-        };
-        for seal in SEAL_BINDINGS {
-            let through = format!("C::{}", seal.method);
-            // An *invocation*, not a mention. Codex caught this on PR #60: a token count is
-            // satisfied by `let _ = C::header_check;` left beside a seal some other helper
-            // now computes, and the checksum-name check below would not see a helper called
-            // anything else. A dead reference is not a call.
-            if invocations(body, &through) != 1 {
-                violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "`{function}` does not call `{through}` exactly once, so the seal \
-                         over {} is not computed by the integrity check its caller chose — \
-                         and a mention of it that is not a call is not a route to it",
-                        seal.covers
-                    ),
-                ));
-            }
-        }
-        for checksum in &checksums {
-            if count_tokens(body, checksum) != 0 {
-                violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "`{function}` names `{checksum}` directly, which goes around the \
-                         trait the choice of algorithm lives in; the codec seals through \
-                         `C`, and the one documented exception is `{}`",
-                        DIGEST_FUNCTION.0
-                    ),
-                ));
-            }
-        }
+        violations.extend(sealing_function_violations(function, &code, &checksums));
     }
-
     let (digest, computed_with) = DIGEST_FUNCTION;
     match braced_body(&code, &format!("fn {digest}")) {
         Some(body) if count_tokens(body, computed_with) == 1 => {}
@@ -1221,29 +1239,173 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     violations
 }
 
-/// How many times `code` *calls* `path`, rather than mentioning it.
+/// What `code` does with `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Invocation {
+    /// Called once, and the answer is used.
+    Once,
+    /// Never called. A mention — `let _ = C::header_check;` — is this, not a call.
+    Missing,
+    /// Called more than once, so which one seals the frame is not decidable by reading it.
+    Repeated,
+    /// Called, and the answer thrown away.
+    Discarded,
+}
+
+/// How `code` uses `path`: called once into something, or one of the three ways that is not
+/// a route to a checksum.
 ///
-/// A call is the path at a token boundary followed, after any whitespace, by `(` or by a
-/// turbofish. `let _ = C::header_check;` is a mention and counts nothing, which is the
-/// distinction this exists for.
-fn invocations(code: &str, path: &str) -> usize {
+/// A call is the path at a token boundary followed, after any whitespace, by `(` or a
+/// turbofish. Two rounds of review were needed to get this far, and both are worth stating
+/// because each looked like the whole answer at the time:
+///
+/// * a token count made `let _ = C::header_check;` a route, beside a seal some other helper
+///   computed;
+/// * counting *calls* made `let _ = C::header_check(&sealed_header);` a route, for the same
+///   reason — the call is real and its answer goes nowhere.
+///
+/// So the result has to be used: bound to a pattern that is not `_`, or consumed on the spot
+/// by a method call or a comparison, which are the two things a checksum is for here. A body
+/// that computes a seal and uses it three statements later fails this, deliberately — see
+/// [`delegation`] for why these pins are strict rather than clever.
+fn invocation(code: &str, path: &str) -> Invocation {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
-    code.match_indices(path)
-        .filter(|(at, _)| {
-            let before_is_boundary = code
-                .get(..*at)
-                .and_then(|before| before.chars().next_back())
-                .is_none_or(|character| !continues(character) && character != ':');
-            let after = code
-                .get(at.saturating_add(path.len())..)
-                .unwrap_or_default();
-            let called = {
-                let next = after.trim_start();
-                next.starts_with('(') || next.starts_with("::<")
-            };
-            before_is_boundary && called
-        })
-        .count()
+    let mut found = Invocation::Missing;
+
+    for (at, _) in code.match_indices(path) {
+        let before = code.get(..at).unwrap_or_default();
+        let before_is_boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|character| !continues(character) && character != ':');
+        let after = code
+            .get(at.saturating_add(path.len())..)
+            .unwrap_or_default();
+        let trimmed = after.trim_start();
+        if !before_is_boundary || !(trimmed.starts_with('(') || trimmed.starts_with("::<")) {
+            continue;
+        }
+        if found != Invocation::Missing {
+            return Invocation::Repeated;
+        }
+        found = if result_is_used(before, after) {
+            Invocation::Once
+        } else {
+            Invocation::Discarded
+        };
+    }
+
+    found
+}
+
+/// Whether a call's answer goes anywhere.
+///
+/// `before` is everything ahead of the call and `after` everything from its name onward.
+/// Used means one of two things: the call is the initialiser of a binding whose pattern is
+/// not `_`, or what follows its closing parenthesis consumes it — `.` for a method call, `!`
+/// or `=` for a comparison.
+fn result_is_used(before: &str, after: &str) -> bool {
+    let head = before.trim_end();
+    if let Some(pattern) = head.strip_suffix('=').map(str::trim_end) {
+        // `let _ =` and `let _: u16 =` discard; `let [a, b] =` and `let seal =` do not.
+        let pattern = pattern
+            .rsplit_once("let ")
+            .map_or(pattern, |(_, tail)| tail)
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        return pattern != "_";
+    }
+
+    let mut depth = 0_i32;
+    for (index, character) in after.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let tail = after
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or_default()
+                        .trim_start();
+                    return tail.starts_with('.') || tail.starts_with('!') || tail.starts_with('=');
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Everything one sealing function has to satisfy, in `frame.rs`.
+///
+/// Split out of [`check_integrity_routing`] to keep each function under the workspace's
+/// line limit, and because the two halves answer different questions: this one is "does this
+/// body reach the seal through the trait", and the caller's is "are the bodies that must do
+/// so all there".
+fn sealing_function_violations(function: &str, code: &str, checksums: &[&str]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    let Some(body) = braced_body(code, &format!("fn {function}")) else {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_ROUTING_PATH} declares no `fn {function}`, so the codec's \
+                 route to its seals is pinned against nothing"
+            ),
+        ));
+        return violations;
+    };
+    for seal in SEAL_BINDINGS {
+        let through = format!("C::{}", seal.method);
+        // An *invocation*, not a mention. Codex caught this on PR #60: a token count is
+        // satisfied by `let _ = C::header_check;` left beside a seal some other helper
+        // now computes, and the checksum-name check below would not see a helper called
+        // anything else. A dead reference is not a call.
+        match invocation(body, &through) {
+            Invocation::Once => {}
+            Invocation::Discarded => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` calls `{through}` and throws the answer away, so the \
+                     seal over {} is whatever the next expression computes; a call whose \
+                     result is discarded is not a route to a checksum either",
+                    seal.covers
+                ),
+            )),
+            Invocation::Missing | Invocation::Repeated => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` does not call `{through}` exactly once, so the seal \
+                     over {} is not computed by the integrity check its caller chose — \
+                     and a mention of it that is not a call is not a route to it",
+                    seal.covers
+                ),
+            )),
+        }
+    }
+    for checksum in checksums {
+        if count_tokens(body, checksum) != 0 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` names `{checksum}` directly, which goes around the \
+                     trait the choice of algorithm lives in; the codec seals through \
+                     `C`, and the one documented exception is `{}`",
+                    DIGEST_FUNCTION.0
+                ),
+            ));
+        }
+    }
+
+    violations
 }
 
 /// The text of the signature `fn <name>` opens: its parameter list and what follows, up to
@@ -3307,6 +3469,99 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_cfg_disabled_import_does_not_vouch_for_a_delegation() {
+        // Codex, PR #60 round 2: `#[cfg(any())] use crate::crc::{crc16, crc32};` is an import
+        // that never exists, and beside a local `fn crc16` it is a textual proof of a
+        // resolution that does not happen. Both spellings — the attribute on its own line and
+        // on the same line — because a formatter chooses between them.
+        for disabled in [
+            format!("#[cfg(any())]\nuse {CHECKSUM_MODULE}::"),
+            format!("#[cfg(any())] use {CHECKSUM_MODULE}::"),
+        ] {
+            let source = tests_support::clean_integrity_binding()
+                .replace(&format!("use {CHECKSUM_MODULE}::"), &disabled);
+            let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("does not import")),
+                "a disabled import vouched for the delegation: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_definition_shadowing_the_checksum_is_reported() {
+        // The other half: the import can be real and unconditional, and a local item of the
+        // same name in the same file is still what a call resolves to.
+        for seal in SEAL_BINDINGS {
+            let source = format!(
+                "{}\nconst fn {}(bytes: &[u8]) -> u32 {{ 0 }}\n",
+                tests_support::clean_integrity_binding(),
+                seal.delegates_to
+            );
+            let violations = check_integrity_binding(&[layer(INTEGRITY_BINDING_PATH, &source)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("shadows the import")),
+                "a local `{}` went unreported: {violations:?}",
+                seal.delegates_to
+            );
+        }
+    }
+
+    #[test]
+    fn a_seal_whose_answer_is_discarded_is_reported() {
+        // Codex, PR #60 round 2, and a genuinely new case rather than the dead reference from
+        // round 1: `let _ = C::header_check(&sealed_header);` is a real call to the right
+        // function whose answer goes nowhere, with the stored seal computed by something else.
+        for seal in SEAL_BINDINGS {
+            let source = tests_support::clean_integrity_routing().replace(
+                &format!(
+                    "let seal_{} = C::{}(bytes).to_le_bytes();",
+                    seal.method, seal.method
+                ),
+                &format!(
+                    "let _ = C::{}(bytes); let seal = forged(bytes);",
+                    seal.method
+                ),
+            );
+            let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("throws the answer away")),
+                "a discarded {} went unreported: {violations:?}",
+                seal.method
+            );
+        }
+    }
+
+    #[test]
+    fn a_seal_compared_or_bound_by_name_is_a_route_to_it() {
+        // The two shapes the real codec uses, so the pin above cannot pass by refusing
+        // everything: `encode_with` turns the seal into bytes, `decode_with` compares it.
+        for used in [
+            "let seal_header_check = C::header_check(bytes).to_le_bytes();",
+            "if C::header_check(bytes) != stored { return None; }",
+            "let header = C::header_check(bytes);",
+        ] {
+            let source = tests_support::clean_integrity_routing().replace(
+                "let seal_header_check = C::header_check(bytes).to_le_bytes();",
+                used,
+            );
+            let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("header_check")),
+                "`{used}` was refused: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_mention_of_the_trait_method_is_not_a_route_to_it() {
         // Codex, PR #60: `let _ = C::header_check;` left beside a seal some other helper now
         // computes satisfied a token count, and the checksum-name check does not see a helper
@@ -4117,7 +4372,11 @@ pub mod tests_support {
         for function in SEALING_FUNCTIONS {
             let _ = writeln!(source, "pub fn {function}<C: IntegrityCheck>() -> u32 {{");
             for seal in SEAL_BINDINGS {
-                let _ = writeln!(source, "    let _ = C::{}(bytes);", seal.method);
+                let _ = writeln!(
+                    source,
+                    "    let seal_{} = C::{}(bytes).to_le_bytes();",
+                    seal.method, seal.method
+                );
             }
             source.push_str("    0\n}\n");
         }
