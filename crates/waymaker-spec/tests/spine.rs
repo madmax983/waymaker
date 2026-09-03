@@ -83,6 +83,43 @@ fn every_legal_recovery_the_design_document_permits_satisfies_every_guarantee() 
 }
 
 #[test]
+fn a_legal_recovery_is_a_prefix_that_holds_every_acknowledged_record() {
+    // `legal_recoveries` states §15's rule as membership, and this is what stops it drifting
+    // back into a length comparison. The two agree under the specified machine because
+    // acknowledged records form a prefix — a theorem `tests/machine.rs` proves — and the
+    // point of stating it as membership is that the definition does not *depend* on the
+    // theorem. Checked over the relaxed machine as well, which is where a length would give
+    // the wrong answer.
+    for guards in [
+        Guards::ENFORCED,
+        Guards::ENFORCED.without(waymaker_spec::model::Guard::AppendOnly),
+        Guards::ENFORCED.without(waymaker_spec::model::Guard::BarrierNeedsWhole),
+    ] {
+        let explored = match explore(Bound::PROOF, guards, CEILING) {
+            Ok(explored) => explored,
+            Err(error) => unreachable!("{error}"),
+        };
+        for state in explored.states() {
+            let full = state.recover();
+            for recovery in state.legal_recoveries() {
+                assert!(
+                    full.starts_with(&recovery),
+                    "{recovery:?} is not a prefix of {full:?} in {state:?}"
+                );
+                for required in state.acknowledged() {
+                    assert!(
+                        recovery.contains(&required),
+                        "{recovery:?} is called legal in {state:?} and loses acknowledged \
+                         record {}",
+                        required.0
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_torn_record_is_always_the_last_one_on_media() {
     // Not one of §14's five, and that is why it is here: it is the reachability invariant
     // the proof of acknowledged durability *rests on*. If a torn record could sit behind a

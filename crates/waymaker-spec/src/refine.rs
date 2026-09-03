@@ -69,6 +69,16 @@ impl Journal {
     /// against [`crate::explore`](mod@crate::explore)'s closed set, and it is the only reason building a state
     /// outside [`Journal::step`] is legitimate at all.
     ///
+    /// # The bank dimension is absent, and that makes one guarantee vacuous
+    ///
+    /// A reconstructed state has both banks erased and has never sealed, so
+    /// [`crate::invariant::Invariant::SingleAuthority`] holds of it *by construction* —
+    /// [`crate::invariant::check`] judges three guarantees here and reports the fourth as
+    /// satisfied without looking at anything. `tests/refinement.rs` asserts that in so many
+    /// words rather than leaving rung 0.2's bank adapter to discover it, and
+    /// [`crate::obligation`]'s `single-authority` row says the same thing in the place a
+    /// reader looks for what is owed.
+    ///
     /// # Errors
     ///
     /// [`Impossible`] when the observation describes a record no media could hold. Refused

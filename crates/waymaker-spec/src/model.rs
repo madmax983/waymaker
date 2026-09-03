@@ -17,9 +17,14 @@
 //!
 //! A [`Transition`] is one thing a writer, or the power supply, can do. [`Journal::step`]
 //! is total: every transition is either legal from a state and yields the successor, or is
-//! refused with the [`Illegal`] reason. There is no third answer, and no transition is
-//! silently a no-op — a state machine whose illegal moves are ignored is a state machine
-//! whose guards are decoration.
+//! refused with the [`Illegal`] reason. There is no third answer — an illegal move is never
+//! silently ignored, because a state machine whose guards can be stepped over is a state
+//! machine whose guards are decoration.
+//!
+//! One transition is genuinely idempotent and may leave the state unchanged: a barrier over
+//! a device with nothing new to acknowledge. It is named, and `tests/machine.rs` requires
+//! every *other* legal transition to change something — a no-op that is not on that list is
+//! a guard that stopped guarding.
 //!
 //! # The guards are the design
 //!
@@ -135,8 +140,15 @@ impl Record {
 /// [`Bank::Sealing`], and [`Journal::authoritative`] does not count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Bank {
-    /// No seal. A reader will not boot from it.
+    /// No seal, and nothing half-gone. A reader will not boot from it, and a new run may be
+    /// written into it.
     Erased,
+    /// An erase was begun and has not returned. Design document §15 enumerates an erase
+    /// interrupted at an erase block, so this is a state a real device is in — and one the
+    /// swap's atomicity rests on being unbootable, which is a fact worth proving rather than
+    /// assuming. Not bootable, and not writable either: a partly-erased bank is not a blank
+    /// one.
+    Erasing,
     /// A seal was written and no barrier has returned. Still not bootable.
     Sealing(u32),
     /// The seal is durable at this generation.
@@ -149,7 +161,7 @@ impl Bank {
     pub const fn authoritative_generation(self) -> Option<u32> {
         match self {
             Self::Sealed(generation) => Some(generation),
-            Self::Erased | Self::Sealing(_) => None,
+            Self::Erased | Self::Erasing | Self::Sealing(_) => None,
         }
     }
 }
@@ -176,8 +188,10 @@ pub enum Transition {
     Barrier,
     /// Hand the effect this record schedules to the world. Physical, and irreversible.
     Dispatch(RecordId),
-    /// Erase a bank, clearing its seal.
-    EraseBank(BankId),
+    /// Begin erasing a bank. Its seal is gone; the bank is not yet blank.
+    BeginErase(BankId),
+    /// The erase returned. The bank is blank and a new run may be written into it.
+    CommitErase(BankId),
     /// Write a bank's generation seal without waiting for it.
     BeginSeal(BankId),
     /// Wait for the seal's barrier. The bank becomes authoritative.
@@ -210,8 +224,17 @@ pub enum Illegal {
     IntentNotDurable,
     /// The effect was already handed to the world; doing it twice is a different property.
     AlreadyDispatched,
-    /// The bank is not erased, so a seal would be written over one.
+    /// The bank is not erased, so a seal would be written over cells only an erase restores.
     BankNotErased,
+    /// The bank has no erase in flight to complete.
+    BankNotErasing,
+    /// The bank already has an erase in flight.
+    ///
+    /// Re-issuing one is not modelled, for the same reason re-programming a half-written
+    /// record is not: a writer that reacts to a failure by retrying is rung 0.2's
+    /// compaction, and a model that admitted the retry without describing what it retries
+    /// *into* would be admitting a transition with no content.
+    EraseAlreadyInFlight,
     /// The bank has no seal in flight to commit.
     BankNotSealing,
     /// This is the bank a reader would boot from, so erasing it would either strand the
@@ -236,6 +259,8 @@ impl Illegal {
             Self::IntentNotDurable => "the schedule record has not crossed a barrier",
             Self::AlreadyDispatched => "that effect was already handed to the world",
             Self::BankNotErased => "the bank is not erased",
+            Self::BankNotErasing => "the bank has no erase in flight",
+            Self::EraseAlreadyInFlight => "the bank already has an erase in flight",
             Self::BankNotSealing => "the bank has no seal in flight",
             Self::WouldEraseTheAuthority => "this is the bank a reader would boot from",
             Self::GenerationExhausted => "the model's generation bound is reached",
@@ -273,7 +298,7 @@ pub enum Guard {
     ///
     /// §02 decision 3, as a precondition rather than a hope.
     DurableIntent,
-    /// The bank a reader would boot from may not be erased.
+    /// The bank a reader would boot from may not have its erase begun.
     ///
     /// Design document §14's failure table, on the two-bank swap: "never recover the old run
     /// as current". Erasing the authoritative bank does exactly that — authority falls back
@@ -315,7 +340,22 @@ pub struct Guards(u8);
 
 impl Guards {
     /// The specification: every precondition enforced.
-    pub const ENFORCED: Self = Self(u8::MAX);
+    ///
+    /// Folded from [`Guard::ALL`] rather than written as `u8::MAX`, so the representation
+    /// has no bit no guard owns. With unowned bits set, `ENFORCED.without(..every guard..)`
+    /// and a hypothetical `Guards(0)` would enforce the same nothing and compare unequal —
+    /// and [`crate::explore::Explored`] derives equality through this field.
+    pub const ENFORCED: Self = {
+        let mut bits = 0;
+        let mut remaining: &[Guard] = &Guard::ALL;
+        // A `while let` over a shrinking slice rather than an index, because the workspace
+        // denies indexing and a `const fn` has no iterator.
+        while let [guard, rest @ ..] = remaining {
+            bits |= guard.bit();
+            remaining = rest;
+        }
+        Self(bits)
+    };
 
     /// The same machine with one precondition removed.
     #[must_use]
@@ -466,16 +506,25 @@ impl Journal {
     ///
     /// "Recovery may include an unacknowledged **complete** record, but it may never lose an
     /// acknowledged one": every prefix of [`recover`](Self::recover) that still holds every
-    /// acknowledged record. Stated as a set rather than as a function because recovery is a
+    /// acknowledged record — membership, exactly as
+    /// [`waymaker_fault::verify_oracle`] states it. Stated as a set rather than as a function because recovery is a
     /// relation — a reader that stops one record early is correct, and a specification that
     /// insisted on the longest answer would fail a correct reader.
     #[must_use]
     pub fn legal_recoveries(&self) -> BTreeSet<Vec<RecordId>> {
         let full = self.recover();
-        let required = self.acknowledged().count();
         (0..=full.len())
-            .filter(|length| *length >= required)
-            .filter_map(|length| full.get(..length).map(<[RecordId]>::to_vec))
+            .filter_map(|length| full.get(..length))
+            // Membership, not a count. Under the specified machine the acknowledged records
+            // are exactly the first few of `recover()`, so "holds every acknowledged record"
+            // and "is at least as long as there are acknowledged records" agree — but that
+            // is a *theorem* about this machine, proved in `tests/machine.rs`, and stating
+            // the rule as a length here would make this function and
+            // [`crate::invariant::holds`] disagree about the same history the moment a guard
+            // is relaxed. Two judgements that only agree via a lemma proved elsewhere are
+            // not two judgements.
+            .filter(|prefix| self.acknowledged().all(|id| prefix.contains(&id)))
+            .map(<[RecordId]>::to_vec)
             .collect()
     }
 
@@ -549,7 +598,8 @@ impl Journal {
             alphabet.push(Transition::Dispatch(id));
         }
         for bank in BankId::ALL {
-            alphabet.push(Transition::EraseBank(bank));
+            alphabet.push(Transition::BeginErase(bank));
+            alphabet.push(Transition::CommitErase(bank));
             alphabet.push(Transition::BeginSeal(bank));
             alphabet.push(Transition::CommitSeal(bank));
         }
@@ -558,8 +608,9 @@ impl Journal {
 
     /// Applies `transition`, or says which precondition refused it.
     ///
-    /// Total: every transition from every state has exactly one of two answers. No
-    /// transition is a silent no-op.
+    /// Total: every transition from every state has exactly one of two answers. The only
+    /// transitions that may leave the state unchanged are the two genuinely idempotent ones,
+    /// [`Transition::Barrier`]; `tests/machine.rs` refuses a no-op from any other.
     ///
     /// # Errors
     ///
@@ -582,7 +633,8 @@ impl Journal {
             }
             Transition::Barrier => next.barrier(guards),
             Transition::Dispatch(id) => next.dispatch(id, guards)?,
-            Transition::EraseBank(bank) => next.erase(bank, guards)?,
+            Transition::BeginErase(bank) => next.begin_erase(bank, guards)?,
+            Transition::CommitErase(bank) => next.commit_erase(bank)?,
             Transition::BeginSeal(bank) => next.begin_seal(bank, guards, bound)?,
             Transition::CommitSeal(bank) => next.commit_seal(bank)?,
             Transition::Tear => next.tear(guards)?,
@@ -664,10 +716,22 @@ impl Journal {
         Ok(())
     }
 
-    /// Erases a bank, clearing its seal.
-    fn erase(&mut self, bank: BankId, guards: Guards) -> Result<(), Illegal> {
+    /// Begins erasing a bank, clearing its seal before the erase has returned.
+    fn begin_erase(&mut self, bank: BankId, guards: Guards) -> Result<(), Illegal> {
+        if self.bank(bank) == Bank::Erasing {
+            return Err(Illegal::EraseAlreadyInFlight);
+        }
         if guards.enforces(Guard::NeverEraseTheAuthority) && self.authoritative().contains(&bank) {
             return Err(Illegal::WouldEraseTheAuthority);
+        }
+        self.set_bank(bank, Bank::Erasing);
+        Ok(())
+    }
+
+    /// The erase returned, so the bank is blank.
+    fn commit_erase(&mut self, bank: BankId) -> Result<(), Illegal> {
+        if self.bank(bank) != Bank::Erasing {
+            return Err(Illegal::BankNotErasing);
         }
         self.set_bank(bank, Bank::Erased);
         Ok(())

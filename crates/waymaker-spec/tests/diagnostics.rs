@@ -36,6 +36,8 @@ fn every_refusal_reason_says_something_different() {
         Illegal::AlreadyDispatched,
         Illegal::BankNotErased,
         Illegal::BankNotSealing,
+        Illegal::BankNotErasing,
+        Illegal::EraseAlreadyInFlight,
         Illegal::WouldEraseTheAuthority,
         Illegal::GenerationExhausted,
     ];
@@ -139,6 +141,7 @@ fn the_census_lists_every_edge_it_counted() {
         0
     );
     assert_eq!(census.bank_steps(BankShape::Sealed, BankShape::Sealed), 0);
+    assert_eq!(BankShape::of(Bank::Erasing), BankShape::Erasing);
     assert_eq!(explored.guards(), Guards::ENFORCED);
     assert_eq!(explored.bound(), Bound::PROOF);
 }
@@ -197,12 +200,13 @@ fn a_record_reports_the_design_documents_state_for_every_shape_it_can_hold() {
 #[test]
 fn a_bank_reports_a_generation_only_once_its_seal_is_durable() {
     assert_eq!(Bank::Erased.authoritative_generation(), None);
+    assert_eq!(Bank::Erasing.authoritative_generation(), None);
     assert_eq!(Bank::Sealing(3).authoritative_generation(), None);
     assert_eq!(Bank::Sealed(3).authoritative_generation(), Some(3));
     for shape in BankShape::ALL {
         assert!(matches!(
             shape,
-            BankShape::Erased | BankShape::Sealing | BankShape::Sealed
+            BankShape::Erased | BankShape::Erasing | BankShape::Sealing | BankShape::Sealed
         ));
     }
     assert_eq!(BankShape::of(Bank::Sealing(1)), BankShape::Sealing);
@@ -252,14 +256,10 @@ fn the_alphabet_covers_every_transition_kind_at_every_record_the_bound_allows() 
 }
 
 #[test]
-fn the_discharge_kinds_each_have_a_word() {
-    let labels: BTreeSet<&str> = [
-        Discharge::Model,
-        Discharge::Firmware,
-        Discharge::Representation,
-    ]
-    .iter()
-    .map(|discharge| discharge.label())
-    .collect();
-    assert_eq!(labels.len(), 3);
+fn the_discharge_kinds_each_have_a_word_of_their_own() {
+    let labels: BTreeSet<&str> = Discharge::ALL
+        .iter()
+        .map(|discharge| discharge.label())
+        .collect();
+    assert_eq!(labels.len(), Discharge::ALL.len());
 }

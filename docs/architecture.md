@@ -426,9 +426,14 @@ Issue [#20](https://github.com/madmax983/waymaker/issues/20) asks for the legal 
 between §15's three record states, and between bank generations, to be stated rather than
 assumed; `waymaker-spec` is where they are proved, and this is the machine it proves over.
 
-The edge labels are the preconditions, because they are the part that carries the design. Each
-is separately removable, and removing any one of them makes a named guarantee reachable-false
-— which is how the specification knows they are load-bearing rather than decorative.
+The edge labels are the preconditions, because they are the part that carries the design. All
+five are drawn, each is separately removable, and removing any one of them makes a named
+guarantee reachable-false — which is how the specification knows they are load-bearing rather
+than decorative. The nodes are §15's three record states and §02 decision 7's four bank
+states — including *erasing*, which design document §15 enumerates as an interrupted erase and
+which the swap's atomicity rests on being unbootable. *Torn* is drawn as a fourth record node
+for legibility and is not a fourth record state: a torn record is `possibly durable`, and
+being torn is the extra fact that says recovery must not produce it.
 
 <!-- diagram: recovery-state-machine -->
 
@@ -444,6 +449,7 @@ flowchart LR
     r1 -- "barrier claims only whole records" --> r2
     r0 -- "power lost mid-program, or the call fails" --> rt
     rt -. "never acknowledged" .-> r2
+    r2 -- "durable intent before dispatch" --> eff(["effect handed to the world"])
   end
 
   subgraph banks ["One bank, through §02 decision 7's swap"]
@@ -451,9 +457,12 @@ flowchart LR
     b0(["erased"])
     b1(["sealing"])
     b2(["sealed"])
+    be(["erasing"])
     b0 -- "write the seal · strictly greater generation" --> b1
     b1 -- "barrier returns" --> b2
-    b2 -- "recycle · never erase the authority" --> b0
+    b2 -- "recycle · never erase the authority" --> be
+    b1 -- "the seal never landed · never erase the authority" --> be
+    be -- "the erase returns" --> b0
   end
 
   records ~~~ banks
@@ -461,8 +470,8 @@ flowchart LR
   classDef live fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef done fill:#e9f7ec,stroke:#2f8f4e,color:#123f22;
   classDef bad fill:#ffe9e9,stroke:#c0392b,color:#3f1212;
-  class r0,r1,b0,b1 live;
-  class r2,b2 done;
+  class r0,r1,b0,b1,be live;
+  class r2,b2,eff done;
   class rt bad;
 ```
 

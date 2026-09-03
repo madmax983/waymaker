@@ -32,7 +32,7 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// one — it means part of the machine stopped being reachable while every proof about the
 /// rest kept passing — and a change that makes it larger is one a reviewer should see too.
 /// Either way the number is the review, and it is expected to move when the model does.
-const REACHABLE_STATES: usize = 1_972;
+const REACHABLE_STATES: usize = 3_248;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -45,6 +45,50 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
     );
 }
 
+/// How many legal edges of each kind the enforced machine has, at [`Bound::PROOF`].
+///
+/// Pinned, not merely required to be non-zero. The reachable state *set* is not the
+/// transition *relation*, and the difference is not academic: a `Tear` restricted to
+/// one-record runs, a `Barrier` refused when it would acknowledge nothing, or a `Declare`
+/// forbidden after an effect is dispatched each delete a whole family of crash
+/// interleavings and leave `REACHABLE_STATES` unchanged — because every state those edges
+/// led to is reachable by some other path. Every invariant, every mutant verdict and every
+/// necessity proof stays green through all three. The edge counts do not.
+const TRANSITION_EDGES: [(TransitionKind, usize); 11] = [
+    (TransitionKind::Declare, 588),
+    (TransitionKind::Program, 448),
+    (TransitionKind::FailedProgram, 448),
+    (TransitionKind::Barrier, 1624),
+    (TransitionKind::Dispatch, 1036),
+    (TransitionKind::BeginErase, 1392),
+    (TransitionKind::CommitErase, 696),
+    (TransitionKind::BeginSeal, 464),
+    (TransitionKind::CommitSeal, 464),
+    (TransitionKind::Tear, 448),
+    (TransitionKind::PowerLoss, 1624),
+];
+
+#[test]
+fn the_transition_relation_is_the_size_it_was_when_these_proofs_were_written() {
+    let explored = proof_space();
+    let census = explored.census();
+    for (kind, expected) in TRANSITION_EDGES {
+        assert_eq!(
+            census.transitions(kind),
+            expected,
+            "the machine has a different number of {kind:?} edges than it did; if that was \
+             on purpose, update TRANSITION_EDGES in the same commit as the model change"
+        );
+    }
+    let total: usize = TRANSITION_EDGES.iter().map(|(_, count)| count).sum();
+    assert_eq!(
+        census.edges(),
+        total,
+        "the per-kind counts do not add up to the edges the search followed, so a kind is \
+         missing from TRANSITION_EDGES"
+    );
+}
+
 #[test]
 fn every_transition_kind_was_followed_at_least_once() {
     let explored = proof_space();
@@ -53,6 +97,11 @@ fn every_transition_kind_was_followed_at_least_once() {
             explored.census().transitions(kind) > 0,
             "{kind:?} is in the alphabet and no reachable state admits it, so every proof \
              about it is vacuous"
+        );
+        assert!(
+            TRANSITION_EDGES.iter().any(|(named, _)| *named == kind),
+            "{kind:?} has no pinned edge count, so a change that deleted its edges would \
+             leave the state count and every proof unchanged"
         );
     }
 }
@@ -74,6 +123,8 @@ fn every_precondition_refused_something() {
         Illegal::AlreadyDispatched,
         Illegal::BankNotErased,
         Illegal::BankNotSealing,
+        Illegal::BankNotErasing,
+        Illegal::EraseAlreadyInFlight,
         Illegal::WouldEraseTheAuthority,
         Illegal::GenerationExhausted,
     ];
@@ -95,7 +146,6 @@ fn every_record_state_edge_the_design_document_names_was_walked() {
     // returned cannot be taken back, and `tests/machine.rs` proves that rather than
     // assuming it.
     let required = [
-        (Durability::Attempted, Durability::Attempted),
         (Durability::Attempted, Durability::PossiblyDurable),
         (Durability::PossiblyDurable, Durability::Acknowledged),
     ];
@@ -105,6 +155,33 @@ fn every_record_state_edge_the_design_document_names_was_walked() {
             "no run ever moved a record from {from:?} to {to:?}"
         );
     }
+    // And the edges the machine must *not* have. `Acknowledged -> anything` would be a
+    // barrier taken back; `Attempted -> Acknowledged` would be a record durable without ever
+    // being written, which is the edge `tests/machine.rs` used to admit in its legal list
+    // while the machine never walked it — a list that admits an edge nothing takes would
+    // pass a model in which `Program` acknowledged its own record.
+    let forbidden = [
+        (Durability::Attempted, Durability::Acknowledged),
+        (Durability::Acknowledged, Durability::PossiblyDurable),
+        (Durability::Acknowledged, Durability::Attempted),
+        (Durability::PossiblyDurable, Durability::Attempted),
+    ];
+    for (from, to) in forbidden {
+        assert_eq!(
+            explored.census().durability_steps(from, to),
+            0,
+            "a run moved a record from {from:?} to {to:?}"
+        );
+    }
+    assert_eq!(
+        explored.census().durability_edges(),
+        required.to_vec(),
+        "the record-state edges the machine walks are not the ones §15 describes"
+    );
+    // Records arrive attempted and in no other state.
+    assert!(explored.census().arrivals(Durability::Attempted) > 0);
+    assert_eq!(explored.census().arrivals(Durability::PossiblyDurable), 0);
+    assert_eq!(explored.census().arrivals(Durability::Acknowledged), 0);
 }
 
 #[test]
@@ -113,7 +190,8 @@ fn every_bank_shape_edge_the_two_bank_swap_needs_was_walked() {
     let required = [
         (BankShape::Erased, BankShape::Sealing),
         (BankShape::Sealing, BankShape::Sealed),
-        (BankShape::Sealed, BankShape::Erased),
+        (BankShape::Sealed, BankShape::Erasing),
+        (BankShape::Erasing, BankShape::Erased),
     ];
     for (from, to) in required {
         assert!(

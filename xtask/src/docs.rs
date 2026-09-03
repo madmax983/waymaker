@@ -479,7 +479,9 @@ const RECOVERY_STATE_MACHINE_LABELS: &[&str] = &[
     "torn",
     "append-only",
     "barrier claims only whole records",
+    "durable intent before dispatch",
     "erased",
+    "erasing",
     "sealing",
     "sealed",
     "never erase the authority",
@@ -933,9 +935,9 @@ fn check_recovery_spec(
              nothing holds the proofs to the documentation",
         )),
         Some(contents) => {
-            let declared = spec_clause_ids(contents);
+            let declared = spec_clause_rows(contents);
             for clause in SPEC_CLAUSES {
-                if !declared.contains(clause.id) {
+                let Some(proof) = declared.get(clause.id) else {
                     violations.push(Violation::new(
                         "recovery-spec",
                         clause.id,
@@ -944,9 +946,36 @@ fn check_recovery_spec(
                              guarantee has documentation and no proof behind it"
                         ),
                     ));
+                    continue;
+                };
+                // The proof as well as the id, because the id alone leaves the crate free to
+                // point a guarantee at a different file than the one CLAUDE.md tells a
+                // reader to look in — two tables agreeing on the names of six things and
+                // disagreeing about all six of them.
+                if *proof != Some(clause.discharged_by) {
+                    violations.push(Violation::new(
+                        "recovery-spec",
+                        clause.id,
+                        proof.map_or_else(
+                            || {
+                                format!(
+                                    "{SPEC_OBLIGATIONS_PATH}'s row for this guarantee names \
+                                     no proof, and docs::SPEC_CLAUSES says `{}`",
+                                    clause.discharged_by
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{SPEC_OBLIGATIONS_PATH} discharges this guarantee with \
+                                     `{named}` and docs::SPEC_CLAUSES says `{}`",
+                                    clause.discharged_by
+                                )
+                            },
+                        ),
+                    ));
                 }
             }
-            for id in &declared {
+            for id in declared.keys() {
                 if !SPEC_CLAUSES.iter().any(|clause| clause.id == *id) {
                     violations.push(Violation::new(
                         "recovery-spec",
@@ -966,23 +995,44 @@ fn check_recovery_spec(
     violations
 }
 
-/// Every clause id [`SPEC_OBLIGATIONS_PATH`] declares.
+/// Every `(clause id, proof)` pair [`SPEC_OBLIGATIONS_PATH`] declares.
 ///
-/// Matched on the table's own `id: "..."` field rather than on the whole file, so a clause
-/// id that only appears in a doc comment does not vouch for a row that is not there.
-fn spec_clause_ids(contents: &str) -> std::collections::BTreeSet<&str> {
-    let mut ids = std::collections::BTreeSet::new();
+/// Matched on the table's own `id: "..."` and `proof: "..."` fields rather than on the whole
+/// file, so a clause id that only appears in a doc comment does not vouch for a row that is
+/// not there. A row's proof is the field that follows its id, which is the order the type
+/// declares them in; a row that reorders its fields reads as having no proof, which is a
+/// violation rather than a silent pass.
+fn spec_clause_rows(contents: &str) -> BTreeMap<&str, Option<&str>> {
+    let mut rows = BTreeMap::new();
     for (index, _) in contents.match_indices("id: \"") {
-        let Some(rest) = contents.get(index.saturating_add(5)..) else {
+        let Some(after_key) = index.checked_add("id: \"".len()) else {
+            continue;
+        };
+        let Some(rest) = contents.get(after_key..) else {
             continue;
         };
         let Some(end) = rest.find('"') else { continue };
         let Some(id) = rest.get(..end) else { continue };
-        if !id.is_empty() {
-            ids.insert(id);
+        if id.is_empty() {
+            continue;
         }
+        // The row runs to the next clause's id, so a proof belongs to the row above it.
+        let tail = rest.get(end..).unwrap_or_default();
+        let row = tail
+            .find("id: \"")
+            .and_then(|next| tail.get(..next))
+            .unwrap_or(tail);
+        rows.insert(id, quoted_field(row, "proof: \""));
     }
-    ids
+    rows
+}
+
+/// The string literal following `key` in `row`, if there is one.
+fn quoted_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
+    let index = row.find(key)?;
+    let rest = row.get(index.checked_add(key.len())?..)?;
+    let end = rest.find('"')?;
+    rest.get(..end)
 }
 
 /// The half of `recovery-spec` that reads `CLAUDE.md`.
@@ -991,35 +1041,58 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = without_html_comments(contents);
+    // Fences as well as comments, for the reason the ADR half strips them: a fenced example
+    // listing the six ids would otherwise satisfy every check below in a file whose table
+    // has been deleted.
+    let contents = without_fenced_code(&without_html_comments(contents));
     let mut violations = Vec::new();
     for clause in SPEC_CLAUSES {
-        if !contents.contains(&format!("`{}`", clause.id)) {
+        // The clause's own table row, found by its backticked id — not three global
+        // `contains` calls, which is the defect `deferred-questions` was fixed for on
+        // PR #58 and which bites harder here: four of the six clauses name the same proof
+        // file, so a whole-file check for `tests/spine.rs` is satisfied by any one of their
+        // rows on behalf of all four.
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
             violations.push(Violation::new(
                 "recovery-spec",
                 clause.id,
-                "CLAUDE.md has no row naming this recovery invariant in backticks, so a \
-                 contributor cannot tell which guarantee a change is touching",
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this recovery invariant in backticks, \
+                     so a contributor cannot tell which guarantee a change is touching"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this recovery invariant, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
             ));
             continue;
-        }
-        if !contents.contains(clause.headline) {
+        };
+
+        if !row.contains(clause.headline) {
             violations.push(Violation::new(
                 "recovery-spec",
                 clause.id,
                 format!(
-                    "CLAUDE.md does not state this guarantee as `{}`, which is what \
-                     docs::SPEC_CLAUSES reads",
+                    "CLAUDE.md's table row for this guarantee does not state it as `{}`, \
+                     which is what docs::SPEC_CLAUSES reads",
                     clause.headline
                 ),
             ));
         }
-        if !contents.contains(clause.discharged_by) {
+        if !row.contains(clause.discharged_by) {
             violations.push(Violation::new(
                 "recovery-spec",
                 clause.id,
                 format!(
-                    "CLAUDE.md does not say this guarantee is discharged by \
+                    "CLAUDE.md's table row does not say this guarantee is discharged by \
                      `{}`, so the row describes a proof without pointing at one",
                     clause.discharged_by
                 ),
@@ -1990,7 +2063,10 @@ pub mod tests_support {
         for clause in SPEC_CLAUSES {
             line(
                 &mut body,
-                format_args!("    Clause {{ id: \"{}\" }},", clause.id),
+                format_args!(
+                    "    Clause {{ id: \"{}\", proof: \"{}\" }},",
+                    clause.id, clause.discharged_by
+                ),
             );
         }
         body.push_str("];\n");
@@ -2091,11 +2167,15 @@ pub mod tests_support {
             }),
             adrs: clean_adrs(),
             spec_obligations: Some(clean_spec_obligations()),
-            crate_roots: vec![CrateRoot {
-                package: "waymaker-core".to_owned(),
-                path: "crates/waymaker-core/src/lib.rs".to_owned(),
-                contents: "//! Docs.\n#![no_std]\n#![warn(missing_docs)]\n".to_owned(),
-            }],
+            // One root per crate the layering covers, so that a fixture describing a clean
+            // workspace really has one for every member `inputs-incomplete` looks for.
+            crate_roots: crate::policy::checked_members()
+                .map(|name| CrateRoot {
+                    package: name.to_owned(),
+                    path: format!("crates/{name}/src/lib.rs"),
+                    contents: "//! Docs.\n#![no_std]\n#![warn(missing_docs)]\n".to_owned(),
+                })
+                .collect(),
         }
     }
 }
@@ -3438,10 +3518,8 @@ mod tests {
     #[test]
     fn a_documented_and_proved_specification_passes() {
         let (claude_md, adrs, obligations) = spec_inputs();
-        assert!(
-            check_recovery_spec(Some(&claude_md), &adrs, Some(&obligations)).is_empty(),
-            "the clean fixtures should satisfy the rule"
-        );
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&obligations));
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -3457,6 +3535,127 @@ mod tests {
                     && violation.detail.contains("no clause with this id")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn a_clause_pointed_at_a_different_proof_than_the_documentation_names_is_reported() {
+        // The id alone is not enough: two tables can agree on the names of six things and
+        // disagree about all six of them.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.last().expect("the table is not empty");
+        let moved = obligations.replace(
+            &format!("proof: \"{}\"", clause.discharged_by),
+            "proof: \"tests/somewhere_else.rs\"",
+        );
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&moved));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("tests/somewhere_else.rs")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_row_that_names_no_proof_at_all_is_reported() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.last().expect("the table is not empty");
+        let stripped = obligations.replace(&format!(", proof: \"{}\"", clause.discharged_by), "");
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&stripped));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("names no proof")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn one_row_naming_a_shared_proof_does_not_vouch_for_the_others() {
+        // Four of the six clauses are discharged by the same file. Three global `contains`
+        // calls would let any one of their rows satisfy the check on behalf of all four —
+        // the defect `deferred-questions` was fixed for on PR #58, which bites harder here
+        // because the shared string is the one a reader most needs to be right.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let shared = "tests/spine.rs";
+        let sharing: Vec<&str> = SPEC_CLAUSES
+            .iter()
+            .filter(|clause| clause.discharged_by == shared)
+            .map(|clause| clause.id)
+            .collect();
+        assert!(sharing.len() > 1, "this test needs a shared proof file");
+        let gutted: String = claude_md
+            .lines()
+            .map(|row| {
+                let names_a_sharer = sharing
+                    .iter()
+                    .skip(1)
+                    .any(|id| row.contains(&format!("`{id}`")));
+                if names_a_sharer {
+                    row.replace(shared, "somewhere")
+                } else {
+                    row.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let violations = check_recovery_spec(Some(&gutted), &adrs, Some(&obligations));
+        for id in sharing.iter().skip(1) {
+            assert!(
+                violations.iter().any(|violation| violation.subject == *id
+                    && violation.detail.contains("discharged by")),
+                "`{id}` lost its proof and nothing said so: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clause_only_inside_a_fenced_block_in_claude_md_does_not_vouch_for_it() {
+        // The counterpart of the ADR half's fence test. Without it, the whole guarantees
+        // section could be replaced by a fenced listing of the six ids.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let fenced = claude_md.replace(
+            &format!("| `{}` |", clause.id),
+            &format!("```text\n| `{}` |", clause.id),
+        ) + "\n```\n";
+        let violations = check_recovery_spec(Some(&fenced), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_named_by_two_rows_is_reported_rather_than_resolved() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let row = format!(
+            "| `{}` | {} | {} |",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let doubled = claude_md.replace(&row, &format!("{row}\n{row}"));
+        let violations = check_recovery_spec(Some(&doubled), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("2 table rows")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_id_in_prose_above_the_table_does_not_shadow_its_row() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let prefixed = format!("Prose about `{}` before the table.\n{claude_md}", clause.id);
+        let violations = check_recovery_spec(Some(&prefixed), &adrs, Some(&obligations));
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]

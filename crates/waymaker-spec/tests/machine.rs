@@ -42,10 +42,14 @@ fn edges() -> Vec<(Journal, Transition, Journal)> {
 fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
     // Design document §15: merely attempted, possibly durable before acknowledgment, and
     // barrier-returned. Forward only, and never back.
+    // Two, not three. `Attempted -> Acknowledged` is not on this list, and a list that
+    // admitted it would pass a model in which `Program` acknowledged its own record —
+    // deleting the barrier from the durability path entirely. `tests/census.rs` requires
+    // both of these to be witnessed and that one never to be, so a list that admits an edge
+    // nothing takes fails there rather than being tolerated here.
     let legal = [
         (Durability::Attempted, Durability::PossiblyDurable),
         (Durability::PossiblyDurable, Durability::Acknowledged),
-        (Durability::Attempted, Durability::Acknowledged),
     ];
     for (from, transition, to) in edges() {
         for (before, after) in from.records().iter().zip(to.records()) {
@@ -125,7 +129,11 @@ fn a_bank_moves_only_erased_to_sealing_to_sealed_to_erased() {
                 (before, after),
                 (Bank::Erased, Bank::Sealing(_))
                     | (Bank::Sealing(_), Bank::Sealed(_))
-                    | (Bank::Sealed(_) | Bank::Sealing(_), Bank::Erased)
+                    | (
+                        Bank::Sealed(_) | Bank::Sealing(_) | Bank::Erased,
+                        Bank::Erasing
+                    )
+                    | (Bank::Erasing, Bank::Erased)
             );
             assert!(
                 legal,
@@ -255,7 +263,7 @@ fn no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to() 
     // wherever they turn up.
     for (from, transition, to) in edges() {
         if from == to {
-            let excused = matches!(transition, Transition::Barrier | Transition::EraseBank(_));
+            let excused = matches!(transition, Transition::Barrier);
             assert!(
                 excused,
                 "{transition:?} is legal from {from:?} and changes nothing"

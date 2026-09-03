@@ -38,8 +38,9 @@ impl Reader for Specified {
 /// A reader that is wrong in exactly one way.
 ///
 /// Each variant exists so that one guarantee can be shown to fail. They are in `src/` rather
-/// than in a test file because `tests/teeth.rs` and `tests/census.rs` both need them and a
-/// mutant copied into two test files is a mutant that drifts.
+/// than in a test file because three test targets need them — `tests/teeth.rs`,
+/// `tests/refinement.rs` and `tests/diagnostics.rs` — and a mutant copied into three test
+/// files is a mutant that drifts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mutant {
     /// Produces one record past the end of history. Breaks prefix safety.

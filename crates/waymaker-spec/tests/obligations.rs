@@ -154,11 +154,40 @@ fn what_is_still_owed_is_written_down_rather_than_left_out() {
 }
 
 #[test]
-fn the_discharge_kinds_are_all_used() {
-    let kinds: BTreeSet<&str> = CLAUSES
+fn every_discharge_kind_is_used_by_a_clause() {
+    // A kind of evidence the table declares and no row claims is a category with nothing in
+    // it, which is how a label that means nothing gets applied to something later.
+    let used: BTreeSet<&str> = CLAUSES
         .iter()
         .map(|entry| entry.discharge.label())
         .collect();
-    assert!(kinds.contains("model"));
-    assert!(kinds.contains("firmware"));
+    for discharge in Discharge::ALL {
+        assert!(
+            used.contains(discharge.label()),
+            "no clause is discharged by `{}`",
+            discharge.label()
+        );
+    }
+    assert_eq!(used.len(), Discharge::ALL.len());
+}
+
+#[test]
+fn every_named_proof_contains_tests_rather_than_merely_existing() {
+    // A file check is not a proof check: `tests/spine.rs` emptied to zero `#[test]`
+    // functions still exists, still compiles, still "passes", and four guarantees have
+    // silently lost their evidence. The count is a floor rather than a pin, because a proof
+    // gaining a test should not be a build failure.
+    for entry in CLAUSES {
+        for (role, target) in [("proof", entry.proof), ("falsifier", entry.falsifier)] {
+            let path = crate_root().join(target);
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            let tests = contents.matches("#[test]").count();
+            assert!(
+                tests >= 2,
+                "clause `{}` names {role} `{target}`, which holds {tests} test(s)",
+                entry.id
+            );
+        }
+    }
 }

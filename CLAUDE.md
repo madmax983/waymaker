@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 35 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 36 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -117,7 +117,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
 | `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — rung 0.2 owes the refinement, because there is no two-bank adapter to abstract yet |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
-| `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, exhaustively over every byte string to three bytes and every mutation of a real frame |
+| `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, exhaustively over every byte string to three bytes, every single-byte mutation of a real frame, and every payload length a header can declare |
 
 Paths are relative to `crates/waymaker-spec`, and they are a CI stage of their own —
 `cargo test --locked -p waymaker-spec --no-default-features`, in the `verification` job.
@@ -387,12 +387,28 @@ Stated so that nobody mistakes silence for coverage:
   in any run. Everything before the injection point is identical by construction, which is
   what makes the enumeration exact for that sequence; it is not a fixpoint over the
   sequences a reacting writer can produce.
-- **That a proof is a proof of anything outside its bound.** `waymaker-spec`'s enumeration is
-  closed within `Bound::PROOF` — three records, three generations, two banks — and silent
-  outside it. A bug that needs four records to show itself is a bug this workspace does not
-  currently look for. Raising the bound is a constant and a re-pinned state count;
-  [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md)
-  says what a general proof would take instead.
+- **What the ghost model does not have dimensions for.** The bound is *not* the binding
+  constraint, and saying only "closed within `Bound::PROOF`" would invite the wrong reading:
+  raising it to four or five records changes no verdict, because the shapes of history it
+  admits are one-dimensional. What is missing is expressiveness, and three gaps are worth
+  naming. The model's **banks hold no records** — no transition changes a bank and a record
+  at once — so §14's "never recover the old run as current" is not a statement it can make.
+  There is **no reboot**: `recover()` is applied to a state the power has left, and nothing
+  consumes a recovered history and carries on, so a second boot and a third are outside the
+  machine. And **a writer that retries** after a failed program or a failed erase is not
+  describable, because an append-only journal with a half-written record in it cannot
+  advance and compaction is rung 0.2's. Each is recorded in `obligation.rs`'s `owed` column
+  and in
+  [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md).
+- **That a named proof contains a proof.** `recovery-spec` checks that a clause's proof file
+  is the one both tables name; `tests/obligations.rs` checks that the file exists and holds
+  at least two tests. Neither reads what those tests assert, and neither can.
+- **That the crash oracle is as strict as the specification.** `waymaker_fault::verify_oracle`
+  compares a recovery against *committed* history, which filters out records that never
+  reached media, so it accepts a history that skips a gap and carries on; the specification's
+  prefix safety is a prefix of *declaration order* and refuses it. The two agree over the
+  specified machine — no reachable state has a gap — and `tests/oracle.rs` measures where
+  they stop agreeing rather than leaving the difference implied.
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers

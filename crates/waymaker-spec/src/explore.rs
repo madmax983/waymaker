@@ -43,8 +43,10 @@ pub enum TransitionKind {
     Barrier,
     /// [`Transition::Dispatch`].
     Dispatch,
-    /// [`Transition::EraseBank`].
-    EraseBank,
+    /// [`Transition::BeginErase`].
+    BeginErase,
+    /// [`Transition::CommitErase`].
+    CommitErase,
     /// [`Transition::BeginSeal`].
     BeginSeal,
     /// [`Transition::CommitSeal`].
@@ -57,13 +59,14 @@ pub enum TransitionKind {
 
 impl TransitionKind {
     /// Every transition kind, in a fixed order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Declare,
         Self::Program,
         Self::FailedProgram,
         Self::Barrier,
         Self::Dispatch,
-        Self::EraseBank,
+        Self::BeginErase,
+        Self::CommitErase,
         Self::BeginSeal,
         Self::CommitSeal,
         Self::Tear,
@@ -81,7 +84,8 @@ impl Transition {
             Self::FailedProgram(_) => TransitionKind::FailedProgram,
             Self::Barrier => TransitionKind::Barrier,
             Self::Dispatch(_) => TransitionKind::Dispatch,
-            Self::EraseBank(_) => TransitionKind::EraseBank,
+            Self::BeginErase(_) => TransitionKind::BeginErase,
+            Self::CommitErase(_) => TransitionKind::CommitErase,
             Self::BeginSeal(_) => TransitionKind::BeginSeal,
             Self::CommitSeal(_) => TransitionKind::CommitSeal,
             Self::Tear => TransitionKind::Tear,
@@ -95,6 +99,8 @@ impl Transition {
 pub enum BankShape {
     /// [`Bank::Erased`].
     Erased,
+    /// [`Bank::Erasing`].
+    Erasing,
     /// [`Bank::Sealing`].
     Sealing,
     /// [`Bank::Sealed`].
@@ -103,13 +109,14 @@ pub enum BankShape {
 
 impl BankShape {
     /// Every bank shape, in a fixed order.
-    pub const ALL: [Self; 3] = [Self::Erased, Self::Sealing, Self::Sealed];
+    pub const ALL: [Self; 4] = [Self::Erased, Self::Erasing, Self::Sealing, Self::Sealed];
 
     /// This bank's shape.
     #[must_use]
     pub const fn of(bank: Bank) -> Self {
         match bank {
             Bank::Erased => Self::Erased,
+            Bank::Erasing => Self::Erasing,
             Bank::Sealing(_) => Self::Sealing,
             Bank::Sealed(_) => Self::Sealed,
         }
@@ -122,7 +129,9 @@ pub struct Census {
     transitions: BTreeMap<TransitionKind, usize>,
     refusals: BTreeMap<Illegal, usize>,
     durability_steps: BTreeMap<(Durability, Durability), usize>,
+    arrivals: BTreeMap<Durability, usize>,
     bank_steps: BTreeMap<(BankShape, BankShape), usize>,
+    edges: usize,
 }
 
 impl Census {
@@ -154,6 +163,29 @@ impl Census {
             .get(&(from, to))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// How many records arrived in this state.
+    ///
+    /// Its own counter rather than a self-pair in [`durability_steps`](Self::durability_steps):
+    /// a record being declared is not a record moving between two of design document §15's
+    /// states, and filing it as one would make `durability_edges` report a transition that
+    /// does not exist the moment any transition appends a record that is not `Attempted`.
+    #[must_use]
+    pub fn arrivals(&self, state: Durability) -> usize {
+        self.arrivals.get(&state).copied().unwrap_or_default()
+    }
+
+    /// How many legal edges the search followed in total.
+    ///
+    /// Pinned by `tests/census.rs` alongside the per-kind counts, because the reachable
+    /// *state set* is not the transition *relation*: a guard tightened until a whole family
+    /// of interleavings is unreachable can leave every state still reachable by another
+    /// path, and then the state count, every invariant and every mutant verdict are
+    /// unchanged while the machine has lost edges.
+    #[must_use]
+    pub const fn edges(&self) -> usize {
+        self.edges
     }
 
     /// Every record-state edge the search saw, in a fixed order.
@@ -272,6 +304,12 @@ pub fn explore(bound: Bound, guards: Guards, ceiling: usize) -> Result<Explored,
     let mut census = Census::default();
     let mut queue = VecDeque::new();
 
+    if ceiling == 0 {
+        // The start state counts. Checked here rather than only at the insert inside the
+        // loop, so that a ceiling of zero is an error rather than a search that returns one
+        // state and calls it closed.
+        return Err(ExploreError::CeilingReached { ceiling });
+    }
     states.insert(start.clone());
     queue.push_back(start);
 
@@ -305,21 +343,23 @@ pub fn explore(bound: Bound, guards: Guards, ceiling: usize) -> Result<Explored,
 /// Counts one legal edge, and every record- and bank-state change it made.
 fn record_edge(census: &mut Census, transition: Transition, from: &Journal, to: &Journal) {
     *census.transitions.entry(transition.kind()).or_default() += 1;
+    census.edges = census.edges.saturating_add(1);
 
     for (before, after) in from.records().iter().zip(to.records()) {
+        // `tests/machine.rs` proves no transition renumbers or drops a record, and this is
+        // what stops the census silently mis-attributing an edge in the window before that
+        // test runs: a zip over reordered records compares different records at the same
+        // position and files the difference as a state change.
+        debug_assert_eq!(before.id, after.id, "a transition renumbered a record");
         let (before, after) = (before.durability(), after.durability());
         if before != after {
             *census.durability_steps.entry((before, after)).or_default() += 1;
         }
     }
-    // A record the transition created has no predecessor to compare against, and its arrival
-    // in `Attempted` is a step the census would otherwise never see.
+    // A record the transition created has no predecessor to compare against, and its
+    // arrival is counted on its own rather than as a step between two states.
     for new in to.records().iter().skip(from.records().len()) {
-        let arrival = new.durability();
-        *census
-            .durability_steps
-            .entry((arrival, arrival))
-            .or_default() += 1;
+        *census.arrivals.entry(new.durability()).or_default() += 1;
     }
 
     for (before, after) in from.banks().iter().zip(to.banks()) {

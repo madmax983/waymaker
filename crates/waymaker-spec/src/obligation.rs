@@ -29,13 +29,13 @@ pub enum Discharge {
     /// Not a model of the decoder: the real `waymaker_flash` functions, over a domain the
     /// proof states.
     Firmware,
-    /// True of every value the representation can hold, so no run can falsify it.
-    ///
-    /// The weakest of the three on its own — a property true by construction is a property a
-    /// wrong construction makes vacuous — so every row that claims it also names a falsifier
-    /// somewhere the construction does not reach.
-    Representation,
 }
+
+// There is deliberately no `Representation` variant for "true by construction". A property a
+// wrong construction makes vacuous is not evidence, and the one place this specification
+// leans on the representation — `bounded-decoding`'s allocation clause, which rests on
+// `no_std` with no dependencies — is recorded as an `owed` note naming the gate rules that
+// hold it, where a reader will see the caveat rather than a reassuring label.
 
 impl Discharge {
     /// One word for the kind of evidence.
@@ -44,9 +44,11 @@ impl Discharge {
         match self {
             Self::Model => "model",
             Self::Firmware => "firmware",
-            Self::Representation => "representation",
         }
     }
+
+    /// Every kind of evidence, in a fixed order.
+    pub const ALL: [Self; 2] = [Self::Model, Self::Firmware];
 }
 
 /// One guarantee, and everything that holds it up.
@@ -66,6 +68,12 @@ pub struct Clause {
     /// already learnt that lesson once: `waymaker-fault`'s `tests/teeth.rs` exists because a
     /// crash suite that cannot catch a weakened codec is a crash suite that proves the
     /// harness runs.
+    ///
+    /// A [`Discharge::Firmware`] row may name its own proof, and only because those two
+    /// files carry their falsifier inside them: `tests/bounded_decoding.rs` sweeps a domain
+    /// and asserts both verdicts occur, and `tests/redelivery.rs` runs a catalogue of wrong
+    /// allocators and requires each to be caught by a *named* claim. A row that named itself
+    /// with neither would be a row exempting itself.
     pub falsifier: &'static str,
     /// What this row does *not* discharge, and the rung that owes it.
     pub owed: Option<&'static str>,
@@ -109,8 +117,14 @@ pub const CLAUSES: &[Clause] = &[
         proof: "tests/spine.rs",
         falsifier: "tests/necessity.rs",
         owed: Some(
-            "rung 0.2 owes the refinement: there is no two-bank adapter to abstract yet, so \
-             this clause is discharged against the model alone",
+            "rung 0.2 owes the refinement, and three things about the model with it. There \
+             is no two-bank adapter to abstract, so this clause is discharged against the \
+             model alone — and a reconstructed state has no banks, so it is answered \
+             vacuously for one. The model's banks hold no records: no transition changes a \
+             bank and a record at once, so \"never recover the old run as current\" is not \
+             something this machine can state, only \"exactly one bank is bootable\". And \
+             generations are compared as unbounded integers, so a seal counter that wraps is \
+             a counterexample no bound reaches",
         ),
     },
     Clause {

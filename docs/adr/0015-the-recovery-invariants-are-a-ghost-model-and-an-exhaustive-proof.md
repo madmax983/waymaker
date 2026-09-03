@@ -129,13 +129,17 @@ authoritative bank may not be erased at all, which subsumes the weaker rule.
 
 ## Consequences
 
-**A bounded proof is not a general one, and this ADR does not pretend otherwise.** Within
+**A bounded proof is not a general one, and the bound is not what it is short of.** Within
 `Bound::PROOF` — three records, three generations, two banks — the enumeration is closed and
-nothing is missed. Outside it the crate says nothing. A general proof is what Verus would
-give, and the door is left open: if the toolchain question is ever settled — a vendored
-verifier, a separate optional job that is allowed to be slow — the specification here is
-already written as pure total functions over a small state, which is the form a Verus port
-would want. Nothing about this decision has to be undone to take that step.
+nothing is missed. Outside it the crate says nothing. But raising the bound to four or five
+records changes no verdict, and it is worth saying so plainly rather than letting a reader
+assume the counterexamples are one record away: the shapes of history this model admits are
+`Whole^w Partial^{≤1} Absent^a`, which is one-dimensional, so a fourth record adds a longer
+instance of a shape already there. What the proof is short of is *expressiveness*, in three
+places named in `obligation.rs`'s `owed` column — banks that hold no records, no reboot, and
+no writer that retries. A general proof is what Verus would give, and the door is left open:
+the specification here is pure total functions over a small state, which is the form a Verus
+port would want. Nothing about this decision has to be undone to take that step.
 
 **The state count is a number a reviewer has to look at.** `REACHABLE_STATES` is pinned, so
 a model change that shrinks the machine fails a build — and a legitimate model change fails
@@ -144,7 +148,9 @@ is silent shrinkage, and the price of catching it is that the number moves.
 
 **Two clauses are only partly discharged, and both say so in a row rather than in a
 sentence.** `single-authority` has no refinement because rung 0.1 has no two-bank adapter to
-abstract — it is proved against the model alone, and rung 0.2 owes the other half.
+abstract — it is proved against the model alone, rung 0.2 owes the other half, and on a state
+rebuilt from a real crashed run it is answered vacuously, which `tests/refinement.rs` asserts
+in so many words rather than leaving to be found.
 `bounded-decoding`'s allocation clause is structural rather than measured: `waymaker-core`
 and `waymaker-flash` are `no_std` with no dependencies and no `extern crate alloc`, which the
 `crate-attributes` and `kernel-zero-dependencies` rules fail a build over. Measuring it
@@ -159,8 +165,10 @@ made for the same reason: an exhaustive host-side search has no business inside 
 flash budget.
 
 **Wrong readers and relaxed machines are public API.** `reader::Mutant` and `Guards::without`
-exist so that the proofs can be shown to fail. They are documented as such, and
-`tests/obligations.rs` requires every one of them to be accounted for. The alternative —
+exist so that the proofs can be shown to fail. They are documented as such, and each is
+required to be accounted for: `tests/teeth.rs` fails if a `Mutant` has no row saying which
+guarantee catches it, and `tests/necessity.rs` fails if a `Guard` has no row saying what it
+is for. The alternative —
 keeping them in test files — means copying them into the four test targets that need them,
 which is a mutant that drifts.
 

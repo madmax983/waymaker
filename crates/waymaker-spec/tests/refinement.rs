@@ -57,6 +57,18 @@ fn geometry() -> Geometry {
     geometry
 }
 
+/// The same capacity in four erase blocks, so a journal crosses a block boundary.
+///
+/// A second geometry because §15 asks for "random record sequences and storage geometries",
+/// and one geometry is a sample of size one: a device whose journal never crosses a block is
+/// a device on which a whole class of offset arithmetic is never exercised.
+fn blocks() -> Geometry {
+    let Ok(geometry) = Geometry::new(256, 64, 4, 1) else {
+        unreachable!("256 is four whole 64-byte blocks of 4-byte units of single bytes")
+    };
+    geometry
+}
+
 fn align() -> ProgramAlign {
     let Some(align) = ProgramAlign::new(4) else {
         unreachable!("4 is a power of two within the program-size range")
@@ -86,11 +98,25 @@ fn append(session: &mut Session, at: &mut u32, record: &RecordRef<'_>) -> Result
 /// checks. A record is identified by what is *in* it, so "recovery produced a prefix" stays
 /// a statement about content rather than about counting.
 fn recovered(image: &[u8], numbering: Numbering) -> Vec<RecordId> {
-    Scan::new(image, align())
+    let read: Vec<RecordRef<'_>> = Scan::new(image, align())
         .take_while(Result::is_ok)
         .flatten()
-        .filter_map(|record| numbering.id_of(&record))
-        .collect()
+        .collect();
+    let named: Vec<RecordId> = read
+        .iter()
+        .filter_map(|record| numbering.id_of(record))
+        .collect();
+    // A record the reader produced and the numbering cannot name would be dropped here, and
+    // the refinement check would then compare a *shorter* history against the model and pass.
+    // Refused loudly instead: the writers under test emit two record kinds, and a third
+    // arriving is a change to the fixture rather than something to quietly ignore.
+    assert_eq!(
+        named.len(),
+        read.len(),
+        "the scan recovered a record kind {numbering:?} does not name, so the comparison \
+         below would be against a history with a hole in it"
+    );
+    named
 }
 
 /// How a writer numbers its records, so that a recovered frame can be named the way the
@@ -146,6 +172,49 @@ fn journal(session: &mut Session) -> Result<(), FaultError> {
     Ok(())
 }
 
+/// A writer that does not give up when a program call fails.
+///
+/// Design document §12: "program and erase may fail". Every other writer here propagates the
+/// error with `?` and the run ends, which means no refined run ever reaches *a live device
+/// with a half-written record on it* — and that is the one state
+/// [`Guard::BarrierNeedsWhole`](waymaker_spec::model::Guard::BarrierNeedsWhole) exists to
+/// constrain, and the only firmware evidence
+/// [`Transition::FailedProgram`](waymaker_spec::model::Transition::FailedProgram) can have.
+/// Without this writer both are proved against the model and against nothing else.
+///
+/// It carries on exactly as far as the specification says it may: a barrier, which must not
+/// claim the torn record, and then it stops. It does not retry at a new offset — an
+/// append-only journal with a half-written record in it cannot advance, which is what
+/// `Illegal::EarlierRecordIncomplete` says, and rung 0.2's compaction is where that is
+/// answered.
+fn journal_that_survives_a_failed_program(session: &mut Session) -> Result<(), FaultError> {
+    let mut at = 0;
+    for index in 0..RECORDS {
+        session.begin_record(RecordId(index));
+        let written = append(
+            session,
+            &mut at,
+            &RecordRef::EffectScheduled {
+                seq: EffectSeq(index.wrapping_add(1)),
+                kind: DOWNLOAD,
+                input_len: 4,
+                input_crc: frame::input_digest(b"blob"),
+            },
+        );
+        match written {
+            Ok(()) => session.barrier()?,
+            // The device is alive and a record is half on media. One barrier, which the
+            // specification says must not acknowledge it, and then the run is over.
+            Err(FaultError::InjectedFailure) => {
+                let _ = session.barrier();
+                return Ok(());
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(())
+}
+
 /// Design document §11's shape: a schedule record crosses a barrier, *then* the effect is
 /// dispatched, and only afterwards is a completion recorded.
 fn effect_protocol(
@@ -190,7 +259,15 @@ where
     W: FnMut(&mut Session) -> Result<(), E>,
     E: std::fmt::Debug,
 {
-    match Harness::new(geometry()).run(writer) {
+    drive_on(geometry(), writer)
+}
+
+fn drive_on<W, E>(geometry: Geometry, writer: W) -> Vec<Run>
+where
+    W: FnMut(&mut Session) -> Result<(), E>,
+    E: std::fmt::Debug,
+{
+    match Harness::new(geometry).run(writer) {
         Ok(runs) => runs,
         Err(error) => unreachable!("{error}"),
     }
@@ -262,9 +339,85 @@ fn the_real_journal_refines_the_specification_at_every_crash_point() {
 }
 
 #[test]
+fn a_writer_that_survives_a_failed_program_refines_the_specification_too() {
+    // The run the other writers never reach: a live device with a half-written record on it,
+    // and a barrier issued over it. This is the only firmware evidence there is for
+    // `Transition::FailedProgram` and for `Guard::BarrierNeedsWhole`, both of which are
+    // otherwise proved against the model alone.
+    for geometry in [geometry(), blocks()] {
+        let runs = drive_on(geometry, journal_that_survives_a_failed_program);
+        let histories = check(&runs, Numbering::OneRecordPerEffect, &[]);
+        assert!(!histories.is_empty());
+
+        // And the state it exists for is really reached: a torn record on a device that then
+        // went on to ask for a barrier, with the torn record still unacknowledged.
+        let survived = runs
+            .iter()
+            .filter(|run| {
+                run.ledger().records().any(|(id, state)| {
+                    run.ledger().torn(id) == Some(true) && state == Durability::PossiblyDurable
+                })
+            })
+            .count();
+        assert!(
+            survived > 0,
+            "no run left a torn record on a live device, so the barrier precondition has no \
+             firmware evidence"
+        );
+    }
+}
+
+#[test]
+fn the_refinement_reaches_the_dimensions_the_guarantees_are_about() {
+    // Question 1 is a containment check, and a containment check passes for a sweep that
+    // reaches nothing. So what the sweep reaches is asserted: torn records, acknowledged
+    // records lost, dispatched effects, and every prefix length. Without this the refinement
+    // could hold because the firmware never got anywhere interesting.
+    let mut torn = 0_usize;
+    let mut acknowledged_and_short = 0_usize;
+    let mut observations = BTreeSet::new();
+    for writer in [
+        &journal as &dyn Fn(&mut Session) -> Result<(), FaultError>,
+        &journal_that_survives_a_failed_program,
+    ] {
+        for geometry in [geometry(), blocks()] {
+            for run in drive_on(geometry, |session| writer(session)) {
+                let observed = abstraction(run.ledger(), &[]);
+                if observed.records.iter().any(|(.., torn_here)| *torn_here) {
+                    torn += 1;
+                }
+                let history = recovered(run.image(), Numbering::OneRecordPerEffect);
+                if run.ledger().acknowledged().count() > 0 && history.len() < RECORDS as usize {
+                    acknowledged_and_short += 1;
+                }
+                observations.insert(observed);
+            }
+        }
+    }
+    assert!(torn > 0, "no run ever tore a record");
+    assert!(
+        acknowledged_and_short > 0,
+        "no run had to keep a record it had promised while losing one it had not"
+    );
+    assert!(
+        observations.len() >= 12,
+        "only {} distinct model states are refined, which is too few for question 1 to be \
+         a check rather than a formality",
+        observations.len()
+    );
+}
+
+#[test]
 fn the_real_effect_protocol_refines_the_specification_at_every_crash_point() {
     // The dispatch log is per run, so it is captured per run: the harness re-runs the writer
     // once per crash point, and an effect dispatched in one run did not happen in another.
+    //
+    // The alignment relies on `Harness::run` invoking the writer in the order it returns the
+    // runs — the fault-free run first, then one per injection, which is what its
+    // implementation does. `Run` carries no dispatch log of its own, so there is nothing to
+    // key on; the length assertion below catches a count that drifted and would not catch a
+    // reordering, which is the reason this comment names the assumption rather than leaving
+    // it to be inferred.
     let log = RefCell::new(Vec::new());
     let per_run = RefCell::new(Vec::new());
     let runs = drive(|session| {
@@ -316,6 +469,35 @@ fn the_refinement_check_can_tell_the_specified_reader_from_a_wrong_one() {
             disagreements > 0,
             "a reader that {mutant} agrees with the firmware at every crash point, so the \
              refinement check cannot tell it from the specified one"
+        );
+    }
+}
+
+#[test]
+fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
+    // Written down as a test rather than left to be discovered. `Observation` carries no
+    // banks, so `reconstructed` builds a state that has never sealed, and `SingleAuthority`
+    // returns `Ok` for it whatever history it is handed — including one that is pure
+    // invention. A caller with real banks to abstract, which is rung 0.2, gets three
+    // guarantees judged and the fourth answered for free, and this is the assertion that
+    // says so out loud.
+    let nonsense = [RecordId(99), RecordId(7)];
+    for run in drive(journal) {
+        let observed = abstraction(run.ledger(), &[]);
+        let Ok(state) = Journal::reconstructed(&observed) else {
+            unreachable!("the harness never builds a torn acknowledged record")
+        };
+        assert!(!state.has_sealed());
+        assert!(state.authoritative().is_empty());
+        assert!(
+            waymaker_spec::invariant::holds(
+                waymaker_spec::invariant::Invariant::SingleAuthority,
+                &state,
+                &nonsense,
+            )
+            .is_ok(),
+            "the fourth guarantee has become falsifiable on a reconstructed state, which \
+             would be an improvement — update this test and obligation.rs's owed note"
         );
     }
 }

@@ -31,8 +31,17 @@
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_flash::frame::{
-    self, ERASED_BYTE, FRAME_OVERHEAD_BYTES, HEADER_BYTES, ProgramAlign, Scan,
+    self, ERASED_BYTE, FRAME_OVERHEAD_BYTES, HEADER_BYTES, HEADER_CRC_BYTES, ProgramAlign, Scan,
 };
+use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
+
+/// Where §09's twelve-byte header carries `payload_len`.
+///
+/// The header seal is the last field, and `payload_len` is the two bytes before it, so both
+/// offsets are derived from the constants `waymaker-flash` exports rather than written as
+/// literals a frame-layout change could leave behind.
+const HEADER_CRC_AT: usize = HEADER_BYTES - HEADER_CRC_BYTES;
+const PAYLOAD_LEN_AT: usize = HEADER_CRC_AT - 2;
 
 fn align() -> ProgramAlign {
     let Some(align) = ProgramAlign::new(4) else {
@@ -53,6 +62,30 @@ fn valid_frame() -> Vec<u8> {
         &mut buffer,
     ) else {
         unreachable!("64 bytes is more than this record needs")
+    };
+    let Some(bytes) = buffer.get(..written) else {
+        unreachable!("`encode` reports what it wrote")
+    };
+    bytes.to_vec()
+}
+
+/// A frame whose record borrows the whole of its payload, and a long one.
+///
+/// The in-bounds claim is only checked on records that *have* a borrow, so the corpus needs
+/// more than one shape that does: `valid_schedule` carries four scalars and no bytes at all,
+/// so a pointer check run over it alone would be a check over nothing.
+fn valid_run_started() -> Vec<u8> {
+    let mut buffer = [0_u8; 96];
+    let Ok(written) = frame::encode(
+        &RecordRef::RunStarted {
+            workflow_kind: 9,
+            workflow_version: 2,
+            input: b"a rather longer input than the others",
+        },
+        align(),
+        &mut buffer,
+    ) else {
+        unreachable!("96 bytes is more than this record needs")
     };
     let Some(bytes) = buffer.get(..written) else {
         unreachable!("`encode` reports what it wrote")
@@ -152,7 +185,7 @@ fn every_truncation_of_a_valid_frame_is_refused_rather_than_half_decoded() {
     // to decode, and one byte less has to be refused. Getting that wrong in either
     // direction is the failure this test is for — a decoder that refused a frame with its
     // pad trimmed would reject the last record of every journal.
-    let corpora = [valid_frame(), valid_schedule()];
+    let corpora = [valid_frame(), valid_schedule(), valid_run_started()];
     // One of the two has to carry padding, or the interesting half of the claim below —
     // that a frame with its pad trimmed still decodes — is about nothing.
     assert!(
@@ -191,7 +224,8 @@ fn every_single_byte_mutation_of_a_valid_frame_is_answered() {
     // decoder answers within its input, never that it refuses.
     let mut accepted = 0_usize;
     let mut refused = 0_usize;
-    for corpus in [valid_frame(), valid_schedule()] {
+    let mut borrowed = 0_usize;
+    for corpus in [valid_frame(), valid_schedule(), valid_run_started()] {
         for position in 0..corpus.len() {
             for replacement in 0..=u8::MAX {
                 let mut mutated = corpus.clone();
@@ -204,6 +238,14 @@ fn every_single_byte_mutation_of_a_valid_frame_is_answered() {
                 *cell = replacement;
                 if decodes_within_its_input(&mutated) {
                     accepted += 1;
+                    if frame::decode(&mutated).is_ok_and(|frame| match frame.decoded {
+                        frame::Decoded::Record(record) => {
+                            borrows(&record).iter().any(|slice| !slice.is_empty())
+                        }
+                        frame::Decoded::UnknownKind(_) => false,
+                    }) {
+                        borrowed += 1;
+                    }
                 } else {
                     refused += 1;
                 }
@@ -215,31 +257,76 @@ fn every_single_byte_mutation_of_a_valid_frame_is_answered() {
         "the mutation sweep produced only one answer ({accepted} accepted, {refused} \
          refused), so it is not exercising the seal"
     );
+    // The in-bounds half of `decodes_within_its_input` only runs on a record that has a
+    // borrow, so a sweep in which nothing decoded to one would be checking totality alone.
+    assert!(
+        borrowed > 0,
+        "no mutated frame decoded to a record with a non-empty borrow, so the pointer check \
+         never ran"
+    );
 }
 
 #[test]
 fn every_declared_payload_length_a_header_can_carry_is_answered() {
     // §15's "malformed lengths", exhaustively: the length field is a `u16`, so every value
-    // it can hold is 65_536 cases and there is no reason to sample them. The header seal
-    // will refuse almost all of these; what matters is that the decoder reaches that
-    // decision without reading past its input first.
+    // it can hold is 65_536 cases and there is no reason to sample them.
+    //
+    // The header seal has to be recomputed after the length is changed, and that is the
+    // whole point of this test rather than an incidental detail. §09 decodes the header
+    // checksum *before* it reads `payload_len` — that is what makes the length trustworthy —
+    // so a sweep that only overwrote the length would be refused at the seal every time and
+    // the bounds check would never see a single one of the 65_536 values. That is exactly
+    // what the first version of this test did, and it passed.
     let corpus = valid_frame();
-    let mut answered = 0_usize;
+    let mut reached = 0_usize;
+    let mut accepted = 0_usize;
     for declared in 0..=u16::MAX {
         let mut mutated = corpus.clone();
-        // The payload length sits in the header; its exact offset is `waymaker-flash`'s
-        // business, so every two-byte window of the header is tried rather than one guessed.
+        let Some(length_field) = mutated.get_mut(PAYLOAD_LEN_AT..PAYLOAD_LEN_AT + 2) else {
+            unreachable!("the corpus is a whole frame, so it has a header")
+        };
+        length_field.copy_from_slice(&declared.to_le_bytes());
+        let Some(sealed) = mutated.get(..HEADER_CRC_AT) else {
+            unreachable!("the corpus is a whole frame, so it has a header")
+        };
+        let seal = Catalogued::header_check(sealed).to_le_bytes();
+        let Some(seal_field) = mutated.get_mut(HEADER_CRC_AT..HEADER_BYTES) else {
+            unreachable!("the corpus is a whole frame, so it has a header")
+        };
+        seal_field.copy_from_slice(&seal);
+        reached = reached.saturating_add(1);
+        if decodes_within_its_input(&mutated) {
+            accepted = accepted.saturating_add(1);
+        }
+    }
+    assert_eq!(
+        reached,
+        usize::from(u16::MAX) + 1,
+        "every declared length is swept, or this is not the exhaustive claim it says it is"
+    );
+    // Exactly one length describes the payload that is really there. Every other one is
+    // refused — and the assertion is that the decoder *reaches* that decision, which the
+    // in-bounds check inside `decodes_within_its_input` is what proves.
+    assert_eq!(
+        accepted, 1,
+        "{accepted} of 65536 declared lengths decoded; only the frame's own should"
+    );
+
+    // And the same sweep without resealing, kept because it is a different claim: arbitrary
+    // bytes anywhere in the header, refused at the seal rather than at the bounds check.
+    let mut unsealed = 0_usize;
+    for declared in 0..=u16::MAX {
         for offset in 0..HEADER_BYTES.saturating_sub(1) {
-            mutated.copy_from_slice(&corpus);
+            let mut mutated = corpus.clone();
             let Some(window) = mutated.get_mut(offset..offset.saturating_add(2)) else {
                 continue;
             };
             window.copy_from_slice(&declared.to_le_bytes());
             decodes_within_its_input(&mutated);
-            answered = answered.saturating_add(1);
+            unsealed = unsealed.saturating_add(1);
         }
     }
-    assert!(answered > 0);
+    assert_eq!(unsealed, (usize::from(u16::MAX) + 1) * (HEADER_BYTES - 1));
 }
 
 #[test]

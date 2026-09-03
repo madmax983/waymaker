@@ -102,6 +102,103 @@ fn two_runs_never_share_an_identity() {
     assert_eq!(seen.len(), RUNS.len() * EFFECTS as usize);
 }
 
+/// Ways an allocator could be wrong, as functions of the same shape as the real one.
+///
+/// The falsifier for this clause. The other five proofs here run against the shipped
+/// allocator and nothing else, and a suite that only ever sees the right answer is a suite
+/// whose assertions nobody has watched fail. Each of these is a plausible mistake — a
+/// per-boot counter, an identity that forgets the run, an allocator that restarts after a
+/// crash — and each has to be caught by a *named* claim above rather than by any claim at
+/// all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrongAllocator {
+    /// Restarts at the first sequence after every reboot. The redelivery-after-reset bug.
+    RestartsAfterACrash,
+    /// Numbers effects by position and forgets the run. Two runs then deduplicate against
+    /// each other.
+    ForgetsTheRun,
+    /// Continues one past where the run left off. The fencepost.
+    SkipsOne,
+}
+
+impl WrongAllocator {
+    const ALL: [Self; 3] = [
+        Self::RestartsAfterACrash,
+        Self::ForgetsTheRun,
+        Self::SkipsOne,
+    ];
+
+    /// The ids this allocator hands out after a reboot with `last` committed.
+    fn resume(self, run: RunId, last: Option<EffectSeq>, count: u32) -> Vec<EffectId> {
+        let (run, first) = match self {
+            Self::RestartsAfterACrash => (run, EffectSeq::FIRST),
+            Self::ForgetsTheRun => (
+                RunId(0),
+                last.map_or(EffectSeq::FIRST, |seq| EffectSeq(seq.0.saturating_add(1))),
+            ),
+            Self::SkipsOne => (
+                run,
+                last.map_or(EffectSeq(2), |seq| EffectSeq(seq.0.saturating_add(2))),
+            ),
+        };
+        (0..count)
+            .map(|offset| EffectId {
+                run,
+                seq: EffectSeq(first.0.saturating_add(offset)),
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn every_wrong_allocator_is_caught_by_a_claim_this_file_makes() {
+    for wrong in WrongAllocator::ALL {
+        let caught = RUNS.iter().any(|run| {
+            let original = fresh(*run);
+            // The claim of `a_reboot_at_every_point_in_history_redelivers_the_same_identity`,
+            // asked of the wrong allocator instead of the real one.
+            (0_usize..=original.len()).any(|committed| {
+                let last = committed
+                    .checked_sub(1)
+                    .and_then(|index| original.get(index))
+                    .map(|id| id.seq);
+                let produced = wrong.resume(
+                    *run,
+                    last,
+                    u32::try_from(original.len().saturating_sub(committed)).unwrap_or(0),
+                );
+                let expected: Vec<EffectId> = original.iter().skip(committed).copied().collect();
+                produced != expected
+            })
+        });
+        assert!(
+            caught,
+            "an allocator that {wrong:?} redelivers the same identities as the real one, so \
+             this file cannot tell them apart"
+        );
+    }
+}
+
+#[test]
+fn an_allocator_that_forgets_the_run_is_caught_by_the_uniqueness_claim_too() {
+    // The second claim, separately: `two_runs_never_share_an_identity` has to be what
+    // catches this one, not a coincidence of the first.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut collided = false;
+    for run in RUNS {
+        for id in WrongAllocator::ForgetsTheRun.resume(run, None, EFFECTS) {
+            if !seen.insert(id) {
+                collided = true;
+            }
+        }
+    }
+    assert!(
+        collided,
+        "an allocator that forgets the run does not collide, so the uniqueness claim is not \
+         what rules it out"
+    );
+}
+
 #[test]
 fn resuming_past_the_last_sequence_is_refused_rather_than_wrapped() {
     // The boundary, and the one place a stable identity could stop being stable: an

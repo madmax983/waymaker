@@ -16,7 +16,8 @@ use std::collections::BTreeSet;
 
 use waymaker_fault::{RecordId, Recovery, verify_oracle, verify_recovery};
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bound, Guards, Journal};
+use waymaker_spec::invariant;
+use waymaker_spec::model::{Bound, Guard, Guards, Journal};
 use waymaker_spec::reader::Reader;
 use waymaker_spec::reader::Specified;
 
@@ -152,6 +153,52 @@ fn the_oracle_refuses_the_bank_counts_the_model_never_reports() {
             "the oracle accepted {count} authoritative banks"
         );
     }
+}
+
+#[test]
+fn the_specification_is_strictly_stronger_than_the_oracle_where_they_differ() {
+    // The agreement above holds over the specified machine, and this is the claim about
+    // where it stops. Relax the append-only precondition and the two part company in one
+    // direction only: the model's prefix-safety is a prefix of *declaration order*, and
+    // `waymaker_fault::verify_oracle` compares against committed history, which filters out
+    // records that never reached media. So the oracle accepts a history that skips a gap and
+    // carries on, and the model refuses it.
+    //
+    // Written down and measured rather than left implied, because the argument for the
+    // oracle's filter is otherwise circular: the filter is sound *because* no reachable
+    // state has a gap, which is a theorem about the machine the filter is being used to
+    // check. Naming the difference — and asserting it never runs the other way — is what
+    // turns that into a stated limit.
+    let relaxed = explore(
+        AGREEMENT,
+        Guards::ENFORCED.without(Guard::AppendOnly),
+        CEILING,
+    )
+    .expect("the agreement bound");
+    let candidates = candidates(AGREEMENT);
+    let mut oracle_is_weaker = 0_usize;
+
+    for state in relaxed.states() {
+        let ledger = state.ledger();
+        for candidate in &candidates {
+            let oracle_accepts = verify_recovery(&ledger, candidate).is_ok();
+            let model_accepts = invariant::check(state, candidate).is_ok();
+            if oracle_accepts && !model_accepts {
+                oracle_is_weaker += 1;
+                continue;
+            }
+            assert!(
+                !model_accepts || oracle_accepts,
+                "the model accepts {candidate:?} in {state:?} and the oracle refuses it; the \
+                 specification is supposed to be the stricter of the two"
+            );
+        }
+    }
+    assert!(
+        oracle_is_weaker > 0,
+        "the two never differ even with the append-only precondition removed, so this claim \
+         is about nothing"
+    );
 }
 
 #[test]
