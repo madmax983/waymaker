@@ -188,9 +188,16 @@ impl<'a> Recovery<'a> {
 
     /// The schedule records of the effects this run really dispatched.
     ///
-    /// A physical effect, not an intention to perform one: §02 decision 3 orders the
-    /// schedule record before the effect, so an id belongs here once the barrier that made
-    /// its intent durable has returned and the effect has been handed to the world.
+    /// Membership is decided by one thing only: the physical effect was handed to the
+    /// world. Not by whether its intent was durable first, and deliberately not — §02
+    /// decision 3 *requires* the schedule record to cross a barrier before dispatch, so a
+    /// contract that admitted an id only once that barrier had returned would be a contract
+    /// in which the violation cannot be described. A writer that dispatches early would
+    /// then omit exactly the effect this line exists to catch, and the oracle would pass
+    /// without ever learning the effect happened.
+    ///
+    /// So: an effect that reached the world belongs here whether or not anything about it
+    /// is on media. Whether that was legal is the oracle's answer, not the caller's.
     #[must_use]
     pub const fn dispatched(mut self, dispatched: &'a [RecordId]) -> Self {
         self.dispatched = dispatched;

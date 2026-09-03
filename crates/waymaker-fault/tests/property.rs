@@ -57,7 +57,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use waymaker_core::{
-    ActivityKind, DecodeError, EffectSeq, KernelError, RecordRef, ReplayCursor, RunId,
+    ActivityKind, DecodeError, EffectSeq, KernelError, RecordKind, RecordRef, ReplayCursor, RunId,
 };
 use waymaker_fault::{
     Breach, Durability, FaultError, Harness, Injection, Interruption, Op, Progress, RecordId,
@@ -829,12 +829,18 @@ fn a_single_bit_flipped_anywhere_loses_only_what_lies_at_or_beyond_the_damage() 
 }
 
 #[test]
-fn a_payload_length_that_lies_is_refused_even_with_a_header_that_checks_out() {
-    // "Malformed lengths", from issue #19's coverage list, at the one place it is
-    // dangerous: `payload_len` is read out of the bytes being validated, so a frame whose
-    // *header* seal is correct and whose length is a lie is the case §09's two checksums
-    // exist for. Resealing the header is what makes this a real test rather than a
-    // corrupted-header test wearing a different name.
+fn a_payload_length_that_lies_is_refused_by_the_seal_or_by_the_bounds() {
+    // "Malformed lengths", first half: a frame whose *header* seal is correct and whose
+    // length is a lie. That is the case §09's two checksums exist for — `payload_len` is
+    // read out of the bytes being validated, so the header seal is what makes it a number
+    // the writer wrote rather than a number that was found.
+    //
+    // What each lie is caught *by* is asserted rather than left as "some error", because
+    // the two mechanisms are different and only one of them is about the length: a short
+    // lie moves the trailer inside the payload, so the frame seal fails; a long one puts
+    // the trailer past the end of the journal, so the bounds check fails.
+    // `a_self_consistently_sealed_frame_whose_length_is_wrong_for_its_kind_is_refused` is
+    // the half that reaches the record's own length rule, which neither of these does.
     let geometry = fixed_geometry();
     let align = align_of(geometry);
     let mut buffer = [0_u8; 64];
@@ -864,10 +870,19 @@ fn a_payload_length_that_lies_is_refused_even_with_a_header_that_checks_out() {
         };
         header_crc.copy_from_slice(&seal.to_le_bytes());
 
+        let claimed = frame::HEADER_BYTES
+            .saturating_add(usize::from(lie))
+            .saturating_add(frame::TRAILER_BYTES);
+        let expected = if claimed <= journal.len() {
+            DecodeError::IntegrityFailed
+        } else {
+            DecodeError::Truncated
+        };
         let mut scan = Scan::new(&journal, align);
-        assert!(
-            matches!(scan.next(), Some(Err(_))),
-            "a frame claiming a {lie}-byte payload was accepted"
+        assert_eq!(
+            scan.next(),
+            Some(Err(expected)),
+            "a frame claiming a {lie}-byte payload was not refused the way it should be"
         );
         assert_eq!(
             scan.offset(),
@@ -875,6 +890,98 @@ fn a_payload_length_that_lies_is_refused_even_with_a_header_that_checks_out() {
             "the scan advanced past a frame it refused"
         );
     }
+}
+
+/// A frame that is self-consistent at every level the checksums can see.
+///
+/// Both seals are computed over what is really there, so nothing about the *bytes* is
+/// wrong. Whether the record is legal is then the only question left, which is the point:
+/// it is the one way to reach `decode`'s per-kind length rule, and a test that stopped at a
+/// broken seal would never get there.
+fn sealed_frame(kind: RecordKind, seq: EffectSeq, payload: &[u8]) -> Vec<u8> {
+    let mut journal = Vec::new();
+    journal.extend_from_slice(&frame::MAGIC.to_le_bytes());
+    journal.push(frame::FORMAT_VERSION);
+    journal.push(kind.0);
+    journal.extend_from_slice(&seq.0.to_le_bytes());
+    journal.extend_from_slice(
+        &u16::try_from(payload.len())
+            .unwrap_or(u16::MAX)
+            .to_le_bytes(),
+    );
+    let header_seal = Catalogued::header_check(&journal);
+    journal.extend_from_slice(&header_seal.to_le_bytes());
+    journal.extend_from_slice(payload);
+    let frame_seal = Catalogued::frame_check(&journal);
+    journal.extend_from_slice(&frame_seal.to_le_bytes());
+    journal
+}
+
+#[test]
+fn a_self_consistently_sealed_frame_whose_length_is_wrong_for_its_kind_is_refused() {
+    // "Malformed lengths", second half, and the half that is actually about the length. A
+    // frame whose header seal, frame seal and trailer position all agree with the length it
+    // claims passes everything the checksums can decide — so what refuses it can only be
+    // the record's own rule about how long its payload is. Nothing in the first half
+    // reaches that code at all.
+    let scheduled = [
+        1_u8, 0, // activity kind
+        4, 0, // input length
+        0xEF, 0xBE, 0xAD, 0xDE, // input digest
+    ];
+
+    // The control. Eight bytes is what a schedule's body is, so this one decodes.
+    let good = sealed_frame(RecordKind::EFFECT_SCHEDULED, EffectSeq(3), &scheduled);
+    assert_eq!(
+        frame::decode(&good).map(|frame| frame.decoded),
+        Ok(frame::Decoded::Record(RecordRef::EffectScheduled {
+            seq: EffectSeq(3),
+            kind: ActivityKind(1),
+            input_len: 4,
+            input_crc: 0xDEAD_BEEF,
+        })),
+        "the fixture frame is not well formed, so the refusals below prove nothing"
+    );
+
+    // Every length but the right one, sealed to agree with itself.
+    for wrong in [0_usize, 1, 4, 7, 9, 12, 40] {
+        let mut payload = scheduled.to_vec();
+        payload.resize(wrong, 0);
+        let journal = sealed_frame(RecordKind::EFFECT_SCHEDULED, EffectSeq(3), &payload);
+        assert_eq!(
+            frame::decode(&journal).err(),
+            Some(DecodeError::MalformedRecord),
+            "a schedule record with a {wrong}-byte body was accepted"
+        );
+    }
+
+    // A run start needs four bytes of workflow identity before its input begins, and it is
+    // a *minimum* rather than an exact length — so the boundary is on the other side.
+    for wrong in [0_usize, 1, 3] {
+        let journal = sealed_frame(RecordKind::RUN_STARTED, EffectSeq::FIRST, &vec![0; wrong]);
+        assert_eq!(
+            frame::decode(&journal).err(),
+            Some(DecodeError::MalformedRecord),
+            "a run start with a {wrong}-byte body was accepted"
+        );
+    }
+    assert!(
+        frame::decode(&sealed_frame(
+            RecordKind::RUN_STARTED,
+            EffectSeq::FIRST,
+            &[0; 4]
+        ))
+        .is_ok(),
+        "four bytes is exactly the workflow identity, so a run start with no input is legal"
+    );
+
+    // And the other rule `decode_body` owns: a run-scoped record carries no effect number.
+    let journal = sealed_frame(RecordKind::RUN_COMPLETED, EffectSeq(1), b"done");
+    assert_eq!(
+        frame::decode(&journal).err(),
+        Some(DecodeError::MalformedRecord),
+        "a run-scoped record numbered as an effect was accepted"
+    );
 }
 
 #[test]
