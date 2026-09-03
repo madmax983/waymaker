@@ -198,6 +198,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymaker-spec"
+version = "0.0.0"
+dependencies = [
+ "waymaker-core",
+ "waymaker-fault",
+ "waymaker-flash",
+]
+
+[[package]]
 name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

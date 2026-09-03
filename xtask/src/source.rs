@@ -29,6 +29,12 @@ pub const REQUIRED_INNER_ATTRIBUTES: &[&str] = &["#![no_std]", "#![forbid(unsafe
 /// catches the `std` half — there is no `std` to link against on that target — but not the
 /// `alloc` half, which cross-compiles perfectly well. This scan is what stops both, and it
 /// says which line did it rather than leaving a linker error to be interpreted.
+///
+/// Scanned over *every* source file of every layer, not only the crate roots. Rust admits
+/// `extern crate alloc;` inside a nested module, so a scan of `src/lib.rs` alone leaves a
+/// decoder free to allocate with the crate root still saying `#![no_std]` and every gate
+/// still green — which is exactly what `bounded-decoding`'s allocation clause rests on not
+/// being possible. Codex caught that on pull request #66.
 pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
 
 /// Rule: every firmware crate is `no_std` and forbids unsafe code, and every test-support
@@ -103,16 +109,255 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
 
 /// Collects the crate names in `extern crate <name>;` declarations, ignoring comments.
 fn extern_crates(contents: &str) -> Vec<String> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("extern crate "))
-        .filter_map(|rest| {
-            rest.split([' ', ';'])
-                .find(|token| !token.is_empty())
-                .map(str::to_owned)
-        })
-        .collect()
+    contents.lines().filter_map(declared_extern_crate).collect()
+}
+
+/// The crate `line` declares with `extern crate`, if it declares one.
+///
+/// Not `strip_prefix("extern crate ")` on the trimmed line, which is what this was and which
+/// Codex caught on pull request #66: `pub extern crate alloc;` is valid Rust — visibility on
+/// an `extern crate` re-exports the name — and rustfmt leaves it alone, so the scan read
+/// nothing and the decoder could allocate. `pub(crate)`, `pub(super)`, `pub(in path)` and a
+/// same-line `#[macro_use]` are the same evasion in four more spellings, and arbitrary
+/// whitespace between the keywords is a fifth.
+///
+/// So the line is tokenised rather than prefix-matched: attributes and visibility are
+/// stripped, then the first two tokens must be exactly `extern` and `crate`. A comment or a
+/// doc line keeps its marker as the first token and is therefore never mistaken for a
+/// declaration.
+fn declared_extern_crate(line: &str) -> Option<String> {
+    let rest = strip_visibility(strip_leading_attributes(line.trim()));
+    let mut tokens = rest.split_whitespace();
+    if tokens.next() != Some("extern") || tokens.next() != Some("crate") {
+        return None;
+    }
+    let name = tokens.next()?.trim_end_matches(';');
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `line` with any `#[..]` or `#![..]` attributes at its start removed.
+fn strip_leading_attributes(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let Some(after_hash) = rest.strip_prefix('#') else {
+            return rest;
+        };
+        let after_bang = after_hash.strip_prefix('!').unwrap_or(after_hash);
+        let Some(body) = after_bang.strip_prefix('[') else {
+            return rest;
+        };
+        // Nested brackets are possible — `#[cfg(all(a, b))]` has none, but `#[doc = "[x]"]`
+        // does — so the close is found by depth rather than by the first `]`.
+        let mut depth = 1_usize;
+        let mut end = None;
+        for (index, character) in body.char_indices() {
+            match character {
+                '[' => depth = depth.saturating_add(1),
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { return rest };
+        let Some(after) = body.get(end.saturating_add(1)..) else {
+            return rest;
+        };
+        rest = after.trim_start();
+    }
+}
+
+/// `line` with a leading visibility modifier removed.
+fn strip_visibility(line: &str) -> &str {
+    let Some(after_pub) = line.strip_prefix("pub") else {
+        return line;
+    };
+    // `pub` has to be a whole token: `public_thing` is not a visibility modifier.
+    match after_pub.chars().next() {
+        Some('(') => {
+            let Some(close) = after_pub.find(')') else {
+                return line;
+            };
+            after_pub
+                .get(close.saturating_add(1)..)
+                .map_or(line, str::trim_start)
+        }
+        Some(character) if character.is_whitespace() => after_pub.trim_start(),
+        _ => line,
+    }
+}
+
+/// Rule: no source file of any layer re-admits `std` or `alloc`.
+/// Rule: no source file of any layer re-admits `std` or `alloc`.
+///
+/// The other half of [`check_crate_attributes`]'s `extern crate` scan, which reads crate
+/// roots. A nested module may declare `extern crate alloc;` perfectly legally, and nothing
+/// about the crate root would change — so a firmware crate could allocate with `#![no_std]`
+/// above it, `cargo build --target thumbv6m-none-eabi` still green (`alloc` cross-compiles),
+/// and `waymaker-spec`'s `bounded-decoding` row still claiming allocation-freedom is
+/// structural. It is structural only because of this.
+///
+/// Fires under `crate-attributes` rather than under an id of its own: it is the same rule
+/// about the same thing, read over more files.
+#[must_use]
+pub fn check_layer_sources_are_bare_metal(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for source in sources {
+        if crate::policy::layer(&source.crate_name).is_none() {
+            continue;
+        }
+        for name in extern_crates(&source.contents) {
+            if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
+                violations.push(Violation::new(
+                    "crate-attributes",
+                    source.crate_name.clone(),
+                    format!(
+                        "{} declares `extern crate {name};`, which puts back what \
+                         #![no_std] excludes — an attribute on the crate root is not a \
+                         guarantee about the modules under it",
+                        source.path
+                    ),
+                ));
+            }
+        }
+    }
+    violations
+}
+
+#[cfg(test)]
+mod bare_metal_tests {
+    use super::check_layer_sources_are_bare_metal;
+    use crate::size::LayerSource;
+
+    fn source(crate_name: &str, path: &str, contents: &str) -> LayerSource {
+        LayerSource {
+            crate_name: crate_name.to_owned(),
+            path: path.to_owned(),
+            contents: contents.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_nested_module_that_puts_the_allocator_back_is_caught() {
+        // Codex, pull request #66. The crate root still says `#![no_std]`, the firmware
+        // target still builds — `alloc` cross-compiles — and before this rule every gate
+        // was green while the decoder could allocate.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-flash",
+            "crates/waymaker-flash/src/frame.rs",
+            "extern crate alloc;\npub fn decode() {}\n",
+        )]);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "crate-attributes");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(violations[0].detail.contains("frame.rs"), "{violations:?}");
+        assert!(violations[0].detail.contains("extern crate alloc"));
+    }
+
+    #[test]
+    fn every_spelling_of_a_visible_extern_crate_is_caught() {
+        // Codex, pull request #66 round 3. `pub extern crate alloc;` is valid Rust — a
+        // visibility modifier on an `extern crate` re-exports the name — and rustfmt leaves
+        // it alone, so a prefix match on `extern crate ` read nothing while the decoder
+        // could allocate. These are the spellings that evasion has.
+        for line in [
+            "pub extern crate alloc;",
+            "pub(crate) extern crate alloc;",
+            "pub(super) extern crate alloc;",
+            "pub(in crate::frame) extern crate alloc;",
+            "#[macro_use] extern crate alloc;",
+            "#[macro_use] pub extern crate alloc;",
+            "extern   crate   alloc;",
+            "    pub  extern crate alloc as _;",
+        ] {
+            let violations = check_layer_sources_are_bare_metal(&[source(
+                "waymaker-flash",
+                "crates/waymaker-flash/src/frame.rs",
+                line,
+            )]);
+            assert_eq!(violations.len(), 1, "`{line}` was not caught");
+            assert!(
+                violations[0].detail.contains("extern crate alloc"),
+                "`{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_that_only_looks_like_a_declaration_is_not_one() {
+        for line in [
+            "/// extern crate alloc;",
+            "//! extern crate alloc;",
+            "// pub extern crate alloc;",
+            "/// `pub extern crate alloc;` is what this rule refuses",
+            "pub_extern_crate_alloc();",
+            "unsafe extern \"C\" { fn f(); }",
+            "let extern_crate_alloc = 1;",
+        ] {
+            assert!(
+                check_layer_sources_are_bare_metal(&[source(
+                    "waymaker-core",
+                    "crates/waymaker-core/src/replay.rs",
+                    line,
+                )])
+                .is_empty(),
+                "`{line}` was mistaken for a declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_module_that_puts_the_standard_library_back_is_caught() {
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-core",
+            "crates/waymaker-core/src/replay.rs",
+            "    extern crate std;\n",
+        )]);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].detail.contains("extern crate std"));
+    }
+
+    #[test]
+    fn an_ordinary_layer_source_passes() {
+        assert!(
+            check_layer_sources_are_bare_metal(&[source(
+                "waymaker-flash",
+                "crates/waymaker-flash/src/frame.rs",
+                "use core::mem::size_of;\npub const fn decode() {}\n",
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_crate_that_is_not_a_layer_is_not_held_to_this() {
+        // `waymaker-fault` and `waymaker-spec` are host code that models media in a `Vec`.
+        // The rule iterates the layers, so a source belonging to anything else is skipped.
+        assert!(
+            check_layer_sources_are_bare_metal(&[source(
+                "waymaker-fault",
+                "crates/waymaker-fault/src/device.rs",
+                "extern crate alloc;\n",
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_third_party_crate_named_in_an_extern_crate_line_is_not_this_rule() {
+        assert!(
+            check_layer_sources_are_bare_metal(&[source(
+                "waymaker-embassy",
+                "crates/waymaker-embassy/src/lib.rs",
+                "extern crate embassy_time;\n",
+            )])
+            .is_empty()
+        );
+    }
 }
 
 /// Lint levels that turn a lint on.

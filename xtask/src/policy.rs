@@ -88,7 +88,7 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
 /// `waymaker-fault` is still a violation. The harness sits above the layers and the tests
 /// that drive it live with it.
-pub const TEST_SUPPORT_CRATES: &[&str] = &["waymaker-fault"];
+pub const TEST_SUPPORT_CRATES: &[&str] = &["waymaker-fault", "waymaker-spec"];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";

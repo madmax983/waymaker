@@ -162,6 +162,24 @@ pub const STAGES: &[Stage] = &[
         why: "design document \u{a7}04: the size budgets are gates rather than unverified claims",
     },
     Stage {
+        name: "spec",
+        job: "verification",
+        // The `test` stage runs these too, and that is not a reason to leave this out.
+        // Issue #20's exit criterion is that the recovery specification "verify in CI
+        // alongside the test suite", and the `layering` job below already establishes the
+        // precedent: a check whose failure a reviewer needs to see belongs in the checks
+        // list rather than at the end of a workspace test log. A red `verification` job
+        // says a §14 guarantee no longer holds; a red `test` job says something in a
+        // workspace of six crates does not.
+        //
+        // `-p waymaker-spec` rather than `--workspace`: the point is the proofs, and a
+        // stage that ran everything would take its name from the smallest thing that
+        // broke it.
+        command: "cargo test --locked -p waymaker-spec --no-default-features",
+        in_hook: false,
+        why: "issue #20: design document \u{a7}14's guarantees verify in CI as a check of their own, not as a line in another job's log",
+    },
+    Stage {
         name: "layering",
         job: "layering",
         command: "cargo --locked xtask check-layering",

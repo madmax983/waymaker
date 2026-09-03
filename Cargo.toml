@@ -5,13 +5,15 @@ members = [
     "crates/waymaker-flash",
     "crates/waymaker-embassy",
     "crates/waymaker-fault",
+    "crates/waymaker-spec",
     "crates/waymaker-size-probe",
     "xtask",
 ]
 # `xtask` is a host tool. Firmware-target builds select the default members so that its
 # host-only dependencies never reach `thumbv6m-none-eabi`.
-# `waymaker-fault` is excluded for the same reason: it is host-side test support that
-# models media in `Vec<u8>`, and no firmware target has any use for it.
+# `waymaker-fault` and `waymaker-spec` are excluded for the same reason: they are host-side
+# test support — an in-memory media model and an exhaustive state-space search — and no
+# firmware target has any use for either.
 # `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
 # selecting it by default would add a member the firmware build has nothing to build.
 default-members = [
@@ -33,6 +35,7 @@ waymaker-core = { path = "crates/waymaker-core", version = "0.0.0", default-feat
 waymaker-flash = { path = "crates/waymaker-flash", version = "0.0.0", default-features = false }
 waymaker-embassy = { path = "crates/waymaker-embassy", version = "0.0.0", default-features = false }
 waymaker-fault = { path = "crates/waymaker-fault", version = "0.0.0", default-features = false }
+waymaker-spec = { path = "crates/waymaker-spec", version = "0.0.0", default-features = false }
 
 [workspace.lints.rust]
 # Denied rather than forbidden at the workspace level on purpose. Each firmware crate

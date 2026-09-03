@@ -171,6 +171,29 @@ jobs:
           # where someone wants to know why.
           if-no-files-found: warn
 
+  verification:
+    # Issue #20: design document §14's five guarantees, proved over the ghost model in
+    # `waymaker-spec` by exhaustive enumeration rather than by sampling. The `check` job's
+    # test stage runs these too — this job exists for the same reason `layering` does: a
+    # guarantee that stopped holding should be legible in the checks list, under a name
+    # that says which, rather than as one line in a six-crate test log.
+    name: recovery specification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block above explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Verify the recovery invariants
+        run: cargo test --locked -p waymaker-spec --no-default-features
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash

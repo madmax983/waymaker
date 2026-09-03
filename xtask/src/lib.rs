@@ -72,6 +72,7 @@ pub const RULES: &[&str] = &[
     "missing-docs",
     "no-build-scripts",
     "pre-commit-hook",
+    "recovery-spec",
     "release-profile",
     "replay-cursor-surface",
     "settled-decisions",
@@ -228,6 +229,9 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         })
         .collect();
     violations.extend(source::check_crate_attributes(&sources));
+    violations.extend(source::check_layer_sources_are_bare_metal(
+        &inputs.layer_sources,
+    ));
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
@@ -279,7 +283,17 @@ fn check_inputs_are_complete(
 
     for member in policy::checked_members() {
         if graph.find(member).is_none() {
-            // Already reported as a missing layer.
+            if policy::layer(member).is_none() {
+                // A layer's absence is `layer-missing`'s to report. A test-support crate has
+                // no rule of its own, so without this its deletion would take every manifest
+                // and crate-root rule that covers it with it, silently.
+                violations.push(Violation::new(
+                    "inputs-incomplete",
+                    member,
+                    "is declared test support in policy::TEST_SUPPORT_CRATES and is not in \
+                     the workspace, so every rule that covers it was skipped",
+                ));
+            }
             continue;
         }
         if !inputs
@@ -492,6 +506,7 @@ fn collect_docs_inputs(
         architecture: read_optional(&root.join(docs::ARCHITECTURE_PATH))?,
         adr_index,
         adrs,
+        spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         crate_roots,
     })
 }
@@ -705,6 +720,11 @@ mod tests {
                     name: "0001-undated.md".to_owned(),
                     contents: "no title, no status, no sections\n".to_owned(),
                 }],
+                // No clause table either, so `recovery-spec` fires on two of its three
+                // halves: the crate's own table is unreadable, and the decision record has
+                // no ADR for the specification. The CLAUDE.md half stays quiet on a missing
+                // file, because `claude-md` already reports that.
+                spec_obligations: None,
                 crate_roots: vec![docs::CrateRoot {
                     package: "waymaker-core".to_owned(),
                     path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -752,6 +772,7 @@ mod tests {
             "missing-docs",
             "no-build-scripts",
             "pre-commit-hook",
+            "recovery-spec",
             "release-profile",
             "replay-cursor-surface",
             "settled-decisions",
@@ -797,20 +818,21 @@ mod tests {
         WorkspaceInputs {
             metadata_json: CLEAN_METADATA.to_owned(),
             workspace_manifest: CLEAN_WORKSPACE_MANIFEST.to_owned(),
-            member_manifests: policy::LAYERS
-                .iter()
-                .map(|spec| {
+            // Every crate the manifest and crate-root rules cover, not only the layers:
+            // the test-support crates are in `checked_members()` too, and a fixture that
+            // left them out would describe a workspace in which those rules never ran.
+            member_manifests: policy::checked_members()
+                .map(|name| {
                     (
-                        spec.name.to_owned(),
+                        name.to_owned(),
                         "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n".to_owned(),
                     )
                 })
                 .collect(),
-            crate_sources: policy::LAYERS
-                .iter()
-                .map(|spec| {
+            crate_sources: policy::checked_members()
+                .map(|name| {
                     (
-                        spec.name.to_owned(),
+                        name.to_owned(),
                         "#![no_std]\n#![forbid(unsafe_code)]\n".to_owned(),
                     )
                 })
@@ -883,19 +905,14 @@ mod tests {
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a
                 // member the `missing-docs` rule could not be run against.
-                crate_roots: [
-                    "waymaker-core",
-                    "waymaker-flash",
-                    "waymaker-embassy",
-                    "waymaker-size-probe",
-                ]
-                .into_iter()
-                .map(|package| docs::CrateRoot {
-                    package: package.to_owned(),
-                    path: format!("crates/{package}/src/lib.rs"),
-                    contents: "//! Docs.\n#![warn(missing_docs)]\n".to_owned(),
-                })
-                .collect(),
+                crate_roots: policy::checked_members()
+                    .chain(policy::MEASUREMENT_CRATES.iter().copied())
+                    .map(|package| docs::CrateRoot {
+                        package: package.to_owned(),
+                        path: format!("crates/{package}/src/lib.rs"),
+                        contents: "//! Docs.\n#![warn(missing_docs)]\n".to_owned(),
+                    })
+                    .collect(),
                 ..docs::tests_support::clean_inputs(RULES)
             },
         }
@@ -966,6 +983,30 @@ mod tests {
     }
 
     #[test]
+    fn check_inputs_reports_a_test_support_crate_that_left_the_workspace() {
+        // A layer's absence is `layer-missing`'s. A test-support crate has no rule of its
+        // own, so deleting it would otherwise take every manifest and crate-root rule that
+        // covers it with it, and the gate would print `ok`.
+        let mut inputs = clean_inputs();
+        let gone = policy::TEST_SUPPORT_CRATES
+            .first()
+            .expect("there is at least one test-support crate");
+        inputs.metadata_json = inputs.metadata_json.replace(
+            &format!("\"name\": \"{gone}\""),
+            "\"name\": \"waymaker-elsewhere\"",
+        );
+        let violations = check_inputs(&inputs).expect("checkable");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "inputs-incomplete"
+                    && violation.subject == *gone
+                    && violation.detail.contains("declared test support")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn check_inputs_surfaces_a_metadata_parse_failure_as_an_error() {
         let mut inputs = broken_inputs();
         inputs.metadata_json = "not json".to_owned();
@@ -1031,13 +1072,24 @@ mod tests {
           "targets": [{ "kind": ["bin"], "name": "waymaker-size-probe",
                         "src_path": "/w/probe/src/main.rs",
                         "required-features": ["probe"] }] }
+        ,
+        { "id": "fault", "name": "waymaker-fault", "source": null,
+          "manifest_path": "/w/fault/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-flash", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/fault/src/lib.rs" }] },
+        { "id": "spec", "name": "waymaker-spec", "source": null,
+          "manifest_path": "/w/spec/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-fault", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/spec/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
         { "id": "embassy", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
-        { "id": "probe", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "embassy" }] }
+        { "id": "probe", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "embassy" }] },
+        { "id": "fault", "deps": [{ "pkg": "flash" }] },
+        { "id": "spec", "deps": [{ "pkg": "fault" }] }
       ] }
     }"#;
 

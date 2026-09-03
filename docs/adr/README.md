@@ -23,6 +23,7 @@ be superseded.
 | [0012](0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md) | The integrity check is swappable behind a trait, and the seal widths are not | accepted |
 | [0013](0013-the-fault-harness-is-a-crate-above-the-layers.md) | The fault harness is a crate above the layers, and the storage contract is pinned | accepted |
 | [0014](0014-the-oracle-is-four-lines-and-the-sweep-is-seeded.md) | The recovery oracle is four lines, and the sweep that proves it is seeded | accepted |
+| [0015](0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md) | The recovery invariants are a ghost model, and the proof over it is exhaustive rather than sampled | accepted |
 
 ## Reading the numbers
 
@@ -39,7 +40,7 @@ of these are older than their numbers suggest:
   to have an ADR and this one turned out not to.
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
-→ 0009 → 0010 → 0011.
+→ 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015.
 
 ## Writing one
 

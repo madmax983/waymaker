@@ -67,10 +67,10 @@ Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `way
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
 
-Three workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
-firmware linked only so that its section sizes can be measured, and `waymaker-fault` is the
-crash harness. None of them is built for a firmware target, and no layer may depend on any
-of them.
+Four workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+firmware linked only so that its section sizes can be measured, `waymaker-fault` is the crash
+harness, and `waymaker-spec` is the formal specification of the recovery invariants. None of
+them is built for a firmware target, and no layer may depend on any of them.
 
 ## Budgets
 
@@ -132,6 +132,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
+cargo test --locked -p waymaker-spec --no-default-features
 cargo --locked xtask check-layering
 ```
 
@@ -307,6 +308,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 | `claude-md` | `CLAUDE.md` loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams |
+| `recovery-spec` | a §14 guarantee stops being named by all four of `CLAUDE.md`, ADR 0015, `xtask::docs::SPEC_CLAUSES` and `waymaker-spec`'s own clause table, or the clause table is not where the gate looks for it |
 | `adr-numbering` | an ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template |
 | `adr-structure` | an ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries a status outside the vocabulary |
 | `adr-index` | an ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist |
