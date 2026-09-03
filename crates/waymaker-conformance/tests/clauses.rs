@@ -103,7 +103,10 @@ fn the_two_barrier_clauses_are_the_ones_the_across_reset_witness_owns() {
         .filter(|spec| spec.discharge == Discharge::AcrossReset)
         .map(|spec| spec.id)
         .collect();
-    assert_eq!(across, ["barrier-is-durable", "barrier-orders-what-follows"]);
+    assert_eq!(
+        across,
+        ["barrier-is-durable", "barrier-orders-what-follows"]
+    );
 }
 
 #[test]

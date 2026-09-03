@@ -215,9 +215,13 @@ impl StableStorage for Broken {
                 self.fill(0, self.geometry.capacity(), |_| ERASED);
             }
             Flaw::EraseYieldsMixedBytes => {
-                self.fill(offset, len, |index| {
-                    if index % 2 == 0 { ERASED } else { 0xFE }
-                });
+                self.fill(
+                    offset,
+                    len,
+                    |index| {
+                        if index % 2 == 0 { ERASED } else { 0xFE }
+                    },
+                );
             }
             _ => self.fill(offset, len, |_| ERASED),
         }

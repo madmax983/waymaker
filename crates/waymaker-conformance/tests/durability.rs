@@ -32,10 +32,10 @@ fn whole(geometry: Geometry) -> Region {
 
 /// The device a reset would leave behind, given the bytes that survived.
 fn after_reset(geometry: Geometry, image: &[u8]) -> Device {
-    match Device::restored(geometry, image.to_vec()) {
-        Some(device) => device,
-        None => unreachable!("the image is exactly the capacity it came from"),
-    }
+    let Some(device) = Device::restored(geometry, image.to_vec()) else {
+        unreachable!("the image is exactly the capacity it came from")
+    };
+    device
 }
 
 #[test]

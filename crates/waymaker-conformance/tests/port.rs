@@ -15,7 +15,7 @@ use embedded_storage::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNo
 use waymaker_conformance::nor::{NorFlashStorage, PortError, PortGeometryError};
 use waymaker_conformance::region::Region;
 use waymaker_conformance::suite::run;
-use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
+use waymaker_flash::storage::{GeometryError, StableStorage};
 
 const ERASED: u8 = 0xFF;
 const CAPACITY: usize = 1024;

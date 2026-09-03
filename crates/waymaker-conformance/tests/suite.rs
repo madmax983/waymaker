@@ -6,7 +6,7 @@
 //! knows nothing about the `Device` and the `Device` knows nothing about the suite, and
 //! `StableStorage` is all they share.
 
-use waymaker_conformance::case::{CaseId, Failure, NotApplicable, Outcome};
+use waymaker_conformance::case::{CaseId, NotApplicable, Outcome};
 use waymaker_conformance::region::{REQUIRED_ERASE_BLOCKS, Region, RegionError};
 use waymaker_conformance::suite::{SuiteError, run};
 use waymaker_fault::Device;

@@ -197,10 +197,7 @@ impl CaseId {
     /// This case's name, or a placeholder if the table and the enum have drifted.
     #[must_use]
     pub fn name(self) -> &'static str {
-        match self.spec() {
-            Some(case) => case.name,
-            None => "unnamed case",
-        }
+        self.spec().map_or("unnamed case", |case| case.name)
     }
 }
 
@@ -333,10 +330,7 @@ impl Report {
 
     /// Every case and its outcome, in [`CASES`] order.
     pub fn entries(&self) -> impl Iterator<Item = (&'static Case, Outcome)> + '_ {
-        CASES
-            .iter()
-            .zip(self.outcomes.iter().copied())
-            .map(|(case, outcome)| (case, outcome))
+        CASES.iter().zip(self.outcomes.iter().copied())
     }
 
     /// The first case that did not pass, if there is one.
