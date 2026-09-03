@@ -8,7 +8,11 @@
 //! # What a run costs the device
 //!
 //! Three erase blocks, erased and reprogrammed several times, inside the [`Region`] the
-//! caller named. No case names a byte outside it — not even in an operation it expects to be
+//! caller named — and one erase-and-read pass over the whole region, which
+//! [`CaseId::BarrierChangesNoMedia`] needs because "changes no media" is a claim about media
+//! and not about the three blocks that happened to be convenient. A caller who wants a
+//! cheaper run passes a smaller region; that is what naming one is for. No case names a byte
+//! outside it — not even in an operation it expects to be
 //! refused, which is the part that matters: an adapter that wrongly *accepted* one could then
 //! only damage media the caller declared expendable. Where no such operation exists — the
 //! mutations that straddle the end of the device, on a region that is not at the end of the
@@ -862,36 +866,54 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn barrier_changes_no_media(&mut self) {
         let case = CaseId::BarrierChangesNoMedia;
-        // A known state in every block of the region, because "no media" means no media. A
-        // check that read the programmed block and one erased block passed an adapter whose
-        // barrier scribbled in the block between them.
-        if !self.program_a_unit(case, self.block_a()) {
+        // The *whole region*, not the three blocks this run otherwise works in. "Changes no
+        // media" is a claim about media, and a check that snapshots three blocks of a
+        // sixteen-block region certifies an adapter whose barrier corrupts the fourth. The
+        // region is what the caller declared expendable, so it is also what the caller has
+        // asked to have checked; a caller who wants a cheaper run passes a smaller region.
+        let start = self.region.offset();
+        let len = self.region.len();
+        if self.storage.erase(start, len).is_err() {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        if !self.program_a_unit(case, self.block_b()) {
+        if !self.program_unit_at(case, self.block_a()) {
             return;
         }
-        if !self.erase_block(case, self.block_c()) {
+        if !self.program_unit_at(case, self.block_b()) {
             return;
         }
         if self.storage.barrier().is_err() {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let (first, second, third) = (self.block_a(), self.block_b(), self.block_c());
-        let block = self.erase_size();
+
+        let unit = self.program_size();
+        let (first, second) = (self.block_a(), self.block_b());
         let (Some(one), Some(two)) = (
-            self.block_holds_the_pattern(first),
-            self.block_holds_the_pattern(second),
+            self.media_matches(first, unit, |position| {
+                pattern(usize::try_from(position).unwrap_or(0))
+            }),
+            self.media_matches(second, unit, |position| {
+                pattern(usize::try_from(position).unwrap_or(0))
+            }),
         ) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        let Some(three) = self.media_is_erased(third, block) else {
+        // Everything else in the region: the tails of the two programmed blocks and every
+        // block after them, all of which the erase above left in a state a barrier must not
+        // have moved.
+        let Some(tails) = self.media_is_erased(first + unit, self.erase_size() - unit) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        let outcome = if one && two && three {
+        let rest_start = second + unit;
+        let Some(rest) = self.media_is_erased(rest_start, self.region.end() - rest_start) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if one && two && tails && rest {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)

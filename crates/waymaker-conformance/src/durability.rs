@@ -397,28 +397,59 @@ pub fn verify<S: StableStorage>(
     // seal-relative rule alone calls a device that lost *everything* `Held`, and a write-back
     // cache behind a `barrier` that returns early loses exactly everything — the most likely
     // barrier bug there is, and the one this witness exists to find.
-    if reset == Reset::AfterACompletedArm && !(acknowledged && seal) {
+    let whole = |presence| presence == Presence::Whole;
+
+    if reset == Reset::AfterACompletedArm && !(whole(acknowledged) && whole(seal)) {
         return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
     }
-    if seal && !acknowledged {
+    if whole(seal) && !whole(acknowledged) {
         return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
     }
-    if unacknowledged && !seal {
+    // *Any* of the later write, not all of it. A program interrupted by the power leaves a
+    // prefix behind, and a prefix that outlived the seal ordered before it is exactly the
+    // mutation §12's third sentence forbids.
+    if unacknowledged != Presence::Absent && !whole(seal) {
         return Ok(WitnessVerdict::Breached(
             Breach::LaterMutationOvertookABarrier,
         ));
     }
+    // The seal is on media, so every erase `arm` performed crossed a barrier that returned.
+    // Each of those blocks must therefore still be erased past its witness.
+    if whole(seal) {
+        for block in [layout.acknowledged, layout.seal, layout.unacknowledged] {
+            if !tail_is_erased(storage, buffer, block, region, layout.unit)? {
+                return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
+            }
+        }
+    }
     Ok(WitnessVerdict::Held)
 }
 
-/// Whether the witness for `salt` is on media at `offset`.
+/// How much of a witness survived.
+///
+/// Three states rather than two, because "not the finished witness" and "nothing at all" are
+/// different facts about a barrier. A power cut partway through a program leaves a *prefix*
+/// on media: a reader that only asked "is this the whole witness?" calls that absent, and a
+/// later mutation that partly survived while the barrier before it did not then looks like a
+/// device that simply lost both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    /// Every byte is erased. Nothing of this write reached media.
+    Absent,
+    /// Some bytes moved and it is not the finished witness: an interrupted program.
+    Partial,
+    /// The witness, exactly.
+    Whole,
+}
+
+/// How much of the witness for `salt` is on media at `offset`.
 fn present<S: StableStorage>(
     storage: &mut S,
     buffer: &mut [u8],
     offset: u32,
     salt: u8,
     unit: usize,
-) -> Result<bool, WitnessError<S::Error>> {
+) -> Result<Presence, WitnessError<S::Error>> {
     let Some(slot) = buffer.get_mut(..unit) else {
         return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
     };
@@ -426,5 +457,50 @@ fn present<S: StableStorage>(
     let Some(slot) = buffer.get(..unit) else {
         return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
     };
-    Ok(is_witness(slot, salt))
+    if is_witness(slot, salt) {
+        Ok(Presence::Whole)
+    } else if slot.iter().all(|byte| *byte == crate::suite::ERASED) {
+        Ok(Presence::Absent)
+    } else {
+        Ok(Presence::Partial)
+    }
+}
+
+/// Whether the bytes of `block` after its witness unit are still erased.
+///
+/// The erases `arm` performs cross barriers of their own, so a device that acknowledged them
+/// and then lost them on reset has broken the first clause just as surely as one that lost a
+/// program. Nothing else looks at these bytes: a region that already held data beyond the
+/// first program unit would otherwise let a lost erase hide behind a witness that survived.
+fn tail_is_erased<S: StableStorage>(
+    storage: &mut S,
+    buffer: &mut [u8],
+    block: u32,
+    region: Region,
+    unit: usize,
+) -> Result<bool, WitnessError<S::Error>> {
+    let size = region.geometry().erase_size();
+    let Ok(step) = u32::try_from(unit) else {
+        return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
+    };
+    let mut seen = step;
+    while seen < size {
+        let Some(chunk) = usize::try_from(core::cmp::min(step, size - seen)).ok() else {
+            return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
+        };
+        let Some(slot) = buffer.get_mut(..chunk) else {
+            return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
+        };
+        storage
+            .read(block + seen, slot)
+            .map_err(WitnessError::Driver)?;
+        let Some(slot) = buffer.get(..chunk) else {
+            return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
+        };
+        if slot.iter().any(|byte| *byte != crate::suite::ERASED) {
+            return Ok(false);
+        }
+        seen += step;
+    }
+    Ok(true)
 }

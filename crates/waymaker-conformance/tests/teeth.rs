@@ -82,6 +82,8 @@ enum Flaw {
     EraseTakesThePrecedingBlock,
     /// `barrier()` clears a byte in the middle block on its way through.
     BarrierScribblesInTheMiddleBlock,
+    /// `barrier()` clears a byte in the fourth block, past the three the run works in.
+    BarrierScribblesBeyondTheWorkingBlocks,
     /// A refused *misaligned* erase clears exactly the range it named on its way out.
     ///
     /// The one an adapter that validates after the fact really has: it does the work, then
@@ -364,6 +366,11 @@ impl StableStorage for Broken {
                 self.apply(block, &[0x00]);
                 Ok(())
             }
+            Flaw::BarrierScribblesBeyondTheWorkingBlocks => {
+                let block = self.geometry.erase_size();
+                self.apply(block.saturating_mul(3), &[0x00]);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -478,6 +485,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
     ),
     (
         Flaw::BarrierScribblesInTheMiddleBlock,
+        CaseId::BarrierChangesNoMedia,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::BarrierScribblesBeyondTheWorkingBlocks,
         CaseId::BarrierChangesNoMedia,
         Failure::MediaOutsideTheOperationChanged,
     ),
@@ -632,7 +644,8 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::EraseTakesThePrecedingBlock
         | Flaw::ProgramCorruptsThePrecedingUnit
         | Flaw::BarrierScribbles
-        | Flaw::BarrierScribblesInTheMiddleBlock => true,
+        | Flaw::BarrierScribblesInTheMiddleBlock
+        | Flaw::BarrierScribblesBeyondTheWorkingBlocks => true,
         Flaw::None
         | Flaw::NoValidation
         | Flaw::PastCapacityIsClamped
@@ -704,7 +717,9 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::EraseLeavesTheNeighbouringBlockAlone,
             Failure::MediaOutsideTheOperationChanged,
         )),
-        Flaw::BarrierScribbles | Flaw::BarrierScribblesInTheMiddleBlock => Some((
+        Flaw::BarrierScribbles
+        | Flaw::BarrierScribblesInTheMiddleBlock
+        | Flaw::BarrierScribblesBeyondTheWorkingBlocks => Some((
             CaseId::BarrierChangesNoMedia,
             Failure::MediaOutsideTheOperationChanged,
         )),
@@ -760,6 +775,7 @@ const ALL: &[Flaw] = &[
     Flaw::EraseTakesTheWholeDevice,
     Flaw::EraseTakesThePrecedingBlock,
     Flaw::BarrierScribblesInTheMiddleBlock,
+    Flaw::BarrierScribblesBeyondTheWorkingBlocks,
     Flaw::EraseDoesNothing,
     Flaw::ZeroLengthIsRefused,
     Flaw::BarrierFails,

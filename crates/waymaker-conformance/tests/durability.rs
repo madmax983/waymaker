@@ -441,6 +441,63 @@ fn a_barrier_that_does_not_flush_is_caught_across_the_reset() {
     );
 }
 
+#[test]
+fn a_later_write_that_only_partly_survived_still_overtook_the_barrier() {
+    // The power cut partway through the final program. A prefix of the unacknowledged
+    // witness is on media and the seal ordered before it is not, which is the third clause
+    // broken — and a reader that asked only "is the whole witness there?" would call the
+    // prefix absent and report `Held`.
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Device::new(geometry);
+    assert_eq!(arm(&mut device, region, &mut buffer), Ok(()));
+
+    let mut image = device.into_image();
+    let (Some(seal), Some(later)) = (region.block(1), region.block(2)) else {
+        unreachable!("a region has three blocks")
+    };
+    erase_block(&mut image, seal, geometry.erase_size());
+    // Keep the first byte of the later witness and erase the rest of its unit: a torn write.
+    erase_block(&mut image, later + 1, geometry.program_size() - 1);
+
+    let mut after = after_reset(geometry, &image);
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Breached(
+            Breach::LaterMutationOvertookABarrier
+        ))
+    );
+}
+
+#[test]
+fn an_erase_a_barrier_acknowledged_and_the_reset_lost_is_a_breach() {
+    // A device whose programs are durable across a barrier and whose erases are not. Both
+    // witnesses survive, so a reader that looked only at the witness units would report
+    // `Held` — while an erase that crossed a barrier of its own is gone.
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Device::new(geometry);
+    assert_eq!(arm(&mut device, region, &mut buffer), Ok(()));
+
+    let mut image = device.into_image();
+    let unit = geometry.program_size() as usize;
+    let Some(start) = usize::try_from(region.offset()).ok().map(|at| at + unit) else {
+        unreachable!("a region offset fits in a usize")
+    };
+    let Some(stale) = image.get_mut(start..start + unit) else {
+        unreachable!("the block is longer than two program units")
+    };
+    stale.fill(0x5A);
+
+    let mut after = after_reset(geometry, &image);
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost))
+    );
+}
+
 /// Clears one erase block of an image, as a reset that lost it would leave it.
 fn erase_block(image: &mut [u8], offset: u32, len: u32) {
     let (Ok(start), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {

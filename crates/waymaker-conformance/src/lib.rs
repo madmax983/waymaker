@@ -39,7 +39,8 @@
 //! # What a run costs
 //!
 //! Three erase blocks of the region the caller names, erased and reprogrammed several
-//! times, and two program units of scratch. **No case names a byte outside that region** —
+//! times, one erase-and-read pass over the whole region for the barrier case, and two
+//! program units of scratch. A caller who wants a cheaper run names a smaller region. **No case names a byte outside that region** —
 //! not even in an operation it expects to be refused, which is the part that matters: an
 //! adapter that wrongly *accepted* one could then only damage media the caller declared
 //! expendable. Where no such operation exists, the case is [`Outcome::NotApplicable`] rather
