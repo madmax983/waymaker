@@ -44,6 +44,7 @@ use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 /// Why a NOR flash cannot be described as a [`Geometry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PortGeometryError {
     /// A unit or the capacity does not fit in the 32-bit words §12's offsets are.
     UnitDoesNotFitInAWord,
@@ -72,6 +73,7 @@ impl core::error::Error for PortGeometryError {}
 
 /// How a ported driver refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PortError<E> {
     /// The operation is not one this geometry permits, and the driver was never called.
     Geometry(GeometryError),
@@ -105,6 +107,16 @@ impl<F: NorFlash> NorFlashStorage<F> {
     /// powers of two, or do not fit in 32 bits is refused here rather than at the first
     /// operation that would have gone somewhere unexpected.
     ///
+    /// # What this constructor cannot check
+    ///
+    /// That the driver beneath it is one whose `barrier` is nothing to do. This port's
+    /// `barrier` returns `Ok(())` for every `F`, on the strength of `NorFlash`'s `write` and
+    /// `erase` being blocking; a driver with a write-back cache in front of it satisfies the
+    /// same trait and breaks `barrier-is-durable`, which is the clause no in-process suite
+    /// can observe. Run [`crate::durability::arm`] and [`crate::durability::verify`] across a
+    /// real reset before trusting this port with a cached driver, or write a port of your own
+    /// whose `barrier` flushes.
+    ///
     /// # Errors
     ///
     /// [`PortGeometryError::UnitDoesNotFitInAWord`] if a `usize` will not narrow, and
@@ -129,11 +141,6 @@ impl<F: NorFlash> NorFlashStorage<F> {
     #[must_use]
     pub const fn flash(&self) -> &F {
         &self.flash
-    }
-
-    /// The driver, borrowed mutably.
-    pub const fn flash_mut(&mut self) -> &mut F {
-        &mut self.flash
     }
 
     /// The driver, back.

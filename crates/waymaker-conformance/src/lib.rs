@@ -16,7 +16,7 @@
 //!   the six rows say "not this crate", which is the point of the table.
 //! * [`case`] and [`suite`] — the nineteen in-process observations and the runner that
 //!   makes them. [`suite::run`] takes an adapter, a [`region::Region`] it may destroy and a
-//!   buffer it may use, and returns one outcome per case.
+//!   buffer it may use, and returns one outcome per case. Twenty of them.
 //! * [`durability`] — the two clauses no in-process suite can observe, as a witness written
 //!   before a reset and read after one.
 //! * [`nor`] — [`NorFlashStorage`], an `embedded_storage::nor_flash::NorFlash` presented as
@@ -39,10 +39,18 @@
 //! # What a run costs
 //!
 //! Three erase blocks of the region the caller names, erased and reprogrammed several
-//! times, and four program units of scratch. The suite never mutates a byte outside that
-//! region: the illegal operations it issues are chosen so that a conformant adapter refuses
-//! them, and an adapter that wrongly accepted one could only damage bytes the region already
-//! covers.
+//! times, and two program units of scratch. **No case names a byte outside that region** —
+//! not even in an operation it expects to be refused, which is the part that matters: an
+//! adapter that wrongly *accepted* one could then only damage media the caller declared
+//! expendable. Where no such operation exists, the case is [`Outcome::NotApplicable`] rather
+//! than issued somewhere unsafe, and
+//! `tests/teeth.rs::no_wrong_adapter_lets_the_suite_damage_media_outside_the_region` holds
+//! it against every wrong adapter in the catalogue rather than against a correct one.
+//!
+//! What that cannot promise is containment of an adapter whose *legal* operations run wild.
+//! A driver asked to erase one block of the region and erasing the whole chip, or a `barrier`
+//! that scribbles somewhere it was not asked to, is outside what any suite can prevent — the
+//! operation was authorised — and both are caught rather than contained.
 //!
 //! ```
 //! use waymaker_conformance::{Region, run};
@@ -71,9 +79,9 @@ pub mod nor;
 pub mod region;
 pub mod suite;
 
-pub use case::{CASES, Case, CaseId, Failure, NotApplicable, Outcome, Report, Verdict};
+pub use case::{CASE_COUNT, CASES, Case, CaseId, Failure, NotApplicable, Outcome, Report, Verdict};
 pub use clause::{CLAUSES, Clause, Discharge};
-pub use durability::{Breach, WitnessError, arm, verify};
+pub use durability::{Breach, Reset, WitnessError, WitnessVerdict};
 pub use nor::{NorFlashStorage, PortError, PortGeometryError};
 pub use region::{REQUIRED_ERASE_BLOCKS, Region, RegionError};
-pub use suite::{REQUIRED_BUFFER_UNITS, SuiteError, run};
+pub use suite::{ERASED, REQUIRED_BUFFER_UNITS, SuiteError, run};

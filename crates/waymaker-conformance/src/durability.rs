@@ -21,6 +21,9 @@
 //! | 5 | B | the *seal*, then a barrier |
 //! | 6 | C | the *unacknowledged* witness. No barrier follows it. |
 //!
+//! Media is `0xFF` when erased, which is [`crate::suite::ERASED`] and is a constant for the
+//! reason the in-process suite gives.
+//!
 //! [`verify`] then asks two questions, and they are the two clauses:
 //!
 //! * The seal is on media and the acknowledged witness is not. The seal was programmed
@@ -30,8 +33,14 @@
 //!   after the seal's barrier completed, so it overtook what the barrier ordered:
 //!   [`Breach::LaterMutationOvertookABarrier`].
 //!
-//! Anything else is [`Verdict::Held`] — including a device that lost everything, which is
-//! what a power cut before the first barrier returned looks like and is not a breach.
+//! Anything else is [`WitnessVerdict::Held`] — including a device that lost everything,
+//! which is what a power cut *during* [`arm`] looks like and is not a breach.
+//!
+//! Unless [`arm`] returned. Then both the acknowledged witness and the seal crossed barriers
+//! that returned, so both are owed whatever else is on media, and a device that lost
+//! everything has broken the first clause rather than illustrated it. The caller says which
+//! of the two histories they produced, through [`Reset`], because a reset destroys the
+//! process that would otherwise remember.
 //!
 //! # Why the erases run backwards
 //!
@@ -49,16 +58,58 @@ use waymaker_flash::storage::StableStorage;
 use crate::region::Region;
 use crate::suite::{REQUIRED_BUFFER_UNITS, SuiteError};
 
-/// What a verified witness says.
+/// When the power went, which is the one thing [`verify`] cannot read off media.
+///
+/// A reset destroys the process that called [`arm`], so nothing can be carried across it in
+/// a value. The caller is the only one who knows which of these two histories they produced,
+/// and the answer changes what a device that lost everything means: after a completed arm it
+/// is a barrier that did not mean what it said, and during one it is an ordinary power cut
+/// before the first barrier returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Verdict {
+#[non_exhaustive]
+pub enum Reset {
+    /// The power went while [`arm`] was running, and it never returned.
+    DuringArm,
+    /// [`arm`] returned `Ok(())`, and the reset came after it.
+    AfterACompletedArm,
+}
+
+/// What a verified witness says.
+///
+/// Named for the witness rather than called `Verdict`, because [`crate::case::Verdict`] is a
+/// different type about a different thing and a crate root exporting both would hand an
+/// out-of-tree caller the wrong one silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WitnessVerdict {
     /// Both barrier clauses held across the reset.
     Held,
     /// One of them did not.
     Breached(Breach),
 }
 
+impl WitnessVerdict {
+    /// `Ok(())` when the barrier clauses held.
+    ///
+    /// The shape [`crate::case::Report::verdict`] has, so that `verify(..)?.held()?` reads
+    /// the way `report.verdict()?` does. Without it, `verify(..)?` type-checks, discards a
+    /// [`Breach`], and reads as a pass — which is the one thing this crate exists to stop.
+    ///
+    /// # Errors
+    ///
+    /// The [`Breach`] the witness found.
+    pub const fn held(self) -> Result<(), Breach> {
+        match self {
+            Self::Held => Ok(()),
+            Self::Breached(breach) => Err(breach),
+        }
+    }
+}
+
 /// A barrier clause an adapter broke.
+///
+/// Deliberately *not* `#[non_exhaustive]`, unlike [`crate::case::Failure`]: this is §12's
+/// two barrier sentences and there is no third. A variant added here would mean the design
+/// document grew a clause, which is a change a caller should be made to look at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Breach {
     /// A mutation a completed barrier acknowledged is not on media after the reset.
@@ -112,11 +163,37 @@ pub enum WitnessError<E> {
     WitnessDidNotTake,
 }
 
+impl<E> WitnessError<E> {
+    /// A short static description of this refusal.
+    ///
+    /// The driver's own error is not rendered here — it is `E` on a generic parameter, and
+    /// the `Display` implementation below is what reaches it when `E` can be displayed.
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Self::Suite(error) => error.message(),
+            Self::Driver(_) => "the driver refused",
+            Self::WitnessDidNotTake => "a programmed witness did not read back",
+        }
+    }
+}
+
 impl<E> From<SuiteError> for WitnessError<E> {
     fn from(error: SuiteError) -> Self {
         Self::Suite(error)
     }
 }
+
+impl<E: core::fmt::Display> core::fmt::Display for WitnessError<E> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Driver(error) => error.fmt(formatter),
+            other => formatter.write_str(other.message()),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for WitnessError<E> {}
 
 /// The three blocks the witness lives in, and the unit each one holds.
 struct Layout {
@@ -281,6 +358,12 @@ fn program_witness<S: StableStorage>(
 
 /// Reads the witness back after a reset.
 ///
+/// `reset` says which history the caller produced, because a reset destroys the process that
+/// ran [`arm`] and no value survives it. Passing [`Reset::AfterACompletedArm`] when `arm`
+/// did not in fact return is how a caller manufactures a breach that never happened; passing
+/// [`Reset::DuringArm`] when it did is how a caller hides the only barrier bug that loses
+/// everything.
+///
 /// # Errors
 ///
 /// [`WitnessError::Suite`] if the region or the buffer is wrong for this device, and
@@ -289,7 +372,8 @@ pub fn verify<S: StableStorage>(
     storage: &mut S,
     region: Region,
     buffer: &mut [u8],
-) -> Result<Verdict, WitnessError<S::Error>> {
+    reset: Reset,
+) -> Result<WitnessVerdict, WitnessError<S::Error>> {
     let layout = Layout::of(storage, region, buffer)?;
 
     let acknowledged = present(
@@ -308,13 +392,23 @@ pub fn verify<S: StableStorage>(
         layout.unit,
     )?;
 
+    // After a completed arm there is nothing to be relative to: both the witness and the
+    // seal crossed a barrier that returned, so both are owed whatever else is on media. A
+    // seal-relative rule alone calls a device that lost *everything* `Held`, and a write-back
+    // cache behind a `barrier` that returns early loses exactly everything — the most likely
+    // barrier bug there is, and the one this witness exists to find.
+    if reset == Reset::AfterACompletedArm && !(acknowledged && seal) {
+        return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
+    }
     if seal && !acknowledged {
-        return Ok(Verdict::Breached(Breach::AcknowledgedMutationLost));
+        return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
     }
     if unacknowledged && !seal {
-        return Ok(Verdict::Breached(Breach::LaterMutationOvertookABarrier));
+        return Ok(WitnessVerdict::Breached(
+            Breach::LaterMutationOvertookABarrier,
+        ));
     }
-    Ok(Verdict::Held)
+    Ok(WitnessVerdict::Held)
 }
 
 /// Whether the witness for `salt` is on media at `offset`.

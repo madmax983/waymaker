@@ -176,7 +176,8 @@ fn a_device_with_byte_granular_erase_exempts_every_misalignment_case() {
 fn the_suite_refuses_a_buffer_it_cannot_work_in() {
     let geometry = nested();
     let mut device = Device::new(geometry);
-    let mut buffer = [0_u8; 8];
+    // One program unit short of the two the widest case holds at once.
+    let mut buffer = [0_u8; 4];
 
     assert_eq!(
         run(&mut device, whole(geometry), &mut buffer),

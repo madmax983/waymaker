@@ -47,12 +47,15 @@ pub enum CaseId {
     ProgramPastCapacityIsRefused,
     /// An erase that reaches past the capacity is refused.
     ErasePastCapacityIsRefused,
+    /// A program or erase that starts in bounds and ends past the capacity is refused, and
+    /// touches no media.
+    MutationStraddlingTheCapacityIsRefused,
     /// A refused program left the media it named exactly as it found it.
     RefusedProgramTouchesNoMedia,
     /// A refused erase left the media it named exactly as it found it.
     RefusedEraseTouchesNoMedia,
-    /// After an erase, every byte of the block reads as one repeated value.
-    EraseYieldsOneRepeatedByte,
+    /// An erase of a block that held a program leaves every byte of it erased.
+    EraseYieldsTheErasedByte,
     /// What a program wrote is what a read returns.
     ProgramRoundTripsThroughRead,
     /// A program of one unit left the rest of its erase block erased.
@@ -111,6 +114,11 @@ pub const CASES: &[Case] = &[
         clause: "validated-before-media",
     },
     Case {
+        id: CaseId::MutationStraddlingTheCapacityIsRefused,
+        name: "a mutation straddling the capacity is refused",
+        clause: "validated-before-media",
+    },
+    Case {
         id: CaseId::RefusedProgramTouchesNoMedia,
         name: "a refused program touches no media",
         clause: "validated-before-media",
@@ -121,8 +129,8 @@ pub const CASES: &[Case] = &[
         clause: "validated-before-media",
     },
     Case {
-        id: CaseId::EraseYieldsOneRepeatedByte,
-        name: "an erase yields one repeated byte",
+        id: CaseId::EraseYieldsTheErasedByte,
+        name: "an erase yields the erased byte",
         clause: "operations-act-on-what-they-name",
     },
     Case {
@@ -203,18 +211,28 @@ impl CaseId {
 
 /// Why a case did not apply to this device.
 ///
+/// `#[non_exhaustive]`, unlike the error vocabularies of `waymaker-core`, `waymaker-flash`
+/// and `waymaker-fault`. Those are exhaustive because every match on them is in this
+/// workspace, and an exhaustive match is how the compiler tells whoever adds a variant which
+/// call sites now have a case to think about. This crate is the first one written for
+/// out-of-tree consumers, where that argument does not hold: a driver author matching on
+/// these should not have their build broken by a case the suite learned to ask.
+///
 /// Every reason is a fact about the geometry, so a report that skips a case says which
 /// property of the device made the case unaskable — never "it did not seem to matter".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum NotApplicable {
     /// The unit this case misaligns against is one byte, so no misalignment exists.
     TheUnitIsOneByte,
     /// The erase block is one program unit, so a program has no rest-of-block to leave
     /// alone.
     TheBlockIsOneProgramUnit,
-    /// Erasing yields a byte with no set bits, so no program can change anything and a
-    /// round-trip would be vacuous.
-    TheErasedStateHasNoProgrammableBits,
+    /// The read unit is the program unit, so a "partial" read is the whole read.
+    TheReadUnitIsTheProgramUnit,
+    /// The region does not reach the end of the device, so the only mutation that starts in
+    /// bounds and ends out of them would name media the caller did not make expendable.
+    TheRegionDoesNotEndAtTheCapacity,
 }
 
 impl NotApplicable {
@@ -224,18 +242,24 @@ impl NotApplicable {
         match self {
             Self::TheUnitIsOneByte => "the unit is one byte, so no misaligned operation exists",
             Self::TheBlockIsOneProgramUnit => "the erase block is a single program unit",
-            Self::TheErasedStateHasNoProgrammableBits => "the erased state has no bits to clear",
+            Self::TheReadUnitIsTheProgramUnit => "the read unit is the whole program unit",
+            Self::TheRegionDoesNotEndAtTheCapacity => {
+                "the region does not reach the end of the device"
+            }
         }
     }
 }
 
 /// How an adapter broke a case.
 ///
+/// `#[non_exhaustive]`, for the reason [`NotApplicable`] is.
+///
 /// The driver's own error is deliberately not carried: it is `S::Error` on a generic
 /// parameter, and a report that had to name it could not be a plain array of `Copy` values
 /// on a target with no allocator. The case id names the operation, and a driver author who
 /// needs the error re-runs the one call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Failure {
     /// An operation the geometry permits was refused.
     LegalOperationRefused,
@@ -305,6 +329,12 @@ impl Default for Report {
 
 impl Report {
     /// A report in which nothing has been run yet.
+    ///
+    /// Every outcome is [`Outcome::NotRun`], so [`Report::verdict`] refuses it. Public
+    /// because a caller may want somewhere to put a run that never happened; it cannot be
+    /// filled in from outside this crate, because the method that records an outcome is
+    /// crate-internal. A report is the claim "this adapter conformed", and a claim anybody
+    /// can assemble by hand is not evidence of anything.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -313,7 +343,11 @@ impl Report {
     }
 
     /// Records what became of `case`.
-    pub fn record(&mut self, case: CaseId, outcome: Outcome) {
+    ///
+    /// Crate-internal: the only thing that may fill a report in is [`crate::suite::run`].
+    /// A report is the claim "this adapter conformed", and a claim anybody can assemble by
+    /// hand is not evidence of anything.
+    pub(crate) fn record(&mut self, case: CaseId, outcome: Outcome) {
         if let Some(slot) = self.outcomes.get_mut(case.index()) {
             *slot = outcome;
         }
@@ -396,3 +430,75 @@ impl fmt::Display for Verdict {
 }
 
 impl core::error::Error for Verdict {}
+
+#[cfg(test)]
+mod tests {
+    use super::{CASE_COUNT, CASES, CaseId, Failure, NotApplicable, Outcome, Report, Verdict};
+
+    #[test]
+    fn a_report_that_was_never_run_is_not_a_pass() {
+        // The failure a conformance suite is most likely to have: a run that did nothing and
+        // reported no failures.
+        let report = Report::default();
+        assert_eq!(report, Report::new());
+        assert_eq!(report.entries().count(), CASE_COUNT);
+        assert_eq!(
+            report.verdict(),
+            Err(Verdict::NotRun(CaseId::GeometryIsStable))
+        );
+        assert_eq!(report.first_failure(), None);
+        assert_eq!(report.exemptions().count(), 0);
+        assert_eq!(report.outcome(CaseId::BarrierSucceeds), Outcome::NotRun);
+    }
+
+    #[test]
+    fn a_report_records_what_it_is_told() {
+        let mut report = Report::new();
+        for case in CASES {
+            report.record(case.id, Outcome::Passed);
+        }
+        assert_eq!(report.verdict(), Ok(()));
+
+        report.record(
+            CaseId::ProgramRoundTripsThroughRead,
+            Outcome::Failed(Failure::ReadBackDiffers),
+        );
+        assert_eq!(
+            report.verdict(),
+            Err(Verdict::Failed(
+                CaseId::ProgramRoundTripsThroughRead,
+                Failure::ReadBackDiffers
+            ))
+        );
+        assert_eq!(
+            report.first_failure(),
+            Some((
+                CaseId::ProgramRoundTripsThroughRead,
+                Failure::ReadBackDiffers
+            ))
+        );
+
+        report.record(
+            CaseId::MisalignedReadIsRefused,
+            Outcome::NotApplicable(NotApplicable::TheUnitIsOneByte),
+        );
+        let mut exemptions = report.exemptions();
+        assert_eq!(
+            exemptions.next(),
+            Some((
+                CaseId::MisalignedReadIsRefused,
+                NotApplicable::TheUnitIsOneByte
+            ))
+        );
+        assert_eq!(exemptions.next(), None);
+    }
+
+    #[test]
+    fn every_case_id_indexes_its_own_row() {
+        for case in CASES {
+            assert_eq!(case.id.spec(), Some(case));
+            assert_eq!(case.id.name(), case.name);
+            assert!(case.id.index() < CASE_COUNT);
+        }
+    }
+}

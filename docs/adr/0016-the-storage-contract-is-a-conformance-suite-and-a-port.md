@@ -64,7 +64,7 @@ ways of saying "not the in-process suite":
 | `operations-act-on-what-they-name` | the in-process suite |
 | `barrier-is-durable` | the across-reset witness |
 | `barrier-orders-what-follows` | the across-reset witness |
-| `interruptible-mutations` | a crash injector, not a suite — `waymaker-fault` |
+| `interruptible-mutations` | a crash injector, not a suite — `waymaker-fault` interrupts a write at every unit |
 | `one-way-bits-are-the-drivers` | the driver, not the protocol |
 
 **The two barrier clauses are a two-phase witness rather than a claim.** `durability::arm`
@@ -107,11 +107,15 @@ workspace test stage rather than by a feature nobody enables. `embedded-storage`
 non-optional dependency for exactly that reason: a feature CI never turns on is a measurement
 that did not happen.
 
-The suite has been observed failing. Thirteen adapters wrong in one way each — a validator
-that validates after the write, an erase that takes the whole chip, a barrier that is a
-no-op with a scribble in it, a read that always returns the erased byte — are each required
-to be caught by the case that names them, and a control adapter with no flaw is required to
-pass. `waymaker_fault::Device`, written for issue #18 and knowing nothing about this crate,
+The suite has been observed failing. Twenty-one adapters wrong in one way each — a validator
+that validates after the write, one that checks the start of a range and not its end, an erase
+that takes the whole chip, a straddling mutation that applies its in-bounds prefix before
+refusing, a barrier that is a no-op with a scribble in it, a read that always returns the
+erased byte — are each required to be caught by the case that names them, and a control
+adapter with no flaw is required to pass. The case each flaw must break is an exhaustive
+`match`, so a flaw added to the model and left out of it does not compile. The across-reset
+witness has teeth of its own: an adapter with a write-back cache behind a `barrier` that
+returns before it settles passes every check `arm` makes and is caught after the reset. `waymaker_fault::Device`, written for issue #18 and knowing nothing about this crate,
 is a second adapter the whole suite runs against.
 
 `embedded-storage` is the first third-party dependency in this workspace outside `xtask`. It
@@ -125,6 +129,12 @@ What this leaves owed:
   is driven through `waymaker-fault`'s injector at every crash point the write sequence has,
   which is a strong test of the *oracle* and no test at all of a real barrier. §15's hardware
   half — power-cut loops against real NOR — is still owed at rung 0.2, where the boards are.
+- **`verify` cannot see when the power went, so the caller has to say.** `Reset::DuringArm`
+  and `Reset::AfterACompletedArm` judge differently, and they have to: after a completed arm
+  the witness and the seal are both owed unconditionally, and a device that lost everything
+  has broken the first clause; during one, the same media is an ordinary power cut before the
+  first barrier returned. A caller who passes the wrong one manufactures a breach or hides the
+  only barrier bug that loses everything, and nothing can check them.
 - **`verify` judges one arm.** A region armed twice with no `verify` between asks a stateless
   reader to tell two histories apart, and it cannot. The backwards erase order removes the
   realistic case; the general one is a precondition, written down rather than checked.

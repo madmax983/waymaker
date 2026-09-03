@@ -167,16 +167,25 @@ All 6 storage-contract clauses, with the id to cite when a change touches one:
 | `interruptible-mutations` | `program` and `erase` may fail or be interrupted at any supported unit. | a crash injector, not a suite: `waymaker-fault` interrupts a write at every byte of every program and every block of every erase, and a driver that never fails satisfies "may fail" vacuously |
 | `barrier-is-durable` | After `barrier` returns, all earlier successful mutations survive reset. | the across-reset witness: `durability::arm`, a reset the caller performs, then `durability::verify` |
 | `barrier-orders-what-follows` | No later mutation may become durable before mutations ordered by a completed barrier. | the across-reset witness, by the same two calls — a write that is on media while the seal ordered before it is not |
-| `validated-before-media` | The adapter validates erase/program alignment before touching media. | the in-process suite, in nine of its nineteen cases, including the two that read the media back after a refusal |
+| `validated-before-media` | The adapter validates erase/program alignment before touching media. | the in-process suite, in ten of its twenty cases, including the three that read the media back after a refusal |
 | `one-way-bits-are-the-drivers` | Flash-specific one-way bit programming rules remain the driver's responsibility. | the driver, not the protocol — named here so its absence from the suite is a decision rather than an oversight |
 | `operations-act-on-what-they-name` | `read`, `program` and `erase` act on exactly the region they name, and `barrier` changes no media. | the in-process suite, in the other ten cases. Not one of §12's five: it is `StableStorage`'s own documentation, and without it the suite would be a suite of refusals that never checked that a legal operation works |
 
 The suite has been observed failing, which is the only thing that makes a passing run worth
-anything: `crates/waymaker-conformance/tests/teeth.rs` runs thirteen adapters wrong in one way
-each and requires the case that names each one to go red, and a control adapter with no flaw
-to pass. It is run against two real adapters — `waymaker_fault::Device`, written for issue #18
-and knowing nothing about this crate, and an `embedded-storage` `NorFlash` through
-`NorFlashStorage` — which is issue #21's two "done when" bullets.
+anything: `crates/waymaker-conformance/tests/teeth.rs` runs adapters wrong in one way each and
+requires the case that names each one to go red, with a control adapter required to pass. The
+case each flaw must break is an exhaustive `match`, so a flaw added to the model and left out
+of it does not compile. It is run against two real adapters — `waymaker_fault::Device`,
+written for issue #18 and knowing nothing about this crate, and an `embedded-storage`
+`NorFlash` through `NorFlashStorage` — which is issue #21's two "done when" bullets.
+
+Two things the suite refuses to guess, because guessing is how a broken adapter talks a suite
+out of testing it. Erased is `0xFF` — a constant, not something learned from the device under
+test, since an adapter whose `erase` does nothing on media reading `0x00` would teach a
+learning suite that nothing is programmable and that it had no questions to ask. And no case
+names a byte outside the caller's region, not even in an operation it expects to be refused,
+so an adapter that wrongly *accepted* one could only damage media the caller made expendable;
+where no such operation exists the case says so rather than reaching somewhere unsafe.
 
 "Without `embedded-storage` becoming a kernel dependency" is not a promise either. Every
 layer's `may_depend_on_external` list in `xtask::policy::LAYERS` is empty, so the kernel

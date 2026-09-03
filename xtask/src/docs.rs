@@ -198,8 +198,8 @@ pub struct StorageClause {
 /// Six rather than issue [#21](https://github.com/madmax983/waymaker/issues/21)'s five: the
 /// issue's list is about what an adapter must *refuse* and what must survive a reset, and a
 /// suite made only of those would never check that a legal operation does what it says. The
-/// sixth is `StableStorage`'s own documentation, and it is where fifteen of the nineteen
-/// cases live.
+/// sixth is `StableStorage`'s own documentation, and it is where half of the twenty cases
+/// live.
 pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
     StorageClause {
         id: "interruptible-mutations",
@@ -1206,26 +1206,76 @@ fn strip_rust_comments(source: &str) -> String {
     out
 }
 
+/// The body of `pub const NAME: &[...] = &[ ... ];`, or `None` when the file has no such
+/// declaration.
+///
+/// Both clause-table scanners run over this rather than over the whole file. Without it a
+/// `#[cfg(test)]` fixture, a rustdoc example, or any other struct literal with an `id: "…"`
+/// field counts as a declaration — in either direction: a phantom clause the table never had,
+/// or a real table deleted while something else in the file goes on vouching for it.
+fn const_slice_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!("pub const {name}");
+    let start = source.find(&key)?;
+    let rest = source.get(start.checked_add(key.len())?..)?;
+    let open = rest.find("&[")?;
+    let body = rest.get(open.checked_add("&[".len())?..)?;
+    // The declaration ends at the first `];` that closes it. The rows in between are struct
+    // literals whose own braces never contain one.
+    let end = body.find("];")?;
+    body.get(..end)
+}
+
+/// Each `Clause { ... }` row of a table body, as the text between its braces.
+///
+/// A row bounded by its *own* braces rather than by the next row's id. The difference is not
+/// cosmetic: with id-to-id windowing, a row that declares its fields in another order has its
+/// second field fall into the previous row's window and reads the next row's on its own
+/// behalf — so the rule both misses the reordering it exists to catch and names the wrong
+/// clause when it fires at all.
+fn struct_rows<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    let opener = format!("{name} {{");
+    let mut rows = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&opener) {
+        let Some(after) = rest.get(start.saturating_add(opener.len())..) else {
+            break;
+        };
+        let mut depth = 1_usize;
+        let mut end = after.len();
+        for (index, character) in after.char_indices() {
+            match character {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(row) = after.get(..end) {
+            rows.push(row);
+        }
+        let Some(next) = after.get(end..) else { break };
+        rest = next;
+    }
+    rows
+}
+
 fn spec_clause_rows(contents: &str) -> BTreeMap<&str, Option<&str>> {
     let mut rows = BTreeMap::new();
-    for (index, _) in contents.match_indices("id: \"") {
-        let Some(after_key) = index.checked_add("id: \"".len()) else {
+    let Some(body) = const_slice_body(contents, "CLAUSES") else {
+        return rows;
+    };
+    for row in struct_rows(body, "Clause") {
+        let Some(id) = quoted_field(row, "id: \"") else {
             continue;
         };
-        let Some(rest) = contents.get(after_key..) else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else { continue };
-        let Some(id) = rest.get(..end) else { continue };
         if id.is_empty() {
             continue;
         }
-        // The row runs to the next clause's id, so a proof belongs to the row above it.
-        let tail = rest.get(end..).unwrap_or_default();
-        let row = tail
-            .find("id: \"")
-            .and_then(|next| tail.get(..next))
-            .unwrap_or(tail);
         rows.insert(id, quoted_field(row, "proof: \""));
     }
     rows
@@ -1341,7 +1391,7 @@ fn check_spec_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
         .collect()
 }
 
-/// Rule: design document §12's storage contract and the three places it lives agree.
+/// Rule: design document §12's storage contract and the four places it lives agree.
 ///
 /// The same shape as [`check_recovery_spec`], for the contract issue
 /// [#21](https://github.com/madmax983/waymaker/issues/21) asks to be documented and tested.
@@ -1376,7 +1426,7 @@ fn check_storage_conformance(
             let source = strip_rust_comments(contents);
             let declared = storage_clause_rows(&source);
             for clause in STORAGE_CONTRACT_CLAUSES {
-                let Some(discharge) = declared.get(clause.id) else {
+                let Some(row) = declared.get(clause.id) else {
                     violations.push(Violation::new(
                         "storage-conformance",
                         clause.id,
@@ -1386,15 +1436,39 @@ fn check_storage_conformance(
                     ));
                     continue;
                 };
-                // The discharge as well as the id. Without it the crate is free to mark a
-                // clause `InProcess` that CLAUDE.md tells a reader is the driver's — two
-                // tables agreeing on the names of six things and disagreeing about what any
-                // of them costs.
-                if *discharge != Some(clause.discharge.variant()) {
+                // The sentence as well as the id. The crate's copy is the one a driver author
+                // reads — it is a `pub` field of a type they depend on — while `CLAUDE.md` is
+                // compared against the gate's. Left unchecked, the two can state opposite
+                // obligations under one name.
+                if row.sentence != Some(clause.sentence) {
                     violations.push(Violation::new(
                         "storage-conformance",
                         clause.id,
-                        discharge.map_or_else(
+                        row.sentence.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_CLAUSES_PATH}'s row for this clause states no sentence, and docs::STORAGE_CONTRACT_CLAUSES says `{}`",
+                                    clause.sentence
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_CLAUSES_PATH} states this clause as `{named}` and docs::STORAGE_CONTRACT_CLAUSES says `{}`",
+                                    clause.sentence
+                                )
+                            },
+                        ),
+                    ));
+                }
+                // The discharge as well. Without it the crate is free to mark a clause
+                // `InProcess` that CLAUDE.md tells a reader is the driver's — two tables
+                // agreeing on the names of six things and disagreeing about what any of them
+                // costs.
+                if row.discharge != Some(clause.discharge.variant()) {
+                    violations.push(Violation::new(
+                        "storage-conformance",
+                        clause.id,
+                        row.discharge.map_or_else(
                             || {
                                 format!(
                                     "{STORAGE_CLAUSES_PATH}'s row for this clause names no discharge, and docs::STORAGE_CONTRACT_CLAUSES says `{}`",
@@ -1439,28 +1513,36 @@ fn check_storage_conformance(
 /// runs to the next row's id — so a discharge belongs to the clause above it, and a row that
 /// reorders its fields reads as having no discharge, which is a violation rather than a
 /// silent pass.
-fn storage_clause_rows(contents: &str) -> BTreeMap<&str, Option<&str>> {
+fn storage_clause_rows(contents: &str) -> BTreeMap<&str, StorageRow<'_>> {
     let mut rows = BTreeMap::new();
-    for (index, _) in contents.match_indices("id: \"") {
-        let Some(after_key) = index.checked_add("id: \"".len()) else {
+    let Some(body) = const_slice_body(contents, "CLAUSES") else {
+        return rows;
+    };
+    for row in struct_rows(body, "Clause") {
+        let Some(id) = quoted_field(row, "id: \"") else {
             continue;
         };
-        let Some(rest) = contents.get(after_key..) else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else { continue };
-        let Some(id) = rest.get(..end) else { continue };
         if id.is_empty() {
             continue;
         }
-        let tail = rest.get(end..).unwrap_or_default();
-        let row = tail
-            .find("id: \"")
-            .and_then(|next| tail.get(..next))
-            .unwrap_or(tail);
-        rows.insert(id, identifier_field(row, "discharge: Discharge::"));
+        rows.insert(
+            id,
+            StorageRow {
+                sentence: quoted_field(row, "sentence: \""),
+                discharge: identifier_field(row, "discharge: Discharge::"),
+            },
+        );
     }
     rows
+}
+
+/// What one row of the conformance crate's clause table declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageRow<'a> {
+    /// The sentence the crate states the clause as, which is the one a driver author reads.
+    sentence: Option<&'a str>,
+    /// The `Discharge` variant the crate says holds it up.
+    discharge: Option<&'a str>,
 }
 
 /// The Rust identifier following `key` in `row`, if there is one.
@@ -1560,20 +1642,49 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
     let contents = without_fenced_code(&without_html_comments(&adr.contents));
-    STORAGE_CONTRACT_CLAUSES
-        .iter()
-        .filter(|clause| !contents.contains(&format!("`{}`", clause.id)))
-        .map(|clause| {
-            Violation::new(
+    let mut violations = Vec::new();
+    for clause in STORAGE_CONTRACT_CLAUSES {
+        // The clause's own row, as in the `CLAUDE.md` half. The ADR states what discharges
+        // each clause in a table of its own; checking only the id would let that table say
+        // the opposite of the one it is a record of.
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-conformance",
+                clause.id,
+                if rows.is_empty() {
+                    format!(
+                        "{STORAGE_CONFORMANCE_ADR} has no table row naming this clause in \
+                         backticks, so the contract has a suite and no decision record behind it"
+                    )
+                } else {
+                    format!(
+                        "{STORAGE_CONFORMANCE_ADR} has {} table rows naming this clause, so \
+                         which one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+        if !row.contains(clause.discharge.message()) {
+            violations.push(Violation::new(
                 "storage-conformance",
                 clause.id,
                 format!(
-                    "{STORAGE_CONFORMANCE_ADR} does not name this clause in backticks, so the \
-                     contract has a suite and no decision record behind it"
+                    "{STORAGE_CONFORMANCE_ADR}'s table row does not say this clause is \
+                     discharged by `{}`, so the record and the gate disagree about what \
+                     holds it up",
+                    clause.discharge.message()
                 ),
-            )
-        })
-        .collect()
+            ));
+        }
+    }
+    violations
 }
 
 /// Rule: the ADR record is numbered without gaps or duplicates, and has its template.
@@ -2569,8 +2680,13 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_storage_conformance_adr() -> String {
         let mut body = clean_adr("the storage conformance suite");
+        line(&mut body, format_args!("| Clause | Discharged by |"));
+        line(&mut body, format_args!("| --- | --- |"));
         for clause in STORAGE_CONTRACT_CLAUSES {
-            line(&mut body, format_args!("- `{}`", clause.id));
+            line(
+                &mut body,
+                format_args!("| `{}` | {} |", clause.id, clause.discharge.message()),
+            );
         }
         body
     }
@@ -4164,7 +4280,10 @@ mod tests {
     #[test]
     fn a_clause_the_crate_invented_is_a_proof_with_no_documentation() {
         let (claude_md, adrs, obligations) = spec_inputs();
-        let extended = format!("{obligations}\n    Clause {{ id: \"time-travel\" }},\n");
+        let extended = obligations.replace(
+            "];",
+            "    Clause { id: \"time-travel\", proof: \"tests/tardis.rs\" },\n];",
+        );
         let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&extended));
         assert!(
             violations
@@ -4346,6 +4465,122 @@ mod tests {
     }
 
     #[test]
+    fn a_clause_literal_outside_the_table_declares_nothing() {
+        // The scan is anchored at `pub const CLAUSES` and stops at its `];`, so a rustdoc
+        // example, a `#[cfg(test)]` fixture, or any other struct literal in the file is not
+        // a declaration — in either direction. Before it was anchored, a doc example listing
+        // the six clauses vouched for a table that had been deleted.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let littered = format!(
+            "{obligations}\n#[cfg(test)]\nmod tests {{\n    const FIXTURE: Clause = \
+             Clause {{ id: \"time-travel\", proof: \"tests/tardis.rs\" }};\n}}\n"
+        );
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&littered));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_storage_clause_literal_outside_the_table_declares_nothing() {
+        let (claude_md, adrs, clauses) = storage_inputs();
+        let littered = format!(
+            "{clauses}\n/// ```\n/// Clause {{ id: \"barrier-is-free\", sentence: \"x\", \
+             discharge: Discharge::InProcess }}\n/// ```\nfn example() {{}}\n"
+        );
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&littered));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_storage_clause_row_that_reorders_its_fields_is_still_read_correctly() {
+        // The defect an id-to-id window has: a row that declares its discharge before its id
+        // has that discharge fall into the previous row's window, and reads the *next* row's
+        // on its own behalf — so the rule misses the reordering it exists to catch and names
+        // the wrong clause when it fires at all. Rows are bounded by their own braces.
+        let (claude_md, adrs, _) = storage_inputs();
+        let mut reordered = String::from("pub const CLAUSES: &[Clause] = &[\n");
+        for clause in STORAGE_CONTRACT_CLAUSES {
+            let discharge = if clause.id == "barrier-is-durable" {
+                "Driver"
+            } else {
+                clause.discharge.variant()
+            };
+            let _ = writeln!(
+                reordered,
+                "    Clause {{ discharge: Discharge::{discharge}, sentence: \"{}\", \
+                 id: \"{}\" }},",
+                clause.sentence, clause.id
+            );
+        }
+        reordered.push_str("];\n");
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&reordered));
+        let named: Vec<&str> = violations
+            .iter()
+            .map(|violation| violation.subject.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            ["barrier-is-durable"],
+            "only the reordered clause should be reported, and it should be: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_storage_clause_the_crate_states_differently_is_reported() {
+        // The crate's sentence is the one a driver author reads — it is a `pub` field of a
+        // type they depend on — while CLAUDE.md is compared against the gate's copy. Left
+        // unchecked, the two can state opposite obligations under one name.
+        let (claude_md, adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES
+            .iter()
+            .find(|clause| clause.id == "validated-before-media")
+            .expect("the table declares it");
+        let reworded = clauses.replace(
+            clause.sentence,
+            "The adapter may validate alignment whenever it feels like it.",
+        );
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&reworded));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("whenever it feels like it")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_adr_row_that_disagrees_about_the_discharge_is_reported() {
+        let (claude_md, adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES
+            .iter()
+            .find(|clause| clause.discharge == Discharge::Driver)
+            .expect("a clause is the driver's");
+        let adrs: Vec<AdrFile> = adrs
+            .into_iter()
+            .map(|adr| {
+                if adr.name == STORAGE_CONFORMANCE_ADR {
+                    AdrFile {
+                        contents: adr
+                            .contents
+                            .replace(clause.discharge.message(), "the in-process suite"),
+                        ..adr
+                    }
+                } else {
+                    adr
+                }
+            })
+            .collect();
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_specification_whose_table_is_commented_out_declares_nothing() {
         // A one-keystroke edit that a substring scan cannot tell from a real table: comment
         // the rows out, leave `&[]` behind, and six ids, six proofs and no declarations all
@@ -4516,12 +4751,22 @@ mod tests {
         let source = "pub const CLAUSES: &[Clause] = &[\n Clause { id: \"x\", sentence: \"see https://example.invalid/spec\", discharge: Discharge::Driver },\n];\n";
         let stripped = strip_rust_comments(source);
         let rows = storage_clause_rows(&stripped);
-        assert_eq!(rows.get("x"), Some(&Some("Driver")), "{rows:?}");
+        assert_eq!(
+            rows.get("x").and_then(|row| row.discharge),
+            Some("Driver"),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.get("x").and_then(|row| row.sentence),
+            Some("see https://example.invalid/spec"),
+            "{rows:?}"
+        );
     }
 
     #[test]
     fn a_block_comment_holding_a_clause_table_declares_nothing() {
-        let source = "/* Clause { id: \"x\", sentence: \"y\", discharge: Discharge::Driver }, */\npub const CLAUSES: &[Clause] = &[];\n";
+        let source = "pub const CLAUSES: &[Clause] = &[\n    /* Clause { id: \"x\", \
+             sentence: \"y\", discharge: Discharge::Driver }, */\n];\n";
         let stripped = strip_rust_comments(source);
         let rows = storage_clause_rows(&stripped);
         assert!(rows.is_empty(), "{rows:?}");

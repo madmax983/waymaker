@@ -23,7 +23,8 @@ pub const REQUIRED_ERASE_BLOCKS: u32 = 3;
 /// # Invariants
 ///
 /// Erase-block aligned at both ends, inside the capacity, and at least
-/// [`REQUIRED_ERASE_BLOCKS`] blocks long. [`Region::new`] is the only constructor.
+/// [`REQUIRED_ERASE_BLOCKS`] blocks long. [`Region::new`] is the only constructor that
+/// checks anything, and [`Region::whole_device`] delegates to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Region {
     geometry: Geometry,
@@ -90,14 +91,13 @@ impl Region {
 
     /// Whether the region covers nothing.
     ///
-    /// Always `false` — [`Region::new`] rejects a region shorter than
-    /// [`REQUIRED_ERASE_BLOCKS`] erase blocks, and an erase block is never zero bytes. It
-    /// exists because a type with a `len` and no `is_empty` is a clippy lint, and because a
-    /// reader who reaches for it should be told the answer is settled rather than left to
-    /// wonder.
+    /// Always `false` in practice — [`Region::new`] rejects a region shorter than
+    /// [`REQUIRED_ERASE_BLOCKS`] erase blocks, and an erase block is never zero bytes — but
+    /// derived from the length rather than written as a constant, so that lowering
+    /// [`REQUIRED_ERASE_BLOCKS`] or adding a constructor cannot make it a lie.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        false
+        self.len == 0
     }
 
     /// One past the last byte of the region.
@@ -123,7 +123,11 @@ impl Region {
 }
 
 /// Why a window is not a region a conformance run may use.
+///
+/// `#[non_exhaustive]`, for the reason [`crate::case::NotApplicable`] is: this crate's
+/// callers are out of tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RegionError {
     /// One of the two ends is not on an erase block boundary.
     NotEraseAligned,

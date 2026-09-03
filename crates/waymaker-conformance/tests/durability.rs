@@ -11,7 +11,9 @@
 //! `waymaker_fault`, which cuts the power at *every* point the write sequence can be
 //! interrupted, and rebuilds the device from the image that survived.
 
-use waymaker_conformance::durability::{Breach, Verdict, WitnessError, arm, verify};
+use std::cell::RefCell;
+use waymaker_conformance::durability::{Breach, Reset, WitnessError, WitnessVerdict, arm, verify};
+
 use waymaker_conformance::region::Region;
 use waymaker_conformance::suite::SuiteError;
 use waymaker_fault::{Device, Harness};
@@ -77,6 +79,12 @@ impl StableStorage for Blind {
     }
 }
 
+/// How many runs the crash-point sweep has.
+///
+/// Pinned, for the reason `waymaker-spec`'s census is: a sweep that silently shrank is the
+/// direction that turns a proof into a formality.
+const SWEEP: usize = 48;
+
 fn nested() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 64, 4, 2) else {
         unreachable!("1024 is whole 64-byte blocks of whole 4-byte units of 2-byte reads")
@@ -111,8 +119,8 @@ fn a_witness_that_was_never_interrupted_holds() {
     let image = device.image().to_vec();
     let mut after = after_reset(geometry, &image);
     assert_eq!(
-        verify(&mut after, region, &mut buffer),
-        Ok(Verdict::Held),
+        verify(&mut after, region, &mut buffer, Reset::AfterACompletedArm),
+        Ok(WitnessVerdict::Held),
         "an uninterrupted run acknowledged everything it barriered"
     );
 }
@@ -126,26 +134,44 @@ fn a_witness_holds_at_every_point_the_power_can_go() {
     let region = whole(geometry);
     let harness = Harness::new(geometry);
 
+    // Each run's `Reset` is what `arm` actually returned in that run, recorded as it goes.
+    // Inferring it from `run.injection().is_some()` would be wrong: a crash point after the
+    // last program interrupts nothing `arm` had left to do, and `arm` returns `Ok(())`.
+    let completed: RefCell<Vec<bool>> = RefCell::new(Vec::new());
     let runs = harness
         .run(|session| {
             let mut buffer = [0_u8; 64];
-            arm(session, region, &mut buffer)
+            let outcome = arm(session, region, &mut buffer);
+            completed.borrow_mut().push(outcome.is_ok());
+            outcome
         })
         .expect("the writer succeeds with no faults armed");
+    let completed = completed.into_inner();
+    assert_eq!(
+        completed.len(),
+        runs.len(),
+        "the harness calls the writer once per run, in run order"
+    );
 
-    assert!(
-        runs.len() > 40,
-        "the sweep thinned out to {} runs; a witness with no crash points in it proves nothing",
-        runs.len()
+    // Pinned rather than bounded below. The dangerous direction is a sweep that silently
+    // shrank, which `> 40` would have tolerated all the way down to 41.
+    assert_eq!(
+        runs.len(),
+        SWEEP,
+        "the crash-point sweep changed size; if that is intended, move the pin"
     );
 
     let mut buffer = [0_u8; 64];
     for (index, run) in runs.iter().enumerate() {
+        let reset = match completed.get(index) {
+            Some(true) => Reset::AfterACompletedArm,
+            _ => Reset::DuringArm,
+        };
         let mut after = after_reset(geometry, run.image());
         assert_eq!(
-            verify(&mut after, region, &mut buffer),
-            Ok(Verdict::Held),
-            "run {index} ({:?}) was judged a breach on a correct device",
+            verify(&mut after, region, &mut buffer, reset),
+            Ok(WitnessVerdict::Held),
+            "run {index} ({:?}, {reset:?}) was judged a breach on a correct device",
             run.injection()
         );
     }
@@ -168,8 +194,9 @@ fn losing_a_mutation_a_barrier_acknowledged_is_a_breach() {
 
     let mut after = after_reset(geometry, &image);
     assert_eq!(
-        verify(&mut after, region, &mut buffer),
-        Ok(Verdict::Breached(Breach::AcknowledgedMutationLost))
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost)),
+        "the seal is on media without the witness the barrier before it acknowledged"
     );
 }
 
@@ -189,8 +216,10 @@ fn a_mutation_overtaking_a_completed_barrier_is_a_breach() {
 
     let mut after = after_reset(geometry, &image);
     assert_eq!(
-        verify(&mut after, region, &mut buffer),
-        Ok(Verdict::Breached(Breach::LaterMutationOvertookABarrier))
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Breached(
+            Breach::LaterMutationOvertookABarrier
+        ))
     );
 }
 
@@ -213,7 +242,18 @@ fn a_device_that_lost_everything_is_not_a_breach() {
     }
 
     let mut after = after_reset(geometry, &image);
-    assert_eq!(verify(&mut after, region, &mut buffer), Ok(Verdict::Held));
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Held),
+        "a power cut before the first barrier returned owes nothing"
+    );
+    // The same media after a *completed* arm is the barrier bug that loses everything, and
+    // a seal-relative rule alone would have called it `Held`.
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::AfterACompletedArm),
+        Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost)),
+        "a completed arm owes the witness and the seal unconditionally"
+    );
 }
 
 #[test]
@@ -230,7 +270,7 @@ fn a_witness_needs_a_region_that_belongs_to_the_device() {
         Err(WitnessError::Suite(SuiteError::RegionIsNotForThisDevice))
     );
     assert_eq!(
-        verify(&mut device, whole(other), &mut buffer),
+        verify(&mut device, whole(other), &mut buffer, Reset::DuringArm),
         Err(WitnessError::Suite(SuiteError::RegionIsNotForThisDevice))
     );
 }
@@ -270,7 +310,7 @@ fn a_read_the_driver_refuses_reaches_the_caller() {
     let mut device = Blind(Device::new(geometry));
 
     assert_eq!(
-        verify(&mut device, region, &mut buffer),
+        verify(&mut device, region, &mut buffer, Reset::DuringArm),
         Err(WitnessError::Driver(
             waymaker_fault::FaultError::InjectedFailure
         ))
@@ -285,8 +325,119 @@ fn verifying_needs_a_buffer_it_can_work_in() {
     let mut device = Device::new(geometry);
 
     assert_eq!(
-        verify(&mut device, region, &mut buffer),
+        verify(&mut device, region, &mut buffer, Reset::DuringArm),
         Err(WitnessError::Suite(SuiteError::BufferTooSmall))
+    );
+}
+
+/// A device with a write-back cache behind a `barrier` that returns before it settles.
+///
+/// The barrier bug, rather than a hand-edited image: programs land in the cache, `barrier()`
+/// returns `Ok(())` without flushing, and the reset finds media as it was. Everything the
+/// witness barriered is lost, which a seal-relative rule alone would have called `Held`.
+struct Cached {
+    device: Device,
+    pending: Vec<(u32, Vec<u8>)>,
+    flushes: bool,
+}
+
+impl Cached {
+    /// A cache whose `barrier` flushes, or one whose `barrier` lies.
+    fn new(geometry: Geometry, flushes: bool) -> Self {
+        Self {
+            device: Device::new(geometry),
+            pending: Vec::new(),
+            flushes,
+        }
+    }
+
+    /// The bytes a reset would find: the media, without whatever is still in the cache.
+    fn image(&self) -> &[u8] {
+        self.device.image()
+    }
+}
+
+impl StableStorage for Cached {
+    type Error = waymaker_fault::FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        // A cache a reader can see through, which is what makes this the *interesting* bug:
+        // `arm`'s own read-back of the witness succeeds, so nothing before the reset notices.
+        self.device.read(offset, dst)?;
+        for (at, bytes) in &self.pending {
+            for (index, byte) in bytes.iter().enumerate() {
+                let Ok(index) = u32::try_from(index) else {
+                    continue;
+                };
+                let Some(position) = at.checked_add(index).and_then(|absolute| {
+                    absolute
+                        .checked_sub(offset)
+                        .and_then(|relative| usize::try_from(relative).ok())
+                }) else {
+                    continue;
+                };
+                if let Some(cell) = dst.get_mut(position) {
+                    *cell &= *byte;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device
+            .geometry()
+            .validate_program(offset, u32::try_from(src.len()).unwrap_or(u32::MAX))?;
+        self.pending.push((offset, src.to_vec()));
+        Ok(())
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        if self.flushes {
+            for (offset, bytes) in core::mem::take(&mut self.pending) {
+                self.device.program(offset, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_barrier_that_does_not_flush_is_caught_across_the_reset() {
+    // The teeth of the witness. Not a hand-edited image: an adapter that implements
+    // `StableStorage` and gets the one clause no in-process suite can observe wrong.
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+
+    let mut lying = Cached::new(geometry, false);
+    assert_eq!(
+        arm(&mut lying, region, &mut buffer),
+        Ok(()),
+        "a cache a reader can see through passes every check `arm` makes"
+    );
+    let mut after = after_reset(geometry, lying.image());
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::AfterACompletedArm),
+        Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost))
+    );
+
+    // The same adapter with a barrier that means it, to show the witness is not simply
+    // failing everything with a cache in it.
+    let mut honest = Cached::new(geometry, true);
+    assert_eq!(arm(&mut honest, region, &mut buffer), Ok(()));
+    let mut after = after_reset(geometry, honest.image());
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::AfterACompletedArm),
+        Ok(WitnessVerdict::Held)
     );
 }
 

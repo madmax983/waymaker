@@ -6,11 +6,9 @@
 //! or a copy of its neighbour: `message()` and `Display` agree everywhere, and no two
 //! variants of one enum say the same thing.
 
-use waymaker_conformance::case::{
-    CASE_COUNT, CaseId, Failure, NotApplicable, Outcome, Report, Verdict,
-};
+use waymaker_conformance::case::{CaseId, Failure, NotApplicable, Verdict};
 use waymaker_conformance::clause::Discharge;
-use waymaker_conformance::durability::{Breach, WitnessError};
+use waymaker_conformance::durability::{Breach, WitnessError, WitnessVerdict};
 use waymaker_conformance::nor::{PortError, PortGeometryError};
 use waymaker_conformance::region::RegionError;
 use waymaker_conformance::suite::SuiteError;
@@ -77,7 +75,8 @@ fn every_exemption_says_which_property_of_the_device_earned_it() {
     let all = [
         NotApplicable::TheUnitIsOneByte,
         NotApplicable::TheBlockIsOneProgramUnit,
-        NotApplicable::TheErasedStateHasNoProgrammableBits,
+        NotApplicable::TheReadUnitIsTheProgramUnit,
+        NotApplicable::TheRegionDoesNotEndAtTheCapacity,
     ];
     distinct(&all.map(NotApplicable::message));
 }
@@ -165,66 +164,33 @@ fn a_verdict_names_the_case_and_what_went_wrong() {
 }
 
 #[test]
-fn a_report_that_was_never_run_is_not_a_pass() {
-    // The failure this guards is the one a conformance suite is most likely to have: a run
-    // that did nothing and reported no failures.
-    let report = Report::default();
-    assert_eq!(report, Report::new());
-    assert_eq!(report.entries().count(), CASE_COUNT);
+fn a_witness_verdict_reads_the_way_a_report_verdict_does() {
+    // `report.verdict()?` propagates a failure, so `verify(..)?` had better not silently
+    // discard a breach. `held()` is what makes the two read alike; without it the natural
+    // spelling of "check the witness" is one that cannot fail.
+    assert_eq!(WitnessVerdict::Held.held(), Ok(()));
     assert_eq!(
-        report.verdict(),
-        Err(Verdict::NotRun(CaseId::GeometryIsStable))
-    );
-    assert_eq!(report.first_failure(), None);
-    assert_eq!(report.exemptions().count(), 0);
-    assert_eq!(report.outcome(CaseId::BarrierSucceeds), Outcome::NotRun);
-}
-
-#[test]
-fn a_report_records_what_it_is_told() {
-    let mut report = Report::new();
-    for (case, _) in Report::new().entries() {
-        report.record(case.id, Outcome::Passed);
-    }
-    assert_eq!(report.verdict(), Ok(()));
-
-    report.record(
-        CaseId::ProgramRoundTripsThroughRead,
-        Outcome::Failed(Failure::ReadBackDiffers),
-    );
-    assert_eq!(
-        report.verdict(),
-        Err(Verdict::Failed(
-            CaseId::ProgramRoundTripsThroughRead,
-            Failure::ReadBackDiffers
-        ))
-    );
-    assert_eq!(
-        report.first_failure(),
-        Some((
-            CaseId::ProgramRoundTripsThroughRead,
-            Failure::ReadBackDiffers
-        ))
-    );
-
-    report.record(
-        CaseId::MisalignedReadIsRefused,
-        Outcome::NotApplicable(NotApplicable::TheUnitIsOneByte),
-    );
-    assert_eq!(
-        report.exemptions().collect::<Vec<_>>(),
-        [(
-            CaseId::MisalignedReadIsRefused,
-            NotApplicable::TheUnitIsOneByte
-        )]
+        WitnessVerdict::Breached(Breach::AcknowledgedMutationLost).held(),
+        Err(Breach::AcknowledgedMutationLost)
     );
 }
 
 #[test]
-fn every_case_id_indexes_its_own_row() {
-    for (case, _) in Report::new().entries() {
-        assert_eq!(case.id.spec(), Some(case));
-        assert_eq!(case.id.name(), case.name);
-        assert!(case.id.index() < CASE_COUNT);
-    }
+fn a_witness_error_says_what_it_is() {
+    let all: [WitnessError<GeometryError>; 3] = [
+        WitnessError::Suite(SuiteError::BufferTooSmall),
+        WitnessError::Driver(GeometryError::OutOfBounds),
+        WitnessError::WitnessDidNotTake,
+    ];
+    let messages: [&str; 3] = [all[0].message(), all[1].message(), all[2].message()];
+    distinct(&messages);
+    // The driver's own error is what a caller wants to read, so `Display` reaches it even
+    // though `message()` — which has to be `&'static str` — cannot.
+    assert_eq!(
+        all[1].to_string(),
+        GeometryError::OutOfBounds.to_string(),
+        "a driver refusal should render as the driver's own error"
+    );
+    assert_eq!(all[0].to_string(), SuiteError::BufferTooSmall.message());
+    assert_eq!(all[2].to_string(), all[2].message());
 }

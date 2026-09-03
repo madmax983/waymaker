@@ -150,6 +150,38 @@ impl NorFlash for OddNor {
     }
 }
 
+/// A driver with a legal geometry that refuses every operation.
+struct SulkingNor;
+
+impl ErrorType for SulkingNor {
+    type Error = NorFlashErrorKind;
+}
+
+impl ReadNorFlash for SulkingNor {
+    const READ_SIZE: usize = 2;
+
+    fn read(&mut self, _offset: u32, _bytes: &mut [u8]) -> Result<(), Self::Error> {
+        Err(NorFlashErrorKind::Other)
+    }
+
+    fn capacity(&self) -> usize {
+        CAPACITY
+    }
+}
+
+impl NorFlash for SulkingNor {
+    const WRITE_SIZE: usize = 4;
+    const ERASE_SIZE: usize = 64;
+
+    fn erase(&mut self, _from: u32, _to: u32) -> Result<(), Self::Error> {
+        Err(NorFlashErrorKind::Other)
+    }
+
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), Self::Error> {
+        Err(NorFlashErrorKind::Other)
+    }
+}
+
 /// A driver whose erase unit does not fit in a 32-bit word.
 struct WideEraseNor;
 
@@ -340,7 +372,7 @@ fn an_erase_length_becomes_the_range_the_driver_expects() {
 }
 
 #[test]
-fn a_driver_error_reaches_the_caller_unchanged() {
+fn a_legal_operation_reaches_the_driver_and_round_trips() {
     let mut storage = ported();
     // Legal against the Waymaker geometry and legal against the driver: nothing to report.
     assert_eq!(storage.program(0, &[0x0F_u8; 4]), Ok(()));
@@ -364,14 +396,25 @@ fn every_unit_wider_than_a_word_is_refused_and_not_only_the_capacity() {
 }
 
 #[test]
-fn the_driver_can_be_reached_through_the_port() {
-    // A port that could not be borrowed mutably would force a caller wanting a driver-level
-    // operation — a chip erase, a status register — to give up the port to get it back.
-    let mut storage = ported();
-    storage.flash_mut().media.fill(0x00);
-    let mut back = [0_u8; 2];
-    assert_eq!(storage.read(0, &mut back), Ok(()));
-    assert_eq!(back, [0x00; 2]);
+fn a_driver_that_refuses_a_legal_operation_reaches_the_caller_as_a_driver_error() {
+    // The other half of `an_illegal_operation_is_refused_before_the_driver_is_called`: when
+    // the geometry permits the operation, whatever the driver says is what the caller gets,
+    // and it is labelled as the driver's rather than as the port's.
+    let Ok(mut storage) = NorFlashStorage::new(SulkingNor) else {
+        unreachable!("a 1024/64/4/2 NOR is a geometry")
+    };
+    assert_eq!(
+        storage.read(0, &mut [0_u8; 2]),
+        Err(PortError::Driver(NorFlashErrorKind::Other))
+    );
+    assert_eq!(
+        storage.program(0, &[0_u8; 4]),
+        Err(PortError::Driver(NorFlashErrorKind::Other))
+    );
+    assert_eq!(
+        storage.erase(0, 64),
+        Err(PortError::Driver(NorFlashErrorKind::Other))
+    );
 }
 
 #[test]

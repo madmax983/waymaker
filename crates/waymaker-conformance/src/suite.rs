@@ -1,6 +1,6 @@
 //! The in-process conformance run.
 //!
-//! Nineteen cases, each one an observation an adapter either survives or does not. Two of
+//! Twenty cases, each one an observation an adapter either survives or does not. Two of
 //! design document §12's clauses are what they speak for: `validated-before-media`, which
 //! is about what an adapter *refuses*, and `operations-act-on-what-they-name`, which is
 //! about what it does when it agrees.
@@ -8,9 +8,27 @@
 //! # What a run costs the device
 //!
 //! Three erase blocks, erased and reprogrammed several times, inside the [`Region`] the
-//! caller named. Nothing outside the region is ever mutated — the illegal operations the
-//! suite issues are chosen so that a *conformant* adapter refuses them, and a broken one
-//! can only damage bytes the region already covers.
+//! caller named. No case names a byte outside it — not even in an operation it expects to be
+//! refused, which is the part that matters: an adapter that wrongly *accepted* one could then
+//! only damage media the caller declared expendable. Where no such operation exists — the
+//! mutations that straddle the end of the device, on a region that is not at the end of the
+//! device — the case is [`NotApplicable`] rather than issued somewhere unsafe.
+//!
+//! What that cannot promise is containment of an adapter whose *legal* operations run wild.
+//! An erase of one block of the region is an operation the caller authorised, and a driver
+//! that answers it by erasing the whole chip — or a `barrier` that scribbles — is caught
+//! rather than contained.
+//!
+//! # Why erased is `0xFF`
+//!
+//! Because that is what the contract above this suite is written against. `embedded-storage`
+//! says an erased NOR range "will contain all 1s afterwards"; design document §09's frame
+//! reads a stale tail as `0xFF`; `waymaker-fault` models media that starts at `0xFF` and can
+//! only clear bits. A suite that tried to be polarity-agnostic would have to learn the
+//! erased byte from the adapter under test, and an adapter whose erase does nothing on media
+//! that happens to read `0x00` would teach it that `0x00` is erased and that nothing is
+//! programmable — which is how a broken driver talks a suite out of testing it. [`ERASED`]
+//! is a constant, and an erase that does not produce it is a failure.
 //!
 //! # Why the caller supplies the buffer
 //!
@@ -18,21 +36,28 @@
 //! ([ADR 0008](https://github.com/madmax983/waymaker/blob/main/docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md)):
 //! the page size a device wants is the device's business, and a suite with an internal
 //! `[u8; N]` either refuses a 256-byte-page SPI part or charges every 4-byte-page internal
-//! flash for one. Four program units is what the widest case needs — a source, the bytes
-//! before it, and the bytes after it — and [`SuiteError::BufferTooSmall`] is what a caller
-//! who supplied less is told.
+//! flash for one. Two program units is what the widest case needs, and
+//! [`SuiteError::BufferTooSmall`] is what a caller who supplied less is told.
+//!
+//! Nothing here holds a copy of a whole erase block: what media *should* say is computed
+//! from the run's own pattern rather than photographed beforehand, so a case can check a
+//! region far larger than the buffer, one chunk at a time.
 
 use waymaker_flash::storage::StableStorage;
 
 use crate::case::{CaseId, Failure, NotApplicable, Outcome, Report};
 use crate::region::Region;
 
+/// The byte an erased cell reads as.
+///
+/// See the module documentation for why this is a constant rather than something the suite
+/// learns from the adapter it is testing.
+pub const ERASED: u8 = 0xFF;
+
 /// How many program units of scratch a run needs.
 ///
-/// The widest case is [`CaseId::RefusedProgramTouchesNoMedia`]: the media as it stands, an
-/// illegally-long source, and the media afterwards, held at once so the three can be
-/// compared without a second pass.
-pub const REQUIRED_BUFFER_UNITS: u32 = 4;
+/// Two: a source and the read-back of it, which is the widest any case holds at once.
+pub const REQUIRED_BUFFER_UNITS: u32 = 2;
 
 /// Why a conformance run could not start.
 ///
@@ -40,6 +65,7 @@ pub const REQUIRED_BUFFER_UNITS: u32 = 4;
 /// means the run never happened. A suite that reported "no failures" for a run it could not
 /// start would be the exact reverse of what this crate is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SuiteError {
     /// The region was checked against a different device than the one handed over.
     RegionIsNotForThisDevice,
@@ -53,7 +79,7 @@ impl SuiteError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::RegionIsNotForThisDevice => "the region describes a different device",
-            Self::BufferTooSmall => "the buffer is smaller than four program units",
+            Self::BufferTooSmall => "the buffer is smaller than two program units",
         }
     }
 }
@@ -65,6 +91,20 @@ impl core::fmt::Display for SuiteError {
 }
 
 impl core::error::Error for SuiteError {}
+
+/// One byte of the pattern this suite programs.
+///
+/// Two properties, and both are load-bearing. It always has a bit clear, so it is
+/// programmable from [`ERASED`] and is never equal to it — a pattern that happened to be
+/// `0xFF` would make every round-trip case pass against an adapter that ignores programs.
+/// And it varies with the index, so an adapter that writes the right number of bytes with
+/// the wrong contents is still caught.
+#[must_use]
+pub fn pattern(index: usize) -> u8 {
+    let position = u32::try_from(index % 8).unwrap_or(0);
+    let mixed = 0xA5_u8 ^ u8::try_from(index & 0xFF).unwrap_or(0);
+    mixed & !(1_u8 << position)
+}
 
 /// Runs every case of [`crate::case::CASES`] against `storage`.
 ///
@@ -98,7 +138,6 @@ pub fn run<S: StableStorage>(
         buffer,
         unit,
         report: Report::new(),
-        erased: None,
     };
     run.everything();
     Ok(run.report)
@@ -111,11 +150,6 @@ struct Run<'a, S: StableStorage> {
     buffer: &'a mut [u8],
     unit: usize,
     report: Report,
-    /// The byte an erase leaves behind, learned rather than assumed.
-    ///
-    /// `None` until [`CaseId::EraseYieldsOneRepeatedByte`] has run, which is why that case
-    /// runs before every case that programs anything.
-    erased: Option<u8>,
 }
 
 impl<S: StableStorage> Run<'_, S> {
@@ -127,9 +161,10 @@ impl<S: StableStorage> Run<'_, S> {
         self.read_past_capacity_is_refused();
         self.program_past_capacity_is_refused();
         self.erase_past_capacity_is_refused();
+        self.mutation_straddling_the_capacity_is_refused();
         self.refused_program_touches_no_media();
         self.refused_erase_touches_no_media();
-        self.erase_yields_one_repeated_byte();
+        self.erase_yields_the_erased_byte();
         self.program_round_trips_through_read();
         self.program_leaves_the_rest_of_the_block_alone();
         self.erase_leaves_the_neighbouring_block_alone();
@@ -153,6 +188,17 @@ impl<S: StableStorage> Run<'_, S> {
         self.region.offset() + self.region.geometry().erase_size()
     }
 
+    /// The third erase block: what a barrier that scribbled elsewhere would show up in.
+    const fn block_c(&self) -> u32 {
+        self.region.offset()
+            + self.region.geometry().erase_size()
+            + self.region.geometry().erase_size()
+    }
+
+    const fn capacity(&self) -> u32 {
+        self.region.geometry().capacity()
+    }
+
     const fn erase_size(&self) -> u32 {
         self.region.geometry().erase_size()
     }
@@ -171,7 +217,7 @@ impl<S: StableStorage> Run<'_, S> {
 
     // ---- the primitives the cases are written in ---------------------------------------
 
-    /// Reads `len` bytes at `offset` into the front of the buffer, returning them.
+    /// Reads `len` bytes at `offset` into the buffer at `at`.
     ///
     /// `None` if the driver refused a read the geometry permits, which every caller turns
     /// into [`Failure::LegalOperationRefused`].
@@ -195,36 +241,87 @@ impl<S: StableStorage> Run<'_, S> {
         true
     }
 
-    /// Whether every byte of `len` bytes at `offset` reads as `wanted`.
+    /// Whether `len` bytes at `offset` read as `expected(position)`, position by position.
     ///
-    /// `None` if a legal read was refused.
-    fn all_bytes_are(&mut self, offset: u32, len: u32, wanted: u8) -> Option<bool> {
+    /// Chunked through the caller's buffer, so a case can check an erase block far wider
+    /// than the buffer without holding a copy of it. `None` if a legal read was refused.
+    fn media_matches(
+        &mut self,
+        offset: u32,
+        len: u32,
+        expected: impl Fn(u32) -> u8,
+    ) -> Option<bool> {
         let step = self.unit;
         let mut seen = 0_u32;
         while seen < len {
             let chunk = core::cmp::min(step, usize::try_from(len - seen).ok()?);
             self.read_into(offset.checked_add(seen)?, chunk, 0)?;
-            if self.bytes(0, chunk)?.iter().any(|byte| *byte != wanted) {
-                return Some(false);
+            let held = self.bytes(0, chunk)?;
+            for (index, byte) in held.iter().enumerate() {
+                if *byte != expected(seen.checked_add(u32::try_from(index).ok()?)?) {
+                    return Some(false);
+                }
             }
             seen = seen.checked_add(u32::try_from(chunk).ok()?)?;
         }
         Some(true)
     }
 
-    /// The pattern this run programs: a subset of the erased byte's bits, so that it is
-    /// programmable from erased on media of either polarity.
-    ///
-    /// The index is taken modulo 256, so a program unit wider than that repeats. Nothing
-    /// here needs the pattern to be injective — it needs it to differ from the erased byte,
-    /// which [`Run::pattern_bites`] is what checks.
-    fn pattern(index: usize, erased: u8) -> u8 {
-        erased & (0xA5_u8 ^ u8::try_from(index & 0xFF).unwrap_or(0))
+    /// Whether `len` bytes at `offset` are all erased.
+    fn media_is_erased(&mut self, offset: u32, len: u32) -> Option<bool> {
+        self.media_matches(offset, len, |_| ERASED)
     }
 
-    /// Whether the pattern would change anything on erased media.
-    fn pattern_bites(&self, erased: u8) -> bool {
-        (0..self.unit).any(|index| Self::pattern(index, erased) != erased)
+    /// Whether the block at `offset` holds one unit of the pattern and is erased after it.
+    fn block_holds_the_pattern(&mut self, offset: u32) -> Option<bool> {
+        let unit = self.program_size();
+        let block = self.erase_size();
+        Some(
+            self.media_matches(offset, unit, |position| {
+                pattern(usize::try_from(position).unwrap_or(0))
+            })? && self.media_is_erased(offset.checked_add(unit)?, block.checked_sub(unit)?)?,
+        )
+    }
+
+    /// Fills the front of the buffer with `len` bytes of `byte`.
+    fn fill_source(&mut self, len: usize, byte: u8) {
+        if let Some(slot) = self.buffer.get_mut(..len) {
+            slot.fill(byte);
+        }
+    }
+
+    /// Fills the front of the buffer with one program unit of the run's pattern.
+    fn fill_pattern(&mut self) {
+        for index in 0..self.unit {
+            let wanted = pattern(index);
+            if let Some(cell) = self.buffer.get_mut(index) {
+                *cell = wanted;
+            }
+        }
+    }
+
+    /// Programs whatever is in `buffer[..len]` at `offset`.
+    fn program_source(&mut self, offset: u32, len: usize) -> bool {
+        match self.buffer.get(..len) {
+            Some(source) => self.storage.program(offset, source).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Erases the block at `offset` and programs one unit of the pattern at its start.
+    ///
+    /// `false` when the adapter refused either; the case has already been recorded.
+    fn program_a_unit(&mut self, case: CaseId, offset: u32) -> bool {
+        if !self.erase_block(case, offset) {
+            return false;
+        }
+        self.fill_pattern();
+        if self.program_source(offset, self.unit) {
+            true
+        } else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            false
+        }
     }
 
     // ---- validated-before-media --------------------------------------------------------
@@ -250,7 +347,7 @@ impl<S: StableStorage> Run<'_, S> {
             );
             return;
         }
-        let step = usize::try_from(unit >> 1).unwrap_or(1);
+        let half = usize::try_from(unit >> 1).unwrap_or(1);
         let whole = usize::try_from(unit).unwrap_or(1);
         let base = self.block_a();
 
@@ -258,7 +355,7 @@ impl<S: StableStorage> Run<'_, S> {
             Some(slot) => self.storage.read(base + (unit >> 1), slot).is_err(),
             None => false,
         };
-        let length_refused = match self.buffer.get_mut(..whole + step) {
+        let length_refused = match self.buffer.get_mut(..whole + half) {
             Some(slot) => self.storage.read(base, slot).is_err(),
             None => false,
         };
@@ -281,12 +378,11 @@ impl<S: StableStorage> Run<'_, S> {
         }
         let half = usize::try_from(unit >> 1).unwrap_or(1);
         let base = self.block_a();
-        // All ones: on NOR this clears nothing, so a driver that wrongly accepted the
-        // operation is still caught by `refused_program_touches_no_media` rather than by
-        // this case having quietly damaged the block the next case needs.
-        if let Some(slot) = self.buffer.get_mut(..self.unit + half) {
-            slot.fill(0xFF);
-        }
+        // All ones: on erased media this clears nothing, so an adapter that wrongly accepted
+        // the operation has not damaged the block the next case needs. Whether it *did*
+        // accept it is what this case reports, and whether a refusal touched media is
+        // `RefusedProgramTouchesNoMedia`'s question rather than this one's.
+        self.fill_source(self.unit + half, ERASED);
 
         let offset_refused = match self.buffer.get(..self.unit) {
             Some(src) => self.storage.program(base + (unit >> 1), src).is_err(),
@@ -325,7 +421,7 @@ impl<S: StableStorage> Run<'_, S> {
     }
 
     fn read_past_capacity_is_refused(&mut self) {
-        let capacity = self.region.geometry().capacity();
+        let capacity = self.capacity();
         let unit = self.read_size();
         let whole = usize::try_from(unit).unwrap_or(1);
 
@@ -333,13 +429,21 @@ impl<S: StableStorage> Run<'_, S> {
             Some(slot) => self.storage.read(capacity, slot).is_err(),
             None => false,
         };
-        // The end is `u32::MAX + 1`, which a driver computing `offset + len` in 32 bits
-        // wraps to zero and then finds comfortably in bounds.
+        // The end is `u32::MAX + 1`, which an adapter computing `offset + len` in 32 bits
+        // wraps to zero and then finds comfortably in bounds. Safe because `unit` is a power
+        // of two no larger than the capacity, so the subtraction cannot underflow.
         let overflowing = match self.buffer.get_mut(..whole) {
             Some(slot) => self.storage.read(u32::MAX - unit + 1, slot).is_err(),
             None => false,
         };
-        let outcome = if past && overflowing {
+        // Starts in bounds and ends out of them, which is the "validate the start and forget
+        // the end" bug. Safe to issue anywhere: a read mutates nothing, so an adapter that
+        // wrongly accepts it damages no media inside the region or outside it.
+        let straddling = match self.buffer.get_mut(..whole + whole) {
+            Some(slot) => self.storage.read(capacity - unit, slot).is_err(),
+            None => false,
+        };
+        let outcome = if past && overflowing && straddling {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::IllegalOperationAccepted)
@@ -348,12 +452,15 @@ impl<S: StableStorage> Run<'_, S> {
     }
 
     fn program_past_capacity_is_refused(&mut self) {
-        let capacity = self.region.geometry().capacity();
+        let capacity = self.capacity();
         let unit = self.program_size();
-        if let Some(slot) = self.buffer.get_mut(..self.unit) {
-            slot.fill(0xFF);
-        }
+        self.fill_source(self.unit, ERASED);
 
+        // Both probes start at or past the capacity, so the bytes they name that are inside
+        // the device number zero: an adapter that wrongly accepted one has nothing in range
+        // to damage. The probe that *starts* in bounds is
+        // `MutationStraddlingTheCapacityIsRefused`, which is only issued when the region
+        // reaches the end of the device.
         let past = match self.buffer.get(..self.unit) {
             Some(src) => self.storage.program(capacity, src).is_err(),
             None => false,
@@ -371,18 +478,57 @@ impl<S: StableStorage> Run<'_, S> {
     }
 
     fn erase_past_capacity_is_refused(&mut self) {
-        let capacity = self.region.geometry().capacity();
+        let capacity = self.capacity();
         let unit = self.erase_size();
 
         let past = self.storage.erase(capacity, unit).is_err();
-        let straddling = self.storage.erase(capacity - unit, unit + unit).is_err();
         let overflowing = self.storage.erase(u32::MAX - unit + 1, unit).is_err();
-        let outcome = if past && straddling && overflowing {
+        let outcome = if past && overflowing {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::IllegalOperationAccepted)
         };
         self.record(CaseId::ErasePastCapacityIsRefused, outcome);
+    }
+
+    fn mutation_straddling_the_capacity_is_refused(&mut self) {
+        let case = CaseId::MutationStraddlingTheCapacityIsRefused;
+        let capacity = self.capacity();
+        if self.region.end() != capacity {
+            // The only mutation that starts in bounds and ends out of them begins in the
+            // device's last erase block. When that block is not the caller's, issuing one
+            // would ask an adapter that forgot to check the end to destroy the media the
+            // caller said not to touch — which is the failure this whole suite is careful
+            // not to cause. Reported rather than skipped, so a run on a mid-device region
+            // says which question it could not ask.
+            self.record(
+                case,
+                Outcome::NotApplicable(NotApplicable::TheRegionDoesNotEndAtTheCapacity),
+            );
+            return;
+        }
+        let block = self.erase_size();
+        let unit = self.program_size();
+        let last = capacity - block;
+        if !self.program_a_unit(case, last) {
+            return;
+        }
+
+        // A source of all zeros, so an adapter that applied the valid prefix would visibly
+        // clear the unit just programmed.
+        self.fill_source(self.unit + self.unit, 0x00);
+        let program_refused = !self.program_source(capacity - unit, self.unit + self.unit);
+        let erase_refused = self.storage.erase(last, block + block).is_err();
+        if !(program_refused && erase_refused) {
+            self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
+            return;
+        }
+        let outcome = match self.block_holds_the_pattern(last) {
+            Some(true) => Outcome::Passed,
+            Some(false) => Outcome::Failed(Failure::RefusedOperationTouchedMedia),
+            None => Outcome::Failed(Failure::LegalOperationRefused),
+        };
+        self.record(case, outcome);
     }
 
     fn refused_program_touches_no_media(&mut self) {
@@ -391,7 +537,7 @@ impl<S: StableStorage> Run<'_, S> {
         if unit == 1 {
             // With a one-byte program unit every in-bounds program is legal, so there is no
             // illegal operation that names bytes inside the region to observe. Refusing one
-            // that names bytes outside it would mean asking a broken driver to damage the
+            // that named bytes outside it would mean asking a broken adapter to damage the
             // media the caller said not to touch.
             self.record(
                 case,
@@ -404,104 +550,62 @@ impl<S: StableStorage> Run<'_, S> {
         }
         let half = usize::try_from(unit >> 1).unwrap_or(1);
         let base = self.block_a();
-        let before = 0;
-        let source = self.unit;
-        let after = self.unit + self.unit + half;
 
-        if self.read_into(base, self.unit, before).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-        // A source that clears every bit the media currently holds, so an applied write
-        // cannot be mistaken for a no-op.
-        for index in 0..self.unit + half {
-            let seen = self
-                .bytes(before, self.unit)
-                .and_then(|held| held.get(index % self.unit).copied())
-                .unwrap_or(0xFF);
-            if let Some(cell) = self.buffer.get_mut(source + index) {
-                *cell = !seen;
-            }
-        }
-        let accepted = match self.buffer.get(source..source + self.unit + half) {
-            Some(src) => self.storage.program(base, src).is_ok(),
-            None => false,
-        };
-        if accepted {
+        // A source of all zeros over erased media, so any byte of it that reached media is
+        // visible. The whole block is checked afterwards rather than only the bytes the
+        // operation named: an adapter that wrote the valid prefix and an adapter that
+        // scribbled past it are the same bug, and the second is the one a narrower window
+        // would miss.
+        self.fill_source(self.unit + half, 0x00);
+        if self.program_source(base, self.unit + half) {
             self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
             return;
         }
-        if self.read_into(base, self.unit, after).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-        let unchanged = self.bytes(before, self.unit) == self.bytes(after, self.unit);
-        let outcome = if unchanged {
-            Outcome::Passed
-        } else {
-            Outcome::Failed(Failure::RefusedOperationTouchedMedia)
+        let block = self.erase_size();
+        let outcome = match self.media_is_erased(base, block) {
+            Some(true) => Outcome::Passed,
+            Some(false) => Outcome::Failed(Failure::RefusedOperationTouchedMedia),
+            None => Outcome::Failed(Failure::LegalOperationRefused),
         };
         self.record(case, outcome);
     }
 
     fn refused_erase_touches_no_media(&mut self) {
         let case = CaseId::RefusedEraseTouchesNoMedia;
-        let unit = self.erase_size();
-        if unit == 1 {
+        let block = self.erase_size();
+        if block == 1 {
             self.record(
                 case,
                 Outcome::NotApplicable(NotApplicable::TheUnitIsOneByte),
             );
             return;
         }
-        if !self.erase_block(case, self.block_a()) {
+        if !self.erase_block(case, self.block_b()) {
+            return;
+        }
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
-        let before = 0;
-        let source = self.unit;
-        let after = self.unit + self.unit;
 
-        if self.read_into(base, self.unit, before).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-        // Put something in the block that an erase would visibly remove.
-        for index in 0..self.unit {
-            let seen = self
-                .bytes(before, self.unit)
-                .and_then(|held| held.get(index).copied())
-                .unwrap_or(0xFF);
-            if let Some(cell) = self.buffer.get_mut(source + index) {
-                *cell = !seen;
-            }
-        }
-        let programmed = match self.buffer.get(source..source + self.unit) {
-            Some(src) => self.storage.program(base, src).is_ok(),
-            None => false,
-        };
-        if !programmed {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-        if self.read_into(base, self.unit, before).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-
-        // Misaligned by half an erase block, and anchored so that a driver which applied it
-        // anyway would clear the block just programmed.
-        let accepted = self.storage.erase(base + (unit >> 1), unit).is_ok();
-        if accepted {
+        // Misaligned by half a block, and anchored so that an adapter which applied it
+        // anyway would clear the unit just programmed *and* reach into the neighbour. Both
+        // blocks are checked afterwards, because a refused erase that took the block it
+        // named and a refused erase that took the one after it are the same bug.
+        if self.storage.erase(base + (block >> 1), block).is_ok() {
             self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
             return;
         }
-        if self.read_into(base, self.unit, after).is_none() {
+        let neighbour = self.block_b();
+        let Some(intact) = self.block_holds_the_pattern(base) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
-        }
-        let unchanged = self.bytes(before, self.unit) == self.bytes(after, self.unit);
-        let outcome = if unchanged {
+        };
+        let Some(neighbour_intact) = self.media_is_erased(neighbour, block) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if intact && neighbour_intact {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::RefusedOperationTouchedMedia)
@@ -511,99 +615,38 @@ impl<S: StableStorage> Run<'_, S> {
 
     // ---- operations-act-on-what-they-name ----------------------------------------------
 
-    fn erase_yields_one_repeated_byte(&mut self) {
-        let case = CaseId::EraseYieldsOneRepeatedByte;
-        if !self.erase_block(case, self.block_a()) {
+    fn erase_yields_the_erased_byte(&mut self) {
+        // Programmed first, on purpose. An erase that does nothing at all leaves a block
+        // reading whatever it read before, and a case that only erased an already-erased
+        // block would call that a pass — which is exactly how an adapter whose `erase` is
+        // `Ok(())` and nothing else talks a suite out of testing it.
+        let case = CaseId::EraseYieldsTheErasedByte;
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
-        if self.read_into(base, self.unit, 0).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        }
-        let Some(first) = self
-            .bytes(0, self.unit)
-            .and_then(|held| held.first().copied())
-        else {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        };
         let block = self.erase_size();
-        match self.all_bytes_are(base, block, first) {
-            Some(true) => {
-                self.erased = Some(first);
-                self.record(case, Outcome::Passed);
-            }
-            Some(false) => self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion)),
-            None => self.record(case, Outcome::Failed(Failure::LegalOperationRefused)),
+        if !self.erase_block(case, base) {
+            return;
         }
-    }
-
-    /// The erased byte, or the failure to record when it was never learned.
-    fn erased_or_report(&mut self, case: CaseId) -> Option<u8> {
-        match self.erased {
-            Some(erased) if self.pattern_bites(erased) => Some(erased),
-            Some(_) => {
-                self.record(
-                    case,
-                    Outcome::NotApplicable(NotApplicable::TheErasedStateHasNoProgrammableBits),
-                );
-                None
-            }
-            None => {
-                self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
-                None
-            }
-        }
-    }
-
-    /// Erases block A and programs one unit of the run's pattern at its start.
-    ///
-    /// `Some(())` when the media now holds the pattern; the case has already been recorded
-    /// when it is `None`.
-    fn program_a_unit(&mut self, case: CaseId, erased: u8) -> Option<()> {
-        if !self.erase_block(case, self.block_a()) {
-            return None;
-        }
-        for index in 0..self.unit {
-            let wanted = Self::pattern(index, erased);
-            if let Some(cell) = self.buffer.get_mut(index) {
-                *cell = wanted;
-            }
-        }
-        let base = self.block_a();
-        let programmed = match self.buffer.get(..self.unit) {
-            Some(src) => self.storage.program(base, src).is_ok(),
-            None => false,
+        let outcome = match self.media_is_erased(base, block) {
+            Some(true) => Outcome::Passed,
+            Some(false) => Outcome::Failed(Failure::EraseDidNotClearTheRegion),
+            None => Outcome::Failed(Failure::LegalOperationRefused),
         };
-        if programmed {
-            Some(())
-        } else {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            None
-        }
-    }
-
-    /// Whether the unit at `offset` reads back as the run's pattern.
-    fn unit_holds_the_pattern(&mut self, offset: u32, erased: u8) -> Option<bool> {
-        self.read_into(offset, self.unit, self.unit)?;
-        Some((0..self.unit).all(|index| {
-            self.bytes(self.unit, self.unit)
-                .and_then(|held| held.get(index).copied())
-                == Some(Self::pattern(index, erased))
-        }))
+        self.record(case, outcome);
     }
 
     fn program_round_trips_through_read(&mut self) {
         let case = CaseId::ProgramRoundTripsThroughRead;
-        let Some(erased) = self.erased_or_report(case) else {
-            return;
-        };
-        if self.program_a_unit(case, erased).is_none() {
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
-        let outcome = match self.unit_holds_the_pattern(base, erased) {
+        let unit = self.program_size();
+        let outcome = match self.media_matches(base, unit, |position| {
+            pattern(usize::try_from(position).unwrap_or(0))
+        }) {
             Some(true) => Outcome::Passed,
             Some(false) => Outcome::Failed(Failure::ReadBackDiffers),
             None => Outcome::Failed(Failure::LegalOperationRefused),
@@ -622,14 +665,11 @@ impl<S: StableStorage> Run<'_, S> {
             );
             return;
         }
-        let Some(erased) = self.erased_or_report(case) else {
-            return;
-        };
-        if self.program_a_unit(case, erased).is_none() {
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let rest = self.block_a() + unit;
-        let outcome = match self.all_bytes_are(rest, block - unit, erased) {
+        let outcome = match self.media_is_erased(rest, block - unit) {
             Some(true) => Outcome::Passed,
             Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
             None => Outcome::Failed(Failure::LegalOperationRefused),
@@ -639,32 +679,14 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn erase_leaves_the_neighbouring_block_alone(&mut self) {
         let case = CaseId::EraseLeavesTheNeighbouringBlockAlone;
-        let Some(erased) = self.erased_or_report(case) else {
-            return;
-        };
-        if !self.erase_block(case, self.block_b()) {
-            return;
-        }
-        // Program the neighbour, then erase the block next to it.
-        for index in 0..self.unit {
-            let wanted = Self::pattern(index, erased);
-            if let Some(cell) = self.buffer.get_mut(index) {
-                *cell = wanted;
-            }
-        }
-        let neighbour = self.block_b();
-        let programmed = match self.buffer.get(..self.unit) {
-            Some(src) => self.storage.program(neighbour, src).is_ok(),
-            None => false,
-        };
-        if !programmed {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+        if !self.program_a_unit(case, self.block_b()) {
             return;
         }
         if !self.erase_block(case, self.block_a()) {
             return;
         }
-        let outcome = match self.unit_holds_the_pattern(neighbour, erased) {
+        let neighbour = self.block_b();
+        let outcome = match self.block_holds_the_pattern(neighbour) {
             Some(true) => Outcome::Passed,
             Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
             None => Outcome::Failed(Failure::LegalOperationRefused),
@@ -674,17 +696,13 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn erase_is_idempotent(&mut self) {
         let case = CaseId::EraseIsIdempotent;
-        let Some(erased) = self.erased else {
-            self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
-            return;
-        };
         let block = self.erase_size();
         let base = self.block_a();
         for _ in 0..2 {
             if !self.erase_block(case, base) {
                 return;
             }
-            match self.all_bytes_are(base, block, erased) {
+            match self.media_is_erased(base, block) {
                 Some(true) => {}
                 Some(false) => {
                     self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
@@ -701,19 +719,15 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn zero_length_operations_are_legal_and_change_nothing(&mut self) {
         let case = CaseId::ZeroLengthOperationsAreLegalAndChangeNothing;
-        let Some(erased) = self.erased else {
-            self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
-            return;
-        };
-        if self.program_a_unit(case, erased).is_none() {
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
 
-        // A caller with nothing to write is not a caller with a bug, and a driver that
+        // A caller with nothing to write is not a caller with a bug, and an adapter that
         // refused would push the empty case into every call site above it. The capacity is
         // an aligned offset for all three units, so it is a legal empty operation too.
-        let capacity = self.region.geometry().capacity();
+        let capacity = self.capacity();
         let legal = self.storage.read(base, &mut []).is_ok()
             && self.storage.program(base, &[]).is_ok()
             && self.storage.erase(base, 0).is_ok()
@@ -724,7 +738,7 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let outcome = match self.unit_holds_the_pattern(base, erased) {
+        let outcome = match self.block_holds_the_pattern(base) {
             Some(true) => Outcome::Passed,
             Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
             None => Outcome::Failed(Failure::LegalOperationRefused),
@@ -734,11 +748,17 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn partial_reads_agree_with_the_whole(&mut self) {
         let case = CaseId::PartialReadsAgreeWithTheWhole;
-        let Some(erased) = self.erased else {
-            self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
+        if self.read_size() == self.program_size() {
+            // One read of the unit and one read of the whole unit are the same read, so
+            // there is nothing partial to disagree. Reported rather than passed, because a
+            // case that compared a value with itself would be a hollow green row.
+            self.record(
+                case,
+                Outcome::NotApplicable(NotApplicable::TheReadUnitIsTheProgramUnit),
+            );
             return;
-        };
-        if self.program_a_unit(case, erased).is_none() {
+        }
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
@@ -753,16 +773,11 @@ impl<S: StableStorage> Run<'_, S> {
                 self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
                 return;
             };
-            if self
-                .read_into(base + offset, step, self.unit + self.unit)
-                .is_none()
-            {
+            if self.read_into(base + offset, step, 0).is_none() {
                 self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
                 return;
             }
-            let piece = self.bytes(self.unit + self.unit, step);
-            let whole = self.bytes(self.unit + at, step);
-            if piece != whole {
+            if self.bytes(0, step) != self.bytes(self.unit + at, step) {
                 self.record(case, Outcome::Failed(Failure::ReadBackDiffers));
                 return;
             }
@@ -782,39 +797,26 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn barrier_changes_no_media(&mut self) {
         let case = CaseId::BarrierChangesNoMedia;
-        let Some(erased) = self.erased else {
-            self.record(case, Outcome::Failed(Failure::EraseDidNotClearTheRegion));
-            return;
-        };
         // The third block is where a barrier that scribbled somewhere *else* would show
         // up: nothing programs it, so it must still read erased when the barrier is done.
-        let third = self.region.offset() + self.erase_size() + self.erase_size();
+        let third = self.block_c();
         if !self.erase_block(case, third) {
             return;
         }
-        if self.program_a_unit(case, erased).is_none() {
-            return;
-        }
-        let base = self.block_a();
-        if self.read_into(base, self.unit, self.unit).is_none() {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         if self.storage.barrier().is_err() {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        if self
-            .read_into(base, self.unit, self.unit + self.unit)
-            .is_none()
-        {
+        let base = self.block_a();
+        let Some(unchanged) = self.block_holds_the_pattern(base) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
-        }
-        let unchanged =
-            self.bytes(self.unit, self.unit) == self.bytes(self.unit + self.unit, self.unit);
+        };
         let block = self.erase_size();
-        let Some(elsewhere) = self.all_bytes_are(third, block, erased) else {
+        let Some(elsewhere) = self.media_is_erased(third, block) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
@@ -833,5 +835,47 @@ impl<S: StableStorage> Run<'_, S> {
             Outcome::Failed(Failure::LegalOperationRefused)
         };
         self.record(CaseId::RepeatedBarriersAreLegal, outcome);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ERASED, pattern};
+
+    #[test]
+    fn every_pattern_byte_is_programmable_from_erased_and_is_not_the_erased_byte() {
+        // The two properties every round-trip case rests on. A pattern byte equal to `0xFF`
+        // would make "program it and read it back" pass against an adapter that ignores
+        // programs, and one with a bit `ERASED` does not hold could not be programmed at
+        // all. Swept over more indices than any program unit this suite will meet.
+        for index in 0..4096_usize {
+            let byte = pattern(index);
+            assert_eq!(
+                byte & !ERASED,
+                0,
+                "pattern({index}) sets a bit erase clears"
+            );
+            assert_ne!(byte, ERASED, "pattern({index}) is the erased byte");
+        }
+    }
+
+    #[test]
+    fn the_pattern_varies_within_a_program_unit() {
+        // An adapter that programs one byte over and over is caught only if the bytes it
+        // should have written differ from each other.
+        let first = pattern(0);
+        assert!(
+            (1..8).any(|index| pattern(index) != first),
+            "the pattern is constant across a program unit"
+        );
+    }
+
+    #[test]
+    fn the_pattern_repeats_every_two_hundred_and_fifty_six_bytes() {
+        // A program unit wider than 256 bytes repeats, which is stated rather than left to
+        // be discovered: nothing here needs the pattern to be injective.
+        for index in 0..512_usize {
+            assert_eq!(pattern(index), pattern(index + 256));
+        }
     }
 }
