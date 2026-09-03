@@ -580,37 +580,41 @@ impl<S: StableStorage> Run<'_, S> {
             );
             return;
         }
-        if !self.erase_block(case, self.block_b()) {
+        // A witness in *both* blocks, because the two misalignments an erase can have reach
+        // different media. A refused erase is only observable where the erase would have
+        // landed: with a 64-byte block and a 4-byte unit, `erase(base + 32, 64)` never
+        // touches `base..base + 4`, so a witness in the first block alone leaves an adapter
+        // that performs the erase and then refuses looking spotless.
+        if !self.program_a_unit(case, self.block_b()) {
             return;
         }
         if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
-
-        // Misaligned by half a block, and anchored so that an adapter which applied it
-        // anyway would clear the unit just programmed *and* reach into the neighbour. Both
-        // blocks are checked afterwards, because a refused erase that took the block it
-        // named and a refused erase that took the one after it are the same bug.
-        if self.storage.erase(base + (block >> 1), block).is_ok() {
-            self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
-            return;
-        }
         let neighbour = self.block_b();
-        let Some(intact) = self.block_holds_the_pattern(base) else {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        };
-        let Some(neighbour_intact) = self.media_is_erased(neighbour, block) else {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        };
-        let outcome = if intact && neighbour_intact {
-            Outcome::Passed
-        } else {
-            Outcome::Failed(Failure::RefusedOperationTouchedMedia)
-        };
-        self.record(case, outcome);
+
+        // Misaligned in length, starting at the first witness; and misaligned in offset,
+        // reaching across into the second. Between them every byte either erase would have
+        // cleared is a byte one of the two witnesses occupies.
+        for (offset, len) in [(base, block + (block >> 1)), (base + (block >> 1), block)] {
+            if self.storage.erase(offset, len).is_ok() {
+                self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
+                return;
+            }
+            let (Some(first), Some(second)) = (
+                self.block_holds_the_pattern(base),
+                self.block_holds_the_pattern(neighbour),
+            ) else {
+                self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+                return;
+            };
+            if !(first && second) {
+                self.record(case, Outcome::Failed(Failure::RefusedOperationTouchedMedia));
+                return;
+            }
+        }
+        self.record(case, Outcome::Passed);
     }
 
     // ---- operations-act-on-what-they-name ----------------------------------------------

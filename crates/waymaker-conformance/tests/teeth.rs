@@ -70,8 +70,12 @@ enum Flaw {
     BoundsCheckedAtTheStartOnly,
     /// A straddling mutation applies its in-bounds prefix and then refuses.
     StraddlingMutationWipesTheValidPrefix,
-    /// A refused *misaligned* erase clears the block it named on its way out.
-    RefusedMisalignedEraseTakesTheBlockItNamed,
+    /// A refused *misaligned* erase clears exactly the range it named on its way out.
+    ///
+    /// The one an adapter that validates after the fact really has: it does the work, then
+    /// notices, then reports. Whether the suite sees it depends entirely on whether its
+    /// witness bytes lie inside the range the erase named.
+    RefusedMisalignedEraseTakesTheRangeItNamed,
 }
 
 const ERASED: u8 = 0xFF;
@@ -268,11 +272,10 @@ impl StableStorage for Broken {
                 Ok(()) => {}
                 Err(GeometryError::OutOfBounds) if !self.checks_the_end(offset) => {}
                 Err(error) => {
-                    let block = self.geometry.erase_size();
-                    if self.flaw == Flaw::RefusedMisalignedEraseTakesTheBlockItNamed
+                    if self.flaw == Flaw::RefusedMisalignedEraseTakesTheRangeItNamed
                         && error != GeometryError::OutOfBounds
                     {
-                        self.fill(offset - (offset % block), block, |_| ERASED);
+                        self.fill(offset, len, |_| ERASED);
                     }
                     if self.flaw == Flaw::StraddlingMutationWipesTheValidPrefix
                         && error == GeometryError::OutOfBounds
@@ -379,7 +382,7 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Failure::RefusedOperationTouchedMedia,
     ),
     (
-        Flaw::RefusedMisalignedEraseTakesTheBlockItNamed,
+        Flaw::RefusedMisalignedEraseTakesTheRangeItNamed,
         CaseId::RefusedEraseTouchesNoMedia,
         Failure::RefusedOperationTouchedMedia,
     ),
@@ -550,7 +553,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::WanderingGeometry
         | Flaw::RefusalScribblesFirst
         | Flaw::StraddlingMutationWipesTheValidPrefix
-        | Flaw::RefusedMisalignedEraseTakesTheBlockItNamed
+        | Flaw::RefusedMisalignedEraseTakesTheRangeItNamed
         | Flaw::EraseYieldsMixedBytes
         | Flaw::EraseYieldsZeros
         | Flaw::EraseDoesNothingOnZeroedMedia
@@ -588,7 +591,7 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::MutationStraddlingTheCapacityIsRefused,
             Failure::RefusedOperationTouchedMedia,
         )),
-        Flaw::RefusedMisalignedEraseTakesTheBlockItNamed => Some((
+        Flaw::RefusedMisalignedEraseTakesTheRangeItNamed => Some((
             CaseId::RefusedEraseTouchesNoMedia,
             Failure::RefusedOperationTouchedMedia,
         )),
@@ -643,7 +646,7 @@ const ALL: &[Flaw] = &[
     Flaw::WanderingGeometry,
     Flaw::RefusalScribblesFirst,
     Flaw::StraddlingMutationWipesTheValidPrefix,
-    Flaw::RefusedMisalignedEraseTakesTheBlockItNamed,
+    Flaw::RefusedMisalignedEraseTakesTheRangeItNamed,
     Flaw::EraseYieldsMixedBytes,
     Flaw::EraseYieldsZeros,
     Flaw::EraseDoesNothingOnZeroedMedia,
