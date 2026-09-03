@@ -244,6 +244,35 @@ The last two are worth spelling out because they fail in different places: 4 fai
 `check-layering` itself, and 5 fails `cargo test` while `check-layering` prints `ok`. A
 contributor working from a three-item list gets a green gate and a red build.
 
+### Changing the record representation, or a recovery guarantee
+
+Issue [#20](https://github.com/madmax983/waymaker/issues/20) asks for a specific order, and
+it is the opposite of the one that comes naturally: **the model and the invariants first,
+then the proofs, then the code.** A representation changed first and modelled afterwards is a
+model written to agree with what was already built, which is the one thing a specification
+must not be.
+
+1. `crates/waymaker-spec/src/model.rs` — the ghost state, the transition, its preconditions
+   and its postconditions. If a precondition is new, it goes in `Guard` so it can be removed
+   on its own.
+2. `crates/waymaker-spec/src/invariant.rs` — what §14 now requires, if that changed.
+3. The proofs. `tests/necessity.rs` needs a row for a new guard and `tests/teeth.rs` a row
+   for a new wrong reader; both fail without one. `tests/census.rs` pins the reachable state
+   count *and* the per-kind edge counts, and both are expected to move — the pin exists
+   because the dangerous direction is a machine that silently shrank, not because the numbers
+   are sacred.
+4. `tests/refinement.rs` — the firmware has to still be a refinement of the model, at every
+   crash point, or the model is now describing something else.
+5. The code.
+
+A guarantee added or removed is a row in `xtask::docs::SPEC_CLAUSES`, a row in
+`crates/waymaker-spec/src/obligation.rs`, a row in
+[the guarantees table](#the-guarantees-and-what-holds-each-up), and a line in
+[ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md).
+The `recovery-spec` rule fails a build in which those four disagree. Nothing can check the
+*order* above; what it checks is that the four never drift, which is the part that fails
+silently.
+
 ### Adding an ADR
 
 Copy [`docs/adr/0000-template.md`](docs/adr/0000-template.md) to the next unused number, fill

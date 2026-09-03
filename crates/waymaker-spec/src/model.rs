@@ -644,6 +644,14 @@ impl Journal {
     }
 
     /// Gives the next record in declaration order an identity. Nothing reaches media.
+    ///
+    /// # Postconditions
+    ///
+    /// One record longer, and identical in every other dimension. The new record is
+    /// [`OnMedia::Absent`] and unacknowledged, its id is its position, and no earlier record
+    /// changes. Held over every edge by `tests/machine.rs`'s
+    /// `a_declared_record_is_never_renumbered_or_removed` and by the census's requirement
+    /// that a record arrive [`Durability::Attempted`] and in no other state.
     fn declare(&mut self, bound: Bound) -> Result<(), Illegal> {
         if self.records.len() >= bound.records {
             return Err(Illegal::CapacityReached);
@@ -658,6 +666,15 @@ impl Journal {
     }
 
     /// Puts `id`'s bytes on media, wholly or in part.
+    ///
+    /// # Postconditions
+    ///
+    /// Exactly one record changes, from [`OnMedia::Absent`] to [`OnMedia::Whole`] or
+    /// [`OnMedia::Partial`]. No record's acknowledgment changes, and no record's bytes are
+    /// taken back — `tests/machine.rs`'s `bytes_on_media_are_never_taken_back_within_a_run`
+    /// is that second half over every edge. With [`Guard::AppendOnly`] enforced, every
+    /// earlier record is already whole, which is what makes the written record extend a
+    /// prefix rather than land behind a gap.
     fn write(&mut self, id: RecordId, whole: bool, guards: Guards) -> Result<(), Illegal> {
         let position = self.position_of(id).ok_or(Illegal::UndeclaredRecord)?;
         let target = self
@@ -685,6 +702,16 @@ impl Journal {
     /// Waits for the durability barrier. Infallible: a barrier over a device with a
     /// half-written record on it returns perfectly well — what it must not do is claim that
     /// record, which is [`Guard::BarrierNeedsWhole`].
+    ///
+    /// # Postconditions
+    ///
+    /// Every [`OnMedia::Whole`] record is acknowledged and no other record is; nothing else
+    /// changes, and no acknowledgment is taken back. The second is
+    /// `an_acknowledged_record_is_never_un_acknowledged` over every edge, and the first is
+    /// `under_the_specification_an_acknowledged_record_is_wholly_on_media` over every state.
+    /// This is the one transition permitted to leave the state unchanged, and
+    /// `no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to` is what
+    /// keeps that permission to this one.
     fn barrier(&mut self, guards: Guards) {
         let claims = if guards.enforces(Guard::BarrierNeedsWhole) {
             OnMedia::Whole
@@ -699,6 +726,14 @@ impl Journal {
     }
 
     /// Hands the effect `id` schedules to the world.
+    ///
+    /// # Postconditions
+    ///
+    /// `id` is in [`dispatched`](Self::dispatched), which stays sorted and free of
+    /// duplicates; no record and no bank changes. With [`Guard::DurableIntent`] enforced,
+    /// `id` was already acknowledged when this ran — §02 decision 3, which is what makes
+    /// [`crate::invariant::Invariant::DurableIntent`] hold rather than a thing to check
+    /// afterwards.
     fn dispatch(&mut self, id: RecordId, guards: Guards) -> Result<(), Illegal> {
         let record = self
             .records
@@ -717,6 +752,15 @@ impl Journal {
     }
 
     /// Begins erasing a bank, clearing its seal before the erase has returned.
+    ///
+    /// # Postconditions
+    ///
+    /// The named bank is [`Bank::Erasing`] and is not bootable; the other bank is untouched,
+    /// as is every record — which is precisely the dimension this model does not yet have,
+    /// and [`crate::obligation`]'s `single-authority` row is where that is written down.
+    /// With [`Guard::NeverEraseTheAuthority`] enforced the named bank was not the one a
+    /// reader would boot from, so the authoritative generation does not fall —
+    /// `the_authoritative_generation_never_goes_backwards`, over every edge.
     fn begin_erase(&mut self, bank: BankId, guards: Guards) -> Result<(), Illegal> {
         if self.bank(bank) == Bank::Erasing {
             return Err(Illegal::EraseAlreadyInFlight);
@@ -729,6 +773,10 @@ impl Journal {
     }
 
     /// The erase returned, so the bank is blank.
+    ///
+    /// # Postconditions
+    ///
+    /// The named bank is [`Bank::Erased`] and may now be sealed; nothing else changes.
     fn commit_erase(&mut self, bank: BankId) -> Result<(), Illegal> {
         if self.bank(bank) != Bank::Erasing {
             return Err(Illegal::BankNotErasing);
@@ -738,6 +786,14 @@ impl Journal {
     }
 
     /// Writes a bank's generation seal without waiting for it.
+    ///
+    /// # Postconditions
+    ///
+    /// The named bank is [`Bank::Sealing`] and still not bootable, so the authoritative bank
+    /// is whichever it was — §02 decision 7's "only after its payload and generation seal
+    /// are durable". With [`Guard::StrictGeneration`] enforced the pending generation
+    /// strictly outranks the other bank's, which `a_new_seal_is_strictly_newer_than_the_bank_it_replaces`
+    /// holds over every edge and which is what makes the two never tie.
     fn begin_seal(&mut self, bank: BankId, guards: Guards, bound: Bound) -> Result<(), Illegal> {
         if self.bank(bank) != Bank::Erased {
             return Err(Illegal::BankNotErased);
@@ -759,6 +815,13 @@ impl Journal {
     }
 
     /// Waits for the seal's barrier. §02 decision 7's "only after ... are durable".
+    ///
+    /// # Postconditions
+    ///
+    /// The named bank is [`Bank::Sealed`] at the generation its seal was *written* at — not
+    /// one this transition chooses, which `committing_a_seal_keeps_the_generation_the_seal_was_written_at`
+    /// holds over every edge — and the device has now sealed at least once, so
+    /// [`crate::invariant::Invariant::SingleAuthority`] applies to it from here on.
     fn commit_seal(&mut self, bank: BankId) -> Result<(), Illegal> {
         let Bank::Sealing(generation) = self.bank(bank) else {
             return Err(Illegal::BankNotSealing);
@@ -769,6 +832,15 @@ impl Journal {
     }
 
     /// The power goes away part-way through the open record's program.
+    ///
+    /// # Postconditions
+    ///
+    /// Exactly one record moves from [`OnMedia::Absent`] to [`OnMedia::Partial`], and the
+    /// power is off — so nothing else happens in this run, which
+    /// `the_power_going_away_is_the_end_of_the_run` holds over every state. The torn record
+    /// is the last one on media and nothing behind it is acknowledged, which is the lemma
+    /// acknowledged durability rests on and which `tests/spine.rs` proves rather than
+    /// assumes.
     fn tear(&mut self, guards: Guards) -> Result<(), Illegal> {
         let position = self
             .records
