@@ -27,8 +27,20 @@ storage model and the crash injector: media that starts erased and only clears b
 complete list of points at which a write sequence can be interrupted — every byte of a
 program, every erase block of an erase, before and after every barrier — enumerated rather
 than sampled, with §15's recovery oracle as a function
-([ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)). Timers and the
-two timer records are the rest of 0.1; the commit seal and the bank swap arrive with 0.2.
+([ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)).
+
+That oracle is now all four lines design document §15 states, and it is swept over histories
+drawn from a seed on geometries drawn from the same one, at every crash point the injector
+lists rather than at a sample of them
+([ADR 0014](docs/adr/0014-the-oracle-is-four-lines-and-the-sweep-is-seeded.md)). Issue #19's
+coverage list is asserted rather than claimed: a census fails the build when the sweep stops
+covering it, and two tests read the enumeration directly to check that a tear really does
+land at every byte and every program unit and that the power really does go before and after
+every barrier. The suite is also proven able to fail — codecs that stop sealing what they say
+they seal, written and read by the same weakened firmware through the `IntegrityCheck` trait,
+are caught, as is history read one record short, out of order, one skipped or one invented.
+Timers and the two timer records are the rest of 0.1; the commit seal and the bank swap
+arrive with 0.2.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check

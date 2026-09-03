@@ -407,6 +407,22 @@ Three unrelated writers are driven through it unmodified, so "reusable without m
 is a test rather than a claim — see
 [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md), which also
 records what this leaves owed: the hardware power-cut loops, at 0.2, where the boards are.
+Issue #19 then makes that harness prove something. §15's oracle is now all four of its lines —
+the prefix, the acknowledgment obligation, the dispatched-intent obligation, and exactly one
+authoritative bank — and it is swept over record sequences drawn from a seed on geometries
+drawn from the same one, at every crash point the injector lists. What #19 asks to be covered
+is asserted rather than claimed: a census fails the build when the sweep thins out, and two
+tests read the enumeration itself to check that a tear lands at every byte and every program
+unit and that the power goes before and after every barrier. The other half of the exit
+criterion is that the suite can fail, and it is shown rather than argued: codecs that stop
+sealing what they say they seal — ordinary implementations of ADR 0012's `IntegrityCheck`
+trait, so the journal is written and read by the same weakened firmware — are caught with
+`RecoveredATornRecord`, and history read one record short, out of order, one skipped or one
+invented past the end is caught too. See
+[ADR 0014](docs/adr/0014-the-oracle-is-four-lines-and-the-sweep-is-seeded.md), which also
+says where the limits are: the cursor mutants are models of a bug rather than injections into
+a `const fn` state machine, and the two-bank generation seal is a stand-in for the storage
+unit rung 0.2 owns.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The
