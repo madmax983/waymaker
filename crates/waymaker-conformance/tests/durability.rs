@@ -13,8 +13,69 @@
 
 use waymaker_conformance::durability::{Breach, Verdict, WitnessError, arm, verify};
 use waymaker_conformance::region::Region;
+use waymaker_conformance::suite::SuiteError;
 use waymaker_fault::{Device, Harness};
-use waymaker_flash::storage::Geometry;
+use waymaker_flash::storage::{Geometry, StableStorage};
+
+/// A device that accepts every program and keeps none of them.
+///
+/// The one shape `arm` has to refuse rather than report as "nothing was durable": if a
+/// witness never reaches media, every answer `verify` could give afterwards is about a
+/// device that was never armed.
+struct Amnesiac(Device);
+
+impl StableStorage for Amnesiac {
+    type Error = waymaker_fault::FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.0.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        let _ = (offset, src);
+        Ok(())
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.0.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.0.barrier()
+    }
+}
+
+/// A device whose reads refuse, so that `verify` has a driver error to carry.
+struct Blind(Device);
+
+impl StableStorage for Blind {
+    type Error = waymaker_fault::FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.0.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let _ = (offset, dst);
+        Err(waymaker_fault::FaultError::InjectedFailure)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.0.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.0.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.0.barrier()
+    }
+}
 
 fn nested() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 64, 4, 2) else {
@@ -166,15 +227,11 @@ fn a_witness_needs_a_region_that_belongs_to_the_device() {
 
     assert_eq!(
         arm(&mut device, whole(other), &mut buffer),
-        Err(WitnessError::Suite(
-            waymaker_conformance::suite::SuiteError::RegionIsNotForThisDevice
-        ))
+        Err(WitnessError::Suite(SuiteError::RegionIsNotForThisDevice))
     );
     assert_eq!(
         verify(&mut device, whole(other), &mut buffer),
-        Err(WitnessError::Suite(
-            waymaker_conformance::suite::SuiteError::RegionIsNotForThisDevice
-        ))
+        Err(WitnessError::Suite(SuiteError::RegionIsNotForThisDevice))
     );
 }
 
@@ -187,9 +244,49 @@ fn a_witness_needs_a_buffer_it_can_work_in() {
 
     assert_eq!(
         arm(&mut device, region, &mut buffer),
-        Err(WitnessError::Suite(
-            waymaker_conformance::suite::SuiteError::BufferTooSmall
+        Err(WitnessError::Suite(SuiteError::BufferTooSmall))
+    );
+}
+
+#[test]
+fn a_witness_that_does_not_reach_media_is_refused_at_arm_time() {
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Amnesiac(Device::new(geometry));
+
+    assert_eq!(
+        arm(&mut device, region, &mut buffer),
+        Err(WitnessError::WitnessDidNotTake),
+        "a device that keeps no witness must be told so before any barrier claims one"
+    );
+}
+
+#[test]
+fn a_read_the_driver_refuses_reaches_the_caller() {
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Blind(Device::new(geometry));
+
+    assert_eq!(
+        verify(&mut device, region, &mut buffer),
+        Err(WitnessError::Driver(
+            waymaker_fault::FaultError::InjectedFailure
         ))
+    );
+}
+
+#[test]
+fn verifying_needs_a_buffer_it_can_work_in() {
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 2];
+    let mut device = Device::new(geometry);
+
+    assert_eq!(
+        verify(&mut device, region, &mut buffer),
+        Err(WitnessError::Suite(SuiteError::BufferTooSmall))
     );
 }
 

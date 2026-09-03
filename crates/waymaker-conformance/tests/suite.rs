@@ -132,6 +132,46 @@ fn a_block_that_is_one_program_unit_exempts_the_rest_of_the_block_case() {
     );
 }
 
+/// A geometry whose erase block is a single byte, where no misaligned operation exists.
+fn byte_granular_blocks() -> Geometry {
+    let Ok(geometry) = Geometry::new(1024, 1, 1, 1) else {
+        unreachable!("1024 is whole single-byte blocks")
+    };
+    geometry
+}
+
+#[test]
+fn a_device_with_byte_granular_erase_exempts_every_misalignment_case() {
+    // A geometry no NOR part has, and the only one in which the erase half of
+    // `validated-before-media` has nothing to ask. Reported as an exemption rather than as a
+    // pass, because "there was no misaligned erase to refuse" and "the misaligned erase was
+    // refused" are different facts about a driver.
+    let geometry = byte_granular_blocks();
+    let mut device = Device::new(geometry);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(report.verdict(), Ok(()), "{report:?}");
+    for case in [
+        CaseId::MisalignedReadIsRefused,
+        CaseId::MisalignedProgramIsRefused,
+        CaseId::MisalignedEraseIsRefused,
+        CaseId::RefusedProgramTouchesNoMedia,
+        CaseId::RefusedEraseTouchesNoMedia,
+    ] {
+        assert_eq!(
+            report.outcome(case),
+            Outcome::NotApplicable(NotApplicable::TheUnitIsOneByte),
+            "{case:?}"
+        );
+    }
+    assert_eq!(
+        report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
+        Outcome::NotApplicable(NotApplicable::TheBlockIsOneProgramUnit)
+    );
+}
+
 #[test]
 fn the_suite_refuses_a_buffer_it_cannot_work_in() {
     let geometry = nested();

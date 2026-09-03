@@ -12,7 +12,7 @@
 
 use std::cell::Cell;
 
-use waymaker_conformance::case::{CaseId, Failure, Outcome};
+use waymaker_conformance::case::{CaseId, Failure, NotApplicable, Outcome};
 use waymaker_conformance::region::Region;
 use waymaker_conformance::suite::run;
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
@@ -48,6 +48,14 @@ enum Flaw {
     BarrierScribbles,
     /// A read always returns the erased byte.
     ReadReturnsErased,
+    /// Every read refuses.
+    ReadAlwaysFails,
+    /// Every program refuses.
+    ProgramAlwaysFails,
+    /// Every erase refuses.
+    EraseAlwaysFails,
+    /// An erase leaves a byte with no set bits, so nothing can be programmed afterwards.
+    EraseYieldsZeros,
 }
 
 const ERASED: u8 = 0xFF;
@@ -135,7 +143,9 @@ impl StableStorage for Broken {
     }
 
     fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
-        if self.flaw == Flaw::ZeroLengthIsRefused && dst.is_empty() {
+        if self.flaw == Flaw::ReadAlwaysFails
+            || (self.flaw == Flaw::ZeroLengthIsRefused && dst.is_empty())
+        {
             return Err(Refused);
         }
         let Ok(len) = u32::try_from(dst.len()) else {
@@ -170,7 +180,9 @@ impl StableStorage for Broken {
         let Ok(len) = u32::try_from(src.len()) else {
             return Err(Refused);
         };
-        if self.flaw == Flaw::ZeroLengthIsRefused && src.is_empty() {
+        if self.flaw == Flaw::ProgramAlwaysFails
+            || (self.flaw == Flaw::ZeroLengthIsRefused && src.is_empty())
+        {
             return Err(Refused);
         }
         if self.validates() {
@@ -199,7 +211,9 @@ impl StableStorage for Broken {
     }
 
     fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
-        if self.flaw == Flaw::ZeroLengthIsRefused && len == 0 {
+        if self.flaw == Flaw::EraseAlwaysFails
+            || (self.flaw == Flaw::ZeroLengthIsRefused && len == 0)
+        {
             return Err(Refused);
         }
         if self.validates() {
@@ -223,6 +237,7 @@ impl StableStorage for Broken {
                     },
                 );
             }
+            Flaw::EraseYieldsZeros => self.fill(offset, len, |_| 0x00),
             _ => self.fill(offset, len, |_| ERASED),
         }
         Ok(())
@@ -322,7 +337,35 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         CaseId::BarrierChangesNoMedia,
         Failure::MediaOutsideTheOperationChanged,
     ),
+    (
+        Flaw::ReadAlwaysFails,
+        CaseId::EraseYieldsOneRepeatedByte,
+        Failure::LegalOperationRefused,
+    ),
+    (
+        Flaw::ProgramAlwaysFails,
+        CaseId::RefusedEraseTouchesNoMedia,
+        Failure::LegalOperationRefused,
+    ),
+    (
+        Flaw::EraseAlwaysFails,
+        CaseId::RefusedProgramTouchesNoMedia,
+        Failure::LegalOperationRefused,
+    ),
 ];
+
+/// The adapters the suite does *not* catch, and the exemption each one earns instead.
+///
+/// A hole recorded as a test rather than as a footnote. `EraseYieldsZeros` is the honest
+/// limit of a suite that refuses to assume NOR polarity: an erased state with no set bits is
+/// something media is allowed to be, and it is indistinguishable from a read that is broken
+/// in that direction. What the suite does instead of guessing is say which cases it could not
+/// ask — which is what `NotApplicable` is for.
+const EXEMPTED: &[(Flaw, CaseId, NotApplicable)] = &[(
+    Flaw::EraseYieldsZeros,
+    CaseId::ProgramRoundTripsThroughRead,
+    NotApplicable::TheErasedStateHasNoProgrammableBits,
+)];
 
 #[test]
 fn the_control_adapter_passes() {
@@ -359,6 +402,41 @@ fn every_wrong_adapter_is_caught_by_the_case_that_names_it() {
 }
 
 #[test]
+fn an_adapter_the_suite_cannot_judge_is_exempted_rather_than_passed() {
+    let geometry = nested();
+    for (flaw, case, reason) in EXEMPTED {
+        let mut device = Broken::new(geometry, *flaw);
+        let mut buffer = [0_u8; 64];
+
+        let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+        assert_eq!(
+            report.outcome(*case),
+            Outcome::NotApplicable(*reason),
+            "{flaw:?} should have exempted {case:?}: {report:?}"
+        );
+        assert!(
+            report.exemptions().any(|(exempt, _)| exempt == *case),
+            "{flaw:?} exempted {case:?} without saying so in the report"
+        );
+    }
+}
+
+#[test]
+fn a_failing_report_names_its_first_failure() {
+    let geometry = nested();
+    let mut device = Broken::new(geometry, Flaw::WanderingGeometry);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(
+        report.first_failure(),
+        Some((CaseId::GeometryIsStable, Failure::GeometryIsNotStable))
+    );
+}
+
+#[test]
 fn every_flaw_the_model_can_wear_is_in_the_table() {
     // A flaw added to the model and left out of the table is a wrong adapter nobody
     // required the suite to catch, which is exactly the shape of an untested gate.
@@ -376,11 +454,19 @@ fn every_flaw_the_model_can_wear_is_in_the_table() {
         Flaw::BarrierFails,
         Flaw::BarrierScribbles,
         Flaw::ReadReturnsErased,
+        Flaw::ReadAlwaysFails,
+        Flaw::ProgramAlwaysFails,
+        Flaw::EraseAlwaysFails,
+        Flaw::EraseYieldsZeros,
     ];
     for flaw in ALL {
+        let caught = TEETH.iter().any(|(candidate, _, _)| candidate == flaw);
+        let exempted = EXEMPTED.iter().any(|(candidate, _, _)| candidate == flaw);
         assert!(
-            TEETH.iter().any(|(candidate, _, _)| candidate == flaw),
-            "{flaw:?} is a wrong adapter no case is required to catch"
+            caught != exempted,
+            "{flaw:?} must be in exactly one of TEETH and EXEMPTED: a wrong adapter in \
+             neither is one no case is required to catch, and one in both is a claim that \
+             contradicts itself"
         );
     }
 }

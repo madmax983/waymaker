@@ -150,6 +150,70 @@ impl NorFlash for OddNor {
     }
 }
 
+/// A driver whose erase unit does not fit in a 32-bit word.
+struct WideEraseNor;
+
+impl ErrorType for WideEraseNor {
+    type Error = NorFlashErrorKind;
+}
+
+impl ReadNorFlash for WideEraseNor {
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, _offset: u32, _bytes: &mut [u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        1024
+    }
+}
+
+impl NorFlash for WideEraseNor {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = (u32::MAX as usize) + 1;
+
+    fn erase(&mut self, _from: u32, _to: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// A driver whose program unit does not fit in a 32-bit word.
+struct WideWriteNor;
+
+impl ErrorType for WideWriteNor {
+    type Error = NorFlashErrorKind;
+}
+
+impl ReadNorFlash for WideWriteNor {
+    const READ_SIZE: usize = (u32::MAX as usize) + 1;
+
+    fn read(&mut self, _offset: u32, _bytes: &mut [u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        1024
+    }
+}
+
+impl NorFlash for WideWriteNor {
+    const WRITE_SIZE: usize = (u32::MAX as usize) + 1;
+    const ERASE_SIZE: usize = 64;
+
+    fn erase(&mut self, _from: u32, _to: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 /// A driver whose capacity does not fit in the 32-bit offsets §12's contract is written in.
 struct HugeNor;
 
@@ -283,6 +347,31 @@ fn a_driver_error_reaches_the_caller_unchanged() {
     let mut back = [0_u8; 4];
     assert_eq!(storage.read(0, &mut back), Ok(()));
     assert_eq!(back, [0x0F; 4]);
+}
+
+#[test]
+fn every_unit_wider_than_a_word_is_refused_and_not_only_the_capacity() {
+    // Four `usize`s narrow to `u32` here, and a `narrow` call left off one of them would be
+    // invisible on a device small enough for the other three.
+    assert_eq!(
+        NorFlashStorage::new(WideEraseNor).err(),
+        Some(PortGeometryError::UnitDoesNotFitInAWord)
+    );
+    assert_eq!(
+        NorFlashStorage::new(WideWriteNor).err(),
+        Some(PortGeometryError::UnitDoesNotFitInAWord)
+    );
+}
+
+#[test]
+fn the_driver_can_be_reached_through_the_port() {
+    // A port that could not be borrowed mutably would force a caller wanting a driver-level
+    // operation — a chip erase, a status register — to give up the port to get it back.
+    let mut storage = ported();
+    storage.flash_mut().media.fill(0x00);
+    let mut back = [0_u8; 2];
+    assert_eq!(storage.read(0, &mut back), Ok(()));
+    assert_eq!(back, [0x00; 2]);
 }
 
 #[test]

@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 36 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 37 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -144,6 +144,45 @@ not be declared while an earlier one is unresolved, which is the rule
 `waymaker_core::ReplayCursor` enforces when it refuses "a schedule while one is unresolved"
 as malformed history.
 
+## The storage contract, and what each sentence rests on
+
+Design document §12 states a storage contract in five sentences, and issue
+[#21](https://github.com/madmax983/waymaker/issues/21) asks for them to be "documented and
+tested". `waymaker-flash` owns the contract — `Geometry` and `StableStorage`, with the trait's
+public surface pinned by `storage-contract` — and `waymaker-conformance` is what any adapter is
+run against. `xtask::docs::STORAGE_CONTRACT_CLAUSES` holds the table, the crate's own
+`clause.rs` holds it again, and the `storage-conformance` rule fails a build in which this
+section, that table, the crate and
+[ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md) stop
+naming the same set.
+
+The "Discharged by" column is the point. Three of §12's five sentences cannot be observed by a
+suite running inside one process, and a suite that reported "all clauses covered" would be
+reporting on the two it can.
+
+All 6 storage-contract clauses, with the id to cite when a change touches one:
+
+| Id | Sentence | Discharged by |
+| --- | --- | --- |
+| `interruptible-mutations` | `program` and `erase` may fail or be interrupted at any supported unit. | a crash injector, not a suite: `waymaker-fault` interrupts a write at every byte of every program and every block of every erase, and a driver that never fails satisfies "may fail" vacuously |
+| `barrier-is-durable` | After `barrier` returns, all earlier successful mutations survive reset. | the across-reset witness: `durability::arm`, a reset the caller performs, then `durability::verify` |
+| `barrier-orders-what-follows` | No later mutation may become durable before mutations ordered by a completed barrier. | the across-reset witness, by the same two calls — a write that is on media while the seal ordered before it is not |
+| `validated-before-media` | The adapter validates erase/program alignment before touching media. | the in-process suite, in nine of its nineteen cases, including the two that read the media back after a refusal |
+| `one-way-bits-are-the-drivers` | Flash-specific one-way bit programming rules remain the driver's responsibility. | the driver, not the protocol — named here so its absence from the suite is a decision rather than an oversight |
+| `operations-act-on-what-they-name` | `read`, `program` and `erase` act on exactly the region they name, and `barrier` changes no media. | the in-process suite, in the other ten cases. Not one of §12's five: it is `StableStorage`'s own documentation, and without it the suite would be a suite of refusals that never checked that a legal operation works |
+
+The suite has been observed failing, which is the only thing that makes a passing run worth
+anything: `crates/waymaker-conformance/tests/teeth.rs` runs thirteen adapters wrong in one way
+each and requires the case that names each one to go red, and a control adapter with no flaw
+to pass. It is run against two real adapters — `waymaker_fault::Device`, written for issue #18
+and knowing nothing about this crate, and an `embedded-storage` `NorFlash` through
+`NorFlashStorage` — which is issue #21's two "done when" bullets.
+
+"Without `embedded-storage` becoming a kernel dependency" is not a promise either. Every
+layer's `may_depend_on_external` list in `xtask::policy::LAYERS` is empty, so the kernel
+growing that dependency fails `kernel-zero-dependencies` and `waymaker-flash` growing it fails
+`dependency-direction`.
+
 ## The layering
 
 `waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way. The table
@@ -177,7 +216,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Four crates are in the workspace and are *not* layers:
+Five crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
@@ -189,6 +228,14 @@ Four crates are in the workspace and are *not* layers:
   `waymaker-flash` for the storage contract; nothing depends on it, and no layer may, in any
   dependency kind — the tests that drive the harness live with the harness. See
   [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
+- `waymaker-conformance` — the conformance suite for §12's storage contract and the
+  `embedded-storage` port, also `policy::TEST_SUPPORT_CRATES`. Outside `default-members`, and
+  nothing depends on it. Two things make it unlike the other two test-support crates, and both
+  are deliberate: it is `#![no_std]` and allocation-free, because the adapter author it exists
+  for may only be able to run it on the target the driver is for; and it carries a third-party
+  dependency, `embedded-storage`, which is the only place in this workspace outside `xtask`
+  that one is allowed. See
+  [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md).
 - `waymaker-spec` — the formal specification of the recovery invariants, also
   `policy::TEST_SUPPORT_CRATES`. The ghost model of committed history, the journal and bank
   state machines, and the exhaustive search that discharges design document §14's guarantees
@@ -296,7 +343,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 36 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 37 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -347,6 +394,7 @@ this table is how you find out what a red build is telling you.
 | --- | --- |
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
+| `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |

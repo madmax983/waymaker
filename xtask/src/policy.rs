@@ -83,12 +83,24 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// has nothing to do with. See
 /// [ADR 0013](https://github.com/madmax983/waymaker/blob/main/docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
 ///
+/// `waymaker-conformance` is issue [#21](https://github.com/madmax983/waymaker/issues/21)'s
+/// conformance suite for design document §12's storage contract, and the `embedded-storage`
+/// port that shows the contract can be adapted. It is the one member of this category that
+/// is `#![no_std]` and allocation-free, because the adapter author it exists for may only be
+/// able to run it on the target the driver is for — and it is the one that carries a
+/// third-party dependency, which is allowed here for the same reason it is forbidden below:
+/// a layer's `may_depend_on_external` list is empty, so `embedded-storage` reaching
+/// `waymaker-core` fails [`crate::graph::check_kernel_has_no_dependencies`] and reaching
+/// `waymaker-flash` fails [`crate::graph::check_dependency_direction`]. See
+/// [ADR 0016](https://github.com/madmax983/waymaker/blob/main/docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md).
+///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
 /// `waymaker-fault` is still a violation. The harness sits above the layers and the tests
 /// that drive it live with it.
-pub const TEST_SUPPORT_CRATES: &[&str] = &["waymaker-fault", "waymaker-spec"];
+pub const TEST_SUPPORT_CRATES: &[&str] =
+    &["waymaker-fault", "waymaker-spec", "waymaker-conformance"];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";

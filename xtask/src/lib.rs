@@ -78,6 +78,7 @@ pub const RULES: &[&str] = &[
     "settled-decisions",
     "size-probe",
     "size-probe-reach",
+    "storage-conformance",
     "storage-contract",
     "toolchain-targets",
     "transition-surface",
@@ -507,6 +508,7 @@ fn collect_docs_inputs(
         adr_index,
         adrs,
         spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
+        storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
         crate_roots,
     })
 }
@@ -725,6 +727,10 @@ mod tests {
                 // no ADR for the specification. The CLAUDE.md half stays quiet on a missing
                 // file, because `claude-md` already reports that.
                 spec_obligations: None,
+                // Nor a storage-contract clause table, so `storage-conformance` fires on
+                // two of its three halves for the same reason: the suite's own table is
+                // unreadable, and the record has no ADR for the conformance suite.
+                storage_clauses: None,
                 crate_roots: vec![docs::CrateRoot {
                     package: "waymaker-core".to_owned(),
                     path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -778,6 +784,7 @@ mod tests {
             "settled-decisions",
             "size-probe",
             "size-probe-reach",
+            "storage-conformance",
             "storage-contract",
             "toolchain-targets",
             "transition-surface",
@@ -1080,16 +1087,28 @@ mod tests {
         { "id": "spec", "name": "waymaker-spec", "source": null,
           "manifest_path": "/w/spec/Cargo.toml",
           "dependencies": [{ "name": "waymaker-fault", "kind": null }],
-          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/spec/src/lib.rs" }] }
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/spec/src/lib.rs" }] },
+        { "id": "conformance", "name": "waymaker-conformance", "source": null,
+          "manifest_path": "/w/conformance/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-flash", "kind": null },
+                           { "name": "embedded-storage", "kind": null }],
+          "features": {},
+          "targets": [{ "kind": ["lib"], "src_path": "/w/conformance/src/lib.rs" }] },
+        { "id": "embedded-storage", "name": "embedded-storage",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "dependencies": [], "features": {},
+          "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
         { "id": "embassy", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "probe", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "embassy" }] },
         { "id": "fault", "deps": [{ "pkg": "flash" }] },
-        { "id": "spec", "deps": [{ "pkg": "fault" }] }
+        { "id": "spec", "deps": [{ "pkg": "fault" }] },
+        { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
+        { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;
 

@@ -120,6 +120,119 @@ pub const SPEC_CLAUSES: &[SpecClause] = &[
     },
 ];
 
+/// The ADR that decides how design document §12's storage contract is held.
+///
+/// Named here rather than found by prefix, for the reason [`RECOVERY_SPEC_ADR`] is: an ADR
+/// the rule located by guessing is an ADR a rename would silently disconnect.
+pub const STORAGE_CONFORMANCE_ADR: &str =
+    "0016-the-storage-contract-is-a-conformance-suite-and-a-port.md";
+
+/// Where the conformance crate's own clause table lives, relative to the workspace root.
+///
+/// Read rather than trusted, for the reason [`SPEC_OBLIGATIONS_PATH`] is: without reading
+/// it, a clause could be deleted from the crate with `CLAUDE.md` still describing it.
+pub const STORAGE_CLAUSES_PATH: &str = "crates/waymaker-conformance/src/clause.rs";
+
+/// What holds a clause of design document §12's storage contract up.
+///
+/// The distinction is the whole reason the table exists. Two of §12's sentences are about
+/// what survives a *reset*, one is about what happens when a write is *interrupted*, and one
+/// is explicitly the driver's — so a conformance suite that reported "all clauses covered"
+/// would be reporting on the two it can actually observe. Every variant here is a way of
+/// saying "not the in-process suite", except the one that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discharge {
+    /// The in-process suite observes it directly.
+    InProcess,
+    /// A witness written before a reset and read after one.
+    AcrossReset,
+    /// A crash injector, not a suite: `waymaker-fault` interrupts a write at every unit.
+    Injected,
+    /// The driver's, and named so that its absence from the suite is a decision.
+    Driver,
+}
+
+impl Discharge {
+    /// The variant's name as `waymaker-conformance`'s own table spells it.
+    #[must_use]
+    pub const fn variant(self) -> &'static str {
+        match self {
+            Self::InProcess => "InProcess",
+            Self::AcrossReset => "AcrossReset",
+            Self::Injected => "Injected",
+            Self::Driver => "Driver",
+        }
+    }
+
+    /// The words `CLAUDE.md`'s table has to carry for this discharge.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InProcess => "the in-process suite",
+            Self::AcrossReset => "the across-reset witness",
+            Self::Injected => "a crash injector, not a suite",
+            Self::Driver => "the driver, not the protocol",
+        }
+    }
+}
+
+/// One sentence of design document §12's required storage contract, as the gate knows it.
+///
+/// The counterpart of [`waymaker-conformance`'s own table][crate]; `storage-conformance`
+/// fails a build in which the two disagree, in either direction.
+///
+/// [crate]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-conformance/src/clause.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageClause {
+    /// Stable identifier, cited by `CLAUDE.md`, by the ADR and by the crate.
+    pub id: &'static str,
+    /// The sentence, quoted from §12 and issue #21 closely enough to be recognisable.
+    pub sentence: &'static str,
+    /// What holds it up.
+    pub discharge: Discharge,
+}
+
+/// Design document §12's five contract sentences, plus the one the trait's own
+/// documentation states.
+///
+/// Six rather than issue [#21](https://github.com/madmax983/waymaker/issues/21)'s five: the
+/// issue's list is about what an adapter must *refuse* and what must survive a reset, and a
+/// suite made only of those would never check that a legal operation does what it says. The
+/// sixth is `StableStorage`'s own documentation, and it is where fifteen of the nineteen
+/// cases live.
+pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
+    StorageClause {
+        id: "interruptible-mutations",
+        sentence: "`program` and `erase` may fail or be interrupted at any supported unit.",
+        discharge: Discharge::Injected,
+    },
+    StorageClause {
+        id: "barrier-is-durable",
+        sentence: "After `barrier` returns, all earlier successful mutations survive reset.",
+        discharge: Discharge::AcrossReset,
+    },
+    StorageClause {
+        id: "barrier-orders-what-follows",
+        sentence: "No later mutation may become durable before mutations ordered by a completed barrier.",
+        discharge: Discharge::AcrossReset,
+    },
+    StorageClause {
+        id: "validated-before-media",
+        sentence: "The adapter validates erase/program alignment before touching media.",
+        discharge: Discharge::InProcess,
+    },
+    StorageClause {
+        id: "one-way-bits-are-the-drivers",
+        sentence: "Flash-specific one-way bit programming rules remain the driver's responsibility.",
+        discharge: Discharge::Driver,
+    },
+    StorageClause {
+        id: "operations-act-on-what-they-name",
+        sentence: "`read`, `program` and `erase` act on exactly the region they name, and `barrier` changes no media.",
+        discharge: Discharge::InProcess,
+    },
+];
+
 /// The id of the diagram that has to agree with [`LAYERS`].
 pub const CRATE_DEPENDENCY_DIAGRAM: &str = "crate-dependency-flow";
 
@@ -594,6 +707,12 @@ pub struct DocsInputs {
     /// `None` is a violation rather than a skip: a specification whose clause table cannot
     /// be read is a specification nothing is holding to its documentation.
     pub spec_obligations: Option<String>,
+    /// Contents of [`STORAGE_CLAUSES_PATH`], when the workspace has it.
+    ///
+    /// `None` is a violation rather than a skip, for the reason [`DocsInputs::spec_obligations`]
+    /// is: a conformance suite whose clause table cannot be read is a suite nothing is
+    /// holding to the contract it claims to check.
+    pub storage_clauses: Option<String>,
     /// Every crate root in the workspace, in package-then-path order.
     ///
     /// A workspace member that contributes no root at all is reported by
@@ -1132,6 +1251,236 @@ fn check_spec_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
                 format!(
                     "{RECOVERY_SPEC_ADR} does not name this clause in backticks, so the \
                      guarantee has a proof and no decision record behind it"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Rule: design document §12's storage contract and the three places it lives agree.
+///
+/// The same shape as [`check_recovery_spec`], for the contract issue
+/// [#21](https://github.com/madmax983/waymaker/issues/21) asks to be documented and tested.
+/// A clause of [`STORAGE_CONTRACT_CLAUSES`] has to appear in `CLAUDE.md` with its sentence
+/// and what discharges it, in [`STORAGE_CONFORMANCE_ADR`], and in the conformance crate's own
+/// table at [`STORAGE_CLAUSES_PATH`] with the same discharge — and a clause the crate declares
+/// that the gate does not is a violation too, because a suite growing a clause nobody wrote
+/// down is the other way this rots.
+///
+/// What it cannot check is that a clause marked [`Discharge::InProcess`] is reached by a
+/// case: that is inside the crate, and `crates/waymaker-conformance/tests/clauses.rs` is what
+/// fails a build over it.
+#[must_use]
+fn check_storage_conformance(
+    claude_md: Option<&str>,
+    adrs: &[AdrFile],
+    clauses: Option<&str>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+
+    match clauses {
+        None => violations.push(Violation::new(
+            "storage-conformance",
+            STORAGE_CLAUSES_PATH,
+            "the conformance suite's clause table is not where the gate looks for it, so              nothing holds the suite to the contract it claims to check",
+        )),
+        Some(contents) => {
+            let declared = storage_clause_rows(contents);
+            for clause in STORAGE_CONTRACT_CLAUSES {
+                let Some(discharge) = declared.get(clause.id) else {
+                    violations.push(Violation::new(
+                        "storage-conformance",
+                        clause.id,
+                        format!(
+                            "{STORAGE_CLAUSES_PATH} declares no clause with this id, so the                              contract has documentation and no suite behind it"
+                        ),
+                    ));
+                    continue;
+                };
+                // The discharge as well as the id. Without it the crate is free to mark a
+                // clause `InProcess` that CLAUDE.md tells a reader is the driver's — two
+                // tables agreeing on the names of six things and disagreeing about what any
+                // of them costs.
+                if *discharge != Some(clause.discharge.variant()) {
+                    violations.push(Violation::new(
+                        "storage-conformance",
+                        clause.id,
+                        discharge.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_CLAUSES_PATH}'s row for this clause names no                                      discharge, and docs::STORAGE_CONTRACT_CLAUSES says                                      `{}`",
+                                    clause.discharge.variant()
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_CLAUSES_PATH} discharges this clause with                                      `{named}` and docs::STORAGE_CONTRACT_CLAUSES says `{}`",
+                                    clause.discharge.variant()
+                                )
+                            },
+                        ),
+                    ));
+                }
+            }
+            for id in declared.keys() {
+                if !STORAGE_CONTRACT_CLAUSES
+                    .iter()
+                    .any(|clause| clause.id == *id)
+                {
+                    violations.push(Violation::new(
+                        "storage-conformance",
+                        (*id).to_owned(),
+                        format!(
+                            "{STORAGE_CLAUSES_PATH} declares this clause and                              docs::STORAGE_CONTRACT_CLAUSES does not, so the suite checks                              something nobody wrote down"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.extend(check_storage_clauses_are_written_down(claude_md));
+    violations.extend(check_storage_clauses_are_decided(adrs));
+    violations
+}
+
+/// Every `(clause id, discharge)` pair [`STORAGE_CLAUSES_PATH`] declares.
+///
+/// Matched on the table's own `id: "..."` and `discharge: Discharge::...` fields, and a row
+/// runs to the next row's id — so a discharge belongs to the clause above it, and a row that
+/// reorders its fields reads as having no discharge, which is a violation rather than a
+/// silent pass.
+fn storage_clause_rows(contents: &str) -> BTreeMap<&str, Option<&str>> {
+    let mut rows = BTreeMap::new();
+    for (index, _) in contents.match_indices("id: \"") {
+        let Some(after_key) = index.checked_add("id: \"".len()) else {
+            continue;
+        };
+        let Some(rest) = contents.get(after_key..) else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else { continue };
+        let Some(id) = rest.get(..end) else { continue };
+        if id.is_empty() {
+            continue;
+        }
+        let tail = rest.get(end..).unwrap_or_default();
+        let row = tail
+            .find("id: \"")
+            .and_then(|next| tail.get(..next))
+            .unwrap_or(tail);
+        rows.insert(id, identifier_field(row, "discharge: Discharge::"));
+    }
+    rows
+}
+
+/// The Rust identifier following `key` in `row`, if there is one.
+fn identifier_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
+    let index = row.find(key)?;
+    let rest = row.get(index.checked_add(key.len())?..)?;
+    let end = rest
+        .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .unwrap_or(rest.len());
+    let name = rest.get(..end)?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The half of `storage-conformance` that reads `CLAUDE.md`.
+fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        // `claude-md` already reports the missing file.
+        return Vec::new();
+    };
+    let contents = without_fenced_code(&without_html_comments(contents));
+    let mut violations = Vec::new();
+    for clause in STORAGE_CONTRACT_CLAUSES {
+        // The clause's own table row, found by its backticked id. Not three whole-file
+        // `contains` calls, for the reason the recovery half is written this way: four of
+        // the six clauses share a discharge, so a file-wide check for "the in-process suite"
+        // is satisfied by one row on behalf of all of them.
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-conformance",
+                clause.id,
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this storage-contract clause in \
+                     backticks, so a contributor cannot tell which clause a change is \
+                     touching"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this storage-contract clause, so \
+                         which one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+
+        if !row.contains(clause.sentence) {
+            violations.push(Violation::new(
+                "storage-conformance",
+                clause.id,
+                format!(
+                    "CLAUDE.md's table row for this clause does not state it as `{}`, which \
+                     is what docs::STORAGE_CONTRACT_CLAUSES reads",
+                    clause.sentence
+                ),
+            ));
+        }
+        if !row.contains(clause.discharge.message()) {
+            violations.push(Violation::new(
+                "storage-conformance",
+                clause.id,
+                format!(
+                    "CLAUDE.md's table row does not say this clause is discharged by `{}`, so \
+                     the row states a contract without saying what holds it up",
+                    clause.discharge.message()
+                ),
+            ));
+        }
+    }
+    let count = format!(
+        "All {} storage-contract clauses",
+        STORAGE_CONTRACT_CLAUSES.len()
+    );
+    if !contents.contains(&count) {
+        violations.push(Violation::new(
+            "storage-conformance",
+            "clause count",
+            format!("CLAUDE.md does not say `{count}`, which is what the table holds"),
+        ));
+    }
+    violations
+}
+
+/// The half of `storage-conformance` that reads the decision record.
+fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
+    let Some(adr) = adrs.iter().find(|adr| adr.name == STORAGE_CONFORMANCE_ADR) else {
+        return vec![Violation::new(
+            "storage-conformance",
+            STORAGE_CONFORMANCE_ADR,
+            "the storage conformance suite has no decision record, so where the suite lives \
+             and what it can observe are choices nobody wrote down",
+        )];
+    };
+    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    STORAGE_CONTRACT_CLAUSES
+        .iter()
+        .filter(|clause| !contents.contains(&format!("`{}`", clause.id)))
+        .map(|clause| {
+            Violation::new(
+                "storage-conformance",
+                clause.id,
+                format!(
+                    "{STORAGE_CONFORMANCE_ADR} does not name this clause in backticks, so the \
+                     contract has a suite and no decision record behind it"
                 ),
             )
         })
@@ -1916,6 +2265,11 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         &inputs.adrs,
         inputs.spec_obligations.as_deref(),
     ));
+    violations.extend(check_storage_conformance(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+        inputs.storage_clauses.as_deref(),
+    ));
     violations.extend(check_diagrams(inputs.architecture.as_deref()));
     violations.extend(check_missing_docs(&inputs.crate_roots));
     violations
@@ -1929,7 +2283,8 @@ pub mod tests_support {
     use super::{
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, QuestionStatus, RECOVERY_SPEC_ADR, SETTLED_DECISIONS,
-        SETTLED_DECISIONS_ADR, SPEC_CLAUSES, adr_number,
+        SETTLED_DECISIONS_ADR, SPEC_CLAUSES, STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES,
+        adr_number,
     };
     use crate::policy::LAYERS;
 
@@ -2054,6 +2409,43 @@ pub mod tests_support {
             &mut body,
             format_args!("All {} recovery invariants.", SPEC_CLAUSES.len()),
         );
+        for clause in STORAGE_CONTRACT_CLAUSES {
+            line(
+                &mut body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    clause.id,
+                    clause.sentence,
+                    clause.discharge.message()
+                ),
+            );
+        }
+        line(
+            &mut body,
+            format_args!(
+                "All {} storage-contract clauses.",
+                STORAGE_CONTRACT_CLAUSES.len()
+            ),
+        );
+        body
+    }
+
+    /// A conformance clause table that declares exactly the clauses the gate expects.
+    #[must_use]
+    pub fn clean_storage_clauses() -> String {
+        let mut body = String::from("//! The clause table.\npub const CLAUSES: &[Clause] = &[\n");
+        for clause in STORAGE_CONTRACT_CLAUSES {
+            line(
+                &mut body,
+                format_args!(
+                    "    Clause {{ id: \"{}\", sentence: \"{}\", discharge: Discharge::{} }},",
+                    clause.id,
+                    clause.sentence,
+                    clause.discharge.variant()
+                ),
+            );
+        }
+        body.push_str("];\n");
         body
     }
 
@@ -2079,6 +2471,16 @@ pub mod tests_support {
     pub fn clean_recovery_spec_adr() -> String {
         let mut body = clean_adr("the recovery invariants");
         for clause in SPEC_CLAUSES {
+            line(&mut body, format_args!("- `{}`", clause.id));
+        }
+        body
+    }
+
+    /// The ADR that records the conformance suite, naming every storage-contract clause.
+    #[must_use]
+    pub fn clean_storage_conformance_adr() -> String {
+        let mut body = clean_adr("the storage conformance suite");
+        for clause in STORAGE_CONTRACT_CLAUSES {
             line(&mut body, format_args!("- `{}`", clause.id));
         }
         body
@@ -2131,6 +2533,16 @@ pub mod tests_support {
             (RECOVERY_SPEC_ADR.to_owned(), clean_recovery_spec_adr()),
         );
 
+        let conformance_number =
+            adr_number(STORAGE_CONFORMANCE_ADR).expect("the storage conformance ADR is numbered");
+        bodies.insert(
+            conformance_number,
+            (
+                STORAGE_CONFORMANCE_ADR.to_owned(),
+                clean_storage_conformance_adr(),
+            ),
+        );
+
         let highest = bodies.keys().copied().max().unwrap_or(0);
         for number in super::ADR_NUMBER_START..=highest {
             bodies
@@ -2168,6 +2580,7 @@ pub mod tests_support {
             }),
             adrs: clean_adrs(),
             spec_obligations: Some(clean_spec_obligations()),
+            storage_clauses: Some(clean_storage_clauses()),
             // One root per crate the layering covers, so that a fixture describing a clean
             // workspace really has one for every member `inputs-incomplete` looks for.
             crate_roots: crate::policy::checked_members()
@@ -3857,7 +4270,8 @@ mod tests {
                 "deferred-questions",
                 "diagrams",
                 "recovery-spec",
-                "settled-decisions"
+                "settled-decisions",
+                "storage-conformance"
             ]
         );
     }
