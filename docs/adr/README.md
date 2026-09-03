@@ -22,6 +22,7 @@ be superseded.
 | [0011](0011-a-scheduled-effect-records-a-length-and-a-digest.md) | A scheduled effect records a length and a digest, and nothing more | accepted |
 | [0012](0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md) | The integrity check is swappable behind a trait, and the seal widths are not | accepted |
 | [0013](0013-the-fault-harness-is-a-crate-above-the-layers.md) | The fault harness is a crate above the layers, and the storage contract is pinned | accepted |
+| [0014](0014-the-oracle-is-four-lines-and-the-sweep-is-seeded.md) | The recovery oracle is four lines, and the sweep that proves it is seeded | accepted |
 
 ## Reading the numbers
 

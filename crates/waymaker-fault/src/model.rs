@@ -48,11 +48,29 @@ impl Ledger {
     /// rung 0.3's effect protocol — can put [`verify_recovery`] to work against a history
     /// it wrote by hand, instead of only against one [`Harness`] produced.
     ///
+    /// # Postconditions
+    ///
+    /// An entry that claims to be both [`Durability::Attempted`] and torn is stored with its
+    /// tornness dropped, so [`torn`](Self::torn)'s postcondition is an invariant of the type
+    /// rather than of the one producer that happens to respect it. The state is what is
+    /// kept, because "none of it reached media" is the stronger statement and the one
+    /// [`verify_recovery`] gives the more specific diagnosis for.
+    ///
+    /// Not a refusal, because there is nothing to refuse through: this is the constructor a
+    /// hand-built history goes through and it has no error to return. It is normalisation
+    /// rather than validation, and it is written down because a silent one would be a
+    /// harness deciding something on its caller's behalf.
+    ///
     /// [`verify_recovery`]: crate::verify_recovery
     /// [`Harness`]: crate::Harness
     #[must_use]
-    pub const fn new(entries: Vec<(RecordId, Durability, bool)>) -> Self {
-        Self { entries }
+    pub fn new(entries: Vec<(RecordId, Durability, bool)>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(id, state, torn)| (id, state, torn && state != Durability::Attempted))
+                .collect(),
+        }
     }
 
     /// The state `id` ended in, or `None` if this run never declared it.
@@ -74,6 +92,15 @@ impl Ledger {
     /// A torn record is never [`Durability::Acknowledged`], and [`verify_recovery`] refuses
     /// a recovery that produces one: design document §15 permits recovery to include "an
     /// unacknowledged **complete** record", and complete is the load-bearing word.
+    ///
+    /// # Postconditions
+    ///
+    /// Never `Some(true)` for a [`Durability::Attempted`] record. "Half of it is on media"
+    /// and "none of it is" are mutually exclusive, so a record the writer was interrupted
+    /// before it changed a cell is not torn — it is absent, which is a different obligation
+    /// on recovery and a different diagnosis when one is breached. This holds for every
+    /// [`Ledger`], not only for the ones [`crate::Session`] builds: [`new`](Self::new)
+    /// normalises an entry that claims both.
     ///
     /// [`verify_recovery`]: crate::verify_recovery
     #[must_use]

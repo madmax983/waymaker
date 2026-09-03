@@ -23,8 +23,8 @@ use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_fault::{
-    Breach, Durability, FaultError, Harness, Interruption, Progress, RecordId, Run, Session,
-    verify_recovery,
+    Breach, Durability, FaultError, Harness, Injection, Interruption, Progress, RecordId, Run,
+    Session, verify_recovery,
 };
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -72,14 +72,19 @@ fn a_scan_stops_at_a_stale_tail_an_interrupted_erase_left_behind() {
     // bytes with real frames *behind* them. A reader that treated an erased header as the
     // end of history and stopped counting would report a clean journal and silently drop
     // everything after the hole.
-    let two_blocks = {
-        let Ok(geometry) = Geometry::new(256, 128, 4, 1) else {
-            unreachable!("256 is two whole 128-byte blocks of 4-byte units")
+    //
+    // 64-byte blocks, so the 128-byte erase below spans two of them. An erase is
+    // interrupted at erase blocks and nowhere else, so a block as wide as the erase leaves
+    // no interior crash point at all and the stale tail could only come from an erase that
+    // *finished* — a weaker case than this test's name claims.
+    let blocks = {
+        let Ok(geometry) = Geometry::new(256, 64, 4, 1) else {
+            unreachable!("256 is four whole 64-byte blocks of 4-byte units")
         };
         geometry
     };
 
-    let runs = match Harness::new(two_blocks).run(|session| {
+    let runs = match Harness::new(blocks).run(|session| {
         // Fill past the first erase block, so that erasing one leaves frames in the other.
         let mut at = 0;
         for seq in 1..=8 {
@@ -104,9 +109,16 @@ fn a_scan_stops_at_a_stale_tail_an_interrupted_erase_left_behind() {
     let stale = runs
         .iter()
         .find(|run| {
-            run.image().first() == Some(&0xFF) && run.image().iter().any(|byte| *byte != 0xFF)
+            matches!(
+                run.injection(),
+                Some(Injection {
+                    progress: Progress::Bytes(_),
+                    ..
+                })
+            ) && run.image().first() == Some(&0xFF)
+                && run.image().iter().any(|byte| *byte != 0xFF)
         })
-        .expect("some crash point erases the first block and leaves the second");
+        .expect("some crash point interrupts the erase between its two blocks");
 
     // The scan meets an erased header with data behind it, and refuses rather than
     // reporting a clean end of history.
