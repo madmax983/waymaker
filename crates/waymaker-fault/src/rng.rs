@@ -99,9 +99,15 @@ impl Rng {
 /// read`, and the capacity is a whole number of erase blocks, because those are the
 /// invariants the constructor enforces and this function clamps rather than gambles.
 ///
-/// The shapes drawn are small on purpose. Every byte of a device is a crash point in the
-/// sweeps that use this, so a generator that could draw a megabyte would be a generator
-/// that occasionally turns one seed into an hour.
+/// The *units* drawn are small on purpose — at most a 128-byte erase block of 16-byte
+/// program units of 4-byte reads — because those are the shapes real NOR parts have and a
+/// sweep gains nothing from a page size no device reports. The *capacity* is not: it is
+/// whatever `max_capacity` allows, and a [`Device`] over it is that many bytes of host
+/// memory and roughly twice that many crash points. `max_capacity` is therefore a runtime
+/// dial the caller owns, and a caller that passes [`u32::MAX`] has asked for a four-gigabyte
+/// device and will get one.
+///
+/// [`Device`]: crate::Device
 #[must_use]
 pub fn random_geometry(rng: &mut Rng, max_capacity: u32) -> Geometry {
     let budget = max_capacity.max(1);

@@ -245,9 +245,11 @@ fn filler(index: usize, at: usize) -> u8 {
 
 /// The program granularity for `geometry`, as the frame encoder wants it.
 fn align_of(geometry: Geometry) -> ProgramAlign {
-    let bytes = u16::try_from(geometry.program_size()).unwrap_or(1);
+    let Ok(bytes) = u16::try_from(geometry.program_size()) else {
+        unreachable!("no geometry in this file has a program unit wider than a `u16`")
+    };
     let Some(align) = ProgramAlign::new(bytes) else {
-        unreachable!("a drawn geometry's program size is a power of two the frame permits")
+        unreachable!("a geometry's program size is a power of two, which is the whole rule")
     };
     align
 }
