@@ -47,7 +47,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef, ReplayCursor, RunId};
+use waymaker_core::{
+    ActivityKind, DecodeError, EffectSeq, KernelError, RecordRef, ReplayCursor, RunId,
+};
 use waymaker_fault::{
     Durability, FaultError, Harness, Injection, Interruption, Op, Progress, RecordId, Recovery,
     Rng, Run, Session, injections, random_geometry, verify_oracle,
@@ -806,33 +808,80 @@ fn a_sequence_at_the_top_of_the_space_survives_the_frame_and_stops_the_run() {
     );
 
     // And a journal whose sequences skip is refused by the cursor rather than replayed:
-    // "out of sequence" is a fact about the run, so the scan does not own it and the
-    // cursor does.
-    let mut journal = Vec::new();
-    for seq in [EffectSeq::FIRST, EffectSeq::MAX] {
-        let record = RecordRef::EffectScheduled {
-            seq,
+    // "out of sequence" is a fact about the run, so the scan does not own it and the cursor
+    // does.
+    //
+    // The prefix in front of the gap is the whole point. A journal that opened with a
+    // schedule would be refused at its *first* record — a fresh cursor accepts only
+    // `RunStarted` — and the assertion below would then pass with sequence checking removed
+    // entirely. So the run starts, one effect is scheduled and resolved, and only the
+    // fourth record jumps to the top of the space.
+    let records = [
+        RecordRef::RunStarted {
+            workflow_kind: 7,
+            workflow_version: 1,
+            input: b"",
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq::FIRST,
             kind: ActivityKind(9),
             input_len: 0,
             input_crc: 0,
-        };
-        let Ok(written) = frame::encode(&record, align, &mut buffer) else {
-            unreachable!("64 bytes holds a schedule record")
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq::FIRST,
+            result: b"",
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq::MAX,
+            kind: ActivityKind(9),
+            input_len: 0,
+            input_crc: 0,
+        },
+    ];
+    let mut journal = Vec::new();
+    for record in &records {
+        let Ok(written) = frame::encode(record, align, &mut buffer) else {
+            unreachable!("64 bytes holds any record in this array")
         };
         journal.extend_from_slice(buffer.get(..written).unwrap_or_default());
     }
+
     let mut cursor = ReplayCursor::new(RUN);
     let mut accepted = 0_usize;
+    let mut refusal = None;
     for step in Scan::new(&journal, align) {
-        let Ok(record) = step else { break };
-        if cursor.advance(record).is_err() {
-            break;
+        let Ok(record) = step else {
+            unreachable!("every frame in this journal was just encoded")
+        };
+        match cursor.advance(record) {
+            Ok(_) => accepted += 1,
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
         }
-        accepted += 1;
     }
     assert_eq!(
-        accepted, 0,
-        "the cursor replayed a journal whose sequences jump to the top of the space"
+        accepted,
+        records.len() - 1,
+        "the cursor refused a record before the one that jumps to the top of the space"
+    );
+    assert_eq!(
+        refusal,
+        Some(KernelError::MalformedHistory),
+        "the cursor replayed a schedule whose sequence jumps to the top of the space"
+    );
+    // And it stays refused: §08's divergence is terminal, so the run cannot be resumed by
+    // handing it the record it should have had.
+    assert_eq!(
+        cursor.advance(RecordRef::EffectScheduled {
+            seq: EffectSeq(1),
+            kind: ActivityKind(9),
+            input_len: 0,
+            input_crc: 0,
+        }),
+        Err(KernelError::MalformedHistory)
     );
 }
 
