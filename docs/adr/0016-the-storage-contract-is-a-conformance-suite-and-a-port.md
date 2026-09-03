@@ -77,6 +77,16 @@ barrier. Anything else, a device that lost everything included, is not a breach.
 run backwards — unacknowledged block first — so that a stale witness from a previous run can
 never be read beside a freshly erased seal.
 
+**A legal operation nobody asks for is an operation nobody tests.** Three of the cases exist
+because a review noticed that every *successful* program in the suite was exactly one unit and
+every successful erase exactly one block, so an adapter that accepted those and refused a legal
+two-unit write or two-block erase would have been certified — while the journal above this
+contract writes whole frames in one call and erases a whole bank in another. A fourth exists
+because `read` is the one operation with nothing to check afterwards: an adapter that hands
+back the right bytes and then corrupts the media they came from passes every case that compares
+what a read *returned*, so one case reads twice and makes the second read a witness for the
+first.
+
 **A skipped case is a fact about the geometry, never a silence.** An outcome starts at
 `NotRun` and `Report::verdict` refuses a report that still holds one, so a case added to the
 table and forgotten in the runner fails a run rather than shrinking it. The only other way a
@@ -107,7 +117,7 @@ workspace test stage rather than by a feature nobody enables. `embedded-storage`
 non-optional dependency for exactly that reason: a feature CI never turns on is a measurement
 that did not happen.
 
-The suite has been observed failing. Twenty-one adapters wrong in one way each — a validator
+The suite has been observed failing. Two dozen adapters wrong in one way each — a validator
 that validates after the write, one that checks the start of a range and not its end, an erase
 that takes the whole chip, a straddling mutation that applies its in-bounds prefix before
 refusing, a barrier that is a no-op with a scribble in it, a read that always returns the

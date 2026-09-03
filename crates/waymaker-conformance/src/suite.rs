@@ -174,6 +174,9 @@ impl<S: StableStorage> Run<'_, S> {
         self.barrier_succeeds();
         self.barrier_changes_no_media();
         self.repeated_barriers_are_legal();
+        self.multi_unit_program_is_legal();
+        self.multi_block_erase_is_legal();
+        self.reading_changes_no_media();
     }
 
     // ---- the block layout every case works in -----------------------------------------
@@ -292,7 +295,12 @@ impl<S: StableStorage> Run<'_, S> {
 
     /// Fills the front of the buffer with one program unit of the run's pattern.
     fn fill_pattern(&mut self) {
-        for index in 0..self.unit {
+        self.fill_pattern_len(self.unit);
+    }
+
+    /// Fills the front of the buffer with `len` bytes of the run's pattern.
+    fn fill_pattern_len(&mut self, len: usize) {
+        for index in 0..len {
             let wanted = pattern(index);
             if let Some(cell) = self.buffer.get_mut(index) {
                 *cell = wanted;
@@ -898,6 +906,117 @@ impl<S: StableStorage> Run<'_, S> {
             Outcome::Failed(Failure::LegalOperationRefused)
         };
         self.record(CaseId::RepeatedBarriersAreLegal, outcome);
+    }
+
+    fn multi_unit_program_is_legal(&mut self) {
+        let case = CaseId::MultiUnitProgramIsLegal;
+        let block = self.erase_size();
+        let unit = self.program_size();
+        if block == unit {
+            self.record(
+                case,
+                Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit),
+            );
+            return;
+        }
+        // Every other successful program in this suite is exactly one unit long, and the
+        // longer requests are all deliberately illegal. An adapter that accepts one unit and
+        // refuses two would be certified by a suite that never asked — and the journal above
+        // this contract writes whole frames in one call.
+        if !self.erase_block(case, self.block_a()) {
+            return;
+        }
+        let base = self.block_a();
+        let span = self.unit + self.unit;
+        self.fill_pattern_len(span);
+        if !self.program_source(base, span) {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        }
+        let Some(written) = self.media_matches(base, unit + unit, |position| {
+            pattern(usize::try_from(position).unwrap_or(0))
+        }) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let Some(rest) = self.media_is_erased(base + unit + unit, block - unit - unit) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if !written {
+            Outcome::Failed(Failure::ReadBackDiffers)
+        } else if rest {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
+        };
+        self.record(case, outcome);
+    }
+
+    fn multi_block_erase_is_legal(&mut self) {
+        let case = CaseId::MultiBlockEraseIsLegal;
+        // As above, for erases: every successful erase elsewhere is exactly one block, so an
+        // adapter that refuses a legal two-block erase has never been asked for one. The
+        // two-bank journal erases a whole bank in a single call.
+        for block in [self.block_a(), self.block_b(), self.block_c()] {
+            if !self.program_a_unit(case, block) {
+                return;
+            }
+        }
+        let size = self.erase_size();
+        let base = self.block_a();
+        if self.storage.erase(base, size + size).is_err() {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        }
+        let Some(cleared) = self.media_is_erased(base, size + size) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        // And it stops where it was told: the third block is one past the range and still
+        // holds what was programmed into it.
+        let third = self.block_c();
+        let Some(untouched) = self.block_holds_the_pattern(third) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if !cleared {
+            Outcome::Failed(Failure::EraseDidNotClearTheRegion)
+        } else if untouched {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
+        };
+        self.record(case, outcome);
+    }
+
+    fn reading_changes_no_media(&mut self) {
+        let case = CaseId::ReadingChangesNoMedia;
+        // `read` is the one operation with nothing to check afterwards, which is exactly why
+        // an adapter that corrupts the bytes it just handed back can pass every other case:
+        // each of them compares what the *first* read returned. Reading twice is what makes
+        // the second read a witness for the first.
+        if !self.program_a_unit(case, self.block_a()) {
+            return;
+        }
+        let base = self.block_a();
+        let unit = self.program_size();
+        for _ in 0..2 {
+            match self.media_matches(base, unit, |position| {
+                pattern(usize::try_from(position).unwrap_or(0))
+            }) {
+                Some(true) => {}
+                Some(false) => {
+                    self.record(case, Outcome::Failed(Failure::ReadBackDiffers));
+                    return;
+                }
+                None => {
+                    self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+                    return;
+                }
+            }
+        }
+        self.record(case, Outcome::Passed);
     }
 }
 

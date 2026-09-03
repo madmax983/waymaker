@@ -70,6 +70,12 @@ enum Flaw {
     BoundsCheckedAtTheStartOnly,
     /// A straddling mutation applies its in-bounds prefix and then refuses.
     StraddlingMutationWipesTheValidPrefix,
+    /// A legal program of more than one unit is refused.
+    RejectsAMultiUnitProgram,
+    /// A legal erase of more than one block is refused.
+    RejectsAMultiBlockErase,
+    /// A read hands back the right bytes and then corrupts the media it read.
+    ReadCorruptsWhatItReturned,
     /// A program also clears the program unit *before* the one it was given.
     ProgramCorruptsThePrecedingUnit,
     /// An erase also clears the erase block *before* the one it was given.
@@ -210,6 +216,22 @@ impl StableStorage for Broken {
             dst.fill(ERASED);
             return Ok(());
         }
+        if self.flaw == Flaw::ReadCorruptsWhatItReturned {
+            let Ok(start) = usize::try_from(offset) else {
+                return Err(Refused);
+            };
+            let Some(end) = start.checked_add(dst.len()) else {
+                return Err(Refused);
+            };
+            let Some(source) = self.media.get(start..end) else {
+                return Err(Refused);
+            };
+            dst.copy_from_slice(source);
+            // The bytes handed back are the right ones; the media they came from is not,
+            // one instruction later. Nothing that compares what a read returned can see it.
+            self.fill(offset, len, |_| 0x00);
+            return Ok(());
+        }
         let Ok(start) = usize::try_from(offset) else {
             return Err(Refused);
         };
@@ -230,6 +252,7 @@ impl StableStorage for Broken {
         };
         if self.flaw == Flaw::ProgramAlwaysFails
             || (self.flaw == Flaw::ZeroLengthIsRefused && src.is_empty())
+            || (self.flaw == Flaw::RejectsAMultiUnitProgram && len > self.geometry.program_size())
         {
             return Err(Refused);
         }
@@ -278,6 +301,7 @@ impl StableStorage for Broken {
     fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
         if self.flaw == Flaw::EraseAlwaysFails
             || (self.flaw == Flaw::ZeroLengthIsRefused && len == 0)
+            || (self.flaw == Flaw::RejectsAMultiBlockErase && len > self.geometry.erase_size())
         {
             return Err(Refused);
         }
@@ -426,6 +450,21 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Flaw::ProgramSpillsIntoTheNextUnit,
         CaseId::ProgramLeavesTheRestOfTheBlockAlone,
         Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::RejectsAMultiUnitProgram,
+        CaseId::MultiUnitProgramIsLegal,
+        Failure::LegalOperationRefused,
+    ),
+    (
+        Flaw::RejectsAMultiBlockErase,
+        CaseId::MultiBlockEraseIsLegal,
+        Failure::LegalOperationRefused,
+    ),
+    (
+        Flaw::ReadCorruptsWhatItReturned,
+        CaseId::ReadingChangesNoMedia,
+        Failure::ReadBackDiffers,
     ),
     (
         Flaw::ProgramCorruptsThePrecedingUnit,
@@ -607,6 +646,9 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::EraseDoesNothingOnZeroedMedia
         | Flaw::ProgramIsIgnored
         | Flaw::ProgramSpillsIntoTheNextUnit
+        | Flaw::RejectsAMultiUnitProgram
+        | Flaw::RejectsAMultiBlockErase
+        | Flaw::ReadCorruptsWhatItReturned
         | Flaw::EraseDoesNothing
         | Flaw::ZeroLengthIsRefused
         | Flaw::BarrierFails
@@ -666,6 +708,17 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::BarrierChangesNoMedia,
             Failure::MediaOutsideTheOperationChanged,
         )),
+        Flaw::RejectsAMultiUnitProgram => Some((
+            CaseId::MultiUnitProgramIsLegal,
+            Failure::LegalOperationRefused,
+        )),
+        Flaw::RejectsAMultiBlockErase => Some((
+            CaseId::MultiBlockEraseIsLegal,
+            Failure::LegalOperationRefused,
+        )),
+        Flaw::ReadCorruptsWhatItReturned => {
+            Some((CaseId::ReadingChangesNoMedia, Failure::ReadBackDiffers))
+        }
         Flaw::ZeroLengthIsRefused => Some((
             CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
             Failure::LegalOperationRefused,
@@ -701,6 +754,9 @@ const ALL: &[Flaw] = &[
     Flaw::ProgramIsIgnored,
     Flaw::ProgramSpillsIntoTheNextUnit,
     Flaw::ProgramCorruptsThePrecedingUnit,
+    Flaw::RejectsAMultiUnitProgram,
+    Flaw::RejectsAMultiBlockErase,
+    Flaw::ReadCorruptsWhatItReturned,
     Flaw::EraseTakesTheWholeDevice,
     Flaw::EraseTakesThePrecedingBlock,
     Flaw::BarrierScribblesInTheMiddleBlock,

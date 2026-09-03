@@ -130,6 +130,10 @@ fn a_block_that_is_one_program_unit_exempts_the_rest_of_the_block_case() {
         report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
         Outcome::NotApplicable(NotApplicable::TheBlockIsOneProgramUnit)
     );
+    assert_eq!(
+        report.outcome(CaseId::MultiUnitProgramIsLegal),
+        Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit)
+    );
 }
 
 /// A geometry whose erase block is a single byte, where no misaligned operation exists.
@@ -169,6 +173,10 @@ fn a_device_with_byte_granular_erase_exempts_every_misalignment_case() {
     assert_eq!(
         report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
         Outcome::NotApplicable(NotApplicable::TheBlockIsOneProgramUnit)
+    );
+    assert_eq!(
+        report.outcome(CaseId::MultiUnitProgramIsLegal),
+        Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit)
     );
 }
 

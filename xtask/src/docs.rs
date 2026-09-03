@@ -198,8 +198,8 @@ pub struct StorageClause {
 /// Six rather than issue [#21](https://github.com/madmax983/waymaker/issues/21)'s five: the
 /// issue's list is about what an adapter must *refuse* and what must survive a reset, and a
 /// suite made only of those would never check that a legal operation does what it says. The
-/// sixth is `StableStorage`'s own documentation, and it is where half of the twenty cases
-/// live.
+/// sixth is `StableStorage`'s own documentation, and it is where every case about what an
+/// adapter does when it *agrees* lives.
 pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
     StorageClause {
         id: "interruptible-mutations",

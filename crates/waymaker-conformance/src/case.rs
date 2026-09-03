@@ -74,6 +74,12 @@ pub enum CaseId {
     BarrierChangesNoMedia,
     /// A second `barrier()` with no mutation between is legal.
     RepeatedBarriersAreLegal,
+    /// A program of more than one unit in one call is legal, and writes what it was given.
+    MultiUnitProgramIsLegal,
+    /// An erase of more than one block in one call is legal, and stops where it was told.
+    MultiBlockEraseIsLegal,
+    /// A read changes no media.
+    ReadingChangesNoMedia,
 }
 
 /// Every case, in the order the runner runs them.
@@ -178,6 +184,21 @@ pub const CASES: &[Case] = &[
         name: "repeated barriers are legal",
         clause: "operations-act-on-what-they-name",
     },
+    Case {
+        id: CaseId::MultiUnitProgramIsLegal,
+        name: "a multi-unit program is legal",
+        clause: "operations-act-on-what-they-name",
+    },
+    Case {
+        id: CaseId::MultiBlockEraseIsLegal,
+        name: "a multi-block erase is legal",
+        clause: "operations-act-on-what-they-name",
+    },
+    Case {
+        id: CaseId::ReadingChangesNoMedia,
+        name: "reading changes no media",
+        clause: "operations-act-on-what-they-name",
+    },
 ];
 
 /// How many cases there are.
@@ -230,6 +251,8 @@ pub enum NotApplicable {
     TheBlockIsOneProgramUnit,
     /// The read unit is the program unit, so a "partial" read is the whole read.
     TheReadUnitIsTheProgramUnit,
+    /// The erase block is a single program unit, so a program cannot span two units of it.
+    TheBlockHoldsOneProgramUnit,
     /// The region does not reach the end of the device, so the only mutation that starts in
     /// bounds and ends out of them would name media the caller did not make expendable.
     TheRegionDoesNotEndAtTheCapacity,
@@ -243,6 +266,7 @@ impl NotApplicable {
             Self::TheUnitIsOneByte => "the unit is one byte, so no misaligned operation exists",
             Self::TheBlockIsOneProgramUnit => "the erase block is a single program unit",
             Self::TheReadUnitIsTheProgramUnit => "the read unit is the whole program unit",
+            Self::TheBlockHoldsOneProgramUnit => "the erase block holds one program unit",
             Self::TheRegionDoesNotEndAtTheCapacity => {
                 "the region does not reach the end of the device"
             }
