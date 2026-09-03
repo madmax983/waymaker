@@ -1,0 +1,46 @@
+[package]
+name = "waymaker-conformance"
+description = "The conformance suite for design document §12's storage contract, and the embedded-storage port that shows the contract can be adapted. Test support: never linked into firmware by Waymaker itself, never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["development-tools::testing", "embedded"]
+keywords = ["durable", "workflow", "conformance", "storage"]
+# Test support, not a shipped library. It sits above the layers with `waymaker-fault` and
+# `waymaker-spec`: it depends on `waymaker-flash` for §12's contract, and no layer may
+# depend on it in any dependency kind. Nothing Waymaker flashes sees it — but unlike the
+# other two it is `#![no_std]` and allocation-free, because the adapter author it exists
+# for may only be able to run it on the target the driver is for.
+publish = false
+
+[dependencies]
+# §12's contract: `Geometry`, its three validators, and `StableStorage`. The suite is
+# written against the trait and knows nothing else about the firmware — no record, no
+# frame, no journal — which is what makes "any adapter" mean any adapter.
+waymaker-flash.workspace = true
+
+# The port this crate exists to demonstrate. It is a dependency *here*, above the layers,
+# and issue #21 asks for exactly that: an `embedded-storage` implementation can be adapted
+# without `embedded-storage` becoming a kernel dependency. `policy::LAYERS` gives every
+# layer an empty `may_depend_on_external`, so a layer that grew this dependency fails
+# `dependency-direction` and the kernel fails `kernel-zero-dependencies` as well.
+#
+# Not optional. A feature CI never enables is a measurement that did not happen: the
+# workspace test stage compiles and runs the port because the dependency is unconditional.
+embedded-storage = "0.3.1"
+
+[dev-dependencies]
+# The in-memory NOR model and the crash injector. The conformance suite is run against
+# `waymaker_fault::Device` here so that "any adapter" is two adapters rather than one, and
+# the across-reset witness is driven through `Harness` at every crash point the injector
+# lists — a power cut this suite cannot perform on the host is one the model can.
+waymaker-fault.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
