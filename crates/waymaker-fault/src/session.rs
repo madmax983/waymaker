@@ -228,12 +228,44 @@ impl Session {
     }
 
     /// How many bytes of an operation of `len` bytes `progress` describes.
+    ///
+    /// [`Progress::Bytes`] is clamped rather than refused, as it documents: zero is
+    /// [`Progress::None`] and anything at or past the length is [`Progress::Whole`]. What
+    /// the caller then gets back depends on this number and not on which variant produced
+    /// it — see [`completes`](Self::completes).
     const fn landed(progress: Progress, len: u32) -> u32 {
         match progress {
             Progress::None => 0,
             Progress::Bytes(bytes) if bytes < len => bytes,
             Progress::Bytes(_) | Progress::Whole => len,
         }
+    }
+
+    /// How much of an erase of `len` bytes can really have happened.
+    ///
+    /// Rounded down to a whole erase block. [`injections`](crate::injections) only ever
+    /// offers erase tear points at block boundaries, because no device erases byte by byte
+    /// — but [`Harness::run_one`](crate::Harness::run_one) takes a crash point a caller
+    /// built by hand, and a `Bytes(1)` applied literally would put a reset image in front of
+    /// that caller which no modelled device can produce: one byte of a block back to `0xFF`
+    /// and the rest of it still programmed. A targeted reproduction is the run somebody is
+    /// staring at, so it is the last place to invent a failure mode.
+    ///
+    /// The mask is exact because [`Geometry`] refuses an erase size that is not a power of
+    /// two.
+    fn erase_blocks_of(&self, landed: u32) -> u32 {
+        let block = self.device.geometry().erase_size();
+        landed & !block.wrapping_sub(1)
+    }
+
+    /// Whether an operation of `len` bytes that put `landed` of them on media is finished.
+    ///
+    /// Decided from how much landed rather than from which [`Progress`] variant said so,
+    /// which is what makes the documented clamping true: a hand-built `Bytes(len)` is
+    /// `Whole`, and under [`Interruption::PowerLoss`] that means the call returns `Ok(())`
+    /// before the power goes rather than an error the writer stops on.
+    const fn completes(landed: u32, len: u32) -> bool {
+        landed == len
     }
 
     /// What an operation that ran to completion returns, given the crash point armed on it.
@@ -323,7 +355,7 @@ impl StableStorage for Session {
         });
 
         self.armed_for(index).map_or(Ok(()), |injection| {
-            if injection.progress == Progress::Whole {
+            if Self::completes(landed, len) {
                 self.completed(injection)
             } else {
                 Err(self.interrupt(injection.interruption))
@@ -339,9 +371,9 @@ impl StableStorage for Session {
 
         let index = self.ops.len();
         self.ops.push(Op::Erase { offset, len });
-        let landed = self
-            .armed_for(index)
-            .map_or(len, |injection| Self::landed(injection.progress, len));
+        let landed = self.armed_for(index).map_or(len, |injection| {
+            self.erase_blocks_of(Self::landed(injection.progress, len))
+        });
         self.touched.push(self.device.apply_erase(offset, landed));
         self.payloads.push(0);
         self.missing.push(if landed == len {
@@ -354,7 +386,7 @@ impl StableStorage for Session {
         });
 
         self.armed_for(index).map_or(Ok(()), |injection| {
-            if injection.progress == Progress::Whole {
+            if Self::completes(landed, len) {
                 self.completed(injection)
             } else {
                 Err(self.interrupt(injection.interruption))
@@ -375,8 +407,9 @@ impl StableStorage for Session {
 
         match self.armed_for(index) {
             // A barrier that returned an error establishes nothing a caller may rely on,
-            // whatever really happened on the wire.
-            Some(injection) if injection.progress != Progress::Whole => {
+            // whatever really happened on the wire. It has no interior, so any progress
+            // other than `None` says it ran — there is no half of a barrier to land.
+            Some(injection) if injection.progress == Progress::None => {
                 Err(self.interrupt(injection.interruption))
             }
             // The barrier completed. Whether the power then went away or the call merely
