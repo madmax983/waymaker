@@ -315,9 +315,10 @@ impl StableStorage for Session {
         self.missing.push(if withheld.is_empty() {
             Missing::Nothing
         } else {
+            let at = offset.wrapping_add(landed);
             Missing::Program {
-                offset: offset.wrapping_add(landed),
-                bytes: withheld.to_vec(),
+                offset: at,
+                expected: self.device.postimage_of(at, withheld),
             }
         });
 
@@ -405,12 +406,13 @@ struct Trace {
 enum Missing {
     /// Nothing: the operation did everything it set out to do.
     Nothing,
-    /// Bytes a program did not write.
+    /// What a program would have left where it stopped.
     Program {
-        /// Where the unwritten bytes would have gone.
+        /// Where the unwritten region starts.
         offset: u32,
-        /// The bytes themselves, so that "is this still missing" can be asked later.
-        bytes: Vec<u8>,
+        /// The bytes a completed write would have left there — the preimage masked by what
+        /// it carried, not the argument it was handed.
+        expected: Vec<u8>,
     },
     /// A region an erase did not reach.
     Erase {
@@ -429,7 +431,7 @@ impl Missing {
     fn outstanding(&self, device: &Device) -> bool {
         match self {
             Self::Nothing => false,
-            Self::Program { offset, bytes } => device.program_would_change(*offset, bytes),
+            Self::Program { offset, expected } => device.differs_from(*offset, expected),
             Self::Erase { offset, len } => device.erase_would_change(*offset, *len),
         }
     }

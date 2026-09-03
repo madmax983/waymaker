@@ -199,24 +199,41 @@ impl Device {
             .any(|(cell, wanted)| wanted & !cell != 0)
     }
 
-    /// Whether programming `src` at `offset` would change any cell.
+    /// What programming `src` at `offset` would leave behind, cell by cell.
     ///
-    /// Not the same question as "does it write bytes". Programming `0xFF` over erased media
-    /// is the identity, which is what makes a write torn inside a frame's padding
-    /// indistinguishable from one that completed — the bytes that did not land were the
-    /// bytes that would have changed nothing.
-    pub(crate) fn program_would_change(&self, offset: u32, src: &[u8]) -> bool {
+    /// The preimage masked by the bytes, because programming ANDs: over media already
+    /// holding `0x3C`, programming `0xF0` leaves `0x30` and not `0xF0`. Storing the
+    /// *argument* as a record's expected contents would call an untouched region torn.
+    pub(crate) fn postimage_of(&self, offset: u32, src: &[u8]) -> Vec<u8> {
         let Some(target) = usize::try_from(offset)
             .ok()
             .and_then(|start| start.checked_add(src.len()).map(|end| (start, end)))
             .and_then(|(start, end)| self.media.get(start..end))
         else {
-            return false;
+            return Vec::new();
         };
         target
             .iter()
             .zip(src)
-            .any(|(cell, wanted)| cell & wanted != *cell)
+            .map(|(cell, wanted)| cell & wanted)
+            .collect()
+    }
+
+    /// Whether the media at `offset` differs from `expected`, byte for byte.
+    ///
+    /// Equality rather than "would programming these bytes change anything". The second
+    /// question cannot tell a withheld byte from one that arrived and then had *more* bits
+    /// cleared: programming only clears, so replaying `0xF0` over a cell now holding `0x00`
+    /// changes nothing and answers "already there" about a byte that is not.
+    pub(crate) fn differs_from(&self, offset: u32, expected: &[u8]) -> bool {
+        let Some(target) = usize::try_from(offset)
+            .ok()
+            .and_then(|start| start.checked_add(expected.len()).map(|end| (start, end)))
+            .and_then(|(start, end)| self.media.get(start..end))
+        else {
+            return !expected.is_empty();
+        };
+        target != expected
     }
 
     /// Whether erasing `offset..offset + len` would change any cell.
