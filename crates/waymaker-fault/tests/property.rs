@@ -49,7 +49,7 @@ use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef, ReplayCursor, RunId};
 use waymaker_fault::{
-    Durability, FaultError, Harness, Injection, Interruption, Op, Progress, Recovery, RecordId,
+    Durability, FaultError, Harness, Injection, Interruption, Op, Progress, RecordId, Recovery,
     Rng, Run, Session, injections, random_geometry, verify_oracle,
 };
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
@@ -119,31 +119,39 @@ impl History {
 
         let effects = rng.below(5);
         let mut seq = EffectSeq::FIRST;
+        let mut unresolved = false;
         for effect in 0..effects {
-            history.push(rng, Planned::Scheduled {
-                seq,
-                kind: ActivityKind(1 + u16::try_from(rng.below(4)).unwrap_or(0)),
-            });
+            let kind = ActivityKind(1 + u16::try_from(rng.below(4)).unwrap_or(0));
+            history.push(rng, Planned::Scheduled { seq, kind });
             // The last effect may be left unresolved, which is the state a run is in when
             // the power goes while an effect is in flight. Every earlier one is resolved,
             // because a schedule with an unresolved schedule before it is not a history the
             // cursor would ever have written.
             if effect + 1 == effects && rng.flip() {
+                unresolved = true;
                 break;
             }
-            history.push(rng, if rng.flip() {
+            let outcome = if rng.flip() {
                 Planned::Completed { seq }
             } else {
                 Planned::Failed { seq }
-            });
+            };
+            history.push(rng, outcome);
             let Some(next) = seq.successor() else { break };
             seq = next;
         }
 
-        match rng.below(4) {
-            0 => history.push(rng, Planned::RunCompleted),
-            1 => history.push(rng, Planned::RunFailed),
-            _ => {}
+        // A run does not end while an effect is in flight: §08's transition table refuses a
+        // terminal record at `AwaitingOutcome`, so a history with one would be a history no
+        // workflow could have written — and the sweep would then be measuring the cursor's
+        // refusals rather than what a crash point did.
+        let terminal = rng.below(4);
+        if !unresolved {
+            match terminal {
+                0 => history.push(rng, Planned::RunCompleted),
+                1 => history.push(rng, Planned::RunFailed),
+                _ => {}
+            }
         }
         history
     }
@@ -151,7 +159,7 @@ impl History {
     /// Appends `plan`, drawing its payload and whether a barrier follows it.
     fn push(&mut self, rng: &mut Rng, plan: Planned) {
         let index = self.plans.len();
-        let len = rng.below(9) as usize;
+        let len = usize::try_from(rng.below(9)).unwrap_or(0);
         self.plans.push(plan);
         // Three quarters, not all: a record with no barrier after it is only ever
         // *possibly* durable, and a sweep in which every record is acknowledged would never
@@ -274,7 +282,10 @@ fn append_all(
             break;
         };
         let len = u32::try_from(written).unwrap_or(u32::MAX);
-        if at.checked_add(len).is_none_or(|end| end > geometry.capacity()) {
+        if at
+            .checked_add(len)
+            .is_none_or(|end| end > geometry.capacity())
+        {
             break;
         }
 
@@ -359,7 +370,11 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
         let align = align_of(geometry);
         let (runs, log) = sweep(&history, geometry);
 
-        assert_eq!(log.len(), runs.len(), "seed {seed}: one dispatch log per run");
+        assert_eq!(
+            log.len(),
+            runs.len(),
+            "seed {seed}: one dispatch log per run"
+        );
         census.runs += runs.len();
         census.geometries.insert((
             geometry.capacity(),
@@ -368,7 +383,9 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
             geometry.read_size(),
         ));
 
-        let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+        let clean = runs
+            .first()
+            .unwrap_or_else(|| unreachable!("the fault-free run"));
         let whole = recover(clean.image(), &history, align);
         census.shapes.insert(whole.clone());
 
@@ -419,8 +436,15 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
         }
     }
 
-    // Everything below is the difference between a sweep and a loop that ran. A suite that
-    // asserted only the oracle would pass just as loudly over one empty journal.
+    assert_the_sweep_covered_something(&census);
+}
+
+/// The difference between a sweep and a loop that ran.
+///
+/// A suite that asserted only the oracle would pass just as loudly over one empty journal
+/// on one geometry, so each of these names a way the sweep above could have been vacuous
+/// and refuses it.
+fn assert_the_sweep_covered_something(census: &Census) {
     assert!(
         census.runs > 5_000,
         "the whole sweep was only {} runs",
@@ -485,7 +509,9 @@ fn every_byte_and_every_program_unit_of_every_write_is_a_crash_point() {
         let history = History::draw(&mut rng);
         let (runs, _) = sweep(&history, geometry);
 
-        let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+        let clean = runs
+            .first()
+            .unwrap_or_else(|| unreachable!("the fault-free run"));
         let enumerated = injections(clean.ops(), geometry);
         assert_eq!(
             runs.len(),
@@ -494,7 +520,9 @@ fn every_byte_and_every_program_unit_of_every_write_is_a_crash_point() {
         );
 
         for (index, op) in clean.ops().iter().enumerate() {
-            let Op::Program { len, .. } = *op else { continue };
+            let Op::Program { len, .. } = *op else {
+                continue;
+            };
             for byte in 1..len {
                 let tear = Injection {
                     op: index,
@@ -531,7 +559,9 @@ fn the_power_goes_before_and_after_every_barrier() {
         let history = History::draw(&mut rng);
         let (runs, _) = sweep(&history, geometry);
 
-        let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+        let clean = runs
+            .first()
+            .unwrap_or_else(|| unreachable!("the fault-free run"));
         let enumerated = injections(clean.ops(), geometry);
 
         for (index, op) in clean.ops().iter().enumerate() {
@@ -567,7 +597,10 @@ fn the_power_goes_before_and_after_every_barrier() {
         }
     }
 
-    assert!(barriers > 32, "only {barriers} barriers across the whole sweep");
+    assert!(
+        barriers > 32,
+        "only {barriers} barriers across the whole sweep"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -593,7 +626,9 @@ fn a_single_bit_flipped_anywhere_never_lengthens_recovered_history() {
     let mut rng = Rng::new(101);
     let history = History::draw(&mut rng);
     let (runs, _) = sweep(&history, geometry);
-    let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+    let clean = runs
+        .first()
+        .unwrap_or_else(|| unreachable!("the fault-free run"));
     let whole = recover(clean.image(), &history, align);
     assert!(whole.len() >= 2, "the fixture recovered only {whole:?}");
 
@@ -669,7 +704,11 @@ fn a_payload_length_that_lies_is_refused_even_with_a_header_that_checks_out() {
             matches!(scan.next(), Some(Err(_))),
             "a frame claiming a {lie}-byte payload was accepted"
         );
-        assert_eq!(scan.offset(), 0, "the scan advanced past a frame it refused");
+        assert_eq!(
+            scan.offset(),
+            0,
+            "the scan advanced past a frame it refused"
+        );
     }
 }
 
@@ -751,10 +790,18 @@ fn a_sequence_at_the_top_of_the_space_survives_the_frame_and_stops_the_run() {
         };
         let journal = buffer.get(..written).unwrap_or_default();
         let mut scan = Scan::new(journal, align);
-        assert_eq!(scan.next(), Some(Ok(record)), "a sequence of {seq:?} did not survive");
+        assert_eq!(
+            scan.next(),
+            Some(Ok(record)),
+            "a sequence of {seq:?} did not survive"
+        );
     }
 
-    assert_eq!(EffectSeq::MAX.successor(), None, "the sequence space wrapped");
+    assert_eq!(
+        EffectSeq::MAX.successor(),
+        None,
+        "the sequence space wrapped"
+    );
 
     // And a journal whose sequences skip is refused by the cursor rather than replayed:
     // "out of sequence" is a fact about the run, so the scan does not own it and the
@@ -796,7 +843,6 @@ fn a_run_that_overflows_its_journal_recovers_what_fitted_and_nothing_more() {
         unreachable!("64 is one whole 64-byte block of 4-byte units")
     };
     let align = align_of(tiny);
-    let mut rng = Rng::new(202);
     let history = History {
         plans: (0..12)
             .map(|index| {
@@ -817,10 +863,11 @@ fn a_run_that_overflows_its_journal_recovers_what_fitted_and_nothing_more() {
         barriers: vec![true; 12],
         payloads: vec![Vec::new(); 12],
     };
-    drop(rng.next_u64());
 
     let (runs, log) = sweep(&history, tiny);
-    let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+    let clean = runs
+        .first()
+        .unwrap_or_else(|| unreachable!("the fault-free run"));
     let whole = recover(clean.image(), &history, align);
     assert!(
         !whole.is_empty() && whole.len() < history.plans.len(),
@@ -847,7 +894,10 @@ fn a_run_that_overflows_its_journal_recovers_what_fitted_and_nothing_more() {
     for (run, dispatched) in runs.iter().zip(log.iter()) {
         let recovered = recover(run.image(), &history, align);
         assert_eq!(
-            verify_oracle(run.ledger(), &Recovery::new(&recovered).dispatched(dispatched)),
+            verify_oracle(
+                run.ledger(),
+                &Recovery::new(&recovered).dispatched(dispatched)
+            ),
             Ok(()),
             "at {:?}: recovered {recovered:?}",
             run.injection()
@@ -888,7 +938,10 @@ fn a_record_the_writer_never_started_is_not_one_recovery_may_produce() {
         );
         caught += 1;
     }
-    assert!(caught > 0, "no crash point stopped before a record's first byte");
+    assert!(
+        caught > 0,
+        "no crash point stopped before a record's first byte"
+    );
 }
 
 #[test]

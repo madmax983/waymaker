@@ -26,8 +26,8 @@
 
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, ReplayCursor, RunId};
 use waymaker_fault::{
-    Breach, Durability, FaultError, Harness, Injection, Interruption, Op, Progress, Recovery,
-    RecordId, Run, Session, verify_oracle,
+    Breach, Durability, FaultError, Harness, Injection, Op, Progress, RecordId, Recovery, Run,
+    Session, verify_oracle,
 };
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -78,12 +78,12 @@ fn align() -> ProgramAlign {
 /// the selection below turns on: a bank is authoritative only once its *last* record is
 /// durable, which is §02 decision 7 with the frame format standing in for rung 0.2's
 /// storage-program unit.
-fn bank_records(generation: [u8; 4]) -> [RecordRef<'_>; 4] {
+const fn bank_records(generation: &[u8; 4]) -> [RecordRef<'_>; 4] {
     [
         RecordRef::RunStarted {
             workflow_kind: 7,
             workflow_version: 1,
-            input: &generation,
+            input: generation,
         },
         RecordRef::EffectScheduled {
             seq: EffectSeq::FIRST,
@@ -93,11 +93,9 @@ fn bank_records(generation: [u8; 4]) -> [RecordRef<'_>; 4] {
         },
         RecordRef::EffectCompleted {
             seq: EffectSeq::FIRST,
-            result: &generation,
+            result: generation,
         },
-        RecordRef::RunCompleted {
-            result: &generation,
-        },
+        RecordRef::RunCompleted { result: generation },
     ]
 }
 
@@ -106,7 +104,7 @@ fn write_bank(session: &mut Session, base: u32, generation: u32) -> Result<(), F
     let bytes = generation.to_le_bytes();
     let mut at = base;
     let mut buffer = [0_u8; 64];
-    for record in bank_records(bytes) {
+    for record in bank_records(&bytes) {
         let Ok(written) = frame::encode(&record, align(), &mut buffer) else {
             unreachable!("64 bytes is more than any bank record")
         };
@@ -162,7 +160,10 @@ fn banks(image: &[u8]) -> [&[u8]; 2] {
 /// count says so rather than picking one — a tie is the state no protocol may produce, so a
 /// selection that resolved it would be hiding the bug the count exists to find.
 fn authority(image: &[u8]) -> (usize, Option<u32>) {
-    let sealed: Vec<u32> = banks(image).iter().filter_map(|bank| sealed_generation(bank)).collect();
+    let sealed: Vec<u32> = banks(image)
+        .iter()
+        .filter_map(|bank| sealed_generation(bank))
+        .collect();
     match sealed.as_slice() {
         [] => (0, None),
         [only] => (1, Some(*only)),
@@ -193,12 +194,17 @@ fn swap(session: &mut Session) -> Result<(), FaultError> {
     write_bank(session, BANK_A, 1)?;
     session.barrier()?;
 
-    // One durable unit: the erase, the payload and the seal, ordered by one barrier at the
-    // end. Nothing in here is separately recoverable, so nothing in here is a record of
-    // its own.
-    session.begin_record(SWAP);
+    // Preparing the spare bank is not part of the durable unit, and declaring it as part of
+    // one would be a silent weakening: a barrier issued after the erase and before the
+    // payload would acknowledge the record while nothing of its content is on media, and
+    // the oracle would then *require* recovery to produce a swap that had not happened.
+    // An erased bank is not a swap. It is a bank with nothing in it.
     session.erase(BANK_B, BANK_BYTES)?;
     session.barrier()?;
+
+    // One durable unit: the payload and the seal, ordered by one barrier at the end.
+    // Nothing in here is separately recoverable, so nothing in here is a record of its own.
+    session.begin_record(SWAP);
     write_bank(session, BANK_B, NEW_GENERATION)?;
     session.barrier()?;
     session.end_record();
@@ -212,10 +218,13 @@ fn swap_clearing_both(session: &mut Session) -> Result<(), FaultError> {
     write_bank(session, BANK_A, 1)?;
     session.barrier()?;
 
-    session.begin_record(SWAP);
+    // The bug, and only the bug: the same shape as `swap`, with the bank being booted from
+    // erased alongside the spare one.
     session.erase(BANK_A, BANK_BYTES)?;
     session.erase(BANK_B, BANK_BYTES)?;
     session.barrier()?;
+
+    session.begin_record(SWAP);
     write_bank(session, BANK_B, NEW_GENERATION)?;
     session.barrier()?;
     session.end_record();
@@ -246,7 +255,9 @@ fn after_first_commit(run: &Run) -> bool {
 #[test]
 fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() {
     let runs = drive(swap);
-    let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+    let clean = runs
+        .first()
+        .unwrap_or_else(|| unreachable!("the fault-free run"));
     assert_eq!(
         clean.ops().get(FIRST_COMMIT),
         Some(&Op::Barrier),
@@ -274,7 +285,8 @@ fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() 
             continue;
         }
         assert_eq!(
-            count, 1,
+            count,
+            1,
             "at {:?}: a committed device has {count} authoritative banks",
             run.injection()
         );
@@ -296,7 +308,6 @@ fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() 
             run.injection(),
             run.ledger().records().collect::<Vec<_>>()
         );
-        continue;
     }
 
     // The sweep has to have seen both outcomes, or "exactly one" held because only one was
@@ -422,7 +433,11 @@ fn a_selection_that_ignores_the_seal_finds_two_authorities() {
     for run in &runs {
         let count = banks(run.image())
             .iter()
-            .filter(|bank| Scan::new(bank, align()).next().is_some_and(|step| step.is_ok()))
+            .filter(|bank| {
+                Scan::new(bank, align())
+                    .next()
+                    .is_some_and(|step| step.is_ok())
+            })
             .count();
         if count < 2 {
             continue;

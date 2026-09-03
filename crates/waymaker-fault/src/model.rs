@@ -75,6 +75,13 @@ impl Ledger {
     /// a recovery that produces one: design document §15 permits recovery to include "an
     /// unacknowledged **complete** record", and complete is the load-bearing word.
     ///
+    /// # Postconditions
+    ///
+    /// Never `Some(true)` for a [`Durability::Attempted`] record. "Half of it is on media"
+    /// and "none of it is" are mutually exclusive, so a record the writer was interrupted
+    /// before it changed a cell is not torn — it is absent, which is a different obligation
+    /// on recovery and a different diagnosis when one is breached.
+    ///
     /// [`verify_recovery`]: crate::verify_recovery
     #[must_use]
     pub fn torn(&self, id: RecordId) -> Option<bool> {

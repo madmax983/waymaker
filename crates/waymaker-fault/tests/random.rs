@@ -4,7 +4,7 @@
 //! sequences across random storage geometries". Random here means *drawn*, never
 //! *unrepeatable*: a suite whose failures cannot be re-run is a suite nobody can fix, and
 //! one that pulls in a third-party generator is a dependency this crate does not have.
-//! So [`Rng`] is SplitMix64 in thirty lines, and this file is what holds it to being a
+//! So [`Rng`] is `SplitMix64` in thirty lines, and this file is what holds it to being a
 //! generator rather than a source of surprises.
 
 use std::collections::BTreeSet;
@@ -13,9 +13,16 @@ use waymaker_fault::{Rng, random_geometry};
 
 #[test]
 fn one_seed_is_one_sequence_for_ever() {
-    let first: Vec<u64> = (0..64).scan(Rng::new(7), |rng, _| Some(rng.next_u64())).collect();
-    let second: Vec<u64> = (0..64).scan(Rng::new(7), |rng, _| Some(rng.next_u64())).collect();
-    assert_eq!(first, second, "the same seed produced two different streams");
+    let first: Vec<u64> = (0..64)
+        .scan(Rng::new(7), |rng, _| Some(rng.next_u64()))
+        .collect();
+    let second: Vec<u64> = (0..64)
+        .scan(Rng::new(7), |rng, _| Some(rng.next_u64()))
+        .collect();
+    assert_eq!(
+        first, second,
+        "the same seed produced two different streams"
+    );
 }
 
 #[test]
@@ -37,7 +44,11 @@ fn below_stays_below_and_reaches_everything_under_it() {
         assert!(drawn < 7, "below(7) drew {drawn}");
         seen.insert(drawn);
     }
-    assert_eq!(seen, (0..7).collect::<BTreeSet<u32>>(), "some value never came up");
+    assert_eq!(
+        seen,
+        (0..7).collect::<BTreeSet<u32>>(),
+        "some value never came up"
+    );
 }
 
 #[test]
@@ -62,7 +73,10 @@ fn every_drawn_geometry_is_a_legal_one_the_caller_asked_for() {
     let mut programs = BTreeSet::new();
     for _ in 0..2048 {
         let geometry = random_geometry(&mut rng, 256);
-        assert!(geometry.capacity() <= 256, "{geometry:?} is bigger than asked for");
+        assert!(
+            geometry.capacity() <= 256,
+            "{geometry:?} is bigger than asked for"
+        );
         assert!(geometry.capacity() >= geometry.erase_size());
         assert_eq!(geometry.capacity() % geometry.erase_size(), 0);
         assert!(geometry.erase_size() >= geometry.program_size());

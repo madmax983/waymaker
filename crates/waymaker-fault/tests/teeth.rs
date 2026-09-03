@@ -107,7 +107,7 @@ const fn id(index: u32) -> RecordId {
 }
 
 /// The `index`-th record of the fixture history, borrowing `payload`.
-fn record<'a>(index: u32, payload: &'a [u8]) -> RecordRef<'a> {
+fn record(index: u32, payload: &[u8]) -> RecordRef<'_> {
     if index == 0 {
         return RecordRef::RunStarted {
             workflow_kind: 7,
@@ -132,7 +132,7 @@ fn record<'a>(index: u32, payload: &'a [u8]) -> RecordRef<'a> {
 }
 
 /// Which fixture record `record` is, by what is in it.
-fn identify(record: &RecordRef<'_>) -> RecordId {
+const fn identify(record: &RecordRef<'_>) -> RecordId {
     match record {
         RecordRef::RunStarted { .. } => id(0),
         RecordRef::EffectScheduled { seq, .. } => id(seq.0.wrapping_mul(2).wrapping_add(1)),
@@ -148,7 +148,9 @@ const RECORDS: u32 = 1 + EFFECTS * 2;
 
 /// The payload record `index` carries.
 fn payload(index: u32) -> Vec<u8> {
-    (0..4).map(|at| u8::try_from((index + at) & 0xFF).unwrap_or(0)).collect()
+    (0..4)
+        .map(|at| u8::try_from((index + at) & 0xFF).unwrap_or(0))
+        .collect()
 }
 
 /// Appends the fixture history, sealing every frame with `C`.
@@ -228,7 +230,9 @@ fn the_unmutated_pipeline_recovers_the_whole_fixture_and_satisfies_the_oracle() 
     let runs = runs::<Catalogued>();
     assert!(runs.len() > 100, "only {} runs", runs.len());
 
-    let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+    let clean = runs
+        .first()
+        .unwrap_or_else(|| unreachable!("the fault-free run"));
     assert_eq!(
         recover::<Catalogued>(clean.image()),
         (0..RECORDS).map(id).collect::<Vec<_>>()
@@ -290,7 +294,7 @@ fn a_codec_that_seals_nothing_recovers_a_record_that_is_half_there() {
 }
 
 /// The name of a breach's variant, for asserting *which* diagnosis was reached.
-fn discriminant(breach: &Breach) -> &'static str {
+const fn discriminant(breach: &Breach) -> &'static str {
     match breach {
         Breach::DuplicateRecordId { .. } => "DuplicateRecordId",
         Breach::NotAPrefix { .. } => "NotAPrefix",
@@ -345,7 +349,7 @@ fn a_cursor_that_skips_a_record_is_not_a_prefix_of_anything() {
     let runs = runs::<Catalogued>();
     let caught = breaches::<Catalogued, _>(&runs, |mut history| {
         if history.len() >= 2 {
-            drop(history.remove(0));
+            history.remove(0);
         }
         history
     });

@@ -177,12 +177,21 @@ impl Session {
                     .marks
                     .get(position.wrapping_add(1))
                     .map_or(self.ops.len(), |(_, next)| *next);
-                let torn = (*start..end.max(*start)).any(|index| {
+                let withheld = (*start..end.max(*start)).any(|index| {
                     self.missing
                         .get(index)
                         .is_some_and(|missing| missing.outstanding(&self.device))
                 });
-                Some((id, self.durability_of(*start, end, torn), torn))
+                let state = self.durability_of(*start, end, withheld);
+                // A record none of whose bytes reached media is not a torn one.
+                // [`Ledger::torn`] is "some of it is on media and the rest is not", and for
+                // a [`Durability::Attempted`] record none of it is — the writer was
+                // interrupted before its first write changed a cell. Reporting both would
+                // make two mutually exclusive states true at once, and a reader asking
+                // "is this half a record" would be told yes about a record that does not
+                // exist on media at all.
+                let torn = withheld && state != Durability::Attempted;
+                Some((id, state, torn))
             })
             .collect();
         Ledger::new(entries)

@@ -70,10 +70,12 @@ mod device;
 mod inject;
 mod model;
 mod oracle;
+mod rng;
 mod session;
 
 pub use device::{Device, ERASED, FaultError, OneWayBits};
 pub use inject::{Injection, Interruption, Op, Progress, injections};
 pub use model::{Durability, Ledger, RecordId};
-pub use oracle::{Breach, verify_recovery};
+pub use oracle::{Breach, Recovery, verify_oracle, verify_recovery};
+pub use rng::{Rng, random_geometry};
 pub use session::{Harness, HarnessError, Run, Session};
