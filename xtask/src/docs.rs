@@ -51,6 +51,75 @@ pub const ADR_NUMBER_START: u32 = 1;
 /// fact rather than a surprise.
 pub const SETTLED_DECISIONS_ADR: &str = "0003-the-eight-settled-design-decisions.md";
 
+/// The ADR that records the recovery specification of issue #20.
+pub const RECOVERY_SPEC_ADR: &str =
+    "0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md";
+
+/// Where the specification's own clause table lives, relative to the workspace root.
+///
+/// Read rather than trusted: [`SPEC_CLAUSES`] is what `CLAUDE.md` and the ADR are compared
+/// against, and this file is what the proofs are compared against. Without reading both, a
+/// clause could be deleted from the crate with the documentation still describing it, which
+/// is one of the exact two ways a specification rots.
+pub const SPEC_OBLIGATIONS_PATH: &str = "crates/waymaker-spec/src/obligation.rs";
+
+/// One of design document §14's guarantees, as the gate knows it.
+///
+/// The counterpart of [`waymaker-spec`'s own table][spec]; `recovery-spec` fails a build in
+/// which the two disagree, in either direction.
+///
+/// [spec]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-spec/src/obligation.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecClause {
+    /// Stable identifier, cited by `CLAUDE.md`, by the ADR and by the crate.
+    pub id: &'static str,
+    /// The guarantee, quoted from §14 closely enough to be recognisable.
+    pub headline: &'static str,
+    /// The test target that discharges it, relative to `crates/waymaker-spec`.
+    ///
+    /// Named in `CLAUDE.md` too, so that a reader who wants to know what holds a guarantee
+    /// up is one grep away from the file rather than one guess away.
+    pub discharged_by: &'static str,
+}
+
+/// Design document §14's five guarantees, plus §02 decision 7's single authority.
+///
+/// Six rather than issue [#20](https://github.com/madmax983/waymaker/issues/20)'s five:
+/// the issue lists single authority where §14 lists stable redelivery, and a specification
+/// of the recovery guarantees that dropped either would be a specification of most of them.
+pub const SPEC_CLAUSES: &[SpecClause] = &[
+    SpecClause {
+        id: "prefix-safety",
+        headline: "recovery exposes only a legal prefix of committed records",
+        discharged_by: "tests/spine.rs",
+    },
+    SpecClause {
+        id: "acknowledged-durability",
+        headline: "any record acknowledged after its barrier is recovered after reset",
+        discharged_by: "tests/spine.rs",
+    },
+    SpecClause {
+        id: "durable-intent",
+        headline: "no Waymaker-dispatched effect lacks a recoverable schedule record",
+        discharged_by: "tests/spine.rs",
+    },
+    SpecClause {
+        id: "single-authority",
+        headline: "exactly one bank is authoritative after any crash",
+        discharged_by: "tests/spine.rs",
+    },
+    SpecClause {
+        id: "stable-redelivery",
+        headline: "retries and reboot redelivery reuse the original effect identity",
+        discharged_by: "tests/redelivery.rs",
+    },
+    SpecClause {
+        id: "bounded-decoding",
+        headline: "malformed storage cannot cause out-of-bounds reads or allocation",
+        discharged_by: "tests/bounded_decoding.rs",
+    },
+];
+
 /// The id of the diagram that has to agree with [`LAYERS`].
 pub const CRATE_DEPENDENCY_DIAGRAM: &str = "crate-dependency-flow";
 
@@ -397,7 +466,27 @@ pub const TRANSITION_TABLE_ROWS: &[&str] = &[
     "Terminal workflow record",
 ];
 
-/// Every diagram issue #11 asks for.
+/// The states and preconditions the recovery specification's journal machine has.
+///
+/// Design document §15 names three record states; issue #20 asks for the legal transitions
+/// between them, and between bank generations, to be *stated*. The states are the nodes and
+/// the preconditions are the edge labels, because a picture of the states without the guards
+/// is a picture of the part that was never in question.
+const RECOVERY_STATE_MACHINE_LABELS: &[&str] = &[
+    "attempted",
+    "possibly durable",
+    "acknowledged",
+    "torn",
+    "append-only",
+    "barrier claims only whole records",
+    "erased",
+    "sealing",
+    "sealed",
+    "never erase the authority",
+    "strictly greater generation",
+];
+
+/// Every diagram issue #11 asks for, plus the recovery state machine of issue #20.
 pub const DIAGRAMS: &[DiagramSpec] = &[
     DiagramSpec {
         id: CRATE_DEPENDENCY_DIAGRAM,
@@ -454,6 +543,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         required_labels: &["BANK A", "BANK B", "generation 41", "generation 42"],
         source_section: "§10 Two-bank lifecycle",
     },
+    DiagramSpec {
+        id: "recovery-state-machine",
+        title: "the journal and bank state machines the recovery specification proves over",
+        required_labels: RECOVERY_STATE_MACHINE_LABELS,
+        source_section: "§14 Guarantees and §15 Testing and verification",
+    },
 ];
 
 /// One ADR file, read off disk.
@@ -491,6 +586,11 @@ pub struct DocsInputs {
     pub adr_index: Option<String>,
     /// Every file in [`ADR_DIR`] except the index, in name order.
     pub adrs: Vec<AdrFile>,
+    /// Contents of [`SPEC_OBLIGATIONS_PATH`], when the workspace has it.
+    ///
+    /// `None` is a violation rather than a skip: a specification whose clause table cannot
+    /// be read is a specification nothing is holding to its documentation.
+    pub spec_obligations: Option<String>,
     /// Every crate root in the workspace, in package-then-path order.
     ///
     /// A workspace member that contributes no root at all is reported by
@@ -804,6 +904,164 @@ fn check_claude_md(contents: Option<&str>, rules: &[&str]) -> Vec<Violation> {
     }
 
     violations
+}
+
+/// Rule: the recovery specification, its documentation and its proofs name one set of
+/// clauses.
+///
+/// Issue [#20](https://github.com/madmax983/waymaker/issues/20)'s third exit criterion is
+/// that "any change to the record representation updates the model and invariants first,
+/// then the proofs, then the code". Nothing mechanical can check the *order*, but this can
+/// check that the four places a clause lives never disagree: [`SPEC_CLAUSES`], `CLAUDE.md`,
+/// [`RECOVERY_SPEC_ADR`], and the crate's own table at [`SPEC_OBLIGATIONS_PATH`]. A clause
+/// deleted from the crate with the documentation still describing it, and a clause written
+/// into the documentation that no proof discharges, are the two ways a specification rots,
+/// and each fails here.
+#[must_use]
+fn check_recovery_spec(
+    claude_md: Option<&str>,
+    adrs: &[AdrFile],
+    obligations: Option<&str>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+
+    match obligations {
+        None => violations.push(Violation::new(
+            "recovery-spec",
+            SPEC_OBLIGATIONS_PATH,
+            "the specification's clause table is not where the gate looks for it, so \
+             nothing holds the proofs to the documentation",
+        )),
+        Some(contents) => {
+            let declared = spec_clause_ids(contents);
+            for clause in SPEC_CLAUSES {
+                if !declared.contains(clause.id) {
+                    violations.push(Violation::new(
+                        "recovery-spec",
+                        clause.id,
+                        format!(
+                            "{SPEC_OBLIGATIONS_PATH} declares no clause with this id, so the \
+                             guarantee has documentation and no proof behind it"
+                        ),
+                    ));
+                }
+            }
+            for id in &declared {
+                if !SPEC_CLAUSES.iter().any(|clause| clause.id == *id) {
+                    violations.push(Violation::new(
+                        "recovery-spec",
+                        (*id).to_owned(),
+                        format!(
+                            "{SPEC_OBLIGATIONS_PATH} declares this clause and docs::SPEC_CLAUSES \
+                             does not, so a guarantee is proved and undocumented"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.extend(check_spec_clauses_are_written_down(claude_md));
+    violations.extend(check_spec_clauses_are_decided(adrs));
+    violations
+}
+
+/// Every clause id [`SPEC_OBLIGATIONS_PATH`] declares.
+///
+/// Matched on the table's own `id: "..."` field rather than on the whole file, so a clause
+/// id that only appears in a doc comment does not vouch for a row that is not there.
+fn spec_clause_ids(contents: &str) -> std::collections::BTreeSet<&str> {
+    let mut ids = std::collections::BTreeSet::new();
+    for (index, _) in contents.match_indices("id: \"") {
+        let Some(rest) = contents.get(index.saturating_add(5)..) else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else { continue };
+        let Some(id) = rest.get(..end) else { continue };
+        if !id.is_empty() {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
+/// The half of `recovery-spec` that reads `CLAUDE.md`.
+fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        // `claude-md` already reports the missing file.
+        return Vec::new();
+    };
+    let contents = without_html_comments(contents);
+    let mut violations = Vec::new();
+    for clause in SPEC_CLAUSES {
+        if !contents.contains(&format!("`{}`", clause.id)) {
+            violations.push(Violation::new(
+                "recovery-spec",
+                clause.id,
+                "CLAUDE.md has no row naming this recovery invariant in backticks, so a \
+                 contributor cannot tell which guarantee a change is touching",
+            ));
+            continue;
+        }
+        if !contents.contains(clause.headline) {
+            violations.push(Violation::new(
+                "recovery-spec",
+                clause.id,
+                format!(
+                    "CLAUDE.md does not state this guarantee as `{}`, which is what \
+                     docs::SPEC_CLAUSES reads",
+                    clause.headline
+                ),
+            ));
+        }
+        if !contents.contains(clause.discharged_by) {
+            violations.push(Violation::new(
+                "recovery-spec",
+                clause.id,
+                format!(
+                    "CLAUDE.md does not say this guarantee is discharged by \
+                     `{}`, so the row describes a proof without pointing at one",
+                    clause.discharged_by
+                ),
+            ));
+        }
+    }
+    let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+    if !contents.contains(&count) {
+        violations.push(Violation::new(
+            "recovery-spec",
+            "clause count",
+            format!("CLAUDE.md does not say `{count}`, which is what the table holds"),
+        ));
+    }
+    violations
+}
+
+/// The half of `recovery-spec` that reads the decision record.
+fn check_spec_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
+    let Some(adr) = adrs.iter().find(|adr| adr.name == RECOVERY_SPEC_ADR) else {
+        return vec![Violation::new(
+            "recovery-spec",
+            RECOVERY_SPEC_ADR,
+            "the recovery specification has no decision record, so the shape of the proof \
+             is a choice nobody wrote down",
+        )];
+    };
+    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    SPEC_CLAUSES
+        .iter()
+        .filter(|clause| !contents.contains(&format!("`{}`", clause.id)))
+        .map(|clause| {
+            Violation::new(
+                "recovery-spec",
+                clause.id,
+                format!(
+                    "{RECOVERY_SPEC_ADR} does not name this clause in backticks, so the \
+                     guarantee has a proof and no decision record behind it"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Rule: the ADR record is numbered without gaps or duplicates, and has its template.
@@ -1579,6 +1837,11 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         inputs.claude_md.as_deref(),
         &inputs.adrs,
     ));
+    violations.extend(check_recovery_spec(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+        inputs.spec_obligations.as_deref(),
+    ));
     violations.extend(check_diagrams(inputs.architecture.as_deref()));
     violations.extend(check_missing_docs(&inputs.crate_roots));
     violations
@@ -1591,7 +1854,8 @@ pub mod tests_support {
 
     use super::{
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
-        DIAGRAMS, DocsInputs, QuestionStatus, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, adr_number,
+        DIAGRAMS, DocsInputs, QuestionStatus, RECOVERY_SPEC_ADR, SETTLED_DECISIONS,
+        SETTLED_DECISIONS_ADR, SPEC_CLAUSES, adr_number,
     };
     use crate::policy::LAYERS;
 
@@ -1703,6 +1967,43 @@ pub mod tests_support {
             &mut body,
             format_args!("All {} deferred questions.", DEFERRED_QUESTIONS.len()),
         );
+        for clause in SPEC_CLAUSES {
+            line(
+                &mut body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    clause.id, clause.headline, clause.discharged_by
+                ),
+            );
+        }
+        line(
+            &mut body,
+            format_args!("All {} recovery invariants.", SPEC_CLAUSES.len()),
+        );
+        body
+    }
+
+    /// A clause table that declares exactly the clauses the gate expects.
+    #[must_use]
+    pub fn clean_spec_obligations() -> String {
+        let mut body = String::from("//! The clause table.\npub const CLAUSES: &[Clause] = &[\n");
+        for clause in SPEC_CLAUSES {
+            line(
+                &mut body,
+                format_args!("    Clause {{ id: \"{}\" }},", clause.id),
+            );
+        }
+        body.push_str("];\n");
+        body
+    }
+
+    /// The ADR that records the recovery specification, naming every clause.
+    #[must_use]
+    pub fn clean_recovery_spec_adr() -> String {
+        let mut body = clean_adr("the recovery invariants");
+        for clause in SPEC_CLAUSES {
+            line(&mut body, format_args!("- `{}`", clause.id));
+        }
         body
     }
 
@@ -1746,6 +2047,13 @@ pub mod tests_support {
             bodies.insert(number, (adr.to_owned(), body));
         }
 
+        let spec_number =
+            adr_number(RECOVERY_SPEC_ADR).expect("the recovery specification ADR is numbered");
+        bodies.insert(
+            spec_number,
+            (RECOVERY_SPEC_ADR.to_owned(), clean_recovery_spec_adr()),
+        );
+
         let highest = bodies.keys().copied().max().unwrap_or(0);
         for number in super::ADR_NUMBER_START..=highest {
             bodies
@@ -1782,6 +2090,7 @@ pub mod tests_support {
                 index
             }),
             adrs: clean_adrs(),
+            spec_obligations: Some(clean_spec_obligations()),
             crate_roots: vec![CrateRoot {
                 package: "waymaker-core".to_owned(),
                 path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -1793,6 +2102,8 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::tests_support::{clean_adr, clean_architecture, clean_claude_md, clean_inputs};
     use super::*;
 
@@ -3116,6 +3427,222 @@ mod tests {
         );
     }
 
+    fn spec_inputs() -> (String, Vec<AdrFile>, String) {
+        (
+            clean_claude_md(RULES),
+            super::tests_support::clean_adrs(),
+            super::tests_support::clean_spec_obligations(),
+        )
+    }
+
+    #[test]
+    fn a_documented_and_proved_specification_passes() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        assert!(
+            check_recovery_spec(Some(&claude_md), &adrs, Some(&obligations)).is_empty(),
+            "the clean fixtures should satisfy the rule"
+        );
+    }
+
+    #[test]
+    fn a_clause_the_crate_stopped_declaring_is_a_guarantee_with_no_proof() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let first = SPEC_CLAUSES.first().expect("the table is not empty");
+        let gutted = obligations.replace(&format!("id: \"{}\"", first.id), "id: \"\"");
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&gutted));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == first.id
+                    && violation.detail.contains("no clause with this id")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_the_crate_invented_is_a_proof_with_no_documentation() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let extended = format!("{obligations}\n    Clause {{ id: \"time-travel\" }},\n");
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&extended));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "time-travel"
+                    && violation.detail.contains("does not")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_table_the_gate_cannot_read_fails_closed() {
+        let (claude_md, adrs, _) = spec_inputs();
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, None);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "recovery-spec");
+        assert!(violations[0].detail.contains("nothing holds the proofs"));
+    }
+
+    #[test]
+    fn an_unbackticked_clause_id_does_not_count() {
+        // The backticks are what stop `durable-intent` being vouched for by a longer id, or
+        // by the prose that happens to use the same words.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let stripped = claude_md.replace(&format!("`{}`", clause.id), clause.id);
+        let violations = check_recovery_spec(Some(&stripped), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("backticks")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_that_names_no_proof_is_a_row_describing_one() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES
+            .iter()
+            .find(|clause| clause.discharged_by == "tests/redelivery.rs")
+            .expect("one clause is discharged by the redelivery proof");
+        let stripped = claude_md.replace(clause.discharged_by, "somewhere");
+        let violations = check_recovery_spec(Some(&stripped), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_guarantee_stated_in_other_words_is_a_guarantee_that_drifted() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let reworded = claude_md.replace(clause.headline, "recovery does the right thing");
+        let violations = check_recovery_spec(Some(&reworded), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("docs::SPEC_CLAUSES reads")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_count_that_does_not_match_the_table_is_reported() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let miscounted = claude_md.replace(
+            &format!("All {} recovery invariants", SPEC_CLAUSES.len()),
+            "All 2 recovery invariants",
+        );
+        let violations = check_recovery_spec(Some(&miscounted), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "clause count"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_specification_with_no_decision_record_is_reported_once() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let without: Vec<AdrFile> = adrs
+            .into_iter()
+            .filter(|adr| adr.name != RECOVERY_SPEC_ADR)
+            .collect();
+        let violations = check_recovery_spec(Some(&claude_md), &without, Some(&obligations));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].subject, RECOVERY_SPEC_ADR);
+    }
+
+    #[test]
+    fn a_decision_record_that_stops_naming_a_clause_is_reported() {
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.last().expect("the table is not empty");
+        let edited: Vec<AdrFile> = adrs
+            .into_iter()
+            .map(|adr| {
+                if adr.name == RECOVERY_SPEC_ADR {
+                    AdrFile {
+                        contents: adr.contents.replace(&format!("`{}`", clause.id), ""),
+                        ..adr
+                    }
+                } else {
+                    adr
+                }
+            })
+            .collect();
+        let violations = check_recovery_spec(Some(&claude_md), &edited, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no decision record")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_id_only_in_a_fenced_example_in_the_adr_does_not_vouch_for_it() {
+        // The same trap `deferred-questions` was caught in: an ADR that documents the clause
+        // syntax in a fenced example would otherwise satisfy the check while having lost the
+        // real citation.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let edited: Vec<AdrFile> = adrs
+            .into_iter()
+            .map(|adr| {
+                if adr.name == RECOVERY_SPEC_ADR {
+                    AdrFile {
+                        contents: adr.contents.replace(
+                            &format!("- `{}`", clause.id),
+                            &format!("```text\n`{}`\n```", clause.id),
+                        ),
+                        ..adr
+                    }
+                } else {
+                    adr
+                }
+            })
+            .collect();
+        let violations = check_recovery_spec(Some(&claude_md), &edited, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_claude_md_is_left_to_the_rule_that_already_reports_it() {
+        let (_, adrs, obligations) = spec_inputs();
+        let violations = check_recovery_spec(None, &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.subject == RECOVERY_SPEC_ADR
+                    || violation.detail.contains("obligation")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_id_in_a_doc_comment_alone_does_not_count_as_a_declaration() {
+        // The scan matches the table's own `id: "..."` field. A clause that only appears in
+        // prose above the table is a clause the crate documents and does not declare.
+        let (claude_md, adrs, _) = spec_inputs();
+        let mut prose = String::new();
+        for clause in SPEC_CLAUSES {
+            let _ = writeln!(prose, "//! `{}` is a guarantee.", clause.id);
+        }
+        let violations = check_recovery_spec(Some(&claude_md), &adrs, Some(&prose));
+        assert_eq!(violations.len(), SPEC_CLAUSES.len(), "{violations:?}");
+    }
+
     #[test]
     fn documentation_that_does_not_exist_fires_every_rule_that_can_fire_on_it() {
         // `adr-structure` and `missing-docs` are absent on purpose: both iterate a
@@ -3129,6 +3656,7 @@ mod tests {
                 "claude-md",
                 "deferred-questions",
                 "diagrams",
+                "recovery-spec",
                 "settled-decisions"
             ]
         );

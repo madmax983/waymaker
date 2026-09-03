@@ -72,6 +72,7 @@ pub const RULES: &[&str] = &[
     "missing-docs",
     "no-build-scripts",
     "pre-commit-hook",
+    "recovery-spec",
     "release-profile",
     "replay-cursor-surface",
     "settled-decisions",
@@ -492,6 +493,7 @@ fn collect_docs_inputs(
         architecture: read_optional(&root.join(docs::ARCHITECTURE_PATH))?,
         adr_index,
         adrs,
+        spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         crate_roots,
     })
 }
@@ -705,6 +707,10 @@ mod tests {
                     name: "0001-undated.md".to_owned(),
                     contents: "no title, no status, no sections\n".to_owned(),
                 }],
+                // No clause table either, so `recovery-spec` fires on all three of its
+                // halves: the crate's own table is unreadable, CLAUDE.md is absent, and the
+                // decision record has no ADR for the specification.
+                spec_obligations: None,
                 crate_roots: vec![docs::CrateRoot {
                     package: "waymaker-core".to_owned(),
                     path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -752,6 +758,7 @@ mod tests {
             "missing-docs",
             "no-build-scripts",
             "pre-commit-hook",
+            "recovery-spec",
             "release-profile",
             "replay-cursor-surface",
             "settled-decisions",

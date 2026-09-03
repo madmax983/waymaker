@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 34 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 35 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -98,6 +98,36 @@ Deciding one of these early is not a favour. An ADR written for a question whose
 implementation does not exist is a snapshot of an opinion, which is the one thing
 [the record](docs/adr/README.md) says a decision record must never be.
 
+## The guarantees, and what holds each up
+
+Design document §14 states five, and §02 decision 7 states the sixth. They are the reason
+this project exists, so they are a table rather than a paragraph: `xtask::docs::SPEC_CLAUSES`
+holds them, `crates/waymaker-spec` proves them, and the `recovery-spec` rule fails a build in
+which this section, that table, the crate's own `obligation.rs` and
+[ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md)
+stop naming the same set.
+
+All 6 recovery invariants, with the id to cite when a change touches one:
+
+| Id | Guarantee | Discharged by |
+| --- | --- | --- |
+| `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
+| `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
+| `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — rung 0.2 owes the refinement, because there is no two-bank adapter to abstract yet |
+| `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
+| `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, exhaustively over every byte string to three bytes and every mutation of a real frame |
+
+Paths are relative to `crates/waymaker-spec`. The proofs are bounded and say so: `Bound::PROOF`
+travels in every result, reaching the state ceiling is an error rather than a truncation, and
+`tests/census.rs` pins the reachable state count so that a machine which quietly shrank fails
+a build rather than passing every proof about the part of it that is left.
+
+A guarantee is only worth the evidence that it could have failed. Every one of these has a
+falsifier: `tests/necessity.rs` removes each of the model's five preconditions in turn and
+requires a named guarantee to break, and `tests/teeth.rs` runs a catalogue of readers that
+are wrong in one way each and requires each to be caught by the guarantee it breaks.
+
 ## The layering
 
 `waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way. The table
@@ -131,7 +161,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Three crates are in the workspace and are *not* layers:
+Four crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
@@ -143,6 +173,13 @@ Three crates are in the workspace and are *not* layers:
   `waymaker-flash` for the storage contract; nothing depends on it, and no layer may, in any
   dependency kind — the tests that drive the harness live with the harness. See
   [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
+- `waymaker-spec` — the formal specification of the recovery invariants, also
+  `policy::TEST_SUPPORT_CRATES`. The ghost model of committed history, the journal and bank
+  state machines, and the exhaustive search that discharges design document §14's guarantees
+  over them. Host-side, outside `default-members`, and above `waymaker-fault` for the reason
+  the harness is above the layers: an exhaustive state-space enumerator has no business in an
+  8 KiB flash budget. See
+  [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md).
 
 ## Budgets
 
@@ -214,7 +251,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 35 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 36 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -264,6 +301,7 @@ this table is how you find out what a red build is telling you.
 | Rule | Fires when |
 | --- | --- |
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
+| `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
@@ -283,6 +321,11 @@ Stated so that nobody mistakes silence for coverage:
 - **The "Owns" column above, and the budget numbers.** Both are transcribed from the design
   document and from `waymaker_core::budget`, and nothing compares them. `budget.rs` is the
   source of truth for the numbers.
+- **That the recovery state machine diagram matches the model.** `diagrams` checks that
+  `docs/architecture.md`'s `recovery-state-machine` block carries every state and every
+  precondition `docs::RECOVERY_STATE_MACHINE_LABELS` names. It does not check that the
+  *arrows* between them are the ones `waymaker-spec` admits — that is `tests/machine.rs`,
+  over every edge of the enumerated machine, and the picture is the picture.
 - **That a diagram renders.** The Mermaid check is a text scan — it proves every layer,
   every permitted edge and every step is in the right block, and that no edge contradicts
   the layering. It does not run Mermaid. The pull request preview is the render.
@@ -337,6 +380,27 @@ Stated so that nobody mistakes silence for coverage:
   in any run. Everything before the injection point is identical by construction, which is
   what makes the enumeration exact for that sequence; it is not a fixpoint over the
   sequences a reacting writer can produce.
+- **That a proof is a proof of anything outside its bound.** `waymaker-spec`'s enumeration is
+  closed within `Bound::PROOF` — three records, three generations, two banks — and silent
+  outside it. A bug that needs four records to show itself is a bug this workspace does not
+  currently look for. Raising the bound is a constant and a re-pinned state count;
+  [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md)
+  says what a general proof would take instead.
+- **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
+  real codec through the injector and requires every crash it can be in to be a state the
+  model describes, which is what makes the model more than a second implementation. It covers
+  records; it does not cover banks, because rung 0.2 owns the two-bank adapter and there is
+  nothing yet to abstract. `single-authority` is therefore proved about a model and not about
+  a device, and its row in `obligation.rs` says so.
+- **That a clause was updated before the code it constrains.** `recovery-spec` compares the
+  four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
+  model and the invariants to be changed *first*, then the proofs, then the code, and the
+  order of edits inside one commit is not a thing a rule can read.
+- **Allocation, as a measurement.** `bounded-decoding` proves the decoder is total and stays
+  inside its input; the allocation half is structural — a `no_std` crate with no dependencies
+  and no `extern crate alloc` cannot allocate, and `crate-attributes` and
+  `kernel-zero-dependencies` fail a build over each of those. A global allocator that counted
+  allocations would need the `unsafe` this workspace denies.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
@@ -423,6 +487,23 @@ invented past the end is caught too. See
 says where the limits are: the cursor mutants are models of a bug rather than injections into
 a `const fn` state machine, and the two-bank generation seal is a stand-in for the storage
 unit rung 0.2 owns.
+Issue #20 then asks §14's guarantees to be *stated* rather than sampled, and `waymaker-spec`
+is that statement: a ghost model of committed history in the vocabulary §15 already uses, the
+journal and bank state machines as one total transition function, and §14's guarantees as
+predicates over a state and a reader's answer. The proofs are exhaustive rather than seeded —
+a breadth-first search closed under every transition, with a ceiling it fails against rather
+than truncates at — and each is falsifiable twice over: every one of the model's five
+preconditions is removed in turn and required to break a named guarantee, and a catalogue of
+readers wrong in one way each is required to be caught by the guarantee it breaks. The
+firmware is held to the model at every crash point `waymaker-fault` lists, so the model is not
+a second implementation nobody tests. Two findings came out of writing the proofs rather than
+out of reading the code: acknowledged durability needs writes to be append-only, which is what
+makes "prefix of committed history" and "prefix of declaration order" the same statement and
+what `waymaker-fault`'s `Ledger::committed` filter had been resting on; and a bank guard that
+only forbade stranding the device still permitted erasing the *newer* of two sealed banks,
+which is §14's "never recover the old run as current". See
+[ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md),
+which also says what is bounded, what is owed at 0.2, and what a general proof would cost.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The

@@ -419,6 +419,60 @@ which is what lets the same harness drive the record codec, the effect protocol,
 writer with a byte layout of its own — see
 [ADR 0013](adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
 
+## The recovery state machine
+
+Design document §14's guarantees are statements about a state, so the states are drawn.
+Issue [#20](https://github.com/madmax983/waymaker/issues/20) asks for the legal transitions
+between §15's three record states, and between bank generations, to be stated rather than
+assumed; `waymaker-spec` is where they are proved, and this is the machine it proves over.
+
+The edge labels are the preconditions, because they are the part that carries the design. Each
+is separately removable, and removing any one of them makes a named guarantee reachable-false
+— which is how the specification knows they are load-bearing rather than decorative.
+
+<!-- diagram: recovery-state-machine -->
+
+```mermaid
+flowchart LR
+  subgraph records ["One record, through §15's three states"]
+    direction LR
+    r0(["attempted"])
+    r1(["possibly durable"])
+    r2(["acknowledged"])
+    rt(["torn"])
+    r0 -- "program · append-only" --> r1
+    r1 -- "barrier claims only whole records" --> r2
+    r0 -- "power lost mid-program, or the call fails" --> rt
+    rt -. "never acknowledged" .-> r2
+  end
+
+  subgraph banks ["One bank, through §02 decision 7's swap"]
+    direction LR
+    b0(["erased"])
+    b1(["sealing"])
+    b2(["sealed"])
+    b0 -- "write the seal · strictly greater generation" --> b1
+    b1 -- "barrier returns" --> b2
+    b2 -- "recycle · never erase the authority" --> b0
+  end
+
+  records ~~~ banks
+
+  classDef live fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
+  classDef done fill:#e9f7ec,stroke:#2f8f4e,color:#123f22;
+  classDef bad fill:#ffe9e9,stroke:#c0392b,color:#3f1212;
+  class r0,r1,b0,b1 live;
+  class r2,b2 done;
+  class rt bad;
+```
+
+A torn record is the dashed edge that does not exist: §15 permits recovery to include "an
+unacknowledged **complete** record", and half a record is not one. Recovery is the longest
+prefix of declaration order whose records are wholly on media — and because writes are
+append-only, that is the same set as the longest prefix of *committed* history, which is the
+theorem `waymaker-fault`'s `Ledger::committed` filter rests on. See
+[ADR 0015](adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md).
+
 ## See also
 
 - [CLAUDE.md](../CLAUDE.md) — the invariants and layering rules a contributor works to.

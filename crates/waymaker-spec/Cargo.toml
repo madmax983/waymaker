@@ -1,0 +1,36 @@
+[package]
+name = "waymaker-spec"
+description = "Formal specification of Waymaker's recovery invariants: the ghost model of committed history, the journal state machine, and the exhaustive proofs that discharge design document §14's guarantees. Test support: never linked into firmware, never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["development-tools::testing"]
+keywords = ["durable", "workflow", "specification", "verification"]
+# Test support, not a shipped library. It sits above the layers with `waymaker-fault`: it
+# names the record states §15 defines and the oracle that judges them, and no layer may
+# depend on it in any dependency kind. Nothing that is ever flashed sees it.
+publish = false
+
+[dependencies]
+# §15's three record states, the oracle that judges a recovery, and the crash injector the
+# refinement proof drives the real firmware through. The ghost model is stated in the same
+# vocabulary the harness already uses, so a model state and a harness run are comparable
+# without a translation nobody checks.
+waymaker-fault.workspace = true
+
+# The refinement proof reads a real journal back with `frame::Scan`, and the bounded-decoding
+# proof calls the real decoder. Both are the shipped firmware, not a copy of it.
+waymaker-flash.workspace = true
+
+# `EffectIdAllocator::resume` is what stable redelivery is a statement about, and `RecordRef`
+# is what the refinement proof encodes.
+waymaker-core.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
