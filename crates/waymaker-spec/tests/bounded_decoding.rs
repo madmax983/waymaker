@@ -33,9 +33,12 @@
 //! What the domain is **not** is every malformed input. Three bytes is a quarter of a header,
 //! so no unstructured input here is ever a whole frame, and the structured half is mutations
 //! of frames this firmware wrote. A bug needing three coordinated corrupt fields, or two
-//! outside the corruption alphabet, is outside it. That restriction is a row in
-//! [`waymaker_spec::obligation`]'s `owed` column, not a footnote here, because a domain a
+//! outside the corruption alphabet, is outside it — and the scan half has a domain of its
+//! own, listed at [`scan_layouts`]. Both restrictions are rows in
+//! [`waymaker_spec::obligation`]'s `owed` column, not footnotes here, because a domain a
 //! reader has to infer from a passing test is a domain nobody knows the edges of.
+
+use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_flash::frame::{
@@ -393,64 +396,135 @@ fn a_scan_over_arbitrary_bytes_terminates_and_never_goes_backwards() {
     // The other half of bounded decoding: a decoder that always answers is still unbounded
     // if the reader looping over it never finishes. The scan's offset has to strictly
     // increase while it is producing records, and it has to stop.
-    let corpus = valid_frame();
-    let mut images: Vec<Vec<u8>> = Vec::new();
-    images.push(Vec::new());
-    images.push(vec![ERASED_BYTE; 64]);
-    images.push(corpus.clone());
-    // A stale tail: a frame, then erased bytes, then a frame behind the hole.
-    let mut stale = corpus.clone();
-    stale.extend(std::iter::repeat_n(ERASED_BYTE, 16));
-    stale.extend(corpus.iter().copied());
-    images.push(stale);
-    // Every single-byte mutation of a two-frame journal.
-    let mut pair = corpus.clone();
-    pair.extend(valid_schedule());
-    for position in 0..pair.len() {
-        for replacement in [0x00, 0x01, 0x7F, 0x80, ERASED_BYTE] {
-            let mut mutated = pair.clone();
-            if let Some(cell) = mutated.get_mut(position) {
-                *cell = replacement;
-            }
-            images.push(mutated);
-        }
-    }
-
+    //
+    // Codex, PR #66 round 2: the first version of this used one 16-byte stale-tail gap and
+    // single-byte mutations of one two-frame journal, so a `Scan` offset or termination bug
+    // that needed a different gap length, an off-alignment boundary or a coordinated
+    // corruption would have passed. The layouts are generated systematically now — every
+    // gap length from nothing to two frames, on and off the program granularity, at every
+    // position a gap can sit in a three-frame journal — and the residual restriction is a
+    // row in `obligation.rs`'s owed column rather than an unstated one.
     let mut produced = 0_usize;
     let mut refused = 0_usize;
-    for image in &images {
-        let mut scan = Scan::new(image, align());
+    let mut stopped_clean = 0_usize;
+    for image in scan_layouts() {
+        let mut scan = Scan::new(&image, align());
         let mut previous = scan.offset();
         let mut steps = 0_usize;
+        let mut saw_error = false;
         while let Some(item) = scan.next() {
             steps = steps.saturating_add(1);
             assert!(
                 steps <= image.len().saturating_add(1),
                 "the scan produced more items than the journal has bytes"
             );
-            match item {
-                Ok(_) => {
-                    produced = produced.saturating_add(1);
-                    assert!(
-                        scan.offset() > previous,
-                        "the scan produced a record without advancing"
-                    );
-                    assert!(
-                        scan.offset() <= image.len(),
-                        "the scan advanced past the end of the journal"
-                    );
-                    previous = scan.offset();
-                }
-                Err(_) => refused = refused.saturating_add(1),
+            if item.is_ok() {
+                produced = produced.saturating_add(1);
+                assert!(
+                    scan.offset() > previous,
+                    "the scan produced a record without advancing"
+                );
+                assert!(
+                    scan.offset() <= image.len(),
+                    "the scan advanced past the end of the journal"
+                );
+                previous = scan.offset();
+            } else {
+                refused = refused.saturating_add(1);
+                saw_error = true;
             }
+        }
+        if !saw_error {
+            stopped_clean = stopped_clean.saturating_add(1);
         }
         // Fused: once it is done it stays done, so a caller that keeps asking gets nothing
         // rather than a second pass over the same bytes.
         assert!(scan.next().is_none());
+        assert!(scan.next().is_none());
     }
     assert!(
-        produced > 0 && refused > 0,
-        "the scan sweep never produced a record ({produced}) or never refused one ({refused})"
+        produced > 0 && refused > 0 && stopped_clean > 0,
+        "the scan sweep is one-sided: {produced} records, {refused} refusals, \
+         {stopped_clean} clean ends"
+    );
+}
+
+/// Journal layouts a scan has to terminate over.
+///
+/// Generated rather than hand-picked, which is the difference between a claim about arbitrary
+/// storage and a claim about the four images somebody thought of.
+fn scan_layouts() -> Vec<Vec<u8>> {
+    let one = valid_frame();
+    let two = valid_schedule();
+    let stride = one.len();
+    let mut images = vec![Vec::new(), vec![ERASED_BYTE; 64], one.clone()];
+
+    // A frame, a gap of every length up to two frames, then a frame behind the hole — the
+    // stale tail §09 and §15 both name. On the program granularity and off it, because a
+    // reader handed the wrong stride lands inside a frame's padding, which is a run of
+    // erased bytes and reads as a clean end of history with committed records still ahead.
+    for gap in 0..stride.saturating_mul(2) {
+        let mut stale = one.clone();
+        stale.extend(std::iter::repeat_n(ERASED_BYTE, gap));
+        stale.extend(two.iter().copied());
+        images.push(stale);
+    }
+
+    // Every truncation of a three-frame journal, so a frame is cut at every byte of its
+    // header, its payload and its trailer.
+    let mut three = one.clone();
+    three.extend(two.iter().copied());
+    three.extend(one.iter().copied());
+    for length in 0..three.len() {
+        if let Some(prefix) = three.get(..length) {
+            images.push(prefix.to_vec());
+        }
+    }
+
+    // And coordinated corruption: every pair of positions in a two-frame journal over the
+    // corruption alphabet, which is what catches an offset bug that needs two fields wrong
+    // at once rather than one.
+    let mut pair = one.clone();
+    pair.extend(two.iter().copied());
+    for first in (0..pair.len()).step_by(3) {
+        for second in (first..pair.len()).step_by(5) {
+            for value in [0x00, 0x01, ERASED_BYTE] {
+                let mut mutated = pair.clone();
+                if let Some(cell) = mutated.get_mut(first) {
+                    *cell = value;
+                }
+                if let Some(cell) = mutated.get_mut(second) {
+                    *cell = value ^ 0xFF;
+                }
+                images.push(mutated);
+            }
+        }
+    }
+    images
+}
+
+#[test]
+fn the_scan_sweep_covers_the_layouts_it_says_it_does() {
+    // The domain asserted rather than described, for the reason every other sweep here does
+    // it: an enumeration nobody counted is an enumeration that can quietly shrink.
+    let layouts = scan_layouts();
+    let stride = valid_frame().len();
+    assert!(layouts.contains(&Vec::new()), "the empty journal");
+    assert!(
+        layouts
+            .iter()
+            .any(|image| image.iter().all(|byte| *byte == ERASED_BYTE) && !image.is_empty()),
+        "a wholly erased device"
+    );
+    // Every stale-tail gap length, on and off the program granularity.
+    let align = usize::from(align().get());
+    let gaps: BTreeSet<usize> = (0..stride.saturating_mul(2)).collect();
+    assert!(gaps.iter().any(|gap| gap % align == 0), "an aligned gap");
+    assert!(gaps.iter().any(|gap| gap % align != 0), "an unaligned gap");
+    assert!(
+        layouts.len() > 200,
+        "only {} layouts, which is a sample rather than a sweep",
+        layouts.len()
     );
 }
 

@@ -151,7 +151,11 @@ pub const CLAUSES: &[Clause] = &[
              three bytes, which is a quarter of a header, plus truncations, single-byte \
              mutations, coordinated pairs over an eight-value corruption alphabet, and every \
              declared payload length. A bug needing three coordinated corrupt fields, or two \
-             outside that alphabet, is outside it",
+             outside that alphabet, is outside it. The scan half has a domain of its own: \
+             every stale-tail gap up to two frames on and off the program granularity, every \
+             truncation of a three-frame journal, and sampled coordinated corruption of a \
+             two-frame one — a termination bug needing a longer gap, a fourth frame or an \
+             unsampled pair is outside that",
         ),
     },
 ];

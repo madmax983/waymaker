@@ -117,7 +117,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
 | `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — rung 0.2 owes the refinement, because there is no two-bank adapter to abstract yet |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
-| `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, exhaustively over every byte string to three bytes, every single-byte mutation of a real frame, and every payload length a header can declare |
+| `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
 Paths are relative to `crates/waymaker-spec`, and they are a CI stage of their own —
 `cargo test --locked -p waymaker-spec --no-default-features`, in the `verification` job.
@@ -438,6 +438,11 @@ Stated so that nobody mistakes silence for coverage:
   advance and compaction is rung 0.2's. Each is recorded in `obligation.rs`'s `owed` column
   and in
   [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md).
+- **Every malformed input.** `bounded-decoding` sweeps a domain it states: exhaustive to
+  three bytes, every truncation, every single-byte mutation, coordinated pairs over an
+  eight-value corruption alphabet, every declared payload length, and a generated set of scan
+  layouts. A bug needing three corrupt fields at once, or two outside that alphabet, is
+  outside it. The `owed` column in `obligation.rs` is where that is written down.
 - **That a named proof contains a proof.** `recovery-spec` checks that a clause's proof file
   is the one both tables name; `tests/obligations.rs` checks that the file exists and holds
   at least two tests. Neither reads what those tests assert, and neither can.

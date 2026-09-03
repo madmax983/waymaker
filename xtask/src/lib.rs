@@ -229,6 +229,9 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         })
         .collect();
     violations.extend(source::check_crate_attributes(&sources));
+    violations.extend(source::check_layer_sources_are_bare_metal(
+        &inputs.layer_sources,
+    ));
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
