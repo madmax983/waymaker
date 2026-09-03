@@ -51,7 +51,10 @@
 //!
 //! What remains outside what [`verify`] can judge is a region that was armed twice with no
 //! `verify` between: a witness is a single arm-reset-verify, and running two on top of each
-//! other asks a stateless reader to tell two histories apart.
+//! other asks a stateless reader to tell two histories apart. Data the region held *before*
+//! the first arm is judged rather than guessed at — bytes no programming of this witness
+//! could have produced are evidence of nothing, rather than evidence of a torn write — but a
+//! prior arm's own witness is indistinguishable from this one's by construction.
 
 use waymaker_flash::storage::StableStorage;
 
@@ -398,24 +401,28 @@ pub fn verify<S: StableStorage>(
     // cache behind a `barrier` that returns early loses exactly everything — the most likely
     // barrier bug there is, and the one this witness exists to find.
     let whole = |presence| presence == Presence::Whole;
+    // A *torn* write proves as much about what came before it as a finished one does: the
+    // program that tore was issued, so everything ordered ahead of it was acknowledged.
+    // `Foreign` proves nothing — it is data that predates this run.
+    let issued = |presence| matches!(presence, Presence::Torn | Presence::Whole);
 
     if reset == Reset::AfterACompletedArm && !(whole(acknowledged) && whole(seal)) {
         return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
     }
-    if whole(seal) && !whole(acknowledged) {
+    if issued(seal) && !whole(acknowledged) {
         return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
     }
     // *Any* of the later write, not all of it. A program interrupted by the power leaves a
     // prefix behind, and a prefix that outlived the seal ordered before it is exactly the
     // mutation §12's third sentence forbids.
-    if unacknowledged != Presence::Absent && !whole(seal) {
+    if issued(unacknowledged) && !whole(seal) {
         return Ok(WitnessVerdict::Breached(
             Breach::LaterMutationOvertookABarrier,
         ));
     }
-    // The seal is on media, so every erase `arm` performed crossed a barrier that returned.
+    // The seal was issued, so every erase `arm` performed crossed a barrier that returned.
     // Each of those blocks must therefore still be erased past its witness.
-    if whole(seal) {
+    if issued(seal) {
         for block in [layout.acknowledged, layout.seal, layout.unacknowledged] {
             if !tail_is_erased(storage, buffer, block, region, layout.unit)? {
                 return Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost));
@@ -436,10 +443,17 @@ pub fn verify<S: StableStorage>(
 enum Presence {
     /// Every byte is erased. Nothing of this write reached media.
     Absent,
-    /// Some bytes moved and it is not the finished witness: an interrupted program.
-    Partial,
+    /// An interrupted program of *this* witness: every byte is either a witness byte or
+    /// still erased, and at least one has moved.
+    Torn,
     /// The witness, exactly.
     Whole,
+    /// Bytes this witness could not have produced from erased media.
+    ///
+    /// Not evidence of anything about this run: it is what the region held before `arm`
+    /// touched it, on a caller whose expendable region was not already blank. Reading it as
+    /// a torn witness would accuse a *correct* adapter of losing a barrier it never made.
+    Foreign,
 }
 
 /// How much of the witness for `salt` is on media at `offset`.
@@ -457,12 +471,34 @@ fn present<S: StableStorage>(
     let Some(slot) = buffer.get(..unit) else {
         return Err(WitnessError::Suite(SuiteError::BufferTooSmall));
     };
-    if is_witness(slot, salt) {
-        Ok(Presence::Whole)
-    } else if slot.iter().all(|byte| *byte == crate::suite::ERASED) {
-        Ok(Presence::Absent)
+    Ok(classify(slot, salt))
+}
+
+/// How much of the witness for `salt` the bytes hold.
+fn classify(bytes: &[u8], salt: u8) -> Presence {
+    let mut erased = true;
+    let mut whole = true;
+    let mut foreign = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        let wanted = witness_byte(salt, low_byte(index));
+        if *byte != crate::suite::ERASED {
+            erased = false;
+        }
+        if *byte != wanted {
+            whole = false;
+            if *byte != crate::suite::ERASED {
+                foreign = true;
+            }
+        }
+    }
+    if erased {
+        Presence::Absent
+    } else if whole {
+        Presence::Whole
+    } else if foreign {
+        Presence::Foreign
     } else {
-        Ok(Presence::Partial)
+        Presence::Torn
     }
 }
 

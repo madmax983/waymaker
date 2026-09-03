@@ -498,6 +498,61 @@ fn an_erase_a_barrier_acknowledged_and_the_reset_lost_is_a_breach() {
     );
 }
 
+#[test]
+fn a_region_that_still_holds_what_it_held_before_is_not_a_breach() {
+    // The regression this guards is the worst kind a conformance suite can have: accusing a
+    // *correct* adapter. A caller whose expendable region is not already blank, whose power
+    // goes before the first erase completes, leaves every block holding ordinary
+    // pre-existing data. Read as "an interrupted witness", that data says a later mutation
+    // overtook a barrier `arm` never reached.
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Device::new(geometry);
+    for index in 0..3 {
+        let Some(block) = region.block(index) else {
+            unreachable!("a region has three blocks")
+        };
+        let stale = [0x3C_u8; 8];
+        match StableStorage::program(&mut device, block, &stale[..]) {
+            Ok(()) => {}
+            Err(error) => unreachable!("{error}"),
+        }
+    }
+
+    assert_eq!(
+        verify(&mut device, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Held),
+        "data that predates the run is evidence of nothing"
+    );
+}
+
+#[test]
+fn a_torn_seal_still_owes_the_witness_the_barrier_before_it_acknowledged() {
+    // A seal that only partly survived was still *issued*, and it was issued after the
+    // acknowledged witness's barrier returned. So the witness is owed, whether the seal
+    // finished or not.
+    let geometry = nested();
+    let region = whole(geometry);
+    let mut buffer = [0_u8; 64];
+    let mut device = Device::new(geometry);
+    assert_eq!(arm(&mut device, region, &mut buffer), Ok(()));
+
+    let mut image = device.into_image();
+    let Some(seal) = region.block(1) else {
+        unreachable!("a region has three blocks")
+    };
+    erase_block(&mut image, region.offset(), geometry.erase_size());
+    // Keep the seal's first byte and erase the rest of its unit: a program the power tore.
+    erase_block(&mut image, seal + 1, geometry.program_size() - 1);
+
+    let mut after = after_reset(geometry, &image);
+    assert_eq!(
+        verify(&mut after, region, &mut buffer, Reset::DuringArm),
+        Ok(WitnessVerdict::Breached(Breach::AcknowledgedMutationLost))
+    );
+}
+
 /// Clears one erase block of an image, as a reset that lost it would leave it.
 fn erase_block(image: &mut [u8], offset: u32, len: u32) {
     let (Ok(start), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {
