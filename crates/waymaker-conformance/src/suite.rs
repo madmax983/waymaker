@@ -308,6 +308,19 @@ impl<S: StableStorage> Run<'_, S> {
         }
     }
 
+    /// Programs one unit of the run's pattern at `offset`, which need not be a block start.
+    ///
+    /// `false` when the adapter refused; the case has already been recorded.
+    fn program_unit_at(&mut self, case: CaseId, offset: u32) -> bool {
+        self.fill_pattern();
+        if self.program_source(offset, self.unit) {
+            true
+        } else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            false
+        }
+    }
+
     /// Erases the block at `offset` and programs one unit of the pattern at its start.
     ///
     /// `false` when the adapter refused either; the case has already been recorded.
@@ -669,31 +682,71 @@ impl<S: StableStorage> Run<'_, S> {
             );
             return;
         }
-        if !self.program_a_unit(case, self.block_a()) {
+        if !self.erase_block(case, self.block_a()) {
             return;
         }
-        let rest = self.block_a() + unit;
-        let outcome = match self.media_is_erased(rest, block - unit) {
-            Some(true) => Outcome::Passed,
-            Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
-            None => Outcome::Failed(Failure::LegalOperationRefused),
+        // The *second* unit of the block, not the first. Every other legal program in this
+        // suite is anchored at a block start, so with a first-unit target there is never a
+        // preceding unit to watch and an adapter that also clears the unit before the one it
+        // was given has nothing to be caught by. Both sides are checked below.
+        let base = self.block_a();
+        let target = base + unit;
+        if !self.program_unit_at(case, target) {
+            return;
+        }
+        let Some(prefix) = self.media_is_erased(base, unit) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let Some(written) = self.media_matches(target, unit, |position| {
+            pattern(usize::try_from(position).unwrap_or(0))
+        }) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let Some(suffix) = self.media_is_erased(target + unit, block - unit - unit) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        if !written {
+            self.record(case, Outcome::Failed(Failure::ReadBackDiffers));
+            return;
+        }
+        let outcome = if prefix && suffix {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
         };
         self.record(case, outcome);
     }
 
     fn erase_leaves_the_neighbouring_block_alone(&mut self) {
         let case = CaseId::EraseLeavesTheNeighbouringBlockAlone;
-        if !self.program_a_unit(case, self.block_b()) {
+        // The *middle* block is the one erased, so both neighbours are watched. Erasing the
+        // first block and watching the second sees an over-erase that runs forwards and not
+        // one that runs backwards, and an adapter has no obligation to get those wrong in
+        // the same direction.
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
-        if !self.erase_block(case, self.block_a()) {
+        if !self.program_a_unit(case, self.block_c()) {
             return;
         }
-        let neighbour = self.block_b();
-        let outcome = match self.block_holds_the_pattern(neighbour) {
-            Some(true) => Outcome::Passed,
-            Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
-            None => Outcome::Failed(Failure::LegalOperationRefused),
+        if !self.erase_block(case, self.block_b()) {
+            return;
+        }
+        let (before, after) = (self.block_a(), self.block_c());
+        let (Some(earlier), Some(later)) = (
+            self.block_holds_the_pattern(before),
+            self.block_holds_the_pattern(after),
+        ) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if earlier && later {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
         };
         self.record(case, outcome);
     }
@@ -801,30 +854,36 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn barrier_changes_no_media(&mut self) {
         let case = CaseId::BarrierChangesNoMedia;
-        // The third block is where a barrier that scribbled somewhere *else* would show
-        // up: nothing programs it, so it must still read erased when the barrier is done.
-        let third = self.block_c();
-        if !self.erase_block(case, third) {
+        // A known state in every block of the region, because "no media" means no media. A
+        // check that read the programmed block and one erased block passed an adapter whose
+        // barrier scribbled in the block between them.
+        if !self.program_a_unit(case, self.block_a()) {
             return;
         }
-        if !self.program_a_unit(case, self.block_a()) {
+        if !self.program_a_unit(case, self.block_b()) {
+            return;
+        }
+        if !self.erase_block(case, self.block_c()) {
             return;
         }
         if self.storage.barrier().is_err() {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let base = self.block_a();
-        let Some(unchanged) = self.block_holds_the_pattern(base) else {
-            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
-            return;
-        };
+        let (first, second, third) = (self.block_a(), self.block_b(), self.block_c());
         let block = self.erase_size();
-        let Some(elsewhere) = self.media_is_erased(third, block) else {
+        let (Some(one), Some(two)) = (
+            self.block_holds_the_pattern(first),
+            self.block_holds_the_pattern(second),
+        ) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        let outcome = if unchanged && elsewhere {
+        let Some(three) = self.media_is_erased(third, block) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if one && two && three {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)

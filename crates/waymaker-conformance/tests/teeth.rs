@@ -70,6 +70,12 @@ enum Flaw {
     BoundsCheckedAtTheStartOnly,
     /// A straddling mutation applies its in-bounds prefix and then refuses.
     StraddlingMutationWipesTheValidPrefix,
+    /// A program also clears the program unit *before* the one it was given.
+    ProgramCorruptsThePrecedingUnit,
+    /// An erase also clears the erase block *before* the one it was given.
+    EraseTakesThePrecedingBlock,
+    /// `barrier()` clears a byte in the middle block on its way through.
+    BarrierScribblesInTheMiddleBlock,
     /// A refused *misaligned* erase clears exactly the range it named on its way out.
     ///
     /// The one an adapter that validates after the fact really has: it does the work, then
@@ -256,6 +262,14 @@ impl StableStorage for Broken {
                 let next = offset.saturating_add(len);
                 self.apply(next, &spill);
             }
+            Flaw::ProgramCorruptsThePrecedingUnit => {
+                self.apply(offset, src);
+                let unit = self.geometry.program_size();
+                if let Some(previous) = offset.checked_sub(unit) {
+                    let spill = vec![0_u8; unit as usize];
+                    self.apply(previous, &spill);
+                }
+            }
             _ => self.apply(offset, src),
         }
         Ok(())
@@ -302,6 +316,13 @@ impl StableStorage for Broken {
                 );
             }
             Flaw::EraseYieldsZeros => self.fill(offset, len, |_| 0x00),
+            Flaw::EraseTakesThePrecedingBlock => {
+                self.fill(offset, len, |_| ERASED);
+                let block = self.geometry.erase_size();
+                if let Some(previous) = offset.checked_sub(block) {
+                    self.fill(previous, block, |_| ERASED);
+                }
+            }
             _ => self.fill(offset, len, |_| ERASED),
         }
         Ok(())
@@ -312,6 +333,11 @@ impl StableStorage for Broken {
             Flaw::BarrierFails => Err(Refused),
             Flaw::BarrierScribbles => {
                 self.apply(0, &[0x00]);
+                Ok(())
+            }
+            Flaw::BarrierScribblesInTheMiddleBlock => {
+                let block = self.geometry.erase_size();
+                self.apply(block, &[0x00]);
                 Ok(())
             }
             _ => Ok(()),
@@ -399,6 +425,21 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
     (
         Flaw::ProgramSpillsIntoTheNextUnit,
         CaseId::ProgramLeavesTheRestOfTheBlockAlone,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::ProgramCorruptsThePrecedingUnit,
+        CaseId::ProgramLeavesTheRestOfTheBlockAlone,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::EraseTakesThePrecedingBlock,
+        CaseId::EraseLeavesTheNeighbouringBlockAlone,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::BarrierScribblesInTheMiddleBlock,
+        CaseId::BarrierChangesNoMedia,
         Failure::MediaOutsideTheOperationChanged,
     ),
     (
@@ -545,7 +586,14 @@ fn the_model_and_the_suite_agree_on_the_erased_byte() {
 /// on rather than defaulting into a claim it might break.
 const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
     match flaw {
-        Flaw::EraseTakesTheWholeDevice | Flaw::BarrierScribbles => true,
+        // Every one of these answers a *legal* operation by touching media the operation did
+        // not name, which no choice of probe offsets can avoid. Each is caught by the case
+        // that watches for it; none is contained.
+        Flaw::EraseTakesTheWholeDevice
+        | Flaw::EraseTakesThePrecedingBlock
+        | Flaw::ProgramCorruptsThePrecedingUnit
+        | Flaw::BarrierScribbles
+        | Flaw::BarrierScribblesInTheMiddleBlock => true,
         Flaw::None
         | Flaw::NoValidation
         | Flaw::PastCapacityIsClamped
@@ -606,12 +654,16 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::ProgramRoundTripsThroughRead,
             Failure::ReadBackDiffers,
         )),
-        Flaw::ProgramSpillsIntoTheNextUnit => Some((
+        Flaw::ProgramSpillsIntoTheNextUnit | Flaw::ProgramCorruptsThePrecedingUnit => Some((
             CaseId::ProgramLeavesTheRestOfTheBlockAlone,
             Failure::MediaOutsideTheOperationChanged,
         )),
-        Flaw::EraseTakesTheWholeDevice => Some((
+        Flaw::EraseTakesTheWholeDevice | Flaw::EraseTakesThePrecedingBlock => Some((
             CaseId::EraseLeavesTheNeighbouringBlockAlone,
+            Failure::MediaOutsideTheOperationChanged,
+        )),
+        Flaw::BarrierScribbles | Flaw::BarrierScribblesInTheMiddleBlock => Some((
+            CaseId::BarrierChangesNoMedia,
             Failure::MediaOutsideTheOperationChanged,
         )),
         Flaw::ZeroLengthIsRefused => Some((
@@ -619,10 +671,6 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             Failure::LegalOperationRefused,
         )),
         Flaw::BarrierFails => Some((CaseId::BarrierSucceeds, Failure::LegalOperationRefused)),
-        Flaw::BarrierScribbles => Some((
-            CaseId::BarrierChangesNoMedia,
-            Failure::MediaOutsideTheOperationChanged,
-        )),
         Flaw::ReadAlwaysFails => Some((
             CaseId::EraseYieldsTheErasedByte,
             Failure::LegalOperationRefused,
@@ -652,7 +700,10 @@ const ALL: &[Flaw] = &[
     Flaw::EraseDoesNothingOnZeroedMedia,
     Flaw::ProgramIsIgnored,
     Flaw::ProgramSpillsIntoTheNextUnit,
+    Flaw::ProgramCorruptsThePrecedingUnit,
     Flaw::EraseTakesTheWholeDevice,
+    Flaw::EraseTakesThePrecedingBlock,
+    Flaw::BarrierScribblesInTheMiddleBlock,
     Flaw::EraseDoesNothing,
     Flaw::ZeroLengthIsRefused,
     Flaw::BarrierFails,
