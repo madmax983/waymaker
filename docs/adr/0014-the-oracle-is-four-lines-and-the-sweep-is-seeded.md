@@ -97,16 +97,46 @@ issue #19 asked it to. `waymaker-fault` is at 96.7% line coverage, and the firmw
 byte-for-byte what it was — 8180 B of the 8192 B budget — because nothing was added to a
 layer.
 
-What got worse, and where the limits are:
+What got worse, and where the limits are. Three of these were found by review after the
+first draft of this ADR claimed more than the code did, which is the reason the list is this
+long:
 
-* **The suite is slower and larger.** The sweep runs the writer once per crash point per
-  seed — tens of thousands of runs — and the bit-flip test re-recovers a journal once per bit.
-  It is still under a second, but it is a runtime dial (`SEEDS`, `MAX_CAPACITY`) that a future
-  contributor can turn until it is not. A slow suite is a suite that gets `--skip`ped.
-* **The cursor mutants are models.** They mutate the *step a caller takes* with a record, not
-  the state machine, so they prove the oracle has teeth and not that `ReplayCursor` is
-  correct. `waymaker-core`'s own suite is what holds that, and this ADR says which is which
-  rather than letting the file names imply otherwise.
+* **The suite is slower and larger.** The three sweeps run the writer once per crash point
+  per seed — roughly eighteen thousand runs between them — and the bit-flip test re-recovers a
+  journal once per bit. It is still well under a second, but it is a runtime dial (`SEEDS`,
+  `MIN_CAPACITY`, `MAX_CAPACITY`) that a future contributor can turn until it is not. A slow
+  suite is a suite that gets `--skip`ped.
+* **Half the enumerated crash set is a duplicate for a writer that propagates every error.**
+  `Interruption::Failure` and `Interruption::PowerLoss` armed at the same point of the same
+  operation leave identical media unless the writer *reacts*, and a writer built out of `?`
+  never does — which made `Harness`'s documented reason for taking a closure rather than a
+  recorded write log true of nothing.
+  `a_writer_that_retries_a_failed_write_is_a_world_the_sweep_would_not_otherwise_reach`
+  retries a failed program once, which on NOR repairs it, and asserts both that the two
+  interruptions now lead to different media and that a record torn by a failure and put right
+  by the retry ends the run whole. It is one writer, not the default: the run counts above
+  still overstate distinct worlds for the others.
+* **The sweep cannot catch a broken cursor, and that is structural.** `History::draw`
+  generates only histories `ReplayCursor` accepts, and every crash point leaves a *prefix* of
+  a legal history, which is legal too — so across every run in this workspace the cursor
+  never refuses a record the scan accepted. Measured, not assumed: replacing every
+  `cursor.advance(..)` refusal with a no-op leaves all three sweeps passing. That is the code
+  being right rather than the suite being weak, but it means the sweeps alone would not
+  notice a cursor that stopped checking. Two tests notice instead:
+  `without_the_cursor_a_reordered_journal_would_be_replayed_as_history` builds a journal
+  whose frames all verify and whose order is illegal — a shape no crash point can produce —
+  and shows the scan alone accepting what the cursor refuses; and
+  `a_sequence_at_the_top_of_the_space_survives_the_frame_and_stops_the_run` fails when the
+  sequence comparison in `ReplayCursor::transition` is deleted. Most of the other cursor
+  mutants remain *models*: they mutate the step a caller takes with a record, not the state
+  machine, so they prove the oracle has teeth rather than that the cursor is correct.
+* **The oracle's third line is reached by the sweep and cannot fail there.** A record whose
+  barrier returned is `Acknowledged`, so for any writer that dispatches *after* its barrier —
+  which is what §02 decision 3 requires — the second line already demands the intent and is
+  the line that fires. The third is load-bearing only for an intent recovery is permitted to
+  drop, so `an_effect_dispatched_before_its_intent_is_durable_is_caught` drives a writer that
+  commits the inversion: the effect happens, and the record is written afterwards. It fails
+  when the dispatched check is removed from `verify_oracle`; the sweep does not.
 * **The bank model is a stand-in.** Its selection rule is exercised against every way a swap
   can be interrupted, so the *shape* of the answer is held; the seal it turns on is a record
   and not the storage-program unit §09 describes. When rung 0.2 writes the real one,
@@ -117,6 +147,22 @@ What got worse, and where the limits are:
   a property of the *scan* — an erased header with frames behind it is never a clean end of
   history — rather than a guarantee of the journal. Two banks are what make an erase safe, and
   that is where the oracle meets one.
+* **Damage inflicted after the writer finished is outside the fault model, so the bit-flip
+  sweep asks the oracle a weaker question.** The ledger records what the writer achieved; a
+  bit somebody flipped afterwards is not a crash point, and a journal of acknowledged records
+  loses one for every flip that lands in a frame. `LostAnAcknowledgedRecord` is the correct
+  verdict there rather than a bug, so what is asserted is that it is the *only* breach and
+  that the record it names still reaches the damaged byte — never one whose frame ended
+  before the damage began. That is the property a mis-striding reader breaks. Corruption
+  *under* the full oracle arrives the realistic way instead: most runs in the sweep contain a
+  frame the scan refuses, and every one of them is verified.
+* **The bank model's fourth line is checked against a selection rule that lives in the test.**
+  Both halves of "exactly one" are now reachable from that rule rather than only from a
+  substituted one — `a_swap_that_clears_both_banks_first_leaves_nothing_to_boot_from` produces
+  zero and `a_swap_that_forgets_to_bump_the_generation_leaves_two_authorities` produces two —
+  but nothing in `waymaker-flash` is under test, because at rung 0.1 there is nothing there to
+  test. The `count <= 1` assertion in the honest sweep is a statement about the protocol and
+  cannot fail: three distinct generations across two banks cannot tie.
 * **`Ledger::torn` changed meaning slightly, in the direction of its own documentation.** It
   reported `true` for a record whose first write was interrupted before it changed a cell —
   a record that is `Attempted`, none of whose bytes are on media. "Half of it is there" and

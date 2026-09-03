@@ -16,14 +16,22 @@
 //! a plausible bug rather than an obviously fatal one: a check that accepts erased bytes
 //! accepts a torn write.
 //!
-//! The cursor mutants are models. `waymaker-core`'s [`ReplayCursor`] is a `const fn` state
-//! machine with no seam to inject through, so what is mutated here is the *step* a caller
-//! takes with the record it hands back: history read one short, two records swapped, one
-//! skipped, one invented past the end. Those are the observable behaviours of the off-by-one
-//! and ordering bugs a cursor can have, and what this file establishes is that the oracle
-//! names each of them at some crash point rather than shrugging. Where a mutant is a model,
-//! the assertion is about the oracle's teeth and not about the cursor's correctness — the
-//! cursor's own suite in `waymaker-core` is what holds that.
+//! Most of the cursor mutants are models. `waymaker-core`'s [`ReplayCursor`] is a `const fn`
+//! state machine with no seam to inject through, so what is mutated in those is the *step* a
+//! caller takes with the record it hands back: history read one short, two records swapped,
+//! one skipped, one invented past the end. Those are the observable behaviours of the
+//! off-by-one and ordering bugs a cursor can have, and what they establish is that the oracle
+//! names each of them at some crash point rather than shrugging.
+//!
+//! One is not a model.
+//! [`without_the_cursor_a_reordered_journal_would_be_replayed_as_history`] runs the real
+//! cursor against a journal whose frames all verify and whose *order* is illegal, and shows
+//! the scan alone accepting exactly what the cursor refuses. That case cannot arise from a
+//! crash point — every history the sweeps draw is legal, and a prefix of a legal history is
+//! legal too, so across every run in this workspace the cursor never refuses a record the
+//! scan accepted — which is the code being right rather than the suite being weak, but it
+//! does mean the sweeps alone would not notice a cursor that stopped checking. That test is
+//! what notices.
 //!
 //! # Every mutant is checked against a control
 //!
@@ -31,6 +39,7 @@
 //! mutant "caught" by a fixture that was already broken would prove the opposite of what it
 //! claims.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, ReplayCursor, RunId};
@@ -379,34 +388,209 @@ fn a_cursor_that_reads_one_record_past_history_invents_what_never_reached_media(
 }
 
 #[test]
-fn an_effect_dispatched_without_a_recovered_intent_is_caught() {
-    // The oracle's third line. The fixture's writer dispatches nothing, so the dispatch is
-    // the mutation: claiming an effect happened whose schedule recovery did not find is
-    // exactly the failure §02 decision 3 forbids, and it must be named rather than ignored.
-    let runs = runs::<Catalogued>();
+fn an_effect_dispatched_before_its_intent_is_durable_is_caught() {
+    // The oracle's third line, reached by a writer that really commits the bug rather than
+    // by a caller that mis-declares a dispatch.
+    //
+    // This matters, and it is subtle. For a writer that dispatches *after* its barrier — the
+    // shape §02 decision 3 requires, and the shape every other writer in this workspace has
+    // — the third line can never be the check that fires: a record whose barrier returned is
+    // `Acknowledged`, so `ledger.acknowledged()` already demands it and
+    // `LostAnAcknowledgedRecord` is reported first. The third line is only load-bearing for
+    // an intent recovery is *permitted* to drop, which is exactly what a dispatch before the
+    // barrier produces.
+    //
+    // So the writer below inverts the order: the effect happens, and then its intent is
+    // recorded. At the crash points that tear that record, the effect has been dispatched
+    // into a world that cannot be rolled back and no committed history accounts for it.
+    let control = dispatch_log(false);
+    let inverted = dispatch_log(true);
 
-    let mut caught = 0_usize;
-    for run in &runs {
+    // The control first. The correct order is caught by nothing, at any crash point, or a
+    // "caught" verdict below would be evidence of the harness rather than of the bug.
+    let mut dispatched_at_all = 0_usize;
+    for (run, dispatched) in &control {
+        dispatched_at_all += dispatched.len();
         let recovered = recover::<Catalogued>(run.image());
-        let missing: Vec<RecordId> = (0..RECORDS)
-            .map(id)
-            .filter(|planned| !recovered.contains(planned))
-            .collect();
-        if missing.is_empty() {
-            continue;
-        }
         assert_eq!(
             verify_oracle(
                 run.ledger(),
-                &Recovery::new(&recovered).dispatched(&missing)
+                &Recovery::new(&recovered).dispatched(dispatched)
             ),
-            Err(Breach::DispatchedWithoutADurableIntent {
-                intent: missing.first().copied().unwrap_or(RecordId(0))
-            }),
-            "at {:?}: {missing:?} were dispatched without a recovered intent",
+            Ok(()),
+            "the control failed at {:?}: dispatched {dispatched:?}, recovered {recovered:?}",
             run.injection()
         );
-        caught += 1;
     }
-    assert!(caught > 0, "every crash point recovered the whole history");
+    assert!(
+        dispatched_at_all > 0,
+        "the control never dispatched anything, so it is not a control"
+    );
+
+    let mut caught = 0_usize;
+    let mut other = Vec::new();
+    for (run, dispatched) in &inverted {
+        let recovered = recover::<Catalogued>(run.image());
+        match verify_oracle(
+            run.ledger(),
+            &Recovery::new(&recovered).dispatched(dispatched),
+        ) {
+            Ok(()) => {}
+            Err(Breach::DispatchedWithoutADurableIntent { intent }) => {
+                assert!(
+                    dispatched.contains(&intent),
+                    "the oracle named {intent:?}, which was never dispatched"
+                );
+                caught += 1;
+            }
+            Err(breach) => other.push(breach),
+        }
+    }
+    assert!(
+        caught > 0,
+        "an effect dispatched before its intent was durable was accepted at every crash          point; other breaches seen: {other:?}"
+    );
+    assert!(
+        other.is_empty(),
+        "the inverted writer breached the oracle in some other way as well: {other:?}"
+    );
+}
+
+/// Every run of the fixture, with the dispatch each run performed.
+///
+/// `before_the_barrier` inverts §02 decision 3: the effect is handed to the world and the
+/// schedule record is written afterwards.
+fn dispatch_log(before_the_barrier: bool) -> Vec<(Run, Vec<RecordId>)> {
+    let log: RefCell<Vec<Vec<RecordId>>> = RefCell::new(Vec::new());
+    let runs = Harness::new(geometry()).run(|session| {
+        log.borrow_mut().push(Vec::new());
+        let mut buffer = [0_u8; 64];
+        let mut at = 0_u32;
+        for index in 0..RECORDS {
+            let bytes = payload(index);
+            let scheduled = matches!(record(index, &bytes), RecordRef::EffectScheduled { .. });
+            let Ok(written) =
+                frame::encode_with::<Catalogued>(&record(index, &bytes), align(), &mut buffer)
+            else {
+                unreachable!("64 bytes is more than any fixture record")
+            };
+            let Some(frame_bytes) = buffer.get(..written) else {
+                unreachable!("`encode_with` reports what it wrote")
+            };
+
+            if before_the_barrier && scheduled {
+                // The bug: the effect happens here, before anything of its intent is on
+                // media.
+                if let Some(run) = log.borrow_mut().last_mut() {
+                    run.push(id(index));
+                }
+            }
+
+            session.begin_record(id(index));
+            session.program(at, frame_bytes)?;
+            at = at.wrapping_add(u32::try_from(written).unwrap_or(u32::MAX));
+            session.barrier()?;
+
+            if !before_the_barrier && scheduled {
+                // The barrier returned, so the intent is durable and the effect may happen.
+                if let Some(run) = log.borrow_mut().last_mut() {
+                    run.push(id(index));
+                }
+            }
+        }
+        Ok::<(), FaultError>(())
+    });
+    let runs = match runs {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    };
+    let log = log.into_inner();
+    assert_eq!(log.len(), runs.len(), "one dispatch log per run");
+    runs.into_iter().zip(log).collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// The cursor is load-bearing
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn without_the_cursor_a_reordered_journal_would_be_replayed_as_history() {
+    // The cursor cannot be caught by the sweeps, and it is worth being exact about why.
+    // Every history the generator draws is legal, and every crash point leaves a *prefix*
+    // of a legal history, which is legal too — so across every run in this workspace the
+    // cursor never refuses a record the scan accepted. That is the code being right, not the
+    // suite being weak, but it does mean nothing in the sweeps would notice if
+    // `ReplayCursor::advance` stopped checking anything at all.
+    //
+    // A journal that is illegal *in its ordering* while every frame in it verifies is the
+    // one shape that separates the two readers, and it cannot arise from a crash point: it
+    // takes a hand assembled — or damaged — journal. So this builds one, by transplanting
+    // two whole frames on media, and shows that the scan alone accepts what the cursor
+    // refuses.
+    let runs = runs::<Catalogued>();
+    let clean = runs
+        .first()
+        .unwrap_or_else(|| unreachable!("the fault-free run"));
+    let image = clean.image();
+
+    // Re-lay the journal with a schedule and its own completion transposed, so history says
+    // an effect finished before it was ever scheduled. Rebuilt rather than swapped in place,
+    // because the two frames are different widths — a completion carries no kind, length or
+    // digest — and an in-place swap would be a transplant this format does not permit.
+    let order = [0, 2, 1, 3, 4, 5, 6];
+    assert_eq!(
+        order.len(),
+        RECORDS as usize,
+        "the transposition must name every record the fixture writes"
+    );
+    let mut reordered = Vec::new();
+    let mut buffer = [0_u8; 64];
+    for index in order {
+        let bytes = payload(index);
+        let Ok(written) = frame::encode(&record(index, &bytes), align(), &mut buffer) else {
+            unreachable!("64 bytes is more than any fixture record")
+        };
+        reordered.extend_from_slice(buffer.get(..written).unwrap_or_default());
+    }
+    reordered.resize(image.len(), 0xFF);
+
+    // Every frame still checks out, so the codec has nothing to say about this journal.
+    assert!(
+        Scan::new(&reordered, align()).all(|step| step.is_ok()),
+        "the transplant damaged a frame, so this tests the codec rather than the cursor"
+    );
+
+    // The scan alone: it hands back the completion before the schedule, and the oracle
+    // reports history that is not a prefix of what was committed. This is the recovery a
+    // cursor that checked nothing would produce.
+    let scan_only: Vec<RecordId> = Scan::new(&reordered, align())
+        .take_while(Result::is_ok)
+        .flatten()
+        .map(|record| identify(&record))
+        .collect();
+    assert_eq!(
+        verify_oracle(clean.ledger(), &Recovery::new(&scan_only)),
+        Err(Breach::NotAPrefix {
+            position: 1,
+            expected: Some(id(1)),
+            found: id(2),
+        }),
+        "a reordered journal was accepted without the cursor, so the oracle would not \
+         notice a cursor that stopped ordering history"
+    );
+
+    // The real reader: the cursor refuses the completion that has no schedule, recovery
+    // stops there, and the only thing the oracle can hold against it is the acknowledged
+    // records the transplant destroyed — never a reordering.
+    let recovered = recover::<Catalogued>(&reordered);
+    assert_eq!(
+        recovered,
+        vec![id(0)],
+        "the cursor replayed a reordered journal"
+    );
+    assert_eq!(
+        verify_oracle(clean.ledger(), &Recovery::new(&recovered)),
+        Err(Breach::LostAnAcknowledgedRecord { record: id(1) }),
+        "damaging a finished journal must lose records, and lose only those"
+    );
 }

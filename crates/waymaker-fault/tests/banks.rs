@@ -24,6 +24,8 @@
 //! [`a_selection_that_ignores_the_seal_finds_two_authorities`] are the proof that satisfying
 //! it means something.
 
+use std::collections::BTreeSet;
+
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, ReplayCursor, RunId};
 use waymaker_fault::{
     Breach, Durability, FaultError, Harness, Injection, Op, Progress, RecordId, Recovery, Run,
@@ -54,9 +56,15 @@ const NEW_GENERATION: u32 = 2;
 /// loudly rather than silently moving what "after the first commit" means.
 const FIRST_COMMIT: usize = 9;
 
+/// Two banks of four erase blocks each.
+///
+/// The block size is a quarter of a bank rather than a whole one on purpose: an erase is
+/// interrupted at erase blocks and nowhere else, so a bank of *one* block has no interior
+/// tear point at all and "a partially erased bank" would be a case the sweep could not
+/// reach. Four blocks gives three.
 fn geometry() -> Geometry {
-    let Ok(geometry) = Geometry::new(256, 64, 4, 1) else {
-        unreachable!("256 is four whole 64-byte blocks of 4-byte units of single bytes")
+    let Ok(geometry) = Geometry::new(256, 32, 4, 1) else {
+        unreachable!("256 is eight whole 32-byte blocks of 4-byte units of single bytes")
     };
     geometry
 }
@@ -173,11 +181,18 @@ fn authority(image: &[u8]) -> (usize, Option<u32>) {
     }
 }
 
-/// What recovery produced: the swap's record if the installed generation is authoritative.
-fn recovered(image: &[u8]) -> Vec<RecordId> {
-    match authority(image) {
-        (1, Some(NEW_GENERATION)) => vec![SWAP],
-        _ => Vec::new(),
+/// What recovery produced: the swap's record if `installed` is the generation on media.
+///
+/// Deliberately not "…and exactly one bank is authoritative". Whether the *count* is legal
+/// is the oracle's fourth line, and a recovery that pre-filtered on it would answer that
+/// line before the oracle was asked — leaving `AmbiguousAuthority` reported as a lost record
+/// instead, which is the wrong diagnosis for the right failure.
+fn recovered(image: &[u8], installed: u32) -> Vec<RecordId> {
+    let (count, generation) = authority(image);
+    if count >= 1 && generation == Some(installed) {
+        vec![SWAP]
+    } else {
+        Vec::new()
     }
 }
 
@@ -231,6 +246,30 @@ fn swap_clearing_both(session: &mut Session) -> Result<(), FaultError> {
     Ok(())
 }
 
+/// The swap with a different bug: the new bank is sealed at the generation the bank being
+/// replaced already carries.
+///
+/// Every frame verifies, every seal is present, and nothing on media says which of the two
+/// banks is newer. This is the only writer here whose *real* selection rule can return two
+/// authorities, and it is why `authority` resolves a tie by refusing to pick rather than by
+/// taking the first: a tie is the state no protocol may reach, so a selection that resolved
+/// it would hide the bug the count exists to find.
+fn swap_without_bumping_the_generation(session: &mut Session) -> Result<(), FaultError> {
+    write_bank(session, BANK_B, 0)?;
+    session.barrier()?;
+    write_bank(session, BANK_A, 1)?;
+    session.barrier()?;
+
+    session.erase(BANK_B, BANK_BYTES)?;
+    session.barrier()?;
+
+    session.begin_record(SWAP);
+    write_bank(session, BANK_B, 1)?;
+    session.barrier()?;
+    session.end_record();
+    Ok(())
+}
+
 fn drive(writer: fn(&mut Session) -> Result<(), FaultError>) -> Vec<Run> {
     match Harness::new(geometry()).run(writer) {
         Ok(runs) => runs,
@@ -274,6 +313,11 @@ fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() 
     let mut before_any_commit = 0_usize;
     for run in &runs {
         let (count, generation) = authority(run.image());
+        // Never two. For *this* writer that is a property of the protocol rather than of
+        // the selection rule — three distinct generations across two banks cannot tie — so
+        // the assertion cannot fail here, and it is not where the "never two" half is held.
+        // `a_swap_that_forgets_to_bump_the_generation_leaves_two_authorities` is: it drives
+        // a writer whose banks *can* tie and shows `authority` returning two.
         assert!(
             count <= 1,
             "at {:?}: {count} banks are authoritative, at generations {generation:?}",
@@ -297,7 +341,7 @@ fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() 
             other => unreachable!("a bank at generation {other:?} was never written"),
         }
 
-        let history = recovered(run.image());
+        let history = recovered(run.image(), NEW_GENERATION);
         assert_eq!(
             verify_oracle(
                 run.ledger(),
@@ -369,9 +413,21 @@ fn a_partially_erased_bank_is_never_mistaken_for_a_sealed_one() {
             b.first() == Some(&0xFF) && b.iter().any(|byte| *byte != 0xFF)
         })
         .collect();
+    // More than one *world*, not more than one run. A `PowerLoss` and a `Failure` armed at
+    // the same point of the same operation produce byte-identical media here, because no
+    // writer in this file reacts to an error — so counting runs would report two where the
+    // sweep has seen one. With a bank of one erase block, as this file had before, there is
+    // no interior point at all and the whole test reduces to a single image.
+    //
+    // Two rather than three: the erase spans four blocks and stops at three interior
+    // points, but a bank's four records reach only into the third, so stopping before the
+    // fourth erases bytes that were already erased and leaves the bank entirely blank —
+    // which is not a stale tail and is filtered out above.
+    let worlds: BTreeSet<&[u8]> = interrupted.iter().map(|run| run.image()).collect();
     assert!(
-        !interrupted.is_empty(),
-        "no crash point left a bank half erased"
+        worlds.len() >= 2,
+        "only {} distinct half-erased banks across the sweep",
+        worlds.len()
     );
     for run in interrupted {
         let [_, b] = banks(run.image());
@@ -403,7 +459,7 @@ fn a_swap_that_clears_both_banks_first_leaves_nothing_to_boot_from() {
         if count != 0 || !after_first_commit(run) {
             continue;
         }
-        let history = recovered(run.image());
+        let history = recovered(run.image(), NEW_GENERATION);
         assert_eq!(
             verify_oracle(
                 run.ledger(),
@@ -442,7 +498,7 @@ fn a_selection_that_ignores_the_seal_finds_two_authorities() {
         if count < 2 {
             continue;
         }
-        let history = recovered(run.image());
+        let history = recovered(run.image(), NEW_GENERATION);
         assert_eq!(
             verify_oracle(
                 run.ledger(),
@@ -457,5 +513,41 @@ fn a_selection_that_ignores_the_seal_finds_two_authorities() {
     assert!(
         caught > 0,
         "a seal-blind selection never found two banks, so the mutant proves nothing"
+    );
+}
+
+#[test]
+fn a_swap_that_forgets_to_bump_the_generation_leaves_two_authorities() {
+    // The other way a two-bank device loses its authority: not by having none, but by having
+    // two that no longer disagree. §02 decision 7 makes a new run authoritative on its
+    // *generation* seal, and a seal that repeats a generation seals nothing.
+    //
+    // Unlike `a_selection_that_ignores_the_seal_finds_two_authorities`, the selection here
+    // is the real one. Nothing is substituted: `authority` is asked the same question it is
+    // asked everywhere else in this file, and on this device it answers two.
+    let runs = drive(swap_without_bumping_the_generation);
+
+    let mut caught = 0_usize;
+    for run in &runs {
+        let (count, _) = authority(run.image());
+        if count < 2 {
+            continue;
+        }
+        let history = recovered(run.image(), 1);
+        assert_eq!(
+            verify_oracle(
+                run.ledger(),
+                &Recovery::new(&history).authoritative_banks(count)
+            ),
+            Err(Breach::AmbiguousAuthority { count }),
+            "at {:?}: two banks sealed at the same generation were accepted",
+            run.injection()
+        );
+        caught += 1;
+    }
+    assert!(
+        caught > 0,
+        "a swap that reused the old generation never produced two authorities, so the \
+         mutant proves nothing"
     );
 }

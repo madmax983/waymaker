@@ -10,8 +10,17 @@
 //!     && recovered_banks.count_authoritative() == 1
 //! ```
 //!
-//! The first three are swept here, over histories drawn from a seed rather than written by
-//! hand. The fourth needs two banks and a generation seal, and it is
+//! The first two are swept here, over histories drawn from a seed rather than written by
+//! hand.
+//!
+//! The third is *reached* by the sweep and cannot fail in it, and that is worth stating
+//! plainly rather than letting the loop imply otherwise. Every writer here dispatches after
+//! its barrier returns, as §02 decision 3 requires — and a record whose barrier returned is
+//! `Acknowledged`, so the second line already demands it and would be the line that fired.
+//! The third line is only load-bearing for an intent recovery is *permitted* to drop, which
+//! is what dispatching before the barrier produces:
+//! `tests/teeth.rs`'s `an_effect_dispatched_before_its_intent_is_durable_is_caught` drives a
+//! writer that commits exactly that inversion, and is where the line has teeth. The fourth needs two banks and a generation seal, and it is
 //! [`tests/banks.rs`](https://github.com/madmax983/waymaker/tree/main/crates/waymaker-fault/tests/banks.rs).
 //! [`tests/teeth.rs`](https://github.com/madmax983/waymaker/tree/main/crates/waymaker-fault/tests/teeth.rs)
 //! is the other half of "done when": a deliberately broken cursor or codec has to make this
@@ -45,14 +54,14 @@
 //! one.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use waymaker_core::{
     ActivityKind, DecodeError, EffectSeq, KernelError, RecordRef, ReplayCursor, RunId,
 };
 use waymaker_fault::{
-    Durability, FaultError, Harness, Injection, Interruption, Op, Progress, RecordId, Recovery,
-    Rng, Run, Session, injections, random_geometry, verify_oracle,
+    Breach, Durability, FaultError, Harness, Injection, Interruption, Op, Progress, RecordId,
+    Recovery, Rng, Run, Session, injections, random_geometry, verify_oracle,
 };
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
@@ -61,6 +70,14 @@ use waymaker_flash::storage::{Geometry, StableStorage};
 /// How many seeds the sweep draws.
 const SEEDS: u64 = 32;
 
+/// The smallest device the sweep will draw.
+///
+/// A device with no room for a single frame is a legal thing to model — the writer stops
+/// with nothing written, and the oracle holds trivially — but it contributes two runs and
+/// no history, and `a_run_that_overflows_its_journal_recovers_what_fitted_and_nothing_more`
+/// covers the boundary properly. A floor keeps every seed carrying its weight.
+const MIN_CAPACITY: u32 = 64;
+
 /// The largest device the sweep will draw.
 ///
 /// Every byte of journal is two crash points and every crash point is one more run of the
@@ -68,6 +85,19 @@ const SEEDS: u64 = 32;
 /// bytes is a journal of several records at every program granularity the generator draws,
 /// which is what the sweep needs; a megabyte would be the same test, slower.
 const MAX_CAPACITY: u32 = 256;
+
+/// A device drawn from `rng` that is worth sweeping: at least [`MIN_CAPACITY`] bytes.
+///
+/// Redrawing rather than clamping, so that every shape in the result is one
+/// [`random_geometry`] really produces.
+fn device(rng: &mut Rng) -> Geometry {
+    loop {
+        let geometry = random_geometry(rng, MAX_CAPACITY);
+        if geometry.capacity() >= MIN_CAPACITY {
+            return geometry;
+        }
+    }
+}
 
 /// The run every generated history belongs to.
 const RUN: RunId = RunId(0x5741_594D_524B_0001);
@@ -352,15 +382,37 @@ fn sweep(history: &History, geometry: Geometry) -> (Vec<Run>, Vec<Vec<RecordId>>
 struct Census {
     runs: usize,
     geometries: BTreeSet<(u32, u32, u32, u32)>,
-    shapes: BTreeSet<Vec<RecordId>>,
+    histories: BTreeSet<Vec<(&'static str, usize)>>,
     prefix_lengths: BTreeSet<usize>,
     acknowledged_kept_while_others_were_lost: usize,
     dispatched: usize,
     dispatched_then_power_lost: usize,
     scans_that_refused: usize,
     torn_records: usize,
+    /// Runs where a record is torn and the scan does *not* refuse, or the other way round.
+    torn_and_refused_disagreed: usize,
     empty_recoveries: usize,
     full_recoveries: usize,
+    /// Which of §09's six record kinds the generator actually drew.
+    kinds: BTreeSet<&'static str>,
+    /// Records the writer appended and never ordered with a barrier.
+    unordered_records: usize,
+    /// Seeds whose history was longer than the device it was drawn beside.
+    histories_that_did_not_fit: usize,
+}
+
+impl Planned {
+    /// The §09 record kind this plan writes, for the census.
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Started => "RunStarted",
+            Self::Scheduled { .. } => "EffectScheduled",
+            Self::Completed { .. } => "EffectCompleted",
+            Self::Failed { .. } => "EffectFailed",
+            Self::RunCompleted => "RunCompleted",
+            Self::RunFailed => "RunFailed",
+        }
+    }
 }
 
 #[test]
@@ -369,7 +421,7 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
 
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
-        let geometry = random_geometry(&mut rng, MAX_CAPACITY);
+        let geometry = device(&mut rng);
         let history = History::draw(&mut rng);
         let align = align_of(geometry);
         let (runs, log) = sweep(&history, geometry);
@@ -390,8 +442,27 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
         let clean = runs
             .first()
             .unwrap_or_else(|| unreachable!("the fault-free run"));
+        assert!(
+            !clean.ops().is_empty(),
+            "seed {seed}: the writer issued no operations at all on {geometry:?}, so this \
+             seed contributes two runs and no history"
+        );
         let whole = recover(clean.image(), &history, align);
-        census.shapes.insert(whole.clone());
+        census.histories.insert(
+            history
+                .plans
+                .iter()
+                .zip(history.payloads.iter())
+                .map(|(plan, payload)| (plan.kind(), payload.len()))
+                .collect(),
+        );
+        census
+            .kinds
+            .extend(history.plans.iter().map(|plan| plan.kind()));
+        census.unordered_records += history.barriers.iter().filter(|kept| !**kept).count();
+        if clean.ledger().len() < history.plans.len() {
+            census.histories_that_did_not_fit += 1;
+        }
 
         for (run, dispatched) in runs.iter().zip(log.iter()) {
             let recovered = recover(run.image(), &history, align);
@@ -427,15 +498,19 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
             {
                 census.dispatched_then_power_lost += 1;
             }
-            if Scan::new(run.image(), align).any(|step| step.is_err()) {
-                census.scans_that_refused += 1;
-            }
-            if run
+            let refused = Scan::new(run.image(), align).any(|step| step.is_err());
+            let torn = run
                 .ledger()
                 .order()
-                .any(|id| run.ledger().torn(id) == Some(true))
-            {
+                .any(|id| run.ledger().torn(id) == Some(true));
+            if refused {
+                census.scans_that_refused += 1;
+            }
+            if torn {
                 census.torn_records += 1;
+            }
+            if refused != torn {
+                census.torn_and_refused_disagreed += 1;
             }
         }
     }
@@ -461,9 +536,9 @@ fn assert_the_sweep_covered_something(census: &Census) {
         census.geometries
     );
     assert!(
-        census.shapes.len() >= 8,
-        "only {} distinct histories",
-        census.shapes.len()
+        census.histories.len() >= 8,
+        "only {} distinct histories drawn across {SEEDS} seeds",
+        census.histories.len()
     );
     assert!(
         census.prefix_lengths.len() >= 4,
@@ -483,8 +558,10 @@ fn assert_the_sweep_covered_something(census: &Census) {
     );
     assert!(
         census.dispatched > 0 && census.dispatched_then_power_lost > 0,
-        "no effect was dispatched and then lost to a power cut, so §02 decision 3 was never \
-         put to the test: {} dispatches, {} of them followed by a power loss",
+        "no run both dispatched an effect and lost power at the end of an operation, so the \
+         sweep never reached the state §02 decision 3 is about — an effect in flight when \
+         the power goes: {} dispatches, {} runs that also lost power on a completed \
+         operation",
         census.dispatched,
         census.dispatched_then_power_lost
     );
@@ -492,10 +569,37 @@ fn assert_the_sweep_covered_something(census: &Census) {
         census.torn_records > 0,
         "no crash point tore a record in half across the whole sweep"
     );
+    // The two counters above are the same measurement taken from opposite ends — the ledger
+    // says a record is half on media, the scan says a frame does not verify — and over the
+    // whole sweep they agree exactly. That equivalence is the interesting property, and
+    // asserting it is what stops these being one check written twice: a codec that accepted
+    // a torn frame, or a harness that stopped noticing one, breaks it from its own side.
+    assert_eq!(
+        census.torn_and_refused_disagreed, 0,
+        "a torn record and a journal the scan refuses stopped being the same thing in {} \
+         runs",
+        census.torn_and_refused_disagreed
+    );
     assert!(
         census.scans_that_refused > 0,
         "no crash point produced a journal the scan refused, so integrity failure was never \
          reached from a real torn write"
+    );
+    assert_eq!(
+        census.kinds.len(),
+        6,
+        "the generator drew only {:?} of §09's six record kinds",
+        census.kinds
+    );
+    assert!(
+        census.unordered_records > 0,
+        "every record the generator drew was followed by a barrier, so the half of the \
+         oracle that *permits* recovery to drop a record was never exercised"
+    );
+    assert!(
+        census.histories_that_did_not_fit > 0,
+        "no drawn history was longer than the device beside it, so the sweep never met the \
+         capacity boundary"
     );
 }
 
@@ -509,7 +613,7 @@ fn every_byte_and_every_program_unit_of_every_write_is_a_crash_point() {
 
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
-        let geometry = random_geometry(&mut rng, MAX_CAPACITY);
+        let geometry = device(&mut rng);
         let history = History::draw(&mut rng);
         let (runs, _) = sweep(&history, geometry);
 
@@ -559,7 +663,7 @@ fn the_power_goes_before_and_after_every_barrier() {
 
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
-        let geometry = random_geometry(&mut rng, MAX_CAPACITY);
+        let geometry = device(&mut rng);
         let history = History::draw(&mut rng);
         let (runs, _) = sweep(&history, geometry);
 
@@ -620,11 +724,19 @@ fn fixed_geometry() -> Geometry {
 }
 
 #[test]
-fn a_single_bit_flipped_anywhere_never_lengthens_recovered_history() {
-    // CRC corruption, swept exhaustively rather than sampled: every bit of a complete
-    // journal, one at a time. A checksum's job is to make damage stop the scan, and the
-    // failure that matters is the silent one — damage that makes recovery produce *more*
-    // than it should, or something other than a prefix of what is really there.
+fn a_single_bit_flipped_anywhere_loses_only_what_lies_at_or_beyond_the_damage() {
+    // CRC corruption, swept exhaustively rather than sampled: every bit of every byte of a
+    // complete journal, one at a time.
+    //
+    // The oracle is asked, and it is asked in the only form that can be true here. Damage
+    // inflicted on media *after* the writer finished is outside the harness's fault model —
+    // the ledger records what the writer achieved, and a bit somebody flipped afterwards is
+    // not a crash point — so a journal whose records are all acknowledged will lose one for
+    // every flip that lands in a frame, and `LostAnAcknowledgedRecord` is the correct
+    // verdict rather than a bug. What must be true, and is what a mis-striding reader would
+    // break, is *which* record it is permitted to lose: never one whose frame ends before
+    // the damage begins. So the assertion is that the only breach is that one, and that the
+    // record it names still reaches the damaged byte.
     let geometry = fixed_geometry();
     let align = align_of(geometry);
     let mut rng = Rng::new(101);
@@ -636,8 +748,27 @@ fn a_single_bit_flipped_anywhere_never_lengthens_recovered_history() {
     let whole = recover(clean.image(), &history, align);
     assert!(whole.len() >= 2, "the fixture recovered only {whole:?}");
 
+    // Where each record's frame ends, taken from the write sequence the writer really
+    // issued rather than recomputed here: `append_all` issues exactly one program per
+    // record, so operation `i` *is* record `i`, and a layout worked out twice is a layout
+    // that can disagree with itself.
+    let ends: Vec<u32> = clean
+        .ops()
+        .iter()
+        .filter_map(|op| match *op {
+            Op::Program { offset, len } => Some(offset.wrapping_add(len)),
+            Op::Erase { .. } | Op::Barrier => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), whole.len(), "one program per recovered record");
+
+    let written_bytes = ends
+        .last()
+        .copied()
+        .unwrap_or_else(|| unreachable!("the fixture wrote at least two records"));
     let mut refusals = 0_usize;
     let mut shortened = 0_usize;
+    let mut breached = 0_usize;
     for byte in 0..clean.image().len() {
         for bit in 0..8_u32 {
             let mut damaged = clean.image().to_vec();
@@ -652,19 +783,49 @@ fn a_single_bit_flipped_anywhere_never_lengthens_recovered_history() {
                 "flipping bit {bit} of byte {byte} made recovery produce {recovered:?}, \
                  which is not a prefix of {whole:?}"
             );
+
+            let at = u32::try_from(byte).unwrap_or(u32::MAX);
+            match verify_oracle(clean.ledger(), &Recovery::new(&recovered)) {
+                Ok(()) => {}
+                Err(Breach::LostAnAcknowledgedRecord { record }) => {
+                    let end = ends
+                        .get(record.0 as usize)
+                        .copied()
+                        .unwrap_or_else(|| unreachable!("every lost record was written"));
+                    assert!(
+                        end > at,
+                        "flipping bit {bit} of byte {byte} lost {record:?}, whose frame \
+                         already ended at {end}"
+                    );
+                    breached += 1;
+                }
+                Err(other) => unreachable!(
+                    "flipping bit {bit} of byte {byte} produced {other}, which no amount of \
+                     damage to a finished journal should be able to do"
+                ),
+            }
+
             if recovered.len() < whole.len() {
                 shortened += 1;
             }
-            if Scan::new(&damaged, align).any(|step| step.is_err()) {
+            // Only damage inside the frames counts. A flip in the erased tail also makes
+            // the scan refuse — the tail stops being erased, which is the stale-tail rule
+            // doing its job — and counting those would make this number say "the scan
+            // noticed something" when almost every flip lands there.
+            if at < written_bytes && Scan::new(&damaged, align).any(|step| step.is_err()) {
                 refusals += 1;
             }
         }
     }
 
     assert!(
-        shortened > 0 && refusals > 0,
-        "no single-bit flip was noticed at all: {shortened} shortened, {refusals} refused"
+        shortened > 0 && refusals > 0 && breached > 0,
+        "no single-bit flip was noticed at all: {shortened} shortened, {refusals} refused, \
+         {breached} breached"
     );
+    // Every flip that shortened history is a flip the oracle was asked about and answered
+    // the same way, so the two counts are the same measurement seen twice.
+    assert_eq!(shortened, breached);
 }
 
 #[test]
@@ -983,8 +1144,13 @@ fn a_record_the_writer_never_started_is_not_one_recovery_may_produce() {
             continue;
         }
         recovered.push(next);
-        assert!(
-            verify_oracle(run.ledger(), &Recovery::new(&recovered)).is_err(),
+        // The exact breach, not merely "some breach". Appending anything past a complete
+        // prefix is also `NotAPrefix`, so an `is_err()` assertion here would survive
+        // deleting the check it is named after — which is the failure this whole file
+        // exists to make impossible.
+        assert_eq!(
+            verify_oracle(run.ledger(), &Recovery::new(&recovered)),
+            Err(Breach::RecoveredWhatWasNeverAttempted { record: next }),
             "the oracle accepted {next:?}, none of whose bytes ever reached media"
         );
         caught += 1;
@@ -1002,10 +1168,14 @@ fn a_stale_tail_left_by_an_interrupted_erase_is_never_read_as_a_clean_end() {
     // oracle asked whether recovery lost an acknowledged record can only say yes. What
     // survives is the property that matters — a reader must not report a *clean* end of
     // history with committed frames still behind the hole.
-    let Ok(two_blocks) = Geometry::new(256, 128, 4, 1) else {
-        unreachable!("256 is two whole 128-byte blocks of 4-byte units")
+    // 64-byte blocks, so the 128-byte erase below spans two of them and the enumeration
+    // really contains an *interrupted* erase. An erase is interrupted at erase blocks and
+    // nowhere else, so a block as large as the erase would leave this test asserting a
+    // property of a completed one — which is a different, weaker thing than the name says.
+    let Ok(blocks) = Geometry::new(256, 64, 4, 1) else {
+        unreachable!("256 is four whole 64-byte blocks of 4-byte units")
     };
-    let align = align_of(two_blocks);
+    let align = align_of(blocks);
     let history = History {
         plans: (0..8)
             .map(|index| Planned::Scheduled {
@@ -1017,9 +1187,9 @@ fn a_stale_tail_left_by_an_interrupted_erase_is_never_read_as_a_clean_end() {
         payloads: vec![Vec::new(); 8],
     };
 
-    let runs = match Harness::new(two_blocks).run(|session| {
+    let runs = match Harness::new(blocks).run(|session| {
         let mut dispatched = Vec::new();
-        append_all(session, &history, two_blocks, &mut dispatched)?;
+        append_all(session, &history, blocks, &mut dispatched)?;
         session.barrier()?;
         session.erase(0, 128)
     }) {
@@ -1028,6 +1198,7 @@ fn a_stale_tail_left_by_an_interrupted_erase_is_never_read_as_a_clean_end() {
     };
 
     let mut stale = 0_usize;
+    let mut half_erased = 0_usize;
     for run in &runs {
         let erased_head = run.image().first() == Some(&0xFF);
         let data_behind = run.image().iter().any(|byte| *byte != 0xFF);
@@ -1035,6 +1206,15 @@ fn a_stale_tail_left_by_an_interrupted_erase_is_never_read_as_a_clean_end() {
             continue;
         }
         stale += 1;
+        if matches!(
+            run.injection(),
+            Some(Injection {
+                progress: Progress::Bytes(_),
+                ..
+            })
+        ) {
+            half_erased += 1;
+        }
         let mut scan = Scan::new(run.image(), align);
         assert_eq!(
             scan.next(),
@@ -1045,4 +1225,127 @@ fn a_stale_tail_left_by_an_interrupted_erase_is_never_read_as_a_clean_end() {
         assert!(recover(run.image(), &history, align).is_empty());
     }
     assert!(stale > 0, "no crash point left a stale tail");
+    assert!(
+        half_erased > 0,
+        "every stale tail here came from an erase that *finished*, so no crash point was \
+         inside the erase and the test is not the one its name claims"
+    );
+}
+
+#[test]
+fn a_writer_that_retries_a_failed_write_is_a_world_the_sweep_would_not_otherwise_reach() {
+    // Half the enumerated crash set is `Interruption::Failure`, and for a writer that
+    // propagates every error with `?` — which is every other writer here, and every writer
+    // in `tests/committed_prefix.rs` — a failure produces byte-identical media to the power
+    // loss armed at the same point. `Harness` documents that it takes a *closure* rather
+    // than a recorded write log precisely so that "what does the writer do when this call
+    // returns an error" is a real question, and nothing was asking it.
+    //
+    // This writer retries a failed program once. On NOR that repairs the write: the bytes
+    // that landed are already correct and the rest are still erased, so programming the same
+    // frame again completes it. Two things follow that no other test here reaches — the
+    // failure worlds stop being duplicates of the power-loss worlds, and `Missing`'s "what
+    // one write failed to put on media a retry may have put there since" is exercised rather
+    // than described.
+    let geometry = fixed_geometry();
+    let align = align_of(geometry);
+    let mut rng = Rng::new(404);
+    let history = History::draw(&mut rng);
+
+    let runs = match Harness::new(geometry).run(|session| {
+        let mut buffer = [0_u8; 128];
+        let mut at = 0_u32;
+        for index in 0..history.plans.len() {
+            let Some(record) = history.record(index) else {
+                break;
+            };
+            let Ok(written) = frame::encode(&record, align, &mut buffer) else {
+                break;
+            };
+            let Some(bytes) = buffer.get(..written) else {
+                break;
+            };
+            let len = u32::try_from(written).unwrap_or(u32::MAX);
+            if at
+                .checked_add(len)
+                .is_none_or(|end| end > geometry.capacity())
+            {
+                break;
+            }
+            session.begin_record(RecordId(u32::try_from(index).unwrap_or(u32::MAX)));
+            // One retry, and one only. After a power loss the session is dead and every
+            // call returns `PowerLoss`, so a loop here would be a writer that cannot stop.
+            if session.program(at, bytes).is_err() {
+                session.program(at, bytes)?;
+            }
+            at = at.wrapping_add(len);
+            session.barrier()?;
+        }
+        session.end_record();
+        Ok::<(), FaultError>(())
+    }) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    };
+
+    // The oracle holds for a writer that reacts to failure, which is the point of asking.
+    for run in &runs {
+        let recovered = recover(run.image(), &history, align);
+        assert_eq!(
+            verify_oracle(run.ledger(), &Recovery::new(&recovered)),
+            Ok(()),
+            "at {:?}: recovered {recovered:?}",
+            run.injection()
+        );
+    }
+
+    // A record whose write was torn by a failure and put right by the retry: not torn at the
+    // end of the run, and acknowledged by the barrier that followed. This is the branch that
+    // judges tornness when the run *ends* rather than when the operation ran.
+    let repaired = runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.injection(),
+                Some(Injection {
+                    progress: Progress::Bytes(_),
+                    interruption: Interruption::Failure,
+                    ..
+                })
+            ) && run.ledger().order().any(|id| {
+                run.ledger().torn(id) == Some(false)
+                    && run.ledger().state(id) == Some(Durability::Acknowledged)
+            })
+        })
+        .count();
+    assert!(
+        repaired > 0,
+        "no failed write was ever repaired by the retry, so the reacting-writer case is \
+         still untested"
+    );
+
+    // And the two interruptions really do lead to different media now.
+    let mut worlds: BTreeMap<(usize, Progress, Interruption), &[u8]> = BTreeMap::new();
+    for run in &runs {
+        if let Some(injection) = run.injection() {
+            worlds.insert(
+                (injection.op, injection.progress, injection.interruption),
+                run.image(),
+            );
+        }
+    }
+    let diverged = worlds
+        .iter()
+        .filter(|((op, progress, interruption), image)| {
+            *interruption == Interruption::Failure
+                && worlds
+                    .get(&(*op, *progress, Interruption::PowerLoss))
+                    .is_some_and(|lost| lost != *image)
+        })
+        .count();
+    assert!(
+        diverged > 0,
+        "every failure produced the same media as the power loss armed at the same point, \
+         so half the enumerated crash set is still a duplicate of the other half"
+    );
 }

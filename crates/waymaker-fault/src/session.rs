@@ -198,7 +198,14 @@ impl Session {
     }
 
     /// The state of a record whose operations are `start..end`.
-    fn durability_of(&self, start: usize, end: usize, torn: bool) -> Durability {
+    ///
+    /// `withheld` is "some operation of this record did not put on media what it meant to",
+    /// which is *not* the same as [`Ledger::torn`]: a record that changed no cell at all is
+    /// [`Durability::Attempted`] and not torn, and the early return below is what separates
+    /// the two. The parameter is named for what it is rather than for what it usually
+    /// implies, because moving that early return below the `withheld` branch would silently
+    /// change the answer.
+    fn durability_of(&self, start: usize, end: usize, withheld: bool) -> Durability {
         let range = || start..end.max(start);
 
         if !range().any(|index| self.touched.get(index) == Some(&true)) {
@@ -209,7 +216,7 @@ impl Session {
         // writer may not even know: an injected failure hands it an error and lets it carry
         // on to the barrier. Acknowledging that would oblige recovery to produce a frame no
         // integrity check would accept.
-        if torn {
+        if withheld {
             return Durability::PossiblyDurable;
         }
 
