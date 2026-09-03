@@ -111,7 +111,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -131,13 +131,18 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Two crates are in the workspace and are *not* layers:
+Three crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
   declares all three layers as *optional* dependencies, on purpose — the baseline variant
   links none of them, which is what makes the code-flash budget a delta rather than an
   absolute — and nothing depends on it.
+- `waymaker-fault` — the in-memory storage model and crash injector, `policy::TEST_SUPPORT_CRATES`.
+  Host-side, `std`, no third-party dependencies, and outside `default-members`. It depends on
+  `waymaker-flash` for the storage contract; nothing depends on it, and no layer may, in any
+  dependency kind — the tests that drive the harness live with the harness. See
+  [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
 
 ## Budgets
 
@@ -209,7 +214,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 34 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 35 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -223,21 +228,22 @@ this table is how you find out what a red build is telling you.
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts: `encode_with` or `decode_with` stops computing a seal through `C::header_check`/`C::frame_check` exactly once, names a checksum function directly, `input_digest` stops calling `crc32` once, or the scan's `next` stops walking with `decode_with` — a trait nothing is obliged to call is a swap point that selects nothing. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
+| `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
-| `workspace-membership` | A workspace member is neither a layer, declared host tooling, nor a measurement crate. |
+| `workspace-membership` | A workspace member is neither a layer, declared host tooling, a measurement crate, nor declared test support. |
 | `inputs-incomplete` | A crate is in the graph but contributed no manifest, or a workspace member contributed no crate root, so rules silently skipped it. |
 
 ### Crates and manifests
 
 | Rule | Fires when |
 | --- | --- |
-| `crate-attributes` | A firmware crate root loses `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std/alloc`. |
-| `empty-default-features` | A firmware crate's `default` feature enables anything, so an optional cost stops being opt-in. |
-| `no-build-scripts` | A firmware crate grows a `build.rs`. |
-| `member-manifest` | A member manifest drops `[lints] workspace = true`, declares a non-empty `default` feature, opts out of its own test binary with `[lib] test = false` — which would make an untested crate report "no coverable lines" and pass the coverage gate — or, for the kernel, grows a dependency table. |
+| `crate-attributes` | A firmware crate root loses `#![no_std]` or `#![forbid(unsafe_code)]` or declares `extern crate std/alloc`; or any crate the layering covers — the three layers and the test-support crates — loses `#![forbid(unsafe_code)]` or allows unsafe code. A test-support crate is host code, so `#![no_std]` is not asked of it; an unreviewed `unsafe` block in the harness the layers are tested against is. |
+| `empty-default-features` | A layer's or a test-support crate's `default` feature enables anything, so an optional cost stops being opt-in. |
+| `no-build-scripts` | A layer or a test-support crate grows a `build.rs`. |
+| `member-manifest` | A layer's or a test-support crate's manifest drops `[lints] workspace = true`, declares a non-empty `default` feature, opts out of its own test binary with `[lib] test = false` — which would make an untested crate report "no coverable lines" and pass the coverage gate — or, for the kernel, grows a dependency table. |
 | `workspace-lints` | The workspace lint table drifts from what this project requires (`manifest::REQUIRED_CLIPPY_GROUPS` and `REQUIRED_CLIPPY_DENIALS`). The design document says nothing about lints; only the release profile comes from §04. |
 | `release-profile` | `[profile.release]` drifts from the size settings the budgets are measured against. |
 | `cargo-config-profile` | `.cargo/config.toml` is missing, rewrites the `xtask` alias or the profile, declares an `[env]` key, or sets `[build] rustflags` — each of which turns a gate into a command that exits zero. |
@@ -297,6 +303,11 @@ Stated so that nobody mistakes silence for coverage:
   `effect-scheduled-fields` compares *names*. ADR 0011's actual claim is 24 bytes per
   scheduled effect, and widening an existing field rather than adding one is invisible to
   it; `waymaker-flash`'s frame tests are what hold the layout.
+- **That a fault the harness models is a fault the hardware has.** `waymaker-fault` models
+  NOR flash — erased is `0xFF`, programming only clears bits, an operation the geometry
+  forbids never reaches media — and a model wrong in the same direction as the code it
+  tests would agree with it. §15's hardware half, "run hardware power-cut loops against real
+  NOR flash", is owed at rung 0.2, where the boards are.
 - **A lookup table outside the checksum module.** `integrity-check`'s table scan reads
   `waymaker-flash/src/crc.rs` and the modules it is split into, so a table in a sibling
   module that `crc.rs` calls is out of its scope.
@@ -312,8 +323,20 @@ Stated so that nobody mistakes silence for coverage:
   refused and a plain one is not. `waymaker-flash`'s golden frames and
   `tests/integrity.rs` are what hold the behaviour; these rules hold what a reviewer can
   check by eye.
-- **`[lints] workspace = true` in `xtask` and the size probe.** `member-manifest` iterates
-  `policy::LAYERS`, so it covers the three firmware crates only.
+- **`[lints] workspace = true` in `xtask` and the size probe.** The manifest and crate-root
+  rules iterate `policy::checked_members` — the three layers plus the test-support crates —
+  so those two are outside them. The size probe has `size-probe` of its own; `xtask` is the
+  gate.
+- **A host convenience added to the storage contract from another file.** `storage-contract`
+  pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
+  in a sibling module adds a method to every port's type with the rule silent, the same way
+  `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **Crash points of operations that exist only after an injected failure.** `injections` is
+  computed from the *fault-free* write sequence, so a retry a writer performs only because a
+  call failed has no crash points of its own — it is never torn, interrupted or power-lost
+  in any run. Everything before the injection point is identical by construction, which is
+  what makes the enumeration exact for that sequence; it is not a fixpoint over the
+  sequences a reacting writer can produce.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
@@ -357,13 +380,33 @@ puts the two seals behind `waymaker-flash`'s `IntegrityCheck` trait, binds the s
 answer to `Catalogued`, and settles the widths as the trait's own return types — sixteen
 bits over the header, thirty-two over the header and payload, which is what §09's frame
 spends. The trait itself costs nothing — 7288 B against 7296 B before, with the probe held still —
-and the `default` row reads 7560 B because `size-probe-reach` makes the probe name both
-entry points and run one codec body twice. The rejected CRC-32C candidate is implemented in
+and the `default` row reads 8180 B of the 8192 B budget, because `size-probe-reach` makes
+the probe name every entry point, run one codec body twice, and link a driver that goes
+through §12's three validators. Twelve bytes of headroom is a real result, and
+[ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md) says so rather
+than absorbing it: rung 0.2's banks, seals and barriers do not fit in it. The rejected CRC-32C candidate is implemented in
 `waymaker-flash`'s integrity tests, in all three forms ADR 0010 measured, so the rejection is
 a comparison rather than an assertion, and the failure modes §09 names — a write torn at a
 program-unit boundary, a stale erased tail, a partial program that can only clear bits — are
 swept there rather than argued. What a CRC still is not is authentication, and that is a
 passing test too.
+Issue #18 then makes design document §15's opening sentence — "crash testing is part of the
+design, not a post-MVP hardening phase" — a thing the workspace does rather than a thing it
+intends. §12's storage contract is now real: `waymaker-flash`'s `Geometry` is the only legal
+description of a device and the only thing that decides whether an offset and a length are
+allowed, and `StableStorage` is the four operations and one barrier every port implements,
+with its public surface pinned by `storage-contract` so §05's "must not expand the firmware
+traits to accommodate host conveniences" is a build failure rather than a sentence. Above the
+layers, `waymaker-fault` is the in-memory storage model and the crash injector: media that
+starts erased and only clears bits, a recorder of the write sequence, and `injections` — a
+pure function that lists *every* point at which that sequence can be interrupted, at every
+byte of a program, at every erase block of an erase, and before and after every barrier. The
+three record states §15 asks for are computed as the writer runs rather than guessed from the
+bytes, and §15's core property oracle is a function that fails closed four different ways.
+Three unrelated writers are driven through it unmodified, so "reusable without modification"
+is a test rather than a claim — see
+[ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md), which also
+records what this leaves owed: the hardware power-cut loops, at 0.2, where the boards are.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The

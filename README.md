@@ -20,8 +20,15 @@ Rung 0.1, in progress. The design is settled at draft v0.2, the three crates exi
 effect identity, activity kinds, the error vocabulary, the borrowed record views, the
 streaming replay cursor, and the §08 transition table that decides at each effect boundary
 whether history answers the workflow's question or the world has to. `waymaker-flash` holds
-the record codec those views are decoded from. Timers and the two timer records are the rest
-of 0.1; the commit seal and the bank swap arrive with 0.2.
+the record codec those views are decoded from, and design document §12's storage contract —
+the geometry that decides whether an offset and a length are legal, and the four operations
+and one barrier every port implements. Above the layers, `waymaker-fault` is the in-memory
+storage model and the crash injector: media that starts erased and only clears bits, and the
+complete list of points at which a write sequence can be interrupted — every byte of a
+program, every erase block of an erase, before and after every barrier — enumerated rather
+than sampled, with §15's recovery oracle as a function
+([ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)). Timers and the
+two timer records are the rest of 0.1; the commit seal and the bank swap arrive with 0.2.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check
@@ -41,12 +48,17 @@ full document, and the issue tracker for the build-out.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | Allocation, serialization framework, CRC, clock, storage driver, executor, logging |
-| `waymaker-flash` | Stable wire encoding, CRC/seals, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
+| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | On-media authority or hidden global state |
 
 Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `waymaker-core`.
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
+
+Three workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+firmware linked only so that its section sizes can be measured, and `waymaker-fault` is the
+crash harness. None of them is built for a firmware target, and no layer may depend on any
+of them.
 
 ## Budgets
 
@@ -262,11 +274,11 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `kernel-owns-no-encoding` | a `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>` — which needs no dependency for the previous rule to catch |
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
-| `workspace-membership` | a workspace member is neither a layer, declared host tooling, nor a measurement fixture |
-| `no-build-scripts` | a firmware crate has a `build.rs` |
-| `empty-default-features` | a firmware crate has a non-empty `default` feature |
-| `crate-attributes` | a crate root drops `#![no_std]` or `#![forbid(unsafe_code)]`, allows unsafe code, or declares `extern crate std`/`alloc` |
-| `member-manifest` | a firmware crate stops inheriting the workspace lints, or opts out of its own test binary |
+| `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, nor declared test support |
+| `no-build-scripts` | a layer or a test-support crate has a `build.rs` |
+| `empty-default-features` | a layer or a test-support crate has a non-empty `default` feature |
+| `crate-attributes` | a firmware crate root drops `#![no_std]` or declares `extern crate std`/`alloc`, or any crate the layering covers drops `#![forbid(unsafe_code)]` or allows unsafe code |
+| `member-manifest` | a layer or a test-support crate stops inheriting the workspace lints, or opts out of its own test binary |
 | `release-profile` | `[profile.release]` drifts from design document §04 |
 | `cargo-config-profile` | `.cargo/config.toml` declares a profile, an `[env]` table or `[build] rustflags`, or stops aliasing `cargo xtask` to the gate |
 | `workspace-lints` | the lint table stops denying `unwrap_used`, or a lint group loses its negative priority |
@@ -276,6 +288,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
 | `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
+| `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or the codec stops routing its seals through the trait |

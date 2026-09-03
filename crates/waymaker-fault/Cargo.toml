@@ -1,0 +1,30 @@
+[package]
+name = "waymaker-fault"
+description = "In-memory storage model and exhaustive crash injector for Waymaker. Test support: never linked into firmware, never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["development-tools::testing"]
+keywords = ["durable", "workflow", "fault-injection", "testing"]
+# Test support, not a shipped library. It sits above the layers: it depends on
+# `waymaker-flash` for the storage contract, and no layer may depend on it in any dependency
+# kind — the tests that drive it live here, with it. Nothing that is ever flashed sees it.
+publish = false
+
+[dependencies]
+waymaker-flash.workspace = true
+
+# Only the tests need the kernel: the harness itself names no record type, which is what
+# makes it reusable by anything that writes through `StableStorage`. A normal dependency
+# here would be the harness knowing what a record is.
+[dev-dependencies]
+waymaker-core.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

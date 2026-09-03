@@ -681,6 +681,103 @@ fn record_codec() -> usize {
         None => 0,
     });
     kept = kept.wrapping_add(scan.offset());
+    kept = kept.wrapping_add(storage_contract());
+
+    core::hint::black_box(kept)
+}
+
+/// A driver that validates and does nothing else, so that the delta charges for §12 and
+/// not for this file.
+///
+/// Design document §12's trait has no implementation in any layer — implementing it is what
+/// a *port* does — so there is no body in `waymaker-flash` for the probe to reach through
+/// [`waymaker_flash::storage::StableStorage`]'s five methods. What a driver really costs a
+/// firmware is the validation §12 obliges it to do before touching media, and that *is*
+/// library code: [`waymaker_flash::storage::Geometry`]'s three validators. So each method
+/// below calls its validator and returns, with no copying, no filling and no bounds
+/// arithmetic of its own. A probe that also modelled media would put its own
+/// `copy_from_slice` into the delta and report it as the contract's price.
+#[cfg(feature = "engine")]
+struct ProbeMedia {
+    geometry: waymaker_flash::storage::Geometry,
+}
+
+#[cfg(feature = "engine")]
+impl waymaker_flash::storage::StableStorage for ProbeMedia {
+    type Error = waymaker_flash::storage::GeometryError;
+
+    fn geometry(&self) -> waymaker_flash::storage::Geometry {
+        self.geometry
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let len = u32::try_from(dst.len())
+            .map_err(|_| waymaker_flash::storage::GeometryError::OutOfBounds)?;
+        self.geometry.validate_read(offset, len)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        let len = u32::try_from(src.len())
+            .map_err(|_| waymaker_flash::storage::GeometryError::OutOfBounds)?;
+        self.geometry.validate_program(offset, len)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.geometry.validate_erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// The storage contract: the geometry arithmetic, and one driver that goes through it.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn storage_contract() -> usize {
+    use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
+
+    let Ok(geometry) = Geometry::new(
+        core::hint::black_box(8),
+        core::hint::black_box(8),
+        core::hint::black_box(4),
+        core::hint::black_box(1),
+    ) else {
+        return 0;
+    };
+
+    let mut kept = (geometry.capacity() as usize)
+        .wrapping_add(geometry.erase_size() as usize)
+        .wrapping_add(geometry.program_size() as usize)
+        .wrapping_add(geometry.read_size() as usize)
+        .wrapping_add(geometry.erase_blocks() as usize);
+
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Taken as a
+    // function pointer for the reason the kernel's two are: formatting would link
+    // `core::fmt::write` and charge this row for machinery the impl was written to avoid.
+    let show: fn(&GeometryError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <GeometryError as core::fmt::Display>::fmt;
+    core::hint::black_box(show);
+
+    // Every operation the contract has, reached through the trait rather than beside it,
+    // because a driver is how the validators are really called. One offset rather than two:
+    // both arms of each validator are in the one function the linker keeps either way, and
+    // a second sweep would charge the delta for this file's loop rather than for §12.
+    let mut media = ProbeMedia { geometry };
+    kept = kept.wrapping_add(media.geometry().capacity() as usize);
+    let mut page = [0_u8; 4];
+    let offset = core::hint::black_box(1);
+    for outcome in [
+        media.read(offset, &mut page),
+        media.program(offset, core::hint::black_box(b"seal")),
+        media.erase(offset, core::hint::black_box(4)),
+        media.barrier(),
+    ] {
+        kept = kept.wrapping_add(match outcome {
+            Ok(()) => 1,
+            Err(error) => error.message().len(),
+        });
+    }
 
     core::hint::black_box(kept)
 }

@@ -27,6 +27,8 @@
 mod crc;
 pub mod frame;
 pub mod integrity;
+pub mod storage;
 
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
+pub use storage::{Geometry, GeometryError, StableStorage};

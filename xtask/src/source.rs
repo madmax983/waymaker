@@ -31,10 +31,16 @@ pub const REQUIRED_INNER_ATTRIBUTES: &[&str] = &["#![no_std]", "#![forbid(unsafe
 /// says which line did it rather than leaving a linker error to be interpreted.
 pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
 
-/// Rule: every firmware crate is `no_std` and forbids unsafe code.
+/// Rule: every firmware crate is `no_std` and forbids unsafe code, and every test-support
+/// crate forbids unsafe code.
 ///
 /// A crate named in [`LAYERS`] but absent from `sources` is not reported here; the graph
 /// rules already report it as a missing layer.
+///
+/// A test-support crate is deliberately held to less: it is host code, so `#![no_std]` and
+/// the `extern crate std` scan would be wrong for it. `#![forbid(unsafe_code)]` is not —
+/// nothing about modelling media in a `Vec<u8>` needs it, and a harness the layers are
+/// tested against is the last place an unreviewed `unsafe` block should be able to appear.
 #[must_use]
 pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -55,14 +61,6 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
             }
         }
 
-        if silences_lint(&attributes, "unsafe_code") {
-            violations.push(Violation::new(
-                "crate-attributes",
-                spec.name,
-                "src/lib.rs allows unsafe code; a documented exception belongs in an ADR",
-            ));
-        }
-
         for name in extern_crates(source.contents) {
             if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
                 violations.push(Violation::new(
@@ -73,6 +71,30 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
                     ),
                 ));
             }
+        }
+    }
+
+    for member in crate::policy::checked_members() {
+        let Some(source) = sources.iter().find(|source| source.name == member) else {
+            continue;
+        };
+        let attributes = inner_attributes(source.contents);
+        if !attributes
+            .iter()
+            .any(|line| line == "#![forbid(unsafe_code)]")
+        {
+            violations.push(Violation::new(
+                "crate-attributes",
+                member,
+                "src/lib.rs is missing `#![forbid(unsafe_code)]`",
+            ));
+        }
+        if silences_lint(&attributes, "unsafe_code") {
+            violations.push(Violation::new(
+                "crate-attributes",
+                member,
+                "src/lib.rs allows unsafe code; a documented exception belongs in an ADR",
+            ));
         }
     }
 
@@ -545,6 +567,7 @@ pub const TRANSITION_SURFACE: &[&str] = &[
 pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
     check_pinned_surface(
         "replay-cursor-surface",
+        "waymaker-core",
         REPLAY_SURFACE_PATH,
         REPLAY_SURFACE,
         sources,
@@ -561,12 +584,75 @@ pub fn check_replay_cursor_surface(sources: &[crate::size::LayerSource]) -> Vec<
 pub fn check_transition_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
     check_pinned_surface(
         "transition-surface",
+        "waymaker-core",
         TRANSITION_SURFACE_PATH,
         TRANSITION_SURFACE,
         sources,
         "the machine's public API is where design document \u{a7}08's \"stop, never guess\" is \
          enforced, so a way out of a divergence cannot be added without a reviewer writing \
          it down",
+    )
+}
+
+/// The file whose public surface [`STORAGE_CONTRACT_SURFACE`] pins.
+pub const STORAGE_CONTRACT_PATH: &str = "waymaker-flash/src/storage.rs";
+
+/// Every public function design document §12's storage contract is allowed to have.
+///
+/// §05 says a host or browser adapter "must not expand the firmware traits to accommodate
+/// host conveniences", and §12 is the firmware trait it is talking about. That sentence is
+/// a rule about *absence*: a `read_all`, a `write_at`, a `flush`, a `Geometry::from_bytes`
+/// or a `capacity()` shortcut on the trait would each break no layering rule, need no
+/// dependency, pass every other gate, and turn a four-operation contract every port must
+/// implement into a surface only a host can afford. A test cannot call a method that is not
+/// there, so the surface is pinned instead and a fifth operation is a line a reviewer
+/// writes on purpose.
+///
+/// The pin fails in the other direction too, which matters as much: a name this file no
+/// longer declares means the contract was renamed or deleted and the pin has stopped
+/// checking anything. `fmt` is on the list because a trait `impl`'s methods are callable
+/// without `pub`, and `message` because a driver with no console still has to report
+/// something.
+///
+/// What it does **not** catch: this compares *names*. A `&mut self` turned into `&self`, an
+/// offset widened to `u64`, or a validator that stopped validating are all invisible to it
+/// and are a reviewer's job. `tests/storage.rs` is what holds the behaviour.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const STORAGE_CONTRACT_SURFACE: &[&str] = &[
+    "barrier",
+    "capacity",
+    "erase",
+    "erase_blocks",
+    "erase_size",
+    "fmt",
+    "geometry",
+    "message",
+    "new",
+    "program",
+    "program_size",
+    "read",
+    "read_size",
+    "validate_erase",
+    "validate_program",
+    "validate_read",
+];
+
+/// Rule: the storage contract's public surface is exactly the one that was reviewed.
+///
+/// The same shape as [`check_replay_cursor_surface`], for design document §12's trait and
+/// the geometry that guards it.
+#[must_use]
+pub fn check_storage_contract(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    check_pinned_surface(
+        "storage-contract",
+        "waymaker-flash",
+        STORAGE_CONTRACT_PATH,
+        STORAGE_CONTRACT_SURFACE,
+        sources,
+        "design document \u{a7}05 says a host adapter must not expand the firmware traits to \
+         accommodate host conveniences, so a fifth storage operation cannot be added without \
+         a reviewer writing it down",
     )
 }
 
@@ -2072,20 +2158,19 @@ fn without_test_modules(code: &str) -> String {
 #[must_use]
 fn check_pinned_surface(
     rule: &'static str,
+    subject: &str,
     path: &str,
     pinned: &[&str],
     sources: &[crate::size::LayerSource],
     purpose: &str,
 ) -> Vec<Violation> {
-    const KERNEL: &str = "waymaker-core";
-
     let Some(source) = sources
         .iter()
         .find(|source| source.path.replace('\\', "/").ends_with(path))
     else {
         return vec![Violation::new(
             rule,
-            KERNEL,
+            subject.to_owned(),
             format!(
                 "no {path} in the workspace, so the pinned surface is checking nothing; \
                  {purpose}"
@@ -2112,7 +2197,7 @@ fn check_pinned_surface(
         if declarations.get(index.wrapping_add(1)) == Some(name) {
             violations.push(Violation::new(
                 rule,
-                KERNEL,
+                subject.to_owned(),
                 format!(
                     "{} declares `{name}` more than once: the pin is a list of names, so a \
                      second declaration under a name already on it is invisible to this rule \
@@ -2129,7 +2214,7 @@ fn check_pinned_surface(
     for added in declared.difference(&pinned) {
         violations.push(Violation::new(
             rule,
-            KERNEL,
+            subject.to_owned(),
             format!(
                 "{} declares `{added}`, which the pinned surface does not list: {purpose}",
                 source.path
@@ -2139,7 +2224,7 @@ fn check_pinned_surface(
     for missing in pinned.difference(&declared) {
         violations.push(Violation::new(
             rule,
-            KERNEL,
+            subject.to_owned(),
             format!(
                 "the pinned surface lists `{missing}`, which {} no longer declares; a pin \
                  nothing matches is a pin that has stopped checking",
@@ -2778,12 +2863,71 @@ mod tests {
         );
     }
 
+    fn storage_source(extra: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{STORAGE_CONTRACT_PATH}"),
+            contents: format!("{}{extra}", tests_support::clean_storage_contract()),
+        }]
+    }
+
     #[test]
-    fn the_two_surface_pins_do_not_read_each_others_module() {
-        // The hazard of one shared body behind two rule ids: a pin pointed at the wrong file
-        // would report the other module's functions and look, from a green build, exactly
-        // like a pin that is working. Each rule is handed only the other's source, and each
-        // has to fail closed rather than find something it can compare.
+    fn the_pinned_storage_contract_passes() {
+        assert!(check_storage_contract(&storage_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_host_convenience_on_the_storage_contract_is_rejected_by_name() {
+        // The shape the rule exists for. Design document §05: a host adapter "must not
+        // expand the firmware traits to accommodate host conveniences". None of these
+        // breaks a layering rule, needs a dependency, or fails any other gate.
+        for convenience in [
+            "pub fn read_all(&mut self) -> Vec<u8> { Vec::new() }\n",
+            "pub fn flush(&mut self) {}\n",
+            "pub fn write_at(&mut self, offset: u32) {}\n",
+        ] {
+            let violations = check_storage_contract(&storage_source(convenience));
+            assert_eq!(violations.len(), 1, "{convenience}");
+            assert_eq!(violations[0].rule, "storage-contract");
+            assert_eq!(violations[0].subject, "waymaker-flash");
+        }
+    }
+
+    #[test]
+    fn a_storage_operation_that_disappeared_is_reported_too() {
+        let thinned = tests_support::clean_storage_contract().replace("pub fn barrier() {}\n", "");
+        let violations = check_storage_contract(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{STORAGE_CONTRACT_PATH}"),
+            contents: thinned,
+        }]);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].detail.contains("barrier"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_storage_module_fails_closed() {
+        let violations = check_storage_contract(&kernel_source("pub fn nothing() {}\n"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "storage-contract");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(
+            violations[0].detail.contains("checking nothing"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn no_surface_pin_reads_another_pin_s_module() {
+        // The hazard of one shared body behind three rule ids: a pin pointed at the wrong
+        // file would report another module's functions and look, from a green build,
+        // exactly like a pin that is working. Each rule is handed only the others' sources,
+        // and each has to fail closed rather than find something it can compare.
         let replay_only = vec![crate::size::LayerSource {
             crate_name: "waymaker-core".to_owned(),
             path: format!("crates/{REPLAY_SURFACE_PATH}"),
@@ -2810,6 +2954,29 @@ mod tests {
             "{}",
             missing_replay[0].detail
         );
+
+        // And the third pin, which reads a different crate's module and must not be
+        // satisfied by either of the kernel's.
+        let storage_only = storage_source("");
+        assert!(check_storage_contract(&storage_only).is_empty());
+        for handed in [&replay_only, &transition_only] {
+            let missing_storage = check_storage_contract(handed);
+            assert_eq!(missing_storage.len(), 1);
+            assert_eq!(missing_storage[0].rule, "storage-contract");
+            assert_eq!(missing_storage[0].subject, "waymaker-flash");
+            assert!(
+                missing_storage[0].detail.contains("checking nothing"),
+                "{}",
+                missing_storage[0].detail
+            );
+        }
+        for other in [
+            check_replay_cursor_surface(&storage_only),
+            check_transition_surface(&storage_only),
+        ] {
+            assert_eq!(other.len(), 1);
+            assert!(other[0].detail.contains("checking nothing"), "{other:?}");
+        }
     }
 
     #[test]
@@ -2820,6 +2987,47 @@ mod tests {
             contents: tests_support::clean_transition_surface(),
         }]);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_storage_module() {
+        let violations = check_storage_contract(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: STORAGE_CONTRACT_PATH.replace('/', "\\"),
+            contents: tests_support::clean_storage_contract(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_test_support_crate_must_forbid_unsafe_code_but_need_not_be_no_std() {
+        // The exemption a test-support crate has is narrow and specific: it is host code,
+        // so `#![no_std]` would be wrong for it. `#![forbid(unsafe_code)]` is not — a
+        // harness the layers are tested against is the last place an unreviewed `unsafe`
+        // block should be able to appear.
+        let clean = sources("waymaker-fault", "//! Docs.\n#![forbid(unsafe_code)]\n");
+        assert!(check_crate_attributes(&clean).is_empty());
+
+        let unforbidden = check_crate_attributes(&sources("waymaker-fault", "//! Docs.\n"));
+        assert_eq!(unforbidden.len(), 1);
+        assert_eq!(unforbidden[0].rule, "crate-attributes");
+        assert_eq!(unforbidden[0].subject, "waymaker-fault");
+        assert!(
+            unforbidden[0].detail.contains("forbid(unsafe_code)"),
+            "{}",
+            unforbidden[0].detail
+        );
+
+        let allowed = check_crate_attributes(&sources(
+            "waymaker-fault",
+            "//! Docs.\n#![forbid(unsafe_code)]\n#![allow(unsafe_code)]\n",
+        ));
+        assert!(
+            allowed
+                .iter()
+                .any(|violation| violation.detail.contains("allows unsafe code")),
+            "{allowed:?}"
+        );
     }
 
     #[test]
@@ -4389,7 +4597,8 @@ pub mod tests_support {
 
     use super::{
         CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, INTEGRITY_CHECK_PARAMETERS,
-        REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, TRANSITION_SURFACE,
+        REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE,
+        TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -4417,6 +4626,12 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_transition_surface() -> String {
         surface("A transition module.", TRANSITION_SURFACE)
+    }
+
+    /// A storage module declaring exactly [`STORAGE_CONTRACT_SURFACE`] and nothing else.
+    #[must_use]
+    pub fn clean_storage_contract() -> String {
+        surface("A storage module.", STORAGE_CONTRACT_SURFACE)
     }
 
     /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
@@ -4558,6 +4773,7 @@ pub mod tests_support {
         let names: BTreeSet<&&str> = REPLAY_SURFACE
             .iter()
             .chain(TRANSITION_SURFACE)
+            .chain(STORAGE_CONTRACT_SURFACE)
             .chain(seals)
             .chain(SEALING_FUNCTIONS)
             .chain([&DIGEST_FUNCTION.0])

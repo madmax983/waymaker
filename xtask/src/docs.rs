@@ -339,6 +339,24 @@ pub const COLD_START_STEPS: &[&str] = &[
     "Stop at pending work or a terminal record",
 ];
 
+/// What the crash injector enumerates and what it concludes, from design document §15.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted. The first
+/// four are §15's fault families and issue #18's "fault injection covering" list; the last
+/// three are the model's three record states, which the same issue asks for by name. A
+/// picture that lost one of the four would understate what is checked; a picture that lost
+/// one of the three would collapse "may be recovered" into "must be", which is the one
+/// distinction §15 spends a paragraph on.
+pub const CRASH_INJECTION_LABELS: &[&str] = &[
+    "Torn write at every byte",
+    "Interrupted erase at every erase block",
+    "Power loss before and after every barrier",
+    "Failed program or erase, writer carries on",
+    "Attempted",
+    "PossiblyDurable",
+    "Acknowledged",
+];
+
 /// The fields of the record frame, from design document §09.
 ///
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
@@ -420,6 +438,12 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the five-row replay transition table",
         required_labels: TRANSITION_TABLE_ROWS,
         source_section: "§08 Replay and determinism",
+    },
+    DiagramSpec {
+        id: "crash-injection",
+        title: "the crash injector's fault families and record states",
+        required_labels: CRASH_INJECTION_LABELS,
+        source_section: "\u{a7}15 Testing and verification",
     },
     DiagramSpec {
         id: "two-bank-generations",
@@ -2802,6 +2826,9 @@ mod tests {
         assert_eq!(TWO_BANK_SWAP_STEPS.len(), 7);
         assert_eq!(COLD_START_STEPS.len(), 6);
         assert_eq!(TRANSITION_TABLE_ROWS.len(), 5);
+        // Four fault families from design document §15 and issue #18's injection list,
+        // plus the three record states the same issue asks the model to distinguish.
+        assert_eq!(CRASH_INJECTION_LABELS.len(), 7);
     }
 
     #[test]
