@@ -34,6 +34,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
+cargo test --locked -p waymaker-spec --no-default-features
 cargo --locked xtask check-layering
 ```
 
@@ -118,7 +119,13 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, exhaustively over every byte string to three bytes and every mutation of a real frame |
 
-Paths are relative to `crates/waymaker-spec`. The proofs are bounded and say so: `Bound::PROOF`
+Paths are relative to `crates/waymaker-spec`, and they are a CI stage of their own —
+`cargo test --locked -p waymaker-spec --no-default-features`, in the `verification` job.
+The workspace test stage runs them too; the separate job exists for the reason the
+`layering` job does, which is that a §14 guarantee that stopped holding should be legible in
+the checks list under a name that says which.
+
+The proofs are bounded and say so: `Bound::PROOF`
 travels in every result, reaching the state ceiling is an error rather than a truncation, and
 `tests/census.rs` pins the reachable state count so that a machine which quietly shrank fails
 a build rather than passing every proof about the part of it that is left.

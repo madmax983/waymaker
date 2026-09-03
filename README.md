@@ -132,6 +132,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
+cargo test --locked -p waymaker-spec --no-default-features
 cargo --locked xtask check-layering
 ```
 
