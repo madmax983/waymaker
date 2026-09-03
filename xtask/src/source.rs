@@ -109,18 +109,89 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
 
 /// Collects the crate names in `extern crate <name>;` declarations, ignoring comments.
 fn extern_crates(contents: &str) -> Vec<String> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("extern crate "))
-        .filter_map(|rest| {
-            rest.split([' ', ';'])
-                .find(|token| !token.is_empty())
-                .map(str::to_owned)
-        })
-        .collect()
+    contents.lines().filter_map(declared_extern_crate).collect()
 }
 
+/// The crate `line` declares with `extern crate`, if it declares one.
+///
+/// Not `strip_prefix("extern crate ")` on the trimmed line, which is what this was and which
+/// Codex caught on pull request #66: `pub extern crate alloc;` is valid Rust — visibility on
+/// an `extern crate` re-exports the name — and rustfmt leaves it alone, so the scan read
+/// nothing and the decoder could allocate. `pub(crate)`, `pub(super)`, `pub(in path)` and a
+/// same-line `#[macro_use]` are the same evasion in four more spellings, and arbitrary
+/// whitespace between the keywords is a fifth.
+///
+/// So the line is tokenised rather than prefix-matched: attributes and visibility are
+/// stripped, then the first two tokens must be exactly `extern` and `crate`. A comment or a
+/// doc line keeps its marker as the first token and is therefore never mistaken for a
+/// declaration.
+fn declared_extern_crate(line: &str) -> Option<String> {
+    let rest = strip_visibility(strip_leading_attributes(line.trim()));
+    let mut tokens = rest.split_whitespace();
+    if tokens.next() != Some("extern") || tokens.next() != Some("crate") {
+        return None;
+    }
+    let name = tokens.next()?.trim_end_matches(';');
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `line` with any `#[..]` or `#![..]` attributes at its start removed.
+fn strip_leading_attributes(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let Some(after_hash) = rest.strip_prefix('#') else {
+            return rest;
+        };
+        let after_bang = after_hash.strip_prefix('!').unwrap_or(after_hash);
+        let Some(body) = after_bang.strip_prefix('[') else {
+            return rest;
+        };
+        // Nested brackets are possible — `#[cfg(all(a, b))]` has none, but `#[doc = "[x]"]`
+        // does — so the close is found by depth rather than by the first `]`.
+        let mut depth = 1_usize;
+        let mut end = None;
+        for (index, character) in body.char_indices() {
+            match character {
+                '[' => depth = depth.saturating_add(1),
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { return rest };
+        let Some(after) = body.get(end.saturating_add(1)..) else {
+            return rest;
+        };
+        rest = after.trim_start();
+    }
+}
+
+/// `line` with a leading visibility modifier removed.
+fn strip_visibility(line: &str) -> &str {
+    let Some(after_pub) = line.strip_prefix("pub") else {
+        return line;
+    };
+    // `pub` has to be a whole token: `public_thing` is not a visibility modifier.
+    match after_pub.chars().next() {
+        Some('(') => {
+            let Some(close) = after_pub.find(')') else {
+                return line;
+            };
+            after_pub
+                .get(close.saturating_add(1)..)
+                .map_or(line, str::trim_start)
+        }
+        Some(character) if character.is_whitespace() => after_pub.trim_start(),
+        _ => line,
+    }
+}
+
+/// Rule: no source file of any layer re-admits `std` or `alloc`.
 /// Rule: no source file of any layer re-admits `std` or `alloc`.
 ///
 /// The other half of [`check_crate_attributes`]'s `extern crate` scan, which reads crate
@@ -185,6 +256,58 @@ mod bare_metal_tests {
         assert_eq!(violations[0].subject, "waymaker-flash");
         assert!(violations[0].detail.contains("frame.rs"), "{violations:?}");
         assert!(violations[0].detail.contains("extern crate alloc"));
+    }
+
+    #[test]
+    fn every_spelling_of_a_visible_extern_crate_is_caught() {
+        // Codex, pull request #66 round 3. `pub extern crate alloc;` is valid Rust — a
+        // visibility modifier on an `extern crate` re-exports the name — and rustfmt leaves
+        // it alone, so a prefix match on `extern crate ` read nothing while the decoder
+        // could allocate. These are the spellings that evasion has.
+        for line in [
+            "pub extern crate alloc;",
+            "pub(crate) extern crate alloc;",
+            "pub(super) extern crate alloc;",
+            "pub(in crate::frame) extern crate alloc;",
+            "#[macro_use] extern crate alloc;",
+            "#[macro_use] pub extern crate alloc;",
+            "extern   crate   alloc;",
+            "    pub  extern crate alloc as _;",
+        ] {
+            let violations = check_layer_sources_are_bare_metal(&[source(
+                "waymaker-flash",
+                "crates/waymaker-flash/src/frame.rs",
+                line,
+            )]);
+            assert_eq!(violations.len(), 1, "`{line}` was not caught");
+            assert!(
+                violations[0].detail.contains("extern crate alloc"),
+                "`{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_that_only_looks_like_a_declaration_is_not_one() {
+        for line in [
+            "/// extern crate alloc;",
+            "//! extern crate alloc;",
+            "// pub extern crate alloc;",
+            "/// `pub extern crate alloc;` is what this rule refuses",
+            "pub_extern_crate_alloc();",
+            "unsafe extern \"C\" { fn f(); }",
+            "let extern_crate_alloc = 1;",
+        ] {
+            assert!(
+                check_layer_sources_are_bare_metal(&[source(
+                    "waymaker-core",
+                    "crates/waymaker-core/src/replay.rs",
+                    line,
+                )])
+                .is_empty(),
+                "`{line}` was mistaken for a declaration"
+            );
+        }
     }
 
     #[test]
