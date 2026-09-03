@@ -32,7 +32,7 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// one — it means part of the machine stopped being reachable while every proof about the
 /// rest kept passing — and a change that makes it larger is one a reviewer should see too.
 /// Either way the number is the review, and it is expected to move when the model does.
-const REACHABLE_STATES: usize = 3_248;
+const REACHABLE_STATES: usize = 2_576;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -55,17 +55,17 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
 /// led to is reachable by some other path. Every invariant, every mutant verdict and every
 /// necessity proof stays green through all three. The edge counts do not.
 const TRANSITION_EDGES: [(TransitionKind, usize); 11] = [
-    (TransitionKind::Declare, 588),
-    (TransitionKind::Program, 448),
-    (TransitionKind::FailedProgram, 448),
-    (TransitionKind::Barrier, 1624),
-    (TransitionKind::Dispatch, 1036),
-    (TransitionKind::BeginErase, 1392),
-    (TransitionKind::CommitErase, 696),
-    (TransitionKind::BeginSeal, 464),
-    (TransitionKind::CommitSeal, 464),
-    (TransitionKind::Tear, 448),
-    (TransitionKind::PowerLoss, 1624),
+    (TransitionKind::Declare, 532),
+    (TransitionKind::Program, 392),
+    (TransitionKind::FailedProgram, 392),
+    (TransitionKind::Barrier, 1288),
+    (TransitionKind::Dispatch, 84),
+    (TransitionKind::BeginErase, 1104),
+    (TransitionKind::CommitErase, 552),
+    (TransitionKind::BeginSeal, 368),
+    (TransitionKind::CommitSeal, 368),
+    (TransitionKind::Tear, 392),
+    (TransitionKind::PowerLoss, 1288),
 ];
 
 #[test]
@@ -119,6 +119,8 @@ fn every_precondition_refused_something() {
         Illegal::SealAlreadyInFlight,
         Illegal::CapacityReached,
         Illegal::UndeclaredRecord,
+        Illegal::NotAScheduleRecord,
+        Illegal::OutOfProtocolOrder,
         Illegal::IntentNotDurable,
         Illegal::AlreadyDispatched,
         Illegal::BankNotErased,

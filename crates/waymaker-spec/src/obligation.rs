@@ -142,11 +142,16 @@ pub const CLAUSES: &[Clause] = &[
         proof: "tests/bounded_decoding.rs",
         falsifier: "tests/bounded_decoding.rs",
         owed: Some(
-            "allocation-freedom is structural rather than measured: `waymaker-core` and \
-             `waymaker-flash` are `no_std` with no dependencies and no `extern crate alloc`, \
-             which the `crate-attributes` and `kernel-zero-dependencies` gate rules fail a \
-             build over. Measuring it instead would need a global allocator, and the \
-             workspace denies the `unsafe` a global allocator requires",
+            "two restrictions. Allocation-freedom is structural rather than measured: \
+             `waymaker-core` and `waymaker-flash` are `no_std` with no dependencies and no \
+             `extern crate alloc`, which the `crate-attributes` and \
+             `kernel-zero-dependencies` gate rules fail a build over — measuring it instead \
+             would need a global allocator, and the workspace denies the `unsafe` one \
+             requires. And the input domain is stated rather than universal: exhaustive to \
+             three bytes, which is a quarter of a header, plus truncations, single-byte \
+             mutations, coordinated pairs over an eight-value corruption alphabet, and every \
+             declared payload length. A bug needing three coordinated corrupt fields, or two \
+             outside that alphabet, is outside it",
         ),
     },
 ];

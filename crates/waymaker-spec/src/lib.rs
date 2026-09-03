@@ -58,7 +58,7 @@ pub mod refine;
 pub use explore::{BankShape, Census, ExploreError, Explored, TransitionKind, explore};
 pub use invariant::{Breach, Invariant, check, holds};
 pub use model::{
-    BANKS, Bank, BankId, Bound, Guard, Guards, Illegal, Journal, OnMedia, Record, Transition,
+    BANKS, Bank, BankId, Bound, Guard, Guards, Illegal, Journal, OnMedia, Record, Role, Transition,
 };
 pub use obligation::{CLAUSES, Clause, Discharge, clause};
 pub use reader::{Mutant, Reader, Specified};

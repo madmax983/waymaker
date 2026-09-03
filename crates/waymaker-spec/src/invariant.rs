@@ -18,7 +18,7 @@
 
 use waymaker_fault::RecordId;
 
-use crate::model::{Journal, OnMedia};
+use crate::model::{Journal, OnMedia, Role};
 
 /// One of design document §14's state-level guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,6 +45,12 @@ pub enum Invariant {
     /// "Any record acknowledged after its barrier is recovered after reset."
     AcknowledgedDurability,
     /// "No Waymaker-dispatched effect lacks a recoverable schedule record."
+    ///
+    /// Two clauses, because §14 says *schedule* record and means it. The intent has to be in
+    /// the recovered history, and it has to be a [`crate::model::Role::Schedule`]: an
+    /// acknowledged completion is a record that says an effect finished, and a guarantee
+    /// satisfied by one would be satisfied by history written *after* the world was changed
+    /// — which is the ordering §02 decision 3 exists to create.
     DurableIntent,
     /// §02 decision 7: exactly one bank is authoritative after any crash, once any bank has
     /// been sealed at all.
@@ -195,16 +201,27 @@ fn acknowledged_durability(state: &Journal, recovered: &[RecordId]) -> Option<St
 
 /// [`Invariant::DurableIntent`]: §02 decision 3, after the fact.
 fn durable_intent(state: &Journal, recovered: &[RecordId]) -> Option<String> {
-    state
-        .dispatched()
-        .iter()
-        .find(|intent| !recovered.contains(intent))
-        .map(|intent| {
-            format!(
+    for intent in state.dispatched() {
+        if !recovered.contains(intent) {
+            return Some(format!(
                 "an effect was dispatched and recovery has no record {} to account for it",
                 intent.0
-            )
-        })
+            ));
+        }
+        let schedules = state
+            .records()
+            .iter()
+            .find(|record| record.id == *intent)
+            .is_some_and(|record| record.role == Role::Schedule);
+        if !schedules {
+            return Some(format!(
+                "an effect was dispatched and record {} is what recovery has to account for \
+                 it, which schedules nothing",
+                intent.0
+            ));
+        }
+    }
+    None
 }
 
 /// [`Invariant::SingleAuthority`]: §02 decision 7, for a device that has sealed at all.

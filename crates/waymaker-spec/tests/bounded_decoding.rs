@@ -23,11 +23,19 @@
 //! # The domain
 //!
 //! Exhaustive over every byte string up to three bytes, every truncation of a valid frame,
-//! every single-byte mutation of one, every declared payload length a header can carry, and
-//! every erased-tail and stale-tail shape a scan can meet. §15 names four of those five —
-//! "CRC corruption, stale tails, and malformed lengths" — and the first is what makes the
-//! word *exhaustive* mean something at the small sizes where a hand-written case would have
-//! been guesswork.
+//! every single-byte mutation of one, every *pair* of positions over an eight-value
+//! corruption alphabet, every declared payload length a header can carry, and every
+//! erased-tail and stale-tail shape a scan can meet. §15 names four of those — "CRC
+//! corruption, stale tails, and malformed lengths" — and the exhaustive byte-string sweep is
+//! what makes the word *exhaustive* mean something at the small sizes where a hand-written
+//! case would have been guesswork.
+//!
+//! What the domain is **not** is every malformed input. Three bytes is a quarter of a header,
+//! so no unstructured input here is ever a whole frame, and the structured half is mutations
+//! of frames this firmware wrote. A bug needing three coordinated corrupt fields, or two
+//! outside the corruption alphabet, is outside it. That restriction is a row in
+//! [`waymaker_spec::obligation`]'s `owed` column, not a footnote here, because a domain a
+//! reader has to infer from a passing test is a domain nobody knows the edges of.
 
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_flash::frame::{
@@ -327,6 +335,57 @@ fn every_declared_payload_length_a_header_can_carry_is_answered() {
         }
     }
     assert_eq!(unsealed, (usize::from(u16::MAX) + 1) * (HEADER_BYTES - 1));
+}
+
+#[test]
+fn every_coordinated_pair_of_corrupt_bytes_in_a_valid_frame_is_answered() {
+    // Codex, PR #66 round 1. The exhaustive byte-string sweep stops before a complete header,
+    // and everything longer was a truncation or a *single*-byte mutation — so a decoder bug
+    // that needs two fields corrupted together was outside the domain entirely. The obvious
+    // one is a length changed and a seal changed to match, which the sweep above now covers;
+    // this is the general case.
+    //
+    // Every pair of positions, over an alphabet of the values a corruption actually reaches:
+    // the erased byte, the all-clear byte, the bit patterns a half-programmed unit leaves,
+    // and the frame's own magic. Exhaustive over *that* alphabet rather than over all 65_536
+    // byte pairs, and the restriction is stated here and in `obligation.rs`'s owed note
+    // rather than left for a reader to infer from a passing test.
+    const ALPHABET: [u8; 8] = [0x00, 0x01, 0x0F, 0x7F, 0x80, 0xF0, 0xFE, 0xFF];
+    let mut accepted = 0_usize;
+    let mut refused = 0_usize;
+    for corpus in [valid_frame(), valid_run_started()] {
+        for first in 0..corpus.len() {
+            for second in first.saturating_add(1)..corpus.len() {
+                for left in ALPHABET {
+                    for right in ALPHABET {
+                        let mut mutated = corpus.clone();
+                        let (Some(a), Some(b)) = (mutated.get(first), mutated.get(second)) else {
+                            unreachable!("both indices are inside the corpus")
+                        };
+                        if *a == left && *b == right {
+                            continue;
+                        }
+                        if let Some(cell) = mutated.get_mut(first) {
+                            *cell = left;
+                        }
+                        if let Some(cell) = mutated.get_mut(second) {
+                            *cell = right;
+                        }
+                        if decodes_within_its_input(&mutated) {
+                            accepted = accepted.saturating_add(1);
+                        } else {
+                            refused = refused.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        accepted > 0 && refused > 0,
+        "the coordinated-pair sweep produced only one answer ({accepted} accepted, \
+         {refused} refused), so it is not exercising the seal"
+    );
 }
 
 #[test]

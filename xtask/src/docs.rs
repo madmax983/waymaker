@@ -480,6 +480,7 @@ const RECOVERY_STATE_MACHINE_LABELS: &[&str] = &[
     "append-only",
     "barrier claims only whole records",
     "durable intent before dispatch",
+    "the intent is a schedule record",
     "erased",
     "erasing",
     "sealing",

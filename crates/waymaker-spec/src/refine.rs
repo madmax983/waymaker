@@ -24,7 +24,7 @@
 
 use waymaker_fault::{Durability, Ledger, RecordId};
 
-use crate::model::{Journal, OnMedia, Record};
+use crate::model::{Journal, OnMedia, Record, Role};
 
 /// The part of a ghost state a crash harness can report.
 ///
@@ -35,8 +35,12 @@ use crate::model::{Journal, OnMedia, Record};
 /// dimensions optional instead of defaulting them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Observation {
-    /// Each record in declaration order, as `(id, state, torn)`.
-    pub records: Vec<(RecordId, Durability, bool)>,
+    /// Each record in declaration order, as `(id, role, state, torn)`.
+    ///
+    /// The role comes from the caller rather than from the ledger: `waymaker-fault` names no
+    /// record type, which is exactly what makes the harness reusable, so what a record is
+    /// *for* is something only the writer under test knows.
+    pub records: Vec<(RecordId, Role, Durability, bool)>,
     /// The schedule records of effects the run really handed to the world.
     pub dispatched: Vec<RecordId>,
 }
@@ -52,6 +56,7 @@ impl Journal {
                 .map(|record| {
                     (
                         record.id,
+                        record.role,
                         record.durability(),
                         record.media == OnMedia::Partial,
                     )
@@ -86,7 +91,7 @@ impl Journal {
     /// questions about a record the caller did not describe, and answer them cheerfully.
     pub fn reconstructed(observation: &Observation) -> Result<Self, Impossible> {
         let mut records = Vec::with_capacity(observation.records.len());
-        for (id, state, torn) in &observation.records {
+        for (id, role, state, torn) in &observation.records {
             let media = match (state, torn) {
                 (Durability::Attempted, false) => OnMedia::Absent,
                 (Durability::Attempted, true) => {
@@ -100,6 +105,7 @@ impl Journal {
             };
             records.push(Record {
                 id: *id,
+                role: *role,
                 media,
                 acknowledged: *state == Durability::Acknowledged,
             });
@@ -144,19 +150,28 @@ impl core::error::Error for Impossible {}
 
 /// α: one crashed run, as an observation of a ghost state.
 ///
+/// `role` is what the writer under test says each of its records is for, for the reason
+/// [`Observation::records`] gives: the harness names no record type. A writer that told the
+/// abstraction the wrong thing would be describing a different run, and question 1 in
+/// `tests/refinement.rs` — "is this a state the model says is reachable" — is what catches
+/// it, because §11's order makes most wrong answers unreachable.
+///
 /// `dispatched` is what the caller *saw the writer do* — an effect that reached the world —
 /// rather than what media says about it, for the same reason
 /// [`waymaker_fault::Recovery::dispatched`] is: an oracle that only admitted an effect once
 /// its intent was durable could not describe the violation it exists to catch.
-#[must_use]
-pub fn abstraction(ledger: &Ledger, dispatched: &[RecordId]) -> Observation {
+pub fn abstraction(
+    ledger: &Ledger,
+    dispatched: &[RecordId],
+    role: impl Fn(RecordId) -> Role,
+) -> Observation {
     let mut sorted = dispatched.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     Observation {
         records: ledger
             .records()
-            .map(|(id, state)| (id, state, ledger.torn(id).unwrap_or(false)))
+            .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
             .collect(),
         dispatched: sorted,
     }

@@ -90,6 +90,32 @@ pub enum OnMedia {
     Whole,
 }
 
+/// What a record is *for*.
+///
+/// The model is otherwise deliberately incurious about record content — that is what makes
+/// it a model of the protocol rather than of the codec — but durable intent cannot be
+/// stated without this one distinction. §02 decision 3 is "no *dispatched effect* lacks a
+/// recoverable *schedule* record", and a model whose records are interchangeable would let
+/// an effect be accounted for by an acknowledged completion, which schedules nothing and
+/// says an effect happened that history has no intent for.
+///
+/// Two roles rather than [`waymaker_core::RecordKind`]'s six: the run records are outside a
+/// bounded model of effect identity, and a failure is an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// A durable intent: the record §02 decision 3 requires to cross a barrier before its
+    /// effect reaches the world.
+    Schedule,
+    /// The outcome of the schedule before it — a completion or a failure, which the kernel
+    /// tells apart and this model does not need to.
+    Outcome,
+}
+
+impl Role {
+    /// Both roles, in a fixed order.
+    pub const ALL: [Self; 2] = [Self::Schedule, Self::Outcome];
+}
+
 /// One record of the ghost history.
 ///
 /// # `acknowledged` and `media` are independent on purpose
@@ -104,6 +130,8 @@ pub enum OnMedia {
 pub struct Record {
     /// The writer's own numbering, allocated in declaration order.
     pub id: RecordId,
+    /// Whether this record is a durable intent or the outcome of one.
+    pub role: Role,
     /// How much of it reached media.
     pub media: OnMedia,
     /// Whether a barrier has returned since the last of its writes.
@@ -173,8 +201,8 @@ impl Bank {
 /// choose would be modelling a freedom the kernel does not have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Transition {
-    /// Begin a record. Nothing reaches media yet.
-    Declare,
+    /// Begin a record in this role. Nothing reaches media yet.
+    Declare(Role),
     /// Write a declared record's bytes, all of them.
     Program(RecordId),
     /// Write a declared record's bytes and have the call fail part-way through.
@@ -220,6 +248,21 @@ pub enum Illegal {
     CapacityReached,
     /// The transition names a record this run never declared.
     UndeclaredRecord,
+    /// The transition dispatches against a record that schedules nothing.
+    ///
+    /// §02 decision 3 is about a *schedule* record. An outcome is not an intent, and a model
+    /// that let one stand in for the other would report durable intent satisfied by a record
+    /// that says an effect finished rather than that one was ordered.
+    NotAScheduleRecord,
+    /// A schedule may not be declared while an earlier one has no outcome, and an outcome
+    /// may not be declared with no schedule waiting for it.
+    ///
+    /// Design document §11's order, and the same rule
+    /// [`waymaker_core::ReplayCursor`](waymaker_core::replay::ReplayCursor) enforces when it
+    /// refuses "a schedule while one is unresolved" as malformed history. A model that
+    /// admitted three schedules in a row would be a model of a journal the kernel refuses to
+    /// replay.
+    OutOfProtocolOrder,
     /// The schedule record has not crossed a barrier, so §02 decision 3 forbids the dispatch.
     IntentNotDurable,
     /// The effect was already handed to the world; doing it twice is a different property.
@@ -256,6 +299,8 @@ impl Illegal {
             Self::SealAlreadyInFlight => "the other bank has a seal in flight",
             Self::CapacityReached => "the model's record bound is reached",
             Self::UndeclaredRecord => "this run never declared that record",
+            Self::NotAScheduleRecord => "that record schedules nothing",
+            Self::OutOfProtocolOrder => "a schedule is unresolved, or no schedule is waiting",
             Self::IntentNotDurable => "the schedule record has not crossed a barrier",
             Self::AlreadyDispatched => "that effect was already handed to the world",
             Self::BankNotErased => "the bank is not erased",
@@ -298,6 +343,15 @@ pub enum Guard {
     ///
     /// §02 decision 3, as a precondition rather than a hope.
     DurableIntent,
+    /// An effect's durable intent must be a *schedule* record.
+    ///
+    /// Without it, a dispatch can be accounted for by an acknowledged completion — a record
+    /// that says an effect finished, standing in for the one that says it was ordered. The
+    /// guarantee would then read "some record about this effect is recoverable", which is
+    /// not §02 decision 3 and is not worth anything: the completion is written *after* the
+    /// world was changed, so a recovery holding it has already lost the ordering the
+    /// decision exists to create.
+    DispatchNeedsASchedule,
     /// The bank a reader would boot from may not have its erase begun.
     ///
     /// Design document §14's failure table, on the two-bank swap: "never recover the old run
@@ -311,10 +365,11 @@ pub enum Guard {
 
 impl Guard {
     /// Every guard, in a fixed order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AppendOnly,
         Self::BarrierNeedsWhole,
         Self::DurableIntent,
+        Self::DispatchNeedsASchedule,
         Self::NeverEraseTheAuthority,
         Self::StrictGeneration,
     ];
@@ -325,8 +380,9 @@ impl Guard {
             Self::AppendOnly => 1,
             Self::BarrierNeedsWhole => 1 << 1,
             Self::DurableIntent => 1 << 2,
-            Self::NeverEraseTheAuthority => 1 << 3,
-            Self::StrictGeneration => 1 << 4,
+            Self::DispatchNeedsASchedule => 1 << 3,
+            Self::NeverEraseTheAuthority => 1 << 4,
+            Self::StrictGeneration => 1 << 5,
         }
     }
 }
@@ -586,7 +642,8 @@ impl Journal {
     #[must_use]
     pub fn alphabet(bound: Bound) -> Vec<Transition> {
         let mut alphabet = vec![
-            Transition::Declare,
+            Transition::Declare(Role::Schedule),
+            Transition::Declare(Role::Outcome),
             Transition::Barrier,
             Transition::Tear,
             Transition::PowerLoss,
@@ -626,7 +683,7 @@ impl Journal {
         }
         let mut next = self.clone();
         match transition {
-            Transition::Declare => next.declare(bound)?,
+            Transition::Declare(role) => next.declare(role, bound)?,
             Transition::Program(id) | Transition::FailedProgram(id) => {
                 let whole = matches!(transition, Transition::Program(_));
                 next.write(id, whole, guards)?;
@@ -652,17 +709,37 @@ impl Journal {
     /// changes. Held over every edge by `tests/machine.rs`'s
     /// `a_declared_record_is_never_renumbered_or_removed` and by the census's requirement
     /// that a record arrive [`Durability::Attempted`] and in no other state.
-    fn declare(&mut self, bound: Bound) -> Result<(), Illegal> {
+    fn declare(&mut self, role: Role, bound: Bound) -> Result<(), Illegal> {
         if self.records.len() >= bound.records {
             return Err(Illegal::CapacityReached);
+        }
+        let unresolved = self.unresolved_schedule().is_some();
+        if (role == Role::Schedule) == unresolved {
+            return Err(Illegal::OutOfProtocolOrder);
         }
         let id = RecordId(u32::try_from(self.records.len()).unwrap_or(u32::MAX));
         self.records.push(Record {
             id,
+            role,
             media: OnMedia::Absent,
             acknowledged: false,
         });
         Ok(())
+    }
+
+    /// The schedule record this run has declared and not yet declared an outcome for.
+    ///
+    /// At most one, which is the whole of §11's order: history is sequential, so an effect is
+    /// scheduled only after the previous one's outcome is committed.
+    fn unresolved_schedule(&self) -> Option<&Record> {
+        let mut open = None;
+        for record in &self.records {
+            match record.role {
+                Role::Schedule => open = Some(record),
+                Role::Outcome => open = None,
+            }
+        }
+        open
     }
 
     /// Puts `id`'s bytes on media, wholly or in part.
@@ -740,6 +817,18 @@ impl Journal {
             .iter()
             .find(|record| record.id == id)
             .ok_or(Illegal::UndeclaredRecord)?;
+        let is_schedule = record.role == Role::Schedule;
+        if guards.enforces(Guard::DispatchNeedsASchedule) && !is_schedule {
+            return Err(Illegal::NotAScheduleRecord);
+        }
+        // §11's order: the effect goes to the world after its intent is durable and before
+        // its outcome is recorded. A dispatch against a schedule history has already
+        // resolved is an effect happening after the record that says it finished. Checked
+        // only for a schedule, so that removing the guard above reaches the state it exists
+        // to forbid rather than being stopped here instead.
+        if is_schedule && self.unresolved_schedule().map(|open| open.id) != Some(id) {
+            return Err(Illegal::OutOfProtocolOrder);
+        }
         if self.dispatched.contains(&id) {
             return Err(Illegal::AlreadyDispatched);
         }

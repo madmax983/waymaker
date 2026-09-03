@@ -131,9 +131,18 @@ travels in every result, reaching the state ceiling is an error rather than a tr
 a build rather than passing every proof about the part of it that is left.
 
 A guarantee is only worth the evidence that it could have failed. Every one of these has a
-falsifier: `tests/necessity.rs` removes each of the model's five preconditions in turn and
+falsifier: `tests/necessity.rs` removes each of the model's six preconditions in turn and
 requires a named guarantee to break, and `tests/teeth.rs` runs a catalogue of readers that
 are wrong in one way each and requires each to be caught by the guarantee it breaks.
+
+Records carry one distinction and no more: a **schedule** or an **outcome**. The model is
+otherwise incurious about content, which is what keeps it a model of the protocol rather than
+of the codec — but §14's third guarantee says *schedule* record and means it, and without the
+distinction an effect could be accounted for by an acknowledged completion, which is history
+written after the world was changed. The same distinction carries §11's order: a schedule may
+not be declared while an earlier one is unresolved, which is the rule
+`waymaker_core::ReplayCursor` enforces when it refuses "a schedule while one is unresolved"
+as malformed history.
 
 ## The layering
 

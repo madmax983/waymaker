@@ -79,7 +79,7 @@ impl Transition {
     #[must_use]
     pub const fn kind(self) -> TransitionKind {
         match self {
-            Self::Declare => TransitionKind::Declare,
+            Self::Declare(_) => TransitionKind::Declare,
             Self::Program(_) => TransitionKind::Program,
             Self::FailedProgram(_) => TransitionKind::FailedProgram,
             Self::Barrier => TransitionKind::Barrier,

@@ -427,7 +427,7 @@ between §15's three record states, and between bank generations, to be stated r
 assumed; `waymaker-spec` is where they are proved, and this is the machine it proves over.
 
 The edge labels are the preconditions, because they are the part that carries the design. All
-five are drawn, each is separately removable, and removing any one of them makes a named
+six are drawn, each is separately removable, and removing any one of them makes a named
 guarantee reachable-false — which is how the specification knows they are load-bearing rather
 than decorative. The nodes are §15's three record states and §02 decision 7's four bank
 states — including *erasing*, which design document §15 enumerates as an interrupted erase and
@@ -449,7 +449,7 @@ flowchart LR
     r1 -- "barrier claims only whole records" --> r2
     r0 -- "power lost mid-program, or the call fails" --> rt
     rt -. "never acknowledged" .-> r2
-    r2 -- "durable intent before dispatch" --> eff(["effect handed to the world"])
+    r2 -- "durable intent before dispatch · the intent is a schedule record" --> eff(["effect handed to the world"])
   end
 
   subgraph banks ["One bank, through §02 decision 7's swap"]

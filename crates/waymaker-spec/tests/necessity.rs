@@ -25,10 +25,11 @@ use waymaker_spec::reader::Specified;
 const CEILING: usize = 400_000;
 
 /// Which guarantee each precondition is holding up.
-const NECESSITY: [(Guard, Invariant); 5] = [
+const NECESSITY: [(Guard, Invariant); 6] = [
     (Guard::AppendOnly, Invariant::AcknowledgedDurability),
     (Guard::BarrierNeedsWhole, Invariant::AcknowledgedDurability),
     (Guard::DurableIntent, Invariant::DurableIntent),
+    (Guard::DispatchNeedsASchedule, Invariant::DurableIntent),
     (Guard::NeverEraseTheAuthority, Invariant::SingleAuthority),
     (Guard::StrictGeneration, Invariant::SingleAuthority),
 ];
@@ -124,6 +125,26 @@ fn removing_the_durable_intent_precondition_dispatches_an_effect_with_no_record(
         .first_breach_of(Invariant::DurableIntent, &Specified)
         .expect("an effect dispatched before its intent was durable");
     assert!(breach.detail.contains("dispatched"), "{breach}");
+}
+
+#[test]
+fn removing_the_schedule_precondition_accounts_for_an_effect_with_a_completion() {
+    // Codex, PR #66 round 1. `Dispatch` used to accept any acknowledged record, and the
+    // model had no record roles, so an effect could be accounted for by an acknowledged
+    // *completion* — a record written after the world was changed, standing in for the one
+    // that ordered it. The guarantee then read "some record about this effect is
+    // recoverable", which is not §02 decision 3. This is the counterexample the role
+    // distinction rules out, produced on demand.
+    let relaxed = explore(
+        Bound::PROOF,
+        Guards::ENFORCED.without(Guard::DispatchNeedsASchedule),
+        CEILING,
+    )
+    .expect("the proof bound");
+    let breach = relaxed
+        .first_breach_of(Invariant::DurableIntent, &Specified)
+        .expect("an effect accounted for by a record that schedules nothing");
+    assert!(breach.detail.contains("schedules nothing"), "{breach}");
 }
 
 #[test]

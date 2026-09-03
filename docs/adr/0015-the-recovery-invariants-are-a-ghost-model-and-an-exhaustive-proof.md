@@ -61,10 +61,10 @@ structure rather than a claim:
 
 Five decisions inside that shape are the ones worth recording.
 
-**The journal is a state machine whose preconditions are separately removable.** Five guards
+**The journal is a state machine whose preconditions are separately removable.** Six guards
 — append-only writing, a barrier that claims only whole records, durable intent before
-dispatch, never erasing the authoritative bank, and a strictly greater seal generation —
-carry the whole specification. Each can be removed on its own, and `tests/necessity.rs`
+dispatch, an intent that is a schedule record, never erasing the authoritative bank, and a
+strictly greater seal generation — carry the whole specification. Each can be removed on its own, and `tests/necessity.rs`
 requires each removal to make a *named* guarantee reachable-false. A guard that can be
 deleted with every proof still green was never load-bearing, and there is no other way to
 find out which those are.
@@ -104,6 +104,27 @@ crate's own `obligation.rs` stop naming the same set:
 | `single-authority` | exactly one bank is authoritative after any crash | exhaustive enumeration of the bank machine |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | exhaustive input sweep against the real decoder |
+
+**Records carry one distinction: schedule or outcome.** The model is otherwise incurious
+about content, and that is deliberate — a model that knew what a frame held would be a second
+codec. But §14's third guarantee says "no dispatched effect lacks a recoverable *schedule*
+record", and a machine whose records are interchangeable satisfies it with an acknowledged
+completion: a record written *after* the world was changed, standing in for the one that
+ordered it. The guarantee would then read "some record about this effect is recoverable",
+which is not §02 decision 3. The distinction also carries §11's order — a schedule may not be
+declared while an earlier one is unresolved — which is the rule `waymaker_core::ReplayCursor`
+already enforces, so a model without it would admit journals the kernel refuses to replay.
+Rung 0.3 owns the rest of the effect protocol; this is the part §14's guarantees cannot be
+stated without.
+
+**Stable redelivery is proved on the path a reboot takes, not only on the allocator.** A
+pending effect — schedule committed, outcome not — is never re-allocated: the allocator has
+moved past its sequence, and the identity a dispatcher is handed again comes from
+`ReplayCursor::pending`. So `tests/redelivery.rs` has two halves. One is the allocator, over
+every resume point, with three wrong allocators required to be caught. The other replays real
+journals — encoded by `waymaker-flash`, read back by `Scan` — and requires the pending
+effect's identity to be the one the run first gave it, with a driver that redelivers from the
+counter instead of from history required to differ.
 
 ### The design smell the proof found
 

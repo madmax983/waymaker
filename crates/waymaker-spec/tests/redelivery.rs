@@ -11,7 +11,12 @@
 //! did. That is what makes redelivery after a reboot the *same* effect rather than a new one,
 //! and it is what lets a downstream service deduplicate.
 
-use waymaker_core::{EffectId, EffectIdAllocator, EffectSeq, KernelError, RunId};
+use waymaker_core::replay::Position;
+use waymaker_core::{
+    ActivityKind, EffectId, EffectIdAllocator, EffectSeq, KernelError, RecordRef, ReplayCursor,
+    RunId,
+};
+use waymaker_flash::frame::{self, ProgramAlign, Scan};
 
 /// How many effects a run allocates in these proofs.
 const EFFECTS: u32 = 6;
@@ -246,4 +251,207 @@ fn every_sequence_boundary_resumes_where_the_run_left_off() {
             assert_eq!(next.run, run);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The redelivery path itself, through the replay API a reboot really uses.
+//
+// Everything above is about `EffectIdAllocator`, and the allocator is only half of §14's
+// fourth guarantee. Codex caught the other half on PR #66: a *pending* effect — one whose
+// schedule is committed and whose outcome is not — is never re-allocated. The allocator
+// advances past its sequence, and the identity a dispatcher is handed again comes from
+// `ReplayCursor::pending`. A regression there leaves every test above green, which is
+// exactly the shape of hole a proof is supposed to have none of.
+//
+// So these drive the real journal: records encoded by `waymaker-flash`, read back by `Scan`,
+// replayed by `ReplayCursor`, at every prefix of history a reset could have left behind.
+// ---------------------------------------------------------------------------------------
+
+/// The run these journals belong to.
+const REPLAYED: RunId = RunId(0x0BAD_F00D_DEAD_BEEF);
+
+/// The activity every schedule below names.
+const DOWNLOAD: ActivityKind = ActivityKind(4);
+
+fn align() -> ProgramAlign {
+    let Some(align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a power of two within the program-size range")
+    };
+    align
+}
+
+/// A journal holding `RunStarted`, then `schedules` effects, the last of which has no
+/// outcome — the shape a reset during an activity leaves behind.
+fn journal(schedules: u32) -> Vec<u8> {
+    let mut image = Vec::new();
+    let mut append = |record: &RecordRef<'_>| {
+        let mut buffer = [0_u8; 64];
+        let Ok(written) = frame::encode(record, align(), &mut buffer) else {
+            unreachable!("64 bytes is more than any record here needs")
+        };
+        let Some(bytes) = buffer.get(..written) else {
+            unreachable!("`encode` reports what it wrote")
+        };
+        image.extend_from_slice(bytes);
+    };
+    append(&RecordRef::RunStarted {
+        workflow_kind: 1,
+        workflow_version: 1,
+        input: b"input",
+    });
+    // Sequences count from `EffectSeq::FIRST`, which is zero: a journal whose first effect
+    // is numbered one is history the cursor refuses as malformed, because a sequence that
+    // skips is a sequence no execution could have produced.
+    for effect in 0..schedules {
+        append(&RecordRef::EffectScheduled {
+            seq: EffectSeq(effect),
+            kind: DOWNLOAD,
+            input_len: 4,
+            input_crc: frame::input_digest(b"blob"),
+        });
+        if effect.saturating_add(1) < schedules {
+            append(&RecordRef::EffectCompleted {
+                seq: EffectSeq(effect),
+                result: b"ok",
+            });
+        }
+    }
+    image
+}
+
+/// Replays `image` and returns the cursor it left behind.
+fn replay(image: &[u8]) -> ReplayCursor {
+    let mut cursor = ReplayCursor::new(REPLAYED);
+    for record in Scan::new(image, align())
+        .take_while(Result::is_ok)
+        .flatten()
+    {
+        match cursor.advance(record) {
+            Ok(_) => {}
+            Err(error) => unreachable!("this journal is a legal history: {error}"),
+        }
+    }
+    cursor
+}
+
+#[test]
+fn a_pending_effect_is_redelivered_under_the_identity_the_run_first_gave_it() {
+    // The claim §14 actually makes, on the path a reboot actually takes. The schedule for
+    // effect `n` is committed and its outcome is not; the cursor rebuilt from that journal
+    // has to hand back the same `EffectId` the run allocated before the reset, not a fresh
+    // one.
+    for schedules in 1..=EFFECTS {
+        let original = fresh(REPLAYED);
+        let Some(expected) = original
+            .get((schedules as usize).saturating_sub(1))
+            .copied()
+        else {
+            unreachable!("the run allocated EFFECTS identities")
+        };
+
+        let cursor = replay(&journal(schedules));
+        assert_eq!(cursor.position(), Position::AwaitingOutcome);
+        let Some(pending) = cursor.pending() else {
+            unreachable!("a schedule with no outcome leaves an effect pending")
+        };
+        assert_eq!(
+            pending.id, expected,
+            "replaying a journal with effect {schedules} unresolved redelivered a different \
+             identity than the run first gave it"
+        );
+        assert_eq!(pending.kind, DOWNLOAD);
+        assert_eq!(pending.input_crc, frame::input_digest(b"blob"));
+    }
+}
+
+#[test]
+fn a_pending_effect_is_not_replaced_by_a_fresh_identity() {
+    // The other half, and the one a naive driver gets wrong: while an effect is unresolved,
+    // asking for the *next* identity is refused. A driver that reached for one anyway would
+    // abandon the effect the world has already seen and hand the same work a second id.
+    for schedules in 1..=EFFECTS {
+        let cursor = replay(&journal(schedules));
+        assert_eq!(
+            cursor.next_effect_id(),
+            Err(KernelError::NondeterministicWorkflow)
+        );
+        // And the allocator has moved past the pending sequence, which is why it cannot be
+        // the thing that redelivers: the pending effect's identity is behind the counter.
+        let Some(pending) = cursor.pending() else {
+            unreachable!("a schedule with no outcome leaves an effect pending")
+        };
+        assert_eq!(cursor.next_seq(), Some(EffectSeq(pending.id.seq.0 + 1)));
+    }
+}
+
+#[test]
+fn redelivery_is_the_same_answer_however_many_times_the_run_is_replayed() {
+    // A reboot loop: the journal does not change, so neither may the identity.
+    let image = journal(EFFECTS);
+    let first = replay(&image).pending();
+    for _ in 0..5 {
+        assert_eq!(replay(&image).pending(), first);
+    }
+    assert!(first.is_some());
+}
+
+#[test]
+fn a_run_whose_last_effect_completed_has_nothing_to_redeliver_and_continues() {
+    // The complement, so the test above is not passing because `pending` is always `Some`.
+    // With every effect resolved, there is nothing to redeliver and the next identity is the
+    // one the allocator would have issued.
+    let mut image = journal(EFFECTS);
+    let mut buffer = [0_u8; 64];
+    let Ok(written) = frame::encode(
+        &RecordRef::EffectCompleted {
+            seq: EffectSeq(EFFECTS.saturating_sub(1)),
+            result: b"ok",
+        },
+        align(),
+        &mut buffer,
+    ) else {
+        unreachable!("64 bytes is more than this record needs")
+    };
+    let Some(bytes) = buffer.get(..written) else {
+        unreachable!("`encode` reports what it wrote")
+    };
+    image.extend_from_slice(bytes);
+
+    let cursor = replay(&image);
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.pending(), None);
+    // One past the last identity the run allocated, and the same one a fresh allocator
+    // resumed from this history would issue — the two halves of §14's guarantee agreeing.
+    let next = EffectId {
+        run: REPLAYED,
+        seq: EffectSeq(EFFECTS),
+    };
+    assert_eq!(cursor.next_effect_id(), Ok(next));
+    let mut resumed = EffectIdAllocator::resume(REPLAYED, Some(EffectSeq(EFFECTS - 1)));
+    assert_eq!(resumed.allocate(), Ok(next));
+}
+
+#[test]
+fn a_driver_that_redelivers_from_the_allocator_instead_of_from_history_is_caught() {
+    // The falsifier for the path itself. `next_seq` is one past the pending effect, so a
+    // driver that redelivered from the counter would hand the world a second identity for
+    // work it has already been given — and every assertion in the first half of this file
+    // would still pass, because the allocator is behaving correctly. This is what makes the
+    // tests above worth having.
+    let mut caught = 0_usize;
+    for schedules in 1..=EFFECTS {
+        let cursor = replay(&journal(schedules));
+        let Some(pending) = cursor.pending() else {
+            unreachable!("a schedule with no outcome leaves an effect pending")
+        };
+        let from_the_counter = cursor.next_seq();
+        if from_the_counter != Some(pending.id.seq) {
+            caught = caught.saturating_add(1);
+        }
+    }
+    assert_eq!(
+        caught, EFFECTS as usize,
+        "redelivering from the allocator agrees with redelivering from history, so nothing \
+         here can tell the two apart"
+    );
 }

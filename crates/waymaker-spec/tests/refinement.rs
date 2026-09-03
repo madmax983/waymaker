@@ -26,21 +26,20 @@ use waymaker_fault::{Durability, FaultError, Harness, RecordId, Run, Session, ve
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bound, Guards, Journal};
+use waymaker_spec::model::{Bound, Guards, Journal, Role};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
 use waymaker_spec::refine::{Observation, abstraction};
 
 /// The activity every schedule record below names.
 const DOWNLOAD: ActivityKind = ActivityKind(1);
 
-/// How many records the journal writer declares.
-const RECORDS: u32 = 3;
+/// How many effects each writer records. Two records each, per design document §11.
+const EFFECTS: u32 = 2;
 
 /// The bound the refinement is checked against.
 ///
-/// Four records, because the effect-protocol writer declares two per effect and the model
-/// has to be able to describe a two-effect run. One generation, because no writer here
-/// touches a bank.
+/// Four records, because every writer declares two per effect and the model has to be able
+/// to describe a two-effect run. One generation, because no writer here touches a bank.
 const REFINEMENT: Bound = Bound {
     records: 4,
     generations: 1,
@@ -97,15 +96,12 @@ fn append(session: &mut Session, at: &mut u32, record: &RecordRef<'_>) -> Result
 /// abstraction that had to renumber would be an abstraction with a translation nobody
 /// checks. A record is identified by what is *in* it, so "recovery produced a prefix" stays
 /// a statement about content rather than about counting.
-fn recovered(image: &[u8], numbering: Numbering) -> Vec<RecordId> {
+fn recovered(image: &[u8]) -> Vec<RecordId> {
     let read: Vec<RecordRef<'_>> = Scan::new(image, align())
         .take_while(Result::is_ok)
         .flatten()
         .collect();
-    let named: Vec<RecordId> = read
-        .iter()
-        .filter_map(|record| numbering.id_of(record))
-        .collect();
+    let named: Vec<RecordId> = read.iter().filter_map(record_id).collect();
     // A record the reader produced and the numbering cannot name would be dropped here, and
     // the refinement check would then compare a *shorter* history against the model and pass.
     // Refused loudly instead: the writers under test emit two record kinds, and a third
@@ -113,63 +109,77 @@ fn recovered(image: &[u8], numbering: Numbering) -> Vec<RecordId> {
     assert_eq!(
         named.len(),
         read.len(),
-        "the scan recovered a record kind {numbering:?} does not name, so the comparison \
-         below would be against a history with a hole in it"
+        "the scan recovered a record kind this file does not name, so the comparison below \
+         would be against a history with a hole in it"
     );
     named
 }
 
-/// How a writer numbers its records, so that a recovered frame can be named the way the
-/// model named it.
+/// Design document §11's numbering: effect `n` is records `2n` and `2n + 1`.
 ///
-/// The model allocates ids in declaration order — 0, 1, 2 — because that is what
-/// [`Transition::Declare`](waymaker_spec::model::Transition::Declare) does, so each writer
-/// has to say how its frames map onto that. Making it explicit is the point: an abstraction
-/// with a numbering baked into it would fit exactly one writer.
-#[derive(Clone, Copy, Debug)]
-enum Numbering {
-    /// One schedule record per declaration: effect `n` is record `n - 1`.
-    OneRecordPerEffect,
-    /// A schedule and a completion per effect: effect `n` is records `2(n-1)` and
-    /// `2(n-1) + 1`.
-    ScheduleThenCompletion,
-}
-
-impl Numbering {
-    const fn id_of(self, record: &RecordRef<'_>) -> Option<RecordId> {
-        match (self, record) {
-            (Self::OneRecordPerEffect, RecordRef::EffectScheduled { seq, .. }) => {
-                Some(RecordId(seq.0.wrapping_sub(1)))
-            }
-            (Self::ScheduleThenCompletion, RecordRef::EffectScheduled { seq, .. }) => {
-                Some(RecordId(seq.0.wrapping_sub(1).wrapping_mul(2)))
-            }
-            (Self::ScheduleThenCompletion, RecordRef::EffectCompleted { seq, .. }) => Some(
-                RecordId(seq.0.wrapping_sub(1).wrapping_mul(2).wrapping_add(1)),
-            ),
-            _ => None,
+/// One scheme rather than one per writer, because there is only one legal shape. A run that
+/// wrote three schedules in a row is not a journal `waymaker_core::ReplayCursor` will
+/// replay — it refuses "a schedule while one is unresolved" as malformed history — and the
+/// model refuses it too, with `Illegal::OutOfProtocolOrder`. Every writer here therefore
+/// alternates, which is what makes these runs journals rather than byte sequences.
+const fn record_id(record: &RecordRef<'_>) -> Option<RecordId> {
+    match record {
+        RecordRef::EffectScheduled { seq, .. } => Some(RecordId(seq.0.wrapping_mul(2))),
+        RecordRef::EffectCompleted { seq, .. } => {
+            Some(RecordId(seq.0.wrapping_mul(2).wrapping_add(1)))
         }
+        RecordRef::RunStarted { .. }
+        | RecordRef::EffectFailed { .. }
+        | RecordRef::RunCompleted { .. }
+        | RecordRef::RunFailed { .. } => None,
     }
 }
 
-/// Three records, one per barrier, numbered 0, 1, 2 in declaration order.
+/// What each record is for, derived from the same numbering.
+const fn role_of(id: RecordId) -> Role {
+    if id.0 % 2 == 0 {
+        Role::Schedule
+    } else {
+        Role::Outcome
+    }
+}
+
+/// A schedule and its completion per effect, each across a barrier.
 fn journal(session: &mut Session) -> Result<(), FaultError> {
     let mut at = 0;
-    for index in 0..RECORDS {
-        session.begin_record(RecordId(index));
-        append(
-            session,
-            &mut at,
-            &RecordRef::EffectScheduled {
-                seq: EffectSeq(index.wrapping_add(1)),
-                kind: DOWNLOAD,
-                input_len: 4,
-                input_crc: frame::input_digest(b"blob"),
-            },
-        )?;
+    for effect in 0..EFFECTS {
+        session.begin_record(RecordId(effect.wrapping_mul(2)));
+        append(session, &mut at, &schedule(effect))?;
+        session.barrier()?;
+
+        session.begin_record(RecordId(effect.wrapping_mul(2).wrapping_add(1)));
+        append(session, &mut at, &completion(effect))?;
         session.barrier()?;
     }
     Ok(())
+}
+
+/// The schedule record for effect `n`, counting from [`EffectSeq::FIRST`].
+///
+/// Zero-based, because that is what `waymaker_core::ReplayCursor` will replay: a journal
+/// whose first effect is numbered one is a sequence that skips, which it refuses as
+/// malformed history. A refinement driven over a journal the kernel would not accept is a
+/// refinement of something else.
+const fn schedule(effect: u32) -> RecordRef<'static> {
+    RecordRef::EffectScheduled {
+        seq: EffectSeq(effect),
+        kind: DOWNLOAD,
+        input_len: 4,
+        input_crc: frame::input_digest(b"blob"),
+    }
+}
+
+/// The completion record for effect `n`.
+const fn completion(effect: u32) -> RecordRef<'static> {
+    RecordRef::EffectCompleted {
+        seq: EffectSeq(effect),
+        result: b"ok",
+    }
 }
 
 /// A writer that does not give up when a program call fails.
@@ -189,22 +199,22 @@ fn journal(session: &mut Session) -> Result<(), FaultError> {
 /// answered.
 fn journal_that_survives_a_failed_program(session: &mut Session) -> Result<(), FaultError> {
     let mut at = 0;
-    for index in 0..RECORDS {
-        session.begin_record(RecordId(index));
-        let written = append(
-            session,
-            &mut at,
-            &RecordRef::EffectScheduled {
-                seq: EffectSeq(index.wrapping_add(1)),
-                kind: DOWNLOAD,
-                input_len: 4,
-                input_crc: frame::input_digest(b"blob"),
-            },
-        );
-        match written {
+    for effect in 0..EFFECTS {
+        session.begin_record(RecordId(effect.wrapping_mul(2)));
+        match append(session, &mut at, &schedule(effect)) {
             Ok(()) => session.barrier()?,
             // The device is alive and a record is half on media. One barrier, which the
             // specification says must not acknowledge it, and then the run is over.
+            Err(FaultError::InjectedFailure) => {
+                let _ = session.barrier();
+                return Ok(());
+            }
+            Err(other) => return Err(other),
+        }
+
+        session.begin_record(RecordId(effect.wrapping_mul(2).wrapping_add(1)));
+        match append(session, &mut at, &completion(effect)) {
+            Ok(()) => session.barrier()?,
             Err(FaultError::InjectedFailure) => {
                 let _ = session.barrier();
                 return Ok(());
@@ -222,33 +232,17 @@ fn effect_protocol(
     dispatched: &RefCell<Vec<RecordId>>,
 ) -> Result<(), FaultError> {
     let mut at = 0;
-    for effect in 1..=2_u32 {
-        let schedule = RecordId(effect.wrapping_sub(1).wrapping_mul(2));
-        session.begin_record(schedule);
-        append(
-            session,
-            &mut at,
-            &RecordRef::EffectScheduled {
-                seq: EffectSeq(effect),
-                kind: DOWNLOAD,
-                input_len: 4,
-                input_crc: frame::input_digest(b"blob"),
-            },
-        )?;
+    for effect in 0..EFFECTS {
+        let intent = RecordId(effect.wrapping_mul(2));
+        session.begin_record(intent);
+        append(session, &mut at, &schedule(effect))?;
         session.barrier()?;
 
         // §02 decision 3: the intent is durable, so the world may now be changed.
-        dispatched.borrow_mut().push(schedule);
+        dispatched.borrow_mut().push(intent);
 
-        session.begin_record(RecordId(schedule.0.wrapping_add(1)));
-        append(
-            session,
-            &mut at,
-            &RecordRef::EffectCompleted {
-                seq: EffectSeq(effect),
-                result: b"ok",
-            },
-        )?;
+        session.begin_record(RecordId(intent.0.wrapping_add(1)));
+        append(session, &mut at, &completion(effect))?;
         session.barrier()?;
     }
     Ok(())
@@ -283,17 +277,13 @@ fn reachable_observations() -> BTreeSet<Observation> {
 }
 
 /// Runs the three refinement questions over `runs`, and reports what it saw.
-fn check(
-    runs: &[Run],
-    numbering: Numbering,
-    dispatched: &[Vec<RecordId>],
-) -> BTreeSet<Vec<RecordId>> {
+fn check(runs: &[Run], dispatched: &[Vec<RecordId>]) -> BTreeSet<Vec<RecordId>> {
     let reachable = reachable_observations();
     let mut histories = BTreeSet::new();
 
     for (index, run) in runs.iter().enumerate() {
         let effects = dispatched.get(index).cloned().unwrap_or_default();
-        let observed = abstraction(run.ledger(), &effects);
+        let observed = abstraction(run.ledger(), &effects, role_of);
 
         // 1. The model describes this crash.
         assert!(
@@ -305,7 +295,7 @@ fn check(
         let Ok(state) = Journal::reconstructed(&observed) else {
             unreachable!("the harness never builds a torn acknowledged record")
         };
-        let real = recovered(run.image(), numbering);
+        let real = recovered(run.image());
         assert_eq!(
             real,
             Specified.recover(&state),
@@ -330,12 +320,14 @@ fn check(
 fn the_real_journal_refines_the_specification_at_every_crash_point() {
     let runs = drive(journal);
     assert!(runs.len() > 100, "only {} crash points", runs.len());
-    let histories = check(&runs, Numbering::OneRecordPerEffect, &[]);
+    let histories = check(&runs, &[]);
 
-    // Every prefix length really occurs. Without this the refinement could be holding
-    // because every crash point recovered the same thing.
+    // Every prefix length really occurs — nothing recovered through every record of a
+    // two-effect run. Without this the refinement could be holding because every crash point
+    // recovered the same thing.
     let lengths: BTreeSet<usize> = histories.iter().map(Vec::len).collect();
-    assert_eq!(lengths, BTreeSet::from([0, 1, 2, 3]));
+    let expected: BTreeSet<usize> = (0..=(EFFECTS as usize).saturating_mul(2)).collect();
+    assert_eq!(lengths, expected);
 }
 
 #[test]
@@ -346,7 +338,7 @@ fn a_writer_that_survives_a_failed_program_refines_the_specification_too() {
     // otherwise proved against the model alone.
     for geometry in [geometry(), blocks()] {
         let runs = drive_on(geometry, journal_that_survives_a_failed_program);
-        let histories = check(&runs, Numbering::OneRecordPerEffect, &[]);
+        let histories = check(&runs, &[]);
         assert!(!histories.is_empty());
 
         // And the state it exists for is really reached: a torn record on a device that then
@@ -382,12 +374,14 @@ fn the_refinement_reaches_the_dimensions_the_guarantees_are_about() {
     ] {
         for geometry in [geometry(), blocks()] {
             for run in drive_on(geometry, |session| writer(session)) {
-                let observed = abstraction(run.ledger(), &[]);
+                let observed = abstraction(run.ledger(), &[], role_of);
                 if observed.records.iter().any(|(.., torn_here)| *torn_here) {
                     torn += 1;
                 }
-                let history = recovered(run.image(), Numbering::OneRecordPerEffect);
-                if run.ledger().acknowledged().count() > 0 && history.len() < RECORDS as usize {
+                let history = recovered(run.image());
+                if run.ledger().acknowledged().count() > 0
+                    && history.len() < (EFFECTS as usize).saturating_mul(2)
+                {
                     acknowledged_and_short += 1;
                 }
                 observations.insert(observed);
@@ -437,7 +431,7 @@ fn the_real_effect_protocol_refines_the_specification_at_every_crash_point() {
         "no run ever dispatched an effect, so durable intent is refined about nothing"
     );
 
-    check(&runs, Numbering::ScheduleThenCompletion, &dispatched);
+    check(&runs, &dispatched);
 }
 
 #[test]
@@ -458,11 +452,11 @@ fn the_refinement_check_can_tell_the_specified_reader_from_a_wrong_one() {
         let disagreements = runs
             .iter()
             .filter(|run| {
-                let observed = abstraction(run.ledger(), &[]);
+                let observed = abstraction(run.ledger(), &[], role_of);
                 let Ok(state) = Journal::reconstructed(&observed) else {
                     return false;
                 };
-                recovered(run.image(), Numbering::OneRecordPerEffect) != mutant.recover(&state)
+                recovered(run.image()) != mutant.recover(&state)
             })
             .count();
         assert!(
@@ -483,7 +477,7 @@ fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
     // says so out loud.
     let nonsense = [RecordId(99), RecordId(7)];
     for run in drive(journal) {
-        let observed = abstraction(run.ledger(), &[]);
+        let observed = abstraction(run.ledger(), &[], role_of);
         let Ok(state) = Journal::reconstructed(&observed) else {
             unreachable!("the harness never builds a torn acknowledged record")
         };
@@ -508,7 +502,7 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     // claims a barrier returned for a half-written record describes nothing, and the state
     // builder says so instead of quietly repairing it.
     let impossible = Observation {
-        records: vec![(RecordId(0), Durability::Acknowledged, true)],
+        records: vec![(RecordId(0), Role::Schedule, Durability::Acknowledged, true)],
         dispatched: Vec::new(),
     };
     let error = Journal::reconstructed(&impossible).expect_err("torn and acknowledged");
@@ -518,7 +512,7 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     );
 
     let also_impossible = Observation {
-        records: vec![(RecordId(0), Durability::Attempted, true)],
+        records: vec![(RecordId(0), Role::Schedule, Durability::Attempted, true)],
         dispatched: Vec::new(),
     };
     let error = Journal::reconstructed(&also_impossible).expect_err("torn and absent");
@@ -529,13 +523,13 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
 fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
     let runs = drive(journal);
     for run in &runs {
-        let observed = abstraction(run.ledger(), &[RecordId(0), RecordId(0)]);
+        let observed = abstraction(run.ledger(), &[RecordId(0), RecordId(0)], role_of);
         assert_eq!(
             observed.records.len(),
             run.ledger().len(),
             "the abstraction invented or dropped a record"
         );
-        for (id, state, torn) in &observed.records {
+        for (id, _, state, torn) in &observed.records {
             assert_eq!(run.ledger().state(*id), Some(*state));
             assert_eq!(run.ledger().torn(*id), Some(*torn));
         }

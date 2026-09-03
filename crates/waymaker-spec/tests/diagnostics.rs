@@ -14,7 +14,7 @@ use waymaker_fault::Durability;
 use waymaker_spec::explore::{BankShape, ExploreError, TransitionKind, explore};
 use waymaker_spec::invariant::{Invariant, holds};
 use waymaker_spec::model::{
-    Bank, BankId, Bound, Guard, Guards, Illegal, Journal, OnMedia, Record, Transition,
+    Bank, BankId, Bound, Guard, Guards, Illegal, Journal, OnMedia, Record, Role, Transition,
 };
 use waymaker_spec::obligation::Discharge;
 use waymaker_spec::reader::{Mutant, Reader, Specified};
@@ -32,6 +32,8 @@ fn every_refusal_reason_says_something_different() {
         Illegal::SealAlreadyInFlight,
         Illegal::CapacityReached,
         Illegal::UndeclaredRecord,
+        Illegal::NotAScheduleRecord,
+        Illegal::OutOfProtocolOrder,
         Illegal::IntentNotDurable,
         Illegal::AlreadyDispatched,
         Illegal::BankNotErased,
@@ -167,6 +169,7 @@ fn the_guards_bitmask_answers_for_every_precondition() {
 fn a_record_reports_the_design_documents_state_for_every_shape_it_can_hold() {
     let record = |media, acknowledged| Record {
         id: waymaker_fault::RecordId(0),
+        role: Role::Schedule,
         media,
         acknowledged,
     };
@@ -241,6 +244,9 @@ fn a_fresh_device_has_nothing_recovered_dispatched_or_authoritative() {
 #[test]
 fn the_alphabet_covers_every_transition_kind_at_every_record_the_bound_allows() {
     let alphabet = Journal::alphabet(Bound::PROOF);
+    for role in Role::ALL {
+        assert!(alphabet.contains(&Transition::Declare(role)));
+    }
     for kind in TransitionKind::ALL {
         assert!(
             alphabet.iter().any(|transition| transition.kind() == kind),
