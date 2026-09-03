@@ -1,0 +1,446 @@
+//! The fourth line of §15's oracle: `recovered_banks.count_authoritative() == 1`.
+//!
+//! Issue [#19](https://github.com/madmax983/waymaker/issues/19) asks for "bank generation
+//! selection under partial swaps", and §02 decision 7 is what it is protecting: "a new run
+//! becomes authoritative only after its payload and generation seal are durable". A swap
+//! interrupted anywhere must leave exactly one bank a reader would boot from — never two,
+//! and never none.
+//!
+//! # This models rung 0.2's protocol; it does not implement it
+//!
+//! `waymaker-flash` has no bank geometry, no generation seal and no swap at rung 0.1, and
+//! deliberately so — [`frame`]'s "Deferred" section says both belong to 0.2, and a firmware
+//! crate that grew them early would be charged for them against an 8 KiB budget before
+//! anything needed them. What is here instead is the smallest thing that gives the oracle's
+//! fourth line something real to be checked against: a bank is a run's history written with
+//! the *real* §09 codec, and its generation seal is the terminal record that closes it. The
+//! writer, the erase, the barriers and every crash point in between are the real harness.
+//!
+//! What that buys, and what it does not: the *selection rule* — a bank counts only when its
+//! frames verify and its seal is present, and the highest generation wins — is exercised
+//! against every way a swap can be interrupted, so the shape of the answer is held. When
+//! rung 0.2 writes the real seal as a storage-program unit, this file is what it has to keep
+//! satisfying, and [`a_swap_that_clears_both_banks_first_leaves_nothing_to_boot_from`] and
+//! [`a_selection_that_ignores_the_seal_finds_two_authorities`] are the proof that satisfying
+//! it means something.
+
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef, ReplayCursor, RunId};
+use waymaker_fault::{
+    Breach, Durability, FaultError, Harness, Injection, Interruption, Op, Progress, Recovery,
+    RecordId, Run, Session, verify_oracle,
+};
+use waymaker_flash::frame::{self, ProgramAlign, Scan};
+use waymaker_flash::storage::{Geometry, StableStorage};
+
+/// The run every bank below records.
+const RUN: RunId = RunId(0x0000_0000_0000_00B7);
+
+/// Where each bank starts, and how long it is.
+const BANK_A: u32 = 0;
+const BANK_B: u32 = 128;
+const BANK_BYTES: u32 = 128;
+
+/// The one record the swap declares: a bank swap is one durable unit or it is nothing.
+const SWAP: RecordId = RecordId(1);
+
+/// The generation the swap installs.
+const NEW_GENERATION: u32 = 2;
+
+/// The op index of the barrier that first makes a bank authoritative.
+///
+/// Everything before it is the device as a previous life left it, and a device that has
+/// never committed anything has no authoritative bank to count. Asserted against the
+/// recorded sequence in every test below, so a writer edited without this constant fails
+/// loudly rather than silently moving what "after the first commit" means.
+const FIRST_COMMIT: usize = 9;
+
+fn geometry() -> Geometry {
+    let Ok(geometry) = Geometry::new(256, 64, 4, 1) else {
+        unreachable!("256 is four whole 64-byte blocks of 4-byte units of single bytes")
+    };
+    geometry
+}
+
+fn align() -> ProgramAlign {
+    let Some(align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a power of two within the program-size range")
+    };
+    align
+}
+
+// ---------------------------------------------------------------------------------------
+// A bank, and what makes one authoritative
+// ---------------------------------------------------------------------------------------
+
+/// The four records a bank at `generation` holds: a run, one effect, and the seal.
+///
+/// The seal is the terminal record, and it carries the generation. That is the property
+/// the selection below turns on: a bank is authoritative only once its *last* record is
+/// durable, which is §02 decision 7 with the frame format standing in for rung 0.2's
+/// storage-program unit.
+fn bank_records(generation: [u8; 4]) -> [RecordRef<'_>; 4] {
+    [
+        RecordRef::RunStarted {
+            workflow_kind: 7,
+            workflow_version: 1,
+            input: &generation,
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq::FIRST,
+            kind: ActivityKind(1),
+            input_len: 0,
+            input_crc: 0,
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq::FIRST,
+            result: &generation,
+        },
+        RecordRef::RunCompleted {
+            result: &generation,
+        },
+    ]
+}
+
+/// Writes a whole bank at `base`, one program per record.
+fn write_bank(session: &mut Session, base: u32, generation: u32) -> Result<(), FaultError> {
+    let bytes = generation.to_le_bytes();
+    let mut at = base;
+    let mut buffer = [0_u8; 64];
+    for record in bank_records(bytes) {
+        let Ok(written) = frame::encode(&record, align(), &mut buffer) else {
+            unreachable!("64 bytes is more than any bank record")
+        };
+        let Some(frame_bytes) = buffer.get(..written) else {
+            unreachable!("`encode` reports what it wrote")
+        };
+        let len = u32::try_from(written).unwrap_or(u32::MAX);
+        if at.wrapping_add(len) > base.wrapping_add(BANK_BYTES) {
+            unreachable!("a bank's four records fit in {BANK_BYTES} bytes")
+        }
+        session.program(at, frame_bytes)?;
+        at = at.wrapping_add(len);
+    }
+    Ok(())
+}
+
+/// The generation `bank` is sealed with, or `None` if it is not sealed.
+///
+/// A bank is read the way recovery reads one: the real scan, then the real cursor, stopping
+/// at the first frame either refuses. The seal is the terminal record, so a bank whose
+/// frames verify but whose last record never landed has no generation — which is exactly
+/// the state a swap is in for every crash point but the last.
+fn sealed_generation(bank: &[u8]) -> Option<u32> {
+    let mut cursor = ReplayCursor::new(RUN);
+    let mut generation = None;
+    for step in Scan::new(bank, align()) {
+        let Ok(record) = step else { break };
+        if cursor.advance(record).is_err() {
+            break;
+        }
+        if let RecordRef::RunCompleted { result } = record {
+            generation = <[u8; 4]>::try_from(result).ok().map(u32::from_le_bytes);
+        }
+    }
+    generation
+}
+
+/// The two banks of `image`, as slices.
+fn banks(image: &[u8]) -> [&[u8]; 2] {
+    let a = image
+        .get(BANK_A as usize..(BANK_A + BANK_BYTES) as usize)
+        .unwrap_or_default();
+    let b = image
+        .get(BANK_B as usize..(BANK_B + BANK_BYTES) as usize)
+        .unwrap_or_default();
+    [a, b]
+}
+
+/// How many banks a reader would boot from, and which generation it would find.
+///
+/// Sealed banks with *different* generations are not two authorities: the higher one wins,
+/// which is what a generation is for. Two banks sealed at the same generation are, and the
+/// count says so rather than picking one — a tie is the state no protocol may produce, so a
+/// selection that resolved it would be hiding the bug the count exists to find.
+fn authority(image: &[u8]) -> (usize, Option<u32>) {
+    let sealed: Vec<u32> = banks(image).iter().filter_map(|bank| sealed_generation(bank)).collect();
+    match sealed.as_slice() {
+        [] => (0, None),
+        [only] => (1, Some(*only)),
+        [left, right] if left == right => (2, Some(*left)),
+        [left, right] => (1, Some(*left.max(right))),
+        _ => unreachable!("a device of two banks has at most two sealed ones"),
+    }
+}
+
+/// What recovery produced: the swap's record if the installed generation is authoritative.
+fn recovered(image: &[u8]) -> Vec<RecordId> {
+    match authority(image) {
+        (1, Some(NEW_GENERATION)) => vec![SWAP],
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The writers
+// ---------------------------------------------------------------------------------------
+
+/// The honest swap: never erase the bank you are booting from.
+fn swap(session: &mut Session) -> Result<(), FaultError> {
+    // The device as a previous life left it: a stale bank, then the one in use. Neither is
+    // declared, because a record is what recovery must account for and setup is not one.
+    write_bank(session, BANK_B, 0)?;
+    session.barrier()?;
+    write_bank(session, BANK_A, 1)?;
+    session.barrier()?;
+
+    // One durable unit: the erase, the payload and the seal, ordered by one barrier at the
+    // end. Nothing in here is separately recoverable, so nothing in here is a record of
+    // its own.
+    session.begin_record(SWAP);
+    session.erase(BANK_B, BANK_BYTES)?;
+    session.barrier()?;
+    write_bank(session, BANK_B, NEW_GENERATION)?;
+    session.barrier()?;
+    session.end_record();
+    Ok(())
+}
+
+/// The swap with the bug: clear the whole device before writing the new bank.
+fn swap_clearing_both(session: &mut Session) -> Result<(), FaultError> {
+    write_bank(session, BANK_B, 0)?;
+    session.barrier()?;
+    write_bank(session, BANK_A, 1)?;
+    session.barrier()?;
+
+    session.begin_record(SWAP);
+    session.erase(BANK_A, BANK_BYTES)?;
+    session.erase(BANK_B, BANK_BYTES)?;
+    session.barrier()?;
+    write_bank(session, BANK_B, NEW_GENERATION)?;
+    session.barrier()?;
+    session.end_record();
+    Ok(())
+}
+
+fn drive(writer: fn(&mut Session) -> Result<(), FaultError>) -> Vec<Run> {
+    match Harness::new(geometry()).run(writer) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
+/// Whether `run` happened at or after the swap's first durable commit.
+fn after_first_commit(run: &Run) -> bool {
+    match run.injection() {
+        None => true,
+        Some(Injection { op, progress, .. }) => {
+            op > FIRST_COMMIT || (op == FIRST_COMMIT && progress == Progress::Whole)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The property
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn exactly_one_bank_is_authoritative_at_every_point_a_swap_can_be_interrupted() {
+    let runs = drive(swap);
+    let clean = runs.first().unwrap_or_else(|| unreachable!("the fault-free run"));
+    assert_eq!(
+        clean.ops().get(FIRST_COMMIT),
+        Some(&Op::Barrier),
+        "the writer changed shape, so `FIRST_COMMIT` no longer names the first commit: {:?}",
+        clean.ops()
+    );
+    assert!(runs.len() > 100, "only {} runs", runs.len());
+
+    let (count, generation) = authority(clean.image());
+    assert_eq!((count, generation), (1, Some(NEW_GENERATION)));
+
+    let mut installed = 0_usize;
+    let mut still_the_old_one = 0_usize;
+    let mut before_any_commit = 0_usize;
+    for run in &runs {
+        let (count, generation) = authority(run.image());
+        assert!(
+            count <= 1,
+            "at {:?}: {count} banks are authoritative, at generations {generation:?}",
+            run.injection()
+        );
+
+        if !after_first_commit(run) {
+            before_any_commit += 1;
+            continue;
+        }
+        assert_eq!(
+            count, 1,
+            "at {:?}: a committed device has {count} authoritative banks",
+            run.injection()
+        );
+
+        match generation {
+            Some(NEW_GENERATION) => installed += 1,
+            Some(1) => still_the_old_one += 1,
+            other => unreachable!("a bank at generation {other:?} was never written"),
+        }
+
+        let history = recovered(run.image());
+        assert_eq!(
+            verify_oracle(
+                run.ledger(),
+                &Recovery::new(&history).authoritative_banks(count)
+            ),
+            Ok(()),
+            "at {:?}: recovered {history:?} from a ledger of {:?}",
+            run.injection(),
+            run.ledger().records().collect::<Vec<_>>()
+        );
+        continue;
+    }
+
+    // The sweep has to have seen both outcomes, or "exactly one" held because only one was
+    // ever possible.
+    assert!(
+        installed > 0 && still_the_old_one > 0,
+        "{installed} runs installed the new generation and {still_the_old_one} kept the old \
+         one"
+    );
+    assert!(
+        before_any_commit > 0,
+        "no crash point fell before the first commit, so the device-with-no-history case \
+         was never reached"
+    );
+}
+
+#[test]
+fn a_swap_torn_anywhere_is_never_half_installed() {
+    // §02 decision 7: a new run becomes authoritative only after its payload *and* its
+    // generation seal are durable. So a torn swap must never be the thing a reader boots
+    // from, whatever landed.
+    let runs = drive(swap);
+    let mut torn = 0_usize;
+    for run in &runs {
+        if run.ledger().torn(SWAP) != Some(true) {
+            continue;
+        }
+        torn += 1;
+        assert_eq!(
+            authority(run.image()).1,
+            Some(1),
+            "at {:?}: a torn swap became authoritative",
+            run.injection()
+        );
+        assert_eq!(run.ledger().state(SWAP), Some(Durability::PossiblyDurable));
+    }
+    assert!(torn > 0, "no crash point tore the swap");
+}
+
+#[test]
+fn a_partially_erased_bank_is_never_mistaken_for_a_sealed_one() {
+    // The stale-tail hazard, on the one operation that can produce it: a bank of two erase
+    // blocks, erased from the front, interrupted at the block boundary. The head reads
+    // erased and a whole sealed generation is still sitting behind it.
+    let runs = drive(swap);
+    let interrupted: Vec<&Run> = runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.injection(),
+                Some(Injection {
+                    progress: Progress::Bytes(_),
+                    ..
+                })
+            ) && run.ops().iter().any(|op| matches!(op, Op::Erase { .. }))
+        })
+        .filter(|run| {
+            let [_, b] = banks(run.image());
+            b.first() == Some(&0xFF) && b.iter().any(|byte| *byte != 0xFF)
+        })
+        .collect();
+    assert!(
+        !interrupted.is_empty(),
+        "no crash point left a bank half erased"
+    );
+    for run in interrupted {
+        let [_, b] = banks(run.image());
+        assert_eq!(
+            sealed_generation(b),
+            None,
+            "at {:?}: a half-erased bank reported a generation",
+            run.injection()
+        );
+        assert_eq!(authority(run.image()), (1, Some(1)));
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Teeth
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_swap_that_clears_both_banks_first_leaves_nothing_to_boot_from() {
+    // The bug a two-bank protocol exists to prevent: erasing the bank you are booting from.
+    // At the crash point between the two erases and the new seal there is no authority at
+    // all, and the oracle has to say so rather than accept an empty recovery as a legal
+    // prefix.
+    let runs = drive(swap_clearing_both);
+
+    let mut caught = 0_usize;
+    for run in &runs {
+        let (count, _) = authority(run.image());
+        if count != 0 || !after_first_commit(run) {
+            continue;
+        }
+        let history = recovered(run.image());
+        assert_eq!(
+            verify_oracle(
+                run.ledger(),
+                &Recovery::new(&history).authoritative_banks(count)
+            ),
+            Err(Breach::NoAuthoritativeBank),
+            "at {:?}: a device with no authoritative bank was accepted",
+            run.injection()
+        );
+        caught += 1;
+    }
+    assert!(
+        caught > 0,
+        "clearing both banks never left the device with nothing to boot from, so the \
+         mutant proves nothing"
+    );
+}
+
+#[test]
+fn a_selection_that_ignores_the_seal_finds_two_authorities() {
+    // The other half of the same line. This selection asks "does the bank have frames in
+    // it", which is the rule somebody writes before the generation seal exists — and after
+    // any swap has written its payload, both banks answer yes.
+    let runs = drive(swap);
+
+    let mut caught = 0_usize;
+    for run in &runs {
+        let count = banks(run.image())
+            .iter()
+            .filter(|bank| Scan::new(bank, align()).next().is_some_and(|step| step.is_ok()))
+            .count();
+        if count < 2 {
+            continue;
+        }
+        let history = recovered(run.image());
+        assert_eq!(
+            verify_oracle(
+                run.ledger(),
+                &Recovery::new(&history).authoritative_banks(count)
+            ),
+            Err(Breach::AmbiguousAuthority { count }),
+            "at {:?}: two authoritative banks were accepted",
+            run.injection()
+        );
+        caught += 1;
+    }
+    assert!(
+        caught > 0,
+        "a seal-blind selection never found two banks, so the mutant proves nothing"
+    );
+}
