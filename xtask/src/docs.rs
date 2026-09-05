@@ -977,6 +977,86 @@ fn without_fenced_code(contents: &str) -> String {
 /// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
 /// reading `CLAUDE.md` is reading the same string the gate reads, or the gate says so.
 #[must_use]
+/// Every number CLAUDE.md attaches to the word "rule" that is not `expected`.
+///
+/// The file states the rule count twice — once in its opening paragraph and once above the
+/// table — and a `contains` check for the right number is satisfied by either of them. That
+/// is how the opening paragraph came to say 39 while the table said 40. Reads the digits
+/// immediately before " rule", so "40 rules" and "40 rule ids" both count and a bare year or
+/// an issue number does not.
+fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
+    let mut stale = Vec::new();
+    for (at, _) in contents.match_indices(" rule") {
+        let Some(before) = contents.get(..at) else {
+            continue;
+        };
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let Ok(said) = digits.parse::<usize>() else {
+            continue;
+        };
+        if said != expected && !stale.contains(&said) {
+            stale.push(said);
+        }
+    }
+    stale
+}
+/// Rule: CLAUDE.md states the gate's rule count, once, and states it right.
+///
+/// Two checks rather than one, because this has now been wrong twice. First the table grew
+/// and the sentence above it did not; then the table was corrected and the file's *opening*
+/// paragraph — which states the same count — was not, and shipped that way on pull request
+/// #76. A `contains` check for the right number is satisfied by whichever of the two is
+/// correct, so the stale one sits in the file telling a contributor something false.
+///
+/// The stale scan runs only once the right count is present: a file that states no correct
+/// count at all has one defect, and listing every other number in it as well would report
+/// that defect twice.
+fn check_rule_count(contents: &str, rules: usize) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    // Prose until it is checked.
+    // wrong twice: the rule table grew and the sentence above it did not, and then the table
+    // was corrected and the file's *opening* paragraph — which states the same count — was
+    // not. So this is two checks rather than one.
+    //
+    // The first is that the right count is said at all. The second is that no *other* count
+    // is, which is the half a `contains` cannot do: CLAUDE.md names the number twice, and a
+    // presence check is satisfied by the corrected one while the stale one sits four hundred
+    // lines above it telling a contributor something false. Every "N rule" in the file has to
+    // be the count the gate reports.
+    let count = format!("{rules} rule");
+    if contents.contains(&count) {
+        // Only once the right count is present. A file that states no correct count at all
+        // has one defect and gets one violation from the branch below; listing every other
+        // number in it as "stale" as well would be the same defect reported twice.
+        for stale in stale_rule_counts(contents, rules) {
+            violations.push(Violation::new(
+                "claude-md",
+                "rule count",
+                format!(
+                    "CLAUDE.md says `{stale} rule` somewhere as well as `{count}`; the gate \
+                     reports {rules} and a contributor who reads the wrong one of the two is \
+                     told a number no build will ever print"
+                ),
+            ));
+        }
+    } else {
+        violations.push(Violation::new(
+            "claude-md",
+            "rule count",
+            format!("CLAUDE.md does not say `{count}s`, which is what the gate reports"),
+        ));
+    }
+
+    violations
+}
+
 fn check_claude_md(contents: Option<&str>, rules: &[&str]) -> Vec<Violation> {
     let Some(contents) = contents else {
         return vec![Violation::new(
@@ -1050,16 +1130,7 @@ fn check_claude_md(contents: Option<&str>, rules: &[&str]) -> Vec<Violation> {
         }
     }
 
-    // The count the gate prints on success. Prose until it is checked, and it was wrong
-    // once already: the rule table grew and the sentence above it did not.
-    let count = format!("{} rule", rules.len());
-    if !contents.contains(&count) {
-        violations.push(Violation::new(
-            "claude-md",
-            "rule count",
-            format!("CLAUDE.md does not say `{count}s`, which is what the gate reports"),
-        ));
-    }
+    violations.extend(check_rule_count(contents, rules.len()));
 
     for command in crate::pipeline::STAGES {
         if !contents.contains(command.command) {
@@ -3474,6 +3545,60 @@ mod tests {
                 .iter()
                 .any(|v| v.subject == "waymaker-embassy" && v.detail.contains("may depend on")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_md_that_says_the_count_twice_and_disagrees_is_reported() {
+        // The defect that shipped on pull request #76: the table above the rules was
+        // corrected to 40 and the file's opening paragraph still said 39. A `contains` check
+        // for the right number is satisfied by the corrected one, so the stale one sat four
+        // hundred lines above it telling a contributor something false.
+        let claude_md = clean_claude_md(RULES).replace(
+            "# CLAUDE.md",
+            &format!("# CLAUDE.md\n\nall {} rule ids below\n", RULES.len() - 1),
+        );
+        let violations = check_claude_md(Some(&claude_md), RULES);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == "rule count" && v.detail.contains("somewhere as well as")),
+            "a second, stale count should be reported: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_count_that_is_not_about_rules_is_not_a_rule_count() {
+        // The scan reads the digits immediately before " rule", so an issue number, a byte
+        // figure or a year elsewhere in the file is not a claim about how many rules there
+        // are. Without this the check would fire on prose it has no business reading.
+        let claude_md = format!(
+            "{}\n\nissue 72, 16456 B of code flash, and the year 2026.\n",
+            clean_claude_md(RULES)
+        );
+        let violations = check_claude_md(Some(&claude_md), RULES);
+        assert!(
+            !violations.iter().any(|v| v.subject == "rule count"),
+            "a number that is not a rule count should not be read as one: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn every_rule_count_the_helper_finds_is_one_the_file_really_states() {
+        assert_eq!(
+            stale_rule_counts("all 39 rule ids and 40 rules", 40),
+            vec![39]
+        );
+        assert_eq!(
+            stale_rule_counts("40 rules, 40 rule ids", 40),
+            Vec::<usize>::new()
+        );
+        // Repeated staleness is reported once, so one drift is one violation.
+        assert_eq!(stale_rule_counts("39 rules and 39 rule ids", 40), vec![39]);
+        // A bare word is not a count, and neither is a number attached to something else.
+        assert_eq!(
+            stale_rule_counts("the rule, issue 72", 40),
+            Vec::<usize>::new()
         );
     }
 
