@@ -36,7 +36,7 @@ use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
 use waymaker_rig::log::{Entry, Outcome};
 use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Rig, Stop};
+use waymaker_rig::run::{Rig, Stop, Verdict};
 use waymaker_rig::wear::{Metered, Wear};
 use waymaker_rig::witness::{Progress as Marks, Stage, Witness};
 use waymaker_rig::workload::Role;
@@ -187,7 +187,7 @@ fn a_clean_run_writes_the_whole_workload_and_recovers_it() {
     );
 
     let outcome = rig.verify(0, &mut device, &mut page).expect("a verdict");
-    assert_eq!(outcome, Outcome::Passed);
+    assert_eq!(outcome.outcome(), Outcome::Passed);
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn every_crash_point_leaves_media_the_oracle_accepts() {
             .verify(0, &mut device, &mut page)
             .unwrap_or_else(|error| panic!("verify at {:?}: {error:?}", run.injection()));
         assert_eq!(
-            outcome,
+            outcome.outcome(),
             Outcome::Passed,
             "crash point {:?} produced {outcome:?}",
             run.injection()
@@ -445,7 +445,7 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
         let outcome = rig
             .verify(iteration, &mut device, &mut page)
             .expect("a verdict");
-        assert_eq!(outcome, Outcome::Passed, "iteration {iteration}");
+        assert_eq!(outcome.outcome(), Outcome::Passed, "iteration {iteration}");
         reached = true;
         break;
     }
@@ -594,7 +594,7 @@ fn a_witness_left_by_the_previous_iteration_is_not_read_as_this_one_s() {
         .expect("a clean run");
     }
     assert_eq!(
-        rig.verify(0, &mut device, &mut page),
+        rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
         Ok(Outcome::Passed),
         "iteration 0 judged as itself"
     );
@@ -606,25 +606,22 @@ fn a_witness_left_by_the_previous_iteration_is_not_read_as_this_one_s() {
         .verify(1, &mut device, &mut page)
         .expect("a verdict rather than an error");
     assert_eq!(
-        outcome,
+        outcome.outcome(),
         Outcome::Breached(Breach::WitnessUnreadable),
         "iteration 1 must refuse iteration 0's witness rather than audit against it"
     );
 }
 
 #[test]
-fn a_violation_is_reproducible_from_the_log_line_alone() {
-    // Issue #27's third "done when", and the whole of it: a breach is produced, logged, the
-    // line is rendered, and a reader given *nothing but those bytes* reaches the identical
-    // breach. Nothing below the `Entry::parse` may name a variable from above it — which is
-    // the discipline the first version of this test broke, by passing the witness it had
-    // built in hand straight into the replay and reproducing nothing.
+fn a_witness_caused_violation_is_reproduced_from_the_log_line_alone() {
+    // The half of issue #27's third "done when" that *is* a replay: the obligations §14 puts
+    // on a recovery come from the witness, the witness travels in the line, and the run comes
+    // from the seed — so a reader with nothing but the bytes reaches the identical verdict.
+    // Nothing below the `Entry::parse` may name a variable from above it.
     let rig = rig();
     let mut device = Device::new(geometry());
     let mut page = [0_u8; Rig::PAGE_BYTES];
     let wear = {
-        // A scope rather than a `drop`: a meter has no destructor, so dropping one only
-        // extends the borrow it holds on the device the judgement below needs back.
         let mut metered = Metered::new(&mut device);
         rig.prepare(&mut metered, 0, &mut page)
             .expect("a prepared part");
@@ -640,82 +637,226 @@ fn a_violation_is_reproducible_from_the_log_line_alone() {
     };
 
     // A witness that claims more than happened: the writer began and acknowledged record 99.
-    // Nothing recovered it, because the run has no record 99 — so `acknowledged-durability`
-    // is the guarantee that breaks.
     let lying = Marks::EMPTY
         .raising(Stage::Attempted, 99)
         .raising(Stage::Acknowledged, 99);
-    let outcome = rig
+    let verdict = rig
         .judge(0, &mut device, lying, &mut page)
         .expect("a verdict");
     assert_eq!(
-        outcome,
+        verdict.outcome(),
         Outcome::Breached(Breach::LostAcknowledgedRecord { index: 99 })
     );
 
     let mut line = [0_u8; Entry::LINE_BYTES];
     let rendered = rig
-        .entry(0, outcome, wear, lying)
+        .entry(0, verdict, wear, lying)
         .render(&mut line)
         .expect("a line")
         .to_vec();
 
     // ---- Everything below this line knows only `rendered`. ----
     let read = Entry::parse(&rendered).expect("a line the rig wrote");
-    let geometry = read.geometry().expect("a geometry");
-    let replayed =
-        Rig::new::<waymaker_fault::FaultError>(geometry, Plan::new(read.seed()), read.effects())
-            .expect("the same layout");
-    let mut fresh = Device::new(geometry);
+    let again = replay_from(&read);
+    assert_eq!(
+        again.outcome(),
+        read.outcome(),
+        "the log line did not reproduce the verdict it recorded"
+    );
+    assert_eq!(again.recovered(), read.recovered());
+    assert_eq!(usize::from(read.banks()), again.banks());
+}
+
+#[test]
+fn a_media_caused_violation_is_characterised_by_the_log_line_it_cannot_replay() {
+    // The other half, and the one worth being exact about. A `RecordDiffers` is caused by the
+    // *bytes on the part*, and a log line cannot carry a bank. Rebuilding a part from the seed
+    // writes the correct history, so replaying it reaches `Passed` — the breach is gone with
+    // the media that caused it.
+    //
+    // What the line can do, and now does, is carry the evidence: how many records recovery
+    // accepted before it diverged, and how many banks claimed authority. Without those a line
+    // reading `record-differs` says history diverged and not where, and the only way to find
+    // out is to still have the device.
+    let rig = rig();
+    let mut device = Device::new(geometry());
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    {
-        let mut metered = Metered::new(&mut fresh);
-        replayed
-            .prepare(&mut metered, read.iteration(), &mut page)
+    let wear = {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
             .expect("a prepared part");
-        replayed
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        )
+        .expect("a clean run");
+        metered.wear()
+    };
+    let honest = {
+        let mut instrument = waymaker_rig::window::Window::new(
+            &mut device,
+            rig.instrument_base(),
+            geometry().erase_size(),
+        )
+        .expect("the instrument window");
+        Witness::new(rig.witness_region())
+            .scan(&mut instrument, &mut page)
+            .expect("a witness the rig wrote")
+    };
+
+    // Media that diverges from what the run declared, without touching the witness: a second
+    // rig's history, written over the first's journal. This is the state a real bug produces.
+    let other = Rig::new::<waymaker_fault::FaultError>(geometry(), Plan::new(SEED ^ 0xFF), EFFECTS)
+        .expect("the same layout under another seed");
+    let mut divergent = Device::new(geometry());
+    {
+        let mut metered = Metered::new(&mut divergent);
+        other
+            .prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        other
             .iterate(
-                read.iteration(),
+                0,
                 &mut metered,
                 &mut Counting::default(),
                 &mut NeverCut,
                 &mut page,
             )
-            .expect("the same run, rebuilt from the seed");
+            .expect("a clean run of another workload");
     }
-
-    let again = replayed
-        .judge(read.iteration(), &mut fresh, read.progress(), &mut page)
+    let verdict = rig
+        .judge(0, &mut divergent, honest, &mut page)
         .expect("a verdict");
+    let Outcome::Breached(Breach::RecordDiffers { index }) = verdict.outcome() else {
+        panic!(
+            "another run's history must differ; got {:?}",
+            verdict.outcome()
+        );
+    };
     assert_eq!(
-        again,
-        read.outcome(),
-        "the log line did not reproduce the breach it recorded"
+        verdict.recovered(),
+        index,
+        "the divergence is where it says"
     );
+
+    let mut line = [0_u8; Entry::LINE_BYTES];
+    let rendered = rig
+        .entry(0, verdict, wear, honest)
+        .render(&mut line)
+        .expect("a line")
+        .to_vec();
+
+    // ---- Everything below this line knows only `rendered`. ----
+    let read = Entry::parse(&rendered).expect("a line the rig wrote");
+    assert_eq!(read.outcome(), verdict.outcome());
+    assert_eq!(read.recovered(), index);
+    assert_eq!(read.banks(), 1);
+    // And the honest limit, asserted rather than left for a reader to discover: the part is
+    // gone, so replaying the run from the seed reaches a pass. That is why the evidence above
+    // is in the line, and it is what ADR 0021 records as what a log line cannot carry.
+    let again = replay_from(&read);
     assert_eq!(
-        again,
-        Outcome::Breached(Breach::LostAcknowledgedRecord { index: 99 })
+        again.outcome(),
+        Outcome::Passed,
+        "a rebuilt part carries correct history, so the breach is not in it"
     );
+    assert_ne!(
+        again.recovered(),
+        read.recovered(),
+        "and the evidence is what tells the two runs apart"
+    );
+}
+
+/// Rebuilds the run `entry` names and judges it against the witness `entry` carries.
+///
+/// Everything it uses comes from the entry, which is the discipline the two tests above are
+/// about: a replay that reached for anything else would be reproducing the test rather than
+/// the log line.
+fn replay_from(entry: &Entry) -> Verdict {
+    // A helper in an integration test is not a test body, and the workspace denies `expect`
+    // outside one. Every refusal here would be a broken fixture rather than a finding.
+    let Ok(geometry) = entry.geometry() else {
+        unreachable!("the rig wrote this line, so its four units are a geometry")
+    };
+    let Ok(replayed) =
+        Rig::new::<waymaker_fault::FaultError>(geometry, Plan::new(entry.seed()), entry.effects())
+    else {
+        unreachable!("the layout the line names is the one the rig was built on")
+    };
+    let mut fresh = Device::new(geometry);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut fresh);
+        let Ok(()) = replayed.prepare(&mut metered, entry.iteration(), &mut page) else {
+            unreachable!("a legal layout prepares")
+        };
+        let Ok(_) = replayed.iterate(
+            entry.iteration(),
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        ) else {
+            unreachable!("the run rebuilt from the seed is the run that already ran")
+        };
+    }
+    let Ok(verdict) = replayed.judge(entry.iteration(), &mut fresh, entry.progress(), &mut page)
+    else {
+        unreachable!("a healthy part has a verdict")
+    };
+    verdict
 }
 
 #[test]
 fn a_log_line_carries_what_the_rig_knew_and_not_only_what_it_ran() {
-    // The field that makes the test above possible. A line whose witness did not survive the
-    // round trip would reproduce a *different* verdict — most likely `Passed`, because an
-    // empty witness demands nothing, which is the direction that turns a recorded violation
-    // into a clean run when somebody investigates it.
+    // The witness field. A line whose witness did not survive the round trip would reproduce a
+    // *different* verdict — most likely `Passed`, because an empty witness demands nothing,
+    // which is the direction that turns a recorded violation into a clean run.
     let rig = rig();
     let knew = Marks::EMPTY
         .raising(Stage::Attempted, 4)
         .raising(Stage::Acknowledged, 3)
         .raising(Stage::Dispatched, 1);
-    let entry = rig.entry(7, Outcome::Passed, Wear::NONE, knew);
     let mut line = [0_u8; Entry::LINE_BYTES];
+    let entry = rig
+        .entry(7, passing_verdict(), Wear::NONE, knew)
+        .with_evidence(6, 1);
     let rendered = entry.render(&mut line).expect("a line");
     let read = Entry::parse(rendered).expect("a line the rig wrote");
     assert_eq!(read.progress(), knew);
     assert_eq!(read.progress().attempted(), Some(4));
     assert_eq!(read.progress().acknowledged(), Some(3));
     assert_eq!(read.progress().dispatched(), Some(1));
+    assert_eq!(read.recovered(), 6);
+    assert_eq!(read.banks(), 1);
     assert_eq!(read, entry);
+}
+
+/// A verdict from a clean run, for the cases that are about the log rather than the run.
+fn passing_verdict() -> waymaker_rig::run::Verdict {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 7, &mut page) else {
+            unreachable!("a legal layout prepares")
+        };
+        let Ok(_) = rig.iterate(
+            7,
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        ) else {
+            unreachable!("a clean run succeeds")
+        };
+    }
+    let Ok(verdict) = rig.verify(7, &mut device, &mut page) else {
+        unreachable!("a clean run has a verdict")
+    };
+    verdict
 }

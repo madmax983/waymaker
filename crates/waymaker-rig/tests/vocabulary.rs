@@ -309,6 +309,92 @@ fn a_page_whose_length_is_not_a_read_unit_still_works() {
     );
 }
 
+/// A part whose reads start failing after `budget` of them.
+///
+/// `Rig::judge` reads the bank headers to count authorities and then reads one again to find
+/// the journal. A device that goes unreadable between those two is the case a blanket `Ok`
+/// turned into "no journal to walk", which an empty witness reports as a pass.
+struct FailsAfter<'a> {
+    device: &'a mut waymaker_fault::Device,
+    budget: core::cell::Cell<u32>,
+}
+
+impl StableStorage for FailsAfter<'_> {
+    type Error = waymaker_fault::FaultError;
+
+    fn geometry(&self) -> waymaker_flash::storage::Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let left = self.budget.get();
+        if left == 0 {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.budget.set(left - 1);
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_device_that_goes_unreadable_during_verification_is_an_error_and_not_a_pass() {
+    // The instrument failing is not the subject passing. Somewhere in the reads `judge`
+    // issues there is a budget at which the device dies, and at every one of them the verdict
+    // must be an error rather than `Outcome::Passed` off an empty audit.
+    let Ok(part) = Geometry::new(6 * 256, 256, 4, 1) else {
+        unreachable!("a legal geometry")
+    };
+    let rig =
+        Rig::new::<waymaker_fault::FaultError>(part, Plan::new(11), 1).expect("a legal layout");
+    let mut device = waymaker_fault::Device::new(part);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Inert,
+            &mut waymaker_rig::cutter::NeverCut,
+            &mut page,
+        )
+        .expect("a clean run");
+    }
+    let whole = rig
+        .verify(0, &mut device, &mut page)
+        .expect("a verdict from a healthy device");
+    assert_eq!(whole.outcome(), Outcome::Passed);
+
+    let mut refused = 0_usize;
+    for budget in 0..6_u32 {
+        let mut failing = FailsAfter {
+            device: &mut device,
+            budget: core::cell::Cell::new(budget),
+        };
+        match rig.judge(0, &mut failing, Progress::EMPTY, &mut page) {
+            Ok(verdict) => panic!(
+                "a device that died after {budget} reads was judged as {:?}",
+                verdict.outcome()
+            ),
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(refused > 0, "no read budget reached the device at all");
+}
+
 #[test]
 fn a_witness_too_small_for_the_whole_run_is_refused_at_construction() {
     // A clean run writes `5 * effects + 4` marks — three for every schedule record, two for
@@ -410,11 +496,36 @@ fn a_never_cutter_never_cuts_and_a_planned_one_cuts_once() {
     assert!(!planned.cut(cut.phase(), cut.cause(), effect));
 }
 
+/// A verdict from a clean run of `rig`, so a log entry can be built without hand-making one.
+fn passing_verdict(rig: &Rig) -> waymaker_rig::run::Verdict {
+    let mut device = waymaker_fault::Device::new(rig.part());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 5, &mut page) else {
+            unreachable!("a legal layout prepares")
+        };
+        let Ok(_) = rig.iterate(
+            5,
+            &mut metered,
+            &mut Inert,
+            &mut waymaker_rig::cutter::NeverCut,
+            &mut page,
+        ) else {
+            unreachable!("a clean run succeeds")
+        };
+    }
+    let Ok(verdict) = rig.verify(5, &mut device, &mut page) else {
+        unreachable!("a clean run has a verdict")
+    };
+    verdict
+}
+
 #[test]
-fn a_rig_builds_a_log_entry_from_an_outcome_and_a_wear() {
+fn a_rig_builds_a_log_entry_from_a_verdict_its_evidence_and_a_wear() {
     let rig =
         Rig::new::<waymaker_fault::FaultError>(part(), Plan::new(77), 3).expect("a legal layout");
-    let entry = rig.entry(5, Outcome::Passed, Wear::NONE, Progress::EMPTY);
+    let entry = rig.entry(5, passing_verdict(&rig), Wear::NONE, Progress::EMPTY);
     assert_eq!(entry.seed(), 77);
     assert_eq!(entry.iteration(), 5);
     assert_eq!(entry.effects(), 3);
@@ -422,6 +533,12 @@ fn a_rig_builds_a_log_entry_from_an_outcome_and_a_wear() {
     assert_eq!(entry.outcome(), Outcome::Passed);
     assert_eq!(entry.wear(), Wear::NONE);
     assert_eq!(entry.progress(), Progress::EMPTY);
+    // The evidence, which is the half a breach code cannot carry.
+    assert_eq!(
+        entry.recovered(),
+        rig.workload(5).records().expect("a length")
+    );
+    assert_eq!(entry.banks(), 1);
     let mut bytes = [0_u8; waymaker_rig::log::ENTRY_BYTES];
     entry.encode(&mut bytes).expect("an entry fits");
     assert_eq!(Entry::decode(&bytes), Ok(entry));

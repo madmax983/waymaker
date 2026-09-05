@@ -168,13 +168,20 @@ jobs:
       - name: Measure the size budgets
         run: cargo --locked xtask size
 
-      - name: Upload the size report
+      - name: Upload the size and wear reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: size-report
-          path: target/waymaker-size.json
-          # `warn` rather than `ignore`: the run where the report is missing is the run
+          # Both, because `cargo xtask size` writes both. Issue #27 asks for the write
+          # amplification to be "published alongside the size report", and a JSON that only
+          # ever existed in a runner's filesystem is published nowhere — the table in the job
+          # log is for a human, and this is the artifact a fleet's figures get compared
+          # against later.
+          path: |
+            target/waymaker-size.json
+            target/waymaker-wear.json
+          # `warn` rather than `ignore`: the run where a report is missing is the run
           # where someone wants to know why.
           if-no-files-found: warn
 

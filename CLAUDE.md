@@ -952,8 +952,10 @@ and `durable-intent` about effects that were dispatched, and neither is readable
 journal. Marks go down before a record's first program, after its commit barrier, and before
 each physical effect, and every one of those positions is chosen for which way an interrupted
 mark is allowed to be wrong. The run and the cut point are pure functions of a seed and an
-iteration, so a log line carries the whole run; the witness travels in the line too, which is
-what makes issue #27's third "done when" true rather than nearly true. A power cut and a
+iteration, so a log line carries the whole run; the witness travels in the line too, along with
+the evidence a verdict rests on — how many records recovery accepted and how many banks claimed
+authority — because two of the six breaches are caused by bytes a line cannot carry, and a
+rebuilt part reaches a pass. A power cut and a
 watchdog reset are modelled differently rather than relabelled — a brownout tears a program
 inside a unit, a watchdog reset lets the controller finish or abandon it whole — and the census
 over three write points and two reset causes fails closed on an uncovered cell. The rig is

@@ -34,7 +34,7 @@ use waymaker_flash::storage::Geometry;
 use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::Rig;
+use waymaker_rig::run::{Rig, Verdict};
 use waymaker_rig::wear::{Metered, Wear};
 
 /// The seed every published figure is measured at.
@@ -124,7 +124,7 @@ pub fn measure_part(part: &'static str, geometry: Geometry) -> Result<PartWear, 
             .map_err(|error| fail(&format!("cannot be written ({error:?})")))?;
         (metered.wear(), metered.rig_wear())
     };
-    match rig.verify(0, &mut device, &mut page) {
+    match rig.verify(0, &mut device, &mut page).map(Verdict::outcome) {
         Ok(Outcome::Passed) => {}
         Ok(Outcome::Breached(breach)) => {
             return Err(fail(&format!(

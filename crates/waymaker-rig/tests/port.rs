@@ -149,7 +149,7 @@ fn a_whole_run_writes_and_recovers_through_the_embedded_storage_port() {
     let outcome = rig
         .verify(0, &mut storage, &mut page)
         .expect("a verdict from the port");
-    assert_eq!(outcome, Outcome::Passed);
+    assert_eq!(outcome.outcome(), Outcome::Passed);
 }
 
 #[test]

@@ -99,6 +99,47 @@ pub enum RigError<E, D = core::convert::Infallible> {
     Geometry(GeometryError),
 }
 
+/// What a verification found, and the evidence it found it from.
+///
+/// # Why the evidence travels with the outcome
+///
+/// A breach code says *which* guarantee broke. It does not say what recovery produced, and
+/// for two of the six that is the whole of the difference: a `RecordDiffers` is caused by the
+/// bytes on the part, and an `Authority` by the state of two bank seals — neither of which a
+/// log line can carry and neither of which survives rebuilding a part from the seed. So the
+/// verdict carries what was *observed*: how many records the audit accepted, and how many
+/// banks claimed authority.
+///
+/// That is what makes a logged breach investigable rather than merely named. Without it, a
+/// line reading `record-differs` tells a reader that history diverged and not where, and the
+/// only way to find out is to still have the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Verdict {
+    outcome: Outcome,
+    recovered: u16,
+    banks: usize,
+}
+
+impl Verdict {
+    /// What the guarantees said.
+    #[must_use]
+    pub const fn outcome(self) -> Outcome {
+        self.outcome
+    }
+
+    /// How many records the audit accepted before it reached that outcome.
+    #[must_use]
+    pub const fn recovered(self) -> u16 {
+        self.recovered
+    }
+
+    /// How many banks claimed authority.
+    #[must_use]
+    pub const fn banks(self) -> usize {
+        self.banks
+    }
+}
+
 /// Where an iteration stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stop {
@@ -719,7 +760,7 @@ impl Rig {
         iteration: u32,
         part: &mut S,
         page: &mut [u8],
-    ) -> Result<Outcome, RigError<S::Error>> {
+    ) -> Result<Verdict, RigError<S::Error>> {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
         }
@@ -727,7 +768,13 @@ impl Rig {
             let mut instrument = self.instrument(part)?;
             match Witness::new(self.witness).scan(&mut instrument, page) {
                 Ok(progress) => progress,
-                Err(_) => return Ok(Outcome::Breached(Breach::WitnessUnreadable)),
+                Err(_) => {
+                    return Ok(Verdict {
+                        outcome: Outcome::Breached(Breach::WitnessUnreadable),
+                        recovered: 0,
+                        banks: 0,
+                    });
+                }
             }
         };
         self.judge(iteration, part, progress, page)
@@ -764,7 +811,7 @@ impl Rig {
         part: &mut S,
         progress: Progress,
         page: &mut [u8],
-    ) -> Result<Outcome, RigError<S::Error>> {
+    ) -> Result<Verdict, RigError<S::Error>> {
         // Checked here as well as in `verify`, because this is a public entry point of its
         // own: `crate::log`'s reconstruction calls it directly, and a short page that reached
         // the scan would surface as a decode failure — which this function reads as "history
@@ -776,11 +823,18 @@ impl Rig {
         let mut engine = self.engine(part)?;
         let banks = self.authoritative_banks(&mut engine, page)?;
 
-        // A bank whose header did not survive is a bank with no journal to walk. The
-        // authority count is still a verdict, so the audit is finished on it rather than
-        // abandoned.
-        let Ok(region) = self.journal_region(&mut engine, page) else {
-            return Ok(finish(Audit::new(workload, progress), banks));
+        // A bank whose header did not survive is a bank with no journal to walk, and the
+        // authority count is still a verdict — so the audit is finished on it rather than
+        // abandoned. But *only* that case: `journal_region` reads media, and a blanket `Ok`
+        // here turned a device that had gone unreadable into an audit over zero records,
+        // which an empty witness reports as `Passed`. The instrument failing is not the
+        // subject passing.
+        let region = match self.journal_region(&mut engine, page) {
+            Ok(region) => region,
+            Err(RigError::Bank) => {
+                return Ok(finish(Audit::new(workload, progress), banks));
+            }
+            Err(error) => return Err(error),
         };
 
         let mut audit = Audit::new(workload, progress);
@@ -790,7 +844,11 @@ impl Rig {
             match step {
                 Ok(record) => {
                     if let Err(breach) = audit.saw(&record, &mut expected) {
-                        return Ok(Outcome::Breached(breach));
+                        return Ok(Verdict {
+                            outcome: Outcome::Breached(breach),
+                            recovered: audit.recovered(),
+                            banks,
+                        });
                     }
                 }
                 // A *decode* failure is history ending: a torn frame, an unsealed one, erased
@@ -814,22 +872,18 @@ impl Rig {
         Ok(finish(audit, banks))
     }
 
-    /// A log entry for `iteration`: the outcome, the wear it cost, and the witness the
-    /// verdict was computed against.
+    /// A log entry for `iteration`: the verdict and its evidence, the wear it cost, and the
+    /// witness the verdict was computed against.
     ///
-    /// The witness is not decoration. A seed and an iteration rebuild the *run*, and §14's
-    /// guarantees are statements about what the rig **knew** — so a line without it is a line
-    /// a violation is reproducible from only while the host still has the device.
+    /// None of the three is decoration. A seed and an iteration rebuild the *run*; §14's
+    /// guarantees are statements about what the rig **knew**, which is the witness; and the
+    /// verdict's evidence is what recovery actually produced, which no amount of rebuilding
+    /// recovers — see [`Verdict`].
     #[must_use]
-    pub const fn entry(
-        &self,
-        iteration: u32,
-        outcome: Outcome,
-        wear: Wear,
-        progress: Progress,
-    ) -> Entry {
+    pub fn entry(&self, iteration: u32, verdict: Verdict, wear: Wear, progress: Progress) -> Entry {
         Entry::new(self.plan.seed(), iteration, self.part, self.effects)
-            .with_outcome(outcome)
+            .with_outcome(verdict.outcome())
+            .with_evidence(verdict.recovered(), verdict.banks())
             .with_wear(wear)
             .with_progress(progress)
     }
@@ -844,11 +898,17 @@ struct DispatchStep<'part, 'storage, S, D, C> {
     cutter: &'part mut C,
 }
 
-/// Turns an audit's closing verdict into an outcome.
-const fn finish(audit: Audit, banks: usize) -> Outcome {
-    match audit.finish(banks) {
+/// Turns an audit's closing verdict into a verdict, evidence and all.
+const fn finish(audit: Audit, banks: usize) -> Verdict {
+    let recovered = audit.recovered();
+    let outcome = match audit.finish(banks) {
         Ok(()) => Outcome::Passed,
         Err(breach) => Outcome::Breached(breach),
+    };
+    Verdict {
+        outcome,
+        recovered,
+        banks,
     }
 }
 

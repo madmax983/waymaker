@@ -13,8 +13,12 @@
 //! * **the geometry** — a violation reproduced on a different part is a different violation.
 //!   Four `u32`s: the capacity and the three units.
 //! * **the effect count** — the run's shape.
-//! * **the outcome** — a [`Breach`] code and its one detail field, so the host reproduces the
-//!   failure it was told about rather than whichever one it happens to find.
+//! * **the outcome, and its evidence** — a [`Breach`] code and its one detail field, plus what
+//!   recovery actually produced: how many records the audit accepted, and how many banks
+//!   claimed authority. The code alone says *which* guarantee broke; for a `record-differs` or
+//!   an `authority` that is caused by the bytes on the part, and those do not survive
+//!   rebuilding a part from the seed. Without the evidence a logged breach names a failure and
+//!   leaves no way to look into it but still having the device.
 //! * **the witness** — the three high waters, the mark count and the tear flag. This is the
 //!   field that makes the "done when" true rather than nearly true: the seed rebuilds the
 //!   *run*, but §14's guarantees are entirely statements about what the rig **knew**, and
@@ -45,7 +49,7 @@ use crate::wear::Wear;
 use crate::witness::Progress;
 
 /// How many bytes an encoded entry occupies.
-pub const ENTRY_BYTES: usize = 88;
+pub const ENTRY_BYTES: usize = 92;
 
 /// The magic an entry opens with.
 const ENTRY_MAGIC: u16 = 0x4752;
@@ -280,6 +284,8 @@ pub struct Entry {
     read_size: u32,
     effects: u16,
     outcome: Outcome,
+    recovered: u16,
+    banks: u16,
     wear: Wear,
     progress: Progress,
 }
@@ -303,9 +309,36 @@ impl Entry {
             read_size: geometry.read_size(),
             effects,
             outcome: Outcome::Passed,
+            recovered: 0,
+            banks: 0,
             wear: Wear::NONE,
             progress: Progress::EMPTY,
         }
+    }
+
+    /// This entry with what recovery was observed to produce.
+    ///
+    /// Saturating in `banks`: it is a count of sealed banks, so two is the interesting value
+    /// and anything a `u16` could not hold is a reading of media rather than a count.
+    #[must_use]
+    pub fn with_evidence(self, recovered: u16, banks: usize) -> Self {
+        Self {
+            recovered,
+            banks: u16::try_from(banks).unwrap_or(u16::MAX),
+            ..self
+        }
+    }
+
+    /// How many records the audit accepted before it reached this entry's outcome.
+    #[must_use]
+    pub const fn recovered(self) -> u16 {
+        self.recovered
+    }
+
+    /// How many banks claimed authority when this entry's outcome was reached.
+    #[must_use]
+    pub const fn banks(self) -> u16 {
+        self.banks
     }
 
     /// This entry with the witness the verdict was computed against.
@@ -422,6 +455,8 @@ impl Entry {
             writer.u32(self.program_size)?;
             writer.u32(self.read_size)?;
             writer.u32(self.outcome.detail())?;
+            writer.u16(self.recovered)?;
+            writer.u16(self.banks)?;
             writer.wear(self.wear)?;
             writer.progress(self.progress)?;
             Some(writer.at)
@@ -506,13 +541,24 @@ impl Entry {
         if version != Self::FORMAT_VERSION {
             return Err(LogError::UnknownVersion { version });
         }
-        let (Some(capacity), Some(erase_size), Some(program_size), Some(read_size), Some(detail)) = (
+        let (
+            Some(capacity),
+            Some(erase_size),
+            Some(program_size),
+            Some(read_size),
+            Some(detail),
+            Some(recovered),
+            Some(banks),
+        ) = (
             reader.u32(),
             reader.u32(),
             reader.u32(),
             reader.u32(),
             reader.u32(),
-        ) else {
+            reader.u16(),
+            reader.u16(),
+        )
+        else {
             return Err(LogError::NotAnEntry);
         };
         let (Some(wear), Some(progress)) = (reader.wear(), reader.progress()) else {
@@ -531,6 +577,8 @@ impl Entry {
             read_size,
             effects,
             outcome,
+            recovered,
+            banks,
             wear,
             progress,
         })

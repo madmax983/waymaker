@@ -1041,8 +1041,15 @@ pub const RIG_RUN_PATH: &str = "waymaker-rig/src/run.rs";
 /// `Rig::new` refuses a too-small instrument against, and a caller sizing a witness region
 /// needs the same number. It grants nothing: it is a pure function of an effect count.
 ///
+/// `outcome`, `recovered` and `banks` are `Verdict`'s accessors. They are what makes a logged
+/// breach investigable rather than merely named — a `record-differs` is caused by bytes a log
+/// line cannot carry, so the line carries what recovery *produced* instead. Read-only, and on
+/// a type the rig constructs: there is no way to build a `Verdict` from outside this file,
+/// which is what keeps them evidence rather than an input.
+///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 pub const RIG_RUN_SURFACE: &[&str] = &[
+    "banks",
     "cut_at",
     "effects",
     "entry",
@@ -1052,9 +1059,11 @@ pub const RIG_RUN_SURFACE: &[&str] = &[
     "layout",
     "marks_per_run",
     "new",
+    "outcome",
     "part",
     "plan",
     "prepare",
+    "recovered",
     "verify",
     "witness_region",
     "workload",

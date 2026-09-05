@@ -17,7 +17,7 @@ use waymaker_rig::audit::Breach;
 use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::Rig;
+use waymaker_rig::run::{Rig, Verdict};
 use waymaker_rig::wear::{Metered, Traffic};
 use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Mark, Stage, Witness};
@@ -188,7 +188,9 @@ fn breaches(flaw: Flaw) -> Vec<Breach> {
         let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
             continue;
         };
-        if let Ok(Outcome::Breached(breach)) = rig.verify(0, &mut device, &mut page) {
+        if let Ok(verdict) = rig.verify(0, &mut device, &mut page)
+            && let Outcome::Breached(breach) = verdict.outcome()
+        {
             found.push(breach);
         }
     }
@@ -218,7 +220,7 @@ fn the_control_writer_is_caught_by_nothing() {
             continue;
         };
         assert_eq!(
-            rig.verify(0, &mut device, &mut page),
+            rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
             Ok(Outcome::Passed),
             "the real writer was caught at {:?}",
             run.injection()
