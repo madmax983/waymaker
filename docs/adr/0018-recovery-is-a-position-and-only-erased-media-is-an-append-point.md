@@ -39,10 +39,18 @@ its own header checksum on every boot for ever.
 The same shape [ADR 0008](0008-the-replay-cursor-is-pumped-by-its-caller.md) chose for the
 replay cursor, for the same reason: the lifetime on the answer is the *page's*, not
 `&mut self`'s, so the caller may overwrite its page the moment it has dealt with a record and
-one page is enough for a history of any length. `Recovery` is 24 bytes — a region, an offset
-and a verdict — and `const _: () = assert!(size_of::<Recovery>() == 24)` fails a build for one
-that grew a buffer. The equality is the point, as it is for the cursor: a `<=` leaves room to
-hide a page in.
+one page is enough for a history of any length.
+
+`Recovery` is **40 bytes** — a 28-byte region, a four-byte offset and an eight-byte verdict —
+and three `const` assertions fail a build for one that grew a buffer:
+`size_of::<JournalRegion>() == 28`, `size_of::<Recovery>() == 40`, and the sum of the two
+restated, so a field added to either moves a number rather than fitting under a ceiling. The
+equalities are the point, as they are for the cursor: a `<=` leaves room to hide a page in.
+
+Sixteen of those forty bytes are the `Geometry` the region carries, which decision 2 below
+argues for; it is stack rather than `.bss`, and §04's runtime-RAM row measures statics. An
+earlier draft of this ADR recorded 24 bytes and a 24-byte assertion, from before the region
+carried the geometry — Codex caught the record understating the type by exactly that sixteen.
 
 Nothing about this is `Iterator`. A lending iterator needs GATs and a lifetime the type would
 have to name, for ergonomics only; the manual pump is the same thing with a name, and it lets
@@ -64,15 +72,21 @@ eight, `validate_read` admits a base of 1, a recovery of an erased region there 
 end at offset 0, and the absolute offset a caller would then program is 1. Codex found that on
 pull request #74; `a_region_a_driver_could_read_but_never_program_is_refused` is it as a test.
 
-The region also **keeps** the geometry. Reading the units back off whichever `StableStorage` a
+The region also **keeps** the geometry, and every step **compares it** with the storage it is
+handed. Reading the units back off whichever `StableStorage` a
 caller hands to `next` would prove every bound against a different device from the one they
 were established on: a region built at granularity 4 and walked on a device that reads sixteen
 bytes at a time rounds a 24-byte frame up to a 32-byte read and runs eight bytes past the
 region's end, into the generation seal or the neighbouring bank. Two independent reviews found
-that, one of them with a running reproduction. Carrying the geometry makes it unrepresentable
-rather than guarded, and a caller that hands over a device the region does not describe now
-gets a refusal from the driver's own validation instead — the failure closing in the right
-direction.
+that, one of them with a running reproduction.
+
+Carrying the geometry fixes the read bound. It does not on its own fix the *append* guarantee,
+which is the half Codex found next: a region built where the program unit is one byte reads
+perfectly on a device that programs eight — every read is one byte aligned — reports a clean
+end, and hands back an offset that device must refuse. So the two geometries are compared on
+every step, with `RecoveryError::WrongDevice` before a byte is read. Four integer comparisons
+per record against an anti-bricking guarantee, and it turns "the caller must hand over the
+right device" from an obligation nothing checks into a refusal.
 
 `of` is also the one call that welds the *writer's* granularity to the *reader's*:
 `journal_offset` comes from the header on media, `payload_bytes` from the layout in hand. It

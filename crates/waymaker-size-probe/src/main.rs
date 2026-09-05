@@ -1092,6 +1092,7 @@ const fn recovery_error_cost(
 
     match error {
         RecoveryError::PageTooSmall { needed } => *needed,
+        RecoveryError::WrongDevice => 1,
         RecoveryError::Storage(inner) => inner.message().len(),
         RecoveryError::Decode(inner) => inner.message().len(),
     }

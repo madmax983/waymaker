@@ -501,6 +501,44 @@ fn a_device_that_cannot_be_read_ends_a_recovery_without_a_prefix_or_an_offset() 
 // ---------------------------------------------------------------------------------------
 
 #[test]
+fn a_recovery_refuses_a_device_its_region_was_not_validated_against() {
+    // Codex's second finding on pull request #74. Carrying the geometry in the region stops
+    // the *reads* being proved against the wrong device; it does not on its own stop the
+    // *append offset* being about the wrong one. A region built where the program unit is a
+    // single byte reads perfectly on a device that programs eight — every read is one byte
+    // aligned — reports a clean end, and hands back an offset that device must refuse.
+    //
+    // So the two are compared, and the refusal comes before a byte is read.
+    let fine = Geometry::new(8192, 4096, 1, 1).expect("programs and reads one");
+    let coarse = Geometry::new(8192, 4096, 8, 1).expect("programs eight, reads one");
+    let journal = region(fine, 1, 512, 1);
+    assert_eq!(
+        coarse.validate_program(journal.base(), 8),
+        Err(GeometryError::MisalignedOffset),
+        "the offset this region would hand back is not programmable on the other device"
+    );
+
+    let mut other = Nor::new(coarse);
+    let mut recovery = Recovery::new(journal);
+    let mut page = [0_u8; PAGE];
+    assert_eq!(
+        recovery.next(&mut other, &mut page),
+        Some(Err(RecoveryError::WrongDevice))
+    );
+    assert_eq!(recovery.ending(), Some(Ending::Incomplete { at: 0 }));
+    assert_eq!(recovery.append_offset(), None);
+    assert!(other.spans.is_empty(), "it refused before reading anything");
+
+    // And the device the region *was* built against still works, so this is a refusal rather
+    // than a rule nobody can satisfy.
+    let mut own = Nor::new(fine);
+    let mut sound = Recovery::new(journal);
+    let (seen, ending) = drain(&mut own, &mut sound);
+    assert!(seen.is_empty());
+    assert_eq!(ending, Some(Ending::Clean { append_at: 0 }));
+}
+
+#[test]
 fn an_append_offset_is_only_ever_erased_media() {
     // The invariant the whole type exists for, stated as a property rather than as a case:
     // whenever an append offset comes back at all, every byte from it to the end of the
@@ -1170,6 +1208,28 @@ fn a_bank_whose_header_fills_it_has_no_journal() {
         JournalRegion::of(layout, BankId::A, &header),
         Err(RegionError::NoJournalRoom)
     );
+}
+
+#[test]
+fn every_recovery_error_is_a_distinct_shape() {
+    // `RecoveryError` carries no `message` of its own — see its documentation — so what a
+    // test can hold is that the variants are distinguishable, which is what a caller's
+    // `match` rests on.
+    let errors: [RecoveryError<GeometryError>; 4] = [
+        RecoveryError::Storage(GeometryError::OutOfBounds),
+        RecoveryError::Decode(DecodeError::Truncated),
+        RecoveryError::PageTooSmall { needed: 16 },
+        RecoveryError::WrongDevice,
+    ];
+    for (left, one) in errors.iter().enumerate() {
+        for (right, other) in errors.iter().enumerate() {
+            assert_eq!(
+                left == right,
+                one == other,
+                "two errors compare equal: {one:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -434,6 +434,19 @@ pub enum RecoveryError<E> {
     Storage(E),
     /// A frame was not the record it claimed to be.
     Decode(DecodeError),
+    /// The storage handed to a step is not the device the region was validated against.
+    ///
+    /// Every bound this module keeps — that a read is aligned and inside the region, that a
+    /// frame's padded stride lands where a record may be written — was established against
+    /// one [`Geometry`], at construction. A step given a different device would be answering
+    /// about that device with arithmetic proved about another, and the failure is silent in
+    /// the direction that matters: a region built where the program unit is one byte and
+    /// walked on a device that programs eight reads perfectly well, reports a clean end, and
+    /// hands back an append offset the second device must refuse.
+    ///
+    /// So the two are compared rather than assumed equal, on every step. It is four integer
+    /// comparisons against an anti-bricking guarantee.
+    WrongDevice,
     /// The caller's page cannot hold what the next step has to stage.
     ///
     /// Not damage: the journal may be perfectly sound and this device simply cannot read a
@@ -657,6 +670,13 @@ impl<C: IntegrityCheck> Recovery<C> {
     ) -> Option<Result<Staged, RecoveryError<S::Error>>> {
         if self.ending.is_some() {
             return None;
+        }
+        // The region carries the device it was validated against, and this is what makes that
+        // more than bookkeeping: a step on any other device is refused before a byte is read.
+        // Codex found the half that survived carrying the geometry — reads that all succeed,
+        // a clean ending, and an append offset the *caller's* device cannot program at.
+        if storage.geometry() != self.region.geometry {
+            return Some(Err(self.incomplete(RecoveryError::WrongDevice)));
         }
         let read_unit = self.region.geometry.read_size();
         let remaining = self.region.bytes.saturating_sub(self.offset);
