@@ -161,6 +161,20 @@ fn run_size(args: &[String]) -> ExitCode {
     }
     println!("wrote {}", json.display());
 
+    // Issue #27: "the measured write amplification per effect is published alongside the
+    // size report". Measured here, in the same command, so a run that produced section sizes
+    // and no wear figure is a run that failed rather than one that printed less.
+    let Ok(wear) = xtask::wear::measure().inspect_err(|error| eprintln!("xtask: {error}")) else {
+        return ExitCode::FAILURE;
+    };
+    print!("{}", xtask::wear::render(&wear));
+    let wear_json = root.join(xtask::wear::REPORT_PATH);
+    if let Err(error) = std::fs::write(&wear_json, xtask::wear::to_json(&wear)) {
+        eprintln!("xtask: cannot write {}: {error}", wear_json.display());
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {}", wear_json.display());
+
     print!("{}", baseline_diff(&root, &options, &report));
 
     report.shortfall_report().map_or_else(

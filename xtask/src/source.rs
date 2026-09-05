@@ -967,6 +967,97 @@ pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Viola
     )
 }
 
+/// The file whose public surface [`check_rig_oracle`] pins: the rig's oracle.
+pub const RIG_AUDIT_PATH: &str = "waymaker-rig/src/audit.rs";
+
+/// The file whose public surface [`check_rig_oracle`] also pins: the rig's census.
+///
+/// The census lives apart from `phase.rs` for this rule's sake: `Phase` and `ResetCause` each
+/// declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell
+/// two such declarations apart — which is exactly the hole
+/// `check_pinned_surface`'s duplicate check refuses to leave open.
+pub const RIG_CENSUS_PATH: &str = "waymaker-rig/src/census.rs";
+
+/// Every public function the rig's oracle is allowed to have.
+///
+/// Issue [#27](https://github.com/madmax983/waymaker/issues/27) asks for a rig that "verifies
+/// recovery against the oracle". The whole of that is an *absence*, and it is the same
+/// absence [`APPEND_SURFACE`] and [`CAPACITY_SURFACE`] pin: an `Audit::assume_passed`, an
+/// `Audit::ignore`, a `Breach::suppress` or a second `finish` that took the authority count
+/// as advisory would each break no other rule, need no dependency, pass every test that
+/// exists — and turn an instrument into a formality.
+///
+/// A rig is the one piece of code in this workspace whose bugs are *invisible*: a firmware
+/// bug shows up as a failing test, and a rig bug shows up as a passing one.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_AUDIT_SURFACE: &[&str] = &[
+    "code",
+    "finish",
+    "fmt",
+    "name",
+    "name_of_code",
+    "new",
+    "progress",
+    "recovered",
+    "saw",
+];
+
+/// Every public function the rig's census is allowed to have.
+///
+/// `Coverage::verdict` is what makes "the rig ran
+/// for an hour" different from "the rig covered the six cells", and issue #27 asks for both
+/// reset causes at all three write points. A `Coverage::force_complete`, a
+/// `Coverage::assume_covered` or a `Gap::ignore` would each give that back in one line.
+///
+/// `saturated` is on the list deliberately: it raises a cell to its ceiling, which the census
+/// already treats as covered, so it grants nothing a long run would not. It exists because
+/// the saturation behaviour is otherwise only reachable by four billion iterations, and an
+/// overflow rule nobody can test is an overflow rule nobody has tested.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_CENSUS_SURFACE: &[&str] = &[
+    "cause",
+    "fmt",
+    "iterations",
+    "phase",
+    "record",
+    "saturated",
+    "total",
+    "verdict",
+];
+
+/// Rule: the rig's oracle and its census are exactly the surfaces that were reviewed.
+///
+/// Two files, one rule id, because they are one decision: what the instrument is obliged to
+/// notice. A rig that could be told to overlook a breach, or to call a run covered that was
+/// not, is a rig whose green runs mean nothing — and unlike every other pin in this file, the
+/// failure it prevents is silent by construction.
+#[must_use]
+pub fn check_rig_oracle(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    let mut violations = check_pinned_surface(
+        "rig-oracle",
+        "waymaker-rig",
+        RIG_AUDIT_PATH,
+        RIG_AUDIT_SURFACE,
+        sources,
+        "the oracle's public API is where design document \u{a7}14's guarantees are actually \
+         demanded of a recovery, so a way to pass without demanding them cannot be added \
+         without a reviewer writing it down",
+    );
+    violations.extend(check_pinned_surface(
+        "rig-oracle",
+        "waymaker-rig",
+        RIG_CENSUS_PATH,
+        RIG_CENSUS_SURFACE,
+        sources,
+        "the census is what makes an uncovered cell a refusal rather than a silence, so a \
+         way to call a run covered that was not cannot be added without a reviewer writing \
+         it down",
+    ));
+    violations
+}
+
 /// The file whose public surface and typestate [`check_commit_discipline`] pins.
 pub const APPEND_SURFACE_PATH: &str = "waymaker-flash/src/append.rs";
 
@@ -6815,6 +6906,18 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_recovery_surface() -> String {
         surface("A recovery module.", RECOVERY_SURFACE)
+    }
+
+    /// A `waymaker-rig` oracle whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_rig_audit() -> String {
+        surface("A rig oracle.", super::RIG_AUDIT_SURFACE)
+    }
+
+    /// A `waymaker-rig` census whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_rig_census() -> String {
+        surface("A rig census.", super::RIG_CENSUS_SURFACE)
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.
