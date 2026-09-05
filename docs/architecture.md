@@ -147,42 +147,53 @@ graph LR
     f5["+10 · 2B<br/>header_crc<br/>u16 LE"]
     f0 --- f1 --- f2 --- f3 --- f4 --- f5
   end
-  subgraph rest["body and trailer"]
+  subgraph rest["body and trailer · programmed first"]
     direction LR
     f6["+12 · N bytes<br/>payload [payload_len]<br/>opaque to the kernel"]
     f7["+12+N · 4B<br/>payload_crc<br/>u32 LE · frame_crc in code"]
     f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
     f6 --- f7 --- f8
   end
+  subgraph committed["commit seal · programmed after the payload barrier"]
+    direction LR
+    f9["one program unit<br/>commit_seal<br/>frame_crc, bit 7 cleared, repeated"]
+  end
   header --> rest
+  rest -- "payload barrier" --> committed
 
   c1(["header_crc covers +0..+10"])
   c2(["payload_crc covers +0..+12+N — the header as well as the payload"])
-  c3(["commit_seal · a storage-program unit, not a field · rung 0.2"])
+  c3(["no byte of a seal is 0xFF, so erased media is never a seal and a torn one is never whole"])
 
   f5 -.- c1
   f7 -.- c2
-  f8 -.- c3
+  f9 -.- c3
 
   classDef field fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
-  class f0,f1,f2,f3,f4,f5,f6,f7,f8 field;
+  class f0,f1,f2,f3,f4,f5,f6,f7,f8,f9 field;
   class c1,c2,c3 note;
 ```
 
 `payload_crc` is §09's name for the field and `frame_crc` is what `waymaker-flash` calls it,
 because it covers the header as well as the payload: that binds a payload to its header,
 and it stops a record with an empty payload having a checksum of zero, which a zeroed page
-would satisfy. `commit_seal` is a storage-program unit rather than a field, written after a
-barrier, and it is what makes a frame *committed* rather than merely present — which is why
-it hangs off the picture rather than sitting in it. It arrives with the barrier protocol at
-rung 0.2. Until then the append scan treats a frame whose checksums hold as history, so a
-torn write at the tail of a journal is not distinguishable from damage there. Both stop the
-scan in the same place, which is what §14 requires either way.
+would satisfy.
 
-Everything after the frame is padding, up to the device's program granularity from §12's
+`commit_seal` is a storage-program unit rather than a field, and it is what makes a frame
+*committed* rather than merely present. It is separated from the frame by a barrier rather
+than by a gap: §07 writes the body, waits for the **payload barrier**, and only then programs
+the seal — so a seal on media is a promise that the frame before it is already durable. Its
+content is the frame's own `frame_crc` with bit 7 of each byte cleared, repeated to fill the
+unit, and the cleared bit is what makes the promise checkable. No byte of a seal is ever
+`0xFF`, so an erased program unit is never a seal and a seal interrupted part-way through its
+own program always ends in erased bytes. `waymaker-flash`'s `append` module is the writer
+that cannot take the two steps out of order, and `Ending::Unsealed` is what a reader reports
+when it meets a frame with no seal over it.
+
+Between the frame and its seal is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
-interpreted: the decoder reports the frame's own length, and the scan is what applies the
+interpreted: the decoder reports the frame's own length, and the reader is what applies the
 stride.
 
 ## Cold-start replay

@@ -202,6 +202,7 @@ fn engine() -> usize {
 
     kept = kept.wrapping_add(record_codec());
     kept = kept.wrapping_add(journal_recovery());
+    kept = kept.wrapping_add(journal_append());
     kept = kept.wrapping_add(replay_cursor());
     kept = kept.wrapping_add(transition_table());
 
@@ -1062,10 +1063,13 @@ fn recovery_walk(
     kept = kept.wrapping_add(recovery.offset() as usize);
     kept = kept.wrapping_add(match recovery.ending() {
         Some(Ending::Clean { append_at }) => append_at as usize,
-        Some(Ending::Damaged { at } | Ending::Incomplete { at }) => at as usize,
+        Some(Ending::Damaged { at } | Ending::Incomplete { at } | Ending::Unsealed { at }) => {
+            at as usize
+        }
         None => 0,
     });
     kept = kept.wrapping_add(recovery.append_offset().unwrap_or(0) as usize);
+    kept = kept.wrapping_add(recovery.region().bytes() as usize);
 
     // The page-too-small refusal, which is the one ending a caller cannot reach by having a
     // damaged device: a record longer than the page it was handed.
@@ -1096,6 +1100,129 @@ const fn recovery_error_cost(
         RecoveryError::Storage(inner) => inner.message().len(),
         RecoveryError::Decode(inner) => inner.message().len(),
     }
+}
+
+/// The two-barrier write discipline, and the seal a record is committed by.
+///
+/// Issue [#24](https://github.com/madmax983/waymaker/issues/24), and the row of the delta a
+/// device pays on every effect rather than only on boot. Every public function of
+/// `waymaker_flash::append` and every seal helper of `waymaker_flash::frame` is called from
+/// here, which is `size-probe-reach`'s requirement, and both halves of the protocol are
+/// linked: a write that reaches its commit barrier and a page too small to stage one.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn journal_append() -> usize {
+    use waymaker_core::{EffectSeq, RecordRef};
+    use waymaker_flash::append::{Journal, WriteAmplification};
+    use waymaker_flash::frame::{self, ProgramAlign};
+    use waymaker_flash::integrity::Catalogued;
+    use waymaker_flash::recovery::{JournalRegion, Recovery};
+    use waymaker_flash::storage::Geometry;
+
+    let Ok(geometry) = Geometry::new(
+        core::hint::black_box(512),
+        core::hint::black_box(256),
+        core::hint::black_box(4),
+        core::hint::black_box(1),
+    ) else {
+        return 0;
+    };
+    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
+        return 0;
+    };
+    let Ok(region) = JournalRegion::spanning(geometry, 0, core::hint::black_box(128), align) else {
+        return 0;
+    };
+
+    // The seal, as bytes: the pattern a frame deserves, the width it occupies, and the
+    // check a reader makes. All three are on the recovery path of every boot.
+    let pattern = frame::commit_seal(core::hint::black_box(0x1234_5678));
+    let mut kept = frame::seal_bytes(align);
+    kept = kept.wrapping_add(usize::from(frame::commit_seal_holds(
+        core::hint::black_box(0x1234_5678),
+        &pattern,
+    )));
+
+    let record = RecordRef::EffectCompleted {
+        seq: EffectSeq(core::hint::black_box(1)),
+        result: core::hint::black_box(b"ok"),
+    };
+    kept = kept.wrapping_add(frame::body_len(&record, align).unwrap_or(0));
+
+    // A writer is reachable only from a finished recovery, so the probe links the boot that
+    // produces one. `ProbeMedia` reads nothing into the page, so the scan meets an erased
+    // header and ends cleanly, which is the ending `Journal::after` accepts.
+    let mut media = ProbeMedia { geometry };
+    let mut page = [0_u8; 64];
+    let mut recovery = Recovery::<Catalogued>::with_integrity(region);
+    while recovery.next(&mut media, &mut page).is_some() {}
+    let Some(mut journal) = Journal::after(&recovery) else {
+        return core::hint::black_box(kept);
+    };
+    kept = kept
+        .wrapping_add(journal.offset() as usize)
+        .wrapping_add(journal.room() as usize);
+
+    let mut staging = [0_u8; 64];
+    kept = kept.wrapping_add(
+        match journal
+            .stage(&mut media, &record, &mut staging)
+            .and_then(|staged| staged.payload_barrier(&mut media))
+            .and_then(|sealable| sealable.commit(&mut media))
+        {
+            Ok(written) => amplification_cost(written.plus(journal.amplification())),
+            Err(error) => append_error_cost(&error),
+        },
+    );
+
+    // And the refusal a caller with a page too small meets, so the delta charges for the
+    // arm that declines rather than only for the one that writes. The staged arm is already
+    // linked above, so this one only has to reach the error.
+    let mut crumb = [0_u8; 4];
+    kept = kept.wrapping_add(match journal.stage(&mut media, &record, &mut crumb) {
+        Ok(_staged) => 0,
+        Err(error) => append_error_cost(&error),
+    });
+    kept = kept.wrapping_add(amplification_cost(WriteAmplification::NONE));
+
+    core::hint::black_box(kept)
+}
+
+/// Every counter a write amplification reports, so the delta charges for all of them.
+#[cfg(feature = "engine")]
+const fn amplification_cost(written: waymaker_flash::append::WriteAmplification) -> usize {
+    (written.payload_bytes() as usize)
+        .wrapping_add(written.programmed_bytes() as usize)
+        .wrapping_add(written.program_operations() as usize)
+        .wrapping_add(written.barriers() as usize)
+        .wrapping_add(written.overhead_bytes() as usize)
+}
+
+/// Every arm of an append's refusal.
+///
+/// `AppendError` carries no `message` of its own — see its documentation for why — so this
+/// is what a driver's own reporting looks like, and linking it is what makes the row honest.
+#[cfg(feature = "engine")]
+const fn append_error_cost(
+    error: &waymaker_flash::append::AppendError<waymaker_flash::storage::GeometryError>,
+) -> usize {
+    use waymaker_flash::append::AppendError;
+
+    match error {
+        AppendError::Storage(inner) => inner.message().len(),
+        AppendError::Encode(inner) => inner.message().len(),
+        AppendError::WrongDevice => 1,
+        AppendError::NoRoom { needed, available } => {
+            (*needed as usize).wrapping_add(*available as usize)
+        }
+    }
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn journal_append() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.

@@ -280,14 +280,14 @@ const fn payload_len(record: &RecordRef<'_>) -> usize {
 /// Total: a short buffer, a failed checksum and an unknown kind are all `false`, so a
 /// caller asserts on the one thing these sweeps care about — whether damaged media
 /// produced a record.
-fn reads_as_a_record(bytes: &[u8]) -> bool {
+fn reads_as_a_record(bytes: &[u8], align: ProgramAlign) -> bool {
     matches!(
         frame::decode(bytes),
         Ok(frame::Frame {
             decoded: Decoded::Record(_),
             ..
         })
-    )
+    ) && matches!(Scan::new(bytes, align).next(), Some(Ok(_)))
 }
 
 /// The records a scan yields before it stops, and where it stopped.
@@ -387,25 +387,27 @@ fn the_header_seal_is_the_header_check_and_the_frame_seal_is_the_frame_check() {
     };
     let mut page = [0_u8; SCRATCH];
 
-    let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).unwrap();
-    let covered = written - FRAME_CRC_BYTES;
+    frame::encode(&record, ProgramAlign::BYTE, &mut page).unwrap();
+    // The frame body, which is where the two seals live. Past it is the commit seal, which
+    // is neither of them and is `tests/commit.rs`'s.
+    let body = frame::body_len(&record, ProgramAlign::BYTE).unwrap();
+    let covered = body - FRAME_CRC_BYTES;
     assert_eq!(
         page[HEADER_BYTES - HEADER_CRC_BYTES..HEADER_BYTES],
         Catalogued::header_check(&page[..HEADER_BYTES - HEADER_CRC_BYTES]).to_le_bytes()
     );
     assert_eq!(
-        page[covered..written],
+        page[covered..body],
         Catalogued::frame_check(&page[..covered]).to_le_bytes()
     );
 
-    let written = frame::encode_with::<Crc32c>(&record, ProgramAlign::BYTE, &mut page).unwrap();
-    let covered = written - FRAME_CRC_BYTES;
+    frame::encode_with::<Crc32c>(&record, ProgramAlign::BYTE, &mut page).unwrap();
     assert_eq!(
         page[HEADER_BYTES - HEADER_CRC_BYTES..HEADER_BYTES],
         Crc32c::header_check(&page[..HEADER_BYTES - HEADER_CRC_BYTES]).to_le_bytes()
     );
     assert_eq!(
-        page[covered..written],
+        page[covered..body],
         Crc32c::frame_check(&page[..covered]).to_le_bytes()
     );
 }
@@ -530,7 +532,7 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
                 torn[..cut].copy_from_slice(&page[..cut]);
 
                 assert!(
-                    !reads_as_a_record(&torn[..written]),
+                    !reads_as_a_record(&torn[..written], align),
                     "{record:?} at {bytes} torn after {cut} of {written} B decoded as a record"
                 );
                 // The refusal *kind* matters and is asserted rather than discarded. A tear
@@ -541,21 +543,26 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
                 let (yielded, failure, offset) = walk(&torn[..written], align);
                 assert_eq!(yielded, 0, "{record:?} at {bytes} torn after {cut} B");
                 assert_eq!(offset, 0);
+                // Three cases rather than two since issue #24. A tear before the frame
+                // body is complete fails a checksum; a tear after it and before the commit
+                // seal leaves a sound frame nothing says was committed, which is the
+                // *point* of the seal and is a different refusal.
                 assert_eq!(
                     failure,
-                    if cut == 0 {
-                        None
-                    } else {
-                        Some(DecodeError::IntegrityFailed)
+                    match cut {
+                        0 => None,
+                        cut if cut >= FRAME_OVERHEAD_BYTES + payload_len(&record) =>
+                            Some(DecodeError::Unsealed),
+                        _ => Some(DecodeError::IntegrityFailed),
                     },
                     "{record:?} at {bytes} torn after {cut} B"
                 );
                 units += 1;
             }
 
-            // The whole frame is the one prefix that is a record, which is what stops the
+            // The whole record is the one prefix that is a record, which is what stops the
             // sweep above from passing for the wrong reason.
-            assert!(reads_as_a_record(&page[..written]));
+            assert!(reads_as_a_record(&page[..written], align));
             // And at least one sample must tear somewhere other than at nothing, at every
             // alignment. Without this the sweep went vacuous at 16 and 256 the moment every
             // sample fitted inside one program unit, and nothing said so.
@@ -585,7 +592,7 @@ fn a_write_torn_inside_a_program_unit_is_never_read_as_a_record() {
             torn.fill(ERASED_BYTE);
             torn[..cut].copy_from_slice(&page[..cut]);
             assert!(
-                !reads_as_a_record(&torn[..written]),
+                !reads_as_a_record(&torn[..written], align),
                 "{record:?} torn after {cut} of {written} B decoded as a record"
             );
         }
@@ -638,10 +645,11 @@ fn a_torn_write_leaves_the_committed_prefix_of_earlier_records_intact() {
         // this assertion a scan that reported every tear as a clean end passed.
         assert_eq!(
             failure,
-            if cut == 0 {
-                None
-            } else {
-                Some(DecodeError::IntegrityFailed)
+            match cut {
+                0 => None,
+                cut if cut >= FRAME_OVERHEAD_BYTES + payload_len(&last) =>
+                    Some(DecodeError::Unsealed),
+                _ => Some(DecodeError::IntegrityFailed),
             },
             "torn after {cut} B of the last record"
         );
@@ -727,7 +735,7 @@ fn every_bit_a_partial_program_could_clear_is_caught() {
                     let mut damaged = page;
                     damaged[index] &= !(1 << bit);
                     assert!(
-                        !reads_as_a_record(&damaged[..padded]),
+                        !reads_as_a_record(&damaged[..padded], align),
                         "{record:?} at {bytes}, byte {index} bit {bit} cleared and still \
                          decoded"
                     );
@@ -754,21 +762,42 @@ fn damage_in_a_frames_padding_is_not_caught() {
         result: b"ok",
     };
     let mut page = [ERASED_BYTE; SCRATCH];
-    let padded = frame::encode(&record, align, &mut page).unwrap();
+    let written = frame::encode(&record, align, &mut page).unwrap();
+    let body = frame::body_len(&record, align).unwrap();
     let frame_len = FRAME_OVERHEAD_BYTES + payload_len(&record);
-    assert!(
-        padded > frame_len,
-        "this record must be padded to be a test"
-    );
+    assert!(body > frame_len, "this record must be padded to be a test");
 
-    for index in frame_len..padded {
+    for index in frame_len..body {
         let mut damaged = page;
         damaged[index] &= !1;
         assert!(
-            reads_as_a_record(&damaged[..padded]),
+            reads_as_a_record(&damaged[..written], align),
             "padding byte {index} is inside a seal after all, which would be an improvement"
         );
-        assert_eq!(walk(&damaged[..padded], align), (1, None, padded));
+        assert_eq!(walk(&damaged[..written], align), (1, None, written));
+    }
+
+    // The commit seal is not padding, and the boundary between them is worth asserting from
+    // both sides: every byte from `body` on is covered, so a bit cleared there is caught.
+    for index in body..written {
+        for bit in 0..8_u8 {
+            if page[index] & (1 << bit) == 0 {
+                // Already zero: a program cycle cannot change it, so there is no failure
+                // here to detect — the same rule every other one-way-bit sweep in this file
+                // follows.
+                continue;
+            }
+            let mut damaged = page;
+            damaged[index] &= !(1 << bit);
+            assert!(
+                !reads_as_a_record(&damaged[..written], align),
+                "commit seal byte {index} bit {bit} was not covered"
+            );
+            assert_eq!(
+                walk(&damaged[..written], align),
+                (0, Some(DecodeError::Unsealed), 0)
+            );
+        }
     }
 }
 
@@ -803,7 +832,7 @@ fn only_the_header_seal_can_catch_a_header_edit_that_was_resealed_at_the_frame()
             // Every other byte must be the header seal's refusal, and none of them may
             // decode.
             assert!(
-                !reads_as_a_record(&damaged[..written]),
+                !reads_as_a_record(&damaged[..written], ProgramAlign::BYTE),
                 "header byte {index} bit {bit} was resealed into a record"
             );
             if !(8..10).contains(&index) {
@@ -894,7 +923,7 @@ fn burst_errors_are_caught_exhaustively_to_nine_bits_and_sampled_to_thirty_two()
                     damaged[bit / 8] ^= 1 << (bit % 8);
                 }
                 assert!(
-                    !reads_as_a_record(&damaged[..written]),
+                    !reads_as_a_record(&damaged[..written], ProgramAlign::BYTE),
                     "burst of {len} bits at {start} pattern {pattern:#x} survived"
                 );
             }
@@ -928,7 +957,7 @@ fn burst_errors_are_caught_exhaustively_to_nine_bits_and_sampled_to_thirty_two()
                     damaged[bit / 8] ^= 1 << (bit % 8);
                 }
                 assert!(
-                    !reads_as_a_record(&damaged[..written]),
+                    !reads_as_a_record(&damaged[..written], ProgramAlign::BYTE),
                     "burst of {len} bits at {start} pattern {pattern:#x} survived"
                 );
             }
@@ -949,7 +978,7 @@ fn a_resealed_forgery_is_accepted_because_a_crc_is_not_authentication() {
         result: b"paid",
     };
     let written = frame::encode(&honest, ProgramAlign::BYTE, &mut page).unwrap();
-    assert!(reads_as_a_record(&page[..written]));
+    assert!(reads_as_a_record(&page[..written], ProgramAlign::BYTE));
 
     let forged = RecordRef::EffectCompleted {
         seq: EffectSeq(1),

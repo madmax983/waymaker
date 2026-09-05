@@ -16,7 +16,7 @@ use waymaker_core::{DecodeError, KernelError};
 /// by construction, so comparing one with the other could not notice two variants whose
 /// strings had been swapped — and a swapped message is a firmware log line naming the wrong
 /// refusal.
-const DECODE_ERRORS: [(DecodeError, &str); 6] = [
+const DECODE_ERRORS: [(DecodeError, &str); 7] = [
     (
         DecodeError::Truncated,
         "the input ended before the frame it claimed",
@@ -37,6 +37,10 @@ const DECODE_ERRORS: [(DecodeError, &str); 6] = [
     (
         DecodeError::IntegrityFailed,
         "a seal did not match the bytes it covers",
+    ),
+    (
+        DecodeError::Unsealed,
+        "a frame carries no commit seal of its own",
     ),
 ];
 

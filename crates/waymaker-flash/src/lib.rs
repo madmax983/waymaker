@@ -21,14 +21,18 @@
 //!
 //! [`bank`] is rung 0.2's first arrival: §10's two-bank layout derived from a geometry, the
 //! bank header, the generation seal that names it, and the selection rule that makes exactly
-//! one bank authoritative. What is still owed at 0.2 is the per-record commit seal, the
-//! barrier protocol that writes it, the capacity reserve and `continue_as_new`; [`frame`]'s
-//! documentation says what the first of those leaves deferred and what the deferral costs.
+//! one bank authoritative. [`recovery`] is the reader that walks an authoritative bank's
+//! journal through §12's contract with one caller-owned page, and [`append`] is the writer
+//! that extends it — §07's two barriers per record, as a typestate in which programming a
+//! commit seal without the payload barrier in front of it does not compile.
+//!
+//! What is still owed at 0.2 is the capacity reserve, the bank swap and `continue_as_new`.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod append;
 pub mod bank;
 mod crc;
 pub mod frame;
@@ -36,6 +40,7 @@ pub mod integrity;
 pub mod recovery;
 pub mod storage;
 
+pub use append::{AppendError, Journal, Sealable, Staged, WriteAmplification};
 pub use bank::{
     Authority, BankHeader, BankId, BankLayout, BankRegion, Generation, LayoutError, Seal,
 };

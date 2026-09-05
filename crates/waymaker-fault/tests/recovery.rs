@@ -223,7 +223,11 @@ fn recovery_produces_a_committed_prefix_at_every_crash_point() {
     let (history, ending, append_at) = recover(clean.image());
     assert_eq!(history, [RecordId(1), RecordId(3), RecordId(5)]);
     assert!(matches!(ending, Some(Ending::Clean { .. })));
-    assert_eq!(append_at, Some(72), "three twenty-four-byte frames");
+    assert_eq!(
+        append_at,
+        Some(84),
+        "three records of a twenty-four-byte frame and a four-byte commit seal"
+    );
 
     // Every prefix length actually occurs. Without this the loop above could be passing
     // because every crash point happened to recover the same thing.
@@ -285,7 +289,11 @@ fn the_two_readers_agree_at_every_crash_point() {
             run.injection()
         );
         assert_eq!(
-            matches!(ending, Some(Ending::Damaged { at }) if usize::try_from(at) == Ok(offset)),
+            matches!(
+                ending,
+                Some(Ending::Damaged { at } | Ending::Unsealed { at })
+                    if usize::try_from(at) == Ok(offset)
+            ),
             failed,
             "the two readers stopped differently at {:?}",
             run.injection()
@@ -305,12 +313,14 @@ fn the_sweep_reaches_every_ending_a_recovery_has() {
     let mut clean = 0_usize;
     let mut damaged = 0_usize;
     let mut incomplete = 0_usize;
+    let mut unsealed = 0_usize;
 
     for run in &runs {
         match recover(run.image()).1 {
             Some(Ending::Clean { .. }) => clean += 1,
             Some(Ending::Damaged { .. }) => damaged += 1,
             Some(Ending::Incomplete { .. }) => incomplete += 1,
+            Some(Ending::Unsealed { .. }) => unsealed += 1,
             None => unreachable!("a drained recovery has ended"),
         }
         // Sixteen bytes is shorter than the twenty-four-byte frames this writer appends, so
@@ -325,6 +335,11 @@ fn the_sweep_reaches_every_ending_a_recovery_has() {
     assert!(
         incomplete > 0,
         "no crash point produced an incomplete recovery, so that ending is untested here"
+    );
+    assert!(
+        unsealed > 0,
+        "no crash point left a frame body with no commit seal over it, so issue #24's \
+         ending is untested here"
     );
 }
 

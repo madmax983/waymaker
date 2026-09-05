@@ -74,6 +74,20 @@ pub enum DecodeError {
     /// that could tell a wrong magic from a failed CRC would learn nothing it could act on.
     /// Either way the bytes are not the record they claim to be, and the adapter stops.
     IntegrityFailed,
+    /// A frame is intact and nothing says it was ever committed.
+    ///
+    /// Design document §09 lists "unsealed" first among the four conditions recovery stops
+    /// at, and this is it. A record's bytes are followed by a commit seal one storage
+    /// program unit wide, written only after a barrier has made the frame body durable, so
+    /// a frame without a valid one is a frame whose writer never reached step 3 of §07's
+    /// protocol — the power went during an append, or the seal itself was torn.
+    ///
+    /// Distinct from [`IntegrityFailed`](Self::IntegrityFailed) in the way a caller acts on
+    /// it: an integrity failure is damage, and the bank has to be recycled. An unsealed tail
+    /// is the ordinary shape of a device that lost power while appending. Neither is
+    /// appendable — both leave programmed cells behind — but only one of them is a reason to
+    /// suspect the media.
+    Unsealed,
 }
 
 impl DecodeError {
@@ -95,6 +109,7 @@ impl DecodeError {
             Self::UnsupportedFormatVersion => "an unsupported record format version",
             Self::MalformedRecord => "a record body does not fit its kind",
             Self::IntegrityFailed => "a seal did not match the bytes it covers",
+            Self::Unsealed => "a frame carries no commit seal of its own",
         }
     }
 }
@@ -225,13 +240,14 @@ mod tests {
     /// A fixed-length array cannot notice a variant that was never put in it, so the list
     /// is not trusted on its own: `the_variant_lists_are_complete` maps each entry through
     /// an exhaustive `match` and fails the moment the enum has an arm this array does not.
-    const DECODE_ERRORS: [DecodeError; 6] = [
+    const DECODE_ERRORS: [DecodeError; 7] = [
         DecodeError::Truncated,
         DecodeError::LengthOutOfBounds,
         DecodeError::UnknownRecordKind,
         DecodeError::UnsupportedFormatVersion,
         DecodeError::MalformedRecord,
         DecodeError::IntegrityFailed,
+        DecodeError::Unsealed,
     ];
 
     /// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm,
@@ -260,6 +276,7 @@ mod tests {
             DecodeError::UnsupportedFormatVersion => 3,
             DecodeError::MalformedRecord => 4,
             DecodeError::IntegrityFailed => 5,
+            DecodeError::Unsealed => 6,
         }
     }
 

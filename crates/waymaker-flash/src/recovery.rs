@@ -42,12 +42,13 @@
 //!   type; because [`append_offset`](Recovery::append_offset) answers [`None`] for a scan
 //!   that has not finished, the refusal withholds the append point as well.
 //!   `tests/cold_start.rs` is that pairing, driven end to end.
-//! * **unsealed** is issue [#24](https://github.com/madmax983/waymaker/issues/24)'s. §09's
-//!   frame ends with a commit seal written after a barrier, and until that writer exists a
-//!   torn tail and a damaged frame stop the scan in the same place — which is what §14
-//!   requires either way. What the seal will add is the ability to say *which* of the two
-//!   happened, and therefore to distinguish "the power went during an append" from "this
-//!   bank is damaged". [`Ending`] is where that distinction will land.
+//! * **unsealed** is here too, since issue
+//!   [#24](https://github.com/madmax983/waymaker/issues/24). §09's frame ends with a commit
+//!   seal one program unit wide, written only after a payload barrier, so a frame body with
+//!   no valid seal over it is a frame whose writer never reached §07 step 3. It stops the
+//!   scan at its own first byte with [`Ending::Unsealed`], which is what lets a caller tell
+//!   "the power went during an append" from "this bank is damaged" — the distinction this
+//!   module was written without, and the one [`Ending`] said it would grow a variant for.
 //!
 //! # The append offset
 //!
@@ -104,10 +105,13 @@
 //! page-sized chunks. That is bounded by the region rather than by history, is paid once,
 //! and is what stops a hole in a journal from reading as the end of one. It is also the
 //! cost that will dominate boot latency on the first real board — a 64 KiB bank with a
-//! 512 B page is 128 reads on *every* boot, however short its history — and it is the
-//! strongest practical argument for the commit seal of issue
-//! [#24](https://github.com/madmax983/waymaker/issues/24): a sealed tail is one a reader can
-//! stop at without proving that everything past it is erased.
+//! 512 B page is 128 reads on *every* boot, however short its history — and the commit seal
+//! of issue [#24](https://github.com/madmax983/waymaker/issues/24) does **not** remove it.
+//! The seal says a record is committed; it does not say that no record follows. Stopping at
+//! an erased header without walking the tail would need a marker saying "history ends
+//! here", which is a record kind rather than a seal, and none of §09's vocabulary is one.
+//! What the seal removes is the *ambiguity* at the stopping point rather than the walk, and
+//! the walk is still owed a cheaper answer.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -357,6 +361,18 @@ impl JournalRegion {
     pub const fn align(self) -> ProgramAlign {
         self.align
     }
+
+    /// The device this region was validated against.
+    ///
+    /// `pub(crate)` rather than `pub`, deliberately. [`crate::append`] needs it to refuse a
+    /// writer handed a device the region does not describe, which is the same check
+    /// [`Recovery::next`] makes; a caller outside this crate has the geometry already,
+    /// because it is the one it built the region with. The `recovery-surface` rule pins this
+    /// file's *public* names, and a fifth accessor on the reader's surface is not the price
+    /// of an internal comparison.
+    pub(crate) const fn geometry(self) -> Geometry {
+        self.geometry
+    }
 }
 
 /// How a recovery ended, and — in one case only — where the next record may be written.
@@ -364,18 +380,20 @@ impl JournalRegion {
 /// The three are not degrees of the same thing; they are three different things a caller
 /// must do next.
 ///
-/// # What issue #24 does to this type
+/// # The fourth shape, and why it is not `Damaged`
 ///
-/// Every variant's payload is [`Recovery::offset`](Recovery::offset) today, so the two are
-/// interchangeable and a caller may use either. With §09's commit seal they stop being the
-/// same number — the end of the *sealed* prefix is not where the scan stopped — and a call
-/// site that picked the wrong one would change meaning silently rather than fail to compile.
-/// The seal also wants a fourth shape: a tail that is present but unsealed is recoverable and
-/// not appendable, which is neither [`Damaged`](Self::Damaged) (final) nor
-/// [`Incomplete`](Self::Incomplete) (unknown). So this enum is expected to *grow a variant*
-/// rather than to have `Damaged` overloaded, and every `match` on it in this workspace is
-/// exhaustive so that the day it does is a list of call sites rather than a silent
-/// reinterpretation.
+/// Issue [#24](https://github.com/madmax983/waymaker/issues/24) added
+/// [`Unsealed`](Self::Unsealed), which is what this type's earlier documentation said it
+/// would grow rather than overloading [`Damaged`](Self::Damaged) — and the reason is what a
+/// caller does next. A damaged bank is a bank to suspect: the media returned bytes no writer
+/// could have written, and §10's swap is what recycles it. An unsealed tail is the ordinary
+/// shape of a device that lost power while appending, and the only thing wrong with it is
+/// that the record was never committed. Both are final and neither is appendable — every
+/// byte of them is programmed — but a firmware that raised an alarm on the second would
+/// raise it on every unlucky reboot.
+///
+/// Every `match` on this enum in this workspace is exhaustive, so a fifth shape would be a
+/// list of call sites rather than a silent reinterpretation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ending {
     /// The journal ended in erased media, and `append_at` is its first erased byte.
@@ -410,6 +428,21 @@ pub enum Ending {
     /// a caller must not replay it as though it were all of history, and must not append.
     Incomplete {
         /// The offset the scan gave up at, relative to [`JournalRegion::base`].
+        at: u32,
+    },
+    /// The scan met a frame body with no commit seal over it, at `at`.
+    ///
+    /// §09's first stop condition. The prefix before it is final and complete, so a caller
+    /// may replay it — that is what separates this from [`Incomplete`](Self::Incomplete),
+    /// where the prefix may be short. Nothing may be appended: `at` is the first byte of a
+    /// frame whose cells a program cycle has already cleared.
+    ///
+    /// This is what a power loss during §07's steps 1 to 3 leaves behind, and it is the
+    /// only ending that says so. A record that reaches it was never acknowledged, was never
+    /// dispatched — §07 dispatches at step 4, after the commit barrier — and is therefore
+    /// history the device is right to have no trace of.
+    Unsealed {
+        /// The first byte of the unsealed frame, relative to [`JournalRegion::base`].
         at: u32,
     },
 }
@@ -497,12 +530,14 @@ pub struct Recovery<C: IntegrityCheck = Catalogued> {
     check: PhantomData<C>,
 }
 
-/// What one step staged, once it is known to be a frame this page can hold.
+/// What one step staged, once it is known to be a record this page can hold.
 #[derive(Clone, Copy)]
 struct Staged {
-    /// Bytes of the page the frame occupies.
+    /// Bytes of the page the record occupies: its padded frame body and its commit seal.
     need: usize,
-    /// Bytes the offset advances by, which is the frame padded to the region's granularity.
+    /// Where the commit seal starts inside those bytes, which is the padded body's length.
+    seal_at: usize,
+    /// Bytes the offset advances by, which is the whole record.
     stride: u32,
 }
 
@@ -530,6 +565,18 @@ impl<C: IntegrityCheck> Recovery<C> {
             ending: None,
             check: PhantomData,
         }
+    }
+
+    /// The region this recovery walks.
+    ///
+    /// The one way the region leaves this type, and it exists so that
+    /// [`crate::append::Journal`] can be built from a finished recovery and nothing else: a
+    /// writer that took a region and an offset separately could be handed two that do not
+    /// belong together, which is the mismatch [`JournalRegion::of`] exists to refuse one
+    /// level down.
+    #[must_use]
+    pub const fn region(&self) -> JournalRegion {
+        self.region
     }
 
     /// The byte at which the committed prefix ends, relative to the region's base.
@@ -620,33 +667,51 @@ impl<C: IntegrityCheck> Recovery<C> {
             }));
         };
         match frame::decode_with::<C>(bytes) {
-            Ok(frame) => match frame.decoded {
-                Decoded::Record(record) => {
-                    // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
-                    // scan over a finite region is finite. Checked rather than saturating,
-                    // because this is the one arithmetic here whose degenerate answer is an
-                    // *affirmative* one: an offset that saturated would make `remaining` zero,
-                    // and the next step would report a clean end at `u32::MAX` — "safe to
-                    // append", at an offset outside the device. `stride <= remaining` is
-                    // checked before the read, so the `else` is unreachable and is spelled as
-                    // the refusal it would have to be.
-                    let Some(next) = self.offset.checked_add(staged.stride) else {
-                        self.ending = Some(Ending::Incomplete { at: self.offset });
-                        return Some(Err(RecoveryError::Decode(DecodeError::LengthOutOfBounds)));
-                    };
-                    self.offset = next;
-                    Some(Ok(record))
+            Ok(frame) => {
+                // §09's first stop condition, before the record kind: what an uncommitted
+                // frame *says* is not a question worth asking. `stage` read the whole
+                // record, so the seal is already in the page.
+                let Some(seal) = bytes.get(staged.seal_at..) else {
+                    // Unreachable: `stage` staged `need > seal_at` bytes.
+                    self.ending = Some(Ending::Incomplete { at: self.offset });
+                    return Some(Err(RecoveryError::PageTooSmall {
+                        needed: staged.need,
+                    }));
+                };
+                if !frame::commit_seal_holds(frame.frame_crc, seal) {
+                    self.ending = Some(Ending::Unsealed { at: self.offset });
+                    return Some(Err(RecoveryError::Decode(DecodeError::Unsealed)));
                 }
-                Decoded::UnknownKind(_) => {
-                    // §09 makes skipping a property of the format version, and
-                    // `permits_unknown_record_skip` answers `false` for every one of the 256
-                    // a version byte can hold. There is deliberately no second arm: a branch
-                    // no test can reach is a branch whose first execution is recovery after
-                    // a power loss on somebody's device.
-                    self.ending = Some(Ending::Damaged { at: self.offset });
-                    Some(Err(RecoveryError::Decode(DecodeError::UnknownRecordKind)))
+                match frame.decoded {
+                    Decoded::Record(record) => {
+                        // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
+                        // scan over a finite region is finite. Checked rather than saturating,
+                        // because this is the one arithmetic here whose degenerate answer is an
+                        // *affirmative* one: an offset that saturated would make `remaining` zero,
+                        // and the next step would report a clean end at `u32::MAX` — "safe to
+                        // append", at an offset outside the device. `stride <= remaining` is
+                        // checked before the read, so the `else` is unreachable and is spelled as
+                        // the refusal it would have to be.
+                        let Some(next) = self.offset.checked_add(staged.stride) else {
+                            self.ending = Some(Ending::Incomplete { at: self.offset });
+                            return Some(Err(RecoveryError::Decode(
+                                DecodeError::LengthOutOfBounds,
+                            )));
+                        };
+                        self.offset = next;
+                        Some(Ok(record))
+                    }
+                    Decoded::UnknownKind(_) => {
+                        // §09 makes skipping a property of the format version, and
+                        // `permits_unknown_record_skip` answers `false` for every one of the 256
+                        // a version byte can hold. There is deliberately no second arm: a branch
+                        // no test can reach is a branch whose first execution is recovery after
+                        // a power loss on somebody's device.
+                        self.ending = Some(Ending::Damaged { at: self.offset });
+                        Some(Err(RecoveryError::Decode(DecodeError::UnknownRecordKind)))
+                    }
                 }
-            },
+            }
             Err(error) => {
                 self.ending = Some(Ending::Damaged { at: self.offset });
                 Some(Err(RecoveryError::Decode(error)))
@@ -780,17 +845,22 @@ impl<C: IntegrityCheck> Recovery<C> {
             Ok(frame_len) => frame_len,
             Err(error) => return Some(Err(self.damaged(RecoveryError::Decode(error)))),
         };
-        // The frame padded to the granularity the journal was written at. A frame whose
-        // padded stride runs past the end of the region could not have been written into it,
-        // so the region is shorter than the frame it appears to hold — a truncation and not
-        // a record.
-        let (Some(stride), Ok(frame_width)) = (
+        // The frame body padded to the granularity the journal was written at, and the
+        // commit seal that follows it. A record whose two parts run past the end of the
+        // region could not have been written into it, so the region is shorter than the
+        // record it appears to hold — a truncation and not a record.
+        let (Some(body), Some(seal)) = (
             self.region
                 .align
                 .round_up(frame_len)
-                .and_then(|stride| u32::try_from(stride).ok()),
-            u32::try_from(frame_len),
+                .and_then(|body| u32::try_from(body).ok()),
+            u32::try_from(frame::seal_bytes(self.region.align)).ok(),
         ) else {
+            return Some(Err(
+                self.damaged(RecoveryError::Decode(DecodeError::LengthOutOfBounds))
+            ));
+        };
+        let Some(stride) = body.checked_add(seal) else {
             return Some(Err(
                 self.damaged(RecoveryError::Decode(DecodeError::LengthOutOfBounds))
             ));
@@ -800,17 +870,13 @@ impl<C: IntegrityCheck> Recovery<C> {
                 self.damaged(RecoveryError::Decode(DecodeError::Truncated))
             ));
         }
-        // At most `stride`, because the region's granularity is at least the device's program
-        // unit and a geometry nests, so it is at least the read unit too — which
-        // `JournalRegion::spanning` is what guarantees. So this read stays inside the region
-        // without a second bounds check.
-        let Some(need) = round_up(frame_width, read_unit) else {
-            return Some(Err(
-                self.damaged(RecoveryError::Decode(DecodeError::LengthOutOfBounds))
-            ));
-        };
-        let need_bytes = usize::try_from(need).unwrap_or(usize::MAX);
-        if need > capacity {
+        // The whole record is staged, seal included, and no rounding is needed to do it: a
+        // padded body and a seal are both whole multiples of the region's granularity, which
+        // is at least the device's program unit, which — a geometry nests — is whole read
+        // units. `JournalRegion::spanning` is what guarantees that, and `stride <= remaining`
+        // is what keeps the read inside the region.
+        let need_bytes = usize::try_from(stride).unwrap_or(usize::MAX);
+        if stride > capacity {
             return Some(Err(
                 self.incomplete(RecoveryError::PageTooSmall { needed: need_bytes })
             ));
@@ -820,6 +886,7 @@ impl<C: IntegrityCheck> Recovery<C> {
         }
         Some(Ok(Staged {
             need: need_bytes,
+            seal_at: usize::try_from(body).unwrap_or(usize::MAX),
             stride,
         }))
     }
