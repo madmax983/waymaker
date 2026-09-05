@@ -42,6 +42,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
+use waymaker_flash::bank::BankId;
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_rig::audit::Breach;
 use waymaker_rig::census::Coverage;
@@ -910,6 +911,71 @@ fn preparing_over_a_finished_run_never_reports_a_recovery_violation() {
         }
     }
     unreachable!("preparation never completed within the fuse's range");
+}
+
+#[test]
+fn two_sealed_banks_are_a_breach_whichever_run_owns_them() {
+    // §14 `single-authority` is not a question about ownership. No crash makes a second
+    // authority out of nothing, so an ambiguous part is a violation before anybody asks which
+    // run installed it — and routing it through the uninstalled path would report the one
+    // state `Audit::finish` exists to refuse as a pass whenever the witness is empty.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+
+    // Two banks at one generation, carrying byte-identical headers and seals. No writer here
+    // produces this — `prepare` installs bank A alone — so it is built rather than driven.
+    let ambiguous = |image: Vec<u8>| {
+        let a = rig.layout().bank(BankId::A);
+        let b = rig.layout().bank(BankId::B);
+        let mut spliced = image;
+        let (Ok(a_base), Ok(b_base), Ok(bytes)) = (
+            usize::try_from(a.base()),
+            usize::try_from(b.base()),
+            usize::try_from(a.bytes()),
+        ) else {
+            unreachable!("a laid-out bank fits a usize")
+        };
+        let Some(installed) = spliced.get(a_base..a_base + bytes).map(<[u8]>::to_vec) else {
+            unreachable!("bank A is inside the part")
+        };
+        let Some(other) = spliced.get_mut(b_base..b_base + bytes) else {
+            unreachable!("bank B is inside the part")
+        };
+        other.copy_from_slice(&installed);
+        let Some(device) = Device::restored(geometry(), spliced) else {
+            unreachable!("the image came from a device of this geometry")
+        };
+        device
+    };
+
+    // With an empty witness — a part prepared and not yet run. This is the silent pass: the
+    // run has claimed nothing, so every other question answers "nothing owed".
+    let prepared = {
+        let mut device = Device::new(geometry());
+        {
+            let mut metered = Metered::new(&mut device);
+            if rig.prepare(&mut metered, 0, &mut page).is_err() {
+                unreachable!("the fixture geometry prepares")
+            }
+        }
+        device.into_image()
+    };
+    let mut device = ambiguous(prepared);
+    let verdict = rig.verify(0, &mut device, &mut page).expect("a verdict");
+    assert_eq!(
+        verdict.outcome(),
+        Outcome::Breached(Breach::Authority { banks: 2 }),
+        "an ambiguous part with an empty witness must not be a pass"
+    );
+
+    // And with a witness, where the count itself is the evidence: reporting zero would name
+    // the wrong failure on a part that has two authorities rather than none.
+    let mut device = ambiguous(part_after(0));
+    let verdict = rig.verify(0, &mut device, &mut page).expect("a verdict");
+    assert_eq!(
+        verdict.outcome(),
+        Outcome::Breached(Breach::Authority { banks: 2 })
+    );
 }
 
 #[test]

@@ -888,6 +888,24 @@ impl Rig {
         let mut engine = self.engine(part)?;
         let banks = self.authoritative_banks(&mut engine, page)?;
 
+        // Ambiguity is decided first and on its own. Two sealed banks means the rig cannot say
+        // which journal is this run's history, so every obligation below — what recovery owed
+        // and what it produced — is *unanswerable* rather than failed, and answering one of
+        // them anyway sends a reader to the journal for a fault that is in the bank selection.
+        // Watched happening: an ambiguous part carrying a whole witness reported
+        // `LostAcknowledgedRecord` at record five, because the rig had refused to walk either
+        // bank and the witness was owed records nothing had produced.
+        //
+        // No crash makes a second authority out of nothing, so ownership is not a question this
+        // has to answer: it is a breach whichever run installed either bank.
+        if banks > 1 {
+            return Ok(Verdict {
+                outcome: Outcome::Breached(Breach::Authority { banks }),
+                recovered: 0,
+                banks,
+            });
+        }
+
         // §10's authority is what a boot reads, and a bank belongs to the run whose header it
         // carries. Both halves are load-bearing here, and the second one was found by review
         // rather than by writing it down: a rig's loop is `prepare(n)` → `iterate(n)` → reset
@@ -980,6 +998,14 @@ struct DispatchStep<'part, 'storage, S, D, C> {
 /// run's header is not it. So a rig that had begun marking a run — a witness with marks in it,
 /// or one torn mid-mark — on a part with no bank of its own is [`Breach::Authority`], which is
 /// what it is: records were being written into a journal this run does not own.
+///
+/// # Preconditions
+///
+/// `banks` is zero or one. An *ambiguous* part never reaches here: [`Rig::judge`] decides two
+/// sealed banks on their own, ahead of every question about ownership, because zero would
+/// report the one state [`Audit::finish`] exists to refuse as a pass whenever the witness is
+/// empty — a part prepared and not yet run — and would name the wrong number whenever it is
+/// not.
 const fn uninstalled(workload: Workload, progress: Progress, banks: usize) -> Verdict {
     let progress = match progress.iteration() {
         Some(other) if other != workload.iteration() => Progress::EMPTY,
