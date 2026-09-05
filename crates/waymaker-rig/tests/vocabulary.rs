@@ -265,9 +265,12 @@ fn a_page_shorter_than_the_rig_needs_is_refused_by_every_entry_point() {
         Rig::new::<waymaker_fault::FaultError>(part(), Plan::new(0), 1).expect("a legal layout");
     let mut device = waymaker_fault::Device::new(part());
     let mut page = [0_u8; Rig::PAGE_BYTES - 1];
-    let mut metered = Metered::new(&mut device);
-    assert!(rig.prepare(&mut metered, 0, &mut page).is_err());
-    drop(metered);
+    {
+        // A scope rather than a `drop`: a meter has no destructor, so dropping one only
+        // extends the borrow it holds on the device the two calls below need back.
+        let mut metered = Metered::new(&mut device);
+        assert!(rig.prepare(&mut metered, 0, &mut page).is_err());
+    }
     assert!(rig.verify(0, &mut device, &mut page).is_err());
     assert!(
         rig.judge(0, &mut device, Progress::default(), &mut page)
@@ -279,7 +282,10 @@ fn a_page_shorter_than_the_rig_needs_is_refused_by_every_entry_point() {
 fn a_never_cutter_never_cuts_and_a_planned_one_cuts_once() {
     let mut never = NeverCut;
     assert!(!never.cut(Phase::Schedule, ResetCause::PowerCut, 0));
-    assert_eq!(NeverCut, NeverCut::default());
+    // A unit struct, so `Default` is the same value; asserted so the derive is not silently
+    // dropped from a type a caller constructs both ways.
+    let default: NeverCut = NeverCut;
+    assert_eq!(default, NeverCut);
 
     let cut = Plan::new(0).cut(0);
     let mut planned = PlannedCut::new(cut, 4);
