@@ -901,6 +901,71 @@ pub fn check_storage_contract(sources: &[crate::size::LayerSource]) -> Vec<Viola
     )
 }
 
+/// The file whose public surface [`RECOVERY_SURFACE`] pins.
+pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
+
+/// Every public function the storage-backed recovery of issue #23 is allowed to have.
+///
+/// Design document §02 decision 2 — "a cursor advances through history in workflow order;
+/// there is no `Journal::get(id)` and no in-memory event index" — is a rule about the
+/// *reader* as much as about the cursor, and this is the reader that touches media. A
+/// `seek(offset)`, a `resume_at(offset)`, a `rewind`, or a `read_all(&mut self) -> Vec<_>`
+/// would each break no layering rule, need no dependency, pass every other gate, and turn a
+/// forward scan whose RAM is one caller-owned page into one that either seeks into the
+/// middle of history or holds it.
+///
+/// One name on this list is load-bearing for a different reason. `append_offset` is the only
+/// way an offset leaves this module, and it answers `Some` only for a scan that ran to
+/// erased media — because appending anywhere else programs cells a cycle has already
+/// cleared, and on NOR that bank never boots again. A second accessor that returned the
+/// stopping offset regardless is the mutation `waymaker-fault`'s sweep demonstrates as
+/// dangerous, and it is a line a reviewer has to write on purpose.
+///
+/// The pin fails in the other direction too, which matters as much: a name this file no
+/// longer declares means the reader was renamed or deleted and the pin has stopped checking
+/// anything. `fmt` is on the list because a trait `impl`'s methods are callable without
+/// `pub`, and `message` because a device with no console still has to report something.
+///
+/// What it does **not** catch: this compares *names*. An `offset` widened to `u64`, or an
+/// `append_offset` that started answering for a damaged journal, are both invisible to it —
+/// `crates/waymaker-flash/tests/recovery.rs` and `waymaker-fault`'s crash sweep are what
+/// hold the behaviour.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RECOVERY_SURFACE: &[&str] = &[
+    "align",
+    "append_offset",
+    "base",
+    "bytes",
+    "ending",
+    "fmt",
+    "message",
+    "new",
+    "next",
+    "of",
+    "offset",
+    "spanning",
+    "with_integrity",
+];
+
+/// Rule: the recovery reader's public surface is exactly the one that was reviewed.
+///
+/// The same shape as [`check_replay_cursor_surface`], for the reader that walks a journal on
+/// media rather than one in RAM.
+#[must_use]
+pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    check_pinned_surface(
+        "recovery-surface",
+        "waymaker-flash",
+        RECOVERY_SURFACE_PATH,
+        RECOVERY_SURFACE,
+        sources,
+        "the reader's public API is where design document \u{a7}02 decision 2 and the rule \
+         that an append offset is only ever erased media are both enforced, so a seek or a \
+         second way to an offset cannot be added without a reviewer writing it down",
+    )
+}
+
 /// The file whose `EffectScheduled` field set [`EFFECT_SCHEDULED_FIELDS`] pins.
 pub const EFFECT_SCHEDULED_PATH: &str = "waymaker-core/src/record.rs";
 
@@ -1006,14 +1071,42 @@ pub const INTEGRITY_SHIPPED_IMPL: &str = "impl IntegrityCheck for Catalogued";
 /// The codec, which must reach a seal through the trait rather than around it.
 pub const INTEGRITY_ROUTING_PATH: &str = "waymaker-flash/src/frame.rs";
 
-/// The two codec functions whose bodies compute a seal.
+/// The codec's functions generic over the integrity check, and which seals each must route
+/// through.
 ///
 /// A binding rule that reads only `integrity.rs` pins a trait nothing is obliged to call.
 /// Review of this change found exactly that: a codec re-hard-wired to `crc16` and `crc32`,
 /// with `integrity.rs` left perfectly intact, passed every rule. So the routing is pinned
-/// too — these two bodies must name `C::header_check` and `C::frame_check`, and must not
-/// name a checksum function at all.
-pub const SEALING_FUNCTIONS: &[&str] = &["encode_with", "decode_with"];
+/// too — each body below must name the seals its row lists, exactly once and with the answer
+/// used, and must not name a checksum function at all.
+///
+/// Named per function rather than "both seals in both bodies", for the reason
+/// [`BANK_SEALING_FUNCTIONS`] is: the header seal is computed in exactly one place.
+/// [`verify_header_with`] is that place, and [`decode_with`] routes through it, which is
+/// what [`HEADER_STEP`] holds. An empty method list is "this body must compute no seal of
+/// its own": the file-wide checksum ban is what holds it, and the row exists because the
+/// derived scan in [`check_integrity_routing`] requires every function generic over the
+/// check to be accounted for — a `frame_len_of_with` that took `C`, ignored it and called
+/// `crc16` is exactly the mutation that scan exists to catch.
+///
+/// [`verify_header_with`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/frame.rs
+/// [`decode_with`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/frame.rs
+pub const SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("encode_with", &["header_check", "frame_check"]),
+    ("verify_header_with", &["header_check"]),
+    ("decode_with", &["frame_check"]),
+    ("frame_len_of_with", &[]),
+    ("input_digest_with", &["frame_check"]),
+    // `Scan`'s three, which are generic because the block they sit in is. None computes a
+    // seal — the scan reaches one through `decode_with`, which [`SCAN_STEP`] pins — so all
+    // three carry the empty list, and the empty list is not nothing: it says "compute no seal
+    // of your own", which the file-wide ban below enforces. They are here because a method in
+    // a generic `impl` block is the most likely place a new seal would be written, and a row
+    // is what makes adding one a line somebody writes on purpose.
+    ("next", &[]),
+    ("offset", &[]),
+    ("with_integrity", &[]),
+];
 
 /// The bank codec of design document §10, which seals two more structures.
 ///
@@ -1053,12 +1146,53 @@ pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
 /// single documented exception, and naming it here is what stops it from becoming a habit.
 pub const DIGEST_FUNCTION: (&str, &str) = ("input_digest", "crc32");
 
+/// The reader that walks a journal on media, which reaches its seals through the codec.
+///
+/// A third file generic over the integrity check, and until review of this change it had no
+/// pin at all: replacing `decode_with::<C>` and `frame_len_of_with::<C>` in it with the
+/// non-generic `decode` and `frame_len_of` — so that every recovery verified with the shipped
+/// check whatever its caller chose — passed all 38 rules and the whole test suite. That is
+/// exactly the mutation [`SEALING_FUNCTIONS`] exists to catch, one file over.
+pub const RECOVERY_ROUTING_PATH: &str = "waymaker-flash/src/recovery.rs";
+
+/// The recovery reader's two steps, and the entry point each must reach the codec through.
+///
+/// Unlike [`SEALING_FUNCTIONS`], these are not bodies that compute a seal: nothing in
+/// `recovery.rs` may, and the file-wide ban is what says so. They are the two places the
+/// reader hands bytes to the codec, and each has to hand them to the *generic* one — which
+/// the rule spells `<callee>::<C>`, so a call that dropped the turbofish and took the default
+/// is a mention rather than a route.
+///
+/// The callee is written module-qualified because that is how `recovery.rs` writes it, and a
+/// pin is a pin on the spelling: importing these two unqualified would fail this rule and is
+/// a line a reviewer writes, which is the same bargain every other pin here makes.
+pub const RECOVERY_ROUTING_STEPS: &[(&str, &str)] = &[
+    ("next", "frame::decode_with"),
+    ("stage", "frame::frame_len_of_with"),
+];
+
 /// The scan's step, and the entry point it must walk a journal with.
 ///
 /// `decode` rather than `decode_with::<C>` here would make [`crate::size`]'s type parameter
 /// decorative: every scan would verify with the shipped check whatever its caller asked
 /// for, which is a reader silently disagreeing with the writer.
 pub const SCAN_STEP: (&str, &str) = ("next", "decode_with");
+
+/// The decoder's header step, and the one function it must verify a header with.
+///
+/// [`SEALING_FUNCTIONS`] says `decode_with` computes no header seal of its own; without
+/// this, "no header seal" would be satisfied by a `decode_with` that skipped the header
+/// check altogether and read `payload_len` out of bytes nothing verified. That is the whole
+/// of §09's first checksum undone, and it is the shape a page-bounded reader depends on:
+/// `frame_len_of` promises a length the writer is known to have written.
+pub const HEADER_STEP: (&str, &str) = ("decode_with", "verify_header_with");
+
+/// The header-length accessor, and the one function it must verify a header with.
+///
+/// The same decision as [`HEADER_STEP`], for the function a recovery calls before it decides
+/// how many bytes to stage. A `frame_len_of_with` that returned a length without checking
+/// the seal over it would let an erased page send a reader anywhere.
+pub const FRAME_LEN_STEP: (&str, &str) = ("frame_len_of_with", "verify_header_with");
 
 /// One seal: what the trait returns for it, and what the shipped implementation computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1572,8 +1706,45 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     let mut violations = Vec::new();
     let checksums: Vec<&str> = SEAL_BINDINGS.iter().map(|seal| seal.delegates_to).collect();
 
-    let seals: Vec<&SealBinding> = SEAL_BINDINGS.iter().collect();
-    for function in SEALING_FUNCTIONS {
+    // Derived, not whitelisted, for the reason `check_bank_routing` derives: a table of five
+    // names pins five bodies and says nothing about a sixth. A
+    // `pub fn frame_len_of_with<C: IntegrityCheck>` that took the type parameter, ignored it
+    // and called `crc16` would be a second reader of a header sealed by a check its caller
+    // did not choose, with every other rule green.
+    for name in integrity_generic_functions(&code) {
+        if !SEALING_FUNCTIONS.iter().any(|(pinned, _)| *pinned == name) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_ROUTING_PATH} declares `fn {name}` generic over the integrity \
+                     check and no row of `SEALING_FUNCTIONS` pins it, so a body that can \
+                     compute a seal is pinned by nothing; add a row naming the seals it must \
+                     route through, or stop taking `C`"
+                ),
+            ));
+        }
+    }
+
+    for (function, methods) in SEALING_FUNCTIONS {
+        // Filtered from `SEAL_BINDINGS` rather than described here, so a seal whose width or
+        // name changes changes in one place. A method named in a row that no longer exists
+        // in `SEAL_BINDINGS` selects nothing, which is why the count is checked.
+        let seals: Vec<&SealBinding> = SEAL_BINDINGS
+            .iter()
+            .filter(|seal| methods.contains(&seal.method))
+            .collect();
+        if seals.len() != methods.len() {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` is pinned to a seal `SEAL_BINDINGS` does not declare, so \
+                     the row checks less than it says it does"
+                ),
+            ));
+            continue;
+        }
         violations.extend(sealing_function_violations(
             INTEGRITY_ROUTING_PATH,
             function,
@@ -1604,21 +1775,139 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
          its caller asked for",
     ));
 
+    violations.extend(checksums_named_outside_the_digest(&code, &checksums));
+
+    for (function, verified_with) in [HEADER_STEP, FRAME_LEN_STEP] {
+        violations.extend(used_call(
+            &code,
+            function,
+            verified_with,
+            "so a header's `payload_len` decides where a frame ends without the seal over it \
+             having been checked, which is design document \u{a7}09's first checksum undone",
+        ));
+    }
+
     violations
+}
+
+/// Violations for every checksum the record codec names outside its one documented exception.
+///
+/// File-wide, which is what a per-body ban is not. Review of this change demonstrated the hole
+/// the per-body version leaves: a `fn shadow_seal<C>(..) -> u16 where C: IntegrityCheck`
+/// calling `crc16`, added beside the pinned bodies and called from one of them, passed every
+/// rule. [`integrity_generic_functions`] now sees that shape; this closes the same hole for a
+/// helper that takes no `C` at all, which no scan over signatures can see by construction.
+///
+/// `input_digest` is the exception, and a named one rather than a habit: [`DIGEST_FUNCTION`]
+/// says which function it is and which checksum it may call, because a `const fn` cannot go
+/// through a trait method. `bank.rs` and `recovery.rs` have no exception at all.
+fn checksums_named_outside_the_digest(code: &str, checksums: &[&str]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    // `use` lines dropped first: an import is not a call, `input_digest` needs one, and an
+    // import nothing calls fails CI on its own under `unused_imports` with `-D warnings`.
+    let callable: String = code
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("use "))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let exempt = braced_body(&callable, &format!("fn {}", DIGEST_FUNCTION.0)).unwrap_or_default();
+
+    checksums
+        .iter()
+        .filter_map(|checksum| {
+            let outside =
+                count_tokens(&callable, checksum).saturating_sub(count_tokens(exempt, checksum));
+            (outside != 0).then(|| {
+                Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{INTEGRITY_ROUTING_PATH} names `{checksum}` {outside} time(s) outside \
+                         `{}`, which is the only body permitted to reach the checksum module \
+                         directly. Every other seal here goes through the trait, or the type \
+                         parameter selects nothing",
+                        DIGEST_FUNCTION.0
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Every function in `code` that is generic over the integrity check, by name.
 ///
-/// A line scan for `fn <name>` and `IntegrityCheck` in the same signature, which is how
-/// rustfmt writes every one of them in this workspace. It is a floor, like every rule here:
-/// a signature broken across lines so that `fn` and the bound land apart would be missed, and
-/// a body that computes a seal without taking `C` at all is caught by the file-wide checksum
-/// ban instead.
+/// A function is generic over the check when its own signature names the bound, or when it is
+/// declared inside an `impl` block whose header does. Both halves are needed and both were
+/// once missing: review of this change demonstrated three shapes that reached a seal through
+/// `C` and were invisible to a one-line scan, each of which passed the whole gate.
+///
+/// * `fn shadow_seal<C>(..) -> u16 where C: IntegrityCheck` — the `fn` line has no bound and
+///   the bound line has no `fn`. Signatures are therefore **joined** up to the `{` or `;`
+///   that ends them, so a `where` clause and a wrapped signature read the same as a
+///   single-line one.
+/// * A method inside `impl<'a, C: IntegrityCheck> Scan<'a, C>`, which is the most likely
+///   place somebody would actually put such code. An `impl` header naming the bound therefore
+///   makes every `fn` it directly contains generic too.
+/// * The same again with the `impl` header itself split across lines, which the joining
+///   above covers.
+///
+/// It is still a floor, and the floor is stated rather than implied: it counts a `fn` as a
+/// direct child of the block that makes it callable, so a nested `fn` inside a method body is
+/// missed, and a body that computes a seal without taking `C` at all is caught by the
+/// file-wide checksum ban instead of by this.
 fn integrity_generic_functions(code: &str) -> Vec<String> {
-    code.lines()
-        .filter(|line| line.contains("IntegrityCheck"))
-        .filter_map(function_declaration_name)
-        .collect()
+    let mut found = Vec::new();
+    let mut depth: i32 = 0;
+    // Depths at which the body of an `impl` generic over the check begins. A `fn` opened at
+    // one of these depths is generic whether or not its own signature says so.
+    let mut generic_impls: Vec<i32> = Vec::new();
+    // A declaration being joined across lines, and whether it is an `impl` header.
+    let mut joining: Option<(String, bool)> = None;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if joining.is_none() {
+            let is_impl = trimmed.starts_with("impl");
+            if is_impl || trimmed.contains("fn ") {
+                joining = Some((String::new(), is_impl));
+            }
+        }
+        if let Some((buffer, _)) = joining.as_mut() {
+            buffer.push(' ');
+            buffer.push_str(trimmed);
+        }
+
+        let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+        let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+
+        // A declaration ends at the brace that opens its body, or at the `;` of one that has
+        // none — a trait method's signature, say.
+        if opens > 0 || trimmed.ends_with(';') {
+            if let Some((declaration, is_impl)) = joining.take() {
+                let bound = declaration.contains("IntegrityCheck");
+                if is_impl {
+                    if bound && opens > 0 {
+                        generic_impls.push(depth.saturating_add(1));
+                    }
+                } else if let Some(name) = function_declaration_name(&declaration) {
+                    if bound || generic_impls.contains(&depth) {
+                        found.push(name);
+                    }
+                }
+            }
+        }
+
+        depth = depth.saturating_add(opens).saturating_sub(closes);
+        // Every generic `impl` body this line closed is no longer open.
+        generic_impls.retain(|body| *body <= depth);
+    }
+
+    found
 }
 
 /// The name a `fn` signature line declares, if the line declares one.
@@ -1628,12 +1917,102 @@ fn function_declaration_name(line: &str) -> Option<String> {
     if trimmed.starts_with("use ") || trimmed.starts_with("//") {
         return None;
     }
+    // `fn` has to stand as a word: `impl Foo for Bar` carries no `fn `, but a joined
+    // declaration can carry a lifetime or a path that ends in one.
     let (_, after) = trimmed.split_once("fn ")?;
     let name: String = after
         .chars()
         .take_while(|character| character.is_alphanumeric() || *character == '_')
         .collect();
     (!name.is_empty()).then_some(name)
+}
+
+/// Rule: the recovery reader reaches the codec through the check its caller chose.
+///
+/// Reported under `integrity-check` like the other three halves, because it is the same
+/// decision. `Recovery<C>`'s type parameter is a promise that a journal is verified with the
+/// algorithm that sealed it; two calls keep that promise, and review of this change
+/// demonstrated that replacing both with their non-generic siblings passed every rule and
+/// every test. A parameter nothing is obliged to use is a swap point that selects nothing.
+///
+/// Three checks, and the file-wide ban is the one that does not depend on a name:
+///
+/// * every step in [`RECOVERY_ROUTING_STEPS`] calls its codec entry point exactly once and
+///   uses the answer;
+/// * the file names no checksum function at all — unlike `frame.rs` there is no `const fn`
+///   here and so no exception, exactly as in `bank.rs`;
+/// * and the file names no [`INTEGRITY_SHIPPED_IMPL`] method directly, so a body cannot reach
+///   `Catalogued::header_check` around the type parameter either.
+#[must_use]
+pub fn check_recovery_routing(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, RECOVERY_ROUTING_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "no {RECOVERY_ROUTING_PATH} in the workspace, so nothing says the recovery \
+                 reader still verifies with the check its caller chose"
+            ),
+        )];
+    };
+
+    let code = without_test_modules(&code_only(&source.contents));
+    let callable: String = code
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("use "))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let mut violations = Vec::new();
+
+    for seal in SEAL_BINDINGS {
+        for named in [seal.delegates_to, seal.method] {
+            if count_tokens(&callable, named) != 0 {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{RECOVERY_ROUTING_PATH} names `{named}` directly. The reader computes \
+                         no seal of its own: it hands bytes to the codec, and the codec is \
+                         what the type parameter selects"
+                    ),
+                ));
+            }
+        }
+    }
+
+    for (step, through) in RECOVERY_ROUTING_STEPS {
+        let Some(body) = braced_body(&code, &format!("fn {step}")) else {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_ROUTING_PATH} declares no `fn {step}`, so the reader's route to \
+                     the codec is pinned against nothing"
+                ),
+            ));
+            continue;
+        };
+        let generic = format!("{through}::<C>");
+        match invocation(body, &generic) {
+            Invocation::Once => {}
+            Invocation::Discarded | Invocation::Missing | Invocation::Repeated => {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{step}` does not call `{generic}` exactly once and use the answer, so \
+                         a recovery verifies with whichever check the codec defaults to rather \
+                         than the one its caller asked for"
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations
 }
 
 /// Rule: the bank codec reaches its seals through the trait rather than around it.
@@ -3433,6 +3812,109 @@ mod tests {
             assert_eq!(other.len(), 1);
             assert!(other[0].detail.contains("checking nothing"), "{other:?}");
         }
+
+        // And the fourth, which reads a second module of the same crate as the third — the
+        // pair most likely to be satisfied by each other if a path were ever wrong.
+        let recovery_only = recovery_source("");
+        assert!(check_recovery_surface(&recovery_only).is_empty());
+        for handed in [&replay_only, &transition_only, &storage_only] {
+            let missing_recovery = check_recovery_surface(handed);
+            assert_eq!(missing_recovery.len(), 1);
+            assert_eq!(missing_recovery[0].rule, "recovery-surface");
+            assert_eq!(missing_recovery[0].subject, "waymaker-flash");
+            assert!(
+                missing_recovery[0].detail.contains("checking nothing"),
+                "{}",
+                missing_recovery[0].detail
+            );
+        }
+        let missing_storage = check_storage_contract(&recovery_only);
+        assert_eq!(missing_storage.len(), 1);
+        assert!(
+            missing_storage[0].detail.contains("checking nothing"),
+            "{}",
+            missing_storage[0].detail
+        );
+    }
+
+    fn recovery_source(extra: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
+        }]
+    }
+
+    #[test]
+    fn the_pinned_recovery_surface_passes() {
+        assert!(check_recovery_surface(&recovery_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_seek_or_a_second_route_to_an_offset_is_rejected_by_name() {
+        // The four shapes the pin exists for. The first three turn a forward scan whose RAM
+        // is one page into one that seeks or indexes, which is what §02 decision 2 rules
+        // out. The fourth is the dangerous one: an offset that comes back whatever the
+        // ending points at cells a program cycle has already cleared, and on NOR a bank
+        // written there never boots again — `waymaker-fault`'s sweep is what demonstrates
+        // that, and this is what stops the door being reopened.
+        for door in [
+            "pub fn seek(&mut self, offset: u32) {}
+",
+            "pub fn resume_at(&mut self, offset: u32) {}
+",
+            "pub fn read_all(&mut self) -> Vec<u8> { Vec::new() }
+",
+            "pub fn stopping_offset(&self) -> u32 { 0 }
+",
+        ] {
+            let violations = check_recovery_surface(&recovery_source(door));
+            assert_eq!(violations.len(), 1, "{door}");
+            assert_eq!(violations[0].rule, "recovery-surface");
+            assert_eq!(violations[0].subject, "waymaker-flash");
+        }
+    }
+
+    #[test]
+    fn a_recovery_function_that_disappeared_is_reported_too() {
+        // The direction that matters more: `append_offset` gone means the module was
+        // renamed or rewritten and the pin has stopped checking anything.
+        let thinned =
+            tests_support::clean_recovery_surface().replace("pub fn append_offset() {}\n", "");
+        let violations = check_recovery_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents: thinned,
+        }]);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].detail.contains("append_offset"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_recovery_module_fails_closed() {
+        let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "recovery-surface");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(
+            violations[0].detail.contains("checking nothing"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_recovery_module() {
+        let violations = check_recovery_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
+            contents: tests_support::clean_recovery_surface(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -4485,7 +4967,7 @@ mod deferred_answer_pins {
     #[test]
     fn a_scan_that_walks_with_the_default_check_is_reported() {
         let source = tests_support::clean_integrity_routing()
-            .replace(&format!("{}::<C>(rest)", SCAN_STEP.1), "decode(rest)");
+            .replace(&format!("{}::<C>(bytes)", SCAN_STEP.1), "decode(bytes)");
         let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
         assert!(
             violations
@@ -4493,6 +4975,177 @@ mod deferred_answer_pins {
                 .any(|violation| violation.detail.contains("its caller asked for")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn the_generic_scan_finds_every_generic_codec_function() {
+        // A derived scan that found nothing would pass every test below while checking
+        // nothing at all, which is the one direction a gate must not fail in. So the real
+        // file's answer is compared against the table, in both directions.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(INTEGRITY_ROUTING_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the codec should exist");
+        let mut found = integrity_generic_functions(&without_test_modules(&code_only(&contents)));
+        found.sort();
+        let mut pinned: Vec<String> = SEALING_FUNCTIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        pinned.sort();
+        assert_eq!(found, pinned);
+        assert!(
+            !found.is_empty(),
+            "a scan that finds nothing checks nothing"
+        );
+    }
+
+    #[test]
+    fn the_generic_scan_sees_the_three_shapes_that_once_escaped_it() {
+        // Each of these reached a seal through the check and passed the whole gate, because
+        // the scan read one line at a time. A `where` clause puts the bound on a line with no
+        // `fn`; a method in a generic `impl` block has a `fn` on a line with no bound; and a
+        // wrapped signature splits the two.
+        let shapes = [
+            "fn shadow_where<C>(bytes: &[u8]) -> u16\nwhere\n    C: IntegrityCheck,\n{\n    0\n}\n",
+            "impl<'a, C: IntegrityCheck> Scan<'a, C> {\n    fn shadow_method(&self) -> u16 {\n        0\n    }\n}\n",
+            "fn shadow_wrapped<\n    C: IntegrityCheck,\n>(bytes: &[u8]) -> u16 {\n    0\n}\n",
+        ];
+        let expected = ["shadow_where", "shadow_method", "shadow_wrapped"];
+        for (shape, name) in shapes.iter().zip(expected) {
+            let found = integrity_generic_functions(shape);
+            assert!(
+                found.iter().any(|declared| declared == name),
+                "{name} escaped the scan: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_codec_function_no_row_pins_is_reported() {
+        let source = tests_support::clean_integrity_routing()
+            + "pub fn sneak_with<C: IntegrityCheck>() -> u32 { 0 }\n";
+        let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("no row of `SEALING_FUNCTIONS`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_names_a_checksum_outside_the_digest_is_reported() {
+        // The hole a per-body ban leaves: a new helper beside the pinned bodies, calling the
+        // checksum module directly, and called from one of them. It takes no `C` at all, so
+        // the scan above cannot see it by construction — this is what does.
+        for seal in SEAL_BINDINGS {
+            let source = format!(
+                "{}fn shadow(bytes: &[u8]) -> u32 {{ {}(bytes) }}\n",
+                tests_support::clean_integrity_routing(),
+                seal.delegates_to
+            );
+            let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("outside")),
+                "{}: {violations:?}",
+                seal.delegates_to
+            );
+        }
+    }
+
+    #[test]
+    fn the_digest_may_still_name_its_own_checksum() {
+        // And the exception is a real one, not a rule nobody can satisfy: the clean fixture
+        // has `input_digest` calling `crc32`, and it passes.
+        let violations = check_integrity_routing(&[layer(
+            INTEGRITY_ROUTING_PATH,
+            &tests_support::clean_integrity_routing(),
+        )]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_decoder_that_reads_a_header_without_verifying_it_is_reported() {
+        // `SEALING_FUNCTIONS` says `decode_with` computes no header seal of its own. Without
+        // these two pins that would be satisfied by a decoder which skipped the header check
+        // altogether and read `payload_len` out of bytes nothing verified — §09's first
+        // checksum undone.
+        for (owner, callee) in [HEADER_STEP, FRAME_LEN_STEP] {
+            let source = tests_support::clean_integrity_routing()
+                .replace(&format!("let routed = {callee}::<C>(bytes);"), "");
+            let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &source)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(callee)),
+                "{owner}: {violations:?}"
+            );
+        }
+    }
+
+    // `integrity-check`, fourth half: the recovery reader's route to the codec.
+
+    #[test]
+    fn the_real_recovery_reader_routes_through_the_check_its_caller_chose() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(RECOVERY_ROUTING_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the reader should exist");
+        let violations = check_recovery_routing(&[layer(RECOVERY_ROUTING_PATH, &contents)]);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_missing_recovery_reader_fails_closed() {
+        assert_eq!(check_recovery_routing(&[]).len(), 1);
+    }
+
+    #[test]
+    fn a_recovery_that_walks_with_the_default_check_is_reported() {
+        // The mutation review demonstrated: both turbofishes dropped, so every recovery
+        // verifies with the shipped check whatever its caller chose. It passed all 38 rules
+        // and the whole suite before this rule existed.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(RECOVERY_ROUTING_PATH);
+        let contents = std::fs::read_to_string(&path).expect("the reader should exist");
+        for (step, through) in RECOVERY_ROUTING_STEPS {
+            let stripped = contents.replace(&format!("{through}::<C>"), through);
+            let violations = check_recovery_routing(&[layer(RECOVERY_ROUTING_PATH, &stripped)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(step)),
+                "{step}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovery_that_computes_a_seal_of_its_own_is_reported() {
+        // Both ways around the type parameter: the checksum module directly, and the shipped
+        // implementation's method directly. Neither needs a `C`, so neither is visible to the
+        // generic-function scan.
+        for seal in SEAL_BINDINGS {
+            for named in [seal.delegates_to, seal.method] {
+                let source = format!(
+                    "//! Reader.\nfn next() {{ frame::decode_with::<C>(b) }}\n                     fn stage() {{ frame::frame_len_of_with::<C>(h) }}\n                     fn shadow(b: &[u8]) {{ {named}(b); }}\n"
+                );
+                let violations = check_recovery_routing(&[layer(RECOVERY_ROUTING_PATH, &source)]);
+                assert!(
+                    violations
+                        .iter()
+                        .any(|violation| violation.detail.contains(named)),
+                    "{named}: {violations:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5053,7 +5706,8 @@ pub mod tests_support {
 
     use super::{
         BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
-        INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS,
+        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
         STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
     };
 
@@ -5088,6 +5742,12 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_storage_contract() -> String {
         surface("A storage module.", STORAGE_CONTRACT_SURFACE)
+    }
+
+    /// A recovery module declaring exactly [`RECOVERY_SURFACE`] and nothing else.
+    #[must_use]
+    pub fn clean_recovery_surface() -> String {
+        surface("A recovery module.", RECOVERY_SURFACE)
     }
 
     /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
@@ -5186,14 +5846,20 @@ pub mod tests_support {
         use std::fmt::Write as _;
 
         let mut source = String::from("//! The codec.\n");
-        for function in SEALING_FUNCTIONS {
+        for (function, methods) in SEALING_FUNCTIONS {
             let _ = writeln!(source, "pub fn {function}<C: IntegrityCheck>() -> u32 {{");
-            for seal in SEAL_BINDINGS {
+            for method in *methods {
                 let _ = writeln!(
                     source,
-                    "    let seal_{} = C::{}(bytes).to_le_bytes();",
-                    seal.method, seal.method
+                    "    let seal_{method} = C::{method}(bytes).to_le_bytes();"
                 );
+            }
+            // The routed calls each body owes, rendered from the same pins the rule reads —
+            // including the scan's, so `next` is declared once rather than twice.
+            for (owner, callee) in [HEADER_STEP, FRAME_LEN_STEP, SCAN_STEP] {
+                if owner == *function {
+                    let _ = writeln!(source, "    let routed = {callee}::<C>(bytes);");
+                }
             }
             source.push_str("    0\n}\n");
         }
@@ -5202,11 +5868,42 @@ pub mod tests_support {
             "pub const fn {}(input: &[u8]) -> u32 {{ {}(input) }}",
             DIGEST_FUNCTION.0, DIGEST_FUNCTION.1
         );
-        let _ = writeln!(
-            source,
-            "fn {}(&mut self) -> Option<u32> {{ {}::<C>(rest) }}",
-            SCAN_STEP.0, SCAN_STEP.1
-        );
+        source
+    }
+
+    /// A whole recovery module both of its pins accept: the surface *and* the routing.
+    ///
+    /// One fixture rather than two concatenated, because `next` is on both lists and two
+    /// declarations of it would make `braced_body` read whichever came first — which is the
+    /// decoy `sealing_function_violations` refuses in the real codec, and a fixture is no
+    /// place to demonstrate it accidentally.
+    ///
+    /// Rendered from [`RECOVERY_SURFACE`] and [`RECOVERY_ROUTING_STEPS`] for the reason every
+    /// other clean fixture is rendered from its table: one written out by hand is one that
+    /// passes a pin the real reader fails.
+    #[must_use]
+    pub fn clean_recovery_routing() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! A recovery module.\n");
+        for name in RECOVERY_SURFACE {
+            let _ = match RECOVERY_ROUTING_STEPS.iter().find(|(step, _)| step == name) {
+                Some((_, through)) => writeln!(
+                    source,
+                    "pub fn {name}<C: IntegrityCheck>() -> u32 {{ {through}::<C>(bytes) }}"
+                ),
+                None => writeln!(source, "pub fn {name}() {{}}"),
+            };
+        }
+        // The private steps, which the surface pin does not see and this one does.
+        for (step, through) in RECOVERY_ROUTING_STEPS {
+            if !RECOVERY_SURFACE.contains(step) {
+                let _ = writeln!(
+                    source,
+                    "fn {step}<C: IntegrityCheck>() -> u32 {{ {through}::<C>(bytes) }}"
+                );
+            }
+        }
         source
     }
 
@@ -5250,8 +5947,9 @@ pub mod tests_support {
             .iter()
             .chain(TRANSITION_SURFACE)
             .chain(STORAGE_CONTRACT_SURFACE)
+            .chain(RECOVERY_SURFACE)
             .chain(seals)
-            .chain(SEALING_FUNCTIONS)
+            .chain(SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .chain([&DIGEST_FUNCTION.0])
             .chain(BANK_SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .collect();

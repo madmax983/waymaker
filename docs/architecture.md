@@ -389,6 +389,45 @@ Capacity is explicit. Waymaker reserves enough tail space for a terminal record 
 `continue_as_new`, so ordinary effect scheduling fails early with `HistoryNearCapacity`; the
 runtime never overwrites committed history to make room.
 
+## Journal recovery
+
+Design document §09, §10 and §14, and issue
+[#23](https://github.com/madmax983/waymaker/issues/23). Once a bank is authoritative its
+journal is scanned forward to the last valid committed record, and **where the scan stops is
+the whole of prefix safety**. The reader holds one caller-owned page and a position, so the
+picture below is the whole of its state: nothing in it grows with history.
+
+The three endings are the point. Only one of them yields a place to write, and the reason is
+physics rather than caution — on NOR a programmed bit cannot be returned to one without
+erasing the block, so an append offset that is not the start of an erased run is a bank that
+never boots again.
+
+<!-- diagram: journal-recovery -->
+
+```mermaid
+flowchart TB
+  start(["offset = 0"]) --> read["read a header · one caller-owned page"]
+  read --> erased{"erased header?"}
+  erased -- "yes" --> tail["read the rest of the region"]
+  tail -- "erased to the end" --> clean(["Clean · append_at = offset"])
+  tail -- "programmed bytes behind it" --> damaged(["Damaged · no append offset"])
+  erased -- "no" --> len["frame_len_of · header seal checked before payload_len is trusted"]
+  len -- "malformed · integrity-failed · truncated" --> damaged
+  len -- "longer than the page" --> incomplete(["Incomplete · no append offset"])
+  len -- "sound" --> frame["read the frame · decode_with"]
+  frame -- "unknown record kind, or a seal that does not hold" --> damaged
+  frame -- "a record" --> yield["yield it · offset += padded stride"]
+  yield --> read
+  read -- "read failed" --> incomplete
+```
+
+Out-of-sequence is the one of §09's four stop conditions that is not drawn here, because it
+is not a fact about the bytes: `waymaker_core::ReplayCursor` owns it, a caller pairs the two,
+and a caller that stops pumping gets no append offset because an unfinished scan has none.
+Unsealed is issue [#24](https://github.com/madmax983/waymaker/issues/24)'s — until the commit
+seal exists, a torn tail and a damaged frame stop the scan in the same place, which is what
+§14 requires either way.
+
 ## Crash injection
 
 Design document §15. Every guarantee drawn above is a statement about what survives a reset,

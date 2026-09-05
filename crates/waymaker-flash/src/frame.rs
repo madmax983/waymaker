@@ -600,6 +600,70 @@ pub fn decode(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
 ///
 /// As [`decode`].
 pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Frame<'_>, DecodeError> {
+    // The header first, and through the one function that verifies one. Everything below
+    // this line reads a length that the writer is known to have written.
+    let header = verify_header_with::<C>(bytes)?;
+    // Both sums are bounded by `MAX_FRAME_BYTES`, so neither can overflow a `usize` on any
+    // target this crate builds for; `saturating_add` says so without depending on it.
+    let covered = HEADER_BYTES.saturating_add(header.payload_len);
+    let frame_len = covered.saturating_add(TRAILER_BYTES);
+    let (Some(sealed), Some(trailer)) = (
+        bytes.get(..covered),
+        bytes
+            .get(covered..)
+            .and_then(<[u8]>::first_chunk::<TRAILER_BYTES>),
+    ) else {
+        return Err(DecodeError::Truncated);
+    };
+    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
+        return Err(DecodeError::IntegrityFailed);
+    }
+
+    let Some(payload) = sealed.get(HEADER_BYTES..) else {
+        // Unreachable: `sealed` is `covered` bytes long and `covered >= HEADER_BYTES`.
+        // Spelled as a refusal rather than an `unwrap` because the workspace denies both
+        // `unwrap` and `panic`, and a decoder walking bytes off a damaged device is the
+        // last place to make an exception.
+        return Err(DecodeError::Truncated);
+    };
+    let decoded = decode_body(header.kind, header.seq, payload)?;
+
+    Ok(Frame {
+        format_version: header.format_version,
+        decoded,
+        frame_len,
+    })
+}
+
+/// A frame header whose own seal has held, with the three fields the rest of the frame is
+/// read against.
+///
+/// Private on purpose: [`Frame`] is what a caller gets, and a partly decoded frame is a
+/// value nothing outside this module has a use for. What *is* public is the one number a
+/// reader with a page smaller than the journal needs — see [`frame_len_of`].
+#[derive(Clone, Copy)]
+struct VerifiedHeader {
+    format_version: u8,
+    kind: RecordKind,
+    seq: EffectSeq,
+    payload_len: usize,
+}
+
+/// Reads the twelve-byte header at the front of `bytes` and verifies it against `C`.
+///
+/// The one place a header's seal is computed. [`decode_with`] and [`frame_len_of_with`]
+/// both come through here rather than each destructuring twelve bytes for themselves,
+/// because two readers of one header is exactly the drift §09's frozen layout exists to
+/// rule out.
+///
+/// # Errors
+///
+/// [`DecodeError::Truncated`] when `bytes` is shorter than a header,
+/// [`DecodeError::IntegrityFailed`] when the magic or the header seal does not hold, and
+/// [`DecodeError::UnsupportedFormatVersion`] for a version this firmware does not read —
+/// in that order, which is the order §09 requires: the header layout is frozen across
+/// format versions, so its checksum is meaningful before its version is known.
+fn verify_header_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<VerifiedHeader, DecodeError> {
     // `first_chunk` gives a `&[u8; 12]`, which destructures. Every header field is then
     // named rather than offset-counted, and the read cannot fail once the chunk is in
     // hand — so the only bounds check on this path is the one that decides whether a
@@ -638,41 +702,62 @@ pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Frame<'_>, DecodeE
         return Err(DecodeError::UnsupportedFormatVersion);
     }
 
-    let payload_len = usize::from(u16::from_le_bytes([len_low, len_high]));
-    // Both sums are bounded by `MAX_FRAME_BYTES`, so neither can overflow a `usize` on any
-    // target this crate builds for; `saturating_add` says so without depending on it.
-    let covered = HEADER_BYTES.saturating_add(payload_len);
-    let frame_len = covered.saturating_add(TRAILER_BYTES);
-    let (Some(sealed), Some(trailer)) = (
-        bytes.get(..covered),
-        bytes
-            .get(covered..)
-            .and_then(<[u8]>::first_chunk::<TRAILER_BYTES>),
-    ) else {
-        return Err(DecodeError::Truncated);
-    };
-    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
-        return Err(DecodeError::IntegrityFailed);
-    }
-
-    let Some(payload) = sealed.get(HEADER_BYTES..) else {
-        // Unreachable: `sealed` is `covered` bytes long and `covered >= HEADER_BYTES`.
-        // Spelled as a refusal rather than an `unwrap` because the workspace denies both
-        // `unwrap` and `panic`, and a decoder walking bytes off a damaged device is the
-        // last place to make an exception.
-        return Err(DecodeError::Truncated);
-    };
-    let decoded = decode_body(
-        RecordKind(kind),
-        EffectSeq(u32::from_le_bytes([seq0, seq1, seq2, seq3])),
-        payload,
-    )?;
-
-    Ok(Frame {
+    Ok(VerifiedHeader {
         format_version: version,
-        decoded,
-        frame_len,
+        kind: RecordKind(kind),
+        seq: EffectSeq(u32::from_le_bytes([seq0, seq1, seq2, seq3])),
+        payload_len: usize::from(u16::from_le_bytes([len_low, len_high])),
     })
+}
+
+/// How long the frame at the front of `header` is, before padding, read from its header
+/// alone.
+///
+/// This is what §09's two checksums are *for*, made usable. `header_crc` covers the twelve
+/// bytes that include `payload_len`, so a reader can learn where a frame ends without
+/// having the frame: the length it gets back is one the writer is known to have written,
+/// rather than one that was found in whatever the media happens to hold.
+///
+/// A recovery whose scratch page is smaller than the journal needs exactly that. It has to
+/// decide how many bytes to stage *before* it stages them, and a reader that trusted an
+/// unverified `payload_len` would be one an erased page could send anywhere.
+///
+/// # Postconditions
+///
+/// [`FRAME_OVERHEAD_BYTES`] plus the payload length the header declares, which is
+/// [`Frame::frame_len`] for the same bytes and never more than [`MAX_FRAME_BYTES`]. Reads
+/// at most [`HEADER_BYTES`] bytes of `header` and nothing past them. Padding is not
+/// included, for the reason [`Frame::frame_len`] does not include it: it is a property of
+/// the device rather than of the frame.
+///
+/// # Errors
+///
+/// [`DecodeError::Truncated`] when `header` is shorter than [`HEADER_BYTES`],
+/// [`DecodeError::IntegrityFailed`] when the magic or the header checksum does not hold,
+/// and [`DecodeError::UnsupportedFormatVersion`] for a version this firmware cannot read.
+#[inline]
+pub fn frame_len_of(header: &[u8]) -> Result<usize, DecodeError> {
+    frame_len_of_with::<Catalogued>(header)
+}
+
+/// How long the frame at the front of `header` is, verified against `C`.
+///
+/// [`frame_len_of`] is this at `C = Catalogued`. A header sealed by another algorithm is
+/// refused with [`DecodeError::IntegrityFailed`] rather than yielding a length taken from
+/// bytes nothing checked.
+///
+/// # Postconditions
+///
+/// As [`frame_len_of`], with `C::header_check` in place of the shipped one.
+///
+/// # Errors
+///
+/// As [`frame_len_of`].
+pub fn frame_len_of_with<C: IntegrityCheck>(header: &[u8]) -> Result<usize, DecodeError> {
+    let verified = verify_header_with::<C>(header)?;
+    // Bounded by `MAX_FRAME_BYTES`, so this cannot overflow on any target this crate builds
+    // for; `saturating_add` says so without depending on it.
+    Ok(FRAME_OVERHEAD_BYTES.saturating_add(verified.payload_len))
 }
 
 /// Interprets a verified payload under the kind its header declared.

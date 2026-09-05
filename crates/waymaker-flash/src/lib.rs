@@ -33,6 +33,7 @@ pub mod bank;
 mod crc;
 pub mod frame;
 pub mod integrity;
+pub mod recovery;
 pub mod storage;
 
 pub use bank::{
@@ -40,4 +41,5 @@ pub use bank::{
 };
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
+pub use recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 pub use storage::{Geometry, GeometryError, StableStorage};
