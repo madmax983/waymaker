@@ -972,11 +972,6 @@ fn without_fenced_code(contents: &str) -> String {
     kept.join("\n")
 }
 
-/// Rule: `CLAUDE.md` exists, quotes the layering table, and names every gate rule.
-///
-/// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
-/// reading `CLAUDE.md` is reading the same string the gate reads, or the gate says so.
-#[must_use]
 /// Every rule count CLAUDE.md states that is not `expected`.
 ///
 /// The file states the count twice — once in its opening paragraph and once above the table
@@ -996,6 +991,12 @@ fn without_fenced_code(contents: &str) -> String {
 /// "Adding a gate rule" tells a contributor to keep. A verb cannot sit there: `ADR 0012 rules`
 /// has no `all`.
 ///
+/// The anchor has to start a word, and Codex found the second false positive that costs:
+/// lowercased, `Install 39 rules from the policy bundle` ends `install ` with `all ` inside
+/// it, so a bare substring match reads a count out of a verb's suffix. Only the two complete
+/// forms the file uses are accepted after the digits — `rules` and `rule id` — so `all 39
+/// ruler` is not a count either.
+///
 /// What it therefore does **not** catch is a count written some other way — `the 39 rules`,
 /// or a bare `39 rules` mid-sentence. That is the narrower gap, and it is the right one to
 /// take: a missed drift is a wrong number a reviewer can still see, and a false positive is a
@@ -1004,6 +1005,16 @@ fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
     let mut stale = Vec::new();
     let lowered = contents.to_lowercase();
     for (at, _) in lowered.match_indices("all ") {
+        // A word boundary before the anchor. Codex found the second false positive this
+        // way: lowercased, `Install 39 rules from the policy bundle` ends `install ` with
+        // `all ` inside it, so a bare substring match reads a count out of a verb's suffix.
+        let starts_a_word = lowered
+            .get(..at)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_');
+        if !starts_a_word {
+            continue;
+        }
         let Some(rest) = lowered.get(at.saturating_add("all ".len())..) else {
             continue;
         };
@@ -1014,7 +1025,9 @@ fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
         let Some(after) = rest.get(digits.len()..) else {
             continue;
         };
-        if !after.starts_with(" rule") {
+        // And only the two complete forms the file uses, so `all 39 ruler` is not a count
+        // either.
+        if !(after.starts_with(" rules") || after.starts_with(" rule id")) {
             continue;
         }
         let Ok(said) = digits.parse::<usize>() else {
@@ -1026,6 +1039,7 @@ fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
     }
     stale
 }
+
 /// Rule: CLAUDE.md states the gate's rule count, once, and states it right.
 ///
 /// Two checks rather than one, because this has now been wrong twice. First the table grew
@@ -1076,6 +1090,11 @@ fn check_rule_count(contents: &str, rules: usize) -> Vec<Violation> {
     violations
 }
 
+/// Rule: `CLAUDE.md` exists, quotes the layering table, and names every gate rule.
+///
+/// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
+/// reading `CLAUDE.md` is reading the same string the gate reads, or the gate says so.
+#[must_use]
 fn check_claude_md(contents: Option<&str>, rules: &[&str]) -> Vec<Violation> {
     let Some(contents) = contents else {
         return vec![Violation::new(
@@ -3622,6 +3641,47 @@ mod tests {
             stale_rule_counts("the rule, issue 72", 40),
             Vec::<usize>::new()
         );
+    }
+
+    #[test]
+    fn the_all_anchor_has_to_start_a_word() {
+        // Codex found this on the fix for its own first finding: lowercased, `install `
+        // ends with `all `, so a bare substring match reads a count out of a verb's suffix
+        // and fails a build over a sentence making no claim about rule counts.
+        assert_eq!(
+            stale_rule_counts("Install 39 rules from the policy bundle. All 40 rules.", 40),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            stale_rule_counts("recall 39 rules. All 40 rules.", 40),
+            Vec::<usize>::new()
+        );
+        // And the anchor still works where it really does start a word, including after
+        // punctuation rather than a space.
+        assert_eq!(stale_rule_counts("(all 39 rules)", 40), vec![39]);
+        assert_eq!(stale_rule_counts("all 39 rules", 40), vec![39]);
+    }
+
+    #[test]
+    fn only_the_complete_count_forms_are_read_as_counts() {
+        // `rules` and `rule ids` are what the file says; a word that merely begins with
+        // them is not a count.
+        assert_eq!(
+            stale_rule_counts("all 39 ruler markings. All 40 rules.", 40),
+            Vec::<usize>::new()
+        );
+        assert_eq!(stale_rule_counts("all 39 rule ids", 40), vec![39]);
+        assert_eq!(stale_rule_counts("all 39 rules", 40), vec![39]);
+    }
+
+    #[test]
+    fn the_aggregate_check_keeps_its_must_use_contract() {
+        // Codex found that extracting the helpers had left `#[must_use]` and the aggregate
+        // check's own documentation attached to a helper instead of to `check_claude_md`,
+        // so a caller discarding the violations would no longer be warned. The helpers now
+        // sit above that doc block; this is the compile-time half of saying so.
+        let _: Vec<Violation> = check_claude_md(Some(&clean_claude_md(RULES)), RULES);
+        let _: Vec<Violation> = check_rule_count(&clean_claude_md(RULES), RULES.len());
     }
 
     #[test]
