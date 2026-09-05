@@ -8,7 +8,9 @@
 //! Neither is checkable from the journal alone.
 
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_rig::witness::{MARK_BYTES, Mark, Stage, Witness, WitnessError, WitnessRegion};
+use waymaker_rig::witness::{
+    MARK_BYTES, Mark, Progress, Stage, Witness, WitnessError, WitnessRegion,
+};
 
 const ITERATION: u32 = 0x0123_4567;
 
@@ -389,4 +391,63 @@ fn a_witness_scanned_on_a_different_geometry_is_refused() {
         Witness::new(region(4)).scan(&mut storage, &mut page),
         Err(WitnessError::WrongGeometry)
     );
+}
+
+#[test]
+fn a_witness_from_the_last_iteration_round_trips_like_any_other() {
+    // `u32::MAX` is a legal iteration: `Plan::cut` answers for it, and a rig can be asked to
+    // run it. Encoding presence as a reserved iteration value made a real witness from that
+    // iteration decode as an *empty* one — which the audit reads as "the run never began", so
+    // a violation recorded there became a clean run for anybody investigating it from the log.
+    for iteration in [0_u32, 1, 0xFFFF_FFFE, u32::MAX] {
+        let progress = with_iteration(iteration);
+        let mut bytes = [0_u8; Progress::ENCODED_BYTES];
+        assert_eq!(progress.encode(&mut bytes), Some(Progress::ENCODED_BYTES));
+        let read = Progress::decode(&bytes).expect("a whole progress");
+        assert_eq!(read.iteration(), Some(iteration), "iteration {iteration}");
+        assert_eq!(read, progress, "iteration {iteration}");
+    }
+}
+
+/// A `Progress` carrying `iteration`, built the way a scan builds one.
+///
+/// `Progress::raising` does not set the iteration — a scan takes that from the marks — so the
+/// only way to a `Progress` with one is through media. That is the right shape for the type
+/// and an awkward one for a codec test, so this writes two marks and scans them back.
+fn with_iteration(iteration: u32) -> Progress {
+    let mut storage = device(4);
+    let mut page = [0_u8; 64];
+    let mut witness = Witness::new(region(4));
+    for (index, stage) in [(0_u16, Stage::Attempted), (0, Stage::Acknowledged)] {
+        let Ok(()) = witness.mark(&mut storage, Mark::new(iteration, index, stage), &mut page)
+        else {
+            unreachable!("two marks fit an erase block")
+        };
+    }
+    let Ok(progress) = Witness::new(region(4)).scan(&mut storage, &mut page) else {
+        unreachable!("the marks this helper wrote are legal")
+    };
+    progress
+}
+
+#[test]
+fn an_undefined_flag_bit_is_not_a_witness() {
+    // The same rule the mark's reserved byte is held to: a bit nothing reads is a bit nothing
+    // can detect a change in.
+    let progress = Progress::EMPTY.raising(Stage::Attempted, 1);
+    let mut bytes = [0_u8; Progress::ENCODED_BYTES];
+    progress.encode(&mut bytes).expect("a progress fits");
+    let Some(flags) = bytes.last_mut() else {
+        unreachable!("the encoding is not empty")
+    };
+    *flags |= 0b1000_0000;
+    assert_eq!(Progress::decode(&bytes), None);
+}
+
+#[test]
+fn a_progress_shorter_than_its_length_is_refused() {
+    let progress = Progress::EMPTY;
+    let mut bytes = [0_u8; Progress::ENCODED_BYTES - 1];
+    assert_eq!(progress.encode(&mut bytes), None);
+    assert_eq!(Progress::decode(&bytes), None);
 }

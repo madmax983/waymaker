@@ -310,6 +310,62 @@ fn a_page_whose_length_is_not_a_read_unit_still_works() {
 }
 
 #[test]
+fn a_witness_too_small_for_the_whole_run_is_refused_at_construction() {
+    // A clean run writes `5 * effects + 4` marks — three for every schedule record, two for
+    // every other. `WitnessRegion::of` only checks that one mark fits, so a rig could be
+    // built whose instrument runs out near the end of an iteration and reports
+    // `WitnessError::Full` — an instrument failure dressed as a run.
+    let Ok(part) = Geometry::new(6 * 256, 256, 4, 1) else {
+        unreachable!("a legal geometry")
+    };
+    let capacity = {
+        let rig =
+            Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), 1).expect("one effect fits");
+        rig.witness_region().capacity()
+    };
+    // Whatever the region holds, a run needing more marks than that must be refused here
+    // rather than part-way through.
+    for effects in 0..12_u16 {
+        let needed = 5 * u32::from(effects) + 4;
+        let built = Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), effects);
+        if needed > capacity {
+            assert!(
+                built.is_err(),
+                "a run needing {needed} marks was accepted against a witness of {capacity}"
+            );
+            continue;
+        }
+        let rig = built.expect("a run whose marks fit");
+        let mut device = waymaker_fault::Device::new(part);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Inert,
+            &mut waymaker_rig::cutter::NeverCut,
+            &mut page,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{effects} effects needed {needed} marks and failed mid-run: {error:?}")
+        });
+    }
+}
+
+/// A dispatcher that does nothing, for the cases that are about media rather than effects.
+struct Inert;
+
+impl waymaker_rig::cutter::Dispatcher for Inert {
+    type Error = core::convert::Infallible;
+
+    fn dispatch(&mut self, _effect: u16, _input: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[test]
 fn a_page_shorter_than_the_rig_needs_is_refused_by_every_entry_point() {
     let rig =
         Rig::new::<waymaker_fault::FaultError>(part(), Plan::new(0), 1).expect("a legal layout");

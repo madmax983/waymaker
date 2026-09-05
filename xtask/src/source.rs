@@ -1037,8 +1037,9 @@ pub const RIG_RUN_PATH: &str = "waymaker-rig/src/run.rs";
 
 /// Every public function the rig's runner is allowed to have.
 ///
-/// `at` rather than a second `new`: `Rig::new` is in this file, and the pin is a list of
-/// names, so `PlannedCut` names its constructor differently on purpose.
+/// `marks_per_run` is on the list rather than private because it is the arithmetic
+/// `Rig::new` refuses a too-small instrument against, and a caller sizing a witness region
+/// needs the same number. It grants nothing: it is a pure function of an effect count.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 pub const RIG_RUN_SURFACE: &[&str] = &[
@@ -1049,6 +1050,7 @@ pub const RIG_RUN_SURFACE: &[&str] = &[
     "iterate",
     "judge",
     "layout",
+    "marks_per_run",
     "new",
     "part",
     "plan",

@@ -82,6 +82,13 @@ pub enum RigError<E, D = core::convert::Infallible> {
         /// The most effects a run can have.
         limit: u16,
     },
+    /// The instrument area cannot hold every mark a clean run writes.
+    WitnessTooSmall {
+        /// How many marks the run needs.
+        needed: u32,
+        /// How many the region holds.
+        capacity: u32,
+    },
     /// The workload asked for a record it does not have.
     Workload,
     /// The part refused.
@@ -125,6 +132,22 @@ pub struct Rig {
 }
 
 impl Rig {
+    /// How many witness marks a clean run of `effects` effects writes.
+    ///
+    /// Three for every schedule record — attempted, acknowledged, dispatched — and two for
+    /// every other: the opening `RunStarted`, each `EffectCompleted`, and the terminal
+    /// `RunCompleted`. That is `5 * effects + 4`.
+    ///
+    /// `None` only for a run too long to index, which [`new`](Self::new) refuses separately.
+    #[must_use]
+    pub const fn marks_per_run(effects: u16) -> Option<u32> {
+        let effects = effects as u32;
+        let Some(per_effect) = effects.checked_mul(5) else {
+            return None;
+        };
+        per_effect.checked_add(4)
+    }
+
     /// The bank the rig installs and writes into.
     ///
     /// One bank, at generation one, for the length of a run. §10's swap is issue
@@ -204,6 +227,21 @@ impl Rig {
         let layout = BankLayout::new(engine).map_err(RigError::Layout)?;
         let witness = WitnessRegion::of(instrument, 0, witness_bytes)
             .map_err(|error| RigError::Witness(promote(error)))?;
+        // `WitnessRegion::of` checks that *one* mark fits. A clean run writes rather more, and
+        // a rig whose instrument runs out near the end of an iteration reports
+        // `WitnessError::Full` — an instrument failure dressed up as a run. Refused here,
+        // where a caller can make the region bigger or the run shorter.
+        let Some(marks) = Self::marks_per_run(effects) else {
+            return Err(RigError::TooManyEffects {
+                limit: Workload::MAX_EFFECTS,
+            });
+        };
+        if marks > witness.capacity() {
+            return Err(RigError::WitnessTooSmall {
+                needed: marks,
+                capacity: witness.capacity(),
+            });
+        }
         Ok(Self {
             part,
             engine_bytes,
@@ -483,18 +521,6 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
-            // The two phases that are *writes*. `Phase::Dispatch` is not one of them and
-            // cannot be reached from here: `phase_of` answers only `Schedule` and
-            // `Completion`, because a dispatch happens between two records rather than at
-            // one, and its cut point is taken below where the effect actually goes out.
-            if let Some(phase) = phase_of(role)
-                && phase == cut.phase()
-                && let Some(effect) = effect_of(role)
-                && cutter.cut(phase, cause, effect)
-            {
-                return Ok(Stop::Cut { phase, effect });
-            }
-
             self.mark(
                 part,
                 &mut witness,
@@ -502,6 +528,33 @@ impl Rig {
                 page,
             )
             .map_err(widen)?;
+
+            // The cut goes here — after the `Attempted` mark and immediately before the
+            // journal write it names — and both halves of that matter.
+            //
+            // *After the mark*, because a board's cutter arms a delayed reset and returns, so
+            // the very next storage operation is what a short delay tears. Offered before the
+            // mark, that operation is the rig's own witness program: the run would report a
+            // schedule-phase cut having torn the instrument, and the write phase issue #27
+            // asks about would never have been under way at all.
+            //
+            // *Gated on the effect*, because `Cutter::cut` says the rig "has reached `phase`
+            // for `effect` and is about to do the work of it". Offered for every effect, a
+            // board cutter that acts whenever it is called arms on the first one whatever the
+            // seed said — and arms again on the next. `PlannedCut` filters internally, which
+            // is exactly why it could not see this.
+            //
+            // `Phase::Dispatch` cannot be reached here: `phase_of` answers only `Schedule` and
+            // `Completion`, because a dispatch happens between two records rather than at one,
+            // and its cut point is taken in `after_schedule`, where the effect goes out.
+            if let Some(phase) = phase_of(role)
+                && phase == cut.phase()
+                && let Some(effect) = effect_of(role)
+                && effect == cut.effect_index(self.effects)
+                && cutter.cut(phase, cause, effect)
+            {
+                return Ok(Stop::Cut { phase, effect });
+            }
 
             {
                 let mut engine = self.engine(part).map_err(widen)?;
@@ -839,6 +892,9 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::ShortPage => RigError::ShortPage,
         RigError::ProgramUnitTooWide { limit } => RigError::ProgramUnitTooWide { limit },
         RigError::TooManyEffects { limit } => RigError::TooManyEffects { limit },
+        RigError::WitnessTooSmall { needed, capacity } => {
+            RigError::WitnessTooSmall { needed, capacity }
+        }
         RigError::Workload => RigError::Workload,
         RigError::Storage(inner) => RigError::Storage(inner),
         RigError::Geometry(inner) => RigError::Geometry(inner),

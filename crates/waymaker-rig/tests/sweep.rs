@@ -32,7 +32,7 @@ use waymaker_fault::{Device, Harness, Injection, Interruption, Op, Progress, Run
 use waymaker_flash::storage::Geometry;
 use waymaker_rig::audit::Breach;
 use waymaker_rig::census::Coverage;
-use waymaker_rig::cutter::{Dispatcher, NeverCut};
+use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
 use waymaker_rig::log::{Entry, Outcome};
 use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
@@ -450,6 +450,123 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
         break;
     }
     assert!(reached, "no iteration in 64 armed a dispatch-phase cut");
+}
+
+/// A cutter that records every call it was offered, and never cuts.
+#[derive(Default)]
+struct Offered {
+    calls: Vec<(Phase, u16)>,
+}
+
+impl waymaker_rig::cutter::Cutter for Offered {
+    fn cut(&mut self, phase: Phase, _cause: ResetCause, effect: u16) -> bool {
+        self.calls.push((phase, effect));
+        false
+    }
+}
+
+#[test]
+fn a_write_cut_is_offered_once_and_for_the_effect_the_plan_named() {
+    // The `Cutter` contract says the rig "has reached `phase` for `effect` and is about to do
+    // the work of it". A board's implementation arms a supply cut and returns — so being
+    // offered the call for *every* effect means arming on effect 0 whatever the seed said,
+    // and being offered it more than once means arming twice. `PlannedCut` filters internally
+    // and so cannot see either.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    for iteration in 0..48_u32 {
+        let cut = rig.cut_at(iteration);
+        if cut.phase() == Phase::Dispatch {
+            continue;
+        }
+        let mut device = Device::new(geometry());
+        let mut offered = Offered::default();
+        {
+            let mut metered = Metered::new(&mut device);
+            rig.prepare(&mut metered, iteration, &mut page)
+                .expect("a prepared part");
+            rig.iterate(
+                iteration,
+                &mut metered,
+                &mut Counting::default(),
+                &mut offered,
+                &mut page,
+            )
+            .expect("a run the cutter never stops");
+        }
+        let wanted = cut.effect_index(EFFECTS);
+        assert_eq!(
+            offered.calls,
+            vec![(cut.phase(), wanted)],
+            "iteration {iteration} offered {:?}, wanted one call for effect {wanted} in {:?}",
+            offered.calls,
+            cut.phase()
+        );
+    }
+}
+
+#[test]
+fn a_write_cut_is_armed_after_the_attempted_mark_and_not_before_it() {
+    // A board's cutter arms a delayed reset and returns, so the very next storage operation is
+    // what a short delay tears. Offered before the `Attempted` mark, that operation is the
+    // rig's own witness program — the instrument — and the write phase the run reports would
+    // never have been under way at all.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut checked = 0_usize;
+    for iteration in 0..48_u32 {
+        let cut = rig.cut_at(iteration);
+        if cut.phase() == Phase::Dispatch {
+            continue;
+        }
+        let mut device = Device::new(geometry());
+        {
+            let mut metered = Metered::new(&mut device);
+            rig.prepare(&mut metered, iteration, &mut page)
+                .expect("a prepared part");
+            let mut cutter = PlannedCut::at(cut, EFFECTS);
+            rig.iterate(
+                iteration,
+                &mut metered,
+                &mut Counting::default(),
+                &mut cutter,
+                &mut page,
+            )
+            .expect("an iteration that stops at its cut");
+            assert!(cutter.fired());
+        }
+        // The record the cut was armed in front of is the one the witness says was begun: the
+        // `Attempted` mark is down, and the record itself is not committed.
+        let marks = {
+            let mut instrument = waymaker_rig::window::Window::new(
+                &mut device,
+                rig.instrument_base(),
+                geometry().erase_size(),
+            )
+            .expect("the instrument window");
+            Witness::new(rig.witness_region())
+                .scan(&mut instrument, &mut page)
+                .expect("a witness the rig wrote")
+        };
+        let workload = rig.workload(iteration);
+        let index = marks.attempted().expect("a record was begun");
+        assert_eq!(
+            workload.role(index),
+            Some(match cut.phase() {
+                Phase::Schedule => Role::Schedule(cut.effect_index(EFFECTS)),
+                Phase::Completion => Role::Completion(cut.effect_index(EFFECTS)),
+                Phase::Dispatch => unreachable!("dispatch iterations are skipped"),
+            }),
+            "iteration {iteration}: the cut was armed in front of record {index}"
+        );
+        assert_eq!(
+            marks.acknowledged(),
+            index.checked_sub(1),
+            "iteration {iteration}: the record the cut precedes must not be acknowledged"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no write-phase iteration in 48");
 }
 
 #[test]

@@ -79,6 +79,17 @@ pub const MARK_MAGIC: u16 = 0x5752;
 /// How many bytes of a mark the check covers.
 const MARK_BODY_BYTES: usize = MARK_BYTES - 2;
 
+/// The flag bit that says the witness's last slot was torn.
+const FLAG_TORN: u8 = 0b0000_0001;
+
+/// The flag bit that says the witness names an iteration.
+///
+/// A flag rather than a reserved iteration value, because `u32::MAX` is a legal iteration and
+/// a sentinel would make a real witness from it decode as an empty one — which
+/// [`crate::audit::Audit`] reads as "the run never began", turning a recorded violation into a
+/// clean run for anybody who investigates it from the log.
+const FLAG_ITERATION: u8 = 0b0000_0010;
+
 /// The bits of the check a seal byte keeps.
 ///
 /// Bit 7 cleared, so a seal byte is never `0xFF` and erased media is never a seal. See the
@@ -509,9 +520,10 @@ impl Progress {
 
     /// A high water, as two bytes, with `0xFFFF` for "none".
     ///
-    /// `u16::MAX` is not a reachable record index — a run of 65535 records is refused long
-    /// before it — so it is free to stand for absence, and a reader that met it would demand
-    /// nothing rather than demand everything.
+    /// `u16::MAX` is not a reachable record index — `Workload::MAX_EFFECTS` refuses a run
+    /// long before it — so it is free to stand for absence, and a reader that met it would
+    /// demand nothing rather than demand everything. The *iteration* has no such spare value
+    /// and does not use this trick; see [`FLAG_ITERATION`].
     const fn word(value: Option<u16>) -> [u8; 2] {
         match value {
             Some(index) => index.to_le_bytes(),
@@ -552,12 +564,24 @@ impl Progress {
         acknowledged.copy_from_slice(&Self::word(self.acknowledged));
         let (dispatched, rest) = rest.split_at_mut(2);
         dispatched.copy_from_slice(&Self::word(self.dispatched));
-        let (marks, torn) = rest.split_at_mut(1);
+        let (marks, flags) = rest.split_at_mut(1);
         // Saturating: the count is a figure in a report, and a wrapped one would read as an
         // empty witness — which `Audit::finish` treats as "the run never began".
         let count = u8::try_from(self.marks.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
         marks.fill(count);
-        torn.fill(u8::from(self.torn));
+        // Presence is a flag rather than a reserved iteration number. `u32::MAX` is a legal
+        // iteration — `Plan::cut` answers for it and a rig can be asked to run it — so a
+        // sentinel would make a real witness from that iteration decode as *no* witness, and
+        // the audit would then read it as the empty state it treats as "the run never began".
+        // One bit costs nothing and the alternative silently loses a violation.
+        let mut bits = 0_u8;
+        if self.torn {
+            bits |= FLAG_TORN;
+        }
+        if self.iteration.is_some() {
+            bits |= FLAG_ITERATION;
+        }
+        flags.fill(bits);
         Some(Self::ENCODED_BYTES)
     }
 
@@ -574,20 +598,22 @@ impl Progress {
         let (attempted, rest) = rest.split_at(2);
         let (acknowledged, rest) = rest.split_at(2);
         let (dispatched, rest) = rest.split_at(2);
-        let (marks, torn) = rest.split_at(1);
+        let (marks, flags) = rest.split_at(1);
         let iteration = u32::from_le_bytes(<[u8; 4]>::try_from(iteration).ok()?);
-        let torn = match torn.first().copied()? {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
+        let bits = flags.first().copied()?;
+        if bits & !(FLAG_TORN | FLAG_ITERATION) != 0 {
+            // A bit with no meaning is not a witness. The same rule the mark's reserved byte
+            // is held to, for the same reason: an undefined bit nothing reads is an undefined
+            // bit nothing can detect a change in.
+            return None;
+        }
         Some(Self {
-            iteration: (iteration != u32::MAX).then_some(iteration),
+            iteration: (bits & FLAG_ITERATION != 0).then_some(iteration),
             attempted: Self::unword(<[u8; 2]>::try_from(attempted).ok()?),
             acknowledged: Self::unword(<[u8; 2]>::try_from(acknowledged).ok()?),
             dispatched: Self::unword(<[u8; 2]>::try_from(dispatched).ok()?),
             marks: u32::from(marks.first().copied()?),
-            torn,
+            torn: bits & FLAG_TORN != 0,
         })
     }
 
