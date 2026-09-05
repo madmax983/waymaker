@@ -124,7 +124,7 @@ fn two_barrier_writer(session: &mut Session) -> Result<(), FaultError> {
     let mut page = [0_u8; PAGE];
     let mut recovery = Recovery::new(region());
     while recovery.next(session, &mut page).is_some() {}
-    let Some(mut journal) = Journal::after(&recovery) else {
+    let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly at its first byte")
     };
 
@@ -195,6 +195,7 @@ fn unwind(error: AppendError<FaultError>) -> FaultError {
         AppendError::NoRoom { needed, available } => {
             unreachable!("{needed} B does not fit {available} B")
         }
+        AppendError::Interrupted => unreachable!("this writer stops at its first failure"),
     }
 }
 
@@ -365,7 +366,7 @@ fn the_writer_reports_the_same_amplification_at_every_record() {
     let mut page = [0_u8; PAGE];
     let mut recovery = Recovery::new(region());
     while recovery.next(&mut device, &mut page).is_some() {}
-    let Some(mut journal) = Journal::after(&recovery) else {
+    let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly")
     };
 

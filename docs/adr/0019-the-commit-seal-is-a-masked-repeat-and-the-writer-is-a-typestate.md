@@ -85,10 +85,30 @@ stops the second from passing for an unrelated reason, and the error code is wha
 passing for a typo. `trybuild` would have been the conventional tool and is a third-party
 dev-dependency this workspace does not allow outside `xtask` and `waymaker-conformance`.
 
-`Journal::after(&Recovery<C>)` is the only constructor, so a writer can only be pointed at an
+`Journal::after(Recovery<C>)` is the only constructor, so a writer can only be pointed at an
 offset a finished scan vouched for — [ADR 0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s
 anti-bricking rule made structural rather than documented. `Recovery::region` exists for that
 and for nothing else.
+
+Three more things had to be true for that to mean anything, and all three came out of review
+rather than out of writing the code:
+
+- **The recovery is consumed.** With `&Recovery` a caller could ask one finished scan for two
+  writers, and both would program their first record at the same offset. Two separate scans of
+  one region still produce two writers, and nothing short of owning the media could stop that
+  — but a second writer is now a line somebody wrote on purpose.
+- **Every step compares the device, not only the first.** `stage` checked that the storage was
+  the one the region was validated against; `payload_barrier` and `commit` did not. A barrier
+  taken on another device orders nothing on this one, so the frame would be sealed without ever
+  having been made durable — §07 step 2 undone — and a commit taken elsewhere programs a seal
+  at an offset that device never validated.
+- **Anything but a whole committed record ends the journal.** The append point is a fact about
+  erased media, and a failed program, a failed barrier and a dropped `Staged` all leave
+  programmed cells at the offset. A writer that carried on would program a second frame over
+  the first. So the journal is spent from the moment a body write is *issued* — §12 says a
+  failed program may still have changed media — and only a returned commit barrier makes it
+  appendable again; anything else is `AppendError::Interrupted` for ever, and recovery is what
+  decides where the run continues.
 
 The `commit-discipline` gate rule is what stops the typestate being given back: the surface is
 pinned, `Staged` must declare exactly one method and must not name `program`, `Sealable` must
@@ -135,6 +155,16 @@ ahead of its frame — and `the_honest_order_refuses_a_torn_record_whatever_the_
 is the new test that says why. That the mutant has to reach around
 `waymaker_flash::append` to the session to express itself is the typestate demonstrated from
 the outside.
+
+**Three defects were found by review rather than by the tests**, which is the same score as
+[ADR 0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s two and
+is worth writing down rather than quietly fixing: a recovery that could be asked for two
+writers, two of the three steps not comparing the device, and a journal that would program
+over a frame body a dropped `Staged` had left behind. Each is now a regression test in
+`crates/waymaker-flash/tests/append.rs`. The common shape is that the *first* step of a
+protocol was guarded and the rest were assumed to inherit the guard — which is exactly what a
+typestate is supposed to stop, and does not, because a typestate constrains the order of steps
+and says nothing about their arguments.
 
 **What the sweep cannot falsify is the payload barrier itself.** `waymaker_fault::Device`
 applies programs in the order they are issued, so it cannot tell a writer that barriers between

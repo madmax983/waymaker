@@ -1156,7 +1156,7 @@ fn journal_append() -> usize {
     let mut page = [0_u8; 64];
     let mut recovery = Recovery::<Catalogued>::with_integrity(region);
     while recovery.next(&mut media, &mut page).is_some() {}
-    let Some(mut journal) = Journal::after(&recovery) else {
+    let Some(mut journal) = Journal::after(recovery) else {
         return core::hint::black_box(kept);
     };
     kept = kept
@@ -1215,6 +1215,7 @@ const fn append_error_cost(
         AppendError::NoRoom { needed, available } => {
             (*needed as usize).wrapping_add(*available as usize)
         }
+        AppendError::Interrupted => 2,
     }
 }
 

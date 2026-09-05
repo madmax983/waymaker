@@ -86,9 +86,11 @@
 //!
 //! # Cost
 //!
-//! Per record: at most two reads — one of a header, one of the frame — and at most one
-//! padded frame of bytes. Nothing in [`Recovery`] grows with history; it is a region, an
-//! offset and a verdict, and a `const` assertion below says so.
+//! Per record: at most two reads — one of a header, one of the whole record — and at most
+//! one padded frame plus its commit seal of bytes. The page therefore has to hold a *record*
+//! rather than a frame, which is one program unit more than it was before issue #24, and
+//! [`RecoveryError::PageTooSmall`] reports that number. Nothing in [`Recovery`] grows with
+//! history; it is a region, an offset and a verdict, and a `const` assertion below says so.
 //!
 //! Two reads rather than one is a deliberate trade and worth stating, because the obvious
 //! alternative looks cheaper and is not. Staging `min(page, remaining)` bytes in one read

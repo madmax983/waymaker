@@ -48,8 +48,9 @@
 //!
 //! # Where a writer may start
 //!
-//! [`Journal::after`] is the only constructor, and it takes a finished [`Recovery`] whose
-//! [`append_offset`](Recovery::append_offset) answered [`Some`]. That is not
+//! [`Journal::after`] is the only constructor. It consumes a finished [`Recovery`] whose
+//! [`append_offset`](Recovery::append_offset) answered [`Some`] — consumes, so that one scan
+//! cannot hand out two writers at one offset. That is not
 //! conservatism: appending anywhere else programs cells a cycle has already cleared, and on
 //! NOR the bank never boots again — [`crate::recovery`]'s module documentation argues it at
 //! length. A constructor taking a region and an offset would let a caller supply two that do
@@ -132,8 +133,10 @@ impl WriteAmplification {
 
     /// How many `program` calls that took.
     ///
-    /// Two per record, and structurally so: the frame body and the commit seal cannot share
-    /// a call, because a barrier goes between them.
+    /// Two for a record that committed, and structurally so: the frame body and the commit
+    /// seal cannot share a call, because a barrier goes between them. A record that did not
+    /// commit contributes what it managed to ask for, which is why this is a count of calls
+    /// rather than twice a count of records.
     #[must_use]
     pub const fn program_operations(self) -> u32 {
         self.program_operations
@@ -141,8 +144,9 @@ impl WriteAmplification {
 
     /// How many barriers that took.
     ///
-    /// Two per record, which is §07's whole cost. On real NOR a barrier is what dominates:
-    /// the bytes are a burst and the barrier is a round trip.
+    /// Two for a record that committed, which is §07's whole cost, and fewer for one that
+    /// did not. On real NOR a barrier is what dominates: the bytes are a burst and the
+    /// barrier is a round trip.
     #[must_use]
     pub const fn barriers(self) -> u32 {
         self.barriers
@@ -235,6 +239,12 @@ pub enum AppendError<E> {
     /// makes, in the direction that programs rather than reads — which is the worse
     /// direction: an append at an offset proved legal on another device is a write outside
     /// the journal.
+    ///
+    /// Compared at **every** step and not only at the first. Review of this change found the
+    /// half that a single check leaves open: a payload barrier taken on some other device
+    /// orders nothing on this one, so the frame would be sealed without ever having been made
+    /// durable, and a commit taken on another device programs a seal at an offset that device
+    /// never validated.
     WrongDevice,
     /// The record does not fit in what is left of the region.
     ///
@@ -247,6 +257,19 @@ pub enum AppendError<E> {
         /// Bytes left in the region.
         available: u32,
     },
+    /// An earlier record did not finish, so this journal has nowhere it may write.
+    ///
+    /// [`Journal::after`] establishes that everything from the append offset to the end of
+    /// the region is erased, and a whole committed record is the only thing that preserves
+    /// it. Anything else leaves programmed cells at the offset: a program that failed may
+    /// have changed media, a barrier that failed says nothing about what preceded it, and a
+    /// [`Staged`] the caller dropped left a frame body there on purpose.
+    ///
+    /// So the journal stops accepting records rather than programming over cells a cycle has
+    /// already cleared, which on NOR is a bank that never boots again. Recovery is what
+    /// decides where — and whether — this run may be continued, and a caller that meets this
+    /// re-reads the bank or swaps it.
+    Interrupted,
 }
 
 /// A position in one journal that records may be appended at.
@@ -256,9 +279,11 @@ pub enum AppendError<E> {
 /// * [`offset`](Self::offset) only ever moves forward, and only when a record's commit
 ///   barrier has returned. A record that failed at any step is not history and does not
 ///   advance it.
-/// * Every byte from [`offset`](Self::offset) to the end of the region is erased. That is
-///   established once, by [`after`](Self::after), and preserved by only ever appending whole
-///   records at the offset.
+/// * Every byte from [`offset`](Self::offset) to the end of the region is erased, or the
+///   journal refuses to write at all. That is established once, by [`after`](Self::after),
+///   and preserved by only ever appending whole records at the offset — anything else, a
+///   dropped [`Staged`] included, ends the journal with [`AppendError::Interrupted`] rather
+///   than programming over cells a cycle has already cleared.
 /// * No borrow of the caller's page is retained past the record it staged.
 ///
 /// # Why it is not `Copy`
@@ -270,6 +295,14 @@ pub enum AppendError<E> {
 pub struct Journal<C: IntegrityCheck = Catalogued> {
     region: JournalRegion,
     offset: u32,
+    /// Whether [`offset`](Journal::offset) is still known to be the start of erased media.
+    ///
+    /// True when the journal was opened and after every record that committed, and false
+    /// from the moment a frame body is *attempted* until its commit barrier returns. That is
+    /// what makes a dropped [`Staged`], a failed program and a failed barrier the same
+    /// answer to the next caller, which is the answer §12 obliges: none of the three leaves
+    /// the offset known erased.
+    appendable: bool,
     written: WriteAmplification,
     /// The check this writer seals with. Zero-sized: [`IntegrityCheck`]'s methods take no
     /// `self`, so there is nothing to carry and the field costs no bytes.
@@ -283,6 +316,16 @@ impl<C: IntegrityCheck> Journal<C> {
     /// The only constructor. See the module documentation for why a region and an offset are
     /// not accepted separately.
     ///
+    /// # Why the recovery is consumed
+    ///
+    /// Because a recovery that could hand out two writers would hand out two writers at one
+    /// offset, and the second would program its frame over the first — on NOR, a bank that
+    /// fails its own header checksum on every boot for ever. Taking it by value makes the
+    /// accidental case not compile. It cannot make the *deliberate* case impossible: two
+    /// separate scans of one region produce two writers, exactly as two [`Recovery`] values
+    /// over one region already do, and nothing short of ownership of the media could stop
+    /// that. What it buys is that a second writer is a line somebody wrote on purpose.
+    ///
     /// # Postconditions
     ///
     /// [`Some`] exactly when [`Recovery::append_offset`] is [`Some`] — so exactly when the
@@ -291,11 +334,18 @@ impl<C: IntegrityCheck> Journal<C> {
     /// parameter: a journal read with one algorithm and extended with another is a journal
     /// neither reader can walk to its end.
     #[must_use]
-    pub fn after(recovery: &Recovery<C>) -> Option<Self> {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the recovery is consumed as a capability rather than for its bytes: a \
+                  scan that could be asked twice would hand out two writers at one offset, \
+                  and clippy cannot see a linear discipline"
+    )]
+    pub fn after(recovery: Recovery<C>) -> Option<Self> {
         let offset = recovery.append_offset()?;
         Some(Self {
             region: recovery.region(),
             offset,
+            appendable: true,
             written: WriteAmplification::NONE,
             check: PhantomData,
         })
@@ -361,6 +411,11 @@ impl<C: IntegrityCheck> Journal<C> {
         if storage.geometry() != self.region.geometry() {
             return Err(AppendError::WrongDevice);
         }
+        // The append point is a fact about erased media, and only a whole committed record
+        // preserves it. See `AppendError::Interrupted`.
+        if !self.appendable {
+            return Err(AppendError::Interrupted);
+        }
         let align = self.region.align();
         let (Ok(total), Ok(body)) = (
             frame::encoded_len(record, align),
@@ -396,6 +451,11 @@ impl<C: IntegrityCheck> Journal<C> {
         };
         let payload = payload_of(record);
         self.written = self.written.carrying(payload).programming(body_bytes);
+        // Spent *before* the program rather than after it. §12 says a failed program may
+        // still have changed media, so the offset stops being known-erased when the write is
+        // issued and not when it succeeds — and the same flag is what a dropped `Staged`
+        // leaves behind, because there is no other moment both share.
+        self.appendable = false;
         storage
             .program(at, frame_bytes)
             .map_err(AppendError::Storage)?;
@@ -488,11 +548,18 @@ impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {
     ///
     /// # Errors
     ///
-    /// [`AppendError::Storage`] if the barrier fails.
+    /// [`AppendError::WrongDevice`] when `storage` is not the device the region was
+    /// validated against, and [`AppendError::Storage`] if the barrier fails.
     pub fn payload_barrier<S: StableStorage>(
         self,
         storage: &mut S,
     ) -> Result<Sealable<'journal, 'page, C>, AppendError<S::Error>> {
+        // Every step compares the device, not only the first. A barrier on some *other*
+        // device orders nothing on this one, and the frame body would then be sealed without
+        // ever having been made durable — which is the one thing §07 step 2 exists to stop.
+        if storage.geometry() != self.journal.region.geometry() {
+            return Err(AppendError::WrongDevice);
+        }
         self.journal.written = self.journal.written.barriering();
         storage.barrier().map_err(AppendError::Storage)?;
         Ok(Sealable {
@@ -539,11 +606,18 @@ impl<C: IntegrityCheck> Sealable<'_, '_, C> {
     ///
     /// # Errors
     ///
-    /// [`AppendError::Storage`] if the program or the barrier fails.
+    /// [`AppendError::WrongDevice`] when `storage` is not the device the region was
+    /// validated against, and [`AppendError::Storage`] if the program or the barrier fails.
     pub fn commit<S: StableStorage>(
         self,
         storage: &mut S,
     ) -> Result<WriteAmplification, AppendError<S::Error>> {
+        // The worst of the three to get wrong: `seal_at` is an offset proved legal against
+        // the region's geometry, and programming it on another device is a write outside any
+        // journal that device has.
+        if storage.geometry() != self.journal.region.geometry() {
+            return Err(AppendError::WrongDevice);
+        }
         let seal_bytes = u32::try_from(self.seal.len()).unwrap_or(u32::MAX);
         self.journal.written = self.journal.written.programming(seal_bytes);
         storage
@@ -553,15 +627,17 @@ impl<C: IntegrityCheck> Sealable<'_, '_, C> {
         storage.barrier().map_err(AppendError::Storage)?;
 
         // And only now is it history. Everything above this line is recoverable as "nothing
-        // happened"; below it, the record is in the committed prefix.
+        // happened"; below it, the record is in the committed prefix — and the new offset is
+        // the start of erased media again, which is what makes the journal appendable.
         self.journal.offset = self.journal.offset.saturating_add(self.stride);
+        self.journal.appendable = true;
         Ok(self.record.programming(seal_bytes).barriering())
     }
 }
 
 // A writer is a position and a tally, and nothing that grows with history. Checked where a
 // mistake is a compile error, the way `Recovery`'s size is.
-const _: () = assert!(size_of::<Journal>() == size_of::<JournalRegion>() + 4 + 16);
+const _: () = assert!(size_of::<Journal>() == size_of::<JournalRegion>() + 4 + 4 + 16);
 const _: () = assert!(size_of::<WriteAmplification>() == 16);
 
 // The seal is one program unit, and a program unit is what a `ProgramAlign` holds. A seal
