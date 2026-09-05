@@ -223,7 +223,12 @@ which. `waymaker-rig` is driven at every crash point `waymaker-fault` enumerates
 of every program, every block of every erase, before and after every barrier — and its own
 oracle accepts every one; the census's three power-cut cells are filled and its three watchdog
 cells are refused, which is the honest shape of a host run; and two writers wrong in one way
-each are required to be caught by the guarantee they break and by no other. What a host cannot
+each are required to be caught by the guarantee they break and by no other. The dispatch cell
+is filled on evidence that execution entered the dispatcher rather than on the mark that
+precedes it — a mark is not evidence of the thing it marks, and `Dispatched` is deliberately
+written *before* the effect, so a power cut taking that mark's own commit barrier leaves it
+whole on media with no effect behind it. `a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran`
+requires such runs to exist, so the qualification cannot quietly stop qualifying. What a host cannot
 supply is a watchdog reset — every injection the harness performs is a power loss, and nothing
 models a core-only reset or retained RAM — nor media that behaves like a part: the model starts
 erased and only clears bits, its barrier is a no-op, and a bit that programmed weakly is not a
@@ -962,7 +967,14 @@ rebuilt part reaches a pass. A watchdog reset is a
 is handed it and the log records it, but `waymaker-fault`'s every injection is a power loss —
 "the world stops here" — and nothing models a core-only reset or retained RAM. So the host
 sweep fills the three power-cut cells and the census refuses the run, naming a watchdog cell as
-the gap; the other three are inside the board rows below. An earlier version of this partitioned
+the gap; the other three are inside the board rows below. Two more corrections came out of
+review, and both are the same shape — an instrument reading its own bookkeeping as a finding
+about the firmware. A mark is not evidence of the thing it marks, so the dispatch cell is
+earned by the dispatcher having been entered; and a part this run was never *installed* on is
+not a verdict about it, so `Rig::judge` walks a journal only when exactly one bank is
+authoritative **and** its header names this run. Without the second, `verify(n)` met the part
+that finished `n - 1` — which is every iteration after the first — and reported a §14 violation
+on a healthy board. An earlier version of this partitioned
 the injector by how much of an operation completed and called half of it watchdog coverage,
 which is the relabelling this crate exists to avoid, and Codex was right to reject it. The rig is
 driven at every crash point `waymaker-fault` enumerates, judged by its own oracle, and held

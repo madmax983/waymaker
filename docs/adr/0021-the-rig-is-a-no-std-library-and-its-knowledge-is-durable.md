@@ -83,6 +83,33 @@ census demands it — and the *evidence* for the three watchdog cells is a board
 rows `HARDWARE_TARGETS` already carries, both of which say "power-cut **and watchdog-reset**
 loops".
 
+**An instrument's own bookkeeping is never a finding about the firmware.** Two rules follow
+from that sentence, and both were corrections rather than decisions taken up front.
+
+The first is that *a mark is not evidence of the thing it marks*. `Dispatched` is written
+before the effect on purpose, so a power cut that takes that mark's own commit barrier leaves
+the mark whole on media with `dispatch` never called. A census that filled its dispatch cell
+from the mark would be reporting a cut in the instrument's write as a cut in the dispatch
+window — the same relabelling as the watchdog partition below, one layer down. So the cell is
+earned by observing that execution entered the dispatcher, which the harness can say and a
+board cannot, and the cell is reachable at all only because `Interruption::PowerLoss` at
+`Progress::Whole` returns `Ok(())` and lets the writer meet the power at its *next* storage
+call: the run really does dispatch, and really does stop in the window §02 decision 3 opens.
+
+The second is that *a part this run was never installed on is not a verdict about it*. A rig's
+loop is `prepare(n)` → `iterate(n)` → reset → `verify(n)`, so from the second iteration onwards
+`verify(n)` meets a part that finished `n - 1`, and a reset anywhere inside `prepare(n)` leaves
+the two halves of that part disagreeing about which run owns it — an erased instrument in front
+of the previous run's sealed journal, or the previous run's marks in front of an erased bank.
+Neither is a §14 violation; nothing has been claimed about run `n` at all. So `Rig::judge`
+walks a journal only when exactly one bank is authoritative **and** its header names this run,
+and a witness naming another iteration is read as saying nothing on such a part and as
+`Breach::WitnessUnreadable` on an installed one — where it cannot arise, because `prepare`
+erases the instrument before it installs the bank. What keeps this from becoming a hole to pass
+through is the authority figure: a bank carrying another run's header is not this run's
+authority, so a witness that says this run had begun writing is
+`Breach::Authority { banks: 0 }` rather than a pass.
+
 This is a correction rather than a decision taken up front, and it is recorded as one because
 the failure is instructive. The first version of this crate partitioned
 `waymaker_fault::injections` by how much of an operation completed — `Progress::Bytes` for a

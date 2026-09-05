@@ -38,10 +38,11 @@
 //! records it, and the census refuses a run that never reached them. That refusal is a tested
 //! property below rather than a claim.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use waymaker_fault::{Device, Harness, Injection, Interruption, Op, Progress, Run};
-use waymaker_flash::storage::Geometry;
+use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
+use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_rig::audit::Breach;
 use waymaker_rig::census::Coverage;
 use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
@@ -134,18 +135,29 @@ fn interrupted_the_engine(run: &Run, rig: &Rig) -> bool {
 /// Which write point the run was in when it stopped.
 ///
 /// Read off the witness, which is the only thing that survives on a board — but *qualified*
-/// by what was interrupted, which is the part the first version of this file left out.
-fn phase_of(marks: Marks, run: &Run, rig: &Rig) -> Option<Phase> {
+/// twice, and both qualifications were found by review rather than written down.
+///
+/// `effects` is how many effects the run's dispatcher was actually entered for, which the
+/// harness can say and a board cannot. It is what earns the dispatch cell. A mark is not
+/// evidence of the thing it marks: `Stage::Dispatched` is programmed *before* the effect goes
+/// out — deliberately, so it over-claims rather than under-claims — so a power loss that takes
+/// the mark's own commit barrier leaves the mark whole on media with `dispatch` never called.
+/// Crediting the dispatch cell from the mark alone would report a cut in the instrument's
+/// write as a cut in the dispatch window, which is the same relabelling the watchdog cells are
+/// left empty to avoid.
+///
+/// What makes the cell reachable at all is [`Interruption::PowerLoss`] at `Progress::Whole`:
+/// the operation returns `Ok(())` and the writer meets the power at its *next* storage call.
+/// So a run cut after the mark's commit barrier really does run `dispatcher.dispatch()` and
+/// really does stop in the window §02 decision 3 opens — the one phase with no storage
+/// operation in flight — which is why that window can be measured here rather than owed to
+/// hardware.
+fn phase_of(marks: Marks, run: &Run, rig: &Rig, effects: usize) -> Option<Phase> {
     let workload = rig.workload(0);
     let index = marks.attempted()?;
     match workload.role(index)? {
-        Role::Schedule(_) => {
-            if marks.dispatched() == Some(index) {
-                // The schedule record committed and its effect was marked as going out, and
-                // no later record has been begun. That is the dispatch window exactly, and it
-                // is the one phase with *no* storage operation in flight — §02 decision 3
-                // creates it precisely so that nothing is being written there — so it is
-                // classified by the witness alone, on purpose.
+        Role::Schedule(effect) => {
+            if marks.dispatched() == Some(index) && effects > usize::from(effect) {
                 Some(Phase::Dispatch)
             } else if interrupted_the_engine(run, rig) {
                 Some(Phase::Schedule)
@@ -160,14 +172,28 @@ fn phase_of(marks: Marks, run: &Run, rig: &Rig) -> Option<Phase> {
 
 /// Runs `prepare` and one whole iteration, so the harness records the write sequence.
 fn drive(session: &mut waymaker_fault::Session) -> Result<Stop, String> {
+    drive_counting(session).0
+}
+
+/// [`drive`], and how many effects the dispatcher was entered for.
+///
+/// The second half is the census's evidence that execution reached the dispatch window, and it
+/// has to be observed rather than inferred — see [`phase_of`]. It is a count rather than the
+/// dispatcher itself because that is all the census asks: which effects went out, not what
+/// they did.
+fn drive_counting(session: &mut waymaker_fault::Session) -> (Result<Stop, String>, usize) {
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let mut metered = Metered::new(session);
-    rig.prepare(&mut metered, 0, &mut page)
-        .map_err(|error| format!("prepare: {error:?}"))?;
     let mut dispatcher = Counting::default();
-    rig.iterate(0, &mut metered, &mut dispatcher, &mut NeverCut, &mut page)
-        .map_err(|error| format!("iterate: {error:?}"))
+    let mut metered = Metered::new(session);
+    let outcome = rig
+        .prepare(&mut metered, 0, &mut page)
+        .map_err(|error| format!("prepare: {error:?}"))
+        .and_then(|()| {
+            rig.iterate(0, &mut metered, &mut dispatcher, &mut NeverCut, &mut page)
+                .map_err(|error| format!("iterate: {error:?}"))
+        });
+    (outcome, dispatcher.dispatched.len())
 }
 
 /// The media a run left behind, as a device the rig can be pointed at again.
@@ -327,14 +353,33 @@ fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
     // dispatch-phase cut has said nothing about that cell, and this is what makes the silence
     // a failure.
     let harness = Harness::new(geometry());
+    // What the dispatcher was entered for, one entry per run. `Harness::run` calls the writer
+    // once for the fault-free run and then once per crash point, in the order it returns them,
+    // so this vector is `runs` — which the two assertions below check rather than assume.
+    let dispatched = RefCell::new(Vec::new());
     let runs = harness
-        .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
+        .run(|session| {
+            let (outcome, effects) = drive_counting(session);
+            dispatched.borrow_mut().push(effects);
+            outcome.map(|_| ()).map_err(|_| ())
+        })
         .expect("the fault-free run succeeds");
+    let dispatched = dispatched.into_inner();
+    assert_eq!(
+        dispatched.len(),
+        runs.len(),
+        "the dispatch evidence and the runs it belongs to came apart"
+    );
+    assert_eq!(
+        dispatched.first().copied(),
+        Some(usize::from(EFFECTS)),
+        "the fault-free run is the first, and it dispatches every effect"
+    );
 
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
     let mut coverage = Coverage::EMPTY;
-    for run in &runs {
+    for (run, effects) in runs.iter().zip(dispatched) {
         let Some(injection) = run.injection() else {
             continue;
         };
@@ -354,7 +399,7 @@ fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
                 Err(_) => continue,
             }
         };
-        if let Some(phase) = phase_of(marks, run, &rig) {
+        if let Some(phase) = phase_of(marks, run, &rig, effects) {
             coverage = coverage.record(phase, cause);
         }
     }
@@ -376,6 +421,73 @@ fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
         gap.cause(),
         ResetCause::Watchdog,
         "the only cells a host cannot fill are the watchdog ones"
+    );
+}
+
+#[test]
+fn a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran() {
+    // The tooth for the qualification `phase_of` puts on the dispatch cell. `Stage::Dispatched`
+    // is programmed *before* the effect goes out, so a power loss taking the mark's own commit
+    // barrier leaves the mark whole on media with `dispatch` never called — and a census that
+    // read the mark as the event would credit a cut in the instrument's write as a cut in the
+    // dispatch window.
+    //
+    // Asserting that such runs exist is what keeps the qualification honest: without this, a
+    // `phase_of` that had quietly gone back to trusting the mark would still pass every test
+    // in this file, because the cell it fills wrongly is a cell that also fills rightly.
+    let harness = Harness::new(geometry());
+    let dispatched = RefCell::new(Vec::new());
+    let runs = harness
+        .run(|session| {
+            let (outcome, effects) = drive_counting(session);
+            dispatched.borrow_mut().push(effects);
+            outcome.map(|_| ()).map_err(|_| ())
+        })
+        .expect("the fault-free run succeeds");
+    let dispatched = dispatched.into_inner();
+    assert_eq!(dispatched.len(), runs.len());
+
+    let rig = rig();
+    let workload = rig.workload(0);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut claimed = 0_usize;
+    let mut earned = 0_usize;
+    for (run, effects) in runs.iter().zip(dispatched) {
+        if run.injection().is_none() {
+            continue;
+        }
+        let mut device = device_after(run);
+        let marks = {
+            let mut instrument = waymaker_rig::window::Window::new(
+                &mut device,
+                rig.instrument_base(),
+                geometry().erase_size(),
+            )
+            .expect("the instrument window");
+            match Witness::new(rig.witness_region()).scan(&mut instrument, &mut page) {
+                Ok(marks) => marks,
+                Err(_) => continue,
+            }
+        };
+        let Some(index) = marks.attempted() else {
+            continue;
+        };
+        let Some(Role::Schedule(effect)) = workload.role(index) else {
+            continue;
+        };
+        if marks.dispatched() != Some(index) {
+            continue;
+        }
+        claimed += 1;
+        if effects > usize::from(effect) {
+            earned += 1;
+        }
+    }
+    assert!(earned > 0, "no run reached the dispatch window at all");
+    assert!(
+        claimed > earned,
+        "every run whose witness claimed a dispatch had really dispatched, so the census's \
+         evidence is measuring nothing"
     );
 }
 
@@ -665,12 +777,185 @@ fn a_write_cut_is_armed_after_the_attempted_mark_and_not_before_it() {
     assert!(checked > 0, "no write-phase iteration in 48");
 }
 
+/// A part whose power goes at the `k`th mutation.
+///
+/// [`Harness`] starts every run on an erased device, which is the one thing the window below
+/// is not about: what matters there is a part that *finished* the previous iteration. So
+/// preparation is cut by a fuse rather than by the injector — at every operation boundary,
+/// which is where every window in `prepare` opens and closes, a window being the gap between
+/// two operations. Reads are not counted: a read changes nothing, so the power taking one is
+/// the power taking the mutation after it.
+struct Fuse<'a> {
+    device: &'a mut Device,
+    left: usize,
+}
+
+impl Fuse<'_> {
+    /// Whether the power has gone, consuming one of the mutations it was given.
+    const fn blown(&mut self) -> bool {
+        match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+impl StableStorage for Fuse<'_> {
+    type Error = FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.barrier()
+    }
+}
+
+/// The image of a part that ran iteration `iteration` to completion.
+fn part_after(iteration: u32) -> Vec<u8> {
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut device = Device::new(geometry());
+    {
+        // A helper in an integration test is not a test body, and the workspace denies
+        // `expect` outside one. Either refusal here is a broken fixture, not a finding.
+        let mut metered = Metered::new(&mut device);
+        if rig.prepare(&mut metered, iteration, &mut page).is_err() {
+            unreachable!("the fixture geometry prepares")
+        }
+        let run = rig.iterate(
+            iteration,
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        );
+        if run != Ok(Stop::Completed) {
+            unreachable!("the fixture run has no cut in it")
+        }
+    }
+    device.into_image()
+}
+
+#[test]
+fn preparing_over_a_finished_run_never_reports_a_recovery_violation() {
+    // The window the initial-device sweep cannot reach. Every run in it starts on an erased
+    // part, so "the engine still holds the previous iteration's authoritative journal" is a
+    // state it never produces — and that is the state a rig is really in at every iteration
+    // after the first.
+    //
+    // A reset anywhere in `prepare(1)` over such a part leaves the two halves of the device
+    // disagreeing about which run owns it: the instrument is erased and the engine is not, or
+    // the other way about, depending on the order preparation takes. Neither is a §14
+    // violation — nothing has been claimed about run 1 at all — and a rig that reported one
+    // would fail a healthy board overnight and blame the firmware.
+    let rig = rig();
+    let finished = part_after(0);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+
+    for cut in 0..64_usize {
+        let Some(mut device) = Device::restored(geometry(), finished.clone()) else {
+            unreachable!("the image came from a device of this geometry")
+        };
+        let outcome = {
+            let mut fuse = Fuse {
+                device: &mut device,
+                left: cut,
+            };
+            let mut metered = Metered::new(&mut fuse);
+            rig.prepare(&mut metered, 1, &mut page)
+        };
+        let interrupted = outcome.is_err();
+
+        let verdict = rig
+            .verify(1, &mut device, &mut page)
+            .unwrap_or_else(|error| panic!("verify after {cut} mutations: {error:?}"));
+        assert_eq!(
+            verdict.outcome(),
+            Outcome::Passed,
+            "preparation cut after {cut} mutations reported {verdict:?}"
+        );
+        if !interrupted {
+            // Preparation ran to completion, so every window in it has been swept.
+            assert!(
+                cut >= 8,
+                "preparation completed after {cut} mutations, so the sweep cut almost nothing"
+            );
+            return;
+        }
+    }
+    unreachable!("preparation never completed within the fuse's range");
+}
+
+#[test]
+fn a_run_that_marked_a_part_it_was_never_installed_on_is_a_breach() {
+    // The other side of the finding above, and the reason "an uninstalled part is not a
+    // verdict" is not a hole to pass through. A part carrying *another* run's bank is not this
+    // run's authority however sealed it is, so a witness that says this run had begun writing
+    // records is §14's `single-authority` failing: the records went into a journal this run
+    // does not own.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let Some(mut device) = Device::restored(geometry(), part_after(0)) else {
+        unreachable!("the image came from a device of this geometry")
+    };
+
+    // A witness that says this run's first record was begun. Hand-built, because no crash
+    // produces it — which is the point.
+    let begun = Marks::default().raising(Stage::Attempted, 0);
+    let verdict = rig
+        .judge(1, &mut device, begun, &mut page)
+        .expect("a verdict rather than an error");
+    assert_eq!(
+        verdict.outcome(),
+        Outcome::Breached(Breach::Authority { banks: 0 }),
+        "a run with marks and no bank of its own has lost its authority"
+    );
+    assert_eq!(
+        verdict.banks(),
+        1,
+        "and the evidence still records what the part physically had"
+    );
+}
+
 #[test]
 fn a_witness_left_by_the_previous_iteration_is_not_read_as_this_one_s() {
-    // The shape a board actually runs in, and the one every other test here misses: iteration
-    // N on media iteration N-1 left behind. A rig that paired iteration N's declarations with
-    // N-1's marks is unsound in both directions — it invents `RecordDiffers` on a healthy
-    // device, and it excuses a genuine loss when the stale marks happen to claim less.
+    // A rig's loop is `prepare(n)` → `iterate(n)` → reset → `verify(n)`, so a reset that lands
+    // before `prepare(n)` erased the instrument leaves iteration `n - 1`'s marks in front of
+    // iteration `n`'s declarations. Pairing the two is unsound in both directions — it invents
+    // a breach on a healthy device, and it excuses a genuine loss when the stale marks happen
+    // to claim less than this run did.
+    //
+    // *Which* of the two is right depends on something outside the witness, and getting that
+    // wrong is what round five of review found. A stale witness on a part this run was never
+    // installed on says nothing and is owed nothing; a stale witness on a part this run *is*
+    // installed on is an instrument that failed, because `prepare` erases the instrument
+    // before it installs the bank. Both halves are below.
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
     let mut device = Device::new(geometry());
@@ -694,17 +979,49 @@ fn a_witness_left_by_the_previous_iteration_is_not_read_as_this_one_s() {
         Ok(Outcome::Passed),
         "iteration 0 judged as itself"
     );
+    let stale = device.image().to_vec();
 
-    // Now the reset lands before iteration 1 got as far as erasing the instrument. The
-    // witness still holds iteration 0's marks, and the journal still holds iteration 0's
-    // records — a perfectly healthy device, mid-way through a rig's own bookkeeping.
+    // Half one: the reset landed before iteration 1 touched anything. Both halves of the part
+    // are iteration 0's — a perfectly healthy device, mid-way through a rig's own bookkeeping
+    // — and iteration 1 has claimed nothing that recovery could have lost.
+    let outcome = rig
+        .verify(1, &mut device, &mut page)
+        .expect("a verdict rather than an error");
+    assert_eq!(
+        outcome.outcome(),
+        Outcome::Passed,
+        "a part iteration 1 was never installed on is not a verdict about iteration 1"
+    );
+
+    // Half two: a part iteration 1 *is* installed on, carrying iteration 0's marks. No crash
+    // produces this — `prepare` erases the instrument first — so reaching it means the
+    // instrument failed, and the rig must say so rather than audit run 1 against run 0's
+    // claims.
+    let mut installed = Device::new(geometry());
+    {
+        let mut metered = Metered::new(&mut installed);
+        rig.prepare(&mut metered, 1, &mut page)
+            .expect("a part prepared for iteration 1");
+    }
+    let mut spliced = installed.into_image();
+    let base = usize::try_from(rig.instrument_base()).expect("an instrument base");
+    let Some(instrument) = spliced.get_mut(base..) else {
+        unreachable!("the instrument is inside the part")
+    };
+    let Some(previous) = stale.get(base..) else {
+        unreachable!("the two images are the same geometry")
+    };
+    instrument.copy_from_slice(previous);
+    let Some(mut device) = Device::restored(geometry(), spliced) else {
+        unreachable!("the image came from a device of this geometry")
+    };
     let outcome = rig
         .verify(1, &mut device, &mut page)
         .expect("a verdict rather than an error");
     assert_eq!(
         outcome.outcome(),
         Outcome::Breached(Breach::WitnessUnreadable),
-        "iteration 1 must refuse iteration 0's witness rather than audit against it"
+        "an installed part carrying the previous iteration's marks is a broken instrument"
     );
 }
 
@@ -804,15 +1121,18 @@ fn a_media_caused_violation_is_characterised_by_the_log_line_it_cannot_replay() 
     };
 
     // Media that diverges from what the run declared, without touching the witness: a second
-    // rig's history, written over the first's journal. This is the state a real bug produces.
+    // rig's history, written into the first's *own* bank. This is the state a real bug
+    // produces — recovery handing back records that are not the ones this run declared — and
+    // the bank is installed by `rig` rather than by `other` on purpose. A part another run
+    // installed is not this run's part at all; it is judged by `Rig::installed_journal` and
+    // reported as no verdict, which is a different finding and belongs to a different test.
     let other = Rig::new::<waymaker_fault::FaultError>(geometry(), Plan::new(SEED ^ 0xFF), EFFECTS)
         .expect("the same layout under another seed");
     let mut divergent = Device::new(geometry());
     {
         let mut metered = Metered::new(&mut divergent);
-        other
-            .prepare(&mut metered, 0, &mut page)
-            .expect("a prepared part");
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a part this run installed");
         other
             .iterate(
                 0,

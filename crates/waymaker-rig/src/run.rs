@@ -527,6 +527,49 @@ impl Rig {
         JournalRegion::of(self.layout, Self::BANK, &header).map_err(RigError::Region)
     }
 
+    /// The journal of the bank *this run* was installed in, or `None` if it was never
+    /// installed on this part.
+    ///
+    /// Three ways to answer `None`, and each of them is a part that has nothing to say about
+    /// `workload`'s run rather than a part that lost something:
+    ///
+    /// * no bank is authoritative, or two are — preparation was cut before its generation
+    ///   seal landed, which is the state every part is in before its first one;
+    /// * the authoritative bank's header does not decode — there is no journal region to
+    ///   derive, and §14's `frame ignored; previous history prefix wins` is about frames
+    ///   inside a journal rather than about the header that names one;
+    /// * the header decodes and names a **different run** — the part is still the previous
+    ///   iteration's, which is exactly the window a reset during `prepare` opens.
+    ///
+    /// The run id is the comparison rather than the whole header because that is what makes a
+    /// bank *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so
+    /// two iterations of one plan never share one.
+    fn installed_journal<S: StableStorage>(
+        &self,
+        engine: &mut Window<'_, S>,
+        workload: Workload,
+        banks: usize,
+        page: &mut [u8],
+    ) -> Result<Option<JournalRegion>, RigError<S::Error>> {
+        if banks != 1 {
+            return Ok(None);
+        }
+        let read = self.read_header(engine, Self::BANK, page)?;
+        let Some(bytes) = page.get(..read) else {
+            return Err(RigError::ShortPage);
+        };
+        let Ok(header) = bank::decode_header(bytes) else {
+            return Ok(None);
+        };
+        if header.run != workload.run() {
+            return Ok(None);
+        }
+        match JournalRegion::of(self.layout, Self::BANK, &header) {
+            Ok(region) => Ok(Some(region)),
+            Err(error) => Err(RigError::Region(error)),
+        }
+    }
+
     /// Runs one iteration, stopping where the cutter fires.
     ///
     /// # Errors
@@ -845,18 +888,16 @@ impl Rig {
         let mut engine = self.engine(part)?;
         let banks = self.authoritative_banks(&mut engine, page)?;
 
-        // A bank whose header did not survive is a bank with no journal to walk, and the
-        // authority count is still a verdict — so the audit is finished on it rather than
-        // abandoned. But *only* that case: `journal_region` reads media, and a blanket `Ok`
-        // here turned a device that had gone unreadable into an audit over zero records,
-        // which an empty witness reports as `Passed`. The instrument failing is not the
-        // subject passing.
-        let region = match self.journal_region(&mut engine, page) {
-            Ok(region) => region,
-            Err(RigError::Bank) => {
-                return Ok(finish(Audit::new(workload, progress), banks));
-            }
-            Err(error) => return Err(error),
+        // §10's authority is what a boot reads, and a bank belongs to the run whose header it
+        // carries. Both halves are load-bearing here, and the second one was found by review
+        // rather than by writing it down: a rig's loop is `prepare(n)` → `iterate(n)` → reset
+        // → `verify(n)`, so from the second iteration onwards `verify(n)` meets a part that
+        // *finished* `n - 1`. A reset during `prepare(n)` leaves that part's engine still
+        // sealed at `n - 1`, and a `judge` that walked whatever bank A held read run `n - 1`'s
+        // journal against run `n`'s declarations and reported a §14 violation on a healthy
+        // board. An uninstalled part is not a verdict about recovery — see [`uninstalled`].
+        let Some(region) = self.installed_journal(&mut engine, workload, banks, page)? else {
+            return Ok(uninstalled(workload, progress, banks));
         };
 
         let mut audit = Audit::new(workload, progress);
@@ -918,6 +959,41 @@ struct DispatchStep<'part, 'storage, S, D, C> {
     witness: &'part mut Witness,
     dispatcher: &'part mut D,
     cutter: &'part mut C,
+}
+
+/// The verdict for a part this run was never installed on.
+///
+/// Nothing has been claimed about the run, so there is nothing recovery can have lost — but
+/// "nothing to audit" is not the same as "nothing to check", and the two things this does
+/// check are what keep it from being a hole the rig passes through.
+///
+/// The witness is normalised rather than read. A [`Progress`] naming a *different* iteration
+/// is the previous run's, still on media because the reset landed before `prepare` erased the
+/// instrument, and on an uninstalled part that is the ordinary state rather than an
+/// instrument fault: it says nothing about this run, so this run is owed nothing. On an
+/// *installed* part the same witness is [`Breach::WitnessUnreadable`] and stays so, because
+/// `prepare` erases the instrument before it installs the bank — an installed part carrying
+/// the previous iteration's marks is an instrument that failed.
+///
+/// And the authority figure is zero rather than `banks`, which is the half that still bites.
+/// §14's `single-authority` asks about *this* run's authority, and a bank carrying another
+/// run's header is not it. So a rig that had begun marking a run — a witness with marks in it,
+/// or one torn mid-mark — on a part with no bank of its own is [`Breach::Authority`], which is
+/// what it is: records were being written into a journal this run does not own.
+const fn uninstalled(workload: Workload, progress: Progress, banks: usize) -> Verdict {
+    let progress = match progress.iteration() {
+        Some(other) if other != workload.iteration() => Progress::EMPTY,
+        _ => progress,
+    };
+    let outcome = match Audit::new(workload, progress).finish(0) {
+        Ok(()) => Outcome::Passed,
+        Err(breach) => Outcome::Breached(breach),
+    };
+    Verdict {
+        outcome,
+        recovered: 0,
+        banks,
+    }
 }
 
 /// Turns an audit's closing verdict into a verdict, evidence and all.
