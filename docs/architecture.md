@@ -147,42 +147,53 @@ graph LR
     f5["+10 · 2B<br/>header_crc<br/>u16 LE"]
     f0 --- f1 --- f2 --- f3 --- f4 --- f5
   end
-  subgraph rest["body and trailer"]
+  subgraph rest["body and trailer · programmed first"]
     direction LR
     f6["+12 · N bytes<br/>payload [payload_len]<br/>opaque to the kernel"]
     f7["+12+N · 4B<br/>payload_crc<br/>u32 LE · frame_crc in code"]
     f8["+16+N<br/>padding to program<br/>granularity · 0xFF"]
     f6 --- f7 --- f8
   end
+  subgraph committed["commit seal · programmed after the payload barrier"]
+    direction LR
+    f9["one program unit<br/>commit_seal<br/>frame_crc, bit 7 cleared, repeated"]
+  end
   header --> rest
+  rest -- "payload barrier" --> committed
 
   c1(["header_crc covers +0..+10"])
   c2(["payload_crc covers +0..+12+N — the header as well as the payload"])
-  c3(["commit_seal · a storage-program unit, not a field · rung 0.2"])
+  c3(["no byte of a seal is 0xFF, so erased media is never a seal and a torn one is never whole"])
 
   f5 -.- c1
   f7 -.- c2
-  f8 -.- c3
+  f9 -.- c3
 
   classDef field fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef note fill:#fff8e6,stroke:#c99a2e,color:#3f3212;
-  class f0,f1,f2,f3,f4,f5,f6,f7,f8 field;
+  class f0,f1,f2,f3,f4,f5,f6,f7,f8,f9 field;
   class c1,c2,c3 note;
 ```
 
 `payload_crc` is §09's name for the field and `frame_crc` is what `waymaker-flash` calls it,
 because it covers the header as well as the payload: that binds a payload to its header,
 and it stops a record with an empty payload having a checksum of zero, which a zeroed page
-would satisfy. `commit_seal` is a storage-program unit rather than a field, written after a
-barrier, and it is what makes a frame *committed* rather than merely present — which is why
-it hangs off the picture rather than sitting in it. It arrives with the barrier protocol at
-rung 0.2. Until then the append scan treats a frame whose checksums hold as history, so a
-torn write at the tail of a journal is not distinguishable from damage there. Both stop the
-scan in the same place, which is what §14 requires either way.
+would satisfy.
 
-Everything after the frame is padding, up to the device's program granularity from §12's
+`commit_seal` is a storage-program unit rather than a field, and it is what makes a frame
+*committed* rather than merely present. It is separated from the frame by a barrier rather
+than by a gap: §07 writes the body, waits for the **payload barrier**, and only then programs
+the seal — so a seal on media is a promise that the frame before it is already durable. Its
+content is the frame's own `frame_crc` with bit 7 of each byte cleared, repeated to fill the
+unit, and the cleared bit is what makes the promise checkable. No byte of a seal is ever
+`0xFF`, so an erased program unit is never a seal and a seal interrupted part-way through its
+own program always ends in erased bytes. `waymaker-flash`'s `append` module is the writer
+that cannot take the two steps out of order, and `Ending::Unsealed` is what a reader reports
+when it meets a frame with no seal over it.
+
+Between the frame and its seal is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
-interpreted: the decoder reports the frame's own length, and the scan is what applies the
+interpreted: the decoder reports the frame's own length, and the reader is what applies the
 stride.
 
 ## Cold-start replay
@@ -397,10 +408,12 @@ journal is scanned forward to the last valid committed record, and **where the s
 the whole of prefix safety**. The reader holds one caller-owned page and a position, so the
 picture below is the whole of its state: nothing in it grows with history.
 
-The three endings are the point. Only one of them yields a place to write, and the reason is
+The four endings are the point. Only one of them yields a place to write, and the reason is
 physics rather than caution — on NOR a programmed bit cannot be returned to one without
 erasing the block, so an append offset that is not the start of an erased run is a bank that
-never boots again.
+never boots again. The other three differ in what a caller does next: `Damaged` is media to
+suspect, `Unsealed` is an append the power interrupted, and `Incomplete` is a prefix that may
+be short and must not be replayed as though it were all of history.
 
 <!-- diagram: journal-recovery -->
 
@@ -414,9 +427,12 @@ flowchart TB
   erased -- "no" --> len["frame_len_of · header seal checked before payload_len is trusted"]
   len -- "malformed · integrity-failed · truncated" --> damaged
   len -- "longer than the page" --> incomplete(["Incomplete · no append offset"])
-  len -- "sound" --> frame["read the frame · decode_with"]
-  frame -- "unknown record kind, or a seal that does not hold" --> damaged
-  frame -- "a record" --> yield["yield it · offset += padded stride"]
+  len -- "sound" --> frame["read the record · decode_with"]
+  frame -- "malformed · integrity-failed" --> damaged
+  frame -- "a sound frame" --> seal["commit_seal_holds · the program unit after the padding"]
+  seal -- "no seal, a torn one, or another frame's" --> unsealed(["Unsealed · no append offset"])
+  seal -- "unknown record kind" --> damaged
+  seal -- "a committed record" --> yield["yield it · offset += padded stride + one seal"]
   yield --> read
   read -- "read failed" --> incomplete
 ```
@@ -424,9 +440,12 @@ flowchart TB
 Out-of-sequence is the one of §09's four stop conditions that is not drawn here, because it
 is not a fact about the bytes: `waymaker_core::ReplayCursor` owns it, a caller pairs the two,
 and a caller that stops pumping gets no append offset because an unfinished scan has none.
-Unsealed is issue [#24](https://github.com/madmax983/waymaker/issues/24)'s — until the commit
-seal exists, a torn tail and a damaged frame stop the scan in the same place, which is what
-§14 requires either way.
+The other three are all in the picture, and *unsealed* is the one issue
+[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame body with no commit
+seal over it is a frame whose writer never reached §07 step 3, so the record was never
+committed and never dispatched. Before the seal existed a torn tail and a damaged frame
+stopped the scan in the same place, which is what §14 requires either way — what the seal
+adds is the ability to say which of the two happened.
 
 ## Crash injection
 

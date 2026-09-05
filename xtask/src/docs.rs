@@ -542,19 +542,24 @@ pub const CRASH_INJECTION_LABELS: &[&str] = &[
 /// What a forward recovery decides, and how it can end, from design document §09 and §14.
 ///
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted. The first
-/// four are the reader's own stop conditions — §09 lists a fifth, out-of-sequence, which
+/// five are the reader's own stop conditions — §09 lists a sixth, out-of-sequence, which
 /// belongs to the replay cursor and is prose in that section rather than a node. The last
-/// three are the endings, and they are the load-bearing half: exactly one of them carries an
+/// four are the endings, and they are the load-bearing half: exactly one of them carries an
 /// append offset, and a picture that collapsed `Incomplete` into `Damaged` would say a
-/// recovery that could not finish had found the end of history.
+/// recovery that could not finish had found the end of history. `Unsealed` is issue #24's
+/// and is on the list for the same reason `Incomplete` is: an interrupted append and damaged
+/// media are two different things for a caller to do next, and a drawing that ran them
+/// together would say so.
 pub const JOURNAL_RECOVERY_LABELS: &[&str] = &[
     "erased header",
     "frame_len_of",
     "decode_with",
     "longer than the page",
+    "commit_seal_holds",
     "Clean",
     "Damaged",
     "Incomplete",
+    "Unsealed",
 ];
 
 /// The fields of the record frame, from design document §09.
@@ -562,9 +567,10 @@ pub const JOURNAL_RECOVERY_LABELS: &[&str] = &[
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
 /// as §09 names them rather than as `waymaker-flash` spells them: the diagram is a picture
 /// of the design document's frame, and a field that quietly disappeared from it would be a
-/// field the picture stopped accounting for. `commit_seal` is in the list even though rung
-/// 0.1 does not write one — a deferred field left out of the drawing is a deferral that
-/// stops being visible.
+/// field the picture stopped accounting for. `commit_seal` was in the list before rung 0.2
+/// wrote one, because a deferred field left out of the drawing is a deferral that stops
+/// being visible; issue #24 made it a field the picture describes rather than one it
+/// promises.
 pub const RECORD_FRAME_FIELDS: &[&str] = &[
     "magic",
     "format_version",
@@ -681,8 +687,8 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
     },
     DiagramSpec {
         id: "journal-recovery",
-        title: "the forward scan and the three ways it can end",
-        // The four stop conditions the reader owns, and the three endings — because the
+        title: "the forward scan and the four ways it can end",
+        // The five stop conditions the reader owns, and the four endings — because the
         // decision the whole module exists to make is *which* ending yields a place to
         // write. A picture with `Clean` and `Damaged` and no `Incomplete` would say a
         // recovery that could not finish is a recovery that found the end of history.
@@ -3900,10 +3906,10 @@ mod tests {
         // issue #22 found it claimed and absent, which is the shape of an unchecked check.
         assert_eq!(BANK_LAYOUT_LABELS.len(), 5);
         // Four stop conditions the reader owns — §09's fifth, out-of-sequence, is the replay
-        // cursor's — and the three endings, of which exactly one carries an append offset.
+        // cursor's — and the four endings, of which exactly one carries an append offset.
         // Claimed and absent again on issue #23, and found the same way; the count is here
         // rather than in a doc comment for the reason the line above says.
-        assert_eq!(JOURNAL_RECOVERY_LABELS.len(), 7);
+        assert_eq!(JOURNAL_RECOVERY_LABELS.len(), 9);
     }
 
     #[test]

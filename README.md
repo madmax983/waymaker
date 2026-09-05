@@ -39,8 +39,10 @@ land at every byte and every program unit and that the power really does go befo
 every barrier. The suite is also proven able to fail — codecs that stop sealing what they say
 they seal, written and read by the same weakened firmware through the `IntegrityCheck` trait,
 are caught, as is history read one record short, out of order, one skipped or one invented.
-Timers and the two timer records are the rest of 0.1; the commit seal and the bank swap
-arrive with 0.2.
+The commit seal is on media too: every record now ends in one program unit whose bytes are
+the frame's own check with bit 7 of each cleared, written only after a payload barrier, so a
+frame with no valid seal over it was never committed and recovery says so. Timers and the two
+timer records are the rest of 0.1; the bank swap and the capacity reserve arrive with 0.2.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check
@@ -60,7 +62,7 @@ full document, and the issue tracker for the build-out.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | Allocation, serialization framework, CRC, clock, storage driver, executor, logging |
-| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, the two-bank layout, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
+| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, compaction transition | Activities, workflow types, timers, Embassy |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | On-media authority or hidden global state |
 
 Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `waymaker-core`.
@@ -303,9 +305,10 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
 | `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `recovery-surface` | the storage-backed recovery reader's public surface differs from the pinned list, so a `seek`, a `resume_at`, or a second route to an append offset could arrive without a reviewer writing it down |
+| `commit-discipline` | the two-barrier writer's public surface differs from the pinned list, a staged frame grows a second method or the ability to program, or the type that may write a commit seal becomes reachable from somewhere other than the payload barrier |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
-| `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or one of the three files with a route — the record codec, the bank codec, the recovery reader — stops reaching its seals through the trait, names a checksum function where it may not, or grows a function generic over the check that no table pins |
+| `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or one of the four files with a route — the record codec, the bank codec, the recovery reader, the two-barrier writer — stops reaching its seals through the trait, names a checksum function where it may not, or grows a function generic over the check that no table pins |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |
 | `claude-md` | `CLAUDE.md` loses a must-not-own row, a settled-decision id, a gate rule id, or its links to the decision record and the diagrams |

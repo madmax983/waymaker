@@ -183,12 +183,85 @@ fn write<C: IntegrityCheck>(session: &mut Session) -> Result<(), FaultError> {
     Ok(())
 }
 
+/// Appends the fixture history with each record's commit seal programmed *before* the frame
+/// it seals, sealing every frame with `C`.
+///
+/// The inverse of §07's order, and the reason issue #24's writer is a typestate rather than
+/// a convention: this function cannot be written against
+/// [`waymaker_flash::append`](waymaker_flash::append), because the value that can program a
+/// seal is one only the payload barrier produces. It reaches around the writer API to the
+/// session, which is what a tooth is for.
+///
+/// What it buys the two codec mutants below is a torn frame under a seal that landed. With
+/// the honest order a torn frame has no seal over it whatever the codec does, so a codec
+/// that stopped sealing its payload would be caught by the seal rather than by the oracle —
+/// and the sweep would have nothing to say.
+fn write_sealing_early<C: IntegrityCheck>(session: &mut Session) -> Result<(), FaultError> {
+    let mut buffer = [0_u8; 64];
+    let mut at = 0_u32;
+    for index in 0..RECORDS {
+        let bytes = payload(index);
+        let staged = record(index, &bytes);
+        let (Ok(written), Ok(body)) = (
+            frame::encode_with::<C>(&staged, align(), &mut buffer),
+            frame::body_len(&staged, align()),
+        ) else {
+            unreachable!("64 bytes is more than any fixture record")
+        };
+        let (Some(seal_bytes), Some(frame_bytes)) = (buffer.get(body..written), buffer.get(..body))
+        else {
+            unreachable!("`encode_with` reports what it wrote")
+        };
+        session.begin_record(id(index));
+        session.program(
+            at.wrapping_add(u32::try_from(body).unwrap_or(0)),
+            seal_bytes,
+        )?;
+        session.program(at, frame_bytes)?;
+        at = at.wrapping_add(u32::try_from(written).unwrap_or(u32::MAX));
+        session.barrier()?;
+    }
+    Ok(())
+}
+
 /// Every run of the fixture, sealed and read with `C`.
 fn runs<C: IntegrityCheck>() -> Vec<Run> {
     match Harness::new(geometry()).run(write::<C>) {
         Ok(runs) => runs,
         Err(error) => unreachable!("{error}"),
     }
+}
+
+/// Every run of the fixture written by [`write_sealing_early`], sealed and read with `C`.
+fn runs_sealing_early<C: IntegrityCheck>() -> Vec<Run> {
+    match Harness::new(geometry()).run(write_sealing_early::<C>) {
+        Ok(runs) => runs,
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
+/// The breaches a codec provokes over runs whose seals were programmed too early.
+///
+/// The control comes first, for the reason [`breaches`] takes one: a writer that seals ahead
+/// of its frame is not on its own enough to recover a torn record — the shipped codec still
+/// refuses one, because its trailer is a checksum an erased field does not satisfy. So a
+/// mutant "caught" here is evidence about the codec rather than about the writer.
+fn breaches_sealing_early<C: IntegrityCheck>() -> BTreeSet<&'static str> {
+    for run in &runs_sealing_early::<Catalogued>() {
+        let recovered = recover::<Catalogued>(run.image());
+        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
+            unreachable!("the control is not clean: {breach}");
+        }
+    }
+
+    let mut caught = BTreeSet::new();
+    for run in &runs_sealing_early::<C>() {
+        let recovered = recover::<C>(run.image());
+        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
+            caught.insert(discriminant(&breach));
+        }
+    }
+    caught
 }
 
 /// Recovery, through the real scan and the real cursor, verifying with `C`.
@@ -270,15 +343,13 @@ fn a_codec_that_stops_sealing_its_payload_recovers_a_record_that_is_half_there()
     // The bug: `frame_check` returns what an unwritten trailer reads back as. Every frame
     // still round-trips, every test that only checks `decode(encode(r)) == r` still passes,
     // and a write torn inside its payload is now accepted as history.
-    let runs = runs::<TrustsThePayload>();
-
-    let mut caught = BTreeSet::new();
-    for run in &runs {
-        let recovered = recover::<TrustsThePayload>(run.image());
-        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
-            caught.insert(discriminant(&breach));
-        }
-    }
+    //
+    // It takes a second bug to get there since issue #24, and that is the finding rather
+    // than an inconvenience: with the commit seal written after a payload barrier, a torn
+    // frame has no seal over it and is refused whatever the codec believes. So the writer
+    // here programs the seal *first* — §07's order inverted — and the two together are what
+    // recovers half a record.
+    let caught = breaches_sealing_early::<TrustsThePayload>();
     assert!(
         caught.contains("RecoveredATornRecord"),
         "a codec that takes its payload on trust was not caught; breaches seen: {caught:?}"
@@ -287,19 +358,35 @@ fn a_codec_that_stops_sealing_its_payload_recovers_a_record_that_is_half_there()
 
 #[test]
 fn a_codec_that_seals_nothing_recovers_a_record_that_is_half_there() {
-    let runs = runs::<TrustsEverything>();
-
-    let mut caught = BTreeSet::new();
-    for run in &runs {
-        let recovered = recover::<TrustsEverything>(run.image());
-        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
-            caught.insert(discriminant(&breach));
-        }
-    }
+    // As above, and for the same reason it needs a writer that seals ahead of its frame.
+    let caught = breaches_sealing_early::<TrustsEverything>();
     assert!(
         caught.contains("RecoveredATornRecord"),
         "a codec that seals nothing at all was not caught; breaches seen: {caught:?}"
     );
+}
+
+#[test]
+fn the_honest_order_refuses_a_torn_record_whatever_the_codec_believes() {
+    // The other half of the two tests above, and issue #24's guarantee stated as a tooth of
+    // its own: with the seal programmed after the payload barrier, neither codec mutant can
+    // recover a torn record. Both are caught by the seal instead of by the checksum they
+    // stopped computing, at every crash point.
+    //
+    // Without this the two tests above would read as "the codec mutants are still caught",
+    // which they are not: what catches them is a writer bug those tests have to add.
+    for run in &runs::<TrustsThePayload>() {
+        let recovered = recover::<TrustsThePayload>(run.image());
+        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
+            unreachable!("a torn record survived the commit seal: {breach}");
+        }
+    }
+    for run in &runs::<TrustsEverything>() {
+        let recovered = recover::<TrustsEverything>(run.image());
+        if let Err(breach) = verify_oracle(run.ledger(), &Recovery::new(&recovered)) {
+            unreachable!("a torn record survived the commit seal: {breach}");
+        }
+    }
 }
 
 /// The name of a breach's variant, for asserting *which* diagnosis was reached.

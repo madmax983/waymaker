@@ -383,14 +383,17 @@ fn a_short_tail_that_is_not_erased_is_a_torn_header() {
         journal,
         &[RecordRef::RunCompleted { result: &[] }],
     );
-    assert_eq!(end, 16, "the shortest frame is sixteen bytes");
+    assert_eq!(
+        end, 24,
+        "the shortest record is a sixteen-byte frame and an eight-byte commit seal"
+    );
     device.put(24, &[0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00]);
 
     let mut recovery = Recovery::new(journal);
     let (seen, ending) = drain(&mut device, &mut recovery);
 
     assert_eq!(seen.len(), 1);
-    assert_eq!(ending, Some(Ending::Damaged { at: 16 }));
+    assert_eq!(ending, Some(Ending::Damaged { at: 24 }));
 }
 
 #[test]
@@ -456,10 +459,15 @@ fn a_frame_the_page_cannot_hold_stops_recovery_without_calling_it_damage() {
     let step = recovery
         .next(&mut device, &mut page)
         .expect("a journal with a frame in it has a step");
+    // The whole record, seal included: a reader that staged only the frame would have
+    // nowhere to check the seal from.
+    let record_bytes = frame::encoded_len(&RecordRef::RunCompleted { result: &payload }, align(8))
+        .expect("this record encodes");
+    assert_eq!(record_bytes, 224);
     assert_eq!(
         step,
         Err(RecoveryError::PageTooSmall {
-            needed: 200 + waymaker_flash::frame::FRAME_OVERHEAD_BYTES
+            needed: record_bytes
         })
     );
     assert_eq!(recovery.ending(), Some(Ending::Incomplete { at: 0 }));
@@ -600,7 +608,7 @@ fn a_full_journal_appends_at_its_end_and_a_caller_finds_no_room() {
     // which is the honest answer. Whether a record fits there is the caller's arithmetic.
     let geometry = nor();
     let mut device = Nor::new(geometry);
-    let journal = region(geometry, 0, 32, 8);
+    let journal = region(geometry, 0, 48, 8);
     let end = append(
         &mut device,
         journal,
@@ -609,13 +617,13 @@ fn a_full_journal_appends_at_its_end_and_a_caller_finds_no_room() {
             RecordRef::RunFailed { error: &[] },
         ],
     );
-    assert_eq!(end, 32);
+    assert_eq!(end, 48, "two empty records, each sixteen bytes and a seal");
 
     let mut recovery = Recovery::new(journal);
     let (seen, ending) = drain(&mut device, &mut recovery);
     assert_eq!(seen.len(), 2);
-    assert_eq!(ending, Some(Ending::Clean { append_at: 32 }));
-    assert_eq!(recovery.append_offset(), Some(32));
+    assert_eq!(ending, Some(Ending::Clean { append_at: 48 }));
+    assert_eq!(recovery.append_offset(), Some(48));
 }
 
 #[test]
@@ -679,11 +687,14 @@ fn a_recovery_reads_what_a_scan_reads() {
         let image: Vec<u8> = device.media[..512].to_vec();
         let mut scan = Scan::new(&image, align(unit));
         let mut expected: Vec<Vec<u8>> = Vec::new();
-        let mut scan_failed = false;
+        let mut scan_failed = None;
         for step in &mut scan {
-            let Ok(record) = step else {
-                scan_failed = true;
-                break;
+            let record = match step {
+                Ok(record) => record,
+                Err(error) => {
+                    scan_failed = Some(error);
+                    break;
+                }
             };
             expected.push(describe(&record));
         }
@@ -697,10 +708,25 @@ fn a_recovery_reads_what_a_scan_reads() {
             u32::try_from(scan.offset()).expect("host"),
             "case {case}: the two readers stopped in different places"
         );
+        // Compared by *which* ending rather than by "did either stop", because that is the
+        // distinction issue #24 added: a recovery that called every unsealed frame damaged
+        // would pass a union and would be exactly the confusion the fourth variant exists to
+        // end.
+        let expected_ending = match scan_failed {
+            None => "clean",
+            Some(DecodeError::Unsealed) => "unsealed",
+            Some(_) => "damaged",
+        };
+        let reported = match ending {
+            Some(Ending::Clean { .. }) => "clean",
+            Some(Ending::Unsealed { .. }) => "unsealed",
+            Some(Ending::Damaged { .. }) => "damaged",
+            Some(Ending::Incomplete { .. }) => "incomplete",
+            None => "unfinished",
+        };
         assert_eq!(
-            matches!(ending, Some(Ending::Damaged { .. })),
-            scan_failed,
-            "case {case}: one reader called damage and the other did not"
+            reported, expected_ending,
+            "case {case}: the two readers classified the same journal differently"
         );
     }
 }
@@ -763,8 +789,8 @@ fn a_read_that_fails_mid_scan_ends_a_recovery_after_a_short_prefix() {
     let mut recovery = Recovery::new(journal);
     let (seen, ending) = drain(&mut device, &mut recovery);
     assert_eq!(seen.len(), 1);
-    assert_eq!(ending, Some(Ending::Incomplete { at: 24 }));
-    assert_ne!(ending, Some(Ending::Damaged { at: 24 }));
+    assert_eq!(ending, Some(Ending::Incomplete { at: 32 }));
+    assert_ne!(ending, Some(Ending::Damaged { at: 32 }));
     assert_eq!(recovery.append_offset(), None);
 }
 
@@ -779,6 +805,11 @@ fn a_frame_exactly_the_size_of_the_page_is_read_rather_than_refused() {
     let payload = [0x5A_u8; 52];
     let frame_len = payload.len() + waymaker_flash::frame::FRAME_OVERHEAD_BYTES;
     assert_eq!(frame_len, 68);
+    // Padded to eight and followed by an eight-byte seal: the page has to hold the record,
+    // not the frame.
+    let record_bytes = frame::encoded_len(&RecordRef::RunCompleted { result: &payload }, align(8))
+        .expect("this record encodes");
+    assert_eq!(record_bytes, 80);
     append(
         &mut device,
         journal,
@@ -786,14 +817,14 @@ fn a_frame_exactly_the_size_of_the_page_is_read_rather_than_refused() {
     );
 
     let mut exact = Recovery::new(journal);
-    let mut page = [0_u8; 68];
+    let mut page = [0_u8; 80];
     assert!(matches!(exact.next(&mut device, &mut page), Some(Ok(_))));
 
     let mut short = Recovery::new(journal);
-    let mut one_less = [0_u8; 67];
+    let mut one_less = [0_u8; 79];
     assert_eq!(
         short.next(&mut device, &mut one_less),
-        Some(Err(RecoveryError::PageTooSmall { needed: 68 }))
+        Some(Err(RecoveryError::PageTooSmall { needed: 80 }))
     );
 }
 
@@ -801,8 +832,9 @@ fn a_frame_exactly_the_size_of_the_page_is_read_rather_than_refused() {
 fn a_page_that_is_not_whole_read_units_is_used_down_to_the_unit() {
     // `capacity = page_bytes & !(read_unit - 1)` is the identity at a one-byte read unit, so
     // every other test in this file leaves the mask untested. A device that reads four at a
-    // time and a page of thirty bytes is what exercises it: twenty-eight bytes are usable,
-    // and a frame that fits those is read rather than refused.
+    // time and a page of thirty-four bytes is what exercises it: thirty-two bytes are
+    // usable, and a record that fits those — a twenty-eight-byte padded frame and a
+    // four-byte seal — is read rather than refused.
     let geometry = Geometry::new(8192, 4096, 4, 4).expect("reads and programs four");
     let mut device = Nor::new(geometry);
     let journal = region(geometry, 0, 256, 4);
@@ -815,7 +847,7 @@ fn a_page_that_is_not_whole_read_units_is_used_down_to_the_unit() {
     );
 
     let mut recovery = Recovery::new(journal);
-    let mut ragged = [0_u8; 30];
+    let mut ragged = [0_u8; 34];
     assert!(matches!(
         recovery.next(&mut device, &mut ragged),
         Some(Ok(_))
@@ -866,9 +898,11 @@ fn the_cost_of_a_record_does_not_depend_on_how_many_came_before_it() {
     // marginal cost of a record between 8 and 100 must be exactly the marginal cost between
     // 100 and 200. That fails on a reader that rescans, and on any term in `n²`; it passes a
     // reader that got cheaper.
-    // Every record here is a twelve-byte header, an eight-byte payload and a four-byte seal,
-    // and the tail is the same in every run so the one cost that is not per record cancels.
-    const FRAME: u32 = 24;
+    // Every record here is a twelve-byte header, an eight-byte payload, a four-byte frame
+    // check — twenty-four bytes, already a whole eight-byte program unit — and an eight-byte
+    // commit seal. The tail is the same in every run, so the one cost that is not per record
+    // cancels between them.
+    const FRAME: u32 = 32;
     const TAIL: u32 = 4_096;
 
     let geometry = Geometry::new(65_536, 4096, 8, 1).expect("sixteen whole blocks");

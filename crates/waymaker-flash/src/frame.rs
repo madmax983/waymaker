@@ -14,7 +14,12 @@
 //!     12     N  payload         the record body, N = payload_len
 //!   12+N     4  frame_crc       u32 LE, CRC-32 over offsets 0..12+N
 //!   16+N     -  padding         to the device's program alignment, written 0xFF
+//!      B     A  commit_seal     one program unit, `A`; written after the payload barrier
 //! ```
+//!
+//! `B` is [`body_len`] — the frame body rounded up to the program unit — and `A` is
+//! [`seal_bytes`], which is that unit. A record occupies `B + A` bytes, which is
+//! [`encoded_len`].
 //!
 //! # What this module owns
 //!
@@ -63,19 +68,41 @@
 //! meeting a version it does not know could not even say how far to skip, and §09's
 //! forward-compatibility rule would have nothing to stand on.
 //!
+//! # The commit seal
+//!
+//! §09's frame ends with a `commit_seal`, one storage-program unit wide, and issue
+//! [#24](https://github.com/madmax983/waymaker/issues/24) is what puts it on media. It is
+//! what makes a frame *committed* rather than merely present: §07 writes the frame body,
+//! waits for a **payload barrier**, and only then programs the seal and waits for a
+//! **commit barrier**. [`crate::append`] is the writer that cannot do those out of order.
+//!
+//! The seal is not a field and carries no length of its own. Every byte of it is
+//! [`commit_seal`]'s pattern for the frame's own `frame_crc`, repeated to fill the unit,
+//! and **no byte of a seal is ever [`ERASED_BYTE`]**. Three things follow, and they are the
+//! whole of why the seal is shaped this way rather than as a small structure with a
+//! checksum of its own:
+//!
+//! * an erased program unit is never a seal, so a frame whose seal was never written is
+//!   refused with [`DecodeError::Unsealed`] rather than read as history;
+//! * a seal that did not land whole is never a whole one, because every byte it did not
+//!   reach still reads erased. On a driver that programs in order — which is what
+//!   `waymaker-fault` models, and which §12 does not actually promise — that is exactly "a
+//!   torn seal ends in erased bytes"; on one that programs out of order it is still true,
+//!   because *some* byte is missing and no seal byte is [`ERASED_BYTE`]. Either way "sealed
+//!   but incomplete" is a state that cannot be reached rather than one a reader has to
+//!   detect;
+//! * the seal is bound to the frame it seals, so a writer that sealed what it *meant* to
+//!   write rather than what landed produces a seal the reader refuses.
+//!
+//! It also has to work at every width a program unit can have, which is one byte to 32 KiB.
+//! A structure with a magic and a checksum of its own — the shape [`crate::bank`]'s
+//! generation seal has — needs ten bytes and cannot exist on a byte-programmable part at
+//! all. A repeated pattern has the three properties above at every width, including one.
+//!
 //! # Deferred
 //!
-//! Two things §09 names are deliberately absent, and are absent visibly rather than
-//! silently:
+//! One thing §09 names is deliberately absent, and is absent visibly rather than silently:
 //!
-//! * **The commit seal.** §09's frame ends with a `commit_seal` — a storage-program unit
-//!   written after a barrier, which is what makes a frame *committed* rather than merely
-//!   present. It needs the [`StableStorage`] barrier protocol, which arrives with rung
-//!   0.2. Until then [`Scan`] treats a frame whose checksums hold as history, so a torn
-//!   write at the tail of a journal is indistinguishable from corruption there. Both stop
-//!   the scan in the same place, which is what §14 requires either way — "frame ignored;
-//!   previous history prefix wins" — so the deferral costs correctness nothing today. What
-//!   the seal will add is the ability to say *which* of the two happened.
 //! * **Bank bounds.** [`Scan`] is handed a `&[u8]`, and that slice *is* the bound: there is
 //!   no offset arithmetic against a geometry. That is still true and is now a division of
 //!   labour rather than a deferral: [`crate::bank`] owns the layout, so a caller asks a
@@ -159,6 +186,102 @@ pub const MAX_FRAME_BYTES: usize = FRAME_OVERHEAD_BYTES + MAX_PAYLOAD_BYTES;
 /// Programming `0xFF` over an erased cell changes no bits, so padding costs the device
 /// nothing beyond the program cycle the alignment already required.
 pub const ERASED_BYTE: u8 = 0xFF;
+
+/// Bytes of the pattern a commit seal repeats.
+///
+/// Four, because it is the four bytes of the frame's own `frame_crc` — the value §09's
+/// second checksum already computes, so a seal costs no third pass over the frame.
+pub const SEAL_PATTERN_BYTES: usize = size_of::<u32>();
+
+/// The bit every byte of a commit seal gives up so that no seal byte can read as erased.
+///
+/// Clearing bit 7 is what makes `0xFF` unreachable, and it is the cheapest way to do it:
+/// one `and` per byte, no branch, and no value the pattern has to be tested against and
+/// nudged away from. It costs one bit per byte, which is the right side of that trade,
+/// because §09 is explicit that a CRC "detects accidental corruption and torn writes; it is
+/// not authentication", and the seal's job is the first of those.
+///
+/// # How tightly a seal is bound to its frame depends on the program unit
+///
+/// A verifier compares [`seal_bytes`] bytes, so the binding is `min(align, 4) * 7` bits:
+/// **seven** at [`ProgramAlign::BYTE`], fourteen at two, and twenty-eight from four up.
+/// Byte-programmable NOR is an ordinary part, so the seven-bit case is a real configuration
+/// and not a corner — a foreign byte sitting where a seal should be is accepted about once
+/// in a hundred and twenty-eight there.
+///
+/// The two properties that make a seal *safe* do not depend on the width at all, and that is
+/// the division worth keeping straight. "An erased program unit is never a seal" and "a seal
+/// that did not land whole is never a whole one" are true at every width, because they rest
+/// on `0xFF` being unreachable rather than on how many bits are compared. What the width
+/// buys is the third property — telling this frame's seal from some other bytes — and on a
+/// one-byte unit there is nowhere to put more of it.
+///
+/// The alternative was to keep all thirty-two bits and special-case the one check value
+/// whose pattern is all ones. That is a branch on a value that occurs once in 2^32, which
+/// means it is a branch whose first execution is on somebody's device, years from now,
+/// during recovery. This one has no branch to get wrong.
+const SEAL_BYTE_MASK: u8 = 0x7F;
+
+/// The pattern a frame's commit seal repeats, for a frame whose trailer holds `frame_crc`.
+///
+/// # Postconditions
+///
+/// Pure, total, and no byte of the result is [`ERASED_BYTE`] — which is the property the
+/// whole seal rests on, and which
+/// [`no_byte_of_a_commit_seal_is_ever_erased`](https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/tests/commit.rs)
+/// checks over every value each byte can take.
+#[must_use]
+pub const fn commit_seal(frame_crc: u32) -> [u8; SEAL_PATTERN_BYTES] {
+    let [first, second, third, fourth] = frame_crc.to_le_bytes();
+    [
+        first & SEAL_BYTE_MASK,
+        second & SEAL_BYTE_MASK,
+        third & SEAL_BYTE_MASK,
+        fourth & SEAL_BYTE_MASK,
+    ]
+}
+
+/// Whether `seal` is the whole commit seal a frame whose trailer holds `frame_crc` deserves.
+///
+/// # Postconditions
+///
+/// `true` only for a non-empty run of bytes that is [`commit_seal`]'s pattern repeated to
+/// its own length. An empty slice is `false` rather than vacuously `true`: there is no seal
+/// of no bytes — a seal is one program unit and a program unit is never zero — and the
+/// vacuous answer would be "committed" for a caller that passed the wrong slice.
+///
+/// A proper prefix of a seal followed by erased media is `false`, because no byte of the
+/// pattern is [`ERASED_BYTE`]. That is the case that matters: a program writes bytes in
+/// order, so a seal interrupted part-way through leaves exactly that.
+#[must_use]
+pub fn commit_seal_holds(frame_crc: u32, seal: &[u8]) -> bool {
+    let pattern = commit_seal(frame_crc);
+    if seal.is_empty() {
+        return false;
+    }
+    seal.iter().enumerate().all(|(at, byte)| {
+        // `SEAL_PATTERN_BYTES` is a power of two, so the remainder is a mask rather than a
+        // division — the same reason `ProgramAlign` insists on one.
+        pattern
+            .get(at % SEAL_PATTERN_BYTES)
+            .is_some_and(|expected| *expected == *byte)
+    })
+}
+
+/// How many bytes a commit seal occupies at `align`.
+///
+/// One program unit, which is §09's own words for it. The journal's granularity is where
+/// that number comes from rather than the device the reader happens to be running on:
+/// [`crate::bank::BankLayout::align`] derives it from [`Geometry::program_size`], the bank
+/// header records it, and [`crate::recovery::JournalRegion`] refuses a granularity finer
+/// than the device's program unit — so a seal is always a whole number of program units and
+/// always one program call.
+///
+/// [`Geometry::program_size`]: crate::storage::Geometry::program_size
+#[must_use]
+pub const fn seal_bytes(align: ProgramAlign) -> usize {
+    align.get() as usize
+}
 
 /// Format versions at which a reader may skip a record kind it does not know.
 ///
@@ -340,6 +463,13 @@ pub struct Frame<'a> {
     /// applying the stride needs the device's program granularity, which is not on media
     /// and is therefore not something a single frame can tell you.
     pub frame_len: usize,
+    /// The frame check this frame's trailer carried, and which the decoder verified.
+    ///
+    /// Carried rather than recomputed because the decoder has just computed it, and because
+    /// it is what a reader needs to decide whether the program unit after the frame is the
+    /// [`commit_seal`] the frame deserves. A reader that recomputed it would checksum every
+    /// frame twice on every boot, to arrive at the number it was already holding.
+    pub frame_crc: u32,
 }
 
 /// The digest a schedule record carries for the activity input it was scheduled with.
@@ -403,6 +533,27 @@ pub fn input_digest_with<C: IntegrityCheck>(input: &[u8]) -> u32 {
 /// buffer *or the caller-owned output*", which is this, and a second error enum for two
 /// cases would be a second vocabulary for adapters to translate between.
 pub fn encoded_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize, DecodeError> {
+    body_len(record, align)?
+        .checked_add(seal_bytes(align))
+        .ok_or(DecodeError::LengthOutOfBounds)
+}
+
+/// Bytes `record`'s frame body occupies once written and padded to `align`.
+///
+/// [`encoded_len`] without the commit seal, which is the number the two-barrier protocol
+/// splits a record at: everything below it is programmed before the payload barrier, and
+/// everything from it to [`encoded_len`] is the seal programmed after it. §07 step 2, as an
+/// offset.
+///
+/// # Postconditions
+///
+/// A whole number of `align`'s units, at least [`FRAME_OVERHEAD_BYTES`], and strictly less
+/// than [`encoded_len`] for the same arguments — a seal is never zero bytes.
+///
+/// # Errors
+///
+/// As [`encoded_len`].
+pub fn body_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize, DecodeError> {
     let payload_len = payload_len(record)?;
     align
         .round_up(FRAME_OVERHEAD_BYTES.saturating_add(payload_len))
@@ -466,11 +617,21 @@ pub fn encode_with<C: IntegrityCheck>(
     let padded = align
         .round_up(frame_len)
         .ok_or(DecodeError::LengthOutOfBounds)?;
+    let total = padded
+        .checked_add(seal_bytes(align))
+        .ok_or(DecodeError::LengthOutOfBounds)?;
 
     // Split once, before a byte moves: the whole length check for the caller's buffer, and
     // the reason a failed encode leaves `out` untouched rather than half a frame a later
-    // flush could program. Everything past `padded` is the caller's and is not written.
-    let Some((frame, _beyond)) = out.split_at_mut_checked(padded) else {
+    // flush could program. Everything past `total` is the caller's and is not written.
+    let Some((record_bytes, _beyond)) = out.split_at_mut_checked(total) else {
+        return Err(DecodeError::LengthOutOfBounds);
+    };
+    // The body and the seal are two program calls on media and are two slices here, for the
+    // same reason: nothing that writes the body can reach the seal's bytes.
+    let Some((frame, seal)) = record_bytes.split_at_mut_checked(padded) else {
+        // Unreachable: `total >= padded` by construction. A refusal rather than an `unwrap`,
+        // because the workspace denies both.
         return Err(DecodeError::LengthOutOfBounds);
     };
 
@@ -548,7 +709,19 @@ pub fn encode_with<C: IntegrityCheck>(
         *slot = ERASED_BYTE;
     }
 
-    Ok(padded)
+    // And the seal, over the check the frame just sealed itself with. In a buffer this is
+    // one write; on media it is a second program call with a barrier in front of it, and
+    // [`crate::append`] is what makes the order unrepresentable rather than remembered.
+    let pattern = commit_seal(frame_crc);
+    for (at, slot) in seal.iter_mut().enumerate() {
+        let Some(byte) = pattern.get(at % SEAL_PATTERN_BYTES) else {
+            // Unreachable: the remainder is below the pattern's length by construction.
+            return Err(DecodeError::LengthOutOfBounds);
+        };
+        *slot = *byte;
+    }
+
+    Ok(total)
 }
 
 /// Reads the frame at the front of `bytes`.
@@ -615,7 +788,8 @@ pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Frame<'_>, DecodeE
     ) else {
         return Err(DecodeError::Truncated);
     };
-    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
+    let declared = u32::from_le_bytes(*trailer);
+    if C::frame_check(sealed) != declared {
         return Err(DecodeError::IntegrityFailed);
     }
 
@@ -632,6 +806,7 @@ pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Frame<'_>, DecodeE
         format_version: header.format_version,
         decoded,
         frame_len,
+        frame_crc: declared,
     })
 }
 
@@ -952,15 +1127,19 @@ impl<'a> Reader<'a> {
 /// stopped it stays stopped, and [`offset`](Self::offset) is the byte the committed prefix
 /// ends at.
 ///
-/// # That offset is not yet an append point
+/// # That offset is an append point only when the scan ended in erased media
 ///
-/// It is tempting to write "and therefore where the next record goes", and at rung 0.1 that
-/// would be wrong in a way that bricks a device. Without the commit seal the scan cannot
-/// tell a torn write from damage, so it may have stopped at a frame whose header was
-/// half-programmed — and on NOR a programmed bit cannot be returned to one without erasing
-/// the block. An appender that wrote there would produce a frame that fails its own header
-/// checksum on every boot, for ever, with no way to move past it. Deciding where it is safe
-/// to append needs the seal and the barrier protocol, which is rung 0.2.
+/// A scan that yielded [`None`] without an error stopped because what was left was erased,
+/// and [`offset`](Self::offset) is then the first erased byte. A scan that stopped at an
+/// error stopped at programmed bytes it could not accept, and on NOR a programmed bit
+/// cannot be returned to one without erasing the block: an appender that wrote there would
+/// produce a frame that fails its own header checksum on every boot, for ever, and one that
+/// wrote *past* it would write records the next boot's scan never reaches.
+///
+/// This type does not enforce the distinction, because a slice is all it has and a caller
+/// that ignores the error is a caller that has already been told. [`crate::recovery`] is
+/// the reader that does — its `Ending` carries the append offset in exactly one of its four
+/// shapes, and [`crate::append::Journal`] is constructible from nothing else.
 ///
 /// # Invariants
 ///
@@ -1033,21 +1212,29 @@ impl<'a> Scan<'a, Catalogued> {
     /// half, a mismatch would report a clean end of history with committed records still
     /// ahead of it, and everything downstream would believe it.
     ///
-    /// The check turns that into [`DecodeError::IntegrityFailed`] at the offset the reader
-    /// went wrong, which is diagnosable. It does not make the mismatch safe, and the other
-    /// half is worse: a reader given a *larger* granularity strides *over* whole frames and
-    /// lands on erased bytes, which is an ordinary end of history in every respect this type
-    /// can see. Nothing on media contradicts it, so nothing here can catch it — the test
-    /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught` asserts the wrong
-    /// answer on purpose, so the limitation is bounded rather than undiscovered. Rung 0.2
-    /// puts the writer's program size in the bank header, which is where a fact about the
-    /// media belongs — and rung 0.2 has: it is
+    /// Both directions are now refused, and the second one only since issue #24. A reader
+    /// given a *smaller* granularity looks for the first record's commit seal inside that
+    /// record's own padding, which is erased, and no byte of a seal ever is: the answer is
+    /// [`DecodeError::Unsealed`] at the first record, which is diagnosable. A reader given a
+    /// *larger* one strides over whole frames and looks for the seal past the end of the
+    /// record it belongs to, and finds either erased media — refused outright — or another
+    /// record's bytes, which is a twenty-eight-bit coincidence away from being refused.
+    ///
+    /// That second half used to be undetectable and is worth saying was closed by accident:
+    /// a seal sits at a fixed offset from the frame it seals, so believing in the wrong
+    /// stride is believing the seal is somewhere it is not. It is a CRC's kind of certainty
+    /// rather than a proof, and
+    /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_caught_by_the_seal` is what
+    /// says so.
+    ///
+    /// None of that makes a mismatched granularity *safe*, and the right answer is still not
+    /// to have one: rung 0.2 puts the writer's program size in the bank header, which is
+    /// where a fact about the media belongs. It is
     /// [`BankHeader::align`](crate::bank::BankHeader::align), and
     /// [`BankHeader::journal_offset`](crate::bank::BankHeader::journal_offset) is the offset
     /// computed from it. A caller that takes both from the header it just decoded cannot be
     /// given a granularity the writer did not use. This type still cannot check that its
-    /// caller did, because a slice carries no such fact — which is why the limitation is
-    /// stated here rather than deleted.
+    /// caller did, because a slice carries no such fact.
     #[must_use]
     #[inline]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {
@@ -1090,7 +1277,7 @@ impl<'a, C: IntegrityCheck> Scan<'a, C> {
     /// rather than a record, so no step can end anywhere but on a boundary.
     ///
     /// This is where history *ended*, which is not the same as where the next record may be
-    /// written: see [the note on `Scan`](Self#that-offset-is-not-yet-an-append-point).
+    /// written unless the scan ended in erased media: see [the note on `Scan`](Self).
     #[must_use]
     pub const fn offset(&self) -> usize {
         self.offset
@@ -1141,29 +1328,44 @@ impl<'a, C: IntegrityCheck> Iterator for Scan<'a, C> {
                 return Some(Err(error));
             }
         };
-        let Some(stride) = self.align.round_up(frame.frame_len) else {
+        let Some(body) = self.align.round_up(frame.frame_len) else {
             self.stopped = true;
             return Some(Err(DecodeError::LengthOutOfBounds));
         };
-        // A frame whose padded stride runs past the end of the journal could not have been
-        // written into it: `encode` reserves the whole padded length before it writes a
-        // byte, and refuses when the buffer is one short. So the journal is shorter than
-        // the frame it appears to hold, which is a truncation and not a record — and
-        // accepting it would advance to an offset that is not on a program boundary, which
-        // is not a place anything may be written.
-        let Some(next) = self
-            .offset
-            .checked_add(stride)
+        // A record whose padded body and commit seal run past the end of the journal could
+        // not have been written into it: `encode` reserves the whole of both before it
+        // writes a byte, and refuses when the buffer is one short. So the journal is
+        // shorter than the record it appears to hold, which is a truncation and not a
+        // record — and accepting it would advance to an offset that is not on a program
+        // boundary, which is not a place anything may be written.
+        let Some(next) = body
+            .checked_add(seal_bytes(self.align))
+            .and_then(|record_len| self.offset.checked_add(record_len))
             .filter(|next| *next <= self.journal.len())
         else {
             self.stopped = true;
             return Some(Err(DecodeError::Truncated));
         };
 
+        // §09's first stop condition, and the one this reader could not state before issue
+        // #24: a frame body with no commit seal over it is a frame whose writer never got
+        // past the payload barrier. It is not damage and it is not history. Checked before
+        // the record kind, because what an uncommitted frame *says* is not a question worth
+        // asking.
+        let Some(seal) = self.journal.get(self.offset.saturating_add(body)..next) else {
+            // Unreachable: `next <= journal.len()` was just established.
+            self.stopped = true;
+            return Some(Err(DecodeError::Truncated));
+        };
+        if !commit_seal_holds(frame.frame_crc, seal) {
+            self.stopped = true;
+            return Some(Err(DecodeError::Unsealed));
+        }
+
         match frame.decoded {
             Decoded::Record(record) => {
-                // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
-                // scan over a finite journal is finite.
+                // A record is at least `FRAME_OVERHEAD_BYTES` of body and one byte of seal,
+                // so the offset always moves and a scan over a finite journal is finite.
                 self.offset = next;
                 Some(Ok(record))
             }

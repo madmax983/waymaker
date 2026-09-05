@@ -53,6 +53,7 @@ pub const RULES: &[&str] = &[
     "cargo-config-profile",
     "ci-pipeline",
     "claude-md",
+    "commit-discipline",
     "crate-attributes",
     "deferred-questions",
     "dependency-direction",
@@ -239,11 +240,13 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
     violations.extend(source::check_storage_contract(&inputs.layer_sources));
     violations.extend(source::check_recovery_surface(&inputs.layer_sources));
+    violations.extend(source::check_commit_discipline(&inputs.layer_sources));
     violations.extend(source::check_recovery_routing(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
+    violations.extend(source::check_append_routing(&inputs.layer_sources));
     violations.extend(source::check_bank_integrity_routing(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
@@ -764,6 +767,7 @@ mod tests {
             "cargo-config-profile",
             "ci-pipeline",
             "claude-md",
+            "commit-discipline",
             "crate-attributes",
             "deferred-questions",
             "dependency-direction",
@@ -904,6 +908,14 @@ mod tests {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::RECOVERY_SURFACE_PATH),
                     contents: source::tests_support::clean_recovery_routing(),
+                },
+                // And the two-barrier writer of issue #24: `commit-discipline` pins its
+                // surface and its typestate, and `integrity-check` pins the one call it
+                // makes into the codec. Both fail closed when the module is absent.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::APPEND_SURFACE_PATH),
+                    contents: source::tests_support::clean_append_module(),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),

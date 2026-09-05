@@ -32,10 +32,16 @@ use waymaker_flash::frame::{
     MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, ProgramAlign, Scan,
 };
 
-/// Frames written out by an independent reference implementation of §09's field list.
+/// Records written out by an independent reference implementation of §09's field list.
 ///
 /// The comment above each says what it holds, so a reader can check the bytes by hand
 /// against the frame in §09 without running anything.
+///
+/// Each one ends in its **commit seal**, one program unit wide, which is the frame's own
+/// four `frame_crc` bytes with bit 7 of each cleared, repeated to fill the unit. That is
+/// checkable by eye against the four bytes immediately before the padding, which is why the
+/// seal is spelled out here rather than computed: a fixture the code under test produces is
+/// not a fixture.
 ///
 /// `pub` inside a private module is unreachable from anywhere, which is what a fixture is;
 /// `pub(super)` would trade this lint for `redundant_pub_crate`, so the allow is here
@@ -47,43 +53,50 @@ use waymaker_flash::frame::{
 mod golden {
     /// `RunStarted { workflow_kind: 0xBEEF, workflow_version: 7, input: b"hi" }`,
     /// alignment 1. Payload is `EF BE 07 00 68 69`.
-    pub const RUN_STARTED: [u8; 22] = [
+    pub const RUN_STARTED: [u8; 23] = [
         0x57, 0x4D, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0xB1, 0x4F, 0xEF, 0xBE, 0x07,
-        0x00, 0x68, 0x69, 0xE8, 0xD9, 0x09, 0xA3,
+        0x00, 0x68, 0x69, 0xE8, 0xD9, 0x09, 0xA3, //
+        0x68, // commit seal: 0xE8 & 0x7F
     ];
 
     /// `EffectScheduled { seq: 0x0102_0304, kind: 0x1234, input_len: 0x40,
     /// input_crc: 0xDEAD_BEEF }`, alignment 1. The body is exactly eight bytes.
-    pub const EFFECT_SCHEDULED: [u8; 24] = [
+    pub const EFFECT_SCHEDULED: [u8; 25] = [
         0x57, 0x4D, 0x01, 0x02, 0x04, 0x03, 0x02, 0x01, 0x08, 0x00, 0x17, 0x86, 0x34, 0x12, 0x40,
-        0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x6F, 0xA7, 0xE7, 0x90,
+        0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x6F, 0xA7, 0xE7, 0x90, //
+        0x6F, // commit seal: 0x6F & 0x7F
     ];
 
     /// `EffectCompleted { seq: 9, result: [1, 2, 3] }` at alignment 8: nineteen bytes of
-    /// frame followed by five bytes of erased padding.
-    pub const EFFECT_COMPLETED_ALIGNED: [u8; 24] = [
+    /// frame, five bytes of erased padding, and eight bytes of commit seal — the pattern
+    /// twice, because a seal fills its whole program unit.
+    pub const EFFECT_COMPLETED_ALIGNED: [u8; 32] = [
         0x57, 0x4D, 0x01, 0x03, 0x09, 0x00, 0x00, 0x00, 0x03, 0x00, 0x45, 0x98, 0x01, 0x02, 0x03,
-        0x75, 0x07, 0xBF, 0x96, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x75, 0x07, 0xBF, 0x96, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, //
+        0x75, 0x07, 0x3F, 0x16, 0x75, 0x07, 0x3F, 0x16, // commit seal: 75 07 BF 96 masked
     ];
 
     /// `EffectFailed { seq: 0xFFFF_FFFE, error: [0x00, 0xFF, 0x80] }` at alignment 2:
     /// nineteen bytes of frame and one byte of erased padding. A sequence near the ceiling
     /// and a payload of the two byte values a flash page can hold on its own.
-    pub const EFFECT_FAILED: [u8; 20] = [
+    pub const EFFECT_FAILED: [u8; 22] = [
         0x57, 0x4D, 0x01, 0x04, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x93, 0x06, 0x00, 0xFF, 0x80,
-        0x9F, 0x7A, 0xD7, 0x43, 0xFF,
+        0x9F, 0x7A, 0xD7, 0x43, 0xFF, //
+        0x1F, 0x7A, // commit seal: the first two of 9F 7A D7 43 masked
     ];
 
     /// `RunFailed { error: b"why" }`, alignment 1.
-    pub const RUN_FAILED: [u8; 19] = [
+    pub const RUN_FAILED: [u8; 20] = [
         0x57, 0x4D, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x88, 0x9B, 0x77, 0x68, 0x79,
-        0x97, 0x11, 0xEE, 0xE0,
+        0x97, 0x11, 0xEE, 0xE0, //
+        0x17, // commit seal: 0x97 & 0x7F
     ];
 
-    /// `RunCompleted { result: &[] }`, alignment 1: the shortest frame there is.
-    pub const RUN_COMPLETED_EMPTY: [u8; 16] = [
+    /// `RunCompleted { result: &[] }`, alignment 1: the shortest record there is.
+    pub const RUN_COMPLETED_EMPTY: [u8; 17] = [
         0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x44, 0x0B, 0xF6, 0x88,
-        0x39,
+        0x39, //
+        0x0B, // commit seal: 0x0B & 0x7F
     ];
 }
 
@@ -660,7 +673,7 @@ fn damaging_a_frame_without_resealing_it_is_always_caught() {
     // catch, and the property is that not one of thirty thousand gets through.
     let mut rng = Rng::new(0x5EED_0003);
     let mut page = [0_u8; SCRATCH];
-    let clean = frame::encode(
+    frame::encode(
         &RecordRef::EffectScheduled {
             seq: EffectSeq(7),
             kind: ActivityKind(3),
@@ -672,6 +685,21 @@ fn damaging_a_frame_without_resealing_it_is_always_caught() {
     )
     .expect("room for the frame");
 
+    // The decoder's business is the frame, and the commit seal is not part of it: a record
+    // whose seal alone was flipped decodes perfectly, which is `Scan`'s finding rather than
+    // `decode`'s. So the damage lands in the body, and `tests/commit.rs` is where a damaged
+    // seal is swept.
+    let body = frame::body_len(
+        &RecordRef::EffectScheduled {
+            seq: EffectSeq(7),
+            kind: ActivityKind(3),
+            input_len: 16,
+            input_crc: 0x0BAD_F00D,
+        },
+        ProgramAlign::BYTE,
+    )
+    .expect("this record encodes");
+
     let mut integrity = 0_u32;
     let mut truncated = 0_u32;
 
@@ -679,20 +707,20 @@ fn damaging_a_frame_without_resealing_it_is_always_caught() {
         let mut damaged = page;
         let edits = 1 + rng.below(3);
         for _ in 0..edits {
-            let at = rng.below(clean);
+            let at = rng.below(body);
             damaged[at] ^= 1 << rng.below(8);
         }
         // A flip is its own inverse, so two edits at the same bit leave the frame
         // pristine — and a pristine frame decoding is not a finding. Discarded here rather
         // than avoided in the generator, because the generator that avoided it would be
         // the thing under test.
-        if damaged[..clean] == page[..clean] {
+        if damaged[..body] == page[..body] {
             continue;
         }
         let length = if rng.below(4) == 0 {
-            rng.below(clean + 1)
+            rng.below(body + 1)
         } else {
-            clean
+            body
         };
 
         match frame::decode(&damaged[..length]) {
@@ -750,7 +778,7 @@ fn resealing_a_damaged_frame_reaches_every_check_past_the_checksums() {
             let at = rng.below(clean);
             damaged[at] = rng.next_u8();
         }
-        reseal(&mut damaged[..clean]);
+        reseal(&mut damaged[..clean], ProgramAlign::BYTE);
         let length = if rng.below(4) == 0 {
             rng.below(clean + 1)
         } else {
@@ -770,7 +798,11 @@ fn resealing_a_damaged_frame_reaches_every_check_past_the_checksums() {
             Err(DecodeError::UnsupportedFormatVersion) => unsupported_version += 1,
             Err(DecodeError::MalformedRecord) => malformed += 1,
             Err(DecodeError::Truncated) => truncated += 1,
-            Err(DecodeError::LengthOutOfBounds | DecodeError::UnknownRecordKind) => {
+            Err(
+                DecodeError::LengthOutOfBounds
+                | DecodeError::UnknownRecordKind
+                | DecodeError::Unsealed,
+            ) => {
                 panic!("decode returned an error it documents that it never returns")
             }
         }
@@ -814,19 +846,25 @@ fn an_unsupported_format_version_is_refused() {
 
     let mut future = page;
     future[2] = FORMAT_VERSION + 1;
-    reseal(&mut future[..written]);
+    reseal(&mut future[..written], ProgramAlign::BYTE);
     assert_eq!(
         frame::decode(&future[..written]),
         Err(DecodeError::UnsupportedFormatVersion)
     );
 }
 
-/// Recomputes both checksums over a frame whose fields a test has edited.
+/// Recomputes both checksums and the commit seal over a record whose fields a test edited.
 ///
 /// Without this, every edit below would be rejected as a checksum failure before it
 /// reached the check it was written to exercise — which would make each of those tests
-/// pass for the wrong reason.
-fn reseal(frame_bytes: &mut [u8]) {
+/// pass for the wrong reason. Since issue #24 that includes the commit seal: a record whose
+/// frame check moved and whose seal did not is refused as unsealed, one stop condition
+/// earlier than the one the edit was aimed at.
+///
+/// `align` is the granularity the record was encoded at, and it is a parameter rather than
+/// a guess because nothing in a slice of bytes says where the body stops and the seal
+/// starts.
+fn reseal(frame_bytes: &mut [u8], align: ProgramAlign) {
     let header_crc = crc16(frame_bytes.get(..HEADER_BYTES - 2).unwrap_or_default());
     for (slot, byte) in frame_bytes
         .iter_mut()
@@ -853,6 +891,20 @@ fn reseal(frame_bytes: &mut [u8]) {
         .zip(frame_crc.to_le_bytes())
     {
         *slot = byte;
+    }
+
+    // And the seal that says the record was committed, over the check just written. Skipped
+    // when the caller handed in the frame alone: a test that only decodes has no seal in its
+    // slice, and inventing one past the end is not this helper's business.
+    let frame_len = covered.saturating_add(waymaker_flash::frame::FRAME_CRC_BYTES);
+    let Some(body) = align.round_up(frame_len) else {
+        return;
+    };
+    let pattern = frame::commit_seal(frame_crc);
+    for (at, slot) in frame_bytes.iter_mut().skip(body).enumerate() {
+        if let Some(byte) = pattern.get(at % 4) {
+            *slot = *byte;
+        }
     }
 }
 
@@ -980,7 +1032,7 @@ fn every_decodable_record_kind_decodes_to_a_record() {
         )
         .expect("room");
         page[3] = reserved.0;
-        reseal(&mut page[..written]);
+        reseal(&mut page[..written], ProgramAlign::BYTE);
         assert_eq!(
             frame::decode(&page[..written]).map(|frame| frame.decoded),
             Ok(Decoded::UnknownKind(reserved)),
@@ -1011,7 +1063,7 @@ fn a_run_scoped_record_may_not_carry_an_effect_sequence() {
 
         let mut tampered = page;
         tampered[4] = 1;
-        reseal(&mut tampered[..written]);
+        reseal(&mut tampered[..written], ProgramAlign::BYTE);
         assert_eq!(
             frame::decode(&tampered[..written]),
             Err(DecodeError::MalformedRecord),
@@ -1065,7 +1117,7 @@ fn a_body_that_does_not_fit_its_kind_is_refused() {
         .expect("room");
 
         page[3] = kind.0;
-        reseal(&mut page[..written]);
+        reseal(&mut page[..written], ProgramAlign::BYTE);
         assert_eq!(
             frame::decode(&page[..written]).map(|_| ()),
             expected,
@@ -1090,14 +1142,19 @@ fn an_unknown_kind_is_self_delimiting() {
     .expect("room");
 
     page[3] = RecordKind::TIMER_SCHEDULED.0;
-    reseal(&mut page[..written]);
+    reseal(&mut page[..written], ProgramAlign::BYTE);
 
+    // `written` is the whole record — body, padding and commit seal — and the frame the
+    // decoder reports is the body alone, because the seal is a fact about durability rather
+    // than a field.
+    let body = written - frame::seal_bytes(ProgramAlign::BYTE);
     assert_eq!(
         frame::decode(&page[..written]),
         Ok(frame::Frame {
             format_version: FORMAT_VERSION,
             decoded: Decoded::UnknownKind(RecordKind::TIMER_SCHEDULED),
-            frame_len: written,
+            frame_len: body,
+            frame_crc: crc32(&page[..body - frame::FRAME_CRC_BYTES]),
         })
     );
 }
@@ -1117,11 +1174,17 @@ fn padding_is_written_erased_and_never_read_back() {
     let written = frame::encode(&record, align, &mut page).expect("room");
 
     let frame_len = FRAME_OVERHEAD_BYTES + 5;
-    assert_eq!(written, 32, "21 bytes of frame padded up to 16-byte units");
+    let body = frame::body_len(&record, align).expect("this record encodes");
+    assert_eq!(body, 32, "21 bytes of frame padded up to 16-byte units");
+    assert_eq!(
+        written, 48,
+        "and a sixteen-byte commit seal after the padding"
+    );
     assert!(
-        page[frame_len..written]
+        page[frame_len..body]
             .iter()
-            .all(|byte| *byte == ERASED_BYTE)
+            .all(|byte| *byte == ERASED_BYTE),
+        "the pad between the frame and its seal is erased"
     );
 
     let decoded = frame::decode(&page[..written]).expect("a valid frame");
@@ -1130,10 +1193,10 @@ fn padding_is_written_erased_and_never_read_back() {
 
     // Stale bytes where the pad is: still the same record, because nothing reads them.
     let mut stale = page;
-    for slot in stale.iter_mut().take(written).skip(frame_len) {
+    for slot in stale.iter_mut().take(body).skip(frame_len) {
         *slot = 0x5A;
     }
-    assert_eq!(decoded_record(&stale[..written]), Some(record));
+    assert_eq!(decoded_record(&stale[..body]), Some(record));
 }
 
 #[test]
@@ -1325,7 +1388,7 @@ fn a_scan_will_not_skip_an_unknown_kind() {
     .expect("room");
 
     journal[first + 3] = RecordKind::TIMER_FIRED.0;
-    reseal(&mut journal[first..first + second]);
+    reseal(&mut journal[first..first + second], align);
 
     let mut scan = Scan::new(&journal, align);
     assert!(matches!(
@@ -1584,15 +1647,20 @@ fn a_scan_reads_its_slice_as_the_whole_journal() {
 }
 
 #[test]
-fn a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught() {
-    // The other half of the stride mismatch, pinned because it is *not* handled. A reader
-    // striding by more than the writer used steps over whole frames and lands on erased
-    // bytes, which is an ordinary end of history in every respect the scan can see. There is
-    // nothing on media to check it against.
+fn a_scan_at_a_larger_alignment_than_the_writer_used_is_caught_by_the_seal() {
+    // The other half of the stride mismatch, which this file used to pin as *not* handled: a
+    // reader striding by more than the writer used steps over whole frames and lands on
+    // erased bytes, which was an ordinary end of history in every respect the scan could
+    // see. Issue #24's commit seal is what closed it, and closed it by accident rather than
+    // by design — which is worth writing down, because it was the one failure this module
+    // documented as undetectable.
     //
-    // So this test asserts the wrong answer on purpose. It is the record that the limitation
-    // is known and bounded rather than undiscovered, and it fails the day rung 0.2 puts the
-    // writer's program size in the bank header and makes the right answer possible.
+    // A seal is at a fixed offset from the frame it seals: the frame body rounded up to the
+    // granularity the reader believes in. A reader that believes in a larger one looks for
+    // the seal past the end of the real record, and finds either erased media or another
+    // record's bytes. No byte of a seal is ever erased, so the first of those is refused
+    // outright; the second is a 28-bit coincidence away from being refused, which is a CRC's
+    // kind of certainty rather than a proof and is stated as such.
     let writer = ProgramAlign::new(8).expect("a non-zero alignment");
     let mut journal = [ERASED_BYTE; 2_048];
     let mut at = 0;
@@ -1605,18 +1673,25 @@ fn a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught() {
     }
 
     let mut over_striding = Scan::new(&journal, ProgramAlign::new(256).expect("non-zero"));
-    assert!(matches!(
+    assert_eq!(
         over_striding.next(),
-        Some(Ok(RecordRef::EffectCompleted { .. }))
-    ));
-    assert!(
-        over_striding.next().is_none(),
-        "known limitation: a larger stride steps over the remaining frames"
+        Some(Err(DecodeError::Unsealed)),
+        "a larger stride looks for the seal past the record it belongs to"
     );
-    assert_ne!(
+    assert_eq!(
         over_striding.offset(),
-        at,
-        "and reports an offset that is not where history ended"
+        0,
+        "and reports no history rather than a short prefix of it"
+    );
+
+    // The same journal at the granularity it was written with walks every record.
+    let matched: Vec<Result<RecordRef<'_>, DecodeError>> = Scan::new(&journal, writer).collect();
+    assert_eq!(matched.len(), 4, "{matched:?}");
+    assert!(matched.iter().all(Result::is_ok));
+    assert_eq!(
+        Scan::new(&journal, writer).count(),
+        4,
+        "the reader that agrees with the writer reaches every record, at offset {at}"
     );
 }
 
@@ -1682,8 +1757,13 @@ fn the_golden_frames_hold_the_fields_section_09_puts_at_those_offsets() {
     );
     assert_eq!(
         g.len(),
-        22,
-        "sixteen bytes of overhead plus a six-byte payload"
+        23,
+        "sixteen bytes of overhead, a six-byte payload and a one-byte commit seal"
+    );
+    assert_eq!(
+        g[22],
+        g[18] & 0x7F,
+        "the commit seal is the frame check with bit 7 cleared, one program unit of it"
     );
 
     let s = golden::EFFECT_SCHEDULED;
@@ -1710,7 +1790,16 @@ fn the_golden_frames_hold_the_fields_section_09_puts_at_those_offsets() {
     let e = golden::RUN_COMPLETED_EMPTY;
     assert_eq!(e[3], 7, "record_kind: RunCompleted");
     assert_eq!(u16::from_le_bytes([e[8], e[9]]), 0, "an empty payload");
-    assert_eq!(e.len(), FRAME_OVERHEAD_BYTES, "the shortest frame there is");
+    assert_eq!(
+        e.len(),
+        FRAME_OVERHEAD_BYTES + 1,
+        "the shortest record there is: the shortest frame and a one-byte commit seal"
+    );
+    assert_eq!(
+        e[16],
+        e[12] & 0x7F,
+        "and the seal is the frame check with bit 7 cleared"
+    );
     // The whole reason the frame checksum covers the header: over an empty payload alone it
     // would be `crc32(&[])`, the same fixed number for every terminal record with no result.
     assert_ne!(
@@ -1802,14 +1891,15 @@ fn the_largest_program_granularities_round_trip_and_scan() {
             },
         ];
 
-        let mut journal = vec![ERASED_BYTE; 4 * usize::from(granularity)];
+        let mut journal = vec![ERASED_BYTE; 6 * usize::from(granularity)];
         let mut at = 0;
         for record in &records {
             let written = frame::encode(record, align, &mut journal[at..]).expect("room");
             assert_eq!(
                 written,
-                usize::from(granularity),
-                "granularity {granularity}: a small frame pads to exactly one unit"
+                2 * usize::from(granularity),
+                "granularity {granularity}: a small frame pads to one unit, and its commit \
+                 seal is a second"
             );
             at += written;
         }
@@ -1881,18 +1971,18 @@ fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
     }
 
     // Each frame is seventeen to nineteen bytes padded out to sixty-four, so a reader
-    // striding by one lands forty-odd bytes into a pad: far more than a header of
-    // `ERASED_BYTE`.
+    // striding by one looks for the first record's commit seal in the first bytes of that
+    // record's own padding — which are erased, and no byte of a seal ever is. Since issue
+    // #24 the mismatch is therefore caught at the *first* record rather than the second: the
+    // seal is a fact about where a record ends, checked at every record rather than only
+    // where a short stride happens to land on a bad header.
     let mut mismatched = Scan::new(&journal, ProgramAlign::BYTE);
-    assert!(matches!(
-        mismatched.next(),
-        Some(Ok(RecordRef::RunStarted { .. }))
-    ));
     assert_eq!(
         mismatched.next(),
-        Some(Err(DecodeError::IntegrityFailed)),
+        Some(Err(DecodeError::Unsealed)),
         "a short stride must be refused, never read as the end of history"
     );
+    assert_eq!(mismatched.offset(), 0);
     assert!(mismatched.next().is_none());
 
     // The same journal at the granularity it was written with walks all three records.
