@@ -972,6 +972,71 @@ fn without_fenced_code(contents: &str) -> String {
     kept.join("\n")
 }
 
+/// The two phrases CLAUDE.md states the gate's rule count in.
+///
+/// # Why this is a pin and not a scan
+///
+/// Because the scan was wrong four times, each time in a *narrower* matcher than the last,
+/// and every one of them was a false positive — a build failing over a correct document,
+/// which is worse than the drift it was written to catch. Codex found all four: `ADR 0012
+/// rules out table-based CRCs` read a verb as a count marker; `Install 39 rules` matched
+/// `all ` inside `install `; and then `Enable all 39 rules from the policy bundle` cleared
+/// the word boundary and was still not a claim about *this* gate.
+///
+/// The fourth is the one that settles the shape. `all 39 rules` and `all 40 rules` are
+/// indistinguishable as *phrases*; what separates them is whether the sentence is about the
+/// gate, and no amount of narrowing recovers that from the digits. So the count is pinned
+/// where it is actually written, with the context that makes it a claim about this gate: the
+/// ids the tables own, and the command that emits them.
+///
+/// The cost is that rewording either sentence means changing this list. That is the trade
+/// this repository already makes for `APPEND_BARRIER_CALL` and the recovery routing steps —
+/// a pinned spelling is a line a reviewer changes on purpose — and it is the right one here,
+/// because the alternative has now failed four times in a row.
+fn rule_count_phrases(rules: usize) -> [String; 2] {
+    [
+        format!("all {rules} rule ids below are compared against the tables that own them"),
+        format!("All {rules} rules `cargo xtask check-layering` can emit"),
+    ]
+}
+
+/// Rule: CLAUDE.md states the gate's rule count, once, and states it right.
+///
+/// Two checks rather than one, because this has now been wrong twice. First the table grew
+/// and the sentence above it did not; then the table was corrected and the file's *opening*
+/// paragraph — which states the same count — was not, and shipped that way on pull request
+/// #76. A `contains` check for the right number is satisfied by whichever of the two is
+/// correct, so the stale one sits in the file telling a contributor something false.
+///
+/// The stale scan runs only once the right count is present: a file that states no correct
+/// count at all has one defect, and listing every other number in it as well would report
+/// that defect twice.
+fn check_rule_count(contents: &str, rules: usize) -> Vec<Violation> {
+    let missing: Vec<String> = rule_count_phrases(rules)
+        .into_iter()
+        .filter(|phrase| !contents.contains(phrase.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    // One violation however many phrases drifted: it is one defect — the file and the gate
+    // disagree about how many rules there are — and listing it twice would not tell a
+    // contributor anything the names do not.
+    vec![Violation::new(
+        "claude-md",
+        "rule count",
+        format!(
+            "CLAUDE.md does not say {}; the gate reports {rules} rules and states the count \
+             in two places, so a change to one of them has to be a change to both",
+            missing
+                .iter()
+                .map(|phrase| format!("`{phrase}`"))
+                .collect::<Vec<String>>()
+                .join(" or ")
+        ),
+    )]
+}
+
 /// Rule: `CLAUDE.md` exists, quotes the layering table, and names every gate rule.
 ///
 /// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
@@ -1050,16 +1115,7 @@ fn check_claude_md(contents: Option<&str>, rules: &[&str]) -> Vec<Violation> {
         }
     }
 
-    // The count the gate prints on success. Prose until it is checked, and it was wrong
-    // once already: the rule table grew and the sentence above it did not.
-    let count = format!("{} rule", rules.len());
-    if !contents.contains(&count) {
-        violations.push(Violation::new(
-            "claude-md",
-            "rule count",
-            format!("CLAUDE.md does not say `{count}s`, which is what the gate reports"),
-        ));
-    }
+    violations.extend(check_rule_count(contents, rules.len()));
 
     for command in crate::pipeline::STAGES {
         if !contents.contains(command.command) {
@@ -2545,7 +2601,7 @@ pub mod tests_support {
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, QuestionStatus, RECOVERY_SPEC_ADR, SETTLED_DECISIONS,
         SETTLED_DECISIONS_ADR, SPEC_CLAUSES, STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES,
-        adr_number,
+        adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
 
@@ -2636,7 +2692,9 @@ pub mod tests_support {
         for rule in rules {
             line(&mut body, format_args!("- `{rule}`"));
         }
-        line(&mut body, format_args!("All {} rules.", rules.len()));
+        for phrase in rule_count_phrases(rules.len()) {
+            line(&mut body, format_args!("{phrase}."));
+        }
         line(
             &mut body,
             format_args!("| Id | Question | Where it stands |"),
@@ -3475,6 +3533,74 @@ mod tests {
                 .any(|v| v.subject == "waymaker-embassy" && v.detail.contains("may depend on")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn the_aggregate_check_keeps_its_must_use_contract() {
+        // Codex found that extracting the helpers had left `#[must_use]` and the aggregate
+        // check's own documentation attached to a helper instead of to `check_claude_md`,
+        // so a caller discarding the violations would no longer be warned. The helpers now
+        // sit above that doc block; this is the compile-time half of saying so.
+        let _: Vec<Violation> = check_claude_md(Some(&clean_claude_md(RULES)), RULES);
+        let _: Vec<Violation> = check_rule_count(&clean_claude_md(RULES), RULES.len());
+    }
+
+    #[test]
+    fn the_count_is_pinned_in_both_places_it_is_written() {
+        // Either sentence drifting on its own is the defect that shipped in #76, and both
+        // directions are the point: the opening paragraph and the rule table have to agree
+        // with the gate and therefore with each other.
+        for phrase in rule_count_phrases(RULES.len()) {
+            let dropped = clean_claude_md(RULES).replace(&phrase, "");
+            let violations = check_claude_md(Some(&dropped), RULES);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.subject == "rule count" && v.detail.contains(&phrase)),
+                "dropping `{phrase}` should be reported: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_sentence_drifting_is_one_violation_naming_it() {
+        let [opening, table] = rule_count_phrases(RULES.len());
+        let stale = rule_count_phrases(RULES.len().saturating_sub(1));
+        let drifted = clean_claude_md(RULES).replace(&opening, &stale[0]);
+        let counts: Vec<&Violation> = check_claude_md(Some(&drifted), RULES)
+            .iter()
+            .filter(|v| v.subject == "rule count")
+            .cloned()
+            .collect::<Vec<Violation>>()
+            .leak()
+            .iter()
+            .collect();
+        assert_eq!(counts.len(), 1, "one defect is one violation: {counts:?}");
+        assert!(counts[0].detail.contains(&opening));
+        assert!(
+            !counts[0].detail.contains(&table),
+            "the sound half is not named"
+        );
+    }
+
+    #[test]
+    fn prose_about_some_other_set_of_rules_is_not_a_gate_count() {
+        // Four false positives found by Codex, each in a narrower scan than the last. The
+        // pin cannot reach any of them, because it matches where the count is written and
+        // the context that makes it a claim about *this* gate.
+        for prose in [
+            "ADR 0012 rules out table-based CRCs.",
+            "Install 39 rules from the policy bundle.",
+            "Enable all 39 rules from the policy bundle.",
+            "There are all 12 rule ids in the other tool.",
+        ] {
+            let claude_md = format!("{}\n\n{prose}\n", clean_claude_md(RULES));
+            let violations = check_claude_md(Some(&claude_md), RULES);
+            assert!(
+                !violations.iter().any(|v| v.subject == "rule count"),
+                "`{prose}` is not a claim about this gate: {violations:?}"
+            );
+        }
     }
 
     #[test]
