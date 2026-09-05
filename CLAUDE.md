@@ -210,7 +210,7 @@ All 2 hardware targets, with the id to cite when a change touches one:
 
 | Id | Target | Where it stands | What would discharge it |
 | --- | --- | --- | --- |
-| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one. |
+| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one — and the census cannot complete without one, because half its cells are watchdog resets a host cannot perform. |
 | `cortex-m4` | power-cut and watchdog-reset loops on a Cortex-M4 board | Not run | the same log from a second core, because a rig that only ever ran on one part has measured that part rather than the protocol. |
 
 Moving a row to `Passed` needs an accepted ADR carrying the attestation marker and the id, in
@@ -221,11 +221,13 @@ guards against for §16's open questions.
 What *is* discharged is everything a host can discharge, and it is worth being exact about
 which. `waymaker-rig` is driven at every crash point `waymaker-fault` enumerates — every byte
 of every program, every block of every erase, before and after every barrier — and its own
-oracle accepts every one; the census over three write points and two reset causes is complete
-on that sweep; and two writers wrong in one way each are required to be caught by the
-guarantee they break. What a host cannot supply is media that behaves like a part: the model
-starts erased and only clears bits, its barrier is a no-op, and a bit that programmed weakly
-is not a state it has. §12's `barrier-is-durable` and `barrier-orders-what-follows` are still
+oracle accepts every one; the census's three power-cut cells are filled and its three watchdog
+cells are refused, which is the honest shape of a host run; and two writers wrong in one way
+each are required to be caught by the guarantee they break and by no other. What a host cannot
+supply is a watchdog reset — every injection the harness performs is a power loss, and nothing
+models a core-only reset or retained RAM — nor media that behaves like a part: the model starts
+erased and only clears bits, its barrier is a no-op, and a bit that programmed weakly is not a
+state it has. §12's `barrier-is-durable` and `barrier-orders-what-follows` are still
 `waymaker-conformance`'s across-reset witness's, and still owed against a real driver.
 
 ## The layering
@@ -955,10 +957,14 @@ mark is allowed to be wrong. The run and the cut point are pure functions of a s
 iteration, so a log line carries the whole run; the witness travels in the line too, along with
 the evidence a verdict rests on — how many records recovery accepted and how many banks claimed
 authority — because two of the six breaches are caused by bytes a line cannot carry, and a
-rebuilt part reaches a pass. A power cut and a
-watchdog reset are modelled differently rather than relabelled — a brownout tears a program
-inside a unit, a watchdog reset lets the controller finish or abandon it whole — and the census
-over three write points and two reset causes fails closed on an uncovered cell. The rig is
+rebuilt part reaches a pass. A watchdog reset is a
+*cause the rig carries* rather than one it can perform on a host: the plan arms it, the cutter
+is handed it and the log records it, but `waymaker-fault`'s every injection is a power loss —
+"the world stops here" — and nothing models a core-only reset or retained RAM. So the host
+sweep fills the three power-cut cells and the census refuses the run, naming a watchdog cell as
+the gap; the other three are inside the board rows below. An earlier version of this partitioned
+the injector by how much of an operation completed and called half of it watchdog coverage,
+which is the relabelling this crate exists to avoid, and Codex was right to reject it. The rig is
 driven at every crash point `waymaker-fault` enumerates, judged by its own oracle, and held
 honest by writers wrong in one way each that must be caught by the guarantee they break and by
 no other. §04's write amplification is published by `cargo xtask size`, measured by running the

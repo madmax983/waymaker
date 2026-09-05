@@ -417,12 +417,34 @@ impl Rig {
         };
         let header = self.header(iteration, run_input);
 
+        // The engine area holds both banks and, on a geometry whose block count is odd, a
+        // spare. Wiping all of it is the *rig* preparing a part, not §10 installing a bank —
+        // and charging it to the engine made the published figure report five erased blocks
+        // for a lifecycle that erases two. So the part outside the bank is erased first, as
+        // the instrument's own traffic, and the bank itself is erased below as the engine's.
+        let region = self.layout.bank(Self::BANK);
+        let Some(beyond) = engine_capacity(&self.layout).checked_sub(region.bytes()) else {
+            return Err(RigError::Layout(LayoutError::TooFewEraseBlocks));
+        };
+        if beyond > 0 {
+            part.set_traffic(Traffic::Rig);
+            let outcome = {
+                let mut engine = self.engine(part)?;
+                engine
+                    .erase(region.bytes(), beyond)
+                    .and_then(|()| engine.barrier())
+            };
+            part.set_traffic(Traffic::Engine);
+            outcome.map_err(unwindow)?;
+        }
+
         let mut engine = self.engine(part)?;
-        let bytes = engine.geometry().capacity();
-        engine.erase(0, bytes).map_err(unwindow)?;
+        // §10's install, and the only erase this figure charges the engine for: one bank.
+        engine
+            .erase(region.base(), region.bytes())
+            .map_err(unwindow)?;
         engine.barrier().map_err(unwindow)?;
 
-        let region = self.layout.bank(Self::BANK);
         let Some(slot) = page.get_mut(..) else {
             return Err(RigError::ShortPage);
         };
@@ -927,6 +949,15 @@ const fn effect_of(role: Role) -> Option<u16> {
         Role::Schedule(effect) | Role::Completion(effect) => Some(effect),
         Role::Start | Role::Finish => None,
     }
+}
+
+/// How many bytes the engine area of `layout` spans.
+///
+/// `BankLayout` reports a bank's size rather than the window's, and the window is the geometry
+/// the layout was built on — which is exactly the engine area, because `Rig::new` builds it
+/// from one.
+const fn engine_capacity(layout: &BankLayout) -> u32 {
+    layout.geometry().capacity()
 }
 
 /// `len` rounded up to a whole number of program units, or `None` on an overflow.

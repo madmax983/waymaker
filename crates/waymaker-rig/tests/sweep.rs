@@ -14,17 +14,29 @@
 //!   model has. That is precisely why the boards are still owed, and
 //!   `xtask::docs::HARDWARE_TARGETS` says so.
 //!
-//! # How a power cut and a watchdog reset are told apart here
+//! # Why every cell this file fills is a power cut
 //!
-//! Not by relabelling. The two differ in what the flash controller was allowed to finish:
+//! An earlier version of this file partitioned the injector's enumeration into the two reset
+//! causes — a torn program for a brownout, a whole or unstarted one for a watchdog — and
+//! reported a complete census. Codex was right to reject it, and the reason is worth keeping
+//! here rather than in a commit message.
 //!
-//! * a **brownout** stops a program where it stopped, inside a program unit — which is
-//!   [`Progress::Bytes`], a torn write;
-//! * a **watchdog reset** leaves the supply up, so the unit already handed to the controller
-//!   completes or is abandoned whole — which is [`Progress::None`] and [`Progress::Whole`].
+//! Every injection the harness performs is an [`Interruption::PowerLoss`], whose documented
+//! contract is "the world stops here": nothing runs afterwards, the session is dead, and the
+//! image is what media held at that instant. What separates a watchdog reset from a brownout
+//! is that the supply *holds* — the flash controller may finish a unit the core has stopped
+//! believing in, RAM is not cleared, and the reset-cause register says which happened. The
+//! model has none of those. Splitting `Progress` two ways groups power cuts by how much of an
+//! operation completed; it does not perform a watchdog reset, and calling the result watchdog
+//! coverage is the relabelling this crate exists to avoid.
 //!
-//! So the injector's own enumeration partitions into the two causes, and the census below
-//! requires both partitions to be non-empty at all three write points.
+//! So this file fills the three [`ResetCause::PowerCut`] cells and says so. The three
+//! [`ResetCause::Watchdog`] cells are a **hardware** obligation, and they are inside the rows
+//! `xtask::docs::HARDWARE_TARGETS` already carries — both of which name "power-cut *and
+//! watchdog-reset* loops". What this crate does supply for them is everything but the
+//! evidence: the plan arms the cause, [`PlannedCut`] hands it to the cutter, the log line
+//! records it, and the census refuses a run that never reached them. That refusal is a tested
+//! property below rather than a claim.
 
 use std::collections::BTreeSet;
 
@@ -84,12 +96,15 @@ fn records() -> u16 {
     records
 }
 
-/// The reset cause an injection models. See the module documentation.
+/// The reset cause an injection models.
+///
+/// One answer, because the harness has one: `Interruption::PowerLoss` is a power cut whatever
+/// `Progress` it stopped at. See the module documentation for why this used to have two.
 const fn cause_of(injection: Injection) -> Option<ResetCause> {
-    match (injection.progress, injection.interruption) {
-        (_, Interruption::Failure) => None,
-        (Progress::Bytes(_), Interruption::PowerLoss) => Some(ResetCause::PowerCut),
-        (Progress::None | Progress::Whole, Interruption::PowerLoss) => Some(ResetCause::Watchdog),
+    match injection.interruption {
+        // A failed call the writer reacts to is not a reset at all.
+        Interruption::Failure => None,
+        Interruption::PowerLoss => Some(ResetCause::PowerCut),
     }
 }
 
@@ -221,6 +236,44 @@ fn the_rig_and_the_journal_agree_about_what_the_engine_was_asked_for() {
 }
 
 #[test]
+fn the_engine_is_charged_for_the_bank_it_installs_and_not_for_the_part() {
+    // §10 erases a bank. The rig erases a *part* — both banks and, on an odd block count, a
+    // spare — and charging that to the engine made the published figure report five erased
+    // blocks for a lifecycle that erases two. The number in the wear report is the one this
+    // asserts.
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut metered = Metered::new(&mut device);
+    rig.prepare(&mut metered, 0, &mut page)
+        .expect("a prepared part");
+
+    let bank = rig.layout().bank(Rig::BANK);
+    let blocks = bank.bytes() / geometry().erase_size();
+    assert_eq!(
+        metered.wear().erase_operations(),
+        1,
+        "§10 installs one bank with one erase"
+    );
+    assert_eq!(
+        metered.wear().erase_blocks(),
+        blocks,
+        "the engine's erase is the bank's blocks, not the window's"
+    );
+    assert_eq!(metered.wear().erased_bytes(), bank.bytes());
+    // And the rest of the part is the instrument's, so it is measured rather than hidden.
+    assert!(
+        metered.rig_wear().erase_blocks() > 0,
+        "the part outside the bank is erased by somebody"
+    );
+    assert_eq!(
+        metered.total_wear().erase_blocks(),
+        geometry().capacity() / geometry().erase_size(),
+        "and between them they erase the whole part exactly once"
+    );
+}
+
+#[test]
 fn the_rigs_own_marks_are_not_charged_to_the_engine() {
     let rig = rig();
     let mut device = Device::new(geometry());
@@ -269,9 +322,10 @@ fn every_crash_point_leaves_media_the_oracle_accepts() {
 }
 
 #[test]
-fn the_sweep_covers_all_three_write_points_under_both_reset_causes() {
-    // Issue #27's census. A sweep that never reached a dispatch-phase watchdog reset has said
-    // nothing about that cell, and this is what makes the silence a failure.
+fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
+    // Issue #27's census, over the half a host can supply. A sweep that never reached a
+    // dispatch-phase cut has said nothing about that cell, and this is what makes the silence
+    // a failure.
     let harness = Harness::new(geometry());
     let runs = harness
         .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
@@ -304,28 +358,70 @@ fn the_sweep_covers_all_three_write_points_under_both_reset_causes() {
             coverage = coverage.record(phase, cause);
         }
     }
-    coverage
+    for phase in Phase::ALL {
+        assert!(
+            coverage.iterations(phase, ResetCause::PowerCut) > 0,
+            "the sweep never cut the {} write",
+            phase.name()
+        );
+    }
+
+    // And the half it cannot: the census must still refuse this run, because a watchdog reset
+    // has not happened. A host sweep that reported a complete census would be reporting
+    // coverage nothing produced — which is what this file used to do.
+    let gap = coverage
         .verdict()
-        .unwrap_or_else(|gap| panic!("the sweep left a hole: {gap}"));
+        .expect_err("a host sweep performs no watchdog reset, so the census is not complete");
+    assert_eq!(
+        gap.cause(),
+        ResetCause::Watchdog,
+        "the only cells a host cannot fill are the watchdog ones"
+    );
 }
 
 #[test]
-fn the_sweep_tears_a_write_and_completes_one_at_every_write_point() {
-    // The census above counts cells; this checks the two partitions are what they claim to
-    // be, so a mapping that quietly put every injection in one bucket cannot pass.
+fn the_watchdog_cells_are_owed_by_hardware_and_the_census_says_so() {
+    // The rig supplies everything for a watchdog reset but the reset. This is that stated as a
+    // test rather than as a comment: a census with every power-cut cell filled is still
+    // incomplete, and the gap it names is a watchdog cell every time.
+    let mut coverage = Coverage::EMPTY;
+    for phase in Phase::ALL {
+        coverage = coverage.record(phase, ResetCause::PowerCut);
+    }
+    let gap = coverage
+        .verdict()
+        .expect_err("three of the six cells are hardware's");
+    assert_eq!(gap.cause(), ResetCause::Watchdog);
+    assert_eq!(gap.phase(), Phase::Schedule);
+
+    // And the cause is carried end to end, so a board that *can* perform one is armed for it:
+    // the plan draws it, and the cutter is handed it.
+    let rig = rig();
+    let armed = (0..64_u32)
+        .map(|iteration| rig.cut_at(iteration))
+        .filter(|cut| cut.cause() == ResetCause::Watchdog)
+        .count();
+    assert!(armed > 0, "no iteration in 64 armed a watchdog reset");
+}
+
+#[test]
+fn the_sweep_tears_a_write_and_completes_one() {
+    // Not a reset cause — see the module documentation — but still the distinction that
+    // decides what media a crash leaves, and worth knowing the sweep produces both.
     let harness = Harness::new(geometry());
     let runs = harness
         .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
         .expect("the fault-free run succeeds");
-    let torn = runs
+    let power_cuts = runs
         .iter()
         .filter_map(Run::injection)
-        .filter(|injection| cause_of(*injection) == Some(ResetCause::PowerCut))
+        .filter(|injection| cause_of(*injection) == Some(ResetCause::PowerCut));
+    let torn = power_cuts
+        .clone()
+        .filter(|injection| matches!(injection.progress, Progress::Bytes(_)))
         .count();
-    let whole = runs
-        .iter()
-        .filter_map(Run::injection)
-        .filter(|injection| cause_of(*injection) == Some(ResetCause::Watchdog))
+    let whole = power_cuts
+        .filter(|injection| matches!(injection.progress, Progress::None | Progress::Whole))
         .count();
     assert!(torn > 0 && whole > 0, "{torn} torn, {whole} whole");
 }
