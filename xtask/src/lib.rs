@@ -239,6 +239,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
     violations.extend(source::check_storage_contract(&inputs.layer_sources));
     violations.extend(source::check_recovery_surface(&inputs.layer_sources));
+    violations.extend(source::check_recovery_routing(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
@@ -902,7 +903,7 @@ mod tests {
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::RECOVERY_SURFACE_PATH),
-                    contents: source::tests_support::clean_recovery_surface(),
+                    contents: source::tests_support::clean_recovery_routing(),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),

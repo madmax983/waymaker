@@ -48,19 +48,38 @@ Nothing about this is `Iterator`. A lending iterator needs GATs and a lifetime t
 have to name, for ergonomics only; the manual pump is the same thing with a name, and it lets
 the caller interleave `ReplayCursor::advance` and its own work, which §06 step 4 requires.
 
-### 2. A region is validated once, and refuses a granularity it cannot read
+### 2. A region is validated once, as a *program*, and carries the device it was validated against
 
 `JournalRegion` is the bytes between a bank's header and its seal. It is built either from a
 geometry directly (`spanning`, for a port that lays journals out its own way) or from §10's
 chain (`of(layout, bank, header)`), and both go through one validation: not empty, inside the
-device, whole read units at both ends, and — the one that is not obvious — **the journal's
-granularity is at least the device's read unit**.
+device, whole **program** units at both ends, and the journal's granularity at least the
+device's program unit.
 
-That last refusal is what makes every later read legal without a second bounds check. Frame
-boundaries are a whole number of the *writer's* program units, so a device whose read unit is
-coarser has frame starts it cannot name. Refusing at construction is a cold boot that stops;
-discovering it mid-scan would be a recovery that halted somewhere arbitrary and reported it as
-the end of history.
+Validated as a program rather than as a read, which is stronger in both places it has to be. A
+geometry nests — `erase >= program >= read` — so whatever is legal to program is legal to
+read, and one check covers both. And a region that is readable but not programmable is one
+whose append offset no driver would accept: on a device that reads single bytes and programs
+eight, `validate_read` admits a base of 1, a recovery of an erased region there reports a clean
+end at offset 0, and the absolute offset a caller would then program is 1. Codex found that on
+pull request #74; `a_region_a_driver_could_read_but_never_program_is_refused` is it as a test.
+
+The region also **keeps** the geometry. Reading the units back off whichever `StableStorage` a
+caller hands to `next` would prove every bound against a different device from the one they
+were established on: a region built at granularity 4 and walked on a device that reads sixteen
+bytes at a time rounds a 24-byte frame up to a 32-byte read and runs eight bytes past the
+region's end, into the generation seal or the neighbouring bank. Two independent reviews found
+that, one of them with a running reproduction. Carrying the geometry makes it unrepresentable
+rather than guarded, and a caller that hands over a device the region does not describe now
+gets a refusal from the driver's own validation instead — the failure closing in the right
+direction.
+
+`of` is also the one call that welds the *writer's* granularity to the *reader's*:
+`journal_offset` comes from the header on media, `payload_bytes` from the layout in hand. It
+refuses a header whose granularity is not the layout's, which closes two silent failures at
+once — a coarser writer reserved more room for its seal than this reader subtracts, so a sound
+bank reads as damaged on every boot; a finer one shortens the region and drops history past its
+end under a clean ending.
 
 ### 3. Only `Ending::Clean` carries an append offset
 
@@ -120,8 +139,37 @@ a table of names pins the bodies it names and says nothing about a new one.
   paid once, at the end of a scan, and it is the one cost that is not per record.
 - **Two reads per record rather than one.** The header read is re-read as part of the frame
   read, which is twelve wasted bytes per record. The alternative was one page-sized read per
-  record and a `Truncated` that could not distinguish "the frame is longer than the page" from
-  "the region is shorter than the frame". Precision was worth twelve bytes.
+  record: half the transactions and *twenty times* the bytes — 512 B fetched for a 24 B record
+  — and a `Truncated` that could not distinguish "the frame is longer than the page" from "the
+  region is shorter than the frame". On a QSPI part transfer time is what dominates, so
+  precision and twelve wasted header bytes beat four hundred and eighty wasted payload ones.
+  The header seal is likewise verified twice, ten bytes of CRC-16, rather than growing a second
+  public decoder entry point that takes an already-verified header.
+- **The erased-tail walk will dominate boot latency before the commit seal lands.** A 64 KiB
+  bank with a 512 B page is 128 reads on every boot, however short its history, because an
+  erased header is only the end of history if the whole tail is erased. That is correct and it
+  is the strongest practical argument for issue
+  [#24](https://github.com/madmax983/waymaker/issues/24): a sealed tail is one a reader can
+  stop at without proving what lies beyond it. Worth knowing before it is measured on hardware
+  rather than after.
+- **`Ending` is expected to grow a variant, not to have `Damaged` overloaded.** Every payload
+  is `Recovery::offset` today, so the two are interchangeable; with the commit seal they stop
+  being the same number, and a tail that is present but unsealed is a fourth thing — recoverable
+  and not appendable — that is neither of the two refusals. Every `match` on it in this
+  workspace is exhaustive so that day is a list of call sites rather than a silent
+  reinterpretation. `frame_len_of`'s postcondition is the other half: `stride` is computed from
+  it, so a seal-aware length has to widen *that* rather than arrive as a second function only
+  `Recovery` knows to call.
+- **`integrity-check` grew a fourth half, and its third was found to be decorative.** Review
+  demonstrated that replacing both `::<C>` calls in the reader with their non-generic siblings
+  passed all 38 rules and the whole suite: `Recovery<C>`'s parameter selected nothing. It also
+  demonstrated three shapes that escaped the derived scan over `frame.rs` — a `where`-clause
+  bound, a method in a generic `impl` block, and a wrapped signature — and one shape no scan
+  over signatures can see, a helper that takes no `C` at all and calls `crc16`. So the scan now
+  reads joined signatures and generic `impl` blocks, `frame.rs` gains a file-wide checksum ban
+  with `input_digest` as its one named exception, and `recovery.rs` gains a routing table of
+  its own. Each of those has a test that makes it fire; a derived scan that quietly found
+  nothing would have passed every test written for it.
 - **A new gate rule, `recovery-surface`.** The reader's public function names are pinned, in
   both directions, for the reason `replay-cursor-surface` and `storage-contract` are: a
   `seek`, a `resume_at` or a `read_all` breaks no layering rule and needs no dependency, and

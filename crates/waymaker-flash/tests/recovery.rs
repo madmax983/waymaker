@@ -27,7 +27,7 @@
 
 use std::vec::Vec;
 
-use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
+use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef, RunId};
 use waymaker_flash::bank::{BankHeader, BankId, BankLayout};
 use waymaker_flash::frame::{self, ERASED_BYTE, HEADER_BYTES, ProgramAlign, Scan};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
@@ -173,10 +173,22 @@ fn align(bytes: u16) -> ProgramAlign {
     align
 }
 
+/// A device that programs `unit` bytes at a time and reads `read` at a time.
+///
+/// A journal's granularity must be at least the device's program unit — a region validated
+/// only as a read would admit an append offset no driver could program — so a test that
+/// varies the granularity has to vary the device with it.
+fn device(unit: u32, read: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(8192, 4096, unit, read) else {
+        unreachable!("8192 is two whole 4096-byte blocks of nesting power-of-two units")
+    };
+    geometry
+}
+
 /// A journal region carved out of a device by hand, so a test can name its bounds.
 fn region(geometry: Geometry, base: u32, bytes: u32, unit: u16) -> JournalRegion {
     let Ok(region) = JournalRegion::spanning(geometry, base, bytes, align(unit)) else {
-        unreachable!("the regions in this file are legal reads")
+        unreachable!("the regions in this file are legal programs")
     };
     region
 }
@@ -594,12 +606,16 @@ fn a_recovery_reads_what_a_scan_reads() {
     // journal below is walked twice — once through §12's storage contract with a page, once
     // as a slice by `frame::Scan` — and the two must agree record for record, on where the
     // prefix ends, and on whether it ended cleanly.
-    let geometry = nor();
     let mut rng = Rng::new(0x5EED_2317);
 
     for case in 0..256_u32 {
+        // Four devices, not one: the granularity a journal was written at is the program
+        // unit of the device that wrote it, and the read unit varies with it so the
+        // page-and-chunk arithmetic is exercised at more than one read width.
+        let (unit, read) =
+            [(1_u16, 1_u32), (2, 2), (4, 1), (8, 4)][usize::try_from(case % 4).expect("host")];
+        let geometry = device(u32::from(unit), read);
         let mut device = Nor::new(geometry);
-        let unit = [1_u16, 2, 4, 8][usize::try_from(case % 4).expect("host")];
         let journal = region(geometry, 0, 512, unit);
         let count = usize::try_from(rng.below(6)).expect("host");
         let payloads: Vec<Vec<u8>> = (0..count)
@@ -651,63 +667,217 @@ fn a_recovery_reads_what_a_scan_reads() {
     }
 }
 
+#[test]
+fn a_recovery_with_the_wrong_check_stops_at_the_first_frame() {
+    // `Recovery<C>` promises a journal is verified with the algorithm that sealed it, and
+    // until this test nothing used the parameter: review of this change replaced both
+    // `::<C>` calls in the reader with their non-generic siblings, and the whole workspace
+    // passed. A pin now refuses that mutation; this is the behaviour behind the pin.
+    let geometry = nor();
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 0, 256, 8);
+    append(
+        &mut device,
+        journal,
+        &[
+            RecordRef::RunCompleted { result: b"one" },
+            RecordRef::RunFailed { error: b"two" },
+        ],
+    );
+
+    // The shipped check reads it.
+    let mut shipped = Recovery::new(journal);
+    let (seen, ending) = drain(&mut device, &mut shipped);
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(ending, Some(Ending::Clean { .. })));
+
+    // Another one does not, and stops at the very first frame rather than walking it wrong.
+    let mut other = Recovery::<Other>::with_integrity(journal);
+    let mut page = [0_u8; PAGE];
+    assert_eq!(
+        other.next(&mut device, &mut page),
+        Some(Err(RecoveryError::Decode(DecodeError::IntegrityFailed)))
+    );
+    assert_eq!(other.ending(), Some(Ending::Damaged { at: 0 }));
+    assert_eq!(other.append_offset(), None);
+}
+
+#[test]
+fn a_read_that_fails_mid_scan_ends_a_recovery_after_a_short_prefix() {
+    // The other side of `Incomplete`: not the first read, but one after a record has already
+    // been yielded. The prefix is *short* rather than final, which is the whole distinction
+    // between this ending and `Damaged` — and the offset it carries is where the scan was,
+    // not where it started.
+    let geometry = nor();
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 0, 256, 8);
+    append(
+        &mut device,
+        journal,
+        &[
+            RecordRef::RunCompleted { result: b"one" },
+            RecordRef::RunFailed { error: b"two" },
+        ],
+    );
+    // Reads 0 and 1 are the first record's header and frame; read 2 is the second's header.
+    device.fail_read_at = Some(2);
+
+    let mut recovery = Recovery::new(journal);
+    let (seen, ending) = drain(&mut device, &mut recovery);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(ending, Some(Ending::Incomplete { at: 24 }));
+    assert_ne!(ending, Some(Ending::Damaged { at: 24 }));
+    assert_eq!(recovery.append_offset(), None);
+}
+
+#[test]
+fn a_frame_exactly_the_size_of_the_page_is_read_rather_than_refused() {
+    // The `need > capacity` boundary from the near side. Only the far side was tested — a
+    // 212-byte frame against a 64-byte page — so an off-by-one that refused a frame the page
+    // could hold would have passed.
+    let geometry = nor();
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 0, 256, 8);
+    let payload = [0x5A_u8; 52];
+    let frame_len = payload.len() + waymaker_flash::frame::FRAME_OVERHEAD_BYTES;
+    assert_eq!(frame_len, 68);
+    append(
+        &mut device,
+        journal,
+        &[RecordRef::RunCompleted { result: &payload }],
+    );
+
+    let mut exact = Recovery::new(journal);
+    let mut page = [0_u8; 68];
+    assert!(matches!(exact.next(&mut device, &mut page), Some(Ok(_))));
+
+    let mut short = Recovery::new(journal);
+    let mut one_less = [0_u8; 67];
+    assert_eq!(
+        short.next(&mut device, &mut one_less),
+        Some(Err(RecoveryError::PageTooSmall { needed: 68 }))
+    );
+}
+
+#[test]
+fn a_page_that_is_not_whole_read_units_is_used_down_to_the_unit() {
+    // `capacity = page_bytes & !(read_unit - 1)` is the identity at a one-byte read unit, so
+    // every other test in this file leaves the mask untested. A device that reads four at a
+    // time and a page of thirty bytes is what exercises it: twenty-eight bytes are usable,
+    // and a frame that fits those is read rather than refused.
+    let geometry = Geometry::new(8192, 4096, 4, 4).expect("reads and programs four");
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 0, 256, 4);
+    append(
+        &mut device,
+        journal,
+        &[RecordRef::RunCompleted {
+            result: b"twelve bytes",
+        }],
+    );
+
+    let mut recovery = Recovery::new(journal);
+    let mut ragged = [0_u8; 30];
+    assert!(matches!(
+        recovery.next(&mut device, &mut ragged),
+        Some(Ok(_))
+    ));
+    for (offset, len) in &device.spans {
+        assert_eq!(
+            len % 4,
+            0,
+            "a read of {len} bytes at {offset} is not whole units"
+        );
+        assert_eq!(offset % 4, 0, "a read at {offset} is not whole units");
+    }
+}
+
+#[test]
+fn a_recovery_at_a_wider_read_unit_still_stops_where_a_scan_does() {
+    // The whole of `waymaker-fault`'s sweep and every stop-condition test above runs at a
+    // one-byte read unit, where `round_up(HEADER_BYTES, read_unit)` is the identity. This is
+    // the same journal at four.
+    let geometry = Geometry::new(8192, 4096, 8, 4).expect("reads four, programs eight");
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 0, 256, 8);
+    let end = append(
+        &mut device,
+        journal,
+        &[RecordRef::RunCompleted { result: b"one" }],
+    );
+    device.put(end, &[0x57, 0x4D, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
+
+    let mut recovery = Recovery::new(journal);
+    let (seen, ending) = drain(&mut device, &mut recovery);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(ending, Some(Ending::Damaged { at: end }));
+}
+
 // ---------------------------------------------------------------------------------------
 // Cost and RAM.
 // ---------------------------------------------------------------------------------------
 
 #[test]
 fn the_cost_of_a_record_does_not_depend_on_how_many_came_before_it() {
-    // Issue #23's second "done when", stated as an equation rather than as a slope, so that
-    // a cost model that changed shape fails here rather than passing an inequality.
+    // Issue #23's second "done when". The contract is that the *per-record* cost is constant
+    // in history — not that a record costs any particular number of reads, which is an
+    // implementation choice a later rung is free to improve.
     //
-    // A recovery costs, exactly:
-    //
-    //   * two reads per record — one of a header, to learn how long the frame is before
-    //     trusting a length nothing checked, and one of the frame itself;
-    //   * one more header read at the erased tail; and
-    //   * a walk of what is left of the *region*, in page-sized chunks, which is what stops
-    //     a hole from reading as the end of a journal.
-    //
-    // Not one term of that mentions how many records came before, and the third is bounded
-    // by the region rather than by history. RAM is the caller's page, which is the same 512
-    // bytes in both runs below and is the only buffer either of them has.
+    // So three points rather than two, with the region's tail held constant so the one cost
+    // that is not per record cancels between them, and the assertion is on the slope: the
+    // marginal cost of a record between 8 and 100 must be exactly the marginal cost between
+    // 100 and 200. That fails on a reader that rescans, and on any term in `n²`; it passes a
+    // reader that got cheaper.
+    // Every record here is a twelve-byte header, an eight-byte payload and a four-byte seal,
+    // and the tail is the same in every run so the one cost that is not per record cancels.
+    const FRAME: u32 = 24;
+    const TAIL: u32 = 4_096;
+
     let geometry = Geometry::new(65_536, 4096, 8, 1).expect("sixteen whole blocks");
-    let bytes = 16_384_u32;
-    for count in [8_usize, 200] {
+    let mut cost = Vec::new();
+    for count in [8_u32, 100, 200] {
         let mut device = Nor::new(geometry);
-        let journal = region(geometry, 0, bytes, 8);
+        let journal = region(geometry, 0, count * FRAME + TAIL, 8);
         let records: Vec<RecordRef<'static>> = (0..count)
             .map(|index| RecordRef::EffectCompleted {
-                seq: EffectSeq(u32::try_from(index).expect("host")),
+                seq: EffectSeq(index),
                 result: b"payload!",
             })
             .collect();
         let end = append(&mut device, journal, &records);
+        assert_eq!(end, count * FRAME);
         device.forget();
 
         let mut recovery = Recovery::new(journal);
         let (seen, ending) = drain(&mut device, &mut recovery);
-        assert_eq!(seen.len(), count);
+        assert_eq!(seen.len(), usize::try_from(count).expect("host"));
         assert_eq!(ending, Some(Ending::Clean { append_at: end }));
-
-        // Every record here is a twelve-byte header, an eight-byte payload and a four-byte
-        // seal: twenty-four bytes, already a whole number of eight-byte program units.
-        let frame = 24_usize;
-        assert_eq!(end, u32::try_from(count * frame).expect("host"));
-        let tail = usize::try_from(bytes - end).expect("host");
-        let chunks = tail.div_ceil(PAGE);
-
-        assert_eq!(
-            device.reads,
-            2 * count + 1 + chunks,
-            "a recovery of {count} records issued the wrong number of reads"
-        );
-        assert_eq!(
-            device.bytes_read,
-            count * (HEADER_BYTES + frame) + HEADER_BYTES + tail,
-            "a recovery of {count} records read the wrong number of bytes"
-        );
+        cost.push((count, device.reads, device.bytes_read));
     }
+
+    let slope = |from: (u32, usize, usize), to: (u32, usize, usize)| {
+        let records = usize::try_from(to.0 - from.0).expect("host");
+        ((to.1 - from.1) / records, (to.2 - from.2) / records)
+    };
+    let (reads_lower, bytes_lower) = slope(cost[0], cost[1]);
+    let (reads_upper, bytes_upper) = slope(cost[1], cost[2]);
+    assert_eq!(
+        (reads_lower, bytes_lower),
+        (reads_upper, bytes_upper),
+        "a record costs more the later it is, so something in this reader grows with history"
+    );
+    // And the marginal cost is bounded, so "constant" is not being satisfied by a constant
+    // that happens to be enormous. Two reads is what the implementation spends today; the
+    // bound is what the contract needs.
+    assert!(reads_upper <= 2, "a record cost {reads_upper} reads");
+    assert!(
+        bytes_upper <= usize::try_from(2 * FRAME).expect("host"),
+        "a record cost {bytes_upper} bytes"
+    );
+
+    // RAM is the caller's page, and it is the same page at every size above — the loop uses
+    // one `PAGE`-sized buffer per run and `Recovery` retains none of it.
+    assert!(cost[2].1 > cost[0].1, "the sweep did not grow at all");
 }
 
 #[test]
@@ -731,11 +901,14 @@ fn recovery_is_a_position_rather_than_a_buffer() {
         page.fill(0xA5);
     }
     assert_eq!(seen.len(), 2);
+    // The size itself is a `const` assertion in the crate, which is where a `<=` would be a
+    // place to hide a page. What a test adds is the *shape*: a recovery is its region, an
+    // offset and a verdict, and nothing else — so a field that appeared would move this
+    // equality rather than merely fit under a ceiling.
     assert_eq!(
         std::mem::size_of::<Recovery>(),
-        std::mem::size_of::<Recovery>()
+        std::mem::size_of::<JournalRegion>() + std::mem::size_of::<u32>() + 8
     );
-    assert!(std::mem::size_of::<Recovery>() <= 32);
 }
 
 #[test]
@@ -776,6 +949,43 @@ fn a_recovery_never_reads_outside_the_region_it_was_given() {
 // ---------------------------------------------------------------------------------------
 
 #[test]
+fn every_offset_a_recovery_reports_is_relative_to_its_region() {
+    // Every stop-condition test above builds a region at base 0, where a region-relative
+    // offset and a device-absolute one are the same number. Review of this change
+    // demonstrated what that costs: changing `Ending::Damaged { at }` to report
+    // `region.base() + offset` passed the entire workspace suite. So one case is run at a
+    // base that is not zero, for both the ending and the offset.
+    let geometry = nor();
+    let mut device = Nor::new(geometry);
+    let journal = region(geometry, 4096, 512, 8);
+    let end = append(
+        &mut device,
+        journal,
+        &[
+            RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 1,
+                input: b"in",
+            },
+            RecordRef::RunCompleted { result: b"done" },
+        ],
+    );
+    let torn_at = end - journal.base();
+    device.put(end, &[0x57, 0x4D, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
+
+    let mut recovery = Recovery::new(journal);
+    let (seen, ending) = drain(&mut device, &mut recovery);
+    assert_eq!(seen.len(), 2);
+    assert!(
+        torn_at > 0 && torn_at < journal.base(),
+        "the two numbers differ"
+    );
+    assert_eq!(ending, Some(Ending::Damaged { at: torn_at }));
+    assert_eq!(recovery.offset(), torn_at);
+    assert_eq!(recovery.append_offset(), None);
+}
+
+#[test]
 fn a_journal_region_is_the_bytes_between_a_banks_header_and_its_seal() {
     // The chain §10 states: a layout says where a bank is, a decoded header says where its
     // journal starts, and the seal is at the far end. This is that chain as one call, so a
@@ -809,21 +1019,56 @@ fn a_journal_region_is_the_bytes_between_a_banks_header_and_its_seal() {
 }
 
 #[test]
-fn a_region_refuses_a_granularity_the_device_cannot_read_at() {
-    // A journal written at a granularity finer than this device's read unit has frame
-    // boundaries this device cannot name. Refusing at construction is a cold boot that
-    // stops; discovering it mid-scan would be a recovery that stopped somewhere arbitrary
-    // and called it the end of history.
-    let geometry = Geometry::new(8192, 4096, 8, 4).expect("a device that reads four at a time");
+fn a_region_refuses_a_granularity_the_device_cannot_program_at() {
+    // A journal written at a granularity finer than this device's program unit has frame
+    // boundaries this device cannot write at — and the offset a recovery hands back is one
+    // of them. Refusing at construction is a cold boot that stops; discovering it at the
+    // first append would be a driver told to program a misaligned offset, and discovering it
+    // mid-scan would be a recovery that stopped somewhere arbitrary and called it the end of
+    // history.
+    let geometry = Geometry::new(8192, 4096, 8, 4).expect("a device that programs eight");
+    for finer in [ProgramAlign::BYTE, align(2), align(4)] {
+        assert_eq!(
+            JournalRegion::spanning(geometry, 0, 512, finer),
+            Err(RegionError::AlignBelowProgramUnit),
+            "granularity {} is below the program unit",
+            finer.get()
+        );
+    }
+    assert!(JournalRegion::spanning(geometry, 0, 512, align(8)).is_ok());
+    assert!(JournalRegion::spanning(geometry, 0, 512, align(16)).is_ok());
+}
+
+#[test]
+fn a_region_a_driver_could_read_but_never_program_is_refused() {
+    // Codex's finding on pull request #74, as a test. A device that reads single bytes and
+    // programs eight accepts a base of 1 as a *read*; a recovery of an erased region there
+    // reports a clean end at offset 0, and the absolute offset a caller would then program
+    // — 1 — is one every conforming `StableStorage` must refuse. So the region is validated
+    // as a program, which is strictly stronger: a geometry nests, so whatever is legal to
+    // program is legal to read.
+    let geometry = Geometry::new(8192, 4096, 8, 1).expect("reads one, programs eight");
     assert_eq!(
-        JournalRegion::spanning(geometry, 0, 512, ProgramAlign::BYTE),
-        Err(RegionError::AlignBelowReadUnit)
+        geometry.validate_read(1, 512),
+        Ok(()),
+        "readable, and that is the trap"
     );
     assert_eq!(
-        JournalRegion::spanning(geometry, 0, 512, align(2)),
-        Err(RegionError::AlignBelowReadUnit)
+        geometry.validate_program(1, 512),
+        Err(GeometryError::MisalignedOffset)
     );
-    assert!(JournalRegion::spanning(geometry, 0, 512, align(4)).is_ok());
+    assert_eq!(
+        JournalRegion::spanning(geometry, 1, 512, align(8)),
+        Err(RegionError::Geometry(GeometryError::MisalignedOffset))
+    );
+    // And a length that is whole read units but not whole program units, for the same
+    // reason: it puts the end of the region — and so a full journal's append offset —
+    // somewhere no program can reach.
+    assert_eq!(
+        JournalRegion::spanning(geometry, 0, 500, align(8)),
+        Err(RegionError::Geometry(GeometryError::MisalignedLength))
+    );
+    assert!(JournalRegion::spanning(geometry, 8, 512, align(8)).is_ok());
 }
 
 #[test]
@@ -843,6 +1088,64 @@ fn a_region_refuses_what_the_device_would_refuse() {
     assert_eq!(
         JournalRegion::spanning(geometry, 0, 0, align(8)),
         Err(RegionError::EmptyRegion)
+    );
+}
+
+#[test]
+fn a_bank_written_at_another_devices_granularity_is_refused() {
+    // The one call that welds the writer's granularity to the reader's, refusing rather than
+    // guessing. Review of this change demonstrated the alternative: taking the offset from
+    // the layout instead of from the header passed the whole suite, because every fixture set
+    // the two to the same value and nothing made them differ. Now they cannot.
+    let geometry = nor();
+    let layout = BankLayout::new(geometry).expect("two blocks are two banks");
+    for foreign in [align(4), align(16)] {
+        assert_ne!(foreign, layout.align());
+        let header = BankHeader {
+            run: RUN,
+            align: foreign,
+            workflow_kind: 7,
+            workflow_version: 1,
+            input_schema: 2,
+            input: b"run-input",
+        };
+        assert_eq!(
+            JournalRegion::of(layout, BankId::A, &header),
+            Err(RegionError::AlignDisagreesWithBank),
+            "granularity {} is not this layout's",
+            foreign.get()
+        );
+    }
+}
+
+#[test]
+fn a_bank_whose_header_leaves_exactly_no_journal_is_refused_too() {
+    // The `bytes == 0` arm, which is a different arm from "the header is longer than the
+    // bank": a zero-length region would be one every caller reads as an empty history it may
+    // append to.
+    let geometry = nor();
+    let layout = BankLayout::new(geometry).expect("two blocks are two banks");
+    let bank = layout.bank(BankId::A);
+    let payload = usize::try_from(bank.payload_bytes()).expect("host");
+    let overhead = waymaker_flash::bank::HEADER_OVERHEAD_BYTES;
+    // An input whose padded header frame is exactly the payload region, and not a byte more.
+    let input = std::vec![0_u8; payload - overhead];
+    let header = BankHeader {
+        run: RUN,
+        align: layout.align(),
+        workflow_kind: 7,
+        workflow_version: 1,
+        input_schema: 2,
+        input: &input,
+    };
+    assert_eq!(
+        header.journal_offset(),
+        Some(payload),
+        "this header fills the payload region exactly"
+    );
+    assert_eq!(
+        JournalRegion::of(layout, BankId::A, &header),
+        Err(RegionError::NoJournalRoom)
     );
 }
 
@@ -871,10 +1174,18 @@ fn a_bank_whose_header_fills_it_has_no_journal() {
 
 #[test]
 fn every_region_error_says_something_different() {
+    // The postcondition says "distinct from every other variant's — including from every
+    // `GeometryError` it wraps", so every one of them is compared rather than one of them.
     let messages = [
         RegionError::NoJournalRoom.message(),
-        RegionError::AlignBelowReadUnit.message(),
+        RegionError::AlignDisagreesWithBank.message(),
+        RegionError::AlignBelowProgramUnit.message(),
         RegionError::EmptyRegion.message(),
+        RegionError::Geometry(GeometryError::ZeroUnit).message(),
+        RegionError::Geometry(GeometryError::UnitIsNotAPowerOfTwo).message(),
+        RegionError::Geometry(GeometryError::UnitsDoNotNest).message(),
+        RegionError::Geometry(GeometryError::MisalignedOffset).message(),
+        RegionError::Geometry(GeometryError::MisalignedLength).message(),
         RegionError::Geometry(GeometryError::OutOfBounds).message(),
     ];
     for (left, one) in messages.iter().enumerate() {
@@ -943,6 +1254,23 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// An integrity check that is not the shipped one, so `Recovery<C>`'s parameter has
+/// something to select.
+///
+/// Both seals are the shipped ones complemented, which is enough: a journal sealed by one and
+/// read by the other fails at the header, which is the first thing a reader checks.
+struct Other;
+
+impl waymaker_flash::integrity::IntegrityCheck for Other {
+    fn header_check(bytes: &[u8]) -> u16 {
+        !crc16(bytes)
+    }
+
+    fn frame_check(bytes: &[u8]) -> u32 {
+        !crc32(bytes)
+    }
 }
 
 /// A deterministic generator, so a failure can be reproduced from the seed it names.

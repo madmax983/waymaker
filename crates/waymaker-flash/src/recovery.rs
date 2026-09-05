@@ -63,19 +63,51 @@
 //! are lost while the device reports success.
 //!
 //! So the invariant is: **whenever an append offset comes back, every byte from it to the
-//! end of the region is erased.** `tests/recovery.rs` asserts exactly that, over a journal
+//! end of the region is erased, and the absolute offset it names is one this device can
+//! program at.** `tests/recovery.rs` asserts exactly that, over a journal
 //! at every length from empty upwards, and `waymaker-fault`'s crash sweep asserts it at
 //! every point a power loss can land.
+//!
+//! # Whether the next record *fits* is a separate question
+//!
+//! An append offset says where a record may go, not that one will. [`Ending::Clean`] is
+//! reported for a journal that is full to its last byte and for one whose tail is shorter
+//! than a header, and both are honest: everything from the offset to the end of the region
+//! is erased, there is just not much of it. The room is
+//! `region.bytes() - append_at`, and the size of the record that has to fit in it is
+//! [`frame::encoded_len`] at the region's granularity.
+//!
+//! Those two are deliberately not folded into a third accessor. §10 reserves tail space for
+//! a terminal record or a `continue_as_new` and fails ordinary scheduling early with
+//! `HistoryNearCapacity`, so "does this fit" is a *policy* question with a reserve in it,
+//! and the reserve is not this module's. What is this module's is that the offset is safe,
+//! and that is what [`append_offset`](Recovery::append_offset) answers.
 //!
 //! # Cost
 //!
 //! Per record: at most two reads — one of a header, one of the frame — and at most one
-//! padded frame of bytes. Nothing in [`Recovery`] grows with history; it is three numbers
-//! and a verdict, and a `const` assertion below says so. The one cost that is not per
-//! record is the erased-tail walk: when the scan meets an erased header it reads the rest of
-//! the region to be sure the whole tail is erased, in page-sized chunks. That is bounded by
-//! the region rather than by history, is paid once, and is what stops a hole in a journal
-//! from reading as the end of one.
+//! padded frame of bytes. Nothing in [`Recovery`] grows with history; it is a region, an
+//! offset and a verdict, and a `const` assertion below says so.
+//!
+//! Two reads rather than one is a deliberate trade and worth stating, because the obvious
+//! alternative looks cheaper and is not. Staging `min(page, remaining)` bytes in one read
+//! would halve the transactions and multiply the *bytes* by twenty: a 512 B page fetched for
+//! a 24 B record. On a QSPI part transfer time is the cost that dominates, so twelve wasted
+//! header bytes per record beats four hundred and eighty wasted payload ones. The header
+//! seal is also verified twice per record, once by
+//! [`frame::frame_len_of`] and once inside
+//! [`frame::decode`] — ten bytes of CRC-16, against the alternative of
+//! a second public decoder entry point taking an already-verified header.
+//!
+//! The one cost that is not per record is the erased-tail walk: when the scan meets an
+//! erased header it reads the rest of the region to be sure the whole tail is erased, in
+//! page-sized chunks. That is bounded by the region rather than by history, is paid once,
+//! and is what stops a hole in a journal from reading as the end of one. It is also the
+//! cost that will dominate boot latency on the first real board — a 64 KiB bank with a
+//! 512 B page is 128 reads on *every* boot, however short its history — and it is the
+//! strongest practical argument for the commit seal of issue
+//! [#24](https://github.com/madmax983/waymaker/issues/24): a sealed tail is one a reader can
+//! stop at without proving that everything past it is erased.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -107,14 +139,32 @@ pub enum RegionError {
     NoJournalRoom,
     /// The region has no bytes in it.
     EmptyRegion,
-    /// The journal was written at a granularity finer than this device can read at.
+    /// The bank records a granularity this layout does not use.
     ///
-    /// Frame boundaries are a whole number of the *writer's* program units, so a device
-    /// whose read unit is coarser than that has frame starts it cannot name. Refusing here
-    /// is a cold boot that stops; discovering it mid-scan would be a recovery that halted
+    /// [`BankLayout::align`](crate::bank::BankLayout::align) is documented as "the value a
+    /// header written for a bank of this layout must carry", and until now nothing enforced
+    /// it. The two can only differ across devices, and the failure is quiet in both
+    /// directions. A writer with a *coarser* program unit reserved more room for its
+    /// generation seal than this reader subtracts, so the journal region runs into the
+    /// writer's seal and a sound bank reads as damaged on every boot. A *finer* one shortens
+    /// the region, and history past its end is dropped under a clean ending — which is the
+    /// silent truncation [`Scan::new`](crate::frame::Scan::new) calls the worst failure it
+    /// has. Neither is something a scan can notice, so the mismatch is refused where it is
+    /// visible: the one call that welds the writer's granularity to the reader's.
+    AlignDisagreesWithBank,
+    /// The journal was written at a granularity finer than this device programs at.
+    ///
+    /// Frame boundaries are a whole number of the *writer's* program units, so a journal
+    /// written more finely than this device programs has frame starts it cannot write at —
+    /// and the offset a recovery hands back is one of them. Refusing here is a cold boot
+    /// that stops; discovering it at the first append would be a driver told to program a
+    /// misaligned offset, and discovering it mid-scan would be a recovery that halted
     /// somewhere arbitrary and called it the end of history.
-    AlignBelowReadUnit,
-    /// The region is not something [`Geometry::validate_read`] permits.
+    ///
+    /// One check rather than two, because a geometry nests: `erase >= program >= read`, so
+    /// a granularity at least the program unit is at least the read unit as well.
+    AlignBelowProgramUnit,
+    /// The region is not something [`Geometry::validate_program`] permits.
     Geometry(GeometryError),
 }
 
@@ -135,7 +185,10 @@ impl RegionError {
         match self {
             Self::NoJournalRoom => "the bank header leaves no room for a journal",
             Self::EmptyRegion => "the journal region is empty",
-            Self::AlignBelowReadUnit => "the journal's granularity is below the device's read unit",
+            Self::AlignDisagreesWithBank => "the bank's granularity is not this layout's",
+            Self::AlignBelowProgramUnit => {
+                "the journal's granularity is below the device's program unit"
+            }
             Self::Geometry(error) => error.message(),
         }
     }
@@ -153,16 +206,36 @@ impl core::error::Error for RegionError {}
 ///
 /// # Invariants
 ///
-/// Every value of this type is a legal read on the device it was built against: the base and
-/// the length are whole read units, the region is inside the device, and it is not empty.
-/// [`spanning`](Self::spanning) and [`of`](Self::of) are the only constructors, and
-/// [`of`](Self::of) goes through [`spanning`](Self::spanning). So a region that exists is one every read this module
-/// performs inside it is legal for — which is why the scan validates once here rather than on every frame.
+/// Every value of this type is a legal *program* on the device it was built against: the base
+/// and the length are whole program units, the region is inside the device, and it is not
+/// empty. [`spanning`](Self::spanning) and [`of`](Self::of) are the only constructors, and
+/// [`of`](Self::of) goes through [`spanning`](Self::spanning). So a region that exists is one
+/// every read this module performs inside it is legal for — a geometry nests, so a program
+/// unit is whole read units — which is why the scan validates once here rather than on every
+/// frame.
 ///
-/// And the recorded granularity is at least the device's read unit, so every frame boundary
-/// inside the region is an offset the device can read at.
+/// And the recorded granularity is at least the device's program unit, so **every frame
+/// boundary inside the region is an offset this device can both read and write at**. The
+/// second half is what makes an append offset a place a driver can really program: validating
+/// the region only as a read would admit a base of 1 on a device that programs eight bytes at
+/// a time, and a recovery of it would hand back an offset every conforming
+/// [`StableStorage`] must refuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JournalRegion {
+    /// The device this region was validated against, kept rather than borrowed from the
+    /// storage a scan is handed.
+    ///
+    /// Every bound in this module — that a read is aligned, that it stays inside the region,
+    /// that a frame's padded stride is a legal offset — was proved against *this* geometry
+    /// at construction. Reading the units back off the `StableStorage` a caller passes to
+    /// [`Recovery::next`] would prove them against a different one: a region built at
+    /// granularity 4 and walked on a device that reads sixteen bytes at a time would round a
+    /// 24-byte frame up to a 32-byte read and run eight bytes past the region's end, into the
+    /// generation seal or the neighbouring bank. Carrying the geometry makes that
+    /// unrepresentable rather than guarded, and a caller that hands over a device the region
+    /// does not describe gets a refusal from the driver's own validation instead — which is
+    /// the failure closing in the right direction.
+    geometry: Geometry,
     base: u32,
     bytes: u32,
     align: ProgramAlign,
@@ -183,9 +256,15 @@ impl JournalRegion {
     /// # Errors
     ///
     /// [`RegionError::EmptyRegion`] for a region of no bytes,
-    /// [`RegionError::AlignBelowReadUnit`] when `align` is finer than the device's read unit
-    /// — see that variant for why that is refused rather than tolerated — and
-    /// [`RegionError::Geometry`] when the region is misaligned or reaches past the device.
+    /// [`RegionError::AlignBelowProgramUnit`] when `align` is finer than the device's program
+    /// unit — see that variant for why that is refused rather than tolerated — and
+    /// [`RegionError::Geometry`] when the region is misaligned against the program unit or
+    /// reaches past the device.
+    ///
+    /// Validated as a *program* rather than as a read, which is stronger in both places it
+    /// has to be: a geometry nests, so whatever is legal to program is legal to read, and a
+    /// region that is readable but not programmable is one whose append offset no driver
+    /// would accept.
     pub fn spanning(
         geometry: Geometry,
         base: u32,
@@ -195,11 +274,16 @@ impl JournalRegion {
         if bytes == 0 {
             return Err(RegionError::EmptyRegion);
         }
-        if u32::from(align.get()) < geometry.read_size() {
-            return Err(RegionError::AlignBelowReadUnit);
+        if u32::from(align.get()) < geometry.program_size() {
+            return Err(RegionError::AlignBelowProgramUnit);
         }
-        match geometry.validate_read(base, bytes) {
-            Ok(()) => Ok(Self { base, bytes, align }),
+        match geometry.validate_program(base, bytes) {
+            Ok(()) => Ok(Self {
+                geometry,
+                base,
+                bytes,
+                align,
+            }),
             Err(error) => Err(RegionError::Geometry(error)),
         }
     }
@@ -215,12 +299,24 @@ impl JournalRegion {
     /// # Errors
     ///
     /// [`RegionError::NoJournalRoom`] when the header's padded frame fills the bank's
-    /// payload region, and otherwise as [`spanning`](Self::spanning).
+    /// payload region, [`RegionError::AlignDisagreesWithBank`] when the header records a
+    /// granularity this layout does not use — see that variant for the two silent failures
+    /// that closes — and otherwise as [`spanning`](Self::spanning).
     pub fn of(
         layout: BankLayout,
         bank: BankId,
         header: &BankHeader<'_>,
     ) -> Result<Self, RegionError> {
+        // Before any offset is computed from either. `journal_offset` is a fact about the
+        // granularity the *writer* used and `payload_bytes` is a fact about the one the
+        // *reader* uses, and welding those two together is this function's whole job — so it
+        // is also the only place that can refuse to. Once they agree, "the offset comes from
+        // the header rather than from the device" is a distinction without a difference,
+        // which is the point: the mismatch is closed by refusal rather than by getting the
+        // field right.
+        if header.align.get() != layout.align().get() {
+            return Err(RegionError::AlignDisagreesWithBank);
+        }
         let region = layout.bank(bank);
         let Some(offset) = header.journal_offset() else {
             return Err(RegionError::NoJournalRoom);
@@ -267,13 +363,29 @@ impl JournalRegion {
 ///
 /// The three are not degrees of the same thing; they are three different things a caller
 /// must do next.
+///
+/// # What issue #24 does to this type
+///
+/// Every variant's payload is [`Recovery::offset`](Recovery::offset) today, so the two are
+/// interchangeable and a caller may use either. With §09's commit seal they stop being the
+/// same number — the end of the *sealed* prefix is not where the scan stopped — and a call
+/// site that picked the wrong one would change meaning silently rather than fail to compile.
+/// The seal also wants a fourth shape: a tail that is present but unsealed is recoverable and
+/// not appendable, which is neither [`Damaged`](Self::Damaged) (final) nor
+/// [`Incomplete`](Self::Incomplete) (unknown). So this enum is expected to *grow a variant*
+/// rather than to have `Damaged` overloaded, and every `match` on it in this workspace is
+/// exhaustive so that the day it does is a list of call sites rather than a silent
+/// reinterpretation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ending {
     /// The journal ended in erased media, and `append_at` is its first erased byte.
     ///
-    /// The prefix is the whole of history, and appending at `append_at` is safe: every byte
-    /// from it to the end of the region is erased. That is the invariant the whole module
-    /// exists to keep — see the note on the append offset in the module documentation.
+    /// The prefix is the whole of history, and appending at `append_at` is safe in both
+    /// senses: every byte from it to the end of the region is erased, and
+    /// `region.base() + append_at` is a whole number of the device's program units, because
+    /// [`JournalRegion`] validated the region as a program and every stride is a multiple of
+    /// its granularity. That is the invariant the whole module exists to keep — see the note
+    /// on the append offset in the module documentation.
     ///
     /// `append_at` may equal [`JournalRegion::bytes`], which is a full journal rather than a
     /// failure; whether the next record fits is the caller's arithmetic.
@@ -498,8 +610,18 @@ impl<C: IntegrityCheck> Recovery<C> {
             Ok(frame) => match frame.decoded {
                 Decoded::Record(record) => {
                     // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
-                    // scan over a finite region is finite.
-                    self.offset = self.offset.saturating_add(staged.stride);
+                    // scan over a finite region is finite. Checked rather than saturating,
+                    // because this is the one arithmetic here whose degenerate answer is an
+                    // *affirmative* one: an offset that saturated would make `remaining` zero,
+                    // and the next step would report a clean end at `u32::MAX` — "safe to
+                    // append", at an offset outside the device. `stride <= remaining` is
+                    // checked before the read, so the `else` is unreachable and is spelled as
+                    // the refusal it would have to be.
+                    let Some(next) = self.offset.checked_add(staged.stride) else {
+                        self.ending = Some(Ending::Incomplete { at: self.offset });
+                        return Some(Err(RecoveryError::Decode(DecodeError::LengthOutOfBounds)));
+                    };
+                    self.offset = next;
                     Some(Ok(record))
                 }
                 Decoded::UnknownKind(_) => {
@@ -536,8 +658,7 @@ impl<C: IntegrityCheck> Recovery<C> {
         if self.ending.is_some() {
             return None;
         }
-        let geometry = storage.geometry();
-        let read_unit = geometry.read_size();
+        let read_unit = self.region.geometry.read_size();
         let remaining = self.region.bytes.saturating_sub(self.offset);
         if remaining == 0 {
             // The region is full to its last byte. That is a clean end: the prefix is whole,
@@ -557,22 +678,27 @@ impl<C: IntegrityCheck> Recovery<C> {
                 needed: HEADER_BYTES,
             })));
         };
-        if capacity < header_need {
-            return Some(Err(self.incomplete(RecoveryError::PageTooSmall {
-                needed: usize::try_from(header_need).unwrap_or(usize::MAX),
-            })));
-        }
-
         // A whole number of read units either way: `header_need` is one by construction and
         // `remaining` is one because the region's length and every stride are.
+        //
+        // The page is sized against `want` rather than against `header_need`, and that is the
+        // difference between agreeing with `frame::Scan` and disagreeing with it: a region
+        // whose tail is shorter than a header needs only that tail read, and refusing because
+        // the page could not have held a *whole* header would report `Incomplete` — the prefix
+        // may be short — where the scan reports a clean end of history.
         let want = header_need.min(remaining);
+        if capacity < want {
+            return Some(Err(self.incomplete(RecoveryError::PageTooSmall {
+                needed: usize::try_from(want).unwrap_or(usize::MAX),
+            })));
+        }
         let Ok(want_bytes) = usize::try_from(want) else {
             return Some(Err(
                 self.incomplete(RecoveryError::PageTooSmall { needed: usize::MAX })
             ));
         };
         if let Err(error) = self.read(storage, page, self.offset, want_bytes) {
-            return Some(Err(self.incomplete(RecoveryError::Storage(error))));
+            return Some(Err(self.incomplete(error)));
         }
 
         let declared = {
@@ -587,7 +713,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 // history there hands a caller an offset pointing into cells a program cycle
                 // has already cleared — which on NOR cannot be written again without erasing
                 // the block.
-                if head.iter().all(|byte| *byte == ERASED_BYTE) {
+                if is_erased(head) {
                     self.ending = Some(Ending::Clean {
                         append_at: self.offset,
                     });
@@ -598,7 +724,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 ));
             }
             match head.get(..HEADER_BYTES) {
-                Some(header) if header.iter().all(|byte| *byte == ERASED_BYTE) => None,
+                Some(header) if is_erased(header) => None,
                 Some(header) => Some(frame::frame_len_of_with::<C>(header)),
                 None => Some(Err(DecodeError::Truncated)),
             }
@@ -610,6 +736,12 @@ impl<C: IntegrityCheck> Recovery<C> {
             // and calling that the end of history would hand back a prefix missing records
             // the device still holds, and an append offset pointing at cells a later frame
             // already occupies.
+            //
+            // The walk needs `capacity >= read_unit` to advance, and it has it. This branch
+            // is reachable only when `want_bytes >= HEADER_BYTES`, and no region can leave a
+            // remainder strictly between `HEADER_BYTES` and `header_need`: `remaining` is a
+            // whole number of program units and a program unit is whole read units. So
+            // `want == header_need >= read_unit` here, and `capacity >= want`.
             return match self.erased_to_end(storage, page, capacity) {
                 Ok(true) => {
                     self.ending = Some(Ending::Clean {
@@ -620,7 +752,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 Ok(false) => Some(Err(
                     self.damaged(RecoveryError::Decode(DecodeError::IntegrityFailed))
                 )),
-                Err(error) => Some(Err(self.incomplete(RecoveryError::Storage(error)))),
+                Err(error) => Some(Err(self.incomplete(error))),
             };
         };
 
@@ -648,9 +780,10 @@ impl<C: IntegrityCheck> Recovery<C> {
                 self.damaged(RecoveryError::Decode(DecodeError::Truncated))
             ));
         }
-        // At most `stride`, because the region's granularity is at least the device's read
-        // unit — which `JournalRegion::spanning` is what guarantees. So this read stays inside the
-        // region without a second bounds check.
+        // At most `stride`, because the region's granularity is at least the device's program
+        // unit and a geometry nests, so it is at least the read unit too — which
+        // `JournalRegion::spanning` is what guarantees. So this read stays inside the region
+        // without a second bounds check.
         let Some(need) = round_up(frame_width, read_unit) else {
             return Some(Err(
                 self.damaged(RecoveryError::Decode(DecodeError::LengthOutOfBounds))
@@ -663,7 +796,7 @@ impl<C: IntegrityCheck> Recovery<C> {
             ));
         }
         if let Err(error) = self.read(storage, page, self.offset, need_bytes) {
-            return Some(Err(self.incomplete(RecoveryError::Storage(error))));
+            return Some(Err(self.incomplete(error)));
         }
         Some(Ok(Staged {
             need: need_bytes,
@@ -672,21 +805,28 @@ impl<C: IntegrityCheck> Recovery<C> {
     }
 
     /// Fills `page[..len]` from `offset` bytes into the region.
+    ///
+    /// # Errors
+    ///
+    /// The driver's own, or [`RecoveryError::PageTooSmall`] for a `len` the page cannot hold
+    /// — which every caller has already ruled out, and which is still a refusal rather than a
+    /// silent success. Answering `Ok(())` without filling the page would leave the *previous*
+    /// frame staged: a whole frame, with both seals holding, which the caller would decode
+    /// and yield as a duplicate record. "Never a record invented out of stale bytes" has to
+    /// include stale bytes this module put there itself.
     fn read<S: StableStorage>(
         &self,
         storage: &mut S,
         page: &mut [u8],
         offset: u32,
         len: usize,
-    ) -> Result<(), S::Error> {
+    ) -> Result<(), RecoveryError<S::Error>> {
         let Some(target) = page.get_mut(..len) else {
-            // Unreachable: every caller has already compared `len` against the page's whole
-            // read units. Reading nothing rather than panicking leaves the page as it was,
-            // which every caller then reads as an erased or malformed frame — a stop, never
-            // a record invented out of stale bytes.
-            return Ok(());
+            return Err(RecoveryError::PageTooSmall { needed: len });
         };
-        storage.read(self.region.base.saturating_add(offset), target)
+        storage
+            .read(self.region.base.saturating_add(offset), target)
+            .map_err(RecoveryError::Storage)
     }
 
     /// Whether the region is erased from [`offset`](Self::offset) to its end.
@@ -700,7 +840,7 @@ impl<C: IntegrityCheck> Recovery<C> {
         storage: &mut S,
         page: &mut [u8],
         capacity: u32,
-    ) -> Result<bool, S::Error> {
+    ) -> Result<bool, RecoveryError<S::Error>> {
         let mut at = self.offset;
         while at < self.region.bytes {
             let want = capacity.min(self.region.bytes.saturating_sub(at));
@@ -713,11 +853,16 @@ impl<C: IntegrityCheck> Recovery<C> {
             let Some(chunk) = page.get(..want_bytes) else {
                 return Ok(false);
             };
-            if !chunk.iter().all(|byte| *byte == ERASED_BYTE) {
+            if !is_erased(chunk) {
                 return Ok(false);
             }
-            // `capacity` is at least one read unit, so this always advances.
-            at = at.saturating_add(want);
+            // `capacity` is at least one read unit, so this always advances — and checked
+            // rather than saturating for the reason the offset advance is: `false` is the
+            // safe answer here, and an `at` that stopped moving would spin.
+            let Some(next) = at.checked_add(want) else {
+                return Ok(false);
+            };
+            at = next;
         }
         Ok(true)
     }
@@ -734,6 +879,16 @@ impl<C: IntegrityCheck> Recovery<C> {
         self.ending = Some(Ending::Incomplete { at: self.offset });
         error
     }
+}
+
+/// Whether every byte of `bytes` reads as an erased NOR cell.
+///
+/// One definition rather than three copies of `iter().all(..)`. Erased is [`ERASED_BYTE`], a
+/// constant, and never something learned from the device: an adapter whose `erase` does
+/// nothing on media reading `0x00` would teach a learning reader that nothing is programmable
+/// and that it had no questions to ask.
+fn is_erased(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == ERASED_BYTE)
 }
 
 /// `len` rounded up to a whole number of `unit`s, or [`None`] on overflow.
@@ -754,8 +909,12 @@ const fn round_up(len: u32, unit: u32) -> Option<u32> {
 // has no room for a second one. Checked where a mistake is a compile error, the way
 // `ReplayCursor`'s size is: the equality is the point, because a `<=` leaves room to hide a
 // buffer in.
-const _: () = assert!(size_of::<Recovery>() == 24);
-const _: () = assert!(size_of::<JournalRegion>() == 12);
+const _: () = assert!(size_of::<JournalRegion>() == 28);
+const _: () = assert!(size_of::<Recovery>() == 40);
+// And the whole of it is the region, the offset and the verdict: no fourth field, and in
+// particular no page. A `<=` here would leave room to hide one in, which is why the two above
+// are equalities and why this restates the sum rather than trusting them separately.
+const _: () = assert!(size_of::<Recovery>() == size_of::<JournalRegion>() + 4 + 8);
 
 #[cfg(test)]
 mod tests {
@@ -774,9 +933,9 @@ mod tests {
     fn every_ending_but_a_clean_one_withholds_the_append_offset() {
         // The invariant stated over the type rather than over a journal: there is no way to
         // get an offset out of a recovery that did not run to erased media.
-        let geometry = Geometry::new(64, 32, 8, 1).expect("two whole blocks");
+        let geometry = Geometry::new(64, 32, 1, 1).expect("two whole blocks");
         let region = JournalRegion::spanning(geometry, 0, 32, ProgramAlign::BYTE)
-            .expect("this region is a legal read");
+            .expect("this region is a legal program");
         for (ending, expected) in [
             (Ending::Clean { append_at: 8 }, Some(8)),
             (Ending::Damaged { at: 8 }, None),

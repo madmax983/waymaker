@@ -3899,6 +3899,11 @@ mod tests {
         // The doc comment on the list claims this assertion exists, so here it is — review of
         // issue #22 found it claimed and absent, which is the shape of an unchecked check.
         assert_eq!(BANK_LAYOUT_LABELS.len(), 5);
+        // Four stop conditions the reader owns — §09's fifth, out-of-sequence, is the replay
+        // cursor's — and the three endings, of which exactly one carries an append offset.
+        // Claimed and absent again on issue #23, and found the same way; the count is here
+        // rather than in a doc comment for the reason the line above says.
+        assert_eq!(JOURNAL_RECOVERY_LABELS.len(), 7);
     }
 
     #[test]

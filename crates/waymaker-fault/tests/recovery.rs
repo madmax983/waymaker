@@ -46,8 +46,17 @@ use waymaker_flash::storage::{Geometry, StableStorage};
 /// two different readers and a disagreement between them is visible as one failing and the
 /// other passing.
 fn geometry() -> Geometry {
-    let Ok(geometry) = Geometry::new(256, 256, 4, 1) else {
-        unreachable!("256 is one whole 256-byte block of 4-byte units of single bytes")
+    device(1)
+}
+
+/// The same device, reading `read` bytes at a time.
+///
+/// The sweep ran only at a one-byte read unit until review of this change pointed out that
+/// `round_up(HEADER_BYTES, read_unit)` is then the identity and the page-and-chunk arithmetic
+/// is dead code under test. Four is the other width the crash images are walked at.
+fn device(read: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(256, 256, 4, read) else {
+        unreachable!("256 is one whole 256-byte block of 4-byte units")
     };
     geometry
 }
@@ -59,11 +68,15 @@ fn align() -> ProgramAlign {
     align
 }
 
-fn region() -> JournalRegion {
-    let Ok(region) = JournalRegion::spanning(geometry(), 0, 256, align()) else {
-        unreachable!("the whole device is a legal read")
+fn region_of(geometry: Geometry) -> JournalRegion {
+    let Ok(region) = JournalRegion::spanning(geometry, 0, 256, align()) else {
+        unreachable!("the whole device is a legal program")
     };
     region
+}
+
+fn region() -> JournalRegion {
+    region_of(geometry())
 }
 
 /// The activity every schedule record below names.
@@ -121,7 +134,12 @@ fn drive() -> Vec<Run> {
 
 /// A device holding `image`, the way a reset would find it.
 fn restored(image: &[u8]) -> Device {
-    let Some(device) = Device::restored(geometry(), image.to_vec()) else {
+    restored_on(geometry(), image)
+}
+
+/// The same, on a device of a stated geometry.
+fn restored_on(geometry: Geometry, image: &[u8]) -> Device {
+    let Some(device) = Device::restored(geometry, image.to_vec()) else {
         unreachable!("an image of the device's own capacity restores")
     };
     device
@@ -139,11 +157,23 @@ const fn id_of(record: &RecordRef<'_>) -> Option<RecordId> {
 
 /// Everything the storage-backed recovery finds in `image`, and how it ended.
 fn recover(image: &[u8]) -> (Vec<RecordId>, Option<Ending>, Option<u32>) {
-    let mut device = restored(image);
-    let mut recovery = Recovery::new(region());
+    recover_with(geometry(), image, PAGE)
+}
+
+/// The same, on a stated device and with a stated page.
+fn recover_with(
+    geometry: Geometry,
+    image: &[u8],
+    page_bytes: usize,
+) -> (Vec<RecordId>, Option<Ending>, Option<u32>) {
+    let mut device = restored_on(geometry, image);
+    let mut recovery = Recovery::new(region_of(geometry));
     let mut page = [0_u8; PAGE];
+    let Some(page) = page.get_mut(..page_bytes) else {
+        unreachable!("no test in this file asks for more than a page")
+    };
     let mut found = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut device, page) {
         let Ok(record) = step else { break };
         if let Some(id) = id_of(&record) {
             found.push(id);
@@ -258,6 +288,59 @@ fn the_two_readers_agree_at_every_crash_point() {
             matches!(ending, Some(Ending::Damaged { at }) if usize::try_from(at) == Ok(offset)),
             failed,
             "the two readers stopped differently at {:?}",
+            run.injection()
+        );
+    }
+}
+
+#[test]
+fn the_sweep_reaches_every_ending_a_recovery_has() {
+    // A census, for the reason `tests/committed_prefix.rs` has one: a sweep in which every
+    // crash point produced the same verdict would pass every assertion above while checking
+    // one branch. Review of this change measured the sweep as it stood — 17 clean, 138
+    // damaged, **0 incomplete** — because a 64-byte page never meets a frame it cannot hold
+    // and a restored device never fails a read. So `Incomplete` is swept here, at a real
+    // crash point, by running the same images through a page too small for a record.
+    let runs = drive();
+    let mut clean = 0_usize;
+    let mut damaged = 0_usize;
+    let mut incomplete = 0_usize;
+
+    for run in &runs {
+        match recover(run.image()).1 {
+            Some(Ending::Clean { .. }) => clean += 1,
+            Some(Ending::Damaged { .. }) => damaged += 1,
+            Some(Ending::Incomplete { .. }) => incomplete += 1,
+            None => unreachable!("a drained recovery has ended"),
+        }
+        // Sixteen bytes is shorter than the twenty-four-byte frames this writer appends, so
+        // any run whose first frame is whole ends `Incomplete` rather than `Damaged`.
+        if let Some(Ending::Incomplete { .. }) = recover_with(geometry(), run.image(), 16).1 {
+            incomplete += 1;
+        }
+    }
+
+    assert!(clean > 0, "no crash point recovered a clean journal");
+    assert!(damaged > 0, "no crash point recovered a damaged one");
+    assert!(
+        incomplete > 0,
+        "no crash point produced an incomplete recovery, so that ending is untested here"
+    );
+}
+
+#[test]
+fn the_same_crash_images_recover_the_same_way_at_a_wider_read_unit() {
+    // `capacity = page_bytes & !(read_unit - 1)` and `round_up(HEADER_BYTES, read_unit)` are
+    // both the identity at a one-byte read unit, which is what every other sweep in this
+    // workspace runs at. Four is where they do arithmetic, and the answer must not change:
+    // the read width is a property of the reader, and history is a property of the media.
+    for run in drive() {
+        let (narrow, narrow_end, narrow_append) = recover(run.image());
+        let (wide, wide_end, wide_append) = recover_with(device(4), run.image(), PAGE);
+        assert_eq!(
+            (narrow, narrow_end, narrow_append),
+            (wide, wide_end, wide_append),
+            "the read width changed what was recovered at {:?}",
             run.injection()
         );
     }
