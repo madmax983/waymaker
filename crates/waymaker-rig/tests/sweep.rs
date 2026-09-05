@@ -26,6 +26,8 @@
 //! So the injector's own enumeration partitions into the two causes, and the census below
 //! requires both partitions to be non-empty at all three write points.
 
+use std::collections::BTreeSet;
+
 use waymaker_fault::{Device, Harness, Injection, Interruption, Progress, Run};
 use waymaker_flash::storage::Geometry;
 use waymaker_rig::audit::Breach;
@@ -285,6 +287,75 @@ fn the_sweep_tears_a_write_and_completes_one_at_every_write_point() {
         .filter(|injection| cause_of(*injection) == Some(ResetCause::Watchdog))
         .count();
     assert!(torn > 0 && whole > 0, "{torn} torn, {whole} whole");
+}
+
+#[test]
+fn the_sweep_reaches_every_record_boundary_and_tears_the_witness_itself() {
+    // A census, for the reason `waymaker-fault`'s exists: every test above says "at every
+    // crash point the oracle accepts", and none of them says the crash points are *anywhere
+    // interesting*. A sweep that quietly thinned out — a workload that stopped writing, a
+    // `prepare` that started failing early, a witness that stopped landing — would keep every
+    // assertion above green while measuring almost nothing.
+    //
+    // Lower bounds rather than equalities: the numbers move when the workload or the geometry
+    // does, and the dangerous direction is a sweep that shrank.
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
+        .expect("the fault-free run succeeds");
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+
+    let mut with_marks = 0_usize;
+    let mut torn_witness = 0_usize;
+    let mut reached: BTreeSet<u16> = BTreeSet::new();
+    for run in &runs {
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            continue;
+        };
+        let mut instrument = waymaker_rig::window::Window::new(
+            &mut device,
+            rig.instrument_base(),
+            geometry().erase_size(),
+        )
+        .expect("the instrument window");
+        let Ok(marks) = Witness::new(rig.witness_region()).scan(&mut instrument, &mut page) else {
+            continue;
+        };
+        if marks.marks() > 0 {
+            with_marks += 1;
+        }
+        if marks.torn() {
+            torn_witness += 1;
+        }
+        if let Some(high) = marks.acknowledged() {
+            reached.insert(high);
+        }
+    }
+
+    assert!(runs.len() >= 800, "the sweep shrank to {} runs", runs.len());
+    assert!(
+        with_marks >= 600,
+        "only {with_marks} of {} runs got as far as writing a record",
+        runs.len()
+    );
+    // The supply going *during a witness mark* is the one crash point the instrument has of
+    // its own, and the one where an under-claiming mark has to be under-claiming rather than
+    // absent. A sweep that never produced one would leave `Progress::torn` untested against
+    // real media.
+    assert!(
+        torn_witness >= 100,
+        "only {torn_witness} runs tore a witness mark"
+    );
+    // Every record of the run, from the opening `RunStarted` to the terminal `RunCompleted`,
+    // is a boundary some crash point acknowledged. A sweep that stopped short would be one
+    // whose later records are never the last thing on media.
+    let records = rig.workload(0).records();
+    let expected: BTreeSet<u16> = (0..records).collect();
+    assert_eq!(
+        reached, expected,
+        "the sweep acknowledged {reached:?} of the run's {records} records"
+    );
 }
 
 #[test]
