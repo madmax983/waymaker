@@ -131,8 +131,13 @@ pub const HEADER_OVERHEAD_BYTES: usize = HEADER_PREFIX_BYTES + HEADER_TRAILER_BY
 
 /// The longest run input `input_len` can describe.
 ///
-/// A format ceiling, not a firmware one: what a caller meets first is the bank the header
-/// has to fit in, which [`BankLayout`] derives from the device's geometry.
+/// A format ceiling, and a long way above every firmware one. Two things bite first, and
+/// neither is this number: the buffer a caller hands [`encode_header`], and the bank the
+/// header has to fit in — which [`BankLayout`] derives from the device's geometry, and which
+/// on §04's typical 4 KiB bank is sixteen times smaller than this. Verifying a header also
+/// means checksumming it, and [`IntegrityCheck`] has no streaming form, so the whole frame
+/// is resident while it is read: on a device with §04's 768 B of runtime RAM the real
+/// ceiling on a run input is the caller's page, not the format's field.
 pub const MAX_RUN_INPUT_BYTES: usize = u16::MAX as usize;
 
 /// Width of a generation seal on media, before padding to the program unit.
@@ -165,6 +170,12 @@ const MAX_PROGRAM_SHIFT: u8 = 15;
 /// [`Geometry`] takes a `u32` program size and [`ProgramAlign`] is a `u16`, so the two do not
 /// agree about what a device may be — and this is the number they disagree above.
 const MAX_PROGRAM_UNIT: u32 = 1 << MAX_PROGRAM_SHIFT;
+
+/// [`crate::frame::FRAME_OVERHEAD_BYTES`] as a `u32`, for the layout arithmetic.
+///
+/// A bank that cannot hold one record frame after its header is a bank with no journal, and
+/// a journal is what a bank is for.
+const FRAME_OVERHEAD_WIDTH: u32 = 16;
 
 /// Which of the two banks something names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -239,23 +250,33 @@ impl Generation {
 
 /// A geometry that cannot hold two banks.
 ///
+/// Deliberately not [`Ord`]: these are three unrelated ways to be undescribable, and a type
+/// that can be sorted is a type somebody will take the `max` of. [`crate::storage::GeometryError`]
+/// derives neither for the same reason.
+///
 /// Not `#[non_exhaustive]`, for the reason [`waymaker_core::DecodeError`] is not: every
 /// match on it is in this workspace, and an exhaustive match is how the compiler tells
 /// whoever adds a variant which call sites now have a case to think about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutError {
     /// The device has fewer than two erase blocks, so the two banks would share one.
     ///
     /// §04: "Two erase blocks minimum." A bank is recycled by erasing it, and an erase acts
     /// on whole blocks, so two banks in one block cannot be swapped at all.
     TooFewEraseBlocks,
-    /// A bank is too small to hold a header and a seal.
+    /// A bank is too small to hold a header, a seal, and one record frame after them.
+    ///
+    /// All three measured *padded* to the device's program unit, which is the smallest thing
+    /// it can write. A bank that clears the header and the seal but has nothing left is a
+    /// bank whose journal is zero bytes long, and a journal is what a bank is for.
     BankTooSmall,
     /// The device programs in units larger than a bank header can record.
     ///
     /// [`Geometry`] describes a program unit with a `u32` and [`ProgramAlign`] with a `u16`,
-    /// so a device that programs in more than [`MAX_PROGRAM_UNIT`] bytes is one this format
-    /// cannot describe. It is refused rather than approximated: the only granularity a
+    /// so a device that programs in more than 32 KiB is one this format cannot describe —
+    /// that being the largest power of two a `u16` holds, and therefore the largest
+    /// granularity a header's `program_shift` can name. It is refused rather than
+    /// approximated: the only granularity a
     /// writer *could* record for such a device is smaller than the one it actually programs
     /// at, and a reader striding at a smaller granularity than the writer used lands inside
     /// a frame's padding and reports a clean end of history with committed records still
@@ -275,7 +296,7 @@ impl LayoutError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::TooFewEraseBlocks => "the device has fewer than two erase blocks",
-            Self::BankTooSmall => "a bank cannot hold a header and a seal",
+            Self::BankTooSmall => "a bank cannot hold a header, a seal and a record",
             Self::ProgramUnitTooLarge => "the program unit is larger than a header can record",
         }
     }
@@ -336,6 +357,42 @@ impl BankRegion {
     pub const fn payload_bytes(self) -> u32 {
         self.len - self.seal_bytes
     }
+
+    /// The longest run input a header for this bank may carry.
+    ///
+    /// [`MAX_RUN_INPUT_BYTES`] is what the length *field* can describe; this is what the
+    /// bank can hold, and it is the smaller of the two on every device §04 targets. Without
+    /// it a caller has to subtract [`HEADER_OVERHEAD_BYTES`] from
+    /// [`payload_bytes`](Self::payload_bytes) itself, leave room for a journal itself, and
+    /// get the padding right itself — and the one in-tree caller that did wrote the check as
+    /// an `unreachable!`, which is what a bound in the wrong place looks like.
+    ///
+    /// # Postconditions
+    ///
+    /// A header whose input is this long, padded to the layout's granularity, leaves at
+    /// least one record frame of journal behind it — so an input at this ceiling is one a
+    /// bank can actually be used with, not merely one that fits.
+    /// [`BankLayout::new`] refuses a geometry for which that would be zero, so this is never
+    /// larger than [`MAX_RUN_INPUT_BYTES`] and is never negative.
+    #[must_use]
+    pub const fn max_run_input_bytes(self, align: ProgramAlign) -> usize {
+        let Some(frame) = align.round_up(crate::frame::FRAME_OVERHEAD_BYTES) else {
+            return 0;
+        };
+        let payload = self.payload_bytes() as usize;
+        let Some(for_header) = payload.checked_sub(frame) else {
+            return 0;
+        };
+        // The header is padded too, so the ceiling is the largest input whose *padded* frame
+        // still fits. Rounding down to a whole unit and then removing the fixed overhead is
+        // that, without a search.
+        let whole = for_header & !(align.get() as usize - 1);
+        match whole.checked_sub(HEADER_OVERHEAD_BYTES) {
+            Some(room) if room < MAX_RUN_INPUT_BYTES => room,
+            Some(_) => MAX_RUN_INPUT_BYTES,
+            None => 0,
+        }
+    }
 }
 
 /// Two banks derived from a device's geometry.
@@ -357,6 +414,7 @@ pub struct BankLayout {
     geometry: Geometry,
     bank_bytes: u32,
     seal_bytes: u32,
+    align: ProgramAlign,
 }
 
 impl BankLayout {
@@ -367,8 +425,8 @@ impl BankLayout {
     /// [`LayoutError::TooFewEraseBlocks`] for a device of fewer than two erase blocks,
     /// [`LayoutError::ProgramUnitTooLarge`] for a device that programs in units no bank
     /// header could record, and [`LayoutError::BankTooSmall`] when a bank could not hold a
-    /// header and a seal — which is a real device on a part whose program unit is a large
-    /// fraction of its erase block.
+    /// padded header, a padded seal and one padded record frame — which is a real device on
+    /// a part whose program unit is a large fraction of its erase block.
     pub const fn new(geometry: Geometry) -> Result<Self, LayoutError> {
         let blocks = geometry.erase_blocks();
         if blocks < 2 {
@@ -389,16 +447,54 @@ impl BankLayout {
         // `SEAL_BYTES` is 12, so this cannot overflow on any geometry `Geometry::new`
         // admits: the largest program unit is the largest erase block, and a capacity is a
         // `u32` of whole blocks.
-        let Some(seal_bytes) = round_up_u32(SEAL_WIDTH, program) else {
+        // Every one of the three is *padded*, because a program unit is the smallest thing a
+        // device can write: a 26-byte header on a part with 256-byte pages occupies 256. An
+        // earlier version of this guard compared the bank against the unpadded header and
+        // reserved nothing for the journal, which admitted a two-erase-block device whose
+        // header filled its whole payload and whose journal was zero bytes long — a bank
+        // that can never hold a record, reported as a legal layout. Review of this change
+        // found it.
+        let (Some(seal_bytes), Some(header_bytes), Some(frame_bytes)) = (
+            round_up_u32(SEAL_WIDTH, program),
+            round_up_u32(HEADER_OVERHEAD_WIDTH, program),
+            round_up_u32(FRAME_OVERHEAD_WIDTH, program),
+        ) else {
             return Err(LayoutError::BankTooSmall);
         };
-        if bank_bytes < seal_bytes || bank_bytes - seal_bytes < HEADER_OVERHEAD_WIDTH {
+        // Summed and compared rather than subtracted from the bank. `seal_bytes` can exceed
+        // `bank_bytes` on a legal geometry — two 8-byte erase blocks with an 8-byte program
+        // unit gives a 8-byte bank and a 16-byte seal — and the subtraction that used to
+        // stand here wraps in a release build, which has no overflow checks, into a layout
+        // whose offsets are enormous and whose `Ok` is a lie.
+        let (Some(used), ..) = (seal_bytes.checked_add(header_bytes), ()) else {
+            return Err(LayoutError::BankTooSmall);
+        };
+        let Some(least) = used.checked_add(frame_bytes) else {
+            return Err(LayoutError::BankTooSmall);
+        };
+        if bank_bytes < least {
             return Err(LayoutError::BankTooSmall);
         }
+        // Resolved once, here, because this is the only place with a `Result` to refuse
+        // through. `program` is a power of two at or below `MAX_PROGRAM_UNIT`, so the shift
+        // is at most `MAX_PROGRAM_SHIFT` and `program_align` answers `Some` — the `else` is
+        // unreachable and is spelled as the same refusal rather than as a fallback, because a
+        // layout that quietly reported the wrong granularity is the failure this whole field
+        // exists to prevent.
+        let mut unit = program;
+        let mut shift = 0_u8;
+        while unit > 1 {
+            unit >>= 1_u32;
+            shift += 1;
+        }
+        let Some(align) = program_align(shift) else {
+            return Err(LayoutError::ProgramUnitTooLarge);
+        };
         Ok(Self {
             geometry,
             bank_bytes,
             seal_bytes,
+            align,
         })
     }
 
@@ -412,6 +508,25 @@ impl BankLayout {
     #[must_use]
     pub const fn bank_bytes(self) -> u32 {
         self.bank_bytes
+    }
+
+    /// The granularity this device programs at, as a header records it.
+    ///
+    /// Infallible, and that is the whole point of it existing.
+    /// [`new`](Self::new) refuses a device whose program unit a [`ProgramAlign`] could not
+    /// hold, so by the time there is a [`BankLayout`] the narrowing has already been proved
+    /// to succeed — and without this every caller writes
+    /// `u16::try_from(..).ok().and_then(ProgramAlign::new)` with an arm it can never reach.
+    /// A fallible conversion a caller cannot act on is a conversion the caller will get
+    /// wrong, most cheaply by hardcoding the granularity it happens to be testing on.
+    ///
+    /// # Postconditions
+    ///
+    /// `align().get()` is [`Geometry::program_size`], and it is the value a header written
+    /// for a bank of this layout must carry in [`BankHeader::align`].
+    #[must_use]
+    pub const fn align(self) -> ProgramAlign {
+        self.align
     }
 
     /// Where one bank is.
@@ -491,6 +606,14 @@ impl BankHeader<'_> {
     /// A whole number of [`align`](Self::align) units, at least
     /// [`frame_len`](Self::frame_len), and [`None`] only on an overflow no encodable header
     /// can reach.
+    ///
+    /// It is *not* guaranteed to be within the bank. For a header this crate encoded into a
+    /// bank's payload region it is, because [`encode_header`] refuses a buffer it does not
+    /// fit and the region's length is a whole number of the device's program units. A header
+    /// that records a granularity the device does not program at breaks that chain, which is
+    /// why [`BankLayout::align`] exists — a caller that takes the granularity from the layout
+    /// rather than from anywhere else cannot get into the state where this offset runs past
+    /// [`BankRegion::payload_bytes`].
     #[must_use]
     pub const fn journal_offset(&self) -> Option<usize> {
         self.align.round_up(self.frame_len())
@@ -501,7 +624,11 @@ impl BankHeader<'_> {
 ///
 /// §02 decision 7: "a new run becomes authoritative only after its payload and generation
 /// seal are durable."
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Deliberately not [`Ord`]. Two seals differing only in `header_check` would sort by a
+/// digest, and a `max` over seals is never the question — [`select`] compares
+/// [`Generation`]s, which are ordered on purpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Seal {
     /// How many times a device has been handed a new run.
     pub generation: Generation,
@@ -970,8 +1097,16 @@ pub fn seal_for_with<C: IntegrityCheck>(
 
 /// The generation a reader would boot this bank at, or [`None`] if it would not boot it.
 ///
-/// `header` is the bank from its base and `seal` is the bank from
-/// [`BankRegion::seal_offset`]; each may be longer than what it holds.
+/// # `header` and `seal` are one bank's regions and nothing else
+///
+/// A precondition rather than a convenience, and the same one [`crate::frame::Scan::new`]
+/// states about its journal. `header` is `base..base + payload_bytes()` and `seal` is
+/// `seal_offset()..seal_offset() + seal_bytes()`, both from [`BankRegion`]. Trailing bytes
+/// inside those regions are ignored — a header is self-delimiting — but a caller that passes
+/// the whole device image passes bank A a slice that runs into bank B, and a header whose
+/// `input_len` reached past its own bank would then borrow bytes from the other one. That is
+/// "recovery combines the footprints of two runs", which is the thing §10 forbids, so the
+/// bound is the caller's to get right and it is stated here rather than assumed.
 ///
 /// # Postconditions
 ///
@@ -1004,8 +1139,10 @@ pub fn sealed_generation_with<C: IntegrityCheck>(header: &[u8], seal: &[u8]) -> 
 
 /// Which bank a reader boots from.
 ///
-/// Not `#[non_exhaustive]`, for the reason [`LayoutError`] is not.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Not `#[non_exhaustive]`, for the reason [`LayoutError`] is not, and not [`Ord`] either:
+/// "unsealed is less than ambiguous" is a sentence with no meaning, and the ordering that
+/// does matter is [`Generation`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Authority {
     /// Neither bank carries a valid seal, so there is nothing to boot from.
     ///
@@ -1096,6 +1233,8 @@ const _: () = assert!(MAX_PROGRAM_SHIFT == 15);
 // read off media, and a build in which they disagree admits a device on one path that the
 // other refuses.
 const _: () = assert!(MAX_PROGRAM_UNIT == 32_768);
+// The frame overhead this module reserves a journal for is the one `frame` really has.
+const _: () = assert!(FRAME_OVERHEAD_WIDTH as usize == crate::frame::FRAME_OVERHEAD_BYTES);
 const _: () = assert!(program_align(MAX_PROGRAM_SHIFT).is_some());
 const _: () = assert!(SEAL_BYTES == 12 && SEAL_WIDTH == 12);
 const _: () = assert!(HEADER_OVERHEAD_BYTES == 26 && HEADER_OVERHEAD_WIDTH == 26);

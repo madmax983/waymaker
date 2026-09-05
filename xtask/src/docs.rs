@@ -3866,6 +3866,11 @@ mod tests {
         // Four fault families from design document §15 and issue #18's injection list,
         // plus the three record states the same issue asks the model to distinguish.
         assert_eq!(CRASH_INJECTION_LABELS.len(), 7);
+        // §10's three bank regions, plus the two bindings that make the picture a mechanism
+        // rather than a partition table: where the journal starts, and what the seal names.
+        // The doc comment on the list claims this assertion exists, so here it is — review of
+        // issue #22 found it claimed and absent, which is the shape of an unchecked check.
+        assert_eq!(BANK_LAYOUT_LABELS.len(), 5);
     }
 
     #[test]

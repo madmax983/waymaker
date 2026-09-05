@@ -257,9 +257,11 @@ Five crates are in the workspace and are *not* layers:
 
 Design document §04. The first three live in `waymaker_core::budget` and are gated by
 `cargo xtask size` — the numbers are in the kernel rather than in the gate, because a budget
-in two places is a budget that ends up disagreeing with itself. The fourth, persistent
-flash, is a §04 statement with no constant and no gate behind it: there is no linked image
-with banks in it yet. Nothing compares the numbers in this table to `budget.rs`, so treat
+in two places is a budget that ends up disagreeing with itself. The fourth,
+persistent flash, no longer has no gate behind it: `bank::BankLayout::new` refuses a device
+of fewer than two erase blocks, which is §04's "two erase blocks minimum" as a build-time
+refusal rather than a sentence — though it is still not a *measurement*, because there is no
+linked image with banks in it. Nothing compares the numbers in this table to `budget.rs`, so treat
 `budget.rs` as the source if they ever differ.
 
 | Budget | Target |
@@ -271,10 +273,11 @@ with banks in it yet. Nothing compares the numbers in this table to `budget.rs`,
 
 The code-flash row is the one place this repository and the design document now disagree, and
 the disagreement is deliberate rather than drift. `budget.rs` is what CI enforces; ADR 0017
-records the measurement that moved it — 8180 B to 10776 B, of which 1492 B is
-`waymaker-flash`'s bank layer and 920 B is the size probe's own arithmetic — and says what is
+records the measurement that moved it — 8180 B to 10976 B, of which 1484 B is
+`waymaker-flash`'s bank layer and 1032 B is the size probe's own arithmetic — and says what is
 owed. A third of the measured "core + flash adapter" figure is the probe rather than either,
-which is a defect in the measurement and is filed as its own issue.
+which is a defect in the measurement and is filed as issue
+[#72](https://github.com/madmax983/waymaker/issues/72).
 
 The workflow future is user memory and is reported separately. A kernel state type added to
 `kernel_state_types!` is asserted at compile time, registered in the size report, and
@@ -536,7 +539,7 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
 - **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
   the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 4 KiB of 10776 B at rung 0.2. ADR 0002 says so and
+  calls "core + flash adapter" — roughly 4 KiB of 10976 B at rung 0.2. ADR 0002 says so and
   ADR 0017 attributes the current figure by symbol, but nothing *checks* the split: doing so
   needs a call graph, and the attribution in ADR 0017 is a reading of `llvm-nm` output rather
   than a gate.
@@ -547,6 +550,21 @@ Stated so that nobody mistakes silence for coverage:
   authoritative, and the scan is what stops at the damage. That is §14's "frame ignored;
   previous history prefix wins", and it is the division of labour rather than a gap — but it
   does mean "authoritative" is a statement about a bank's header and seal alone.
+- **That a bank's seal covers its journal.** A generation seal names the bank *header*'s
+  digest and nothing else, so a bank whose header and seal agree is authoritative however
+  damaged its journal is. That is the division of labour — §14's "frame ignored; previous
+  history prefix wins" is `frame::Scan`'s — but it has a sharp edge worth naming: an erase
+  that cleared a *middle or trailing* block of a journal leaves a hole running to the end of
+  the region, which is exactly the shape `Scan`'s erased-tail rule reads as a clean end of
+  history. Acknowledged records would be lost with nothing to say so. No crash point in
+  `waymaker-fault` can produce it — an interrupted erase there always lands a block-aligned
+  prefix, and the header sits at the bank base — so this is stated rather than swept.
+- **That a re-written header cannot be claimed by a stale seal.** The bank header records no
+  generation, so re-writing byte-identical header content under a seal that survived from an
+  earlier generation of the same bank produces a matching digest and a bank that reports the
+  *stale* generation. Reaching it needs a writer that carries on past a failed erase, which no
+  writer in the sweep does. Feeding the generation into the header would close it and is a
+  wire-format change; ADR 0017 records it as considered rather than taken.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -670,7 +688,7 @@ lists — `crates/waymaker-fault/tests/banks.rs`, which used to *model* this pro
 drives it — with four mutants holding the sweep honest, the sharpest being a seal-blind
 reader booting a bank whose header was never written. The `integrity-check` rule grew a
 second routing table so the bank's seals cannot drift around the trait either. What it cost
-is 8180 B to 10776 B of code flash against an 8192 B budget, which is the budget conversation
+is 8180 B to 10976 B of code flash against an 8192 B budget, which is the budget conversation
 [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md) said had to happen
 before these were written; ADR 0017 has it, raises the gate to 16 KiB, and writes down that a
 third of the measured figure is the size probe rather than the engine.

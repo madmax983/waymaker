@@ -50,7 +50,14 @@ const STALE: Generation = Generation(0);
 const CURRENT: Generation = Generation(1);
 
 /// The generation the swap installs.
-const NEW: Generation = Generation(2);
+///
+/// Minted from the generation it replaces rather than written down, so the sweep drives the
+/// one function that makes "generations do not wrap" true. A literal here would leave
+/// `Generation::successor` with no caller on any swap path in the workspace.
+const NEW: Generation = match CURRENT.successor() {
+    Some(next) => next,
+    None => unreachable!(),
+};
 
 /// The op index of the barrier that first makes any bank authoritative.
 ///
@@ -354,6 +361,52 @@ fn recovered(image: &[u8], installed: Generation) -> Vec<RecordId> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The swap that seals the new bank with the *old* bank's digest.
+///
+/// The one bug: `seal_for` is asked about bank A — the bank being replaced, whose header
+/// decodes perfectly well — and the answer is programmed into bank B. Every structure on
+/// media is intact, both headers decode, both seals decode, and the higher generation names
+/// a header that is not beneath it.
+///
+/// This is the writer the sweep needed. Every other mutant here breaks a bank by *damaging*
+/// it, and damage stops `decode_header` before the digest is ever compared — so deleting the
+/// comparison from `sealed_generation` left all eight tests in this file green. Review of
+/// this change measured that: 0 of 303 runs disagreed. With this writer the comparison is the
+/// only thing standing between a reader and the wrong bank.
+fn swap_sealed_with_the_wrong_header(session: &mut Session) -> Result<(), FaultError> {
+    previous_life(session)?;
+
+    let spare = layout().bank(BankId::B);
+    session.erase(spare.base(), spare.bytes())?;
+    session.barrier()?;
+
+    program_header(session, BankId::B, NEW)?;
+    session.barrier()?;
+
+    // Sealed from bank A's header rather than bank B's.
+    let other = layout().bank(BankId::A);
+    let mut page = [0_u8; 64];
+    let Some(read_back) = page.get_mut(..other.payload_bytes().min(64) as usize) else {
+        unreachable!("64 bytes is within a bank's payload")
+    };
+    session.read(other.base(), read_back)?;
+    let Ok(seal) = bank::seal_for(read_back, NEW) else {
+        return Ok(());
+    };
+    let mut sealed = [0_u8; 16];
+    let Ok(written) = bank::encode_seal(&seal, align(), &mut sealed) else {
+        unreachable!("a seal fits 16 bytes at a 4-byte program unit")
+    };
+    let Some(bytes) = sealed.get(..written) else {
+        unreachable!("`encode_seal` reports what it wrote")
+    };
+    session.begin_record(SWAP);
+    session.program(spare.seal_offset(), bytes)?;
+    session.barrier()?;
+    session.end_record();
+    Ok(())
 }
 
 fn drive(writer: fn(&mut Session) -> Result<(), FaultError>) -> Vec<Run> {
@@ -682,6 +735,51 @@ fn a_selection_that_ignores_the_seal_finds_two_authorities() {
     assert!(
         caught > 0,
         "a seal-blind selection never found two banks, so the mutant proves nothing"
+    );
+}
+
+#[test]
+fn a_seal_that_names_another_banks_header_is_never_authoritative() {
+    // The digest comparison, made load-bearing under crash injection.
+    //
+    // Bank B is whole: its header decodes, its seal decodes, and its generation is the
+    // highest on the device. The only thing wrong with it is that the seal names bank A's
+    // header. A selection that checked "does the header decode" and "is the seal valid" — the
+    // two things every *other* mutant in this file breaks — boots it.
+    let runs = drive(swap_sealed_with_the_wrong_header);
+
+    let mut caught = 0_usize;
+    for run in &runs {
+        let (header, seal) = regions(run.image(), BankId::B);
+        let (Ok(_), Ok(decoded)) = (bank::decode_header(header), bank::decode_seal(seal)) else {
+            continue;
+        };
+        if decoded.generation != NEW {
+            continue;
+        }
+        caught += 1;
+
+        // Intact by every measure but the one that matters.
+        assert_eq!(
+            bank::sealed_generation(header, seal),
+            None,
+            "at {:?}: a seal naming another bank's header was accepted",
+            run.injection()
+        );
+        assert_eq!(
+            authority(run.image()),
+            Authority::Bank {
+                id: BankId::A,
+                generation: CURRENT
+            },
+            "at {:?}: the device did not fall back to the bank it was booting",
+            run.injection()
+        );
+    }
+    assert!(
+        caught > 0,
+        "no crash point left an intact header under an intact seal naming another header, so \
+         the mutant proves nothing"
     );
 }
 

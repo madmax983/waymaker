@@ -54,10 +54,17 @@ layout that handed the odd block of a three-block device to one of them would ma
 between them a swap that can fail one way and not the other. The odd block is therefore not
 addressed by the layout, and that is written down rather than left to be discovered.
 
-Two refusals, both `LayoutError`: a device of fewer than two erase blocks
-(`TooFewEraseBlocks` — §04's "two erase blocks minimum"), and a bank that could not hold a
-header and a seal (`BankTooSmall`), which is a real part whose program unit is a large
-fraction of its erase block.
+Three refusals, all `LayoutError`. A device of fewer than two erase blocks
+(`TooFewEraseBlocks` — §04's "two erase blocks minimum"). A device that programs in units no
+bank header could record (`ProgramUnitTooLarge`): `Geometry` takes a `u32` program size and
+`ProgramAlign` is a `u16`, so above 32 KiB the only granularity a writer *could* record is
+smaller than the one it programs at — and a reader striding short lands inside a frame's
+padding and reports a clean end of history, which `frame::Scan` names as the worst failure it
+has. And a bank that could not hold a padded header, a padded seal and one padded record
+frame (`BankTooSmall`), which is a real part whose program unit is a large fraction of its
+erase block. All three measured *padded*: an earlier draft compared the bank against the
+unpadded 26-byte header and reserved nothing for the journal, which admitted a device whose
+header filled its whole payload and whose journal was zero bytes long.
 
 ### The seal names its header
 
@@ -76,10 +83,20 @@ rather than by ordering:
   not check its program results from a device-bricking bug into a device that boots the
   previous run.
 
-`crates/waymaker-fault/tests/banks.rs` holds both, and the second one is held by a mutant:
-`a_selection_that_ignores_the_header_boots_a_bank_that_was_never_written` drives a writer
-that seals the header it *intended*, shows a seal-blind reader booting a bank whose header is
-torn, and shows the real selection booting the previous run instead.
+`crates/waymaker-fault/tests/banks.rs` holds both, and each is held by a mutant.
+`a_selection_that_ignores_the_header_boots_a_bank_that_was_never_written` drives a writer that
+seals the header it *intended*, shows a seal-blind reader booting a bank whose header is torn,
+and shows the real selection booting the previous run instead.
+`a_seal_that_names_another_banks_header_is_never_authoritative` drives a writer that seals
+bank B with bank A's digest — every structure intact, both headers decoding, the highest
+generation over a header that is not beneath it — which is the case the first mutant cannot
+reach.
+
+That second mutant exists because review of this change measured the sweep without it and
+found the digest comparison carrying nothing: deleting it from `sealed_generation` left all
+eight tests green, across 303 crash points, because the only way a header stops decoding under
+*damage* is a tear or an erase, and both refuse the bank before a digest is ever compared. A
+seal binding held only by a hand-built unit test is a seal binding no crash has been near.
 
 The seal sits at the end of its bank so that its offset is a function of the geometry alone —
 a reader finds it before it has decoded anything, and the header may grow with the run input
@@ -140,7 +157,7 @@ size` fails a build over the new number exactly as it failed over the old one �
 number stays in `waymaker-core` so that there is one place to change it.
 
 The measurement, so that the raise is a decision rather than a shrug. `cargo xtask size`
-moves from **8180 B to 10776 B**, and the delta attributes as (`llvm-nm --print-size` on the
+moves from **8180 B to 10976 B**, and the delta attributes as (`llvm-nm --print-size` on the
 unstripped `engine` image):
 
 | Symbol | Bytes |
@@ -151,24 +168,32 @@ unstripped `engine` image):
 | `bank::decode_seal_with` | 184 |
 | `bank::seal_for_with` | 92 |
 | `bank::sealed_generation_with` | 72 |
-| `LayoutError`'s `Display` | 44 |
+| `LayoutError`'s `Display` | 36 |
 | `BankHeader::journal_offset` | 24 |
-| **`waymaker-flash::bank`, total** | **1492** |
-| the size probe's own `two_bank_lifecycle` and `bank_seal_and_selection` | 920 |
-| `.rodata` and knock-on | ~184 |
+| **`waymaker-flash::bank`, total** | **1484** |
+| the size probe's own `two_bank_lifecycle` and `bank_seal_and_selection` | 1032 |
+| `.rodata` and knock-on | ~280 |
+
+`BankLayout`'s accessors, `BankRegion`'s and `select` do not appear: each is a field read or a
+`match` on two `Option`s, and the optimiser folds them into their callers. They are reached —
+`size-probe-reach` requires it — and they cost what an inlined field read costs.
 
 So more than a third of the growth is not library code at all: it is the probe's own `match`
 arms and folds, which exist to keep the library's code alive past `--gc-sections`. That is
 not new —
 [ADR 0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md) says the
 `default` row measures "the probe's own arithmetic plus the cost of linking the crates", and
-at rung 0.0 that was an honest zero. It is now roughly 4 KiB of a 10776 B figure that §04
+at rung 0.0 that was an honest zero. It is now roughly 4 KiB of a 10976 B figure that §04
 describes as "core + flash adapter", and it is a defect in the measurement rather than a cost
-of the engine. It is filed as its own issue rather than fixed here, because fixing it means
-changing what every row of the size matrix means and that does not belong in the pull request
-that also writes the bank layer.
+of the engine. It is filed as issue
+[#72](https://github.com/madmax983/waymaker/issues/72) rather than fixed here, because fixing
+it means changing what every row of the size matrix means and that does not belong in the pull
+request that also writes the bank layer.
 
-What 16 KiB buys: about 5.5 KiB of headroom for the rest of rung 0.2 — the barriers, the
+The measurement also has about 4 B of run-to-run variance in the linker's output, so the
+figures above are quoted to the byte for attribution rather than as a reproducible constant.
+
+What 16 KiB buys: about 5.3 KiB of headroom for the rest of rung 0.2 — the barriers, the
 capacity reserve and `continue_as_new`. It is a number chosen to be revisited once the probe
 attribution is fixed, and `crates/waymaker-core/tests/budget.rs` asserts it explicitly so
 that the next change to it is a line somebody writes on purpose.
@@ -188,14 +213,30 @@ that the next change to it is a line somebody writes on purpose.
   the alternative — packing the seal beside the header — would make the seal's offset depend
   on the header's length, which is the one thing a reader has to know before it decodes
   anything.
-- `sealed_generation` decodes the header twice on the path that also decodes the seal: once
-  to find the frame's extent, and the digest is then recomputed rather than read back out of
-  the header's own trailer. Both are deliberate — recomputing is what makes the answer depend
-  on the caller's `C` rather than on four bytes a damaged bank carries — and both cost cycles
-  on a cold boot, once.
+- `sealed_generation` decodes the header once and *frame-checks* it twice: `decode_header_with`
+  verifies the stored trailer, and `seal_for_with` then recomputes the same digest rather than
+  reading those four bytes back. The second pass is redundant given the first — if the decode
+  returned `Ok`, the trailer *is* `C::frame_check` under this `C` — and it is kept anyway, for
+  a reason worth stating plainly rather than dressing up: it is what gives the
+  `integrity-check` routing pin a call to hold in that body. The cost is one table-free CRC-32
+  over the header frame, per bank, per boot; on a 4 KiB header at 93 cycles per byte that is
+  around 8 ms on a 48 MHz Cortex-M0+. A cheaper binding that the gate could still hold would
+  supersede this.
 - `waymaker-spec`'s `single-authority` is still proved against the model alone. There is now
   a two-bank adapter to abstract, so the refinement rung 0.2 owes is now owed against real
-  code rather than against nothing; `crates/waymaker-spec/src/obligation.rs` says so.
+  code rather than against nothing; `crates/waymaker-spec/src/obligation.rs` says so, and it
+  is filed as issue [#73](https://github.com/madmax983/waymaker/issues/73).
+  [ADR 0015](0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md) gives
+  the reason as "rung 0.1 has no two-bank adapter to abstract"; that reason has now expired,
+  and this line is the amendment rather than an edit to an accepted record.
+- **Two limits of the seal's binding, stated rather than discovered.** The seal names the
+  bank *header*'s digest, so it says nothing about the journal: a bank whose header and seal
+  agree is authoritative however damaged its records are. And the header carries no
+  generation, so re-writing byte-identical header content under a seal that survived from an
+  earlier generation of the same bank produces a matching digest and a bank reporting the
+  *stale* generation. Neither is reachable in the fault model — an interrupted erase there
+  always lands a block-aligned prefix, and no writer in the sweep carries on past a failed
+  erase — and both are in CLAUDE.md's "What is not checked" for that reason.
 - §10's step 7 — "lazily erase the old bank" — is not implemented here. #22 is the layout,
   the seal and the selection; the swap that drives them end to end is `continue_as_new`, and
   the writer in `crates/waymaker-fault/tests/banks.rs` is the protocol modelled, not shipped.
@@ -221,6 +262,13 @@ temptation is real — the seal's offset is much easier to reason about when it 
 and because the geometry-derived version is what lets one firmware image serve a 2 × 4 KiB
 part and a 2 × 64 KiB one.
 
+**Putting the generation in the bank header.** Four bytes, and it would close the
+identical-header rewrite above: two generations of one bank would then have different header
+bytes and therefore different digests. Rejected for now because it puts the generation on
+media in two places, which needs a rule for what a device does when they disagree — and
+inventing that rule under review pressure is worse than recording the gap. It is the change to
+make when `continue_as_new` arrives and there is a writer whose behaviour would settle it.
+
 **Putting the seal at the start of the bank.** It would mean a front-to-back erase clears the
 seal first, which is a second, order-dependent defence. Rejected as a *substitute* for the
 header digest, because it is only true of drivers that erase front to back and nothing in §12
@@ -233,7 +281,8 @@ forced this conversation again mid-rung. Rejected as churn: the number is going 
 revisited when the probe attribution is fixed either way, and 16 KiB is the figure that lets
 the rung be finished before then.
 
-**Fixing the probe attribution first, and keeping 8 KiB.** The honest fix, and the one that
+**Fixing the probe attribution first, and keeping 8 KiB** (issue
+[#72](https://github.com/madmax983/waymaker/issues/72)). The honest fix, and the one that
 might have made the raise unnecessary — the library's own contribution is 1548 B against
 8180 B of prior measurement, of which roughly 3.2 KiB was already the probe. Rejected for
 this pull request because it changes what every row of the size matrix means, in the same

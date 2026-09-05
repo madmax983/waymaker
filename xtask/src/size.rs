@@ -398,7 +398,12 @@ impl KernelState {
 /// One of the gates a measurement is held to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Budget {
-    /// Design document §04's 8 KiB for the kernel plus the flash adapter.
+    /// The incremental code-flash gate for the kernel plus the flash adapter.
+    ///
+    /// Design document §04 states 8 KiB as a *v0.1* target; the number this variant gates on
+    /// is `waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`, which ADR 0017 raised once
+    /// for rung 0.2's two-bank lifecycle. Naming a figure here rather than the constant is
+    /// how a gate's own documentation ends up describing a gate it no longer is.
     IncrementalCodeFlash,
     /// What the engine may own in statics once the caller's scratch page is counted.
     ///

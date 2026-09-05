@@ -35,7 +35,9 @@ pub mod frame;
 pub mod integrity;
 pub mod storage;
 
-pub use bank::{Authority, BankHeader, BankId, BankLayout, BankRegion, Generation, Seal};
+pub use bank::{
+    Authority, BankHeader, BankId, BankLayout, BankRegion, Generation, LayoutError, Seal,
+};
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
 pub use storage::{Geometry, GeometryError, StableStorage};

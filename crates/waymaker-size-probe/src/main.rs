@@ -800,7 +800,6 @@ fn storage_contract() -> usize {
 fn two_bank_lifecycle() -> usize {
     use waymaker_core::RunId;
     use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout};
-    use waymaker_flash::frame::ProgramAlign;
     use waymaker_flash::integrity::Catalogued;
     use waymaker_flash::storage::Geometry;
 
@@ -828,7 +827,11 @@ fn two_bank_lifecycle() -> usize {
     ) -> core::fmt::Result = <waymaker_flash::bank::LayoutError as core::fmt::Display>::fmt;
     core::hint::black_box(show);
 
+    // The granularity the layout proved exists, and the run-input ceiling a caller needs
+    // before it builds a header. Both are what stop a caller writing the arithmetic itself.
+    let align = layout.align();
     let region = layout.bank(core::hint::black_box(BankId::A).other());
+    kept = kept.wrapping_add(region.max_run_input_bytes(align));
     kept = kept
         .wrapping_add(region.base() as usize)
         .wrapping_add(region.bytes() as usize)
@@ -837,9 +840,6 @@ fn two_bank_lifecycle() -> usize {
         .wrapping_add(region.payload_bytes() as usize)
         .wrapping_add(BankId::B.index());
 
-    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
-        return kept;
-    };
     let header = BankHeader {
         run: RunId(core::hint::black_box(7)),
         align,
