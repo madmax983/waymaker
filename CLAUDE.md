@@ -205,7 +205,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, the capacity reserve, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -279,10 +279,17 @@ owed. Issue #24's commit seal and two-barrier writer then took it to 14764 B aga
 16 KiB gate, and
 [ADR 0019](docs/adr/0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md)
 splits that: 2420 B is the seal reaching the codec and the two readers, and 1368 B is the
-writer with the probe section that keeps it alive. The gate is **not** raised again, and
-1620 B of headroom is what the rest of rung 0.2 has to fit in. A third of the measured
-"core + flash adapter" figure is still the probe rather than either, which is a defect in the
-measurement and is filed as issue
+writer with the probe section that keeps it alive. Issue #25's capacity reserve then took it
+to 16232 B against the same 16 KiB gate, and
+[ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
+splits *that* the same way — and says plainly that almost none of it is the module: 40 B is
+the library change measured on its own, and the remaining 1428 B is what the probe drags in
+to reach eleven public functions. The gate is **not** raised, and **152 B** of headroom is
+what the rest of rung 0.2 has to fit in — which is not enough for issue
+[#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap, so the budget
+conversation ADR 0017 opened and ADR 0019 deferred now falls due there. A third of the
+measured "core + flash adapter" figure is still the probe rather than either, which is a
+defect in the measurement and is filed as issue
 [#72](https://github.com/madmax983/waymaker/issues/72).
 
 The workflow future is user memory and is reported separately. A kernel state type added to
@@ -368,7 +375,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 39 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 40 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -385,6 +392,7 @@ this table is how you find out what a red build is telling you.
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
 | `commit-discipline` | The two-barrier writer's public function surface differs from `source::APPEND_SURFACE`; or the typestate that makes design document §07's order unrepresentable comes apart — the staged frame grows a second method or the word `program`, the sealable frame grows anything but `commit`, the sealable frame is constructed anywhere but inside `payload_barrier`, or that barrier stops calling `storage.barrier` exactly once. Issue [#24](https://github.com/madmax983/waymaker/issues/24) asks that "it is not possible to program a seal without the intervening payload barrier having returned", and a `compile_fail` doctest in the crate proves that of the code as it stands. This is what stops it being given back: a `Staged::commit`, a `Journal::write` that did all four steps in one call, or a second constructor for `Sealable` would each break no other rule and turn a protocol into a convention. What it cannot see is whether the barrier is a real one — that is §12's contract and `waymaker-conformance`'s across-reset witness. |
+| `capacity-reserve` | §10's capacity reserve gains a public function `source::CAPACITY_SURFACE` does not list, in either direction — or `Reserved::stage` stops taking the admission decision as `source::CAPACITY_ADMISSION_CALL` before `source::CAPACITY_DELEGATION`. §10 says "the runtime never overwrites committed history to make room", and every way of giving that back is an *addition*: a `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back, a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from its caller rather than from a `BankLayout` — which is the sharpest of the four, because a reserve is only a promise because a layout vouched for it. The order half is the other word §10 uses: scheduling fails **early**, and issue #25 asks that the failure "produce no mutation at all". §12 says a failed program may still have changed media, so the only refusal that changes nothing is one taken before the device is called — and `let _ = self.reserve.admits(..);`, or an `admits` taken after the delegation, each satisfy "calls `admits`" while programming the record they were meant to refuse. What it cannot see is the arithmetic: a `tail_bytes` that quietly stopped counting the outcome record is `crates/waymaker-flash/tests/capacity.rs`'s, where `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the wrong reserve and watches a run reach a state it can never leave. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
@@ -604,6 +612,20 @@ Stated so that nobody mistakes silence for coverage:
   *can* falsify is the other half — that a seal never lands over an incomplete frame — and
   `crates/waymaker-fault/tests/commit_discipline.rs` does, with a seal-before-frame writer as
   the tooth.
+- **That a reserve is the reserve §10 needs.** `capacity-reserve` pins the surface and the
+  order the one gate is applied in. It compares *names* and one spelling, so a
+  `Reserve::tail_bytes` that stopped counting the outcome record — the term §08's transition
+  table makes load-bearing, since there is no edge from an unresolved effect to a terminal
+  record — passes it unchanged. `crates/waymaker-flash/tests/capacity.rs` is what holds the
+  arithmetic, against `frame::encoded_len` of real records rather than against a second copy
+  of the same sum, and `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` is
+  what makes the outcome term falsifiable rather than argued.
+- **That a caller went through the reserve at all.** `capacity::Reserved` consumes the
+  `Journal` it gates, so a caller holding both had to construct a second one from a second
+  recovery — the same linear discipline `Journal::after` uses, and the same limit: it makes
+  the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
+  in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
+  and it is stated here so its absence is a decision.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -799,6 +821,30 @@ committed, not that no record follows. See
 which also says what the sweep cannot falsify: the fault harness does not reorder stores, so
 the payload barrier's necessity is §12's contract and `waymaker-conformance`'s across-reset
 witness rather than something this sweep can break.
+Issue #25 then makes §10's "capacity is explicit" a thing the writer does. `waymaker-flash`'s
+`capacity` module is the reserve: `Bounds` is what a run declares its records may be worth,
+`Reserve::for_layout` prices §10's two exits against a real bank — a terminal record, and the
+`continue_as_new` header the swap writes into the *inactive* bank — and refuses bounds under
+which a bank could not roll over, or under which the run a swap installs would have no exit of
+its own. `Reserve::admits` is §10's decision as a pure predicate over a length, and `Reserved`
+is the gate: it consumes the `Journal` it wraps and takes the decision before `Journal::stage`
+is called at all, so issue #25's "the failure produces no mutation at all" is a property of
+the call order rather than of an undo — the device is not read, not programmed, not
+barriered, and the write-amplification counters do not move.
+The reserve's least obvious term is the one that makes it correct, and it came out of §08
+rather than out of §10. A schedule record creates an obligation: `ReplayCursor` has no edge
+from an unresolved effect to a terminal record, so a run with an effect outstanding cannot end
+until its outcome is written — and the reserve everybody writes first, one terminal record,
+admits a schedule and then strands the run with an outcome that does not fit and a terminal
+record §08 will not let follow it. That is driven and watched failing rather than argued:
+`a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` runs the wrong policy
+against the real writer and finds the crash point at which it strands. `continue_as_new` from
+the near-capacity state is a test too, run through §10's seven steps by hand because the
+writer that will do them is issue #26's. See
+[ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md), which
+also says what this leaves owed: the reserve is not obliged on anybody, because the dispatcher
+that would be obliged is rung 0.4's, and 152 B of code-flash headroom is not enough for the
+bank swap.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the bank swap
 arrives with 0.2, and the async `Ctx` and dispatcher with 0.4. The

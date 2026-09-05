@@ -533,9 +533,41 @@ pub fn input_digest_with<C: IntegrityCheck>(input: &[u8]) -> u32 {
 /// buffer *or the caller-owned output*", which is this, and a second error enum for two
 /// cases would be a second vocabulary for adapters to translate between.
 pub fn encoded_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize, DecodeError> {
-    body_len(record, align)?
-        .checked_add(seal_bytes(align))
-        .ok_or(DecodeError::LengthOutOfBounds)
+    encoded_len_for(payload_len(record)?, align)
+}
+
+/// Bytes a frame carrying `payload_bytes` of record body occupies once padded to `align`,
+/// commit seal included.
+///
+/// [`encoded_len`] without a record in hand. §10's capacity reserve is stated for the
+/// *worst case* of the bounds a run declares — "enough tail space for a terminal record or
+/// `continue_as_new`" — and the worst case is a length rather than a value: a firmware with
+/// an 8 KiB budget cannot conjure a 64 KiB record to measure. So the arithmetic lives here,
+/// where the padding and the seal already do, and [`crate::capacity`] asks it for a length
+/// rather than reimplementing it. Two copies of this sum would agree until somebody changed
+/// the frame's overhead.
+///
+/// # Postconditions
+///
+/// [`encoded_len`] of any record whose payload is `payload_bytes` long, exactly. A whole
+/// number of `align`'s units plus [`seal_bytes`], and never less than
+/// [`FRAME_OVERHEAD_BYTES`].
+///
+/// # Errors
+///
+/// [`DecodeError::LengthOutOfBounds`] when `payload_bytes` exceeds [`MAX_PAYLOAD_BYTES`],
+/// which `payload_len` could not describe, or when rounding up to `align` would overflow.
+pub const fn encoded_len_for(
+    payload_bytes: usize,
+    align: ProgramAlign,
+) -> Result<usize, DecodeError> {
+    match body_len_for(payload_bytes, align) {
+        Ok(body) => match body.checked_add(seal_bytes(align)) {
+            Some(total) => Ok(total),
+            None => Err(DecodeError::LengthOutOfBounds),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 /// Bytes `record`'s frame body occupies once written and padded to `align`.
@@ -554,10 +586,23 @@ pub fn encoded_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize,
 ///
 /// As [`encoded_len`].
 pub fn body_len(record: &RecordRef<'_>, align: ProgramAlign) -> Result<usize, DecodeError> {
-    let payload_len = payload_len(record)?;
-    align
-        .round_up(FRAME_OVERHEAD_BYTES.saturating_add(payload_len))
-        .ok_or(DecodeError::LengthOutOfBounds)
+    body_len_for(payload_len(record)?, align)
+}
+
+/// [`body_len`] for a payload of `payload_bytes`, with no record in hand.
+///
+/// The one place the frame's padded length is computed; [`encoded_len_for`] adds the seal
+/// and both record-taking siblings above route through the pair. Private because a caller
+/// that wants a length wants the whole record's — a body length is where the two-barrier
+/// writer splits a record, and that is [`body_len`]'s to answer about a record it can see.
+const fn body_len_for(payload_bytes: usize, align: ProgramAlign) -> Result<usize, DecodeError> {
+    if payload_bytes > MAX_PAYLOAD_BYTES {
+        return Err(DecodeError::LengthOutOfBounds);
+    }
+    match align.round_up(FRAME_OVERHEAD_BYTES.saturating_add(payload_bytes)) {
+        Some(len) => Ok(len),
+        None => Err(DecodeError::LengthOutOfBounds),
+    }
 }
 
 /// Writes `record` into `out` as a frame padded to `align`, returning the bytes written.

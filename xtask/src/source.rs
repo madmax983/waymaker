@@ -985,18 +985,26 @@ pub const APPEND_SURFACE_PATH: &str = "waymaker-flash/src/append.rs";
 /// vouched for. A `Journal::at(region, offset)` is the mutation `waymaker-fault`'s sweep
 /// demonstrates as dangerous, and it is a line a reviewer has to write on purpose.
 ///
+/// `region` is on it for a third reason, and it is the one worth reading before adding a
+/// fourth. It hands out a [`JournalRegion`] by value, which is `Copy` and read-only, so it
+/// cannot move a writer or widen what it may program — and §10's capacity reserve, one
+/// module up, cannot price a record without the granularity the journal was written at. An
+/// accessor that handed out something *mutable*, or an offset, would not be that.
+///
 /// What it does **not** catch: this compares *names*. It is the surface half of the rule;
 /// [`check_commit_discipline`] also checks the shape the names sit in.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 ///
 /// [`Journal`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+/// [`JournalRegion`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/recovery.rs
 pub const APPEND_SURFACE: &[&str] = &[
     "after",
     "amplification",
     "barriers",
     "commit",
     "offset",
+    "region",
     "overhead_bytes",
     "payload_barrier",
     "payload_bytes",
@@ -1186,6 +1194,129 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
                  frame no barrier ever ordered"
             ),
         ));
+    }
+
+    violations
+}
+
+/// The file whose public surface and admission order [`check_capacity_reserve`] pins.
+pub const CAPACITY_SURFACE_PATH: &str = "waymaker-flash/src/capacity.rs";
+
+/// Every public function §10's capacity reserve is allowed to have.
+///
+/// Design document §10: "Waymaker reserves enough tail space for a terminal record or
+/// `continue_as_new`. Ordinary effect scheduling fails early with `HistoryNearCapacity`; the
+/// runtime never overwrites committed history to make room." Issue
+/// [#25](https://github.com/madmax983/waymaker/issues/25) asks for that, and — as with §07's
+/// two barriers — most of the guarantee is an *absence*.
+///
+/// A `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back,
+/// a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from the caller
+/// instead of from a [`BankLayout`] would each break no layering rule, need no dependency,
+/// pass every other gate, and turn a reserve into a suggestion. The last one is the sharpest:
+/// a reserve is only a promise because a layout vouched for it, and a constructor that
+/// accepted numbers would accept numbers that describe no device.
+///
+/// `journal` is on the list because a caller needs the writer's offset, room and write
+/// amplification, and it returns a *shared* borrow — [`Journal::stage`] needs a unique one,
+/// so it cannot be used to append around the reserve. A `journal_mut` would be exactly that,
+/// and is the name this pin exists to make somebody write down.
+///
+/// What it does **not** catch: this compares *names*. A `tail_bytes` that quietly stopped
+/// counting the outcome record is invisible to it —
+/// `crates/waymaker-flash/tests/capacity.rs` is what holds the arithmetic, and
+/// `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` is what makes the
+/// outcome term falsifiable.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+///
+/// [`BankLayout`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/bank.rs
+/// [`Journal::stage`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+pub const CAPACITY_SURFACE: &[&str] = &[
+    "admits",
+    "exit_bytes_after",
+    "fmt",
+    "for_layout",
+    "journal",
+    "message",
+    "over",
+    "stage",
+    "swap_bytes",
+    "tail_bytes",
+];
+
+/// The whole expression a reserved append must take the admission decision with.
+///
+/// A pin on the *spelling*, like [`APPEND_BARRIER_CALL`], and for the same reason. "Calls
+/// `admits` somewhere in the body" is satisfied by `let _ = self.reserve.admits(..);`, which
+/// refuses nothing and programs the record anyway — and by an `admits` taken *after* the
+/// delegation, which is a refusal that arrives once the frame body is already on media. §10
+/// says scheduling fails **early**, and issue #25 asks that the failure "produces no
+/// mutation at all"; §12 is explicit that a failed program may still have changed media, so
+/// the only refusal that changes nothing is one taken before the device is called.
+///
+/// So what is pinned is the propagation, characters and all: the room comes from the journal
+/// this writer gates rather than from an argument, and the failure is returned rather than
+/// observed. Whitespace is normalised before the comparison, so rustfmt may break the line;
+/// anything else is a line a reviewer writes.
+pub const CAPACITY_ADMISSION_CALL: &str =
+    "self.reserve .admits(record, self.journal.room()) .map_err(ReservedError::Capacity)?;";
+
+/// The delegation the admission has to come before.
+pub const CAPACITY_DELEGATION: &str = "self.journal .stage(storage, record, page)";
+
+/// Rule: §10's reserve is applied before anything reaches media, and cannot be given back.
+///
+/// Two halves, for the reason [`check_commit_discipline`] has two: the surface is a set
+/// comparison and the order is a shape, and they fail for different reasons.
+#[must_use]
+pub fn check_capacity_reserve(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "capacity-reserve";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = check_pinned_surface(
+        RULE,
+        ADAPTER,
+        CAPACITY_SURFACE_PATH,
+        CAPACITY_SURFACE,
+        sources,
+        "the reserve's public API is where design document \u{a7}10's \"the runtime never \
+         overwrites committed history to make room\" stops being a sentence, so an ungated \
+         writer or a reserve built from numbers rather than from a layout cannot be added \
+         without a reviewer writing it down",
+    );
+
+    let Some(source) = find_source(sources, CAPACITY_SURFACE_PATH) else {
+        // `check_pinned_surface` has already reported the missing file.
+        return violations;
+    };
+    let code = without_test_modules(&code_only(&source.contents));
+    let Some(body) = braced_body(&code, "fn stage") else {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{CAPACITY_SURFACE_PATH} declares no `stage`, so the one place \u{a7}10's \
+                 reserve is applied is pinned against nothing"
+            ),
+        ));
+        return violations;
+    };
+
+    let squeezed_body = squeezed(body);
+    let admission = squeezed_body.find(&squeezed(CAPACITY_ADMISSION_CALL));
+    let delegation = squeezed_body.find(&squeezed(CAPACITY_DELEGATION));
+    match (admission, delegation) {
+        (Some(admits_at), Some(stages_at)) if admits_at < stages_at => {}
+        _ => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "`stage` does not take the decision as `{CAPACITY_ADMISSION_CALL}` before \
+                 `{CAPACITY_DELEGATION}`: a body that admits afterwards, or that does not \
+                 propagate the refusal, programs the record it was meant to refuse"
+            ),
+        )),
     }
 
     violations
@@ -6349,7 +6480,8 @@ pub mod tests_support {
 
     use super::{
         APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_STEP, APPEND_ROUTING_STEPS,
-        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION,
+        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CAPACITY_ADMISSION_CALL,
+        CAPACITY_DELEGATION, CAPACITY_SURFACE, CHECKSUM_MODULE, DIGEST_FUNCTION,
         EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
         RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS,
         SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
@@ -6392,6 +6524,31 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_recovery_surface() -> String {
         surface("A recovery module.", RECOVERY_SURFACE)
+    }
+
+    /// A capacity module the `capacity-reserve` rule accepts whole.
+    ///
+    /// The surface is rendered from the pin for the reason every surface above is, and the
+    /// `stage` body is the pinned admission and delegation in the order the rule requires —
+    /// so a fixture cannot be the reason the shape half passes.
+    #[must_use]
+    pub fn clean_capacity_reserve() -> String {
+        // Every pinned name but `stage`, which the `impl` below declares: the pin refuses a
+        // name declared twice, so a fixture that rendered it in both places would fail the
+        // surface half for a reason no rule is about.
+        let others: Vec<&str> = CAPACITY_SURFACE
+            .iter()
+            .copied()
+            .filter(|name| *name != "stage")
+            .collect();
+        let mut source = surface("A capacity module.", &others);
+        source.push_str("impl Reserved {\n");
+        source.push_str("    pub fn stage(&mut self) -> Result<(), ()> {\n        ");
+        source.push_str(CAPACITY_ADMISSION_CALL);
+        source.push_str("\n        ");
+        source.push_str(CAPACITY_DELEGATION);
+        source.push_str("\n    }\n}\n");
+        source
     }
 
     /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
@@ -6642,6 +6799,7 @@ pub mod tests_support {
             .chain([&DIGEST_FUNCTION.0])
             .chain(BANK_SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .chain(APPEND_SURFACE)
+            .chain(CAPACITY_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

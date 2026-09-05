@@ -28,6 +28,7 @@ be superseded.
 | [0017](0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) | The two-bank layout is geometry-derived and the seal names its header | accepted |
 | [0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md) | Recovery is a position pumped by its caller, and only erased media is an append point | accepted |
 | [0019](0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md) | The commit seal is a masked repeat of the frame check, and the writer is a typestate | accepted |
+| [0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) | The capacity reserve is an outcome and a terminal record, and the gate is a type | accepted |
 
 ## Reading the numbers
 
@@ -44,7 +45,7 @@ of these are older than their numbers suggest:
   to have an ADR and this one turned out not to.
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
-→ 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019.
+→ 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020.
 
 ## Writing one
 

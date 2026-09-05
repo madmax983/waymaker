@@ -368,6 +368,19 @@ impl<C: IntegrityCheck> Journal<C> {
         self.offset
     }
 
+    /// The region this writer appends to.
+    ///
+    /// Read-only, and [`JournalRegion`] is `Copy`, so handing one out cannot move a writer
+    /// or widen what it may program. It is here because a *policy* above this type — §10's
+    /// capacity reserve, in [`crate::capacity`] — has to know the granularity the journal
+    /// was written at before it can say what a record costs, and taking that from anywhere
+    /// but the writer's own region is how a reserve computed for one device ends up
+    /// under-reserving on another.
+    #[must_use]
+    pub const fn region(&self) -> JournalRegion {
+        self.region
+    }
+
     /// How many bytes are left in the region.
     ///
     /// What a record has to fit in, and nothing more: §10's reserved tail — the space a
