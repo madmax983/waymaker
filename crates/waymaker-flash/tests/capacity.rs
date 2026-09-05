@@ -1121,6 +1121,51 @@ fn a_full_journal_refuses_even_a_terminal_record() {
 }
 
 #[test]
+fn a_journal_driven_past_its_capacity_refuses_rather_than_reusing_its_own_bytes() {
+    // §10's third sentence: "the runtime never overwrites committed history to make room" —
+    // no circular buffer, no oldest-record eviction. A journal is driven to its boundary,
+    // then past it in every way this gate allows, and the first record it ever committed is
+    // still the first record it reads back, at the same offset, byte for byte.
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+    let mut writer = reserved(&mut device, region);
+
+    let first = width(&schedule(0));
+    commit(&mut writer, &mut device, &schedule(0)).expect("an empty journal takes a schedule");
+    let opening = device.window(region.base(), first);
+    assert!(opening.iter().any(|byte| *byte != ERASED_BYTE));
+    commit(&mut writer, &mut device, &outcome(0)).expect("and the outcome it owes");
+
+    let effects = fill_to_the_boundary(&mut writer, &mut device);
+    let offset = writer.journal().offset();
+    let image = device.snapshot();
+
+    // Every refusal there is, repeatedly. None of them may move the offset backwards, and
+    // none of them may put a byte anywhere.
+    for _ in 0..4 {
+        assert_eq!(
+            commit(&mut writer, &mut device, &schedule(effects + 1)),
+            Err(ReservedError::Capacity(Refusal::NearCapacity))
+        );
+        assert_eq!(
+            writer.journal().offset(),
+            offset,
+            "an offset that moved backwards is a journal reusing its own bytes"
+        );
+    }
+    assert_eq!(device.snapshot(), image, "no byte was reused");
+    assert_eq!(
+        device.window(region.base(), first),
+        opening,
+        "the first record ever committed is untouched"
+    );
+
+    // And the exit is the only thing that still moves it, forwards.
+    commit(&mut writer, &mut device, &terminal()).expect("the exit the reserve was kept for");
+    assert!(writer.journal().offset() > offset);
+}
+
+#[test]
 fn a_bank_at_the_boundary_still_reads_back_as_the_history_it_committed() {
     // The reserve must not corrupt the thing it protects. Every record committed up to the
     // boundary is recovered, in order, by the reader that walks media.
