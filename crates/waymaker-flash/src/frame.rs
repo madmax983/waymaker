@@ -84,9 +84,13 @@
 //!
 //! * an erased program unit is never a seal, so a frame whose seal was never written is
 //!   refused with [`DecodeError::Unsealed`] rather than read as history;
-//! * a seal interrupted part-way through its own program ends in erased bytes, so a torn
-//!   seal is never a whole one — which is what makes "sealed but incomplete" a state that
-//!   cannot be reached rather than one a reader has to detect;
+//! * a seal that did not land whole is never a whole one, because every byte it did not
+//!   reach still reads erased. On a driver that programs in order — which is what
+//!   `waymaker-fault` models, and which §12 does not actually promise — that is exactly "a
+//!   torn seal ends in erased bytes"; on one that programs out of order it is still true,
+//!   because *some* byte is missing and no seal byte is [`ERASED_BYTE`]. Either way "sealed
+//!   but incomplete" is a state that cannot be reached rather than one a reader has to
+//!   detect;
 //! * the seal is bound to the frame it seals, so a writer that sealed what it *meant* to
 //!   write rather than what landed produces a seal the reader refuses.
 //!
@@ -193,10 +197,24 @@ pub const SEAL_PATTERN_BYTES: usize = size_of::<u32>();
 ///
 /// Clearing bit 7 is what makes `0xFF` unreachable, and it is the cheapest way to do it:
 /// one `and` per byte, no branch, and no value the pattern has to be tested against and
-/// nudged away from. It costs four bits of the thirty-two the frame check has — a seal binds
-/// to its frame at twenty-eight bits rather than thirty-two — which is the right side of
-/// that trade, because §09 is explicit that a CRC "detects accidental corruption and torn
-/// writes; it is not authentication", and the seal's job is the first of those.
+/// nudged away from. It costs one bit per byte, which is the right side of that trade,
+/// because §09 is explicit that a CRC "detects accidental corruption and torn writes; it is
+/// not authentication", and the seal's job is the first of those.
+///
+/// # How tightly a seal is bound to its frame depends on the program unit
+///
+/// A verifier compares [`seal_bytes`] bytes, so the binding is `min(align, 4) * 7` bits:
+/// **seven** at [`ProgramAlign::BYTE`], fourteen at two, and twenty-eight from four up.
+/// Byte-programmable NOR is an ordinary part, so the seven-bit case is a real configuration
+/// and not a corner — a foreign byte sitting where a seal should be is accepted about once
+/// in a hundred and twenty-eight there.
+///
+/// The two properties that make a seal *safe* do not depend on the width at all, and that is
+/// the division worth keeping straight. "An erased program unit is never a seal" and "a seal
+/// that did not land whole is never a whole one" are true at every width, because they rest
+/// on `0xFF` being unreachable rather than on how many bits are compared. What the width
+/// buys is the third property — telling this frame's seal from some other bytes — and on a
+/// one-byte unit there is nowhere to put more of it.
 ///
 /// The alternative was to keep all thirty-two bits and special-case the one check value
 /// whose pattern is all ones. That is a branch on a value that occurs once in 2^32, which
@@ -1194,21 +1212,29 @@ impl<'a> Scan<'a, Catalogued> {
     /// half, a mismatch would report a clean end of history with committed records still
     /// ahead of it, and everything downstream would believe it.
     ///
-    /// The check turns that into [`DecodeError::IntegrityFailed`] at the offset the reader
-    /// went wrong, which is diagnosable. It does not make the mismatch safe, and the other
-    /// half is worse: a reader given a *larger* granularity strides *over* whole frames and
-    /// lands on erased bytes, which is an ordinary end of history in every respect this type
-    /// can see. Nothing on media contradicts it, so nothing here can catch it — the test
-    /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught` asserts the wrong
-    /// answer on purpose, so the limitation is bounded rather than undiscovered. Rung 0.2
-    /// puts the writer's program size in the bank header, which is where a fact about the
-    /// media belongs — and rung 0.2 has: it is
+    /// Both directions are now refused, and the second one only since issue #24. A reader
+    /// given a *smaller* granularity looks for the first record's commit seal inside that
+    /// record's own padding, which is erased, and no byte of a seal ever is: the answer is
+    /// [`DecodeError::Unsealed`] at the first record, which is diagnosable. A reader given a
+    /// *larger* one strides over whole frames and looks for the seal past the end of the
+    /// record it belongs to, and finds either erased media — refused outright — or another
+    /// record's bytes, which is a twenty-eight-bit coincidence away from being refused.
+    ///
+    /// That second half used to be undetectable and is worth saying was closed by accident:
+    /// a seal sits at a fixed offset from the frame it seals, so believing in the wrong
+    /// stride is believing the seal is somewhere it is not. It is a CRC's kind of certainty
+    /// rather than a proof, and
+    /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_caught_by_the_seal` is what
+    /// says so.
+    ///
+    /// None of that makes a mismatched granularity *safe*, and the right answer is still not
+    /// to have one: rung 0.2 puts the writer's program size in the bank header, which is
+    /// where a fact about the media belongs. It is
     /// [`BankHeader::align`](crate::bank::BankHeader::align), and
     /// [`BankHeader::journal_offset`](crate::bank::BankHeader::journal_offset) is the offset
     /// computed from it. A caller that takes both from the header it just decoded cannot be
     /// given a granularity the writer did not use. This type still cannot check that its
-    /// caller did, because a slice carries no such fact — which is why the limitation is
-    /// stated here rather than deleted.
+    /// caller did, because a slice carries no such fact.
     #[must_use]
     #[inline]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {
@@ -1251,7 +1277,7 @@ impl<'a, C: IntegrityCheck> Scan<'a, C> {
     /// rather than a record, so no step can end anywhere but on a boundary.
     ///
     /// This is where history *ended*, which is not the same as where the next record may be
-    /// written: see [the note on `Scan`](Self#that-offset-is-not-yet-an-append-point).
+    /// written unless the scan ended in erased media: see [the note on `Scan`](Self).
     #[must_use]
     pub const fn offset(&self) -> usize {
         self.offset

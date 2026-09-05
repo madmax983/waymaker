@@ -57,11 +57,13 @@
 //! ## Why `program_shift` is on media
 //!
 //! Because nothing else records it, and a reader that guesses wrong walks the journal
-//! wrong. [`crate::frame::Scan`] documents the hazard and names this as its answer: a
-//! reader handed a *larger* granularity than the writer used strides over whole frames and
-//! lands on erased bytes, which is an ordinary end of history in every respect the scan can
-//! see. With the writer's program unit in the header, a caller reads it rather than assumes
-//! it, and [`BankHeader::journal_offset`] is computed from the same number.
+//! wrong. [`crate::frame::Scan`] documents the hazard and names this as its answer: a reader
+//! handed the wrong granularity strides to the wrong place, and until issue #24's commit
+//! seal a larger one landed on erased bytes and read as an ordinary end of history. The seal
+//! now refuses both directions, which makes the mismatch loud rather than silent — but loud
+//! is a diagnosis and not a fix. With the writer's program unit in the header, a caller
+//! reads it rather than assumes it, and [`BankHeader::journal_offset`] is computed from the
+//! same number.
 //!
 //! # The generation seal
 //!

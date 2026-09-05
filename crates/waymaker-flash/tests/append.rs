@@ -351,6 +351,102 @@ fn amplification_accumulates_over_the_records_a_writer_committed() {
 // ---------------------------------------------------------------------------------------
 
 #[test]
+fn amplification_counts_what_the_device_was_asked_for_and_not_what_it_agreed_to() {
+    // §12: "a failed program may still have changed media." A wear figure that only counted
+    // successes would understate exactly the runs that wore the part, so the counters go up
+    // before the call and not after it. Nothing else in this file reads them after a failure,
+    // which is what made the invariant deletable.
+    let mut device = Nor::new(geometry());
+    let region = region(256);
+    let mut journal = opened(&mut device, region);
+    device.refuse_programs = true;
+
+    let mut page = [0_u8; PAGE];
+    assert!(journal.stage(&mut device, &record(0), &mut page).is_err());
+    let after_a_failed_program = journal.amplification();
+    assert_eq!(after_a_failed_program.program_operations(), 1);
+    assert_eq!(after_a_failed_program.barriers(), 0);
+    assert_eq!(
+        after_a_failed_program.programmed_bytes(),
+        u32::try_from(frame::body_len(&record(0), align()).expect("encodes")).expect("host"),
+        "the bytes the program carried are spent whether or not it returned"
+    );
+    assert_eq!(after_a_failed_program.payload_bytes(), 8);
+
+    // And a barrier that failed: asked for, ordered nothing.
+    let mut fresh = Nor::new(geometry());
+    let mut second = opened(&mut fresh, region);
+    fresh.fail_barrier_at = Some(fresh.barriers);
+    let mut staging = [0_u8; PAGE];
+    assert!(
+        second
+            .stage(&mut fresh, &record(0), &mut staging)
+            .expect("a legal stage")
+            .payload_barrier(&mut fresh)
+            .is_err()
+    );
+    assert_eq!(second.amplification().barriers(), 1);
+}
+
+#[test]
+fn a_seal_wider_than_the_devices_program_unit_is_written_and_read_back() {
+    // The journal's granularity is what a bank header records, and `JournalRegion` requires
+    // only that it be *at least* the device's program unit. A journal written at a coarser
+    // one has a seal several program units wide, and every other case in this file has the
+    // two equal — so a writer that programmed one device-unit of seal instead of one
+    // journal-unit would pass all of them and produce a journal no reader can walk.
+    let Ok(geometry) = Geometry::new(8192, 4096, 4, 1) else {
+        unreachable!("a legal geometry")
+    };
+    let Some(coarse) = ProgramAlign::new(16) else {
+        unreachable!("16 is a power of two")
+    };
+    let Ok(region) = JournalRegion::spanning(geometry, 0, 256, coarse) else {
+        unreachable!("a legal program region at a coarser granularity")
+    };
+    let mut device = Nor::new(geometry);
+    let mut page = [0_u8; PAGE];
+    let mut recovery = Recovery::new(region);
+    while recovery.next(&mut device, &mut page).is_some() {}
+    let Some(mut journal) = Journal::after(recovery) else {
+        unreachable!("an erased region ends cleanly")
+    };
+    device.ops.clear();
+
+    for seq in 0..2 {
+        let mut staging = [0_u8; PAGE];
+        journal
+            .stage(&mut device, &record(seq), &mut staging)
+            .and_then(|staged| staged.payload_barrier(&mut device))
+            .and_then(|sealable| sealable.commit(&mut device))
+            .expect("a legal append");
+    }
+
+    let programs = device.programs();
+    assert_eq!(
+        programs.iter().map(|(_, len)| *len).collect::<Vec<u32>>(),
+        std::vec![32, 16, 32, 16],
+        "the seal is one journal unit — four device program units — and not one of those"
+    );
+
+    let mut reader = Recovery::new(region);
+    let mut seen = Vec::new();
+    while let Some(step) = reader.next(&mut device, &mut page) {
+        match step {
+            Ok(RecordRef::EffectCompleted { seq, .. }) => seen.push(seq.0),
+            other => unreachable!("{other:?}"),
+        }
+    }
+    assert_eq!(seen, [0, 1]);
+    assert_eq!(
+        reader.ending(),
+        Some(Ending::Clean {
+            append_at: journal.offset()
+        })
+    );
+}
+
+#[test]
 fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
     // §10's anti-bricking rule as a constructor. Every ending but a clean one leaves
     // programmed cells at the offset, and there is no other way to build a writer.

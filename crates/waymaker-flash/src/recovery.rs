@@ -11,7 +11,7 @@
 //! [`JournalRegion`], which is the bytes between a bank's header and its seal, validated
 //! once as a legal read; [`Recovery`], which is a position in that region and nothing else;
 //! and [`Ending`], which is what a finished scan learned — including, in exactly one of its
-//! three shapes, where the next record may be written.
+//! four shapes, where the next record may be written.
 //!
 //! # Why this is not [`Scan`](crate::frame::Scan)
 //!
@@ -53,15 +53,15 @@
 //! # The append offset
 //!
 //! Issue #23 asks for the append point as a by-product of the scan, and the by-product is
-//! deliberately hard to get at: only [`Ending::Clean`] carries one. A scan that stopped at
-//! damage has **no** safe append point, and this is not conservatism.
-//! [`Scan`](crate::frame::Scan)'s own documentation states the failure: without the commit
-//! seal a scan cannot tell a torn write from corruption, so it may have stopped at a frame
-//! whose header was half-programmed — and on NOR a programmed bit cannot be returned to one
-//! without erasing the block. A writer that appended there would produce a frame that fails
-//! its own header checksum on every boot, for ever. Appending *past* it is worse: the next
-//! boot's scan stops at the tear again and never reaches what was written, so the records
-//! are lost while the device reports success.
+//! deliberately hard to get at: only [`Ending::Clean`] carries one. Every other ending
+//! stopped at *programmed* bytes, and this is not conservatism. On NOR a programmed bit
+//! cannot be returned to one without erasing the block, so a writer that appended at a
+//! damaged or unsealed frame would produce a frame that fails its own header checksum on
+//! every boot, for ever. Appending *past* it is worse: the next boot's scan stops in the
+//! same place again and never reaches what was written, so the records are lost while the
+//! device reports success. Since issue #24 a caller can tell the two apart —
+//! [`Ending::Unsealed`] is an interrupted append and [`Ending::Damaged`] is media to
+//! suspect — and neither of them is a place to write.
 //!
 //! So the invariant is: **whenever an append offset comes back, every byte from it to the
 //! end of the region is erased, and the absolute offset it names is one this device can
@@ -379,8 +379,8 @@ impl JournalRegion {
 
 /// How a recovery ended, and — in one case only — where the next record may be written.
 ///
-/// The three are not degrees of the same thing; they are three different things a caller
-/// must do next.
+/// The four are not degrees of the same thing; they are four different things a caller must
+/// do next.
 ///
 /// # The fourth shape, and why it is not `Damaged`
 ///
@@ -485,8 +485,13 @@ pub enum RecoveryError<E> {
     /// The caller's page cannot hold what the next step has to stage.
     ///
     /// Not damage: the journal may be perfectly sound and this device simply cannot read a
-    /// record that long. `needed` is how many bytes the page would have had to hold,
-    /// rounded up to the device's read unit.
+    /// record that long. `needed` is how many bytes the page would have had to hold for
+    /// **the step that refused**, rounded up to the device's read unit — which is a header
+    /// when the scan had not read one yet, and a whole record once it had. A caller that
+    /// retries with exactly `needed` bytes can therefore be refused again at the same offset
+    /// with a larger number: the first refusal cannot know how long the frame is, because
+    /// reading the header is what would have told it. It converges, and a caller that sizes
+    /// its page from the region's granularity rather than from this number does not have to.
     PageTooSmall {
         /// Bytes the page would have had to hold.
         needed: usize,
@@ -642,10 +647,12 @@ impl<C: IntegrityCheck> Recovery<C> {
     /// # Errors
     ///
     /// [`RecoveryError::Decode`] for a frame that is malformed, integrity-failed, truncated
-    /// against the region, or wearing a record kind this firmware does not know;
-    /// [`RecoveryError::Storage`] when a read fails; and
-    /// [`RecoveryError::PageTooSmall`] when `page` cannot hold the next frame. Every one of
-    /// them ends the scan.
+    /// against the region, unsealed — [`DecodeError::Unsealed`], §09's first stop condition
+    /// and the one that says the writer never reached §07 step 3 — or wearing a record kind
+    /// this firmware does not know; [`RecoveryError::Storage`] when a read fails;
+    /// [`RecoveryError::WrongDevice`] when `storage` is not the device the region was
+    /// validated against; and [`RecoveryError::PageTooSmall`] when `page` cannot hold the
+    /// next record. Every one of them ends the scan.
     pub fn next<'page, S: StableStorage>(
         &mut self,
         storage: &mut S,

@@ -408,10 +408,12 @@ journal is scanned forward to the last valid committed record, and **where the s
 the whole of prefix safety**. The reader holds one caller-owned page and a position, so the
 picture below is the whole of its state: nothing in it grows with history.
 
-The three endings are the point. Only one of them yields a place to write, and the reason is
+The four endings are the point. Only one of them yields a place to write, and the reason is
 physics rather than caution — on NOR a programmed bit cannot be returned to one without
 erasing the block, so an append offset that is not the start of an erased run is a bank that
-never boots again.
+never boots again. The other three differ in what a caller does next: `Damaged` is media to
+suspect, `Unsealed` is an append the power interrupted, and `Incomplete` is a prefix that may
+be short and must not be replayed as though it were all of history.
 
 <!-- diagram: journal-recovery -->
 
@@ -425,9 +427,12 @@ flowchart TB
   erased -- "no" --> len["frame_len_of · header seal checked before payload_len is trusted"]
   len -- "malformed · integrity-failed · truncated" --> damaged
   len -- "longer than the page" --> incomplete(["Incomplete · no append offset"])
-  len -- "sound" --> frame["read the frame · decode_with"]
-  frame -- "unknown record kind, or a seal that does not hold" --> damaged
-  frame -- "a record" --> yield["yield it · offset += padded stride"]
+  len -- "sound" --> frame["read the record · decode_with"]
+  frame -- "malformed · integrity-failed" --> damaged
+  frame -- "a sound frame" --> seal["commit_seal_holds · the program unit after the padding"]
+  seal -- "no seal, a torn one, or another frame's" --> unsealed(["Unsealed · no append offset"])
+  seal -- "unknown record kind" --> damaged
+  seal -- "a committed record" --> yield["yield it · offset += padded stride + one seal"]
   yield --> read
   read -- "read failed" --> incomplete
 ```
@@ -435,9 +440,12 @@ flowchart TB
 Out-of-sequence is the one of §09's four stop conditions that is not drawn here, because it
 is not a fact about the bytes: `waymaker_core::ReplayCursor` owns it, a caller pairs the two,
 and a caller that stops pumping gets no append offset because an unfinished scan has none.
-Unsealed is issue [#24](https://github.com/madmax983/waymaker/issues/24)'s — until the commit
-seal exists, a torn tail and a damaged frame stop the scan in the same place, which is what
-§14 requires either way.
+The other three are all in the picture, and *unsealed* is the one issue
+[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame body with no commit
+seal over it is a frame whose writer never reached §07 step 3, so the record was never
+committed and never dispatched. Before the seal existed a torn tail and a damaged frame
+stopped the scan in the same place, which is what §14 requires either way — what the seal
+adds is the ability to say which of the two happened.
 
 ## Crash injection
 

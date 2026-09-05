@@ -34,7 +34,7 @@
 
 use std::collections::BTreeSet;
 
-use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
+use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef};
 use waymaker_fault::{Device, FaultError, Harness, RecordId, Run, Session, verify_recovery};
 use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign, Scan};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
@@ -185,20 +185,31 @@ fn recover_with(
 }
 
 /// The same journal read the in-RAM way, for the agreement check.
-fn scanned(image: &[u8]) -> (Vec<RecordId>, usize, bool) {
+///
+/// The third element is *which* verdict the scan reached rather than whether it reached one:
+/// a recovery that called every unsealed frame damaged would agree with a boolean and would
+/// be exactly the confusion issue #24's fourth ending exists to end.
+fn scanned(image: &[u8]) -> (Vec<RecordId>, usize, &'static str) {
     let mut scan = Scan::new(image, align());
     let mut found = Vec::new();
-    let mut failed = false;
+    let mut verdict = "clean";
     for step in &mut scan {
-        let Ok(record) = step else {
-            failed = true;
-            break;
+        let record = match step {
+            Ok(record) => record,
+            Err(DecodeError::Unsealed) => {
+                verdict = "unsealed";
+                break;
+            }
+            Err(_) => {
+                verdict = "damaged";
+                break;
+            }
         };
         if let Some(id) = id_of(&record) {
             found.push(id);
         }
     }
-    (found, scan.offset(), failed)
+    (found, scan.offset(), verdict)
 }
 
 #[test]
@@ -281,20 +292,24 @@ fn the_two_readers_agree_at_every_crash_point() {
     // drift, and this is what fails when they start to.
     for run in drive() {
         let (recovered, ending, _) = recover(run.image());
-        let (scanned, offset, failed) = scanned(run.image());
+        let (scanned, offset, verdict) = scanned(run.image());
         assert_eq!(
             recovered,
             scanned,
             "the two readers disagree at {:?}",
             run.injection()
         );
+        let reported = match ending {
+            Some(Ending::Clean { append_at }) if usize::try_from(append_at) == Ok(offset) => {
+                "clean"
+            }
+            Some(Ending::Unsealed { at }) if usize::try_from(at) == Ok(offset) => "unsealed",
+            Some(Ending::Damaged { at }) if usize::try_from(at) == Ok(offset) => "damaged",
+            _ => "elsewhere",
+        };
         assert_eq!(
-            matches!(
-                ending,
-                Some(Ending::Damaged { at } | Ending::Unsealed { at })
-                    if usize::try_from(at) == Ok(offset)
-            ),
-            failed,
+            reported,
+            verdict,
             "the two readers stopped differently at {:?}",
             run.injection()
         );

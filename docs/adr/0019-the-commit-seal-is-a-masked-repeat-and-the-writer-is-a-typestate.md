@@ -38,8 +38,9 @@ The alternative was to teach only the writer about seals and leave `Scan` and `R
 accepting an unsealed frame as history. That would make "never sealed but incomplete" a claim
 about a writer nobody is obliged to use, which is the shape of guarantee this repository does
 not accept. So a record is now a padded frame body **and** a commit seal, `frame::encoded_len`
-counts both, `DecodeError::Unsealed` is §09's missing fourth stop condition, and
-`Ending::Unsealed` is the fourth shape `recovery.rs` said it would need.
+counts both, `DecodeError::Unsealed` is the first of §09's four stop conditions and the last
+of them to be implemented, and `Ending::Unsealed` is the fourth shape `recovery.rs` said it
+would need.
 
 `Ending::Unsealed` is not `Damaged`, and the difference is what a caller does next. A damaged
 bank is a bank to suspect. An unsealed tail is the ordinary shape of a device that lost power
@@ -65,12 +66,24 @@ What the seal must do is three things, and the masked repeat does all three at e
   codec has already computed, so binding costs no third pass. A writer that sealed what it
   *meant* to write rather than what landed produces a seal the reader refuses.
 
-The cost is four bits: a seal binds at twenty-eight bits rather than thirty-two. The rejected
-alternative was to keep all thirty-two and special-case the one check value whose pattern is
-all ones — a branch taken once in 2^32, which means a branch whose first execution is on
-somebody's device, during recovery, years from now. §09 is explicit that a CRC "detects
-accidental corruption and torn writes; it is not authentication", and the first of those is
-what this is for.
+The first two hold at every width. The third does **not**, and review caught the ADR
+overstating it: a verifier compares `seal_bytes(align)` bytes, so the binding is
+`min(align, 4) * 7` bits — seven on a byte-programmable part, fourteen at two, twenty-eight
+from four up. Seven bits means a foreign byte where a seal should be is accepted about once
+in a hundred and twenty-eight. There is nowhere to put more of it in a one-byte program unit,
+so the number is written down rather than rounded up, in `frame.rs` and here.
+
+The rejected alternative to the mask was to keep all thirty-two bits and special-case the one
+check value whose pattern is all ones — a branch taken once in 2^32, which means a branch
+whose first execution is on somebody's device, during recovery, years from now. §09 is
+explicit that a CRC "detects accidental corruption and torn writes; it is not
+authentication", and the first of those is what this is for.
+
+One justification in the first draft was also weaker than it read. "A program writes bytes in
+order, so a tear leaves erased bytes at the end" is `waymaker_fault::Device`'s model rather
+than §12's contract, which promises only that a program "may fail or be interrupted". The
+conclusion survives without the assumption — a seal that did not land whole has *some* byte
+still reading `0xFF`, and no seal byte is `0xFF` — and the wording now says that instead.
 
 ### 3. The writer is three types, because the ordering has to not compile
 
@@ -136,8 +149,10 @@ dominate. That is §07's price and it was always going to be paid.
 every respect this type can see", and pinned the wrong answer in a test on purpose. A seal
 sits at a fixed offset from the frame it seals, so a reader that believes in a larger stride
 looks for it past the end of the real record and finds erased media — which is never a seal.
-The test now asserts the right answer. It is a CRC's kind of certainty rather than a proof:
-another record's bytes coinciding with the pattern is twenty-eight bits away.
+The test now asserts the right answer, and so does `Scan`'s own documentation, which had been
+the one place still claiming the hole. It is a CRC's kind of certainty rather than a proof:
+another record's bytes coinciding with the pattern is `min(align, 4) * 7` bits away, which on
+a byte-programmable part is seven.
 
 **The erased-tail walk is not closed.** `recovery.rs` named the commit seal as "the strongest
 practical argument" for making a boot cheaper, and that turned out to be wrong. A seal says a
@@ -176,10 +191,10 @@ reordering is a different harness and is owed. What the sweep *does* falsify is 
 seal-before-frame writer leaves a valid seal over a torn frame, and the honest writer never
 does, at any of the crash points the injector enumerates.
 
-**Code flash moved from 10 976 B to 14 668 B of a 16 384 B budget**, and the split is measured
+**Code flash moved from 10 976 B to 14 764 B of a 16 384 B budget**, and the split is measured
 rather than guessed. Linking the seal into the codec and the two readers, with the writer
 dead-stripped, is **13 396 B** — so the seal costs 2 420 B and the writer plus the probe
-section that keeps it alive costs a further 1 272 B. The budget is **not** raised: 1 716 B of
+section that keeps it alive costs a further 1 368 B. The budget is **not** raised: 1 620 B of
 headroom is left, which is less than rung 0.2 started with and is a conversation the next
 change on this path has to have rather than one this one settles.
 
@@ -192,11 +207,19 @@ module and every arm of its refusal; issue
 [#72](https://github.com/madmax983/waymaker/issues/72) is where the probe's share of the
 measurement is owed a proper attribution.
 
-**The ghost model did not change, and that is worth stating.** `waymaker-spec` describes a
-record as one durable unit written by one `Program` and made durable by one `Barrier`, and a
-partial write as a `Tear` that recovery must not produce. The two-barrier writer refines that
-exactly: with the seal at the end of a record's bytes, "the frame body landed and the seal did
-not" *is* a torn record, and the reader refuses it. Before this change a body-complete frame
-was a complete record, so the model and the code agreed for a different reason. No transition,
-no invariant and no proof needed editing, and `tests/refinement.rs` re-ran against the new
-codec unchanged.
+**The ghost model did not change, and what that is and is not evidence of.** `waymaker-spec`
+describes a record as one durable unit written by one `Program` and made durable by one
+`Barrier`, and a partial write as a `Tear` that recovery must not produce. With the commit
+seal at the end of a record's bytes, "the frame body landed and the seal did not" is a
+*prefix* of that record's bytes — so a two-barrier writer's intermediate state is a state the
+model already has a name for and already forbids recovering. No transition, no invariant and
+no proof needed editing, and `tests/refinement.rs` re-ran against the new codec unchanged.
+
+What that is **not** is evidence that the writer refines the model, and review was right to
+press on it. `waymaker-spec` imports `frame` and `storage` and never `append`;
+`tests/refinement.rs` writes each record with one `frame::encode` and one `session.program`,
+which is the one-shot writer the model describes rather than the two-step one this change
+adds. The model has no vocabulary for the barrier between them, so it could not tell the two
+apart even if it drove both. Holding the real writer to the model is owed, and belongs with
+the reordering harness the sweep also wants; it is written down in CLAUDE.md's "What is not
+checked" rather than left to be inferred from a passing test.

@@ -64,10 +64,20 @@
 //! [`Sealable::commit`] returns one record's, and [`Journal::amplification`] accumulates.
 //!
 //! What it does *not* do is divide. A ratio would link software division on
-//! `thumbv6m-none-eabi`, which [`crate::storage`] measures at 408 B of an 8 KiB budget, to
-//! compute a number a device with no console cannot print. The counters are exact, the
-//! division is the host's, and [`WriteAmplification::overhead_bytes`] is the one derived
-//! figure that costs a subtraction.
+//! `thumbv6m-none-eabi` — which [`crate::storage`] measures at 408 B, against a code-flash
+//! budget this whole engine has under two kilobytes of headroom in — to compute a number a
+//! device with no console cannot print. The counters are exact, the division is the host's,
+//! and [`WriteAmplification::overhead_bytes`] is the one derived figure that costs a
+//! subtraction.
+//!
+//! Issue #24 asks for it "per effect" and this reports it **per record**. §07 writes two
+//! records per effect — a schedule and an outcome — and nothing here groups them, because
+//! nothing here knows what an effect is: that is `waymaker-core`'s [`EffectId`], one layer
+//! down, and the dispatcher that owns the pairing is rung 0.4's. Adding two
+//! [`WriteAmplification`]s is [`WriteAmplification::plus`], and a caller that has the two
+//! records of an effect in hand has its figure.
+//!
+//! [`EffectId`]: waymaker_core::EffectId
 //!
 //! # What this module must not own
 //!
@@ -99,9 +109,10 @@ use crate::storage::StableStorage;
 /// [`programmed_bytes`](Self::programmed_bytes) over
 /// [`payload_bytes`](Self::payload_bytes). A record of eight payload bytes on a device with
 /// an eight-byte program unit costs a twenty-four-byte frame and an eight-byte seal, which
-/// is four times its payload; the same record on a byte-programmable part costs twenty-one,
-/// which is a little over two and a half. Neither number is computed here — see the module
-/// documentation for why a division is not free on the target this runs on.
+/// is four times its payload; the same record on a byte-programmable part costs the same
+/// twenty-four-byte frame and a one-byte seal, which is a little over three. Neither number
+/// is computed here — see the module documentation for why a division is not free on the
+/// target this runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WriteAmplification {
     payload_bytes: u32,

@@ -687,11 +687,14 @@ fn a_recovery_reads_what_a_scan_reads() {
         let image: Vec<u8> = device.media[..512].to_vec();
         let mut scan = Scan::new(&image, align(unit));
         let mut expected: Vec<Vec<u8>> = Vec::new();
-        let mut scan_failed = false;
+        let mut scan_failed = None;
         for step in &mut scan {
-            let Ok(record) = step else {
-                scan_failed = true;
-                break;
+            let record = match step {
+                Ok(record) => record,
+                Err(error) => {
+                    scan_failed = Some(error);
+                    break;
+                }
             };
             expected.push(describe(&record));
         }
@@ -705,13 +708,25 @@ fn a_recovery_reads_what_a_scan_reads() {
             u32::try_from(scan.offset()).expect("host"),
             "case {case}: the two readers stopped in different places"
         );
+        // Compared by *which* ending rather than by "did either stop", because that is the
+        // distinction issue #24 added: a recovery that called every unsealed frame damaged
+        // would pass a union and would be exactly the confusion the fourth variant exists to
+        // end.
+        let expected_ending = match scan_failed {
+            None => "clean",
+            Some(DecodeError::Unsealed) => "unsealed",
+            Some(_) => "damaged",
+        };
+        let reported = match ending {
+            Some(Ending::Clean { .. }) => "clean",
+            Some(Ending::Unsealed { .. }) => "unsealed",
+            Some(Ending::Damaged { .. }) => "damaged",
+            Some(Ending::Incomplete { .. }) => "incomplete",
+            None => "unfinished",
+        };
         assert_eq!(
-            matches!(
-                ending,
-                Some(Ending::Damaged { .. } | Ending::Unsealed { .. })
-            ),
-            scan_failed,
-            "case {case}: one reader refused a frame and the other did not"
+            reported, expected_ending,
+            "case {case}: the two readers classified the same journal differently"
         );
     }
 }

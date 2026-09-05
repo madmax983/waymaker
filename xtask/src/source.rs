@@ -1019,6 +1019,21 @@ pub const APPEND_BARRIER_STEP: &str = "payload_barrier";
 /// The one method a sealable frame is allowed to have.
 pub const APPEND_COMMIT_STEP: &str = "commit";
 
+/// The whole expression the payload barrier must be taken with.
+///
+/// A pin on the *spelling*, like [`RECOVERY_ROUTING_STEPS`], and for a sharper reason than
+/// usual. "Calls `storage.barrier` exactly once and uses the answer" is satisfied by
+/// `let ordered = storage.barrier(); let _ = ordered.is_ok();` — a body that hands back a
+/// [`Sealable`] after a barrier that *failed*, which is the one state
+/// `payload_barrier`'s postcondition says cannot exist. Review of this change wrote exactly
+/// that and watched the rule stay green.
+///
+/// So what is pinned is the propagation, characters and all. Whitespace is normalised before
+/// the comparison, so rustfmt may break the line; anything else is a line a reviewer writes.
+///
+/// [`Sealable`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+pub const APPEND_BARRIER_CALL: &str = "storage.barrier().map_err(AppendError::Storage)?";
+
 /// Rule: a commit seal cannot be programmed without the payload barrier in front of it.
 ///
 /// Issue #24's second "done when" is a `compile_fail` doctest in the crate itself, which
@@ -1076,7 +1091,8 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
     let code = without_test_modules(&code_only(contents));
 
     let [staged, sealable] = APPEND_TYPESTATE;
-    let Some(staged_impl) = inherent_impl_body(&code, staged) else {
+    let staged_impls = inherent_impl_bodies(&code, staged);
+    if staged_impls.is_empty() {
         violations.push(Violation::new(
             RULE,
             ADAPTER,
@@ -1086,9 +1102,10 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
             ),
         ));
         return violations;
-    };
+    }
+    let staged_impl = staged_impls.join("\n");
 
-    let staged_methods = declared_function_names(staged_impl);
+    let staged_methods = declared_function_names(&staged_impl);
     if staged_methods != vec![APPEND_BARRIER_STEP.to_owned()] {
         violations.push(Violation::new(
             RULE,
@@ -1100,7 +1117,7 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
             ),
         ));
     }
-    if count_tokens(staged_impl, "program") != 0 {
+    if count_tokens(&staged_impl, "program") != 0 {
         violations.push(Violation::new(
             RULE,
             ADAPTER,
@@ -1112,29 +1129,29 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
         ));
     }
 
-    match inherent_impl_body(&code, sealable) {
-        Some(body) => {
-            let methods = declared_function_names(body);
-            if methods != vec![APPEND_COMMIT_STEP.to_owned()] {
-                violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "`{sealable}` declares {methods:?} rather than only \
-                         `{APPEND_COMMIT_STEP}`: the one type that may program a seal should \
-                         do nothing else"
-                    ),
-                ));
-            }
-        }
-        None => violations.push(Violation::new(
+    let sealable_impls = inherent_impl_bodies(&code, sealable);
+    if sealable_impls.is_empty() {
+        violations.push(Violation::new(
             RULE,
             ADAPTER,
             format!(
                 "{APPEND_SURFACE_PATH} declares no inherent `impl` for `{sealable}`, so the \
                  only type that may program a commit seal is pinned against nothing"
             ),
-        )),
+        ));
+    } else {
+        let methods = declared_function_names(&sealable_impls.join("\n"));
+        if methods != vec![APPEND_COMMIT_STEP.to_owned()] {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{sealable}` declares {methods:?} rather than only \
+                     `{APPEND_COMMIT_STEP}`: the one type that may program a seal should do \
+                     nothing else"
+                ),
+            ));
+        }
     }
 
     // One construction, and it is the barrier's. A `Sealable { .. }` anywhere else is a
@@ -1154,41 +1171,61 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
             ),
         ));
     }
-    match barrier_body.map(|body| invocation(body, "storage.barrier")) {
-        Some(Invocation::Once) => {}
-        _ => violations.push(Violation::new(
+    let takes_the_barrier = barrier_body.is_some_and(|body| {
+        invocation(body, "storage.barrier") == Invocation::Once
+            && squeezed(body).contains(&squeezed(APPEND_BARRIER_CALL))
+    });
+    if !takes_the_barrier {
+        violations.push(Violation::new(
             RULE,
             ADAPTER,
             format!(
-                "`{APPEND_BARRIER_STEP}` does not call `storage.barrier` exactly once and use \
-                 the answer, so the step \u{a7}07 names is not the step it takes"
+                "`{APPEND_BARRIER_STEP}` does not take the barrier as \
+                 `{APPEND_BARRIER_CALL}`, exactly once: a body that calls it and does not \
+                 propagate the failure hands back a value that may program a seal over a \
+                 frame no barrier ever ordered"
             ),
-        )),
+        ));
     }
 
     violations
 }
 
-/// The body of the inherent `impl` block for `type_name`, if the file declares one.
+/// `code` with every run of whitespace collapsed, so a pinned expression survives rustfmt.
+fn squeezed(code: &str) -> String {
+    code.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// The bodies of every inherent `impl` block for `type_name` the file declares.
 ///
 /// Line-scanned by brace depth, like every other rule here. An `impl Trait for Type` is not
 /// one: its methods are the trait's, and a trait cannot add a way to program a seal without
 /// also declaring it.
-fn inherent_impl_body<'a>(code: &'a str, type_name: &str) -> Option<&'a str> {
+fn inherent_impl_bodies(code: &str, type_name: &str) -> Vec<String> {
+    let mut found = Vec::new();
     let mut cursor = 0_usize;
-    while let Some(at) = code.get(cursor..)?.find("\nimpl") {
+    // *Every* block, not the first. Review of this change pointed out that a second
+    // `impl Staged { .. }` further down the file is invisible to a rule that stops at the
+    // first, and a private helper in it could program a seal with the pin green.
+    while let Some(at) = code.get(cursor..).and_then(|rest| rest.find("\nimpl")) {
         let start = cursor.saturating_add(at).saturating_add(1);
-        let rest = code.get(start..)?;
+        let Some(rest) = code.get(start..) else {
+            break;
+        };
         cursor = start.saturating_add(5);
-        let header = rest.get(..rest.find('{').unwrap_or(0))?;
+        let Some(header) = rest.get(..rest.find('{').unwrap_or(0)) else {
+            continue;
+        };
         if header.contains(" for ") {
             continue;
         }
-        if implemented_type(header).as_deref() == Some(type_name) {
-            return braced_body(rest, "impl");
+        if implemented_type(header).as_deref() == Some(type_name)
+            && let Some(body) = braced_body(rest, "impl")
+        {
+            found.push(body.to_owned());
         }
     }
-    None
+    found
 }
 
 /// The type an inherent `impl` header names, with its generics stripped.
@@ -1237,10 +1274,14 @@ fn struct_literals(code: &str, name: &str) -> usize {
     code.match_indices(name)
         .filter(|(index, _)| {
             let before = code.get(..*index).unwrap_or_default();
+            // A `:` *is* allowed to precede a construction, unlike in `invocation`:
+            // `self::Sealable { .. }` and `crate::append::Sealable { .. }` build the same
+            // value the bare name does, and review of this change found that rejecting them
+            // let a second construction be added by writing one extra path segment.
             let before_is_boundary = before
                 .chars()
                 .next_back()
-                .is_none_or(|character| !continues(character) && character != ':');
+                .is_none_or(|character| !continues(character));
             // A declaration is not a construction, and a type with no generics puts the
             // brace in the same place a literal does: `impl Sealable {` and
             // `pub struct Sealable {` both have to be skipped by what line they are on.
@@ -5518,6 +5559,190 @@ mod deferred_answer_pins {
         assert!(violations.is_empty(), "{violations:?}");
     }
 
+    // -----------------------------------------------------------------------------------
+    // `commit-discipline` and the append routing
+    // -----------------------------------------------------------------------------------
+
+    /// The real writer, read off disk, so a rule that only the fixture satisfies is caught.
+    fn real_append_module() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(APPEND_SURFACE_PATH);
+        std::fs::read_to_string(&path).expect("the writer should exist")
+    }
+
+    #[test]
+    fn the_real_writer_satisfies_the_commit_discipline_it_is_pinned_by() {
+        let contents = real_append_module();
+        let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
+        assert!(violations.is_empty(), "{violations:?}");
+        let routing = check_append_routing(&[layer(APPEND_SURFACE_PATH, &contents)]);
+        assert!(routing.is_empty(), "{routing:?}");
+    }
+
+    #[test]
+    fn a_missing_writer_fails_both_of_its_rules_closed() {
+        // Two rules, two refusals: the pin cannot compare a surface that is not there, and
+        // the routing cannot say the writer seals with the check its caller chose.
+        assert_eq!(check_commit_discipline(&[]).len(), 1);
+        assert_eq!(check_append_routing(&[]).len(), 1);
+    }
+
+    #[test]
+    fn a_staged_frame_that_can_program_is_reported() {
+        let contents = real_append_module().replace(
+            "        self.journal.written = self.journal.written.barriering();",
+            "        let _ = storage.program(self.seal_at, self.seal);",
+        );
+        let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names `program`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_route_to_the_sealable_frame_is_reported() {
+        // Both spellings, because review of this change evaded the first one by qualifying
+        // the path: `self::Sealable { .. }` builds the same value the bare name does.
+        for spelling in ["Sealable {", "self::Sealable {"] {
+            let contents = real_append_module().replace(
+                "impl<C: IntegrityCheck> Sealable<'_, '_, C> {",
+                &format!(
+                    "impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
+                     fn assume(self) -> Sealable<'journal, 'page, C> {{ {spelling} \
+                     journal: self.journal, seal: self.seal, seal_at: self.seal_at, \
+                     stride: self.stride, record: self.record }} }} }}\n\
+                     impl<C: IntegrityCheck> Sealable<'_, '_, C> {{"
+                ),
+            );
+            let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("is constructed")),
+                "{spelling}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_impl_block_does_not_hide_a_method_from_the_pin() {
+        // The rule reads *every* inherent block for the type, not the first: a second
+        // `impl Staged` further down the file was invisible until review said so.
+        let contents = format!(
+            "{}\nimpl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
+             fn sneak(&self) {{}}\n}}\n",
+            real_append_module()
+        );
+        let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("sneak")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_payload_barrier_that_swallows_its_failure_is_reported() {
+        // The mutation review wrote: a barrier whose answer is bound and never propagated
+        // satisfies "called once and used", and hands back a value that may program a seal
+        // over a frame no barrier ever ordered.
+        let contents = real_append_module().replace(
+            APPEND_BARRIER_CALL,
+            "let ordered = storage.barrier();\n        let _ = ordered.is_ok()",
+        );
+        let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not take the barrier")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_seals_with_the_default_check_is_reported() {
+        let contents = real_append_module();
+        for (step, through) in APPEND_ROUTING_STEPS {
+            let stripped = contents.replace(&format!("{through}::<C>"), through);
+            let violations = check_append_routing(&[layer(APPEND_SURFACE_PATH, &stripped)]);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(step)),
+                "{step}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_writer_that_computes_a_seal_of_its_own_is_reported() {
+        for seal in SEAL_BINDINGS {
+            for named in [seal.delegates_to, seal.method] {
+                let source = format!(
+                    "//! Writer.\nfn stage() {{ frame::encode_with::<C>(r, a, p) }}\n\
+                     fn shadow(b: &[u8]) {{ {named}(b); }}\n"
+                );
+                let violations = check_append_routing(&[layer(APPEND_SURFACE_PATH, &source)]);
+                assert!(
+                    violations
+                        .iter()
+                        .any(|violation| violation.detail.contains(named)),
+                    "{named}: {violations:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_impl_header_names_the_type_rather_than_its_last_generic_parameter() {
+        // `impl<'a, C: IntegrityCheck> Sealable<'a, C>` is a block for `Sealable`, and the
+        // naive reading — the last whitespace-separated word — takes `C>` out of it.
+        assert_eq!(
+            implemented_type("impl<'journal, 'page, C: IntegrityCheck> Sealable<'journal, C> ")
+                .as_deref(),
+            Some("Sealable")
+        );
+        assert_eq!(
+            implemented_type("impl Journal ").as_deref(),
+            Some("Journal")
+        );
+        assert_eq!(
+            implemented_type("impl<C> Journal<C> ").as_deref(),
+            Some("Journal")
+        );
+        assert_eq!(implemented_type("impl ").as_deref(), None);
+        assert_eq!(implemented_type("struct Journal ").as_deref(), None);
+    }
+
+    #[test]
+    fn a_declaration_and_a_return_type_are_not_constructions() {
+        // The three shapes that put a brace where a literal does, and the two that are one.
+        assert_eq!(
+            struct_literals("pub struct Seal {\n    a: u8,\n}\n", "Seal"),
+            0
+        );
+        assert_eq!(
+            struct_literals("impl Seal {\n    fn f() {}\n}\n", "Seal"),
+            0
+        );
+        assert_eq!(
+            struct_literals("fn f(self) -> Seal {\n    x\n}\n", "Seal"),
+            0
+        );
+        assert_eq!(struct_literals("fn f() { Seal { a: 1 } }\n", "Seal"), 1);
+        assert_eq!(
+            struct_literals("fn f() { self::Seal { a: 1 } }\n", "Seal"),
+            1
+        );
+        assert_eq!(struct_literals("fn f() { Sealed { a: 1 } }\n", "Seal"), 0);
+    }
+
     #[test]
     fn a_missing_recovery_reader_fails_closed() {
         assert_eq!(check_recovery_routing(&[]).len(), 1);
@@ -6123,8 +6348,8 @@ pub mod tests_support {
     use std::collections::BTreeSet;
 
     use super::{
-        APPEND_BARRIER_STEP, APPEND_COMMIT_STEP, APPEND_ROUTING_STEPS, APPEND_SURFACE,
-        APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION,
+        APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_STEP, APPEND_ROUTING_STEPS,
+        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION,
         EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
         RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS,
         SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
@@ -6362,7 +6587,7 @@ pub mod tests_support {
 
         let _ = writeln!(
             source,
-            "impl {staged} {{\n    pub fn {APPEND_BARRIER_STEP}(self) -> {sealable} {{\n                     let ordered = storage.barrier();\n        let _ = ordered;\n        {sealable}              {{}}\n    }}\n}}"
+            "impl {staged} {{\n    pub fn {APPEND_BARRIER_STEP}(self) -> {sealable} {{\n        {APPEND_BARRIER_CALL};\n        {sealable} {{}}\n    }}\n}}"
         );
         let _ = writeln!(
             source,

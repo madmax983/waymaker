@@ -20,6 +20,18 @@
 //! [`waymaker_flash::append`] to the session to do it, because the writer API has no way to
 //! express it — which is the guarantee, demonstrated from the outside.
 //!
+//! # The granularity this sweep runs at
+//!
+//! One: the journal's granularity is the device's program unit, so a commit seal here is one
+//! program call of one program unit. A journal written at a *coarser* granularity — which
+//! [`waymaker_flash::bank::BankHeader`] exists to record — has a seal several program units
+//! wide, and this sweep does not enumerate a crash inside one. Two things cover it between
+//! them and neither is this file: `waymaker-flash`'s
+//! `a_seal_wider_than_the_devices_program_unit_is_written_and_read_back` drives the writer
+//! and the reader through that shape and asserts the program lengths, and `tests/commit.rs`'s
+//! `every_torn_seal_is_refused` sweeps every tear point of a seal at widths up to sixty-four.
+//! What is missing is the two together, and it is missing rather than argued away.
+//!
 //! # What this file cannot falsify
 //!
 //! That the *payload barrier* is necessary. §12 requires that "no later mutation may become
