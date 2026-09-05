@@ -710,16 +710,21 @@ Issue #23 then makes recovery a thing a *device* does. `frame::Scan` walks a jou
 already in RAM, which §04's 768 B runtime budget — stated with a 512 B scratch page — says a
 device cannot do with a 4 KiB bank; `waymaker-flash`'s `recovery` module is the other reader.
 `JournalRegion` is the bytes between a bank's header and its seal, validated once as a legal
-read and refusing a granularity below the device's read unit, so every frame boundary inside
-it is an offset the device can name. `Recovery` is a position in that region and nothing else
-— twenty-four bytes, asserted at compile time — pumped by its caller with a page it never
-retains, which is [ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md)'s
-decision made twice for the same reason. And `Ending` is what a finished scan learned, with
+*program* rather than as a read — a geometry nests, so whatever may be programmed may be
+read, and a region that is readable but not programmable is one whose append offset no driver
+would accept. It also keeps the geometry it was validated against and every step compares
+that against the storage it is handed, because bounds proved on one device say nothing about
+another. `Recovery` is a position in that region and nothing else — forty bytes, a 28-byte
+region and an offset and a verdict, all asserted at compile time — pumped by its caller with
+a page it never retains, which is
+[ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md)'s decision made twice
+for the same reason. And `Ending` is what a finished scan learned, with
 the append offset carried by exactly one of its three shapes: a scan that stopped at damage
 has nowhere safe to write, because without §09's commit seal it may have stopped at a
 half-programmed header, and on NOR appending there — or past it — is a bank that never boots
 again. The invariant is that an append offset is always the start of an erased run reaching
-the end of the region, and it is *swept* rather than asserted: `waymaker-fault` drives the
+the end of the region *and* an offset this device can program at, and it is *swept* rather
+than asserted: `waymaker-fault` drives the
 real reader over media a real crash left behind, at every point a power loss can land, with a
 tooth that finds a crash point at which the obvious implementation would have pointed at
 programmed media. Two readers of one format drift, so they are held to each other — 256
@@ -731,7 +736,12 @@ before the payload is in hand. See
 [ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md),
 which also says what is owed — "unsealed" is issue #24's, so a torn tail and a damaged frame
 still stop the scan in the same place, and out-of-sequence stays the replay cursor's, held
-sound by an append offset derived from the ending rather than from the offset.
+sound by an append offset derived from the ending rather than from the offset. Both halves of
+the append guarantee were found by review rather than by writing them down: the region
+validated only as a read, and then the captured geometry never compared with the caller's
+storage. The erased-tail walk is the cost that will be felt first — a 64 KiB bank with a
+512 B page is 128 reads on every boot, however short its history — and it is the strongest
+practical argument for that commit seal.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The
