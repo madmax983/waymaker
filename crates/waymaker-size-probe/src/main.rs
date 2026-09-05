@@ -1236,7 +1236,7 @@ fn capacity_reserve(
     let mut kept = frame::encoded_len_for(core::hint::black_box(8), layout.align()).unwrap_or(0);
     kept = kept
         .wrapping_add(reserve.tail_bytes() as usize)
-        .wrapping_add(reserve.swap_bytes() as usize);
+        .wrapping_add(reserve.rollover_bytes() as usize);
 
     let schedule = RecordRef::EffectScheduled {
         seq: EffectSeq(core::hint::black_box(0)),
@@ -1245,25 +1245,26 @@ fn capacity_reserve(
         input_crc: core::hint::black_box(0x0BAD_F00D),
     };
     kept = kept.wrapping_add(reserve.exit_bytes_after(&schedule) as usize);
-    // Both arms of the predicate: a journal with room, and one at its boundary.
-    kept = kept.wrapping_add(
-        match reserve.admits(&schedule, core::hint::black_box(4096)) {
+    // Both arms of the predicate: a journal with room, and one at its boundary. Driven from
+    // one call site rather than two, because two would charge this row twice for a body the
+    // linker keeps once.
+    for room in [core::hint::black_box(4096), core::hint::black_box(0)] {
+        kept = kept.wrapping_add(match reserve.admits(&schedule, room) {
             Ok(()) => 1,
             Err(error) => admission_cost(error),
-        },
-    );
-    kept = kept.wrapping_add(match reserve.admits(&schedule, core::hint::black_box(0)) {
-        Ok(()) => 1,
-        Err(error) => admission_cost(error),
-    });
+        });
+    }
 
     // And the gate itself, over the writer `journal_append` positioned.
-    kept = kept.wrapping_add(journal.region().bytes() as usize);
     let mut writer = match Reserved::over(journal, reserve) {
         Ok(writer) => writer,
         Err(error) => return kept.wrapping_add(capacity_error_cost(error)),
     };
-    kept = kept.wrapping_add(writer.journal().room() as usize);
+    kept = kept
+        .wrapping_add(writer.journal().room() as usize)
+        // §10 step 1 is "stop accepting new effects", which a dispatcher asks the reserve
+        // rather than the writer — so the accessor that lets it is linked too.
+        .wrapping_add(writer.reserve().tail_bytes() as usize);
 
     let mut staging = [0_u8; 64];
     kept = kept.wrapping_add(
@@ -1296,10 +1297,10 @@ const fn capacity_error_cost(error: waymaker_flash::capacity::CapacityError) -> 
     error.message().len()
 }
 
-/// Both answers §10's admission can refuse with.
+/// Every answer §10's admission can refuse with, and the kernel's word for each.
 #[cfg(feature = "engine")]
-const fn admission_cost(error: waymaker_core::KernelError) -> usize {
-    error.message().len()
+const fn admission_cost(error: waymaker_flash::capacity::Refusal) -> usize {
+    error.kernel_error().message().len()
 }
 
 /// Every counter a write amplification reports, so the delta charges for all of them.

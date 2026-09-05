@@ -45,7 +45,7 @@ dashed edges — the contract is the solid ones.
 ```mermaid
 graph TD
   waymaker-embassy["waymaker-embassy<br/>async façade · Ctx · dispatcher · wakeups · clock"]
-  waymaker-flash["waymaker-flash<br/>two banks · wire encoding · CRC and seals · compaction"]
+  waymaker-flash["waymaker-flash<br/>two banks · wire encoding · CRC and seals · capacity reserve · compaction"]
   waymaker-core["waymaker-core<br/>records · replay cursor · effect identity · transition rules"]
   waymaker-size-probe["waymaker-size-probe<br/>linked to be measured, never shipped"]
   waymaker-fault["waymaker-fault<br/>storage model · crash injector · never flashed"]

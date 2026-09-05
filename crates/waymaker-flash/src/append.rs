@@ -370,14 +370,14 @@ impl<C: IntegrityCheck> Journal<C> {
 
     /// The region this writer appends to.
     ///
-    /// Read-only, and [`JournalRegion`] is `Copy`, so handing one out cannot move a writer
-    /// or widen what it may program. It is here because a *policy* above this type — §10's
-    /// capacity reserve, in [`crate::capacity`] — has to know the granularity the journal
-    /// was written at before it can say what a record costs, and taking that from anywhere
-    /// but the writer's own region is how a reserve computed for one device ends up
-    /// under-reserving on another.
-    #[must_use]
-    pub const fn region(&self) -> JournalRegion {
+    /// `pub(crate)` on purpose. §10's capacity reserve, in [`crate::capacity`], has to know
+    /// the granularity and the size of the journal before it can say what a record costs,
+    /// and taking those from anywhere but the writer's own region is how a reserve computed
+    /// for one device ends up under-reserving on another — but that caller is one module
+    /// away, and this type's public surface is the one `commit-discipline` exists to make
+    /// expensive. A crate-private accessor serves the caller without widening the pin, and
+    /// without obliging the size probe to link a call it has no use for.
+    pub(crate) const fn region(&self) -> JournalRegion {
         self.region
     }
 

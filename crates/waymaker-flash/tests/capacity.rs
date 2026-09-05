@@ -15,10 +15,10 @@
 //! a state from which it can never write one, because §08's transition table has no edge
 //! from an unresolved effect to a terminal record.
 
-use waymaker_core::{ActivityKind, DecodeError, EffectSeq, KernelError, RecordRef, RunId};
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::{AppendError, Journal, WriteAmplification};
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
-use waymaker_flash::capacity::{Bounds, CapacityError, Reserve, Reserved, ReservedError};
+use waymaker_flash::capacity::{Bounds, CapacityError, Refusal, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
@@ -61,6 +61,20 @@ impl Nor {
     /// The whole image, copied out so a later mutation cannot change it.
     fn snapshot(&self) -> Vec<u8> {
         self.media.clone()
+    }
+
+    /// `len` bytes at `at`, copied out for the same reason.
+    fn window(&self, at: u32, len: u32) -> Vec<u8> {
+        let (Ok(start), Ok(width)) = (usize::try_from(at), usize::try_from(len)) else {
+            unreachable!("a host holds any offset this file describes")
+        };
+        let Some(bytes) = start
+            .checked_add(width)
+            .and_then(|end| self.media.get(start..end))
+        else {
+            unreachable!("the windows in this file are inside the device")
+        };
+        bytes.to_vec()
     }
 }
 
@@ -216,6 +230,14 @@ const fn outcome(seq: u32) -> RecordRef<'static> {
     }
 }
 
+const fn opening() -> RecordRef<'static> {
+    RecordRef::RunStarted {
+        workflow_kind: 0x0042,
+        workflow_version: 3,
+        input: &NEXT_RUN_INPUT,
+    }
+}
+
 const fn terminal() -> RecordRef<'static> {
     RecordRef::RunCompleted {
         result: &TERMINAL_RESULT,
@@ -237,9 +259,24 @@ fn width(record: &RecordRef<'_>) -> u32 {
 ///
 /// §10's steps 3 to 6, done by hand because the writer that will do them is issue #26's.
 fn install(device: &mut Nor, id: BankId, generation: Generation, input: &[u8]) -> JournalRegion {
-    let region = layout().bank(id);
+    install_on(device, layout(), id, generation, input)
+}
+
+/// [`install`] on a layout other than this file's default.
+fn install_on(
+    device: &mut Nor,
+    layout: BankLayout,
+    id: BankId,
+    generation: Generation,
+    input: &[u8],
+) -> JournalRegion {
+    let region = layout.bank(id);
     let mut staging = [0_u8; PAGE];
-    let head = BankHeader { input, ..header() };
+    let head = BankHeader {
+        align: layout.align(),
+        input,
+        ..header()
+    };
     let Ok(header_len) = bank::encode_header(&head, &mut staging) else {
         unreachable!("a bank holds its own header")
     };
@@ -256,7 +293,7 @@ fn install(device: &mut Nor, id: BankId, generation: Generation, input: &[u8]) -
         unreachable!("a header frame can be sealed")
     };
     let mut seal_bytes = [0_u8; 64];
-    let Ok(seal_len) = bank::encode_seal(&seal, align(), &mut seal_bytes) else {
+    let Ok(seal_len) = bank::encode_seal(&seal, layout.align(), &mut seal_bytes) else {
         unreachable!("a seal fits its own region")
     };
     let Some(sealed) = seal_bytes.get(..seal_len) else {
@@ -268,7 +305,7 @@ fn install(device: &mut Nor, id: BankId, generation: Generation, input: &[u8]) -
     let Ok(()) = device.barrier() else {
         unreachable!("this device's barrier does not fail")
     };
-    let Ok(journal) = JournalRegion::of(layout(), id, &head) else {
+    let Ok(journal) = JournalRegion::of(layout, id, &head) else {
         unreachable!("this bank has room for a journal")
     };
     journal
@@ -307,10 +344,15 @@ fn opened(device: &mut Nor, region: JournalRegion) -> Journal {
 
 /// A reserved writer over `region`.
 fn reserved(device: &mut Nor, region: JournalRegion) -> Reserved {
-    let Ok(reserved) = Reserved::over(opened(device, region), reserve()) else {
-        unreachable!("this reserve was computed for this layout")
+    gated(device, region, reserve())
+}
+
+/// A writer over `region`, gated by `reserve`.
+fn gated(device: &mut Nor, region: JournalRegion, reserve: Reserve) -> Reserved {
+    let Ok(writer) = Reserved::over(opened(device, region), reserve) else {
+        unreachable!("this reserve was priced for this journal")
     };
-    reserved
+    writer
 }
 
 /// Writes `record` through the whole protocol, reserve first.
@@ -351,7 +393,7 @@ fn fill_to_the_boundary(writer: &mut Reserved, device: &mut Nor) -> u32 {
     loop {
         match commit(writer, device, &schedule(committed)) {
             Ok(_) => {}
-            Err(ReservedError::Capacity(KernelError::HistoryNearCapacity)) => return committed,
+            Err(ReservedError::Capacity(Refusal::NearCapacity)) => return committed,
             Err(other) => unreachable!("a schedule was refused for {other:?}"),
         }
         let Ok(_) = commit(writer, device, &outcome(committed)) else {
@@ -403,11 +445,11 @@ fn a_reserve_carries_what_continue_as_new_costs_the_bank_it_rolls_into() {
     let Some(padded) = head.journal_offset() else {
         unreachable!("a header this size has a journal offset")
     };
-    assert_eq!(reserve().swap_bytes(), 64);
+    assert_eq!(reserve().rollover_bytes(), 64);
     assert_eq!(
         u32::try_from(padded),
-        Ok(reserve().swap_bytes()),
-        "the swap figure is the padded header frame a continue_as_new writes"
+        Ok(reserve().rollover_bytes()),
+        "the roll-over figure is the padded header frame a continue_as_new writes"
     );
 }
 
@@ -488,6 +530,24 @@ fn a_reserve_refuses_bounds_whose_own_tail_a_bank_could_not_hold() {
 }
 
 #[test]
+fn a_gate_refuses_a_journal_smaller_than_the_one_its_reserve_was_priced_for() {
+    // `for_layout` priced a bank's worst-case journal; nothing about a `Reserve` value ties
+    // it to that bank afterwards. Review of this change built one on a 4 KiB layout, handed
+    // it a journal from a 256 B device of the same granularity, and watched every
+    // `RunStarted` be refused for ever with the journal empty. Refused at the gate instead.
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+    let Ok(cramped) = JournalRegion::spanning(geometry(), region.base(), 64, align()) else {
+        unreachable!("64 bytes at a bank's journal base is a legal program region")
+    };
+    let journal = opened(&mut device, cramped);
+    assert_eq!(
+        Reserved::over(journal, reserve()).map(|_| ()),
+        Err(CapacityError::RegionTooSmall)
+    );
+}
+
+#[test]
 fn a_reserve_refuses_a_journal_written_at_another_granularity() {
     // A reserve computed at a byte-programmable granularity under-reserves on a device with
     // an eight-byte program unit: every frame there is padded and every figure is too small.
@@ -507,6 +567,152 @@ fn a_reserve_refuses_a_journal_written_at_another_granularity() {
     assert_eq!(
         Reserved::over(journal, fine_reserve).map(|_| ()),
         Err(CapacityError::WrongGranularity)
+    );
+}
+
+#[test]
+fn a_reserve_refuses_bounds_whose_run_could_start_and_end_and_never_do_any_work() {
+    // The floor is "can be *used*", not "can end". These bounds fit a 128-byte bank's
+    // opening record and its exit, and leave no room for the `EffectScheduled` between
+    // them — a run that can start, and finish, and never schedule anything. A floor that
+    // priced only `max(opening record + terminal, tail)` accepts this.
+    let Ok(geometry) = Geometry::new(256, 128, 8, 1) else {
+        unreachable!("256 is two whole 128-byte blocks of whole 8-byte units")
+    };
+    let Ok(small) = BankLayout::new(geometry) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    let bounds = Bounds {
+        run_input_bytes: 8,
+        effect_result_bytes: 0,
+        terminal_bytes: 0,
+    };
+    assert_eq!(
+        Reserve::for_layout(bounds, small),
+        Err(CapacityError::ReserveDoesNotFit)
+    );
+}
+
+#[test]
+fn a_bound_no_record_could_carry_is_not_reported_as_a_bank_being_too_small() {
+    // §09's `payload_len` is a `u16` and a `RunStarted` spends four of those bytes on the
+    // workflow identity, so a run input a *header* can carry is not always one a record can.
+    // No bank will fix that, and the refusal has to say so or it sends an operator to the
+    // geometry. A 4 MiB device with 1 MiB banks is one whose header really could carry it.
+    let Ok(geometry) = Geometry::new(4 * 1024 * 1024, 1024 * 1024, 8, 1) else {
+        unreachable!("4 MiB is four whole 1 MiB blocks")
+    };
+    let Ok(large) = BankLayout::new(geometry) else {
+        unreachable!("four erase blocks are two banks of two")
+    };
+    let bounds = Bounds {
+        run_input_bytes: u16::MAX,
+        ..BOUNDS
+    };
+    assert_eq!(
+        large.bank(BankId::A).max_run_input_bytes(large.align()),
+        usize::from(u16::MAX),
+        "a 1 MiB bank's header really can carry the longest input the field describes"
+    );
+    assert_eq!(
+        Reserve::for_layout(bounds, large),
+        Err(CapacityError::BoundUnencodable)
+    );
+}
+
+#[test]
+fn every_layout_a_reserve_accepts_can_run_an_effect_end_to_end() {
+    // `for_layout`'s postcondition, swept rather than asserted about one fixture: whenever a
+    // reserve exists, the worst-case journal behind a worst-case header admits the opening
+    // record, a schedule, its outcome and a terminal record, in that order, with the room
+    // each leaves behind. A floor that dropped any of its four terms shows up here as a
+    // refusal on a layout `for_layout` said was fine.
+    let mut accepted = 0_u32;
+    for (capacity, erase, unit) in [
+        (256_u32, 128_u32, 1_u16),
+        (256, 128, 8),
+        (512, 256, 4),
+        (1024, 512, 8),
+        (4096, 1024, 16),
+        (8192, 4096, 8),
+        (65_536, 4096, 32),
+    ] {
+        for run_input in [0_u16, 1, 8, 64] {
+            for result in [0_u16, 1, 32, 200] {
+                let (Ok(geometry), Some(_)) = (
+                    Geometry::new(capacity, erase, u32::from(unit), 1),
+                    ProgramAlign::new(unit),
+                ) else {
+                    continue;
+                };
+                let Ok(layout) = BankLayout::new(geometry) else {
+                    continue;
+                };
+                let bounds = Bounds {
+                    run_input_bytes: run_input,
+                    effect_result_bytes: result,
+                    terminal_bytes: result,
+                };
+                let Ok(reserve) = Reserve::for_layout(bounds, layout) else {
+                    continue;
+                };
+                accepted = accepted.saturating_add(1);
+
+                // The journal a `continue_as_new` at these bounds would leave behind.
+                let region = layout.bank(BankId::A);
+                let Some(mut room) = region.payload_bytes().checked_sub(reserve.rollover_bytes())
+                else {
+                    unreachable!("a reserve that exists was priced inside its bank")
+                };
+
+                let input = std::vec![0_u8; usize::from(run_input)];
+                let payload = std::vec![0_u8; usize::from(result)];
+                let run = layout.align();
+                let sequence: [RecordRef<'_>; 4] = [
+                    RecordRef::RunStarted {
+                        workflow_kind: 1,
+                        workflow_version: 1,
+                        input: &input,
+                    },
+                    RecordRef::EffectScheduled {
+                        seq: EffectSeq(0),
+                        kind: DOWNLOAD,
+                        input_len: 0,
+                        input_crc: 0,
+                    },
+                    RecordRef::EffectCompleted {
+                        seq: EffectSeq(0),
+                        result: &payload,
+                    },
+                    RecordRef::RunCompleted { result: &payload },
+                ];
+                for record in &sequence {
+                    assert_eq!(
+                        reserve.admits(record, room),
+                        Ok(()),
+                        "a reserve for {bounds:?} on {capacity}/{erase}/{unit} refused \
+                         {record:?} with {room} B left"
+                    );
+                    let Ok(bytes) = frame::encoded_len(record, run) else {
+                        unreachable!("a record the reserve admitted encodes")
+                    };
+                    let (Ok(width), Some(left)) = (
+                        u32::try_from(bytes),
+                        room.checked_sub(u32::try_from(bytes).unwrap_or(u32::MAX)),
+                    ) else {
+                        unreachable!(
+                            "a record the reserve admitted fits the room it was admitted for"
+                        )
+                    };
+                    let _ = width;
+                    room = left;
+                }
+            }
+        }
+    }
+    assert!(
+        accepted > 20,
+        "the sweep accepted {accepted} layouts, which is too few to be saying anything"
     );
 }
 
@@ -557,7 +763,7 @@ fn continue_as_new_succeeds_from_the_near_capacity_state() {
     assert!(effects > 0);
     assert_eq!(
         commit(&mut writer, &mut device, &schedule(effects)),
-        Err(ReservedError::Capacity(KernelError::HistoryNearCapacity)),
+        Err(ReservedError::Capacity(Refusal::NearCapacity)),
         "the run is at its reserve boundary"
     );
 
@@ -580,11 +786,93 @@ fn continue_as_new_succeeds_from_the_near_capacity_state() {
         Some(Generation(2))
     );
 
-    // And the new run can do what the old one could no longer do: schedule an effect.
+    // And the new run can do everything the reserve promised the *next* run could: the bank
+    // it rolled into runs to its own boundary and still ends. That is `for_layout`'s floor —
+    // an opening record, one effect scheduled and resolved, and an exit — asserted end to
+    // end on media rather than as arithmetic, with the header at exactly the declared bound.
     let mut rolled = reserved(&mut device, next);
     assert_eq!(rolled.journal().offset(), 0);
-    commit(&mut rolled, &mut device, &schedule(0))
-        .expect("a freshly rolled-over bank has room for a schedule");
+    commit(&mut rolled, &mut device, &opening())
+        .expect("a rolled-over bank has room for its own opening record");
+    let effects = fill_to_the_boundary(&mut rolled, &mut device);
+    assert!(
+        effects > 0,
+        "the reserve priced this bank for at least one effect"
+    );
+    commit(&mut rolled, &mut device, &terminal()).expect("and for the exit after it");
+    assert!(
+        device
+            .window(layout().bank(BankId::B).base(), 4)
+            .iter()
+            .any(|byte| *byte != ERASED_BYTE),
+        "the rolled-into bank really was written"
+    );
+}
+
+#[test]
+fn the_exit_is_still_open_after_a_reset_at_the_boundary() {
+    // The reserve's real claim is not about one call: it is that a device which admitted a
+    // record can still write its exit *after any reset*. On a reboot the writer is rebuilt
+    // from a recovery of media and the reserve is recomputed from the bounds and the
+    // geometry, and nothing else in this file exercises that join.
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+    let mut writer = reserved(&mut device, region);
+    let effects = fill_to_the_boundary(&mut writer, &mut device);
+    assert!(effects > 0);
+    let offset = writer.journal().offset();
+
+    // The power goes here. Everything below is what the next boot does: a fresh recovery of
+    // the same media, a fresh reserve from the same bounds, and a fresh gate over the two.
+    // The writer above is not used again.
+    let _ = writer;
+    let mut rebooted = reserved(&mut device, region);
+    assert_eq!(
+        rebooted.journal().offset(),
+        offset,
+        "recovery found the same append point the writer left"
+    );
+    assert_eq!(
+        commit(&mut rebooted, &mut device, &schedule(effects)),
+        Err(ReservedError::Capacity(Refusal::NearCapacity)),
+        "and the same boundary"
+    );
+    commit(&mut rebooted, &mut device, &terminal())
+        .expect("the exit the reserve was kept for survives a reset");
+}
+
+#[test]
+fn the_reserve_holds_at_every_program_granularity() {
+    // Every media-driving test above runs at one granularity, and every figure in a reserve
+    // is padded to the program unit. `tests/append.rs` sweeps the seal's width the same way
+    // and for the same reason: a reserve correct only at eight-byte units is a reserve
+    // nobody outside this fixture can use.
+    for unit in [1_u32, 2, 4, 8, 16, 32] {
+        let (Ok(geometry), Some(_)) =
+            (Geometry::new(8192, 4096, unit, 1), u16::try_from(unit).ok())
+        else {
+            unreachable!("a legal geometry")
+        };
+        let Ok(layout) = BankLayout::new(geometry) else {
+            unreachable!("two erase blocks are two banks")
+        };
+        let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+            unreachable!("these bounds fit a 4 KiB bank at any granularity")
+        };
+
+        let mut device = Nor::new(geometry);
+        let region = install_on(&mut device, layout, BankId::A, Generation(1), RUN_INPUT);
+        let mut writer = gated(&mut device, region, reserve);
+        let effects = fill_to_the_boundary(&mut writer, &mut device);
+        assert!(
+            effects > 0,
+            "a 4 KiB bank at a {unit}-byte program unit holds at least one effect"
+        );
+        assert!(
+            commit(&mut writer, &mut device, &terminal()).is_ok(),
+            "the exit is still open at a {unit}-byte program unit"
+        );
+    }
 }
 
 #[test]
@@ -604,7 +892,7 @@ fn a_refused_schedule_moves_no_byte_and_asks_the_device_for_nothing() {
 
     assert_eq!(
         commit(&mut writer, &mut device, &schedule(effects)),
-        Err(ReservedError::Capacity(KernelError::HistoryNearCapacity))
+        Err(ReservedError::Capacity(Refusal::NearCapacity))
     );
 
     assert_eq!(device.ops, Vec::new(), "the device was never asked");
@@ -660,7 +948,7 @@ fn a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding() {
             let room_before = journal.room() + width(&schedule(seq));
             assert_eq!(
                 reserve().admits(&schedule(seq), room_before),
-                Err(KernelError::HistoryNearCapacity),
+                Err(Refusal::NearCapacity),
                 "§10's reserve refuses the schedule the terminal-only rule admitted"
             );
             return;
@@ -699,6 +987,53 @@ fn an_admitted_record_always_fits_the_journal_it_was_admitted_for() {
 }
 
 #[test]
+fn a_record_that_exactly_fits_beside_what_it_owes_is_admitted() {
+    // The completeness half. `an_admitted_record_always_fits_the_journal_it_was_admitted_for`
+    // is one-directional — it is satisfied by an `admits` that refuses everything — so the
+    // exact boundary is pinned here, one byte either side of it, for a record that owes
+    // nothing and for one that owes the whole tail.
+    let reserve = reserve();
+    for record in [terminal(), schedule(0), outcome(0)] {
+        let needed = width(&record) + reserve.exit_bytes_after(&record);
+        assert_eq!(
+            reserve.admits(&record, needed),
+            Ok(()),
+            "a record that exactly fits beside what it owes is admitted"
+        );
+        assert_eq!(
+            reserve.admits(&record, needed - 1),
+            Err(Refusal::NearCapacity),
+            "and one byte less is not"
+        );
+    }
+}
+
+#[test]
+fn a_run_started_at_its_declared_bound_is_admitted_and_priced_from_the_codec() {
+    // `start_bytes` is the one ceiling no other test exercises: `RunStarted` appears
+    // elsewhere only in the over-length refusal. A four-byte error in the workflow-identity
+    // prefix makes a run unable to write its own first record, for ever.
+    let reserve = reserve();
+    let at_the_bound = RecordRef::RunStarted {
+        workflow_kind: 0x0042,
+        workflow_version: 3,
+        input: &NEXT_RUN_INPUT,
+    };
+    assert_eq!(reserve.admits(&at_the_bound, 4096), Ok(()));
+    // And priced at exactly what the codec charges, the way the outcome and the terminal
+    // record are: a ceiling derived from a constant that drifted from `frame::body` would
+    // refuse a legal record rather than admit an oversized one, which is silent.
+    let needed = width(&at_the_bound) + reserve.exit_bytes_after(&at_the_bound);
+    assert_eq!(reserve.admits(&at_the_bound, needed), Ok(()));
+    assert_eq!(
+        reserve.admits(&at_the_bound, needed - 1),
+        Err(Refusal::NearCapacity),
+        "an opening record priced above the codec's figure would refuse here for the wrong \
+         reason"
+    );
+}
+
+#[test]
 fn a_record_longer_than_the_bounds_the_reserve_was_computed_from_is_refused() {
     // A reserve is a promise about records of a declared size. A terminal record longer than
     // its bound is a record the reserve never budgeted for, and admitting it would make the
@@ -707,7 +1042,7 @@ fn a_record_longer_than_the_bounds_the_reserve_was_computed_from_is_refused() {
     let oversized = [0_u8; 64];
     assert_eq!(
         reserve().admits(&RecordRef::RunCompleted { result: &oversized }, 4096),
-        Err(KernelError::Decode(DecodeError::LengthOutOfBounds))
+        Err(Refusal::OverDeclaredBound)
     );
     assert_eq!(
         reserve().admits(
@@ -717,7 +1052,7 @@ fn a_record_longer_than_the_bounds_the_reserve_was_computed_from_is_refused() {
             },
             4096
         ),
-        Err(KernelError::Decode(DecodeError::LengthOutOfBounds))
+        Err(Refusal::OverDeclaredBound)
     );
     assert_eq!(
         reserve().admits(
@@ -728,7 +1063,7 @@ fn a_record_longer_than_the_bounds_the_reserve_was_computed_from_is_refused() {
             },
             4096
         ),
-        Err(KernelError::Decode(DecodeError::LengthOutOfBounds))
+        Err(Refusal::OverDeclaredBound)
     );
     // And one at exactly the bound is not.
     assert_eq!(reserve().admits(&terminal(), 4096), Ok(()));
@@ -776,7 +1111,7 @@ fn a_full_journal_refuses_even_a_terminal_record() {
     let mut writer = writer;
     assert!(matches!(
         commit(&mut writer, &mut device, &terminal()),
-        Err(ReservedError::Capacity(KernelError::HistoryNearCapacity))
+        Err(ReservedError::Capacity(Refusal::NearCapacity))
     ));
     // And the media is untouched by that refusal, which is what "no mutation at all" means
     // on the path where even the exit does not fit.

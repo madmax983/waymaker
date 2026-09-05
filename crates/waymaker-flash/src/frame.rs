@@ -345,8 +345,13 @@ pub const fn permits_unknown_record_skip(version: u8) -> bool {
 }
 
 /// How far the payload of the two fixed-shape records extends.
-const RUN_STARTED_PREFIX_BYTES: usize = 4;
-const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
+///
+/// `pub(crate)` rather than private because [`crate::capacity`] prices the worst case of a
+/// record without having one in hand, and a second copy of these two numbers is a second
+/// thing to keep in step with [`body`]. ADR 0011 fixes the second at eight; the first is the
+/// workflow kind and version, two bytes each.
+pub(crate) const RUN_STARTED_PREFIX_BYTES: usize = 4;
+pub(crate) const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
 
 /// The device's program granularity: a power of two, and never zero.
 ///

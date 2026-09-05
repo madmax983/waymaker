@@ -71,16 +71,24 @@ budgeted for:
 
 `Reserve::admits(record, room)` is §10's whole decision: the record's own encoded length plus
 what it still owes, against the room left. It is a pure predicate over a length — no media,
-no state, the same answer on every boot — and it refuses with `HistoryNearCapacity`, which is
-§10's own word.
+no state, the same answer on every boot. It refuses with a `Refusal`, whose three variants are
+the three different things a caller does next, and `Refusal::kernel_error` is where §10's own
+word — `HistoryNearCapacity` — is kept. Three rather than one because "the journal is full,
+roll over" and "this record is longer than you declared records could be" have opposite
+remedies, and a firmware log line that could not tell them apart sends an engineer to the
+wrong place.
 
 **The `continue_as_new` header is priced but is not in the tail.**
 `Reserve::swap_bytes` is the padded bank header the swap writes, and what it buys is a
 *construction-time* refusal rather than tail space: `Reserve::for_layout` rejects bounds whose
-run input a bank header could not carry (`SwapDoesNotFit`), and bounds under which a bank
-could not hold that header *and* the run behind it — its own `RunStarted` record and its own
-exit (`ReserveDoesNotFit`). So a `Reserve` in hand is a promise that this device can end the
-run it is running and roll over into another one that can do the same. That is §10's "a
+run input a bank header could not carry (`SwapDoesNotFit`), bounds longer than a *record* can
+express whatever the bank (`BoundUnencodable`), and bounds under which a bank could not hold
+that header *and a usable run* behind it (`ReserveDoesNotFit`). "Usable" is the word review
+made precise: the floor is the next run's opening record, one effect scheduled and resolved,
+and its exit. A floor that stopped at "can end" accepts 4004 configurations — measured — in
+which the very first `EffectScheduled` is refused for ever, which is a run that can start and
+finish and never do any work. So a `Reserve` in hand is a promise that this device can finish
+the run it is running and roll over into another one that can do the same. That is §10's "a
 terminal record **or** `continue_as_new`" read as two exits that must both stay open, checked
 once where a device is configured rather than hoped for at each append.
 
@@ -91,17 +99,37 @@ somebody writes on purpose. `Reserved::stage` calls `Reserve::admits` before `Jo
 is called at all, so a refusal reads nothing, programs nothing, barriers nothing, and does not
 move the write-amplification counters.
 
+`Reserved::over` re-checks that floor against the journal it is actually handed, and that is
+not belt-and-braces. Nothing about a `Reserve` value ties it to the bank it was priced for:
+review built one on a 4 KiB layout, handed it an 80-byte journal from a 256 B device of the
+same granularity, and watched every `RunStarted` be refused for ever with the journal empty.
+A journal whose header carried an input longer than the bounds declared reaches the same
+state on one device. `CapacityError::RegionTooSmall` is that refusal.
+
 **A record longer than its bound is refused, and says something different.** A reserve is a
 promise about records of a declared size; admitting a larger one would make the promise false
-for whatever came after it. That refusal is `KernelError::Decode(LengthOutOfBounds)` rather
-than `HistoryNearCapacity`, because a caller acts on the two differently — one means end the
-run, and the other means the bounds are wrong and ending the run will not help.
+for whatever came after it. That refusal is `Refusal::OverDeclaredBound`, because a caller
+acts on the two differently — one means end the run, and the other means the bounds are wrong
+and ending the run will not help. One state deserves naming, because it is the one place §10
+leaves no exit at all: an *outcome* refused this way while its effect is outstanding cannot be
+followed by a terminal record either, since §08 has no edge from an unresolved effect to one.
+The caller must shorten the payload; the run cannot be ended around it.
 
 The gate rule is **`capacity-reserve`**. It pins the module's public surface, in both
-directions, and pins the *spelling* of the admission call and its position before the
-delegation — because "calls `admits` somewhere" is satisfied by `let _ = self.reserve.admits(..);`
-and by an `admits` taken after the frame body is already on media, and each of those is a
-refusal that programs the record it was meant to refuse.
+directions, and pins the shape of the gate: `Reserved` declares exactly one `stage`, and that
+`stage` **opens** with the pinned admission call and goes on to the pinned delegation.
+
+Every clause of that was earned. "Calls `admits` somewhere" is satisfied by
+`let _ = self.reserve.admits(..);`, which refuses nothing. "Admits before it delegates" is
+satisfied by an admission inside `if false`, inside a closure nobody calls, and — the
+plausible one — guarded so that only `RunStarted` reaches it, which turns the gate off for
+exactly the *ordinary* scheduling §10 is about; review wrote all three and watched a rule that
+checked only the order stay green. And reading "the first `fn stage` in the file" is defeated
+by a **private** decoy above the real one, which the surface half cannot see because it counts
+only public functions. So the rule reads the named type's inherent `impl` blocks, requires one
+`stage` in them, and requires the decision to be the first thing it does. Each of those five
+mutants is a test in `xtask/src/source.rs`, and each was watched failing against the rule as
+first written.
 
 ## Consequences
 
@@ -112,34 +140,48 @@ necessity is falsifiable rather than argued:
 `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the tempting policy
 against the real writer and finds the point at which it strands.
 
-**`append` grew one public function.** `Journal::region` hands out a `Copy`, read-only
-`JournalRegion`, because a reserve cannot price a record without the granularity the journal
-was written at, and taking that from anywhere but the writer's own region is how a reserve
-computed for one device under-reserves on another. It is on `APPEND_SURFACE` with that
-argument written beside it.
+**`append` grew one accessor, and it is not public.** `Journal::region` is `pub(crate)`: a
+reserve cannot price a record without the granularity and size of the journal it is pricing
+for, and taking those from anywhere but the writer's own region is how a reserve computed for
+one device under-reserves on another — but the only caller is one module away. A crate-private
+accessor serves it without widening the surface `commit-discipline` exists to make expensive,
+and without obliging the size probe to link a call it has no use for.
 
-**`frame` grew one too.** `encoded_len_for(payload_bytes, align)` is `encoded_len` without a
-record in hand, because the worst case of a bound is a *length* and a firmware with a 16 KiB
-budget cannot conjure a 64 KiB record to measure one. `encoded_len` and `body_len` now route
-through it, so there is one copy of the sum rather than two that agree until somebody changes
-the frame's overhead.
+**`frame` grew one public function.** `encoded_len_for(payload_bytes, align)` is `encoded_len`
+without a record in hand, because the worst case of a bound is a *length* and a firmware with
+a 16 KiB budget cannot conjure a 64 KiB record to measure one. `encoded_len` and `body_len`
+route through it and its private sibling `body_len_for`, so there is one copy of the sum
+rather than two that agree until somebody changes the frame's overhead. `frame`'s two
+payload-shape constants and a `bank::header_len_for` became `pub(crate)` for the same reason:
+the reserve reads them rather than writing them out again.
 
-**The code-flash figure moved and the gate did not.** 14764 B to **16232 B** against the same
+**It found a bug in issue #24's own layout guard.** `BankLayout::new` and
+`BankRegion::max_run_input_bytes` reserved "one padded record frame" and reserved a frame
+*body* — the commit seal issue #24 added is one more program unit, and both were short by
+exactly that. A bank whose journal could hold a frame and not the seal that commits it was
+reported as a legal layout. Fixed here, because `Reserve::for_layout` now takes
+`max_run_input_bytes` as its first gate; the smallest accepted device grows from three erase
+blocks per bank to four.
+
+**The code-flash figure moved and the gate did not.** 14764 B to **16348 B** against the same
 16 KiB budget. The split is worth stating because it is almost entirely not the module: the
-library change measured with the probe not reaching it is **40 B** — `Journal::region` and the
-`encoded_len_for` refactor — and the remaining **1428 B** is what the probe drags in to reach
-eleven public functions and both arms of every refusal. That is issue
+library change measured with the probe not reaching it is **40 B** — the `encoded_len_for`
+refactor and the crate-private accessor — and the rest is what the probe drags in to reach
+twelve public functions and both arms of every refusal. That is issue
 [#72](https://github.com/madmax983/waymaker/issues/72)'s defect in the flesh rather than an
 estimate: `size-probe-reach` obliges the probe to name every public function, and the probe's
-own arithmetic is charged to the engine's row.
+own arithmetic is charged to the engine's row. Two diagnostic strings were shortened to fit,
+which is the wrong reason to shorten a diagnostic string and is recorded here as such.
 
-**152 B of headroom is what is left, and it is not enough for issue #26.** ADR 0017 raised
-this gate once and ADR 0019 declined to raise it again, saying 1620 B was what the rest of
-rung 0.2 had to fit in. This spends most of it. The bank swap of issue
-[#26](https://github.com/madmax983/waymaker/issues/26) will not fit in what remains, so the
-budget conversation now falls due there — and it should be had against a measurement that has
-issue #72 fixed first, because a raise argued from a figure a third of which is the probe is a
-raise argued from the wrong number.
+**36 B of headroom is what is left, and issue #26 cannot land in it.** ADR 0017 raised this
+gate once and ADR 0019 declined to raise it again, saying 1620 B was what the rest of rung 0.2
+had to fit in. This spends it. The bank swap of issue
+[#26](https://github.com/madmax983/waymaker/issues/26) does not fit in 36 B, so the budget
+conversation falls due there — and it should be had *after* issue #72, not instead of it,
+because a raise argued from a figure a third of which is the probe is a raise argued from the
+wrong number. The alternative available today is in the alternatives below: dropping the gate
+type and keeping the predicate alone is worth roughly 600 B, and it is a real option if #26
+turns out to need the room before #72 is fixed.
 
 **Nothing obliges a caller to use the gate.** `Journal` is still public and still ungated,
 which is what `append`'s own documentation promises: it programs what it is handed. `Reserved`
@@ -148,6 +190,14 @@ obligatory is a dispatcher that only ever holds a `Reserved`, and that is rung 0
 [#36](https://github.com/madmax983/waymaker/issues/36). Stated here so its absence is a
 decision.
 
+**The reserve assumes §08's order and cannot enforce it.** `exit_bytes_after` prices exactly
+one outstanding effect and releases the whole tail after a terminal record. Both are right for
+history `ReplayCursor` would accept — it refuses a schedule while one is unresolved, and
+refuses anything after a terminal record — but `Reserved` holds no cursor. A caller that
+commits two schedules in a row is admitted here and produces history the cursor halts on for
+ever. §08's order is a precondition on the caller, written into `Reserved`'s own invariants,
+and the thing that will discharge it is the dispatcher of rung 0.4, which holds both.
+
 **The reserve does not know what history says.** `exit_bytes_after` is a function of the
 record's kind alone, not of whether an effect is actually outstanding, so a schedule is always
 charged for an outcome even where the run is about to fail instead. That is conservative in
@@ -155,6 +205,16 @@ the safe direction and keeps the reserve stateless — which is what lets a devi
 same number on every boot from the bounds and the geometry, with nothing to recover. A reserve
 that consulted the cursor would be a second replay state machine in the adapter layer, which
 §05 puts in the kernel.
+
+**A crash sweep is owed and is not here.** The reserve's claim across a reset is that a
+device which admitted a record can still write its exit after any power loss, and on a reboot
+the writer is rebuilt from a recovery of media while the reserve is recomputed from the bounds
+and the geometry. `the_exit_is_still_open_after_a_reset_at_the_boundary` exercises that join
+once, at the boundary. What is owed is the `waymaker-fault` version: drive the gated writer to
+its boundary through the injector and require, at every crash point, that `Journal::after` is
+either `None` or leaves room for the tail. The refusal itself needs no sweep — it never calls
+the device, so it contributes nothing to a write sequence — but the join does, and it is the
+shape `crates/waymaker-fault/tests/commit_discipline.rs` already has for §07.
 
 **`continue_as_new` is still issue #26's.** The test that shows the roll-over succeeds from
 the near-capacity state runs §10's seven steps by hand, the way
@@ -175,10 +235,16 @@ reserve could not be used for the bank header or by `waymaker-fault`'s crash wri
 have no run and no bounds.
 
 **A pure predicate and no gate type.** `Reserve::admits` alone, applied by the caller.
-Cheapest in flash by roughly 600 B, and it is what is left if the budget forces a choice.
-Rejected because a reserve nobody is obliged to consult is a comment: the failure mode is a
-dispatcher that forgets on one path, which is exactly the shape of bug the rest of this
-repository spends its gates on.
+Cheapest in flash by roughly 600 B, measured, and it is what is left if the budget forces a
+choice — see the headroom above. Rejected because a reserve nobody is obliged to consult is a
+comment: the failure mode is a dispatcher that forgets on one path, which is exactly the shape
+of bug the rest of this repository spends its gates on.
+
+**A floor of "the run can end".** The obvious reading of §10, and the one this ADR shipped
+before review: price the next run's opening record and its exit, and stop. Rejected on
+evidence — 4004 accepted configurations in which the first `EffectScheduled` is refused for
+ever. A bank that can start a run and finish it and never do any work in it is not a bank §10
+would call usable, and the extra term costs one addition.
 
 **Charging a schedule only for its outcome, and a terminal record separately.** It looks
 tighter: reserve one outcome after a schedule, and let the terminal record be checked when it

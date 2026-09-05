@@ -49,7 +49,7 @@ pub use append::{AppendError, Journal, Sealable, Staged, WriteAmplification};
 pub use bank::{
     Authority, BankHeader, BankId, BankLayout, BankRegion, Generation, LayoutError, Seal,
 };
-pub use capacity::{Bounds, CapacityError, Reserve, Reserved, ReservedError};
+pub use capacity::{Bounds, CapacityError, Refusal, Reserve, Reserved, ReservedError};
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
 pub use recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
