@@ -977,27 +977,46 @@ fn without_fenced_code(contents: &str) -> String {
 /// The "must not own" cells are compared against [`LAYERS`] verbatim. A contributor
 /// reading `CLAUDE.md` is reading the same string the gate reads, or the gate says so.
 #[must_use]
-/// Every number CLAUDE.md attaches to the word "rule" that is not `expected`.
+/// Every rule count CLAUDE.md states that is not `expected`.
 ///
-/// The file states the rule count twice — once in its opening paragraph and once above the
-/// table — and a `contains` check for the right number is satisfied by either of them. That
-/// is how the opening paragraph came to say 39 while the table said 40. Reads the digits
-/// immediately before " rule", so "40 rules" and "40 rule ids" both count and a bare year or
-/// an issue number does not.
+/// The file states the count twice — once in its opening paragraph and once above the table
+/// — and a `contains` check for the right number is satisfied by either of them. That is how
+/// the opening paragraph came to say 39 while the table said 40.
+///
+/// # Why this anchors on "all"
+///
+/// The first version read the digits immediately before `" rule"`, and Codex found what that
+/// costs: `ADR 0012 rules out table-based CRCs` is prose making no claim about how many rules
+/// there are, and the scan read `0012` and reported a stale count of 12. A rule that fails a
+/// build over a sentence like that is worse than the drift it was written to catch, because
+/// the drift is a wrong number in a document and this is a red build on a correct one.
+///
+/// So the anchor is the phrasing a count is actually written in — `all 40 rules`,
+/// `all 40 rule ids` — which is the convention both occurrences already follow and the one
+/// "Adding a gate rule" tells a contributor to keep. A verb cannot sit there: `ADR 0012 rules`
+/// has no `all`.
+///
+/// What it therefore does **not** catch is a count written some other way — `the 39 rules`,
+/// or a bare `39 rules` mid-sentence. That is the narrower gap, and it is the right one to
+/// take: a missed drift is a wrong number a reviewer can still see, and a false positive is a
+/// build nobody can make green without deleting true prose.
 fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
     let mut stale = Vec::new();
-    for (at, _) in contents.match_indices(" rule") {
-        let Some(before) = contents.get(..at) else {
+    let lowered = contents.to_lowercase();
+    for (at, _) in lowered.match_indices("all ") {
+        let Some(rest) = lowered.get(at.saturating_add("all ".len())..) else {
             continue;
         };
-        let digits: String = before
-            .chars()
-            .rev()
-            .take_while(char::is_ascii_digit)
-            .collect::<Vec<char>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let Some(after) = rest.get(digits.len()..) else {
+            continue;
+        };
+        if !after.starts_with(" rule") {
+            continue;
+        }
         let Ok(said) = digits.parse::<usize>() else {
             continue;
         };
@@ -3586,19 +3605,52 @@ mod tests {
     #[test]
     fn every_rule_count_the_helper_finds_is_one_the_file_really_states() {
         assert_eq!(
-            stale_rule_counts("all 39 rule ids and 40 rules", 40),
+            stale_rule_counts("all 39 rule ids and All 40 rules", 40),
             vec![39]
         );
         assert_eq!(
-            stale_rule_counts("40 rules, 40 rule ids", 40),
+            stale_rule_counts("All 40 rules, all 40 rule ids", 40),
             Vec::<usize>::new()
         );
         // Repeated staleness is reported once, so one drift is one violation.
-        assert_eq!(stale_rule_counts("39 rules and 39 rule ids", 40), vec![39]);
+        assert_eq!(
+            stale_rule_counts("all 39 rules and all 39 rule ids", 40),
+            vec![39]
+        );
         // A bare word is not a count, and neither is a number attached to something else.
         assert_eq!(
             stale_rule_counts("the rule, issue 72", 40),
             Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn a_number_that_merely_precedes_the_verb_rules_is_not_a_count() {
+        // Codex found this on pull request #78. The first version read the digits before
+        // " rule" wherever they fell, so this sentence — which makes no claim about how many
+        // rules there are — reported a stale count of 12 and would have failed a build over
+        // correct prose.
+        assert_eq!(
+            stale_rule_counts(
+                "ADR 0012 rules out table-based CRCs. All 40 rules apply.",
+                40
+            ),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            stale_rule_counts("Issue 26 rules the swap out of scope. All 40 rules.", 40),
+            Vec::<usize>::new()
+        );
+        // And the whole-file version: a CLAUDE.md carrying that prose is still clean.
+        let claude_md = format!(
+            "{}\n\nADR 0012 rules out table-based CRCs.\n",
+            clean_claude_md(RULES)
+        );
+        assert!(
+            !check_claude_md(Some(&claude_md), RULES)
+                .iter()
+                .any(|v| v.subject == "rule count"),
+            "prose using `rules` as a verb is not a rule count"
         );
     }
 
