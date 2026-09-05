@@ -1900,3 +1900,134 @@ fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
     assert_eq!(matched.len(), 3, "{matched:?}");
     assert!(matched.iter().all(Result::is_ok));
 }
+
+#[test]
+fn a_header_says_how_long_its_frame_is_before_the_payload_is_in_hand() {
+    // §09's reason for two checksums, used rather than only explained: `payload_len` is a
+    // number that has been *verified* before it is trusted to say where the frame ends. A
+    // reader with a page smaller than the journal needs exactly this — it has to know how
+    // much to stage before it can stage it.
+    for golden in [
+        golden::RUN_STARTED.as_slice(),
+        golden::EFFECT_SCHEDULED.as_slice(),
+        golden::RUN_FAILED.as_slice(),
+        golden::RUN_COMPLETED_EMPTY.as_slice(),
+    ] {
+        let whole = frame::decode(golden).expect("a golden frame decodes");
+        let from_header =
+            frame::frame_len_of(&golden[..HEADER_BYTES]).expect("a golden header is sound");
+        assert_eq!(from_header, whole.frame_len);
+        // And the header alone is enough: nothing past the twelfth byte is read.
+        assert_eq!(
+            frame::frame_len_of(&golden[..HEADER_BYTES]),
+            Ok(from_header)
+        );
+    }
+}
+
+#[test]
+fn a_header_shorter_than_a_header_declares_no_length() {
+    for len in 0..HEADER_BYTES {
+        assert_eq!(
+            frame::frame_len_of(&golden::RUN_FAILED[..len]),
+            Err(DecodeError::Truncated),
+            "{len} bytes is not a header"
+        );
+    }
+}
+
+#[test]
+fn a_header_that_is_not_one_declares_no_length() {
+    // The same three refusals `decode` makes, in the same order, reached without a payload:
+    // a wrong magic, a header seal that does not hold, and a version this firmware does not
+    // read. A length taken from any of them is a number that was found rather than written.
+    let mut wrong_magic = golden::RUN_FAILED;
+    wrong_magic[0] ^= 0x01;
+    assert_eq!(
+        frame::frame_len_of(&wrong_magic[..HEADER_BYTES]),
+        Err(DecodeError::IntegrityFailed)
+    );
+
+    let mut wrong_seal = golden::RUN_FAILED;
+    wrong_seal[HEADER_BYTES - 1] ^= 0x01;
+    assert_eq!(
+        frame::frame_len_of(&wrong_seal[..HEADER_BYTES]),
+        Err(DecodeError::IntegrityFailed)
+    );
+
+    // A length field changed without resealing is caught by the header seal, which is the
+    // whole point: `payload_len` is covered by `header_crc`.
+    let mut wrong_length = golden::RUN_FAILED;
+    wrong_length[8] = 0xFF;
+    assert_eq!(
+        frame::frame_len_of(&wrong_length[..HEADER_BYTES]),
+        Err(DecodeError::IntegrityFailed)
+    );
+
+    let mut wrong_version = golden::RUN_FAILED;
+    wrong_version[2] = FORMAT_VERSION.wrapping_add(1);
+    reseal_header(&mut wrong_version);
+    assert_eq!(
+        frame::frame_len_of(&wrong_version[..HEADER_BYTES]),
+        Err(DecodeError::UnsupportedFormatVersion)
+    );
+
+    let erased = [ERASED_BYTE; HEADER_BYTES];
+    assert_eq!(
+        frame::frame_len_of(&erased),
+        Err(DecodeError::IntegrityFailed)
+    );
+}
+
+#[test]
+fn a_header_length_agrees_with_the_decoder_at_every_payload_length() {
+    // The two are separate code paths over the same field, so they are compared over the
+    // whole range a page can hold rather than at one value.
+    let mut page = [0_u8; SCRATCH];
+    for payload_len in 0..64_usize {
+        let payload = std::vec![0x5A_u8; payload_len];
+        let record = RecordRef::RunCompleted { result: &payload };
+        let written = frame::encode(&record, ProgramAlign::BYTE, &mut page).expect("it fits");
+        let whole = frame::decode(&page[..written]).expect("it decodes");
+        assert_eq!(
+            frame::frame_len_of(&page[..HEADER_BYTES]),
+            Ok(whole.frame_len)
+        );
+        assert_eq!(whole.frame_len, FRAME_OVERHEAD_BYTES + payload_len);
+    }
+}
+
+#[test]
+fn a_header_length_is_computed_by_whichever_check_the_caller_asked_for() {
+    // The generic sibling verifies with `C`, so a header sealed by one algorithm is refused
+    // by a reader that chose another rather than yielding a length from bytes it never
+    // checked.
+    struct Other;
+    impl waymaker_flash::integrity::IntegrityCheck for Other {
+        fn header_check(bytes: &[u8]) -> u16 {
+            !crc16(bytes)
+        }
+        fn frame_check(bytes: &[u8]) -> u32 {
+            !crc32(bytes)
+        }
+    }
+
+    let header = &golden::RUN_FAILED[..HEADER_BYTES];
+    assert!(frame::frame_len_of(header).is_ok());
+    assert_eq!(
+        frame::frame_len_of_with::<Other>(header),
+        Err(DecodeError::IntegrityFailed)
+    );
+}
+
+/// Re-computes only the header checksum, leaving the frame checksum alone.
+fn reseal_header(frame_bytes: &mut [u8]) {
+    let sealed = HEADER_BYTES - 2;
+    let Some(header) = frame_bytes.get(..sealed).map(crc16) else {
+        unreachable!("a frame is at least sixteen bytes long")
+    };
+    let Some(seal) = frame_bytes.get_mut(sealed..HEADER_BYTES) else {
+        unreachable!("a frame is at least sixteen bytes long")
+    };
+    seal.copy_from_slice(&header.to_le_bytes());
+}
