@@ -158,6 +158,76 @@ fn a_bank_too_small_for_a_header_and_a_seal_is_refused() {
 }
 
 #[test]
+fn a_device_that_programs_in_units_no_header_can_record_is_refused() {
+    // `Geometry` describes a program unit with a `u32` and `ProgramAlign` with a `u16`, so
+    // the two disagree above 32 KiB. A layout that accepted the difference would hand a
+    // writer offsets it could only record at a *smaller* granularity than it programs at,
+    // and a reader striding at that number lands inside a frame's padding and calls it the
+    // end of history.
+    assert_eq!(
+        BankLayout::new(geometry(1024 * 1024, 256 * 1024, 64 * 1024, 1)),
+        Err(LayoutError::ProgramUnitTooLarge)
+    );
+    assert!(!LayoutError::ProgramUnitTooLarge.message().is_empty());
+
+    // The largest unit that *is* recordable is accepted, and round-trips through a header.
+    let largest = layout(4 * 65_536, 65_536, 32_768, 1);
+    assert_eq!(largest.bank_bytes(), 2 * 65_536);
+    assert_eq!(largest.bank(BankId::A).seal_bytes(), 32_768);
+
+    let mut media = vec![0_u8; 65_536];
+    let written = bank::encode_header(
+        &BankHeader {
+            align: align(32_768),
+            ..header(b"at the ceiling")
+        },
+        &mut media,
+    )
+    .expect("it fits");
+    assert_eq!(written, 32_768);
+    let decoded = bank::decode_header(&media).expect("what was just written");
+    assert_eq!(decoded.align, align(32_768));
+    assert_eq!(decoded.journal_offset(), Some(32_768));
+}
+
+#[test]
+fn every_geometry_a_layout_accepts_has_a_recordable_program_unit() {
+    // The invariant the refusal above establishes, swept rather than sampled: over every
+    // power-of-two program unit a `Geometry` admits, a layout either refuses the device or
+    // its program unit is one a header can record.
+    let mut accepted = 0_usize;
+    let mut refused = 0_usize;
+    for shift in 0..=20_u32 {
+        let program = 1_u32 << shift;
+        let erase = program.max(65_536);
+        let Ok(geometry) = Geometry::new(erase * 4, erase, program, 1) else {
+            continue;
+        };
+        match BankLayout::new(geometry) {
+            Ok(layout) => {
+                accepted += 1;
+                assert!(
+                    u16::try_from(layout.geometry().program_size())
+                        .ok()
+                        .and_then(ProgramAlign::new)
+                        .is_some(),
+                    "a layout accepted a {program}-byte program unit no header can record"
+                );
+            }
+            Err(LayoutError::ProgramUnitTooLarge) => {
+                refused += 1;
+                assert!(program > 32_768, "{program} is recordable and was refused");
+            }
+            Err(other) => unreachable!("{other} for a {program}-byte program unit"),
+        }
+    }
+    assert!(
+        accepted > 0 && refused > 0,
+        "{accepted} accepted and {refused} refused, so the sweep saw only one side"
+    );
+}
+
+#[test]
 fn the_layout_reports_the_geometry_it_was_derived_from() {
     let geometry = geometry(8192, 4096, 4, 1);
     let layout = layout(8192, 4096, 4, 1);

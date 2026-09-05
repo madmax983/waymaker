@@ -160,6 +160,12 @@ const SEALED_HEADER_BYTES: usize = HEADER_PREFIX_BYTES - 2;
 /// a number it computed by overflowing.
 const MAX_PROGRAM_SHIFT: u8 = 15;
 
+/// The largest program unit a bank header can record.
+///
+/// [`Geometry`] takes a `u32` program size and [`ProgramAlign`] is a `u16`, so the two do not
+/// agree about what a device may be — and this is the number they disagree above.
+const MAX_PROGRAM_UNIT: u32 = 1 << MAX_PROGRAM_SHIFT;
+
 /// Which of the two banks something names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BankId {
@@ -245,6 +251,17 @@ pub enum LayoutError {
     TooFewEraseBlocks,
     /// A bank is too small to hold a header and a seal.
     BankTooSmall,
+    /// The device programs in units larger than a bank header can record.
+    ///
+    /// [`Geometry`] describes a program unit with a `u32` and [`ProgramAlign`] with a `u16`,
+    /// so a device that programs in more than [`MAX_PROGRAM_UNIT`] bytes is one this format
+    /// cannot describe. It is refused rather than approximated: the only granularity a
+    /// writer *could* record for such a device is smaller than the one it actually programs
+    /// at, and a reader striding at a smaller granularity than the writer used lands inside
+    /// a frame's padding and reports a clean end of history with committed records still
+    /// ahead of it — which [`crate::frame::Scan`] names as the worst failure it has, because
+    /// everything downstream believes it.
+    ProgramUnitTooLarge,
 }
 
 impl LayoutError {
@@ -259,6 +276,7 @@ impl LayoutError {
         match self {
             Self::TooFewEraseBlocks => "the device has fewer than two erase blocks",
             Self::BankTooSmall => "a bank cannot hold a header and a seal",
+            Self::ProgramUnitTooLarge => "the program unit is larger than a header can record",
         }
     }
 }
@@ -329,6 +347,11 @@ impl BankRegion {
 /// odd number of erase blocks gets two banks of `blocks / 2` each and the last block is not
 /// addressed here — a layout that gave one bank the spare block would make the two banks
 /// unequal, and a run that fits one would then not fit the other.
+///
+/// And the device's program unit is one a [`ProgramAlign`] can hold, so a header written for
+/// a bank of this layout can record the granularity it was really written at. Every value of
+/// this type therefore describes a device this format can describe, which is what lets
+/// [`BankHeader::journal_offset`] be trusted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BankLayout {
     geometry: Geometry,
@@ -341,10 +364,11 @@ impl BankLayout {
     ///
     /// # Errors
     ///
-    /// [`LayoutError::TooFewEraseBlocks`] for a device of fewer than two erase blocks, and
-    /// [`LayoutError::BankTooSmall`] when a bank could not hold a header and a seal —
-    /// which is a real device on a part whose program unit is a large fraction of its erase
-    /// block.
+    /// [`LayoutError::TooFewEraseBlocks`] for a device of fewer than two erase blocks,
+    /// [`LayoutError::ProgramUnitTooLarge`] for a device that programs in units no bank
+    /// header could record, and [`LayoutError::BankTooSmall`] when a bank could not hold a
+    /// header and a seal — which is a real device on a part whose program unit is a large
+    /// fraction of its erase block.
     pub const fn new(geometry: Geometry) -> Result<Self, LayoutError> {
         let blocks = geometry.erase_blocks();
         if blocks < 2 {
@@ -355,6 +379,12 @@ impl BankLayout {
         // matters on `thumbv6m-none-eabi`.
         let bank_bytes = (blocks >> 1) * geometry.erase_size();
         let program = geometry.program_size();
+        // Before any offset is computed from it. A layout is the first thing a caller asks
+        // for, so a refusal it can act on beats an offset it cannot trust — and the offsets
+        // below would be perfectly well-formed for a device no header can describe.
+        if program > MAX_PROGRAM_UNIT {
+            return Err(LayoutError::ProgramUnitTooLarge);
+        }
         // The seal is a whole number of program units. `program` is a power of two and
         // `SEAL_BYTES` is 12, so this cannot overflow on any geometry `Geometry::new`
         // admits: the largest program unit is the largest erase block, and a capacity is a
@@ -1061,6 +1091,12 @@ const _: () = assert!(BANK_MAGIC != SEAL_MAGIC && BANK_MAGIC != crate::frame::MA
 const _: () = assert!(SEAL_MAGIC != crate::frame::MAGIC);
 const _: () = assert!(BANKS == 2);
 const _: () = assert!(MAX_PROGRAM_SHIFT == 15);
+// The two spellings of the same ceiling, checked against each other rather than trusted:
+// `MAX_PROGRAM_UNIT` guards a `u32` from a `Geometry` and `MAX_PROGRAM_SHIFT` guards a byte
+// read off media, and a build in which they disagree admits a device on one path that the
+// other refuses.
+const _: () = assert!(MAX_PROGRAM_UNIT == 32_768);
+const _: () = assert!(program_align(MAX_PROGRAM_SHIFT).is_some());
 const _: () = assert!(SEAL_BYTES == 12 && SEAL_WIDTH == 12);
 const _: () = assert!(HEADER_OVERHEAD_BYTES == 26 && HEADER_OVERHEAD_WIDTH == 26);
 
