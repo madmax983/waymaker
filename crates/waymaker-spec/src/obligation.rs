@@ -117,14 +117,17 @@ pub const CLAUSES: &[Clause] = &[
         proof: "tests/spine.rs",
         falsifier: "tests/necessity.rs",
         owed: Some(
-            "rung 0.2 owes the refinement, and three things about the model with it. There \
-             is no two-bank adapter to abstract, so this clause is discharged against the \
-             model alone — and a reconstructed state has no banks, so it is answered \
-             vacuously for one. The model's banks hold no records: no transition changes a \
-             bank and a record at once, so \"never recover the old run as current\" is not \
-             something this machine can state, only \"exactly one bank is bootable\". And \
-             generations are compared as unbounded integers, so a seal counter that wraps is \
-             a counterexample no bound reaches",
+            "the refinement, and three things about the model with it. There is now a \
+             two-bank adapter to abstract — `waymaker_flash::bank`, issue #22 — and \
+             `tests/refinement.rs` does not yet abstract it, so this clause is still \
+             discharged against the model alone and a reconstructed state has no banks, \
+             which answers it vacuously for one. The model's banks hold no records: no \
+             transition changes a bank and a record at once, so \"never recover the old run \
+             as current\" is not something this machine can state, only \"exactly one bank \
+             is bootable\". And generations are compared as unbounded integers, so a seal \
+             counter that wraps is a counterexample no bound reaches — the firmware makes \
+             that unreachable rather than orderable (`Generation::successor` refuses at the \
+             ceiling, ADR 0017), which is a fact about the code and not yet about the model",
         ),
     },
     Clause {

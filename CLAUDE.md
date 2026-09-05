@@ -115,7 +115,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — rung 0.2 owes the refinement, because there is no two-bank adapter to abstract yet |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — there is now a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -205,7 +205,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, bank selection, append scanning, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the two-bank layout, bank selection, append scanning, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -262,12 +262,19 @@ flash, is a §04 statement with no constant and no gate behind it: there is no l
 with banks in it yet. Nothing compares the numbers in this table to `budget.rs`, so treat
 `budget.rs` as the source if they ever differ.
 
-| Budget | v0.1 target |
+| Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page |
-| Kernel state | ≤ 128 B, excluding any page buffer |
-| Incremental code flash | ≤ 8 KiB for core + flash adapter, on `thumbv6m-none-eabi` |
-| Persistent flash | two erase blocks minimum |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1) |
+| Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
+| Incremental code flash | ≤ 16 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises the gate once for rung 0.2's two-bank lifecycle) |
+| Persistent flash | two erase blocks minimum (§04, v0.1) |
+
+The code-flash row is the one place this repository and the design document now disagree, and
+the disagreement is deliberate rather than drift. `budget.rs` is what CI enforces; ADR 0017
+records the measurement that moved it — 8180 B to 10776 B, of which 1492 B is
+`waymaker-flash`'s bank layer and 920 B is the size probe's own arithmetic — and says what is
+owed. A third of the measured "core + flash adapter" figure is the probe rather than either,
+which is a defect in the measurement and is filed as its own issue.
 
 The workflow future is user memory and is reported separately. A kernel state type added to
 `kernel_state_types!` is asserted at compile time, registered in the size report, and
@@ -365,7 +372,7 @@ this table is how you find out what a red build is telling you.
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
-| `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts: `encode_with` or `decode_with` stops computing a seal through `C::header_check`/`C::frame_check` exactly once, names a checksum function directly, `input_digest` stops calling `crc32` once, or the scan's `next` stops walking with `decode_with` — a trait nothing is obliged to call is a swap point that selects nothing. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
+| `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts: `encode_with` or `decode_with` stops computing a seal through `C::header_check`/`C::frame_check` exactly once, names a checksum function directly, `input_digest` stops calling `crc32` once, or the scan's `next` stops walking with `decode_with` — a trait nothing is obliged to call is a swap point that selects nothing. The same routing pin covers `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names: a firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
@@ -527,6 +534,19 @@ Stated so that nobody mistakes silence for coverage:
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
+- **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
+  the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
+  calls "core + flash adapter" — roughly 4 KiB of 10776 B at rung 0.2. ADR 0002 says so and
+  ADR 0017 attributes the current figure by symbol, but nothing *checks* the split: doing so
+  needs a call graph, and the attribution in ADR 0017 is a reading of `llvm-nm` output rather
+  than a gate.
+- **That a bank's journal region holds a legal journal.** `bank::sealed_generation` decides
+  whether a bank is a candidate from its header and its seal. What is between them is
+  `frame::Scan`'s, and the two are joined by `BankHeader::journal_offset` rather than by
+  anything that checks it: a bank whose header and seal agree and whose journal is damaged is
+  authoritative, and the scan is what stops at the damage. That is §14's "frame ignored;
+  previous history prefix wins", and it is the division of labour rather than a gap — but it
+  does mean "authoritative" is a statement about a bank's header and seal alone.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -627,6 +647,33 @@ only forbade stranding the device still permitted erasing the *newer* of two sea
 which is §14's "never recover the old run as current". See
 [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md),
 which also says what is bounded, what is owed at 0.2, and what a general proof would cost.
+Issue #22 then arrives at rung 0.2 and gives §10's two-bank lifecycle a shape on media.
+`waymaker-flash`'s `bank` module is the layout — `erase_blocks / 2` whole blocks per bank,
+derived from a `Geometry` rather than written down, refusing a device that cannot hold two —
+the bank header of §10 and issue #22 (the `RunId`, the workflow identity, an input schema and
+the bounded run input, in a self-delimiting frame checksummed twice like §09's), the
+generation seal, and `select`, which is §10's "the bank with the highest valid generation
+seal is authoritative" as a total function. Two decisions in it are about crash windows
+rather than about layout, and
+[ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md)
+is where both are argued. The seal names its header — it carries the header frame's own
+digest — so a seal that outlived the erase which took its header, or one written over a torn
+header by a writer that did not check, is not a candidate at any generation, with no
+assumption about erase order anywhere in the module. And generations do not wrap:
+`Generation::successor` refuses at `MAX`, so the plain `u32` order *is* the order of the
+swaps and issue #22's "explicitly rather than by unsigned comparison luck" is answered by
+making the wrap unreachable rather than by getting a comparison right. A tie is
+`Authority::Ambiguous` and is reported rather than resolved. The header also carries the
+program granularity it was written at, which is the fact `frame::Scan`'s documentation named
+as rung 0.2's to record. All of it is swept at every partial-swap crash point the injector
+lists — `crates/waymaker-fault/tests/banks.rs`, which used to *model* this protocol and now
+drives it — with four mutants holding the sweep honest, the sharpest being a seal-blind
+reader booting a bank whose header was never written. The `integrity-check` rule grew a
+second routing table so the bank's seals cannot drift around the trait either. What it cost
+is 8180 B to 10776 B of code flash against an 8192 B budget, which is the budget conversation
+[ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md) said had to happen
+before these were written; ADR 0017 has it, raises the gate to 16 KiB, and writes down that a
+third of the measured figure is the size probe rather than the engine.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The

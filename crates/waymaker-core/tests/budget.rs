@@ -13,7 +13,19 @@ fn the_budgets_are_the_numbers_from_the_design_document() {
     assert_eq!(budget::RUNTIME_RAM_BYTES, 768);
     assert_eq!(budget::SCRATCH_PAGE_BYTES, 512);
     assert_eq!(budget::KERNEL_STATE_BYTES, 128);
-    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 8 * 1024);
+    // The one budget that is *not* the design document's number, and the assertion says so
+    // rather than being quietly relaxed. §04 states 8 KiB and labels its column "v0.1
+    // target"; ADR 0017 raises the gate once for rung 0.2's two-bank lifecycle, which §04's
+    // row does not scope. Changing it again is changing this line, which is the point.
+    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 16 * 1024);
+    // A relation between two constants is a compile-time fact, so it is asserted at compile
+    // time — see the note below the next test.
+    const {
+        assert!(
+            budget::INCREMENTAL_CODE_FLASH_BYTES > 8 * 1024,
+            "a raise that went the other way is a budget nobody meant to tighten silently"
+        );
+    }
 }
 
 // A relation between two constants is a compile-time fact, so it is asserted at compile

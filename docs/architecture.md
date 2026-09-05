@@ -366,6 +366,25 @@ graph LR
   before --> after
 ```
 
+And what one bank is made of. The layout is derived from the device's geometry rather than
+written down — `erase_blocks / 2` whole blocks per bank — and the seal sits at the bank's end
+so that a reader can find it before it has decoded anything. The digest in it is the bank
+header's own frame check, which is what makes a seal that outlived its header no seal at all:
+
+<!-- diagram: bank-layout -->
+
+```mermaid
+graph TB
+  subgraph bank["one bank · whole erase blocks · geometry-derived"]
+    direction TB
+    header["bank header<br/>magic · format_version · program_shift<br/>run_id · workflow_kind · workflow_version<br/>input_schema · input_len · header_crc<br/>run input · frame_crc"]
+    journal["journal region<br/>committed record frames, append →"]
+    seal["generation seal<br/>magic · generation · header_check · seal_check"]
+  end
+  header -->|"journal_offset: the header padded to program_shift"| journal
+  seal -.->|"header_check names the header's frame_crc"| header
+```
+
 Capacity is explicit. Waymaker reserves enough tail space for a terminal record or a
 `continue_as_new`, so ordinary effect scheduling fails early with `HistoryNearCapacity`; the
 runtime never overwrites committed history to make room.

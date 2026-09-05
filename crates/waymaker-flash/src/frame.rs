@@ -77,8 +77,11 @@
 //!   previous history prefix wins" — so the deferral costs correctness nothing today. What
 //!   the seal will add is the ability to say *which* of the two happened.
 //! * **Bank bounds.** [`Scan`] is handed a `&[u8]`, and that slice *is* the bound: there is
-//!   no offset arithmetic against a geometry this rung does not have. Bank selection and
-//!   the generation seal arrive with rung 0.2.
+//!   no offset arithmetic against a geometry. That is still true and is now a division of
+//!   labour rather than a deferral: [`crate::bank`] owns the layout, so a caller asks a
+//!   [`BankLayout`](crate::bank::BankLayout) where a bank is and a
+//!   [`BankHeader`](crate::bank::BankHeader) where its journal starts, and hands the scan
+//!   the slice between them.
 //!
 //! [`StableStorage`]: https://github.com/madmax983/waymaker/blob/main/docs/design/waymaker-design-v0.2.html
 
@@ -953,7 +956,13 @@ impl<'a> Scan<'a, Catalogued> {
     /// `a_scan_at_a_larger_alignment_than_the_writer_used_is_not_caught` asserts the wrong
     /// answer on purpose, so the limitation is bounded rather than undiscovered. Rung 0.2
     /// puts the writer's program size in the bank header, which is where a fact about the
-    /// media belongs.
+    /// media belongs — and rung 0.2 has: it is
+    /// [`BankHeader::align`](crate::bank::BankHeader::align), and
+    /// [`BankHeader::journal_offset`](crate::bank::BankHeader::journal_offset) is the offset
+    /// computed from it. A caller that takes both from the header it just decoded cannot be
+    /// given a granularity the writer did not use. This type still cannot check that its
+    /// caller did, because a slice carries no such fact — which is why the limitation is
+    /// stated here rather than deleted.
     #[must_use]
     #[inline]
     pub const fn new(journal: &'a [u8], align: ProgramAlign) -> Self {

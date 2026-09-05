@@ -47,7 +47,14 @@ pub const KERNEL_STATE_BYTES: usize = 128;
 ///
 /// Design document §04: "Measured on `thumbv6m-none-eabi` with release-size settings.
 /// This is a gate, not an unverified claim."
-pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 8 * 1024;
+///
+/// §04 states **8 KiB** and labels the column "v0.1 target". This is that number raised
+/// once, for rung 0.2's two-bank lifecycle, by
+/// [ADR 0017](https://github.com/madmax983/waymaker/blob/main/docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md)
+/// — which also records what the raise buys and how much of the measured delta is not
+/// library code at all. It is still a gate: `cargo xtask size` fails a build over it, and
+/// the number lives here rather than in the gate so that there is one place to change.
+pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 16 * 1024;
 
 /// One type that is part of the kernel's live state, and the space it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
