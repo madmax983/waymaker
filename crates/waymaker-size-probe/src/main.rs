@@ -1046,7 +1046,7 @@ fn recovery_walk(
     page: &mut [u8],
 ) -> usize {
     use waymaker_flash::integrity::Catalogued;
-    use waymaker_flash::recovery::{Ending, Recovery, RecoveryError};
+    use waymaker_flash::recovery::{Ending, Recovery};
 
     let mut media = ProbeMedia { geometry };
     // `ProbeMedia::read` validates and copies nothing, so the frame staged above is what
@@ -1085,7 +1085,7 @@ fn recovery_walk(
 /// `RecoveryError` carries no `message` of its own — see its documentation for why — so this
 /// is what a driver's own reporting looks like, and linking it is what makes the row honest.
 #[cfg(feature = "engine")]
-fn recovery_error_cost(
+const fn recovery_error_cost(
     error: &waymaker_flash::recovery::RecoveryError<waymaker_flash::storage::GeometryError>,
 ) -> usize {
     use waymaker_flash::recovery::RecoveryError;
