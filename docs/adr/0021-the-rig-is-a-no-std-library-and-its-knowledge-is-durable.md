@@ -74,12 +74,24 @@ which is what lets a rig resumed after a reset carry one counter rather than a g
 a power cut could have torn. It is also the whole of issue #27's third "done when": a log line
 carrying two numbers carries the run, the workload, every payload and the cut point.
 
-**A power cut and a watchdog reset are modelled differently, not relabelled.** They differ in
-what the flash controller was allowed to finish: a brownout stops a program inside a program
-unit, leaving a torn write; a watchdog reset leaves the supply up, so the unit already handed
-to the controller completes or is abandoned whole, and RAM is not cleared. That partitions
-`waymaker_fault::injections` exactly — `Progress::Bytes` against `Progress::{None, Whole}` —
-and the census requires both partitions to be non-empty at all three write points.
+**A watchdog reset is a cause the rig carries, not one a host can perform.** The two differ in
+what the flash controller was allowed to finish, whether RAM survived, and what the
+reset-cause register says. `waymaker-fault`'s every injection is an
+`Interruption::PowerLoss`, documented as "the world stops here", and it models none of those
+three. So the plan arms the cause, the cutter is handed it, the log line records it and the
+census demands it — and the *evidence* for the three watchdog cells is a board's, inside the
+rows `HARDWARE_TARGETS` already carries, both of which say "power-cut **and watchdog-reset**
+loops".
+
+This is a correction rather than a decision taken up front, and it is recorded as one because
+the failure is instructive. The first version of this crate partitioned
+`waymaker_fault::injections` by how much of an operation completed — `Progress::Bytes` for a
+brownout, `Progress::{None, Whole}` for a watchdog — and reported a complete census on a host.
+Codex rejected it on review, correctly: that groups power cuts by their media outcome and
+performs no watchdog reset at all, which is precisely the relabelling this crate was written to
+avoid. The reverse-brainstorm that shaped the design had named the trap in those words and the
+implementation walked into it anyway, which is an argument for adversarial review rather than
+against it.
 
 **Erase counting is a decorator, not a field on `WriteAmplification`.** `wear::Metered` is a
 `StableStorage` that counts what the device beneath it was asked for, and it attributes the
@@ -102,8 +114,9 @@ Those are the two ways a list like this normally rots.
 
 **What now holds.** The rig runs on a host through `waymaker-fault` at every crash point the
 injector lists — `crates/waymaker-rig/tests/sweep.rs` — and its own oracle accepts every one.
-The census over three write points and two reset causes is complete on that sweep and fails
-closed when it is not. `crates/waymaker-rig/tests/teeth.rs` runs two writers that are wrong in
+The census fills its three power-cut cells on that sweep and *refuses* the run, naming a
+watchdog cell as the gap — which is the honest shape of a host run and a test rather than a
+remark. `crates/waymaker-rig/tests/teeth.rs` runs two writers that are wrong in
 one way each — an acknowledgment mark before the commit seal, a dispatch mark before it — and
 requires each to be caught by the guarantee it breaks, with an unmodified control writer
 required to pass. Without those the oracle would be a function nobody has seen fail.
@@ -114,6 +127,12 @@ that is what the answer turns on: a commit seal is one program unit, so a sixtee
 part pays sixteen bytes to commit a twenty-four-byte frame. Erase counts are reported as run
 totals rather than per-effect figures, because §10 erases a whole bank once per run and
 dividing by eight effects prints a zero that reads as "this engine does not erase".
+
+Every per-effect figure is a fraction rather than a quotient, and that too came out of review:
+an eight-effect run issues thirty-eight program calls, and `38 / 8` is `4`. An integer quotient
+publishes *less wear than was measured*, silently, for every division that is not exact — which
+is the one direction a wear figure must not be wrong in, and the direction truncation always
+fails in. The totals stay exact and the rendering carries two decimal places.
 
 **What this cost.** A sixth non-layer crate, a `Window` adapter so the engine and the
 instrument can share one part and therefore one supply, and three new `xtask` dependencies —

@@ -34,13 +34,20 @@
 //! gets worse the more carefully you measure. [`Traffic`] is the switch, and
 //! [`Metered::wear`] is the engine's alone.
 //!
-//! # Why the division is here and not in the journal
+//! # Why a per-effect figure is a fraction and not a number
 //!
 //! `waymaker-flash` refuses to divide because a divider is not free on `thumbv6m` and the
-//! figure is the host's business. The rig is on the same target and takes the same care —
-//! [`Wear::programmed_bytes_per_effect`] is `Option`, computed once at the end of a run
-//! rather than per record, and `None` rather than zero when no effect ran, because a report
-//! that printed `0 B per effect` would be reporting a division nobody performed.
+//! figure is the host's business. The rig is on the same target and takes the same care: a
+//! per-effect figure is computed once at the end of a run rather than per record, and it is
+//! `None` rather than zero when no effect ran, because a report that printed `0 B per effect`
+//! would be reporting a division nobody performed.
+//!
+//! It is also a [`PerEffect`] — a numerator and a denominator — rather than a quotient. An
+//! eight-effect run issues thirty-eight program calls, and `38 / 8` is `4`: an integer
+//! quotient publishes **less wear than was measured**, every time the division is not exact.
+//! That is the one direction a wear figure must not be wrong in, and it is the direction
+//! truncation always fails in. The totals stay exact, the rendering carries two decimal
+//! places, and [`PerEffect::is_exact`] says whether they were needed.
 
 use waymaker_flash::append::WriteAmplification;
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -282,32 +289,45 @@ impl Wear {
         }
     }
 
-    /// `total / effects`, or `None` when no effect completed.
-    const fn per_effect(self, total: u32) -> Option<u32> {
-        total.checked_div(self.effects)
+    /// `total` over the completed effects, or `None` when none completed.
+    const fn per_effect(self, total: u32) -> Option<PerEffect> {
+        if self.effects == 0 {
+            None
+        } else {
+            Some(PerEffect {
+                total,
+                effects: self.effects,
+            })
+        }
     }
 
     /// Programmed bytes per completed effect.
     #[must_use]
-    pub const fn programmed_bytes_per_effect(self) -> Option<u32> {
+    pub const fn programmed_bytes_per_effect(self) -> Option<PerEffect> {
         self.per_effect(self.programmed_bytes)
+    }
+
+    /// Payload bytes per completed effect.
+    #[must_use]
+    pub const fn payload_bytes_per_effect(self) -> Option<PerEffect> {
+        self.per_effect(self.payload_bytes)
     }
 
     /// `program` calls per completed effect.
     #[must_use]
-    pub const fn program_operations_per_effect(self) -> Option<u32> {
+    pub const fn program_operations_per_effect(self) -> Option<PerEffect> {
         self.per_effect(self.program_operations)
     }
 
     /// `barrier` calls per completed effect.
     #[must_use]
-    pub const fn barriers_per_effect(self) -> Option<u32> {
+    pub const fn barriers_per_effect(self) -> Option<PerEffect> {
         self.per_effect(self.barriers)
     }
 
     /// `erase` calls per completed effect.
     #[must_use]
-    pub const fn erase_operations_per_effect(self) -> Option<u32> {
+    pub const fn erase_operations_per_effect(self) -> Option<PerEffect> {
         self.per_effect(self.erase_operations)
     }
 
@@ -343,6 +363,84 @@ impl Wear {
             barriers: self.barriers.saturating_add(1),
             ..self
         }
+    }
+}
+
+/// A measured total over the effects that produced it.
+///
+/// A fraction rather than a quotient, because a quotient is wrong in the one direction a wear
+/// figure must not be wrong in. An eight-effect run issues thirty-eight program calls, and
+/// `38 / 8` is `4` — a published artifact reporting less wear than was measured, silently,
+/// for every division that is not exact.
+///
+/// The numerator and the denominator are both kept, so a reader can check the arithmetic and a
+/// consumer can re-derive it at whatever precision it wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PerEffect {
+    total: u32,
+    effects: u32,
+}
+
+impl PerEffect {
+    /// The measured total.
+    #[must_use]
+    pub const fn total(self) -> u32 {
+        self.total
+    }
+
+    /// How many effects it is over.
+    ///
+    /// Never zero: a run with no completed effects has no per-effect figure at all, and
+    /// [`Wear::programmed_bytes_per_effect`] and its siblings answer `None` rather than
+    /// dividing.
+    #[must_use]
+    pub const fn effects(self) -> u32 {
+        self.effects
+    }
+
+    /// The integer part.
+    #[must_use]
+    pub const fn whole(self) -> u32 {
+        match self.total.checked_div(self.effects) {
+            Some(whole) => whole,
+            // Unreachable: the constructor refuses a zero denominator.
+            None => 0,
+        }
+    }
+
+    /// The figure in hundredths, so a renderer can show two decimal places without a float.
+    ///
+    /// Saturating in the multiply rather than wrapping: a total that large is a reading of
+    /// media rather than a count, and a wrapped figure would understate it — which is the
+    /// failure this whole type exists to prevent.
+    #[must_use]
+    pub const fn hundredths(self) -> u32 {
+        match self.total.saturating_mul(100).checked_div(self.effects) {
+            Some(hundredths) => hundredths,
+            None => 0,
+        }
+    }
+
+    /// Whether the division is exact, so a report can say when a decimal is a rounding.
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        match self.total.checked_rem(self.effects) {
+            Some(remainder) => remainder == 0,
+            None => true,
+        }
+    }
+}
+
+impl core::fmt::Display for PerEffect {
+    /// Two decimal places, computed in integers.
+    ///
+    /// Truncated at the hundredth rather than rounded, and that is deliberate in the same
+    /// direction as everything else here: a report that rounded 4.995 up to 5.00 would be
+    /// publishing a figure nobody measured, and one that rounded down understates by at most a
+    /// hundredth of a byte. [`is_exact`](Self::is_exact) is how a caller tells the two apart.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let hundredths = self.hundredths();
+        write!(formatter, "{}.{:02}", hundredths / 100, hundredths % 100)
     }
 }
 

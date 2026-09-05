@@ -35,7 +35,7 @@ use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Rig, Verdict};
-use waymaker_rig::wear::{Metered, Wear};
+use waymaker_rig::wear::{Metered, PerEffect, Wear};
 
 /// The seed every published figure is measured at.
 ///
@@ -163,8 +163,12 @@ pub fn measure() -> Result<Vec<PartWear>, WearError> {
         .collect()
 }
 
-/// A per-effect figure, or a dash where no effect ran.
-fn per_effect(value: Option<u32>) -> String {
+/// A per-effect figure to two decimal places, or a dash where no effect ran.
+///
+/// Two places rather than a whole number, because an eight-effect run issues thirty-eight
+/// program calls and `38 / 8` is `4`: an integer quotient publishes *less wear than was
+/// measured*, which is the one direction a wear figure must not be wrong in.
+fn per_effect(value: Option<PerEffect>) -> String {
     value.map_or_else(|| "-".to_owned(), |figure| figure.to_string())
 }
 
@@ -194,10 +198,10 @@ pub fn render(rows: &[PartWear]) -> String {
         // eight effects is zero — a figure that reads as "this engine does not erase", which
         // is the opposite of true and exactly the kind of number a report should not print.
         table.push(format!(
-            "  {:<width$}  {:>7} {:>9} {:>9} {:>8} {:>8}  {:>9} {:>10}\n",
+            "  {:<width$}  {:>7} {:>9} {:>9} {:>8} {:>8}  {:>10} {:>10}\n",
             row.part,
             row.program_size,
-            per_effect(row.engine.payload_bytes().checked_div(row.engine.effects())),
+            per_effect(row.engine.payload_bytes_per_effect()),
             per_effect(row.engine.programmed_bytes_per_effect()),
             per_effect(row.engine.program_operations_per_effect()),
             per_effect(row.engine.barriers_per_effect()),
@@ -241,9 +245,21 @@ pub fn to_json(rows: &[PartWear]) -> String {
                 "erase_operations": row.engine.erase_operations(),
                 "erase_blocks": row.engine.erase_blocks(),
                 "erased_bytes": row.engine.erased_bytes(),
-                "programmed_bytes_per_effect": row.engine.programmed_bytes_per_effect(),
-                "program_operations_per_effect": row.engine.program_operations_per_effect(),
-                "barriers_per_effect": row.engine.barriers_per_effect(),
+                // Hundredths rather than a quotient: `38 / 8` is `4`, and a consumer handed
+                // that is handed less wear than was measured. The totals above are the exact
+                // figures and these are derived from them.
+                "programmed_bytes_per_effect_hundredths": row
+                    .engine
+                    .programmed_bytes_per_effect()
+                    .map(PerEffect::hundredths),
+                "program_operations_per_effect_hundredths": row
+                    .engine
+                    .program_operations_per_effect()
+                    .map(PerEffect::hundredths),
+                "barriers_per_effect_hundredths": row
+                    .engine
+                    .barriers_per_effect()
+                    .map(PerEffect::hundredths),
                 // Deliberately no `erase_operations_per_effect`. §10 erases a whole bank once
                 // per run, so the figure is zero for every run this measures, and the table
                 // refuses to print it for that reason — a JSON consumer handed exactly the
@@ -276,6 +292,39 @@ mod tests {
     }
 
     #[test]
+    fn a_per_effect_figure_is_never_less_than_what_was_measured() {
+        // The defect this type exists for: an eight-effect run's thirty-eight program calls
+        // are 4.75 each, and an integer quotient publishes 4. A published wear figure that
+        // understates is worse than no figure, because it is believed.
+        let rows = measure().expect("every part is measurable");
+        for row in &rows {
+            let figure = row
+                .engine
+                .program_operations_per_effect()
+                .expect("a run with effects in it");
+            assert_eq!(figure.total(), row.engine.program_operations());
+            assert_eq!(figure.effects(), row.engine.effects());
+            // The rendered figure, times the effect count, is at least the measured total —
+            // truncation at the hundredth loses less than one effect's worth.
+            assert!(
+                u64::from(figure.hundredths()) * u64::from(figure.effects())
+                    >= u64::from(figure.total()) * 100 - u64::from(figure.effects()),
+                "{}: {figure} understates {} over {} effects",
+                row.part,
+                figure.total(),
+                figure.effects()
+            );
+            if !figure.is_exact() {
+                assert!(
+                    figure.hundredths() > figure.whole() * 100,
+                    "{}: an inexact figure rendered as a whole number",
+                    row.part
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_wider_program_unit_costs_more_per_effect() {
         // The reason the table has rows rather than a number: a commit seal is one program
         // unit, so the same record costs more to commit on a coarser part.
@@ -285,7 +334,8 @@ mod tests {
             let figure = row
                 .engine
                 .programmed_bytes_per_effect()
-                .expect("a run with effects in it");
+                .expect("a run with effects in it")
+                .hundredths();
             assert!(
                 figure >= previous,
                 "{} programmed {figure} B per effect, less than a finer part",
@@ -336,7 +386,9 @@ mod tests {
         let rows = measure().expect("every part is measurable");
         let row = rows.first().expect("at least one part");
         assert_eq!(
-            row.engine.erase_operations_per_effect(),
+            row.engine
+                .erase_operations_per_effect()
+                .map(PerEffect::whole),
             Some(0),
             "the per-effect figure is the misleading one this table avoids printing"
         );

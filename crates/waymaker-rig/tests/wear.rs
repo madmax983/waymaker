@@ -7,7 +7,7 @@
 //! is also the only way to see traffic the journal did not issue.
 
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_rig::wear::{Metered, Traffic, Wear};
+use waymaker_rig::wear::{Metered, PerEffect, Traffic, Wear};
 
 fn geometry() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 256, 4, 1) else {
@@ -138,9 +138,18 @@ fn an_effect_is_credited_once_and_the_figures_are_per_effect() {
     assert_eq!(wear.programmed_bytes(), 32);
     assert_eq!(wear.program_operations(), 8);
     assert_eq!(wear.barriers(), 8);
-    assert_eq!(wear.programmed_bytes_per_effect(), Some(8));
-    assert_eq!(wear.program_operations_per_effect(), Some(2));
-    assert_eq!(wear.barriers_per_effect(), Some(2));
+    // Exact here — four effects, thirty-two bytes — and asserted as exact rather than as a
+    // number, so a truncating quotient could not satisfy it by accident.
+    let bytes = wear.programmed_bytes_per_effect().expect("effects ran");
+    assert_eq!(bytes.whole(), 8);
+    assert_eq!(bytes.hundredths(), 800);
+    assert!(bytes.is_exact());
+    assert_eq!(bytes.to_string(), "8.00");
+    assert_eq!(
+        wear.program_operations_per_effect().map(PerEffect::whole),
+        Some(2)
+    );
+    assert_eq!(wear.barriers_per_effect().map(PerEffect::whole), Some(2));
 }
 
 #[test]
@@ -152,6 +161,7 @@ fn a_run_with_no_effects_has_no_per_effect_figure() {
     assert_eq!(wear.program_operations_per_effect(), None);
     assert_eq!(wear.barriers_per_effect(), None);
     assert_eq!(wear.erase_operations_per_effect(), None);
+    assert_eq!(wear.payload_bytes_per_effect(), None);
 }
 
 #[test]
@@ -164,6 +174,38 @@ fn a_meter_that_saw_traffic_the_journal_did_not_count_does_not_agree_with_it() {
         !meter.wear().agrees_with(WriteAmplification::NONE),
         "a meter that counted a program agreed with a journal that counted none"
     );
+}
+
+#[test]
+fn a_per_effect_figure_that_does_not_divide_is_not_rounded_down_to_a_whole() {
+    // The defect Codex found: an eight-effect run's thirty-eight program calls are 4.75 each,
+    // and an integer quotient publishes 4 — less wear than was measured, silently.
+    metered!(part, meter);
+    meter.erase(0, 256).expect("one block");
+    for step in 0..3_u32 {
+        meter
+            .program(step * 4, b"\x01\x02\x03\x04")
+            .expect("a program");
+    }
+    for _ in 0..2 {
+        meter.credit_effect();
+    }
+    let figure = meter
+        .wear()
+        .program_operations_per_effect()
+        .expect("effects ran");
+    assert_eq!(figure.total(), 3);
+    assert_eq!(figure.effects(), 2);
+    assert_eq!(figure.whole(), 1, "the integer part alone understates");
+    assert_eq!(figure.hundredths(), 150);
+    assert!(!figure.is_exact());
+    assert_eq!(figure.to_string(), "1.50");
+}
+
+#[test]
+fn a_run_with_no_effects_has_no_fraction_at_all() {
+    // `None`, not a zero denominator: a division nobody performed is not a figure.
+    assert_eq!(Wear::NONE.program_operations_per_effect(), None);
 }
 
 #[test]
