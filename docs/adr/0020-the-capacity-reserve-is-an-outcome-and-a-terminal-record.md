@@ -106,10 +106,24 @@ same granularity, and watched every `RunStarted` be refused for ever with the jo
 A journal whose header carried an input longer than the bounds declared reaches the same
 state on one device. `CapacityError::RegionTooSmall` is that refusal.
 
+Codex then found the half the floor does not cover: two devices can share a program unit and
+not a bank size, and a reserve priced for a large bank carries a `continue_as_new` header
+figure that bank could hold. Applied to a journal on a smaller device, the floor and the tail
+may both fit while the header the roll-over would write does not — so the gate would promise
+an exit that is not there. `Reserve` therefore remembers the capacity and erase size it was
+priced against, which with the program unit decide a `BankLayout` entirely, and `over` refuses
+a journal from anywhere else with `CapacityError::WrongDevice` — the refusal
+`AppendError::WrongDevice` already makes one layer up.
+
 **A record longer than its bound is refused, and says something different.** A reserve is a
 promise about records of a declared size; admitting a larger one would make the promise false
-for whatever came after it. That refusal is `Refusal::OverDeclaredBound`, because a caller
-acts on the two differently — one means end the run, and the other means the bounds are wrong
+for whatever came after it. The comparison is against the caller's *payload bytes* and not
+against the padded frame they encode to: Codex found that a bound and a larger payload can
+share a record — an eight-byte result and a one-byte terminal bound are both a 32-byte record
+at an eight-byte program unit — so a ceiling compared in encoded bytes admits the larger one
+under the smaller bound. It costs the reserve nothing, since the padded frame was priced
+either way; what it costs is the promise. That refusal is `Refusal::OverDeclaredBound`,
+because a caller acts on the two differently — one means end the run, and the other means the bounds are wrong
 and ending the run will not help. One state deserves naming, because it is the one place §10
 leaves no exit at all: an *outcome* refused this way while its effect is outstanding cannot be
 followed by a terminal record either, since §08 has no edge from an unresolved effect to one.
@@ -163,25 +177,34 @@ reported as a legal layout. Fixed here, because `Reserve::for_layout` now takes
 `max_run_input_bytes` as its first gate; the smallest accepted device grows from three erase
 blocks per bank to four.
 
-**The code-flash figure moved and the gate did not.** 14764 B to **16348 B** against the same
-16 KiB budget. The split is worth stating because it is almost entirely not the module: the
-library change measured with the probe not reaching it is **40 B** — the `encoded_len_for`
-refactor and the crate-private accessor — and the rest is what the probe drags in to reach
-twelve public functions and both arms of every refusal. That is issue
+**The incremental code-flash gate goes to 18 KiB.** 14764 B to **16456 B**, which does not fit
+the 16 KiB ADR 0017 set and ADR 0019 declined to raise. `INCREMENTAL_CODE_FLASH_BYTES` goes to
+18432 B.
+
+The split is what justifies it, because it is almost entirely not the module. Measured with
+the probe not reaching `capacity` at all, the library change is **tens of bytes** — the
+`encoded_len_for` refactor and a crate-private accessor. Everything else is what the probe
+links to reach twelve public functions and both arms of every refusal. That is issue
 [#72](https://github.com/madmax983/waymaker/issues/72)'s defect in the flesh rather than an
 estimate: `size-probe-reach` obliges the probe to name every public function, and the probe's
-own arithmetic is charged to the engine's row. Two diagnostic strings were shortened to fit,
-which is the wrong reason to shorten a diagnostic string and is recorded here as such.
+own arithmetic is charged to the engine's row.
 
-**36 B of headroom is what is left, and issue #26 cannot land in it.** ADR 0017 raised this
-gate once and ADR 0019 declined to raise it again, saying 1620 B was what the rest of rung 0.2
-had to fit in. This spends it. The bank swap of issue
-[#26](https://github.com/madmax983/waymaker/issues/26) does not fit in 36 B, so the budget
-conversation falls due there — and it should be had *after* issue #72, not instead of it,
-because a raise argued from a figure a third of which is the probe is a raise argued from the
-wrong number. The alternative available today is in the alternatives below: dropping the gate
-type and keeping the predicate alone is worth roughly 600 B, and it is a real option if #26
-turns out to need the room before #72 is fixed.
+The alternative was to shrink to fit, and the attempts are worth recording because they are
+what makes the raise a decision rather than a shrug. Two diagnostic strings were shortened —
+which is the wrong reason to shorten a diagnostic string. Merging the two length refusals into
+one bought 8 B and cost a distinction review had asked for. Retaining the trivial accessors as
+function pointers rather than folding them, which is how this probe keeps `Display` impls
+alive, cost **92 B more** rather than less. What was left was to drop `Refusal`, or
+`CapacityError`'s split, or the payload bound — every one of them a review finding, given back
+to fit a number that is measuring the probe.
+
+**18 KiB and not more, and this should be the last raise before #72.** 1976 B of headroom,
+which is the same order ADR 0019 left. It deliberately does *not* pre-authorise the bank swap
+of issue [#26](https://github.com/madmax983/waymaker/issues/26): that change should be measured
+against a figure that has #72 fixed, because a third raise argued from a number a third of
+which is the probe would be a third raise argued from the wrong number. If #26 needs room
+before #72 is fixed, the alternative below — the predicate without the gate type, worth roughly
+600 B — is a real option, and a better one than a gate that moves whenever it is inconvenient.
 
 **Nothing obliges a caller to use the gate.** `Journal` is still public and still ungated,
 which is what `append`'s own documentation promises: it programs what it is handed. `Reserved`

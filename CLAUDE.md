@@ -268,7 +268,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1) |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
-| Incremental code flash | ≤ 16 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises the gate once for rung 0.2's two-bank lifecycle) |
+| Incremental code flash | ≤ 18 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve) |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree, and
@@ -280,14 +280,17 @@ owed. Issue #24's commit seal and two-barrier writer then took it to 14764 B aga
 [ADR 0019](docs/adr/0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md)
 splits that: 2420 B is the seal reaching the codec and the two readers, and 1368 B is the
 writer with the probe section that keeps it alive. Issue #25's capacity reserve then took it
-to 16348 B against the same 16 KiB gate, and
+to 16456 B, and
 [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
-splits *that* the same way — and says plainly that almost none of it is the module: 40 B is
-the library change measured on its own, and the rest is what the probe drags in
-to reach twelve public functions. The gate is **not** raised, and **36 B** of headroom is
-what the rest of rung 0.2 has to fit in — which is not enough for issue
-[#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap, so the budget
-conversation ADR 0017 opened and ADR 0019 deferred now falls due there. A third of the
+splits *that* the same way — and says plainly that almost none of it is the module: some
+tens of bytes are the library change measured on its own, and the rest is what the probe
+drags in to reach twelve public functions. That is the budget conversation ADR 0019
+deferred, and ADR 0020 has it: the gate goes to **18 KiB**, the second and — it argues — the
+last raise that should happen before issue
+[#72](https://github.com/madmax983/waymaker/issues/72) is fixed, because a raise argued from
+a figure a third of which is the probe is a raise argued from the wrong number. Issue
+[#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap is to be measured against
+a corrected figure rather than against a third raise. A third of the
 measured "core + flash adapter" figure is still the probe rather than either, which is a
 defect in the measurement and is filed as issue
 [#72](https://github.com/madmax983/waymaker/issues/72).
@@ -568,7 +571,7 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
 - **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
   the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 5 KiB of 16348 B at rung 0.2. ADR 0002 says so, ADR
+  calls "core + flash adapter" — roughly 5 KiB of 16456 B at rung 0.2. ADR 0002 says so, ADR
   0017 attributes rung 0.2's first figure by symbol, ADR 0019 splits the writer out and
   ADR 0020 the reserve, but nothing *checks* the split: doing so needs a call graph, and all
   three attributions are readings of measurements rather than gates.
@@ -865,7 +868,8 @@ and not the seal that commits it was a legal layout; that is fixed here, because
 left owed is written down: the reserve is not obliged on anybody, because the dispatcher that
 would be obliged is rung 0.4's; §08's order is a precondition on the caller rather than
 something `Reserved` can enforce; the `waymaker-fault` sweep of the reboot join is not here;
-and 36 B of code-flash headroom is not enough for the bank swap.
+and the code-flash gate needed a second raise, which ADR 0020 argues should be the last
+before issue #72 corrects what the figure is measuring.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the bank swap
 arrives with 0.2, and the async `Ctx` and dispatcher with 0.4. The

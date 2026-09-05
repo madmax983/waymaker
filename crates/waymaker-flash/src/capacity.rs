@@ -189,6 +189,17 @@ pub enum CapacityError {
     ///
     /// From [`Reserved::over`] only.
     WrongGranularity,
+    /// The journal is on a different device than the reserve was priced for.
+    ///
+    /// The granularity check above is not enough on its own, and Codex found the gap: two
+    /// devices can share a program unit and not a bank size. A reserve priced for a large
+    /// bank carries a `continue_as_new` header figure that bank could hold; applied to a
+    /// journal on a smaller device, the tail and the floor may both fit while the header the
+    /// roll-over would write does not — so the gate would promise an exit that is not there.
+    /// The same refusal [`AppendError::WrongDevice`] makes, one layer up.
+    ///
+    /// From [`Reserved::over`] only.
+    WrongDevice,
 }
 
 impl CapacityError {
@@ -208,6 +219,7 @@ impl CapacityError {
             Self::ReserveDoesNotFit => "a bank cannot hold the run and its exit",
             Self::RegionTooSmall => "this journal is smaller than the reserve",
             Self::WrongGranularity => "the reserve was priced at another unit",
+            Self::WrongDevice => "the reserve was priced for another device",
         }
     }
 }
@@ -304,10 +316,25 @@ impl Refusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Reserve {
     align: ProgramAlign,
-    /// The worst-case `RunStarted` record, seal included.
-    start_bytes: u32,
-    /// An `EffectScheduled` record, which has one size. ADR 0011.
-    schedule_bytes: u32,
+    /// The bank size this reserve was priced against: the device's capacity and erase size.
+    ///
+    /// Those two and the program unit decide a [`BankLayout`] entirely, and the program unit
+    /// is [`align`](Self::align), so this pair is what identifies the banks a reserve was
+    /// priced for. Compared against the journal's own device in [`Reserved::over`]: without
+    /// it a reserve priced for a large bank could gate a journal on a smaller device of the
+    /// same granularity, where the `continue_as_new` header it promised room for does not
+    /// fit — the case Codex found. Two `u32`s rather than a whole [`Geometry`] because a
+    /// read size a bank layout never consults would make two identical layouts compare
+    /// unequal.
+    banks: (u32, u32),
+    /// What the run declared its records may be worth.
+    ///
+    /// Kept as *lengths* rather than only as the padded frames they price. A bound and a
+    /// larger payload can occupy the same padded frame — an eight-byte result and a one-byte
+    /// bound are both a 32-byte record at an eight-byte program unit — so a ceiling compared
+    /// in encoded bytes admits records the bounds do not. Codex found that on this change;
+    /// [`admits`](Reserve::admits) compares the payload the caller supplied.
+    bounds: Bounds,
     /// The worst-case `EffectCompleted` or `EffectFailed` record, seal included.
     outcome_bytes: u32,
     /// The worst-case `RunCompleted` or `RunFailed` record, seal included.
@@ -403,8 +430,8 @@ impl Reserve {
 
         Ok(Self {
             align,
-            start_bytes: narrow(start),
-            schedule_bytes: narrow(schedule),
+            banks: (layout.geometry().capacity(), layout.geometry().erase_size()),
+            bounds,
             outcome_bytes: narrow(outcome),
             terminal_bytes: narrow(terminal),
             rollover_bytes: narrow(rollover),
@@ -483,10 +510,10 @@ impl Reserve {
         let Ok(encoded) = frame::encoded_len(record, self.align) else {
             return Err(Refusal::Unencodable);
         };
-        let needed = narrow(encoded);
-        if needed > self.ceiling_for(record) {
+        if !self.within_bounds(record) {
             return Err(Refusal::OverDeclaredBound);
         }
+        let needed = narrow(encoded);
         let Some(total) = needed.checked_add(self.exit_bytes_after(record)) else {
             return Err(Refusal::NearCapacity);
         };
@@ -496,16 +523,28 @@ impl Reserve {
         Ok(())
     }
 
-    /// The largest `record` of its kind this reserve priced.
-    const fn ceiling_for(&self, record: &RecordRef<'_>) -> u32 {
-        match record {
-            RecordRef::RunStarted { .. } => self.start_bytes,
-            RecordRef::EffectScheduled { .. } => self.schedule_bytes,
-            RecordRef::EffectCompleted { .. } | RecordRef::EffectFailed { .. } => {
-                self.outcome_bytes
+    /// Whether `record`'s payload is within the bound its kind was priced at.
+    ///
+    /// The caller's *bytes*, compared with the declared length. Comparing padded frames
+    /// instead lets a bound and a larger payload share a record — an eight-byte result and a
+    /// one-byte terminal bound are both a 32-byte record at an eight-byte program unit — and
+    /// admits the larger one under the smaller bound. It costs the reserve nothing, because
+    /// the padded frame was priced either way; what it costs is the promise, which is the
+    /// thing [`Refusal::OverDeclaredBound`] exists to keep.
+    ///
+    /// An `EffectScheduled` has one size that ADR 0011 fixed, so there is no bound to exceed.
+    const fn within_bounds(&self, record: &RecordRef<'_>) -> bool {
+        let (payload, bound) = match record {
+            RecordRef::RunStarted { input, .. } => (input.len(), self.bounds.run_input_bytes),
+            RecordRef::EffectScheduled { .. } => return true,
+            RecordRef::EffectCompleted { result, .. } => {
+                (result.len(), self.bounds.effect_result_bytes)
             }
-            RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => self.terminal_bytes,
-        }
+            RecordRef::EffectFailed { error, .. } => (error.len(), self.bounds.effect_result_bytes),
+            RecordRef::RunCompleted { result } => (result.len(), self.bounds.terminal_bytes),
+            RecordRef::RunFailed { error } => (error.len(), self.bounds.terminal_bytes),
+        };
+        payload <= bound as usize
     }
 
     /// The granularity every figure here was padded to.
@@ -594,8 +633,17 @@ impl<C: IntegrityCheck> Reserved<C> {
     /// rather than the tail alone is what closes it: the tail is what an *outstanding
     /// effect* owes, and a journal that can hold only that cannot hold the run that reaches
     /// it.
-    pub const fn over(journal: Journal<C>, reserve: Reserve) -> Result<Self, CapacityError> {
+    pub fn over(journal: Journal<C>, reserve: Reserve) -> Result<Self, CapacityError> {
         let region = journal.region();
+        // The device first. Everything else a reserve knows — the bank a roll-over would
+        // write its header into, the payload that header and the run have to share — is a
+        // fact about the geometry it was priced on, and a journal from elsewhere makes none
+        // of it true. `JournalRegion` keeps the geometry it was validated against for
+        // exactly this kind of comparison.
+        let here = region.geometry();
+        if (here.capacity(), here.erase_size()) != reserve.banks {
+            return Err(CapacityError::WrongDevice);
+        }
         if region.align().get() != reserve.align().get() {
             return Err(CapacityError::WrongGranularity);
         }
@@ -661,7 +709,7 @@ impl<C: IntegrityCheck> Reserved<C> {
 // A reserve is a price list and nothing that grows with history, and a gated writer is a
 // writer plus that list. Checked where a mistake is a compile error, the way `Journal`'s
 // size is.
-const _: () = assert!(size_of::<Reserve>() == 28);
+const _: () = assert!(size_of::<Reserve>() == 32);
 const _: () = assert!(size_of::<Reserved>() == size_of::<Journal>() + size_of::<Reserve>());
 
 #[cfg(test)]
@@ -810,15 +858,58 @@ mod tests {
 
     #[test]
     fn the_floor_is_an_opening_record_one_effect_and_an_exit() {
-        // The number `Reserved::over` re-checks. Stated as the sum it is, so a floor that
-        // stopped counting the schedule — the term that separates a usable bank from one
-        // that can only start and end a run — is a failure here rather than 4004 silently
-        // accepted configurations.
+        // The number `Reserved::over` re-checks. Stated as the sum it is — and against the
+        // codec rather than against fields of its own — so a floor that stopped counting the
+        // schedule, the term that separates a usable bank from one that can only start and
+        // end a run, is a failure here rather than 4004 silently accepted configurations.
         let reserve = reserve();
+        let align = layout().align();
+        let (Ok(start), Ok(schedule)) = (
+            frame::encoded_len_for(
+                RUN_STARTED_PREFIX_BYTES + BOUNDS.run_input_bytes as usize,
+                align,
+            ),
+            frame::encoded_len_for(EFFECT_SCHEDULED_BODY_BYTES, align),
+        ) else {
+            unreachable!("these bounds encode")
+        };
         assert_eq!(
             reserve.floor_bytes,
-            reserve.start_bytes + reserve.schedule_bytes + reserve.tail_bytes()
+            narrow(start) + narrow(schedule) + reserve.tail_bytes()
         );
         assert!(reserve.floor_bytes > reserve.tail_bytes());
+    }
+
+    #[test]
+    fn a_payload_larger_than_its_bound_is_refused_even_when_the_padding_hides_it() {
+        // Codex found this: a bound and a larger payload can occupy the same padded frame,
+        // so a ceiling compared in *encoded* bytes admits the larger one. At an eight-byte
+        // program unit a one-byte terminal bound and an eight-byte result are both a 32-byte
+        // record.
+        let Ok(reserve) = Reserve::for_layout(
+            Bounds {
+                run_input_bytes: 8,
+                effect_result_bytes: 8,
+                terminal_bytes: 1,
+            },
+            layout(),
+        ) else {
+            unreachable!("these bounds fit a 4 KiB bank")
+        };
+        let at_the_bound = RecordRef::RunCompleted { result: &[0_u8; 1] };
+        let over = RecordRef::RunCompleted { result: &[0_u8; 8] };
+        let Ok(align) = frame::encoded_len(&at_the_bound, layout().align()) else {
+            unreachable!("it encodes")
+        };
+        let Ok(same) = frame::encoded_len(&over, layout().align()) else {
+            unreachable!("it encodes")
+        };
+        assert_eq!(align, same, "the two really do share a padded frame");
+        assert_eq!(reserve.admits(&at_the_bound, 4096), Ok(()));
+        assert_eq!(
+            reserve.admits(&over, 4096),
+            Err(Refusal::OverDeclaredBound),
+            "a record the bounds do not admit must be refused however the padding falls"
+        );
     }
 }

@@ -548,24 +548,136 @@ fn a_gate_refuses_a_journal_smaller_than_the_one_its_reserve_was_priced_for() {
 }
 
 #[test]
-fn a_reserve_refuses_a_journal_written_at_another_granularity() {
-    // A reserve computed at a byte-programmable granularity under-reserves on a device with
-    // an eight-byte program unit: every frame there is padded and every figure is too small.
-    let Ok(fine) = Geometry::new(8192, 4096, 1, 1) else {
-        unreachable!("8192 is two whole 4096-byte blocks of single bytes")
+fn a_payload_larger_than_its_bound_is_refused_however_the_padding_falls() {
+    // Codex found this. A declared bound and a larger payload can occupy the same padded
+    // frame, so a ceiling compared in *encoded* bytes admits the larger one: at an
+    // eight-byte program unit a one-byte terminal bound and an eight-byte result are both a
+    // 32-byte record. It costs the reserve nothing — the padded frame was priced either way
+    // — and it costs the promise, which is what `OverDeclaredBound` exists to keep.
+    let Ok(narrow) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 1,
+            effect_result_bytes: 1,
+            terminal_bytes: 1,
+        },
+        layout(),
+    ) else {
+        unreachable!("one-byte bounds fit a 4 KiB bank")
     };
-    let Ok(fine) = BankLayout::new(fine) else {
+    for (at_the_bound, over) in [
+        (
+            RecordRef::RunCompleted { result: &[0_u8; 1] },
+            RecordRef::RunCompleted { result: &[0_u8; 8] },
+        ),
+        (
+            RecordRef::RunFailed { error: &[0_u8; 1] },
+            RecordRef::RunFailed { error: &[0_u8; 8] },
+        ),
+        (
+            RecordRef::EffectCompleted {
+                seq: EffectSeq(0),
+                result: &[0_u8; 1],
+            },
+            RecordRef::EffectCompleted {
+                seq: EffectSeq(0),
+                result: &[0_u8; 8],
+            },
+        ),
+        (
+            RecordRef::EffectFailed {
+                seq: EffectSeq(0),
+                error: &[0_u8; 1],
+            },
+            RecordRef::EffectFailed {
+                seq: EffectSeq(0),
+                error: &[0_u8; 8],
+            },
+        ),
+        (
+            RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 1,
+                input: &[0_u8; 1],
+            },
+            // Four rather than eight: a `RunStarted` spends four payload bytes on the
+            // workflow identity before its input, so it reaches the next padded frame
+            // sooner. The point is a payload over its bound that shares a frame with the
+            // bound, and four is where that lands for this kind.
+            RecordRef::RunStarted {
+                workflow_kind: 1,
+                workflow_version: 1,
+                input: &[0_u8; 4],
+            },
+        ),
+    ] {
+        assert_eq!(
+            width(&at_the_bound),
+            width(&over),
+            "the two really do share a padded frame, which is what hid the bug"
+        );
+        assert_eq!(narrow.admits(&at_the_bound, 4096), Ok(()));
+        assert_eq!(
+            narrow.admits(&over, 4096),
+            Err(Refusal::OverDeclaredBound),
+            "a record the bounds do not admit must be refused however the padding falls"
+        );
+    }
+}
+
+#[test]
+fn a_reserve_refuses_a_journal_on_another_device() {
+    // Codex found this one. A reserve priced on one device carries a `continue_as_new` header
+    // figure that *that* device's bank could hold; applied to a journal on a smaller device
+    // of the same granularity, the floor and the tail may both fit while the header the
+    // roll-over would write does not — so the gate would promise an exit that is not there.
+    // The granularity check alone does not see it: two devices can share a program unit and
+    // not a bank size.
+    let Ok(smaller) = Geometry::new(1024, 512, 8, 1) else {
+        unreachable!("1024 is two whole 512-byte blocks of whole 8-byte units")
+    };
+    let Ok(smaller_layout) = BankLayout::new(smaller) else {
         unreachable!("two erase blocks are two banks")
     };
-    let Ok(fine_reserve) = Reserve::for_layout(BOUNDS, fine) else {
-        unreachable!("these bounds fit a 4 KiB bank")
-    };
+    let mut device = Nor::new(smaller);
+    let region = install_on(
+        &mut device,
+        smaller_layout,
+        BankId::A,
+        Generation(1),
+        RUN_INPUT,
+    );
+    let journal = opened(&mut device, region);
+    // The two devices share a program unit, and this journal is large enough for the floor,
+    // so nothing but the device itself distinguishes them.
+    assert_eq!(smaller_layout.align().get(), align().get());
+    assert!(region.bytes() > reserve().tail_bytes());
+    assert_eq!(
+        Reserved::over(journal, reserve()).map(|_| ()),
+        Err(CapacityError::WrongDevice)
+    );
+}
 
+#[test]
+fn a_reserve_refuses_a_journal_written_at_another_granularity() {
+    // A reserve computed at one granularity under-states every figure at a coarser one:
+    // every frame there is padded further. The device is the same, so this is the check the
+    // device comparison does not make.
     let mut device = Nor::new(geometry());
     let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
-    let journal = opened(&mut device, region);
+    let Some(coarse) = ProgramAlign::new(16) else {
+        unreachable!("16 is a power of two within the program-size range")
+    };
+    let Ok(coarser) = JournalRegion::spanning(geometry(), region.base(), 2048, coarse) else {
+        unreachable!("a coarser granularity than the device's program unit is legal")
+    };
+    let journal = opened(&mut device, coarser);
+    assert_ne!(
+        coarser.align().get(),
+        align().get(),
+        "the device is the same and the granularity is not"
+    );
     assert_eq!(
-        Reserved::over(journal, fine_reserve).map(|_| ()),
+        Reserved::over(journal, reserve()).map(|_| ()),
         Err(CapacityError::WrongGranularity)
     );
 }

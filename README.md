@@ -84,7 +84,7 @@ them is built for a firmware target, and no layer may depend on any of them.
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
-| Incremental code flash | ≤ 16 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised the gate once for rung 0.2's two-bank lifecycle) |
+| Incremental code flash | ≤ 18 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve) |
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
@@ -209,7 +209,7 @@ the panic handler and drift with the toolchain.
 
 | Measured | Gated on | How |
 | --- | --- | --- |
-| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 16 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 18 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
 | Engine statics | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 
