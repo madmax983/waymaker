@@ -972,72 +972,32 @@ fn without_fenced_code(contents: &str) -> String {
     kept.join("\n")
 }
 
-/// Every rule count CLAUDE.md states that is not `expected`.
+/// The two phrases CLAUDE.md states the gate's rule count in.
 ///
-/// The file states the count twice — once in its opening paragraph and once above the table
-/// — and a `contains` check for the right number is satisfied by either of them. That is how
-/// the opening paragraph came to say 39 while the table said 40.
+/// # Why this is a pin and not a scan
 ///
-/// # Why this anchors on "all"
+/// Because the scan was wrong four times, each time in a *narrower* matcher than the last,
+/// and every one of them was a false positive — a build failing over a correct document,
+/// which is worse than the drift it was written to catch. Codex found all four: `ADR 0012
+/// rules out table-based CRCs` read a verb as a count marker; `Install 39 rules` matched
+/// `all ` inside `install `; and then `Enable all 39 rules from the policy bundle` cleared
+/// the word boundary and was still not a claim about *this* gate.
 ///
-/// The first version read the digits immediately before `" rule"`, and Codex found what that
-/// costs: `ADR 0012 rules out table-based CRCs` is prose making no claim about how many rules
-/// there are, and the scan read `0012` and reported a stale count of 12. A rule that fails a
-/// build over a sentence like that is worse than the drift it was written to catch, because
-/// the drift is a wrong number in a document and this is a red build on a correct one.
+/// The fourth is the one that settles the shape. `all 39 rules` and `all 40 rules` are
+/// indistinguishable as *phrases*; what separates them is whether the sentence is about the
+/// gate, and no amount of narrowing recovers that from the digits. So the count is pinned
+/// where it is actually written, with the context that makes it a claim about this gate: the
+/// ids the tables own, and the command that emits them.
 ///
-/// So the anchor is the phrasing a count is actually written in — `all 40 rules`,
-/// `all 40 rule ids` — which is the convention both occurrences already follow and the one
-/// "Adding a gate rule" tells a contributor to keep. A verb cannot sit there: `ADR 0012 rules`
-/// has no `all`.
-///
-/// The anchor has to start a word, and Codex found the second false positive that costs:
-/// lowercased, `Install 39 rules from the policy bundle` ends `install ` with `all ` inside
-/// it, so a bare substring match reads a count out of a verb's suffix. Only the two complete
-/// forms the file uses are accepted after the digits — `rules` and `rule id` — so `all 39
-/// ruler` is not a count either.
-///
-/// What it therefore does **not** catch is a count written some other way — `the 39 rules`,
-/// or a bare `39 rules` mid-sentence. That is the narrower gap, and it is the right one to
-/// take: a missed drift is a wrong number a reviewer can still see, and a false positive is a
-/// build nobody can make green without deleting true prose.
-fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
-    let mut stale = Vec::new();
-    let lowered = contents.to_lowercase();
-    for (at, _) in lowered.match_indices("all ") {
-        // A word boundary before the anchor. Codex found the second false positive this
-        // way: lowercased, `Install 39 rules from the policy bundle` ends `install ` with
-        // `all ` inside it, so a bare substring match reads a count out of a verb's suffix.
-        let starts_a_word = lowered
-            .get(..at)
-            .and_then(|before| before.chars().next_back())
-            .is_none_or(|character| !character.is_alphanumeric() && character != '_');
-        if !starts_a_word {
-            continue;
-        }
-        let Some(rest) = lowered.get(at.saturating_add("all ".len())..) else {
-            continue;
-        };
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if digits.is_empty() {
-            continue;
-        }
-        let Some(after) = rest.get(digits.len()..) else {
-            continue;
-        };
-        // And only the two complete forms the file uses, so `all 39 ruler` is not a count
-        // either.
-        if !(after.starts_with(" rules") || after.starts_with(" rule id")) {
-            continue;
-        }
-        let Ok(said) = digits.parse::<usize>() else {
-            continue;
-        };
-        if said != expected && !stale.contains(&said) {
-            stale.push(said);
-        }
-    }
-    stale
+/// The cost is that rewording either sentence means changing this list. That is the trade
+/// this repository already makes for `APPEND_BARRIER_CALL` and the recovery routing steps —
+/// a pinned spelling is a line a reviewer changes on purpose — and it is the right one here,
+/// because the alternative has now failed four times in a row.
+fn rule_count_phrases(rules: usize) -> [String; 2] {
+    [
+        format!("all {rules} rule ids below are compared against the tables that own them"),
+        format!("All {rules} rules `cargo xtask check-layering` can emit"),
+    ]
 }
 
 /// Rule: CLAUDE.md states the gate's rule count, once, and states it right.
@@ -1052,42 +1012,29 @@ fn stale_rule_counts(contents: &str, expected: usize) -> Vec<usize> {
 /// count at all has one defect, and listing every other number in it as well would report
 /// that defect twice.
 fn check_rule_count(contents: &str, rules: usize) -> Vec<Violation> {
-    let mut violations = Vec::new();
-    // Prose until it is checked.
-    // wrong twice: the rule table grew and the sentence above it did not, and then the table
-    // was corrected and the file's *opening* paragraph — which states the same count — was
-    // not. So this is two checks rather than one.
-    //
-    // The first is that the right count is said at all. The second is that no *other* count
-    // is, which is the half a `contains` cannot do: CLAUDE.md names the number twice, and a
-    // presence check is satisfied by the corrected one while the stale one sits four hundred
-    // lines above it telling a contributor something false. Every "N rule" in the file has to
-    // be the count the gate reports.
-    let count = format!("{rules} rule");
-    if contents.contains(&count) {
-        // Only once the right count is present. A file that states no correct count at all
-        // has one defect and gets one violation from the branch below; listing every other
-        // number in it as "stale" as well would be the same defect reported twice.
-        for stale in stale_rule_counts(contents, rules) {
-            violations.push(Violation::new(
-                "claude-md",
-                "rule count",
-                format!(
-                    "CLAUDE.md says `{stale} rule` somewhere as well as `{count}`; the gate \
-                     reports {rules} and a contributor who reads the wrong one of the two is \
-                     told a number no build will ever print"
-                ),
-            ));
-        }
-    } else {
-        violations.push(Violation::new(
-            "claude-md",
-            "rule count",
-            format!("CLAUDE.md does not say `{count}s`, which is what the gate reports"),
-        ));
+    let missing: Vec<String> = rule_count_phrases(rules)
+        .into_iter()
+        .filter(|phrase| !contents.contains(phrase.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
     }
-
-    violations
+    // One violation however many phrases drifted: it is one defect — the file and the gate
+    // disagree about how many rules there are — and listing it twice would not tell a
+    // contributor anything the names do not.
+    vec![Violation::new(
+        "claude-md",
+        "rule count",
+        format!(
+            "CLAUDE.md does not say {}; the gate reports {rules} rules and states the count \
+             in two places, so a change to one of them has to be a change to both",
+            missing
+                .iter()
+                .map(|phrase| format!("`{phrase}`"))
+                .collect::<Vec<String>>()
+                .join(" or ")
+        ),
+    )]
 }
 
 /// Rule: `CLAUDE.md` exists, quotes the layering table, and names every gate rule.
@@ -2654,7 +2601,7 @@ pub mod tests_support {
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, QuestionStatus, RECOVERY_SPEC_ADR, SETTLED_DECISIONS,
         SETTLED_DECISIONS_ADR, SPEC_CLAUSES, STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES,
-        adr_number,
+        adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
 
@@ -2745,7 +2692,9 @@ pub mod tests_support {
         for rule in rules {
             line(&mut body, format_args!("- `{rule}`"));
         }
-        line(&mut body, format_args!("All {} rules.", rules.len()));
+        for phrase in rule_count_phrases(rules.len()) {
+            line(&mut body, format_args!("{phrase}."));
+        }
         line(
             &mut body,
             format_args!("| Id | Question | Where it stands |"),
@@ -3587,94 +3536,6 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_md_that_says_the_count_twice_and_disagrees_is_reported() {
-        // The defect that shipped on pull request #76: the table above the rules was
-        // corrected to 40 and the file's opening paragraph still said 39. A `contains` check
-        // for the right number is satisfied by the corrected one, so the stale one sat four
-        // hundred lines above it telling a contributor something false.
-        let claude_md = clean_claude_md(RULES).replace(
-            "# CLAUDE.md",
-            &format!("# CLAUDE.md\n\nall {} rule ids below\n", RULES.len() - 1),
-        );
-        let violations = check_claude_md(Some(&claude_md), RULES);
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.subject == "rule count" && v.detail.contains("somewhere as well as")),
-            "a second, stale count should be reported: {violations:?}"
-        );
-    }
-
-    #[test]
-    fn a_count_that_is_not_about_rules_is_not_a_rule_count() {
-        // The scan reads the digits immediately before " rule", so an issue number, a byte
-        // figure or a year elsewhere in the file is not a claim about how many rules there
-        // are. Without this the check would fire on prose it has no business reading.
-        let claude_md = format!(
-            "{}\n\nissue 72, 16456 B of code flash, and the year 2026.\n",
-            clean_claude_md(RULES)
-        );
-        let violations = check_claude_md(Some(&claude_md), RULES);
-        assert!(
-            !violations.iter().any(|v| v.subject == "rule count"),
-            "a number that is not a rule count should not be read as one: {violations:?}"
-        );
-    }
-
-    #[test]
-    fn every_rule_count_the_helper_finds_is_one_the_file_really_states() {
-        assert_eq!(
-            stale_rule_counts("all 39 rule ids and All 40 rules", 40),
-            vec![39]
-        );
-        assert_eq!(
-            stale_rule_counts("All 40 rules, all 40 rule ids", 40),
-            Vec::<usize>::new()
-        );
-        // Repeated staleness is reported once, so one drift is one violation.
-        assert_eq!(
-            stale_rule_counts("all 39 rules and all 39 rule ids", 40),
-            vec![39]
-        );
-        // A bare word is not a count, and neither is a number attached to something else.
-        assert_eq!(
-            stale_rule_counts("the rule, issue 72", 40),
-            Vec::<usize>::new()
-        );
-    }
-
-    #[test]
-    fn the_all_anchor_has_to_start_a_word() {
-        // Codex found this on the fix for its own first finding: lowercased, `install `
-        // ends with `all `, so a bare substring match reads a count out of a verb's suffix
-        // and fails a build over a sentence making no claim about rule counts.
-        assert_eq!(
-            stale_rule_counts("Install 39 rules from the policy bundle. All 40 rules.", 40),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            stale_rule_counts("recall 39 rules. All 40 rules.", 40),
-            Vec::<usize>::new()
-        );
-        // And the anchor still works where it really does start a word, including after
-        // punctuation rather than a space.
-        assert_eq!(stale_rule_counts("(all 39 rules)", 40), vec![39]);
-        assert_eq!(stale_rule_counts("all 39 rules", 40), vec![39]);
-    }
-
-    #[test]
-    fn only_the_complete_count_forms_are_read_as_counts() {
-        // `rules` and `rule ids` are what the file says; a word that merely begins with
-        // them is not a count.
-        assert_eq!(
-            stale_rule_counts("all 39 ruler markings. All 40 rules.", 40),
-            Vec::<usize>::new()
-        );
-        assert_eq!(stale_rule_counts("all 39 rule ids", 40), vec![39]);
-        assert_eq!(stale_rule_counts("all 39 rules", 40), vec![39]);
-    }
-
-    #[test]
     fn the_aggregate_check_keeps_its_must_use_contract() {
         // Codex found that extracting the helpers had left `#[must_use]` and the aggregate
         // check's own documentation attached to a helper instead of to `check_claude_md`,
@@ -3685,33 +3546,61 @@ mod tests {
     }
 
     #[test]
-    fn a_number_that_merely_precedes_the_verb_rules_is_not_a_count() {
-        // Codex found this on pull request #78. The first version read the digits before
-        // " rule" wherever they fell, so this sentence — which makes no claim about how many
-        // rules there are — reported a stale count of 12 and would have failed a build over
-        // correct prose.
-        assert_eq!(
-            stale_rule_counts(
-                "ADR 0012 rules out table-based CRCs. All 40 rules apply.",
-                40
-            ),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            stale_rule_counts("Issue 26 rules the swap out of scope. All 40 rules.", 40),
-            Vec::<usize>::new()
-        );
-        // And the whole-file version: a CLAUDE.md carrying that prose is still clean.
-        let claude_md = format!(
-            "{}\n\nADR 0012 rules out table-based CRCs.\n",
-            clean_claude_md(RULES)
-        );
+    fn the_count_is_pinned_in_both_places_it_is_written() {
+        // Either sentence drifting on its own is the defect that shipped in #76, and both
+        // directions are the point: the opening paragraph and the rule table have to agree
+        // with the gate and therefore with each other.
+        for phrase in rule_count_phrases(RULES.len()) {
+            let dropped = clean_claude_md(RULES).replace(&phrase, "");
+            let violations = check_claude_md(Some(&dropped), RULES);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.subject == "rule count" && v.detail.contains(&phrase)),
+                "dropping `{phrase}` should be reported: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_sentence_drifting_is_one_violation_naming_it() {
+        let [opening, table] = rule_count_phrases(RULES.len());
+        let stale = rule_count_phrases(RULES.len().saturating_sub(1));
+        let drifted = clean_claude_md(RULES).replace(&opening, &stale[0]);
+        let counts: Vec<&Violation> = check_claude_md(Some(&drifted), RULES)
+            .iter()
+            .filter(|v| v.subject == "rule count")
+            .cloned()
+            .collect::<Vec<Violation>>()
+            .leak()
+            .iter()
+            .collect();
+        assert_eq!(counts.len(), 1, "one defect is one violation: {counts:?}");
+        assert!(counts[0].detail.contains(&opening));
         assert!(
-            !check_claude_md(Some(&claude_md), RULES)
-                .iter()
-                .any(|v| v.subject == "rule count"),
-            "prose using `rules` as a verb is not a rule count"
+            !counts[0].detail.contains(&table),
+            "the sound half is not named"
         );
+    }
+
+    #[test]
+    fn prose_about_some_other_set_of_rules_is_not_a_gate_count() {
+        // Four false positives found by Codex, each in a narrower scan than the last. The
+        // pin cannot reach any of them, because it matches where the count is written and
+        // the context that makes it a claim about *this* gate.
+        for prose in [
+            "ADR 0012 rules out table-based CRCs.",
+            "Install 39 rules from the policy bundle.",
+            "Enable all 39 rules from the policy bundle.",
+            "There are all 12 rule ids in the other tool.",
+        ] {
+            let claude_md = format!("{}\n\n{prose}\n", clean_claude_md(RULES));
+            let violations = check_claude_md(Some(&claude_md), RULES);
+            assert!(
+                !violations.iter().any(|v| v.subject == "rule count"),
+                "`{prose}` is not a claim about this gate: {violations:?}"
+            );
+        }
     }
 
     #[test]
