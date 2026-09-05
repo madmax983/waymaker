@@ -1,7 +1,7 @@
 //! Two-bank NOR flash adapter for Waymaker.
 //!
 //! This crate owns the stable wire encoding, CRC and record seals, bank selection, append
-//! scanning, and the compaction transition. It turns the kernel's effect boundaries into
+//! scanning, the capacity reserve, and the compaction transition. It turns the kernel's effect boundaries into
 //! bytes that survive power loss, and turns bytes back into a legal committed prefix.
 //!
 //! # What this crate must not own
@@ -26,7 +26,11 @@
 //! that extends it — §07's two barriers per record, as a typestate in which programming a
 //! commit seal without the payload barrier in front of it does not compile.
 //!
-//! What is still owed at 0.2 is the capacity reserve, the bank swap and `continue_as_new`.
+//! [`capacity`] is §10's reserve: what a run declares its records may be worth, what the two
+//! ways out of a full journal cost on this layout, and the one gate that refuses an ordinary
+//! record while both are still affordable — before the device is called at all.
+//!
+//! What is still owed at 0.2 is the bank swap and `continue_as_new`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -34,6 +38,7 @@
 
 pub mod append;
 pub mod bank;
+pub mod capacity;
 mod crc;
 pub mod frame;
 pub mod integrity;
@@ -44,6 +49,7 @@ pub use append::{AppendError, Journal, Sealable, Staged, WriteAmplification};
 pub use bank::{
     Authority, BankHeader, BankId, BankLayout, BankRegion, Generation, LayoutError, Seal,
 };
+pub use capacity::{Bounds, CapacityError, Refusal, Reserve, Reserved, ReservedError};
 pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
 pub use recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};

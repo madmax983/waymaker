@@ -205,7 +205,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, the capacity reserve, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -268,7 +268,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1) |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
-| Incremental code flash | ≤ 16 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises the gate once for rung 0.2's two-bank lifecycle) |
+| Incremental code flash | ≤ 18 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve) |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree, and
@@ -279,10 +279,20 @@ owed. Issue #24's commit seal and two-barrier writer then took it to 14764 B aga
 16 KiB gate, and
 [ADR 0019](docs/adr/0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md)
 splits that: 2420 B is the seal reaching the codec and the two readers, and 1368 B is the
-writer with the probe section that keeps it alive. The gate is **not** raised again, and
-1620 B of headroom is what the rest of rung 0.2 has to fit in. A third of the measured
-"core + flash adapter" figure is still the probe rather than either, which is a defect in the
-measurement and is filed as issue
+writer with the probe section that keeps it alive. Issue #25's capacity reserve then took it
+to 16456 B, and
+[ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
+splits *that* the same way — and says plainly that almost none of it is the module: some
+tens of bytes are the library change measured on its own, and the rest is what the probe
+drags in to reach twelve public functions. That is the budget conversation ADR 0019
+deferred, and ADR 0020 has it: the gate goes to **18 KiB**, the second and — it argues — the
+last raise that should happen before issue
+[#72](https://github.com/madmax983/waymaker/issues/72) is fixed, because a raise argued from
+a figure a third of which is the probe is a raise argued from the wrong number. Issue
+[#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap is to be measured against
+a corrected figure rather than against a third raise. A third of the
+measured "core + flash adapter" figure is still the probe rather than either, which is a
+defect in the measurement and is filed as issue
 [#72](https://github.com/madmax983/waymaker/issues/72).
 
 The workflow future is user memory and is reported separately. A kernel state type added to
@@ -368,7 +378,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 39 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 40 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -385,6 +395,7 @@ this table is how you find out what a red build is telling you.
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
 | `commit-discipline` | The two-barrier writer's public function surface differs from `source::APPEND_SURFACE`; or the typestate that makes design document §07's order unrepresentable comes apart — the staged frame grows a second method or the word `program`, the sealable frame grows anything but `commit`, the sealable frame is constructed anywhere but inside `payload_barrier`, or that barrier stops calling `storage.barrier` exactly once. Issue [#24](https://github.com/madmax983/waymaker/issues/24) asks that "it is not possible to program a seal without the intervening payload barrier having returned", and a `compile_fail` doctest in the crate proves that of the code as it stands. This is what stops it being given back: a `Staged::commit`, a `Journal::write` that did all four steps in one call, or a second constructor for `Sealable` would each break no other rule and turn a protocol into a convention. What it cannot see is whether the barrier is a real one — that is §12's contract and `waymaker-conformance`'s across-reset witness. |
+| `capacity-reserve` | §10's capacity reserve gains a public function `source::CAPACITY_SURFACE` does not list, in either direction — or the gate comes apart: `source::CAPACITY_GATE` declares no inherent `impl`, declares `stage` other than exactly once, or its `stage` does not *open* with `source::CAPACITY_ADMISSION_CALL` and go on to `source::CAPACITY_DELEGATION`. §10 says "the runtime never overwrites committed history to make room", and every way of giving that back is an *addition*: a `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back, a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from its caller rather than from a `BankLayout` — which is the sharpest of the four, because a reserve is only a promise because a layout vouched for it. The order half is the other word §10 uses: scheduling fails **early**, and issue #25 asks that the failure "produce no mutation at all". §12 says a failed program may still have changed media, so the only refusal that changes nothing is one taken before the device is called. The decision must therefore be the body's **first** statement, not merely one that precedes the delegation — review of this change wrote an admission inside `if false`, inside a closure nobody calls, and guarded so that only `RunStarted` reached it, and watched a rule that only checked the order stay green on all three. The blocks are read for the named type rather than by finding the first `fn stage` in the file, because the surface half counts only *public* functions and a private decoy carrying the pinned call stood in for the real one. What it cannot see is the arithmetic: a `tail_bytes` that quietly stopped counting the outcome record is `crates/waymaker-flash/tests/capacity.rs`'s, where `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the wrong reserve and watches a run reach a state it can never leave. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
@@ -560,10 +571,10 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
 - **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
   the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 4 KiB of 14764 B at rung 0.2. ADR 0002 says so, ADR
-  0017 attributes rung 0.2's first figure by symbol and ADR 0019 splits the current one by
-  linking the writer out, but nothing *checks* the split: doing so needs a call graph, and
-  both attributions are readings of measurements rather than gates.
+  calls "core + flash adapter" — roughly 5 KiB of 16456 B at rung 0.2. ADR 0002 says so, ADR
+  0017 attributes rung 0.2's first figure by symbol, ADR 0019 splits the writer out and
+  ADR 0020 the reserve, but nothing *checks* the split: doing so needs a call graph, and all
+  three attributions are readings of measurements rather than gates.
 - **That a bank's journal region holds a legal journal.** `bank::sealed_generation` decides
   whether a bank is a candidate from its header and its seal. What is between them is
   `frame::Scan`'s, and the two are joined by `BankHeader::journal_offset` rather than by
@@ -604,6 +615,33 @@ Stated so that nobody mistakes silence for coverage:
   *can* falsify is the other half — that a seal never lands over an incomplete frame — and
   `crates/waymaker-fault/tests/commit_discipline.rs` does, with a seal-before-frame writer as
   the tooth.
+- **That a reserve is the reserve §10 needs.** `capacity-reserve` pins the surface and the
+  order the one gate is applied in. It compares *names* and one spelling, so a
+  `Reserve::tail_bytes` that stopped counting the outcome record — the term §08's transition
+  table makes load-bearing, since there is no edge from an unresolved effect to a terminal
+  record — passes it unchanged. `crates/waymaker-flash/tests/capacity.rs` is what holds the
+  arithmetic, against `frame::encoded_len` of real records rather than against a second copy
+  of the same sum, and `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` is
+  what makes the outcome term falsifiable rather than argued.
+- **An ungated writer added to the reserve from another file, or without `pub`.**
+  `capacity-reserve` pins one file, exactly as `storage-contract` and `recovery-surface` do.
+  An `impl Reserved { pub fn stage_unchecked(..) }` in a sibling module, or a
+  `trait ReservedExt: ...` with a blanket impl, adds the ungated path with the rule silent —
+  and so does a `pub(crate)` one *inside* the pinned file, because the scan reads `pub ` and
+  not `pub(`. A macro-generated `pub fn` is invisible to it too. The same shape as the two
+  bullets above, and stated for the same reason.
+- **That the admission the gate opens with is reachable in every case.** The rule pins a
+  *position* — the first statement of `Reserved::stage` — and the spelling of the call. It
+  does not evaluate the body, so an admission that is first and then conditionally skipped by
+  something inside it is outside what a scanner can say. What makes the position enough is
+  that the pinned spelling propagates with `?`: a first statement that refuses cannot be
+  followed by one that programs.
+- **That a caller went through the reserve at all.** `capacity::Reserved` consumes the
+  `Journal` it gates, so a caller holding both had to construct a second one from a second
+  recovery — the same linear discipline `Journal::after` uses, and the same limit: it makes
+  the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
+  in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
+  and it is stated here so its absence is a decision.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -799,6 +837,39 @@ committed, not that no record follows. See
 which also says what the sweep cannot falsify: the fault harness does not reorder stores, so
 the payload barrier's necessity is §12's contract and `waymaker-conformance`'s across-reset
 witness rather than something this sweep can break.
+Issue #25 then makes §10's "capacity is explicit" a thing the writer does. `waymaker-flash`'s
+`capacity` module is the reserve: `Bounds` is what a run declares its records may be worth,
+`Reserve::for_layout` prices §10's two exits against a real bank — a terminal record, and the
+`continue_as_new` header the swap writes into the *inactive* bank — and refuses bounds under
+which a bank could not roll over, or under which the run a swap installs would have no exit of
+its own. `Reserve::admits` is §10's decision as a pure predicate over a length, and `Reserved`
+is the gate: it consumes the `Journal` it wraps and takes the decision before `Journal::stage`
+is called at all, so issue #25's "the failure produces no mutation at all" is a property of
+the call order rather than of an undo — the device is not read, not programmed, not
+barriered, and the write-amplification counters do not move.
+The reserve's least obvious term is the one that makes it correct, and it came out of §08
+rather than out of §10. A schedule record creates an obligation: `ReplayCursor` has no edge
+from an unresolved effect to a terminal record, so a run with an effect outstanding cannot end
+until its outcome is written — and the reserve everybody writes first, one terminal record,
+admits a schedule and then strands the run with an outcome that does not fit and a terminal
+record §08 will not let follow it. That is driven and watched failing rather than argued:
+`a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` runs the wrong policy
+against the real writer and finds the crash point at which it strands. `continue_as_new` from
+the near-capacity state is a test too, run through §10's seven steps by hand because the
+writer that will do them is issue #26's. See
+[ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md).
+Two more things came out of review rather than out of writing it. The floor a bank is accepted
+against is the next run's opening record, one effect scheduled and resolved, and its exit —
+not merely "the run can end", which accepts 4004 measured configurations in which the very
+first `EffectScheduled` is refused for ever. And issue #24's own layout guard reserved a frame
+*body* where a record is a body and a commit seal, so a bank whose journal could hold a frame
+and not the seal that commits it was a legal layout; that is fixed here, because
+`Reserve::for_layout` now takes `BankRegion::max_run_input_bytes` as its first gate. What is
+left owed is written down: the reserve is not obliged on anybody, because the dispatcher that
+would be obliged is rung 0.4's; §08's order is a precondition on the caller rather than
+something `Reserved` can enforce; the `waymaker-fault` sweep of the reboot join is not here;
+and the code-flash gate needed a second raise, which ADR 0020 argues should be the last
+before issue #72 corrects what the figure is measuring.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the bank swap
 arrives with 0.2, and the async `Ctx` and dispatcher with 0.4. The

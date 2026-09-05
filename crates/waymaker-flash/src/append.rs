@@ -368,6 +368,19 @@ impl<C: IntegrityCheck> Journal<C> {
         self.offset
     }
 
+    /// The region this writer appends to.
+    ///
+    /// `pub(crate)` on purpose. §10's capacity reserve, in [`crate::capacity`], has to know
+    /// the granularity and the size of the journal before it can say what a record costs,
+    /// and taking those from anywhere but the writer's own region is how a reserve computed
+    /// for one device ends up under-reserving on another — but that caller is one module
+    /// away, and this type's public surface is the one `commit-discipline` exists to make
+    /// expensive. A crate-private accessor serves the caller without widening the pin, and
+    /// without obliging the size probe to link a call it has no use for.
+    pub(crate) const fn region(&self) -> JournalRegion {
+        self.region
+    }
+
     /// How many bytes are left in the region.
     ///
     /// What a record has to fit in, and nothing more: §10's reserved tail — the space a

@@ -174,21 +174,35 @@ fn a_bank_too_small_for_a_header_a_seal_and_a_record_is_refused() {
         Err(LayoutError::BankTooSmall)
     );
 
-    // And the smallest device that really is enough: three blocks per bank, one each for the
-    // header, the journal and the seal.
-    let smallest = layout(6 * 32, 32, 32, 1);
-    assert_eq!(smallest.bank_bytes(), 96);
-    assert_eq!(smallest.bank(BankId::A).payload_bytes(), 64);
+    // Three blocks per bank used to be the smallest device that worked, and it is not: since
+    // issue #24 a record is its frame body *and* a commit seal one program unit wide, so a
+    // bank whose journal is one program unit long can hold a frame that can never be
+    // committed. Review of issue #25 found the guard reserving a frame body and calling it a
+    // record.
+    assert_eq!(
+        BankLayout::new(geometry(6 * 32, 32, 32, 1)),
+        Err(LayoutError::BankTooSmall)
+    );
+
+    // Four blocks per bank is: one for the header, two for a record and its seal, one for the
+    // generation seal.
+    let smallest = layout(8 * 32, 32, 32, 1);
+    assert_eq!(smallest.bank_bytes(), 128);
+    assert_eq!(smallest.bank(BankId::A).payload_bytes(), 96);
     let header = BankHeader {
         align: align(32),
         ..header(b"")
     };
     let journal = header.journal_offset().expect("it rounds");
     assert_eq!(journal, 32, "the header occupies one whole program unit");
+    let record = waymaker_flash::frame::encoded_len_for(0, align(32)).expect("it encodes");
+    assert_eq!(
+        record, 64,
+        "a frame body and its commit seal, one unit each"
+    );
     assert!(
-        smallest.bank(BankId::A).payload_bytes() as usize - journal
-            >= waymaker_flash::frame::FRAME_OVERHEAD_BYTES,
-        "the smallest accepted bank must still hold one record after its header"
+        smallest.bank(BankId::A).payload_bytes() as usize - journal >= record,
+        "the smallest accepted bank must still hold one committed record after its header"
     );
 }
 
@@ -311,7 +325,9 @@ fn a_bank_bounds_the_run_input_its_header_may_carry() {
     let ceiling = region.max_run_input_bytes(layout.align());
     assert!(ceiling < bank::MAX_RUN_INPUT_BYTES);
 
-    // An input at the ceiling fits the bank *and* leaves a record frame of journal behind it.
+    // An input at the ceiling fits the bank *and* leaves a whole committed record — a frame
+    // body and its commit seal — of journal behind it.
+    let record = waymaker_flash::frame::encoded_len_for(0, layout.align()).expect("it encodes");
     let mut image = vec![ERASED_BYTE; region.payload_bytes() as usize];
     let input = vec![0x5A_u8; ceiling];
     let written = bank::encode_header(
@@ -324,8 +340,8 @@ fn a_bank_bounds_the_run_input_its_header_may_carry() {
     )
     .expect("an input at the ceiling fits its bank");
     assert!(
-        region.payload_bytes() as usize - written >= waymaker_flash::frame::FRAME_OVERHEAD_BYTES,
-        "the ceiling must leave room for a record"
+        region.payload_bytes() as usize - written >= record,
+        "the ceiling must leave room for a committed record"
     );
 
     // One byte more still *fits* — it is inside the same program unit — and that is the
@@ -344,8 +360,8 @@ fn a_bank_bounds_the_run_input_its_header_may_carry() {
     )
     .expect("one byte past the ceiling is still inside the payload region");
     assert!(
-        region.payload_bytes() as usize - overrun < waymaker_flash::frame::FRAME_OVERHEAD_BYTES,
-        "past the ceiling there must be no room left for a record"
+        region.payload_bytes() as usize - overrun < record,
+        "past the ceiling there must be no room left for a committed record"
     );
 
     // And an input that genuinely cannot fit the payload region is refused by the buffer.

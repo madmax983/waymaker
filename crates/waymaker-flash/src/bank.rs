@@ -378,7 +378,10 @@ impl BankRegion {
     /// larger than [`MAX_RUN_INPUT_BYTES`] and is never negative.
     #[must_use]
     pub const fn max_run_input_bytes(self, align: ProgramAlign) -> usize {
-        let Some(frame) = align.round_up(crate::frame::FRAME_OVERHEAD_BYTES) else {
+        // A whole record, not a frame body: since issue #24 a record ends in a commit seal
+        // one program unit wide, and a journal sized to the body alone can hold a frame that
+        // can never be committed. `encoded_len_for` is the codec's own arithmetic for it.
+        let Ok(frame) = crate::frame::encoded_len_for(0, align) else {
             return 0;
         };
         let payload = self.payload_bytes() as usize;
@@ -456,11 +459,18 @@ impl BankLayout {
         // header filled its whole payload and whose journal was zero bytes long — a bank
         // that can never hold a record, reported as a legal layout. Review of this change
         // found it.
-        let (Some(seal_bytes), Some(header_bytes), Some(frame_bytes)) = (
+        let (Some(seal_bytes), Some(header_bytes), Some(frame_body)) = (
             round_up_u32(SEAL_WIDTH, program),
             round_up_u32(HEADER_OVERHEAD_WIDTH, program),
             round_up_u32(FRAME_OVERHEAD_WIDTH, program),
         ) else {
+            return Err(LayoutError::BankTooSmall);
+        };
+        // And a record is its frame body *plus its commit seal*, which issue #24 made one
+        // more program unit. Reserving only the body admitted a bank whose journal could
+        // hold a frame and not the seal that commits it — a journal in which no record can
+        // ever become history, reported as a legal layout. Review of issue #25 found it.
+        let Some(frame_bytes) = frame_body.checked_add(program) else {
             return Err(LayoutError::BankTooSmall);
         };
         // Summed and compared rather than subtracted from the bank. `seal_bytes` can exceed
@@ -620,6 +630,19 @@ impl BankHeader<'_> {
     pub const fn journal_offset(&self) -> Option<usize> {
         self.align.round_up(self.frame_len())
     }
+}
+
+/// Bytes a bank header carrying `input_bytes` of run input occupies, padded to `align`.
+///
+/// [`BankHeader::frame_len`] followed by [`BankHeader::journal_offset`], without a header in
+/// hand — the same thing [`crate::frame::encoded_len_for`] is to [`crate::frame::encoded_len`],
+/// and here for the same reason: §10's capacity reserve prices the *worst case* of a bound,
+/// and the worst case is a length rather than a value. `pub(crate)` because the reserve is
+/// the only caller and a header a caller has in hand can answer for itself.
+///
+/// [`None`] when rounding up would overflow, which no encodable header can reach.
+pub(crate) const fn header_len_for(input_bytes: usize, align: ProgramAlign) -> Option<usize> {
+    align.round_up(HEADER_OVERHEAD_BYTES.saturating_add(input_bytes))
 }
 
 /// A bank's generation seal: what makes a written bank an authoritative one.

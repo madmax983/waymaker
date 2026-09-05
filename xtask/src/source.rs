@@ -985,6 +985,11 @@ pub const APPEND_SURFACE_PATH: &str = "waymaker-flash/src/append.rs";
 /// vouched for. A `Journal::at(region, offset)` is the mutation `waymaker-fault`'s sweep
 /// demonstrates as dangerous, and it is a line a reviewer has to write on purpose.
 ///
+/// What §10's capacity reserve needed from this type is deliberately *not* here. It reads the
+/// writer's region — its granularity and its size — to price a record, and that accessor is
+/// `pub(crate)`: a same-crate caller is served without widening the surface this rule exists
+/// to make expensive, and without obliging the size probe to link a call it has no use for.
+///
 /// What it does **not** catch: this compares *names*. It is the surface half of the rule;
 /// [`check_commit_discipline`] also checks the shape the names sit in.
 ///
@@ -1189,6 +1194,221 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
     }
 
     violations
+}
+
+/// The file whose public surface and admission order [`check_capacity_reserve`] pins.
+pub const CAPACITY_SURFACE_PATH: &str = "waymaker-flash/src/capacity.rs";
+
+/// Every public function §10's capacity reserve is allowed to have.
+///
+/// Design document §10: "Waymaker reserves enough tail space for a terminal record or
+/// `continue_as_new`. Ordinary effect scheduling fails early with `HistoryNearCapacity`; the
+/// runtime never overwrites committed history to make room." Issue
+/// [#25](https://github.com/madmax983/waymaker/issues/25) asks for that, and — as with §07's
+/// two barriers — most of the guarantee is an *absence*.
+///
+/// A `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back,
+/// a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from the caller
+/// instead of from a [`BankLayout`] would each break no layering rule, need no dependency,
+/// pass every other gate, and turn a reserve into a suggestion. The last one is the sharpest:
+/// a reserve is only a promise because a layout vouched for it, and a constructor that
+/// accepted numbers would accept numbers that describe no device.
+///
+/// `journal` is on the list because a caller needs the writer's offset, room and write
+/// amplification, and it returns a *shared* borrow — [`Journal::stage`] needs a unique one,
+/// so it cannot be used to append around the reserve. A `journal_mut` would be exactly that,
+/// and is the name this pin exists to make somebody write down.
+///
+/// What it does **not** catch: this compares *names*. A `tail_bytes` that quietly stopped
+/// counting the outcome record is invisible to it —
+/// `crates/waymaker-flash/tests/capacity.rs` is what holds the arithmetic, and
+/// `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` is what makes the
+/// outcome term falsifiable.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+///
+/// [`BankLayout`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/bank.rs
+/// [`Journal::stage`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+pub const CAPACITY_SURFACE: &[&str] = &[
+    "admits",
+    "exit_bytes_after",
+    "fmt",
+    "for_layout",
+    "journal",
+    "kernel_error",
+    "message",
+    "over",
+    "reserve",
+    "rollover_bytes",
+    "stage",
+    "tail_bytes",
+];
+
+/// The whole expression a reserved append must take the admission decision with.
+///
+/// A pin on the *spelling*, like [`APPEND_BARRIER_CALL`], and for the same reason. "Calls
+/// `admits` somewhere in the body" is satisfied by `let _ = self.reserve.admits(..);`, which
+/// refuses nothing and programs the record anyway — and by an `admits` taken *after* the
+/// delegation, which is a refusal that arrives once the frame body is already on media. §10
+/// says scheduling fails **early**, and issue #25 asks that the failure "produces no
+/// mutation at all"; §12 is explicit that a failed program may still have changed media, so
+/// the only refusal that changes nothing is one taken before the device is called.
+///
+/// So what is pinned is the propagation, characters and all: the room comes from the journal
+/// this writer gates rather than from an argument, and the failure is returned rather than
+/// observed. Whitespace is normalised before the comparison, so rustfmt may break the line;
+/// anything else is a line a reviewer writes.
+pub const CAPACITY_ADMISSION_CALL: &str =
+    "self.reserve.admits(record, self.journal.room()).map_err(ReservedError::Capacity)?;";
+
+/// The delegation the admission has to come before.
+pub const CAPACITY_DELEGATION: &str = "self.journal.stage(storage, record, page)";
+
+/// The type whose one method §10's reserve is applied in.
+///
+/// The rule reads *this type's* inherent `impl` blocks rather than the first `fn stage` in
+/// the file. `stage` is a collidable name, and a private decoy carrying the pinned admission
+/// — invisible to the surface half, which counts only public functions — stood in for the
+/// real one until review of this change tried it.
+pub const CAPACITY_GATE: &str = "Reserved";
+
+/// Rule: §10's reserve is applied before anything reaches media, and cannot be given back.
+///
+/// Two halves, for the reason [`check_commit_discipline`] has two: the surface is a set
+/// comparison and the order is a shape, and they fail for different reasons.
+#[must_use]
+pub fn check_capacity_reserve(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "capacity-reserve";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = check_pinned_surface(
+        RULE,
+        ADAPTER,
+        CAPACITY_SURFACE_PATH,
+        CAPACITY_SURFACE,
+        sources,
+        "the reserve's public API is where design document \u{a7}10's \"the runtime never \
+         overwrites committed history to make room\" stops being a sentence, so an ungated \
+         writer or a reserve built from numbers rather than from a layout cannot be added \
+         without a reviewer writing it down",
+    );
+
+    let Some(source) = find_source(sources, CAPACITY_SURFACE_PATH) else {
+        // `check_pinned_surface` has already reported the missing file.
+        return violations;
+    };
+    violations.extend(check_capacity_gate(&source.contents));
+    violations
+}
+
+/// The shape half of [`check_capacity_reserve`], over one file's text.
+///
+/// Split out for the reason [`check_append_typestate`] is: the surface half is a set
+/// comparison and this half is a shape, and a reader chasing one does not have to read the
+/// other.
+fn check_capacity_gate(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "capacity-reserve";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    let code = without_test_modules(&code_only(contents));
+
+    // *This type's* blocks, not the first `fn stage` in the file. `inherent_impl_bodies`
+    // reads every block for the type, which is the hole review closed in
+    // `commit-discipline` and the same one a private `fn stage` decoy opened here.
+    let blocks = inherent_impl_bodies(&code, CAPACITY_GATE);
+    if blocks.is_empty() {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{CAPACITY_SURFACE_PATH} declares no inherent `impl` for `{CAPACITY_GATE}`, \
+                 so the one place \u{a7}10's reserve is applied is pinned against nothing"
+            ),
+        ));
+        return violations;
+    }
+    let gated = blocks.join("\n");
+
+    let staged = declared_function_names(&gated)
+        .into_iter()
+        .filter(|name| name == "stage")
+        .count();
+    if staged != 1 {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "`{CAPACITY_GATE}` declares `stage` {staged} time(s) rather than once: the \
+                 gate is one method, and a second one is a second way to the writer it wraps"
+            ),
+        ));
+        return violations;
+    }
+    let Some(body) = braced_body(&gated, "fn stage") else {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!("`{CAPACITY_GATE}::stage` has no body the gate could read"),
+        ));
+        return violations;
+    };
+
+    // The *first* statement, not merely one that precedes the delegation. "Occurs before"
+    // is satisfied by an admission inside `if false { .. }`, inside a closure nothing calls,
+    // or guarded so that only some record kinds reach it — and the third is a plausible diff
+    // that turns off the gate for exactly the records \u{a7}10 is about. Review of this change
+    // wrote all three and watched the rule stay green.
+    let tight = tightened(body);
+    let admission = tightened(CAPACITY_ADMISSION_CALL);
+    let delegation = tightened(CAPACITY_DELEGATION);
+    if !tight.starts_with(&admission) {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "`{CAPACITY_GATE}::stage` does not open with \
+                 `{CAPACITY_ADMISSION_CALL}`: \u{a7}10 says scheduling fails *early* and issue \
+                 #25 asks that the failure produce no mutation at all, so the decision is \
+                 the first thing the body does or it is a decision taken too late"
+            ),
+        ));
+    }
+    if !tight.contains(&delegation) {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "`{CAPACITY_GATE}::stage` does not delegate as `{CAPACITY_DELEGATION}`: the \
+                 gate is a gate rather than a second writer, and what reaches media is \
+                 `append`'s to say"
+            ),
+        ));
+    }
+    // A second admission is a second decision, and the one that mattered may be either.
+    let admissions = count_tokens(body, "admits");
+    if admissions != 1 {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "`{CAPACITY_GATE}::stage` names `admits` {admissions} time(s) rather than \
+                 once"
+            ),
+        ));
+    }
+
+    violations
+}
+
+/// `code` with every whitespace character removed.
+///
+/// [`squeezed`] collapses runs of whitespace to one space, which survives rustfmt *breaking*
+/// a chain and not rustfmt *joining* it — so a pinned expression that fits on one line after
+/// an unrelated rename would fail its rule for a formatting reason. Removing whitespace
+/// altogether pins the tokens and nothing else.
+fn tightened(code: &str) -> String {
+    code.split_whitespace().collect::<String>()
 }
 
 /// `code` with every run of whitespace collapsed, so a pinned expression survives rustfmt.
@@ -5581,6 +5801,208 @@ mod deferred_answer_pins {
         assert!(routing.is_empty(), "{routing:?}");
     }
 
+    // -----------------------------------------------------------------------------------
+    // `capacity-reserve`
+    // -----------------------------------------------------------------------------------
+
+    /// The real reserve, read off disk, so a rule that only the fixture satisfies is caught.
+    fn real_capacity_module() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(CAPACITY_SURFACE_PATH);
+        std::fs::read_to_string(&path).expect("the reserve should exist")
+    }
+
+    /// The admission as the real module spells it, for a mutant to remove or move.
+    fn real_admission() -> String {
+        "        self.reserve\n            .admits(record, self.journal.room())\n            \
+         .map_err(ReservedError::Capacity)?;\n"
+            .to_owned()
+    }
+
+    /// The real module with its admission replaced by `instead`.
+    fn capacity_module_with(instead: &str) -> String {
+        let contents = real_capacity_module();
+        let admission = real_admission();
+        assert!(
+            contents.contains(&admission),
+            "the mutants below rewrite the admission, so they have to be able to find it"
+        );
+        contents.replace(&admission, instead)
+    }
+
+    fn capacity_violations(contents: &str) -> Vec<Violation> {
+        check_capacity_reserve(&[layer(CAPACITY_SURFACE_PATH, contents)])
+    }
+
+    #[test]
+    fn the_real_reserve_satisfies_the_rule_it_is_pinned_by() {
+        let violations = capacity_violations(&real_capacity_module());
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_missing_reserve_fails_closed() {
+        assert_eq!(check_capacity_reserve(&[]).len(), 1);
+    }
+
+    #[test]
+    fn the_pinned_admission_and_delegation_are_not_empty() {
+        // `"anything".find("")` is `Some(0)` and `starts_with("")` is `true`, so an emptied
+        // pin would leave every mutant below passing with the gate green. That is the
+        // failure `gate-broken` exists for, and this is where it is caught for these two.
+        assert!(!CAPACITY_ADMISSION_CALL.trim().is_empty());
+        assert!(!CAPACITY_DELEGATION.trim().is_empty());
+        assert!(!CAPACITY_GATE.trim().is_empty());
+    }
+
+    #[test]
+    fn a_gate_that_never_admits_is_reported() {
+        let violations = capacity_violations(&capacity_module_with(""));
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_admission_whose_answer_is_dropped_is_reported() {
+        let violations = capacity_violations(&capacity_module_with(
+            "        let _ = self.reserve.admits(record, self.journal.room());\n",
+        ));
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_admission_taken_after_the_delegation_is_reported() {
+        // The refusal that arrives once the frame body is already on media.
+        let moved = format!(
+            "        let staged = self.journal.stage(storage, record, page);\n{}        staged\n",
+            real_admission()
+        );
+        let violations = capacity_violations(&capacity_module_with(&moved));
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_admission_the_body_can_skip_is_reported() {
+        // The plausible diff: guard the gate so only some record kinds reach it, and
+        // *ordinary* effect scheduling — the one thing \u{a7}10 is about — goes ungated. A rule
+        // that only asked whether the admission occurred before the delegation said nothing.
+        let guarded = format!(
+            "        if matches!(record, RecordRef::RunStarted {{ .. }}) {{\n{}        }}\n",
+            real_admission()
+        );
+        let violations = capacity_violations(&capacity_module_with(&guarded));
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+        // And the same admission inside a closure nothing calls.
+        let deferred = format!(
+            "        let _unused = || {{\n{}        }};\n",
+            real_admission()
+        );
+        let violations = capacity_violations(&capacity_module_with(&deferred));
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_private_stage_decoy_does_not_stand_in_for_the_real_gate() {
+        // The surface half counts only *public* functions, so a private `fn stage` above the
+        // real one is invisible to it — and a rule that took the first `fn stage` in the file
+        // read the decoy's body and reported nothing. Both halves are needed.
+        let gutted = capacity_module_with("");
+        let decoy = format!(
+            "struct Decoy;\nimpl Decoy {{\n    fn stage(&mut self) {{\n{}    }}\n}}\n{gutted}",
+            real_admission()
+        );
+        let violations = capacity_violations(&decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("does not open with")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_gate_method_named_stage_is_reported() {
+        let contents = format!(
+            "{}\nimpl {CAPACITY_GATE} {{\n    fn stage(&mut self) {{}}\n}}\n",
+            real_capacity_module()
+        );
+        let violations = capacity_violations(&contents);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("declares `stage` 2 time(s)")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_ungated_writer_added_to_the_reserve_is_reported() {
+        let contents = format!(
+            "{}\nimpl {CAPACITY_GATE} {{\n    pub fn stage_unchecked(&mut self) {{}}\n}}\n",
+            real_capacity_module()
+        );
+        let violations = capacity_violations(&contents);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("`stage_unchecked`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_reserve_with_no_gate_type_is_reported() {
+        let contents = real_capacity_module().replace(
+            &format!("impl<C: IntegrityCheck> {CAPACITY_GATE}<C> {{"),
+            "impl<C: IntegrityCheck> Elsewhere<C> {",
+        );
+        let violations = capacity_violations(&contents);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("declares no inherent `impl`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_expression_survives_rustfmt_joining_the_line() {
+        // `squeezed` collapses runs of whitespace and so survives rustfmt *breaking* a chain
+        // but not rustfmt *joining* it. These two pins are compared with whitespace removed
+        // instead, so an unrelated rename that shortens the line cannot turn the gate red.
+        let joined = capacity_module_with(
+            "        self.reserve.admits(record, self.journal.room()).map_err(ReservedError::Capacity)?;\n",
+        );
+        let violations = capacity_violations(&joined);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
     #[test]
     fn a_missing_writer_fails_both_of_its_rules_closed() {
         // Two rules, two refusals: the pin cannot compare a surface that is not there, and
@@ -6349,7 +6771,8 @@ pub mod tests_support {
 
     use super::{
         APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_STEP, APPEND_ROUTING_STEPS,
-        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION,
+        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CAPACITY_ADMISSION_CALL,
+        CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, DIGEST_FUNCTION,
         EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
         RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS,
         SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
@@ -6392,6 +6815,34 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_recovery_surface() -> String {
         surface("A recovery module.", RECOVERY_SURFACE)
+    }
+
+    /// A capacity module the `capacity-reserve` rule accepts whole.
+    ///
+    /// The surface is rendered from the pin for the reason every surface above is, and the
+    /// `stage` body is the pinned admission and delegation in the order the rule requires —
+    /// so a fixture cannot be the reason the shape half passes.
+    #[must_use]
+    pub fn clean_capacity_reserve() -> String {
+        // Every pinned name but `stage`, which the `impl` below declares: the pin refuses a
+        // name declared twice, so a fixture that rendered it in both places would fail the
+        // surface half for a reason no rule is about.
+        let others: Vec<&str> = CAPACITY_SURFACE
+            .iter()
+            .copied()
+            .filter(|name| *name != "stage")
+            .collect();
+        let mut source = surface("A capacity module.", &others);
+        source.push('\n');
+        source.push_str("impl ");
+        source.push_str(CAPACITY_GATE);
+        source.push_str(" {\n");
+        source.push_str("    pub fn stage(&mut self) -> Result<(), ()> {\n        ");
+        source.push_str(CAPACITY_ADMISSION_CALL);
+        source.push_str("\n        ");
+        source.push_str(CAPACITY_DELEGATION);
+        source.push_str("\n    }\n}\n");
+        source
     }
 
     /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
@@ -6642,6 +7093,7 @@ pub mod tests_support {
             .chain([&DIGEST_FUNCTION.0])
             .chain(BANK_SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .chain(APPEND_SURFACE)
+            .chain(CAPACITY_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

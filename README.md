@@ -41,8 +41,12 @@ they seal, written and read by the same weakened firmware through the `Integrity
 are caught, as is history read one record short, out of order, one skipped or one invented.
 The commit seal is on media too: every record now ends in one program unit whose bytes are
 the frame's own check with bit 7 of each cleared, written only after a payload barrier, so a
-frame with no valid seal over it was never committed and recovery says so. Timers and the two
-timer records are the rest of 0.1; the bank swap and the capacity reserve arrive with 0.2.
+frame with no valid seal over it was never committed and recovery says so. §10's capacity
+reserve is the last thing rung 0.2's record format owed, and it writes nothing at all: a run
+declares what its records may be worth, the reserve prices the two ways out — a terminal
+record and a `continue_as_new` header — and ordinary scheduling is refused with
+`HistoryNearCapacity` while both are still affordable, before the device is called at all. Timers and the two timer records are the rest of 0.1; the bank swap arrives
+with 0.2.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check
@@ -80,7 +84,7 @@ them is built for a firmware target, and no layer may depend on any of them.
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
-| Incremental code flash | ≤ 16 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised the gate once for rung 0.2's two-bank lifecycle) |
+| Incremental code flash | ≤ 18 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve) |
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
@@ -205,7 +209,7 @@ the panic handler and drift with the toolchain.
 
 | Measured | Gated on | How |
 | --- | --- | --- |
-| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 16 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 18 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
 | Engine statics | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 
@@ -306,6 +310,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `recovery-surface` | the storage-backed recovery reader's public surface differs from the pinned list, so a `seek`, a `resume_at`, or a second route to an append offset could arrive without a reviewer writing it down |
 | `commit-discipline` | the two-barrier writer's public surface differs from the pinned list, a staged frame grows a second method or the ability to program, or the type that may write a commit seal becomes reachable from somewhere other than the payload barrier |
+| `capacity-reserve` | §10's capacity reserve gains a public function the pinned list does not have — an ungated writer handed back, a reserve built from numbers rather than from a bank layout — or the gate comes apart: its type declares `stage` other than once, or that `stage` stops *opening* with the admission decision |
 | `size-probe-reach` | a layer declares a public function the probe never calls, so the linker discards it and no size budget charges for it |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or one of the four files with a route — the record codec, the bank codec, the recovery reader, the two-barrier writer — stops reaching its seals through the trait, names a checksum function where it may not, or grows a function generic over the check that no table pins |

@@ -1185,7 +1185,122 @@ fn journal_append() -> usize {
     });
     kept = kept.wrapping_add(amplification_cost(WriteAmplification::NONE));
 
+    // §10's reserve is measured with the writer this function already built rather than with
+    // one of its own. A second geometry, region, recovery and `Journal::after` in the probe
+    // would be charged to the engine's row, and issue #72 is about how much of this figure
+    // is already the probe's own arithmetic.
+    kept = kept.wrapping_add(match waymaker_flash::bank::BankLayout::new(geometry) {
+        Ok(layout) => capacity_reserve(&mut media, layout, journal),
+        Err(error) => error.message().len(),
+    });
+
     core::hint::black_box(kept)
+}
+
+/// §10's capacity reserve: the arithmetic that refuses a schedule while an exit still fits.
+///
+/// Issue [#25](https://github.com/madmax983/waymaker/issues/25), and a row of the delta a
+/// device pays on every append rather than only on boot. Every public function of
+/// `waymaker_flash::capacity` is called from here, which is `size-probe-reach`'s
+/// requirement, and both admission answers are linked: a record the reserve admits and one
+/// it refuses. A probe that only linked the accepting arm would charge nothing for the
+/// refusal that is the whole point of the module.
+///
+/// The layout, the media and the writer are arguments rather than locals because
+/// [`journal_append`] has already built each of them: this row is meant to charge for the
+/// reserve, and a probe that stood up a second boot sequence would charge the engine for
+/// the probe's own scaffolding.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn capacity_reserve(
+    media: &mut ProbeMedia,
+    layout: waymaker_flash::bank::BankLayout,
+    journal: waymaker_flash::append::Journal,
+) -> usize {
+    use waymaker_core::{EffectSeq, RecordRef};
+    use waymaker_flash::capacity::{Bounds, CapacityError, Reserve, Reserved, ReservedError};
+    use waymaker_flash::frame;
+
+    let bounds = Bounds {
+        run_input_bytes: core::hint::black_box(8),
+        effect_result_bytes: core::hint::black_box(8),
+        terminal_bytes: core::hint::black_box(8),
+    };
+    let reserve = match Reserve::for_layout(bounds, layout) {
+        Ok(reserve) => reserve,
+        Err(error) => return capacity_error_cost(error),
+    };
+
+    // The sizing arithmetic a reserve is built out of, linked on its own so the row charges
+    // for the padding and the seal even where the optimiser could fold the call above.
+    let mut kept = frame::encoded_len_for(core::hint::black_box(8), layout.align()).unwrap_or(0);
+    kept = kept
+        .wrapping_add(reserve.tail_bytes() as usize)
+        .wrapping_add(reserve.rollover_bytes() as usize);
+
+    let schedule = RecordRef::EffectScheduled {
+        seq: EffectSeq(core::hint::black_box(0)),
+        kind: waymaker_core::ActivityKind(core::hint::black_box(1)),
+        input_len: core::hint::black_box(2),
+        input_crc: core::hint::black_box(0x0BAD_F00D),
+    };
+    kept = kept.wrapping_add(reserve.exit_bytes_after(&schedule) as usize);
+    // Both arms of the predicate: a journal with room, and one at its boundary. Driven from
+    // one call site rather than two, because two would charge this row twice for a body the
+    // linker keeps once.
+    for room in [core::hint::black_box(4096), core::hint::black_box(0)] {
+        kept = kept.wrapping_add(match reserve.admits(&schedule, room) {
+            Ok(()) => 1,
+            Err(error) => admission_cost(error),
+        });
+    }
+
+    // And the gate itself, over the writer `journal_append` positioned.
+    let mut writer = match Reserved::over(journal, reserve) {
+        Ok(writer) => writer,
+        Err(error) => return kept.wrapping_add(capacity_error_cost(error)),
+    };
+    kept = kept
+        .wrapping_add(writer.journal().room() as usize)
+        // §10 step 1 is "stop accepting new effects", which a dispatcher asks the reserve
+        // rather than the writer — so the accessor that lets it is linked too.
+        .wrapping_add(writer.reserve().tail_bytes() as usize);
+
+    let mut staging = [0_u8; 64];
+    kept = kept.wrapping_add(
+        match writer
+            .stage(media, &schedule, &mut staging)
+            .map(|staged| staged.payload_barrier(media))
+        {
+            Ok(Ok(sealable)) => match sealable.commit(media) {
+                Ok(written) => amplification_cost(written),
+                Err(error) => append_error_cost(&error),
+            },
+            Ok(Err(error)) | Err(ReservedError::Append(error)) => append_error_cost(&error),
+            Err(ReservedError::Capacity(error)) => admission_cost(error),
+        },
+    );
+
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a
+    // function pointer for the reason [`engine`] retains the kernel's: formatting something
+    // would link `core::fmt::write` and charge this row for machinery the impl avoids.
+    let show: fn(&CapacityError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <CapacityError as core::fmt::Display>::fmt;
+    core::hint::black_box(show);
+
+    core::hint::black_box(kept)
+}
+
+/// Every arm of a reserve's construction refusal.
+#[cfg(feature = "engine")]
+const fn capacity_error_cost(error: waymaker_flash::capacity::CapacityError) -> usize {
+    error.message().len()
+}
+
+/// Every answer §10's admission can refuse with, and the kernel's word for each.
+#[cfg(feature = "engine")]
+const fn admission_cost(error: waymaker_flash::capacity::Refusal) -> usize {
+    error.kernel_error().message().len()
 }
 
 /// Every counter a write amplification reports, so the delta charges for all of them.
