@@ -14,7 +14,7 @@
 //!    claim that makes the model load-bearing rather than decorative.
 //! 3. **Does design document §15's oracle agree?** Three independent judgements of one run.
 //!
-//! What this does not cover is banks: rung 0.1 has no two-bank adapter to drive, so the
+//! What this does not cover is banks: no writer in this file drives the two-bank adapter issue #22 added, so the
 //! fourth guarantee is discharged against the model alone and
 //! [`waymaker_spec::obligation`] says so in a row rather than leaving it to be noticed.
 
@@ -472,7 +472,7 @@ fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
     // Written down as a test rather than left to be discovered. `Observation` carries no
     // banks, so `reconstructed` builds a state that has never sealed, and `SingleAuthority`
     // returns `Ok` for it whatever history it is handed — including one that is pure
-    // invention. A caller with real banks to abstract, which is rung 0.2, gets three
+    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank` is one, and abstracting it is still owed — gets three
     // guarantees judged and the fourth answered for free, and this is the assertion that
     // says so out loud.
     let nonsense = [RecordId(99), RecordId(7)];

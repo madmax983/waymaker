@@ -241,6 +241,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
+    violations.extend(source::check_bank_integrity_routing(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -905,6 +906,11 @@ mod tests {
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::BANK_ROUTING_PATH),
+                    contents: source::tests_support::clean_bank_routing(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::INTEGRITY_CHECK_PATH),
                     contents: source::tests_support::clean_checksum_module(),
                 },
@@ -950,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn check_inputs_wires_up_both_halves_of_the_integrity_pin() {
+    fn check_inputs_wires_up_every_half_of_the_integrity_pin() {
         // `check_inputs_wires_up_every_rule` cannot see these. `integrity-check` already
         // fires on the broken fixture from `check_integrity_check`, so deleting either of
         // the other two `violations.extend(..)` lines leaves the rule id in the set and
@@ -970,6 +976,15 @@ mod tests {
                     .replace("C::header_check(bytes)", "crc16(bytes)"),
                 source::INTEGRITY_ROUTING_PATH,
                 "goes around the trait",
+            ),
+            (
+                // The bank codec's half. It emits the same wording as the frame codec's, so
+                // it is told apart by the file it names — which is the only detail only this
+                // extend line can produce.
+                source::tests_support::clean_bank_routing()
+                    .replace("fn encode_header_with", "fn was_encode_header_with"),
+                source::BANK_ROUTING_PATH,
+                "declares no `fn encode_header_with`",
             ),
         ] {
             let mut inputs = clean_inputs();

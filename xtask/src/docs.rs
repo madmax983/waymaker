@@ -602,6 +602,23 @@ const RECOVERY_STATE_MACHINE_LABELS: &[&str] = &[
     "strictly greater generation",
 ];
 
+/// The three regions of a bank, and the two bindings between them.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted. The first
+/// three are the regions [`BankRegion`] describes; the last two are the reason issue #22's
+/// layout is not a partition table — the journal begins where the header the *writer* wrote
+/// ends, and a seal is worth nothing unless it names the header beside it. A picture that
+/// lost either would draw a layout that cannot fail, which is the one thing this one can.
+///
+/// [`BankRegion`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/bank.rs
+const BANK_LAYOUT_LABELS: &[&str] = &[
+    "bank header",
+    "journal region",
+    "generation seal",
+    "journal_offset",
+    "header_check names the header",
+];
+
 /// Every diagram issue #11 asks for, plus the recovery state machine of issue #20.
 pub const DIAGRAMS: &[DiagramSpec] = &[
     DiagramSpec {
@@ -658,6 +675,16 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         // generations rising is a picture of the wrong thing.
         required_labels: &["BANK A", "BANK B", "generation 41", "generation 42"],
         source_section: "§10 Two-bank lifecycle",
+    },
+    DiagramSpec {
+        id: "bank-layout",
+        title: "what one bank is made of",
+        // The three regions and the two facts that are not layout at all: where the journal
+        // starts is a function of the header the writer wrote, and the seal is bound to the
+        // header by naming its digest. A picture of three boxes without those two arrows is
+        // a picture of a partition table.
+        required_labels: BANK_LAYOUT_LABELS,
+        source_section: "\u{a7}10 Two-bank lifecycle",
     },
     DiagramSpec {
         id: "recovery-state-machine",
@@ -3839,6 +3866,11 @@ mod tests {
         // Four fault families from design document §15 and issue #18's injection list,
         // plus the three record states the same issue asks the model to distinguish.
         assert_eq!(CRASH_INJECTION_LABELS.len(), 7);
+        // §10's three bank regions, plus the two bindings that make the picture a mechanism
+        // rather than a partition table: where the journal starts, and what the seal names.
+        // The doc comment on the list claims this assertion exists, so here it is — review of
+        // issue #22 found it claimed and absent, which is the shape of an unchecked check.
+        assert_eq!(BANK_LAYOUT_LABELS.len(), 5);
     }
 
     #[test]

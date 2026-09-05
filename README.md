@@ -60,7 +60,7 @@ full document, and the issue tracker for the build-out.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | Allocation, serialization framework, CRC, clock, storage driver, executor, logging |
-| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
+| `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, the two-bank layout, bank selection, append scanning, compaction transition | Activities, workflow types, timers, Embassy |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | On-media authority or hidden global state |
 
 Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `waymaker-core`.
@@ -78,7 +78,7 @@ them is built for a firmware target, and no layer may depend on any of them.
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
-| Incremental code flash | ≤ 8 KiB core + flash adapter on `thumbv6m-none-eabi` |
+| Incremental code flash | ≤ 16 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised the gate once for rung 0.2's two-bank lifecycle) |
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
@@ -203,7 +203,7 @@ the panic handler and drift with the toolchain.
 
 | Measured | Gated on | How |
 | --- | --- | --- |
-| Incremental code flash | the `default` row, 8 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 16 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
 | Engine statics | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 

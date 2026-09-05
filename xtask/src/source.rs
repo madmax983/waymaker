@@ -1015,6 +1015,36 @@ pub const INTEGRITY_ROUTING_PATH: &str = "waymaker-flash/src/frame.rs";
 /// name a checksum function at all.
 pub const SEALING_FUNCTIONS: &[&str] = &["encode_with", "decode_with"];
 
+/// The bank codec of design document §10, which seals two more structures.
+///
+/// A second file with the same hazard. `frame.rs` is pinned above; without this, the bank
+/// header and the generation seal could be hard-wired to `crc16` and `crc32` with every
+/// other rule green, and a caller that asked for a different integrity check would get the
+/// shipped one for its banks and its chosen one for its records — a device sealing one part
+/// of its media with an algorithm it does not verify the other part with.
+pub const BANK_ROUTING_PATH: &str = "waymaker-flash/src/bank.rs";
+
+/// The bank codec's sealing functions, and which seals each body must route through.
+///
+/// Unlike [`SEALING_FUNCTIONS`], not every body computes both seals: a generation seal
+/// carries only its own sixteen-bit check, and the digest that binds it to a bank header is
+/// computed in exactly one place. Naming the subset per function is what keeps the rule a
+/// statement about each body rather than the loosest thing true of all of them.
+pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("encode_header_with", &["header_check", "frame_check"]),
+    ("decode_header_with", &["header_check", "frame_check"]),
+    ("encode_seal_with", &["header_check"]),
+    ("decode_seal_with", &["header_check"]),
+    ("seal_for_with", &["frame_check"]),
+    // Routes by delegation rather than by computing a seal itself: it decodes the seal and
+    // asks `seal_for_with` for the one the header deserves. An empty method list is what
+    // "this body must compute no seal of its own" is spelled as — the file-wide checksum ban
+    // is what holds it, and the row exists because the derived scan below requires every
+    // function generic over the check to be accounted for. A body that started computing a
+    // seal here would be a row somebody has to widen.
+    ("sealed_generation_with", &[]),
+];
+
 /// The one function permitted to call the checksum module from the codec, and what it may
 /// call.
 ///
@@ -1542,8 +1572,15 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     let mut violations = Vec::new();
     let checksums: Vec<&str> = SEAL_BINDINGS.iter().map(|seal| seal.delegates_to).collect();
 
+    let seals: Vec<&SealBinding> = SEAL_BINDINGS.iter().collect();
     for function in SEALING_FUNCTIONS {
-        violations.extend(sealing_function_violations(function, &code, &checksums));
+        violations.extend(sealing_function_violations(
+            INTEGRITY_ROUTING_PATH,
+            function,
+            &code,
+            &seals,
+            &checksums,
+        ));
     }
     // Both of these were token counts until Codex's third round, and both fell to the same
     // thing the sealing functions did: `let _ = crc32; 0` is valid in a `const fn`, and
@@ -1566,6 +1603,147 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
         "so a scan verifies with whichever check the codec defaults to rather than the one \
          its caller asked for",
     ));
+
+    violations
+}
+
+/// Every function in `code` that is generic over the integrity check, by name.
+///
+/// A line scan for `fn <name>` and `IntegrityCheck` in the same signature, which is how
+/// rustfmt writes every one of them in this workspace. It is a floor, like every rule here:
+/// a signature broken across lines so that `fn` and the bound land apart would be missed, and
+/// a body that computes a seal without taking `C` at all is caught by the file-wide checksum
+/// ban instead.
+fn integrity_generic_functions(code: &str) -> Vec<String> {
+    code.lines()
+        .filter(|line| line.contains("IntegrityCheck"))
+        .filter_map(function_declaration_name)
+        .collect()
+}
+
+/// The name a `fn` signature line declares, if the line declares one.
+fn function_declaration_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // A `use` line or a `where` clause mentions the bound without declaring anything.
+    if trimmed.starts_with("use ") || trimmed.starts_with("//") {
+        return None;
+    }
+    let (_, after) = trimmed.split_once("fn ")?;
+    let name: String = after
+        .chars()
+        .take_while(|character| character.is_alphanumeric() || *character == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Rule: the bank codec reaches its seals through the trait rather than around it.
+///
+/// The same decision as [`check_integrity_routing`], reported under the same id, for the
+/// second file that computes seals. Design document §10's bank header and generation seal
+/// are sealed with the same two checks a record frame is, and a caller that chose an
+/// integrity check gets to have chosen it for its whole device — a firmware whose banks are
+/// sealed with one algorithm and whose records are sealed with another is a firmware that
+/// cannot read half of what it wrote.
+///
+/// Each body is held to the seals its row in [`BANK_SEALING_FUNCTIONS`] names, exactly once
+/// and with the answer used, and to naming no checksum function at all. There is no
+/// `DIGEST_FUNCTION`-style exception here: nothing in the bank codec is a `const fn`, so
+/// every seal on this path can and does go through the trait.
+#[must_use]
+pub fn check_bank_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, BANK_ROUTING_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "no {BANK_ROUTING_PATH} in the workspace, so nothing says the bank header \
+                 and the generation seal still reach their checks through the integrity \
+                 trait"
+            ),
+        )];
+    };
+
+    let code = without_test_modules(&code_only(&source.contents));
+    let checksums: Vec<&str> = SEAL_BINDINGS.iter().map(|seal| seal.delegates_to).collect();
+    let mut violations = Vec::new();
+
+    // File-wide rather than per-body, which is what `frame.rs` has to settle for. `frame.rs`
+    // has one documented exception — `input_digest` is a `const fn`, so it cannot go through
+    // a trait method — and `bank.rs` has none: nothing here is `const`, so every seal on this
+    // path can and does go through `C`. A ban on the whole file therefore costs nothing and
+    // closes the hole a per-body ban leaves, which is a *new* helper that names a checksum
+    // and is called from a pinned body.
+    for checksum in &checksums {
+        if count_tokens(&code, checksum) != 0 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{BANK_ROUTING_PATH} names `{checksum}` directly. The bank codec has no \
+                     `const fn` that needs one, so every seal here goes through `C` and a \
+                     direct call is a seal the caller's chosen check did not compute"
+                ),
+            ));
+        }
+    }
+
+    // Derived, not whitelisted. A table of five names pins five bodies and says nothing
+    // about a sixth: review of this change added a `pub fn header_is_intact_with<C: IntegrityCheck>`
+    // that took the type parameter, ignored it, called `crc16` and passed every rule. It also
+    // says nothing about a row *deleted* — dropping `seal_for_with` from the table and
+    // rewiring its body to `crc32` left the gate and all 538 tests green, because the clean
+    // fixture is rendered from the same table and adapts to any deletion. Reading the file
+    // for functions generic over the check closes both directions.
+    for name in integrity_generic_functions(&code) {
+        if !BANK_SEALING_FUNCTIONS
+            .iter()
+            .any(|(pinned, _)| *pinned == name)
+        {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{BANK_ROUTING_PATH} declares `fn {name}` generic over the integrity \
+                     check and no row of `BANK_SEALING_FUNCTIONS` pins it, so a body that can \
+                     compute a seal is pinned by nothing; add a row naming the seals it must \
+                     route through, or stop taking `C`"
+                ),
+            ));
+        }
+    }
+
+    for (function, methods) in BANK_SEALING_FUNCTIONS {
+        // Filtered from `SEAL_BINDINGS` rather than described here, so a seal whose width or
+        // name changes changes in one place. A method named in a row that no longer exists
+        // in `SEAL_BINDINGS` selects nothing, which is why the count is checked.
+        let seals: Vec<&SealBinding> = SEAL_BINDINGS
+            .iter()
+            .filter(|seal| methods.contains(&seal.method))
+            .collect();
+        if seals.len() != methods.len() {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` is pinned to a seal `SEAL_BINDINGS` does not declare, so \
+                     the row checks less than it says it does"
+                ),
+            ));
+            continue;
+        }
+        violations.extend(sealing_function_violations(
+            BANK_ROUTING_PATH,
+            function,
+            &code,
+            &seals,
+            // Empty: the file-wide ban above already covers every body in this file, and
+            // reporting the same mutation twice makes a failure harder to read, not safer.
+            &[],
+        ));
+    }
 
     violations
 }
@@ -1734,23 +1912,56 @@ fn result_is_used(before: &str, after: &str) -> bool {
 /// line limit, and because the two halves answer different questions: this one is "does this
 /// body reach the seal through the trait", and the caller's is "are the bodies that must do
 /// so all there".
-fn sealing_function_violations(function: &str, code: &str, checksums: &[&str]) -> Vec<Violation> {
+fn sealing_function_violations(
+    path: &str,
+    function: &str,
+    code: &str,
+    seals: &[&SealBinding],
+    checksums: &[&str],
+) -> Vec<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
     let mut violations = Vec::new();
-    let Some(body) = braced_body(code, &format!("fn {function}")) else {
+    // Exactly one, not "the first one". `braced_body` takes the first textual match, so a
+    // second declaration of a pinned name is a decoy: a `mod shim` above the real code,
+    // carrying five conforming bodies, satisfied every check below while every real call
+    // site was rewired to `crc16` and `crc32`. Review of this change demonstrated it on both
+    // routing pins, so ambiguity is a violation rather than a tie-break — the same rule
+    // `check_integrity_binding` already applies to the trait and its `impl`.
+    let declaration = format!("fn {function}");
+    let declared = count_tokens(code, &declaration);
+    if declared != 1 {
+        violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            if declared == 0 {
+                format!(
+                    "{path} declares no `fn {function}`, so the codec's route to its seals \
+                     is pinned against nothing"
+                )
+            } else {
+                format!(
+                    "{path} declares `fn {function}` {declared} times, so a scan that reads \
+                     the first one is reading whichever a contributor put first; one \
+                     declaration, or the pin is a decoy away from meaning nothing"
+                )
+            },
+        ));
+        return violations;
+    }
+    let Some(body) = braced_body(code, &declaration) else {
         violations.push(Violation::new(
             RULE,
             ADAPTER,
             format!(
-                "{INTEGRITY_ROUTING_PATH} declares no `fn {function}`, so the codec's \
+                "{path} declares no `fn {function}`, so the codec's \
                  route to its seals is pinned against nothing"
             ),
         ));
         return violations;
     };
-    for seal in SEAL_BINDINGS {
+    for seal in seals {
         let through = format!("C::{}", seal.method);
         // An *invocation*, not a mention. Codex caught this on PR #60: a token count is
         // satisfied by `let _ = C::header_check;` left beside a seal some other helper
@@ -4841,9 +5052,9 @@ pub mod tests_support {
     use std::collections::BTreeSet;
 
     use super::{
-        CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, INTEGRITY_CHECK_PARAMETERS,
-        REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE,
-        TRANSITION_SURFACE,
+        BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
+        INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -4999,6 +5210,26 @@ pub mod tests_support {
         source
     }
 
+    /// A bank codec whose routing the pin accepts, for tests about everything else.
+    ///
+    /// Rendered from [`BANK_SEALING_FUNCTIONS`] for the reason
+    /// [`clean_integrity_routing`] is rendered from its own table: a fixture written out by
+    /// hand is a fixture that passes a pin the real codec fails.
+    #[must_use]
+    pub fn clean_bank_routing() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! The bank codec.\n");
+        for (function, methods) in BANK_SEALING_FUNCTIONS {
+            let _ = writeln!(source, "pub fn {function}<C: IntegrityCheck>() -> u32 {{");
+            for method in *methods {
+                let _ = writeln!(source, "    let seal_{method} = C::{method}(bytes);");
+            }
+            source.push_str("    0\n}\n");
+        }
+        source
+    }
+
     /// Probe source calling every name both pins list, for the clean-workspace fixture.
     ///
     /// `size-probe-reach` demands a call for every public function a layer declares, and the
@@ -5022,6 +5253,7 @@ pub mod tests_support {
             .chain(seals)
             .chain(SEALING_FUNCTIONS)
             .chain([&DIGEST_FUNCTION.0])
+            .chain(BANK_SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

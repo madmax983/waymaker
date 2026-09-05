@@ -682,6 +682,7 @@ fn record_codec() -> usize {
     });
     kept = kept.wrapping_add(scan.offset());
     kept = kept.wrapping_add(storage_contract());
+    kept = kept.wrapping_add(two_bank_lifecycle());
 
     core::hint::black_box(kept)
 }
@@ -780,6 +781,175 @@ fn storage_contract() -> usize {
     }
 
     core::hint::black_box(kept)
+}
+
+/// The two-bank lifecycle of design document §10: the layout, the header, the seal, and
+/// which bank a reader boots from.
+///
+/// A function of its own rather than more lines in [`record_codec`], because it is a second
+/// codec with a second pair of seals and clippy's line budget refuses the two together.
+/// Every public function of `waymaker-flash::bank` is called from here, which is
+/// `size-probe-reach`'s requirement — and it is what makes the bank layer's share of the
+/// code-flash delta a real number rather than the cost of naming the module.
+///
+/// Both halves of the selection rule are linked: a device with one authority and one with
+/// two. A delta that charged only for the first would understate the firmware that has to
+/// refuse an ambiguous device on a cold boot, which is the branch §02 decision 7 exists for.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn two_bank_lifecycle() -> usize {
+    use waymaker_core::RunId;
+    use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout};
+    use waymaker_flash::integrity::Catalogued;
+    use waymaker_flash::storage::Geometry;
+
+    let Ok(geometry) = Geometry::new(
+        core::hint::black_box(256),
+        core::hint::black_box(64),
+        core::hint::black_box(4),
+        core::hint::black_box(1),
+    ) else {
+        return 0;
+    };
+    let layout = match BankLayout::new(geometry) {
+        Ok(layout) => layout,
+        Err(error) => return error.message().len(),
+    };
+    let mut kept = layout.bank_bytes() as usize;
+    kept = kept.wrapping_add(layout.geometry().capacity() as usize);
+
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Taken as a function
+    // pointer for the reason the other three are: formatting would link `core::fmt::write`
+    // and charge this row for machinery the impl was written to avoid.
+    let show: fn(
+        &waymaker_flash::bank::LayoutError,
+        &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result = <waymaker_flash::bank::LayoutError as core::fmt::Display>::fmt;
+    core::hint::black_box(show);
+
+    // The granularity the layout proved exists, and the run-input ceiling a caller needs
+    // before it builds a header. Both are what stop a caller writing the arithmetic itself.
+    let align = layout.align();
+    let region = layout.bank(core::hint::black_box(BankId::A).other());
+    kept = kept.wrapping_add(region.max_run_input_bytes(align));
+    kept = kept
+        .wrapping_add(region.base() as usize)
+        .wrapping_add(region.bytes() as usize)
+        .wrapping_add(region.seal_offset() as usize)
+        .wrapping_add(region.seal_bytes() as usize)
+        .wrapping_add(region.payload_bytes() as usize)
+        .wrapping_add(BankId::B.index());
+
+    let header = BankHeader {
+        run: RunId(core::hint::black_box(7)),
+        align,
+        workflow_kind: core::hint::black_box(1),
+        workflow_version: core::hint::black_box(1),
+        input_schema: core::hint::black_box(2),
+        input: core::hint::black_box(b"in"),
+    };
+    kept = kept.wrapping_add(header.frame_len());
+    kept = kept.wrapping_add(header.journal_offset().unwrap_or(0));
+
+    let mut page = [0_u8; 64];
+    kept = kept.wrapping_add(
+        match bank::encode_header_with::<Catalogued>(&header, &mut page) {
+            Ok(written) => written,
+            Err(error) => return kept.wrapping_add(error.message().len()),
+        },
+    );
+    // `encode_header` is the `Catalogued` instantiation of `encode_header_with`, so this
+    // reaches the same body rather than a second copy of the codec.
+    kept = kept.wrapping_add(bank::encode_header(&header, &mut page).unwrap_or(0));
+    kept = kept.wrapping_add(match bank::decode_header(&page) {
+        Ok(decoded) => usize::from(decoded.workflow_kind).wrapping_add(decoded.input.len()),
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        bank::decode_header_with::<Catalogued>(&page).map_or(0, |decoded| decoded.frame_len()),
+    );
+
+    kept = kept.wrapping_add(bank_seal_and_selection(&page));
+
+    core::hint::black_box(kept)
+}
+
+/// The generation seal and the selection rule, given a bank header already on `page`.
+///
+/// Split out of [`two_bank_lifecycle`] because clippy's line budget refuses the two
+/// together, and called unconditionally from there — so no figure the size report prints
+/// changes either way. The split falls at §10's own seam: everything above is the payload,
+/// everything here is what makes it authoritative.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn bank_seal_and_selection(page: &[u8]) -> usize {
+    use waymaker_flash::bank::{self, Authority, Generation, Seal};
+    use waymaker_flash::frame::ProgramAlign;
+    use waymaker_flash::integrity::Catalogued;
+
+    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
+        return 0;
+    };
+    let mut kept = usize::from(align.get());
+    let generation = Generation::FIRST.successor().unwrap_or(Generation::MAX);
+    let seal = match bank::seal_for(page, generation) {
+        Ok(seal) => seal,
+        Err(error) => return kept.wrapping_add(error.message().len()),
+    };
+    kept = kept.wrapping_add(
+        bank::seal_for_with::<Catalogued>(page, Generation::MAX)
+            .map_or(0, |seal| seal.header_check as usize),
+    );
+
+    let mut seal_page = [0_u8; 16];
+    kept = kept.wrapping_add(
+        match bank::encode_seal_with::<Catalogued>(&seal, align, &mut seal_page) {
+            Ok(written) => written,
+            Err(error) => return kept.wrapping_add(error.message().len()),
+        },
+    );
+    kept = kept.wrapping_add(bank::encode_seal(&seal, align, &mut seal_page).unwrap_or(0));
+    kept = kept.wrapping_add(match bank::decode_seal(&seal_page) {
+        Ok(decoded) => decoded.generation.0 as usize,
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        bank::decode_seal_with::<Catalogued>(&seal_page)
+            .map_or(0, |decoded| decoded.header_check as usize),
+    );
+
+    // The selection rule, both ways it can go: one authority, and the tie it must refuse.
+    let found = bank::sealed_generation(page, &seal_page);
+    kept = kept.wrapping_add(
+        bank::sealed_generation_with::<Catalogued>(page, &seal_page)
+            .map_or(0, |generation| generation.0 as usize),
+    );
+    for authority in [
+        bank::select([found, None]),
+        bank::select([found, Some(Generation::MAX)]),
+        bank::select([found, found]),
+    ] {
+        kept = kept.wrapping_add(match authority {
+            Authority::Unsealed => 0,
+            Authority::Bank { id, generation } => id.index().wrapping_add(generation.0 as usize),
+            Authority::Ambiguous { generation } => generation.0 as usize,
+        });
+    }
+    // `Seal`'s fields, so the struct is not folded away entirely.
+    let quoted = Seal {
+        generation: Generation(core::hint::black_box(1)),
+        header_check: core::hint::black_box(2),
+    };
+    kept = kept.wrapping_add(quoted.header_check as usize);
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn two_bank_lifecycle() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.
