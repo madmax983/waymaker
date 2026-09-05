@@ -12,6 +12,14 @@ const fn workload() -> Workload {
     Workload::new(SEED, 0, EFFECTS)
 }
 
+/// How many records the run above writes.
+fn records() -> u16 {
+    let Some(records) = workload().records() else {
+        unreachable!("a three-effect run has eight records")
+    };
+    records
+}
+
 /// A witness that saw `attempted` records begun, `acknowledged` records committed and
 /// `dispatched` effects sent, expressed as the high-water marks a scan reports.
 fn progress(
@@ -49,7 +57,7 @@ fn audit(recovered: u16, progress: Progress, banks: usize) -> Result<(), Breach>
 
 #[test]
 fn a_clean_run_recovered_whole_is_no_breach() {
-    let whole = workload().records();
+    let whole = records();
     audit(
         whole,
         progress(Some(whole - 1), Some(whole - 1), Some(5)),
@@ -124,7 +132,7 @@ fn a_dispatched_effect_whose_schedule_is_gone_is_a_breach() {
 fn a_dispatch_mark_that_names_a_record_which_is_not_a_schedule_is_a_breach() {
     // The witness is the instrument. An instrument reporting a dispatch against a completion
     // record is broken, and a rig that shrugged would be reading its own bug as a pass.
-    let whole = workload().records();
+    let whole = records();
     let breach = audit(
         whole,
         progress(Some(whole - 1), Some(whole - 1), Some(2)),
@@ -152,7 +160,7 @@ fn two_authorities_are_a_breach_even_before_the_rig_began() {
 #[test]
 fn anything_but_exactly_one_authoritative_bank_is_a_breach() {
     // §14 `single-authority`.
-    let whole = workload().records();
+    let whole = records();
     let full = progress(Some(whole - 1), Some(whole - 1), Some(5));
     for banks in [0_usize, 2, 3] {
         let breach = audit(whole, full, banks).expect_err("only one bank may be authoritative");

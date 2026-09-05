@@ -37,13 +37,27 @@
 //! still has its schedule record demanded, and demanding more of recovery than happened is
 //! the safe direction for an instrument.
 //!
-//! # Why a mark is sealed
+//! # Why a mark is sealed, and why the seal is masked
 //!
 //! Because "erased" and "torn" and "written" have to be three different answers. A mark
-//! carries a magic that is neither `0xFFFF` nor `0x0000` and a sixteen-bit check over its own
-//! body, computed with the same [`IntegrityCheck`] the firmware seals frames with — so an
-//! erased slot is not a mark, a mark whose program stopped half way is not a mark, and the
-//! rig's own instrument is held to the standard the thing it measures is.
+//! carries a magic that is neither `0xFFFF` nor `0x0000`, a stage byte that is neither
+//! `0x00` nor `0xFF`, a reserved byte that must be zero, and a check over its own body
+//! computed with the same [`IntegrityCheck`] the firmware seals frames with.
+//!
+//! The check is stored with **bit 7 of each byte cleared**, which is
+//! [ADR 0019](https://github.com/madmax983/waymaker/blob/main/docs/adr/0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md)'s
+//! trick for the commit seal, applied here for exactly the reason it was invented there: it
+//! makes **no byte a mark writes ever equal `0xFF`**. Without it the seal is the one field
+//! with no guard against erased media, and a tear that landed eleven of twelve bytes leaves
+//! `check | 0xFF00` on media — which verifies whenever the real check's high byte is `0xFF`,
+//! one mark in 256. That is not a corner: `waymaker_fault::injections` enumerates a tear at
+//! every byte of every program, so it is an ordinary crash point, and a falsely-accepted torn
+//! `Attempted` mark raises the high water for a record whose first program never began —
+//! loosening `Audit::saw`'s only defence against recovery inventing a record.
+//!
+//! The masking costs two bits, so the check is fourteen wide rather than sixteen. That is the
+//! same trade ADR 0019 made and is worth it for the same reason: a collision is one in 16384,
+//! and a torn mark is now *impossible* rather than merely unlikely.
 //!
 //! # What this is not
 //!
@@ -65,6 +79,12 @@ pub const MARK_MAGIC: u16 = 0x5752;
 /// How many bytes of a mark the check covers.
 const MARK_BODY_BYTES: usize = MARK_BYTES - 2;
 
+/// The bits of the check a seal byte keeps.
+///
+/// Bit 7 cleared, so a seal byte is never `0xFF` and erased media is never a seal. See the
+/// module documentation for why two bits are worth that.
+const SEAL_MASK: u8 = 0x7F;
+
 /// How many bytes a mark occupies, as the offsets a geometry validates are counted.
 ///
 /// Declared rather than narrowed from [`MARK_BYTES`]: `usize::try_from` is not `const`, and a
@@ -72,7 +92,10 @@ const MARK_BODY_BYTES: usize = MARK_BYTES - 2;
 /// a compile-time assertion, so a mark that grew in one place and not the other does not
 /// build.
 const MARK_WORDS: u32 = 12;
-const _: () = assert!(MARK_BYTES == 12);
+// The assertion the doc above describes: it pins the *pair*, so a mark that grew in one place
+// and not the other does not build. Pinning only `MARK_BYTES` would have left `MARK_WORDS`
+// free to drift, and every `Witness::mark` would then have become a runtime `ShortBuffer`.
+const _: () = assert!(MARK_BYTES == MARK_WORDS as usize);
 
 /// What a mark says happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -170,6 +193,12 @@ impl<E: core::fmt::Display> core::fmt::Display for WitnessError<E> {
 
 impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for WitnessError<E> {}
 
+/// The seal `body` gets, with bit 7 of each byte cleared.
+fn masked_seal<C: IntegrityCheck>(body: &[u8]) -> [u8; 2] {
+    let [low, high] = C::header_check(body).to_le_bytes();
+    [low & SEAL_MASK, high & SEAL_MASK]
+}
+
 /// One thing the rig durably knew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mark {
@@ -239,10 +268,9 @@ impl Mark {
         *code = self.stage.code();
         reserved.fill(0);
 
-        let check = C::header_check(&body);
         let (head, tail) = slot.split_at_mut(MARK_BODY_BYTES);
         head.copy_from_slice(&body);
-        tail.copy_from_slice(&check.to_le_bytes());
+        tail.copy_from_slice(&masked_seal::<C>(&body));
         Ok(MARK_BYTES)
     }
 
@@ -289,7 +317,9 @@ impl Mark {
         let Some(stage) = stage.first().and_then(|code| Stage::from_code(*code)) else {
             return Err(WitnessError::NotAMark);
         };
-        if C::header_check(body) != u16::from_le_bytes(seal) {
+        // Compared against the *masked* check, so a seal byte with bit 7 set — which no
+        // encoder writes and erased media always has — cannot match whatever the body says.
+        if masked_seal::<C>(body) != seal {
             return Err(WitnessError::NotAMark);
         }
         Ok(Self {
@@ -401,6 +431,16 @@ pub struct Progress {
 }
 
 impl Progress {
+    /// A witness nothing has been read from.
+    pub const EMPTY: Self = Self {
+        iteration: None,
+        attempted: None,
+        acknowledged: None,
+        dispatched: None,
+        marks: 0,
+        torn: false,
+    };
+
     /// The iteration every mark named, or `None` for an empty witness.
     #[must_use]
     pub const fn iteration(self) -> Option<u32> {
@@ -462,6 +502,93 @@ impl Progress {
         }
         self.marks = self.marks.saturating_add(1);
         self
+    }
+
+    /// How many bytes [`encode`](Self::encode) writes.
+    pub const ENCODED_BYTES: usize = 12;
+
+    /// A high water, as two bytes, with `0xFFFF` for "none".
+    ///
+    /// `u16::MAX` is not a reachable record index — a run of 65535 records is refused long
+    /// before it — so it is free to stand for absence, and a reader that met it would demand
+    /// nothing rather than demand everything.
+    const fn word(value: Option<u16>) -> [u8; 2] {
+        match value {
+            Some(index) => index.to_le_bytes(),
+            None => u16::MAX.to_le_bytes(),
+        }
+    }
+
+    /// The inverse of [`word`](Self::word).
+    const fn unword(bytes: [u8; 2]) -> Option<u16> {
+        match u16::from_le_bytes(bytes) {
+            u16::MAX => None,
+            index => Some(index),
+        }
+    }
+
+    /// The three high waters and the iteration they belong to, little-endian.
+    ///
+    /// This is what makes issue [#27](https://github.com/madmax983/waymaker/issues/27)'s
+    /// third "done when" true rather than nearly true. A log line carrying a seed, an
+    /// iteration and a geometry can rebuild the *run*; it cannot rebuild what the rig
+    /// **knew**, and the obligations §14 puts on a recovery are entirely statements about
+    /// that. Without these twelve bytes a violation is reproducible only if the host still
+    /// has the device.
+    ///
+    /// The mark count and the tear flag travel too, because `Audit::finish` reads both.
+    ///
+    /// # Errors
+    ///
+    /// `None` when `out` is shorter than [`ENCODED_BYTES`](Self::ENCODED_BYTES).
+    #[must_use]
+    pub fn encode(self, out: &mut [u8]) -> Option<usize> {
+        let slot = out.get_mut(..Self::ENCODED_BYTES)?;
+        let (iteration, rest) = slot.split_at_mut(4);
+        iteration.copy_from_slice(&self.iteration.unwrap_or(u32::MAX).to_le_bytes());
+        let (attempted, rest) = rest.split_at_mut(2);
+        attempted.copy_from_slice(&Self::word(self.attempted));
+        let (acknowledged, rest) = rest.split_at_mut(2);
+        acknowledged.copy_from_slice(&Self::word(self.acknowledged));
+        let (dispatched, rest) = rest.split_at_mut(2);
+        dispatched.copy_from_slice(&Self::word(self.dispatched));
+        let (marks, torn) = rest.split_at_mut(1);
+        // Saturating: the count is a figure in a report, and a wrapped one would read as an
+        // empty witness — which `Audit::finish` treats as "the run never began".
+        let count = u8::try_from(self.marks.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
+        marks.fill(count);
+        torn.fill(u8::from(self.torn));
+        Some(Self::ENCODED_BYTES)
+    }
+
+    /// The progress [`encode`](Self::encode) wrote.
+    ///
+    /// # Errors
+    ///
+    /// `None` when `bytes` is shorter than [`ENCODED_BYTES`](Self::ENCODED_BYTES), or when
+    /// the tear flag is neither zero nor one — a byte with no meaning is not a witness.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let slot = bytes.get(..Self::ENCODED_BYTES)?;
+        let (iteration, rest) = slot.split_at(4);
+        let (attempted, rest) = rest.split_at(2);
+        let (acknowledged, rest) = rest.split_at(2);
+        let (dispatched, rest) = rest.split_at(2);
+        let (marks, torn) = rest.split_at(1);
+        let iteration = u32::from_le_bytes(<[u8; 4]>::try_from(iteration).ok()?);
+        let torn = match torn.first().copied()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some(Self {
+            iteration: (iteration != u32::MAX).then_some(iteration),
+            attempted: Self::unword(<[u8; 2]>::try_from(attempted).ok()?),
+            acknowledged: Self::unword(<[u8; 2]>::try_from(acknowledged).ok()?),
+            dispatched: Self::unword(<[u8; 2]>::try_from(dispatched).ok()?),
+            marks: u32::from(marks.first().copied()?),
+            torn,
+        })
     }
 
     /// Raises the high water for `stage`, refusing an index that did not increase.

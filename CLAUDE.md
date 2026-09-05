@@ -32,6 +32,7 @@ cargo test --locked --workspace --no-default-features
 cargo doc --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
@@ -269,16 +270,21 @@ Six crates are in the workspace and are *not* layers:
   absolute — and nothing depends on it.
 - `waymaker-fault` — the in-memory storage model and crash injector, `policy::TEST_SUPPORT_CRATES`.
   Host-side, `std`, no third-party dependencies, and outside `default-members`. It depends on
-  `waymaker-flash` for the storage contract; nothing depends on it, and no layer may, in any
-  dependency kind — the tests that drive the harness live with the harness. See
+  `waymaker-flash` for the storage contract; no layer depends on it, in any dependency kind,
+  and the only crates that do are `waymaker-spec`, `waymaker-rig` and `xtask` — the last
+  because the write-amplification figure `cargo xtask size` publishes is measured by running
+  the real writer over this model rather than transcribed. The tests that drive the harness
+  live with the harness. See
   [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md).
 - `waymaker-conformance` — the conformance suite for §12's storage contract and the
   `embedded-storage` port, also `policy::TEST_SUPPORT_CRATES`. Outside `default-members`, and
   nothing depends on it. Two things make it unlike the other two test-support crates, and both
   are deliberate: it is `#![no_std]` and allocation-free, because the adapter author it exists
   for may only be able to run it on the target the driver is for; and it carries a third-party
-  dependency, `embedded-storage`, which is the only place in this workspace outside `xtask`
-  that one is allowed. See
+  dependency, `embedded-storage`, which outside `xtask` is allowed in this crate and — as a
+  *dev*-dependency only, so that `waymaker-rig`'s `tests/port.rs` can drive a rig through this
+  crate's port — in the rig. No layer may reach it in any dependency kind, which is
+  `dependency-direction` and `kernel-zero-dependencies` rather than a convention. See
   [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md).
 - `waymaker-rig` — design document §15's power-cut and watchdog-reset rig, also
   `policy::TEST_SUPPORT_CRATES`. The deterministic workload and cut plan, the durable witness
@@ -689,6 +695,23 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
+- **A public function added to the rig's oracle from another file.** `rig-oracle` pins three
+  files — `audit.rs`, `census.rs` and `run.rs`. An `impl Audit { pub fn assume_passed(..) }`
+  in a sibling module, or a `trait AuditExt` with a blanket impl, adds the escape with the
+  rule silent, exactly as `recovery-surface`, `storage-contract` and `capacity-reserve` each
+  say of the one file they pin. The rig is the sharpest case of the three, because its bugs
+  show up as *passing* tests.
+- **That the published write-amplification figure is any particular size.** `cargo xtask size`
+  fails when the measurement cannot be *taken* — a part that cannot be laid out, a run its own
+  oracle rejects — but there is no budget the figure is compared against, so it can regress
+  arbitrarily with the build green. Issue #27 asks only that it be published. A budget would
+  need a target §04 does not state.
+- **That the rig's `no_std` claim survives its dependencies.** The `rig-firmware` stage builds
+  `waymaker-rig`'s library for `thumbv6m-none-eabi`, which is what makes "written to run on the
+  part" a build failure rather than an attribute. What it cannot check is the other half of ADR
+  0021's claim — that the rig *fits*, in flash or in RAM, next to an engine. There is no size
+  probe for it and no budget it is measured against, because the board it would be measured on
+  is the thing that is owed.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -917,6 +940,37 @@ would be obliged is rung 0.4's; §08's order is a precondition on the caller rat
 something `Reserved` can enforce; the `waymaker-fault` sweep of the reboot join is not here;
 and the code-flash gate needed a second raise, which ADR 0020 argues should be the last
 before issue #72 corrects what the figure is measuring.
+Issue #27 is rung 0.2's exit criterion, and one bullet of it — "power-cut loops pass on one
+Cortex-M0+ board and one Cortex-M4 board" — is the first thing in this repository that no
+amount of host-side work discharges. `waymaker-rig` is everything else: §15's power-cut and
+watchdog-reset rig, `#![no_std]`, allocation-free, and built for `thumbv6m-none-eabi` by a CI
+stage of its own, because a rig that could only run on a host would be a simulation wearing a
+rig's name. What makes it more than a second `waymaker-fault` is that it keeps a **durable
+witness** — a power cut takes RAM, and two of §14's guarantees are statements about the
+*writer* rather than about bytes: `acknowledged-durability` is about barriers that returned
+and `durable-intent` about effects that were dispatched, and neither is readable off a
+journal. Marks go down before a record's first program, after its commit barrier, and before
+each physical effect, and every one of those positions is chosen for which way an interrupted
+mark is allowed to be wrong. The run and the cut point are pure functions of a seed and an
+iteration, so a log line carries the whole run; the witness travels in the line too, which is
+what makes issue #27's third "done when" true rather than nearly true. A power cut and a
+watchdog reset are modelled differently rather than relabelled — a brownout tears a program
+inside a unit, a watchdog reset lets the controller finish or abandon it whole — and the census
+over three write points and two reset causes fails closed on an uncovered cell. The rig is
+driven at every crash point `waymaker-fault` enumerates, judged by its own oracle, and held
+honest by writers wrong in one way each that must be caught by the guarantee they break and by
+no other. §04's write amplification is published by `cargo xtask size`, measured by running the
+real `Journal` over three parts that differ in program granularity, because that is what the
+answer turns on. Three findings came out of review rather than out of writing it, and all three
+were live: a torn witness mark decoded as a whole one about once in 256, which is
+[ADR 0019](docs/adr/0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md)'s
+masked-repeat trick reimplemented without the trick; the audit never checked that the witness
+it read belonged to the iteration it was judging, so a reset landing before the instrument was
+erased made a healthy device report a violation; and a standard 256-byte-page NOR was accepted
+at construction and then failed in the middle of installing a bank. See
+[ADR 0021](docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md), and
+[what the boards still owe](#what-the-boards-still-owe), which is where the exit criterion
+itself is recorded as unmet.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the bank swap
 arrives with 0.2, and the async `Ctx` and dispatcher with 0.4. The

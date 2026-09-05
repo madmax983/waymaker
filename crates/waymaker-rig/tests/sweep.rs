@@ -28,16 +28,18 @@
 
 use std::collections::BTreeSet;
 
-use waymaker_fault::{Device, Harness, Injection, Interruption, Progress, Run};
+use waymaker_fault::{Device, Harness, Injection, Interruption, Op, Progress, Run};
 use waymaker_flash::storage::Geometry;
 use waymaker_rig::audit::Breach;
 use waymaker_rig::census::Coverage;
+use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::{Entry, Outcome};
 use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Dispatcher, NeverCut, Rig, Stop};
-use waymaker_rig::wear::Metered;
+use waymaker_rig::run::{Rig, Stop};
+use waymaker_rig::wear::{Metered, Wear};
 use waymaker_rig::witness::{Progress as Marks, Stage, Witness};
+use waymaker_rig::workload::Role;
 
 const SEED: u64 = 0x00C0_FFEE_0BAD_CAFE;
 const EFFECTS: u16 = 2;
@@ -74,6 +76,14 @@ impl Dispatcher for Counting {
     }
 }
 
+/// How many records a run of this rig writes.
+fn records() -> u16 {
+    let Some(records) = rig().workload(0).records() else {
+        unreachable!("a two-effect run has six records")
+    };
+    records
+}
+
 /// The reset cause an injection models. See the module documentation.
 const fn cause_of(injection: Injection) -> Option<ResetCause> {
     match (injection.progress, injection.interruption) {
@@ -83,22 +93,53 @@ const fn cause_of(injection: Injection) -> Option<ResetCause> {
     }
 }
 
-/// Which write point the run had reached when it stopped, read off the witness.
-fn phase_of(marks: Marks, rig: &Rig) -> Option<Phase> {
+/// Whether the interrupted operation was a write to the *engine*, rather than to the rig's
+/// own instrument.
+///
+/// The census below would otherwise credit "a power cut during the schedule write" to a run
+/// whose cut actually tore a witness mark. Both are crash points, but only one of them is the
+/// write issue #27 names, and a census that could not tell them apart would not be measuring
+/// what its own `Gap` message says.
+fn interrupted_the_engine(run: &Run, rig: &Rig) -> bool {
+    let Some(injection) = run.injection() else {
+        return false;
+    };
+    let Some(op) = run.ops().get(injection.op) else {
+        return false;
+    };
+    let offset = match *op {
+        Op::Program { offset, .. } | Op::Erase { offset, .. } => offset,
+        // A barrier names no offset. It is ordered against whatever was written before it, so
+        // it belongs to neither side and is left out rather than guessed at.
+        Op::Barrier => return false,
+    };
+    offset < rig.instrument_base()
+}
+
+/// Which write point the run was in when it stopped.
+///
+/// Read off the witness, which is the only thing that survives on a board — but *qualified*
+/// by what was interrupted, which is the part the first version of this file left out.
+fn phase_of(marks: Marks, run: &Run, rig: &Rig) -> Option<Phase> {
     let workload = rig.workload(0);
     let index = marks.attempted()?;
     match workload.role(index)? {
-        waymaker_rig::workload::Role::Schedule(_) => {
-            // A schedule record that was acknowledged and dispatched puts the run in the
-            // dispatch window; one that was not is still in the schedule write.
+        Role::Schedule(_) => {
             if marks.dispatched() == Some(index) {
+                // The schedule record committed and its effect was marked as going out, and
+                // no later record has been begun. That is the dispatch window exactly, and it
+                // is the one phase with *no* storage operation in flight — §02 decision 3
+                // creates it precisely so that nothing is being written there — so it is
+                // classified by the witness alone, on purpose.
                 Some(Phase::Dispatch)
-            } else {
+            } else if interrupted_the_engine(run, rig) {
                 Some(Phase::Schedule)
+            } else {
+                None
             }
         }
-        waymaker_rig::workload::Role::Completion(_) => Some(Phase::Completion),
-        waymaker_rig::workload::Role::Start | waymaker_rig::workload::Role::Finish => None,
+        Role::Completion(_) if interrupted_the_engine(run, rig) => Some(Phase::Completion),
+        Role::Completion(_) | Role::Start | Role::Finish => None,
     }
 }
 
@@ -169,12 +210,12 @@ fn the_rig_and_the_journal_agree_about_what_the_engine_was_asked_for() {
     // is the difference rather than the total.
     assert_eq!(
         after.program_operations() - before.program_operations(),
-        u32::from(rig.workload(0).records()) * 2,
+        u32::from(records()) * 2,
         "every record is a frame program and a seal program"
     );
     assert_eq!(
         after.barriers() - before.barriers(),
-        u32::from(rig.workload(0).records()) * 2,
+        u32::from(records()) * 2,
         "every record is a payload barrier and a commit barrier"
     );
 }
@@ -259,7 +300,7 @@ fn the_sweep_covers_all_three_write_points_under_both_reset_causes() {
                 Err(_) => continue,
             }
         };
-        if let Some(phase) = phase_of(marks, &rig) {
+        if let Some(phase) = phase_of(marks, run, &rig) {
             coverage = coverage.record(phase, cause);
         }
     }
@@ -350,7 +391,7 @@ fn the_sweep_reaches_every_record_boundary_and_tears_the_witness_itself() {
     // Every record of the run, from the opening `RunStarted` to the terminal `RunCompleted`,
     // is a boundary some crash point acknowledged. A sweep that stopped short would be one
     // whose later records are never the last thing on media.
-    let records = rig.workload(0).records();
+    let records = records();
     let expected: BTreeSet<u16> = (0..records).collect();
     assert_eq!(
         reached, expected,
@@ -369,7 +410,7 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
     // window this test is about is the one actually exercised.
     let mut reached = false;
     for iteration in 0..64_u32 {
-        let cut = rig.cut(iteration);
+        let cut = rig.cut_at(iteration);
         if cut.phase() != Phase::Dispatch {
             continue;
         }
@@ -378,7 +419,7 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
         rig.prepare(&mut metered, iteration, &mut page)
             .expect("a prepared part");
         let mut dispatcher = Counting::default();
-        let mut cutter = waymaker_rig::run::PlannedCut::new(cut, EFFECTS);
+        let mut cutter = waymaker_rig::cutter::PlannedCut::at(cut, EFFECTS);
         let stop = rig
             .iterate(
                 iteration,
@@ -412,64 +453,152 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
 }
 
 #[test]
+fn a_witness_left_by_the_previous_iteration_is_not_read_as_this_one_s() {
+    // The shape a board actually runs in, and the one every other test here misses: iteration
+    // N on media iteration N-1 left behind. A rig that paired iteration N's declarations with
+    // N-1's marks is unsound in both directions — it invents `RecordDiffers` on a healthy
+    // device, and it excuses a genuine loss when the stale marks happen to claim less.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut device = Device::new(geometry());
+
+    // Iteration 0, run to completion and left on the part.
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        )
+        .expect("a clean run");
+    }
+    assert_eq!(
+        rig.verify(0, &mut device, &mut page),
+        Ok(Outcome::Passed),
+        "iteration 0 judged as itself"
+    );
+
+    // Now the reset lands before iteration 1 got as far as erasing the instrument. The
+    // witness still holds iteration 0's marks, and the journal still holds iteration 0's
+    // records — a perfectly healthy device, mid-way through a rig's own bookkeeping.
+    let outcome = rig
+        .verify(1, &mut device, &mut page)
+        .expect("a verdict rather than an error");
+    assert_eq!(
+        outcome,
+        Outcome::Breached(Breach::WitnessUnreadable),
+        "iteration 1 must refuse iteration 0's witness rather than audit against it"
+    );
+}
+
+#[test]
 fn a_violation_is_reproducible_from_the_log_line_alone() {
-    // Issue #27's third "done when". A breach is produced, logged, the log line is encoded,
-    // and a reader given nothing but those bytes reaches the identical breach.
+    // Issue #27's third "done when", and the whole of it: a breach is produced, logged, the
+    // line is rendered, and a reader given *nothing but those bytes* reaches the identical
+    // breach. Nothing below the `Entry::parse` may name a variable from above it — which is
+    // the discipline the first version of this test broke, by passing the witness it had
+    // built in hand straight into the replay and reproducing nothing.
     let rig = rig();
     let mut device = Device::new(geometry());
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let mut metered = Metered::new(&mut device);
-    rig.prepare(&mut metered, 0, &mut page)
-        .expect("a prepared part");
-    let mut dispatcher = Counting::default();
-    rig.iterate(0, &mut metered, &mut dispatcher, &mut NeverCut, &mut page)
+    let wear = {
+        // A scope rather than a `drop`: a meter has no destructor, so dropping one only
+        // extends the borrow it holds on the device the judgement below needs back.
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Counting::default(),
+            &mut NeverCut,
+            &mut page,
+        )
         .expect("a clean run");
-    let wear = metered.wear();
+        metered.wear()
+    };
 
     // A witness that claims more than happened: the writer began and acknowledged record 99.
     // Nothing recovered it, because the run has no record 99 — so `acknowledged-durability`
-    // is the guarantee that breaks, and it breaks at `finish` rather than at a record.
-    let lying = Marks::default()
+    // is the guarantee that breaks.
+    let lying = Marks::EMPTY
         .raising(Stage::Attempted, 99)
         .raising(Stage::Acknowledged, 99);
     let outcome = rig
         .judge(0, &mut device, lying, &mut page)
         .expect("a verdict");
-    let Outcome::Breached(breach) = outcome else {
-        panic!("a witness claiming record 99 must break something");
-    };
-    assert_eq!(breach, Breach::LostAcknowledgedRecord { index: 99 });
+    assert_eq!(
+        outcome,
+        Outcome::Breached(Breach::LostAcknowledgedRecord { index: 99 })
+    );
 
-    let entry = rig.entry(0, outcome, wear);
     let mut line = [0_u8; Entry::LINE_BYTES];
-    let rendered = entry.render(&mut line).expect("a line").to_vec();
+    let rendered = rig
+        .entry(0, outcome, wear, lying)
+        .render(&mut line)
+        .expect("a line")
+        .to_vec();
 
-    // Everything from here on knows only the bytes.
+    // ---- Everything below this line knows only `rendered`. ----
     let read = Entry::parse(&rendered).expect("a line the rig wrote");
-    assert_eq!(read.outcome(), outcome);
-    let replayed = Rig::new::<waymaker_fault::FaultError>(
-        read.geometry().expect("a geometry"),
-        Plan::new(read.seed()),
-        read.effects(),
-    )
-    .expect("the same layout");
-    let mut fresh = Device::new(read.geometry().expect("a geometry"));
-    let mut metered = Metered::new(&mut fresh);
-    replayed
-        .prepare(&mut metered, read.iteration(), &mut page)
-        .expect("a prepared part");
-    let mut dispatcher = Counting::default();
-    replayed
-        .iterate(
-            read.iteration(),
-            &mut metered,
-            &mut dispatcher,
-            &mut NeverCut,
-            &mut page,
-        )
-        .expect("the same clean run");
+    let geometry = read.geometry().expect("a geometry");
+    let replayed =
+        Rig::new::<waymaker_fault::FaultError>(geometry, Plan::new(read.seed()), read.effects())
+            .expect("the same layout");
+    let mut fresh = Device::new(geometry);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut fresh);
+        replayed
+            .prepare(&mut metered, read.iteration(), &mut page)
+            .expect("a prepared part");
+        replayed
+            .iterate(
+                read.iteration(),
+                &mut metered,
+                &mut Counting::default(),
+                &mut NeverCut,
+                &mut page,
+            )
+            .expect("the same run, rebuilt from the seed");
+    }
+
     let again = replayed
-        .judge(read.iteration(), &mut fresh, lying, &mut page)
+        .judge(read.iteration(), &mut fresh, read.progress(), &mut page)
         .expect("a verdict");
-    assert_eq!(again, outcome, "the log line did not reproduce the breach");
+    assert_eq!(
+        again,
+        read.outcome(),
+        "the log line did not reproduce the breach it recorded"
+    );
+    assert_eq!(
+        again,
+        Outcome::Breached(Breach::LostAcknowledgedRecord { index: 99 })
+    );
+}
+
+#[test]
+fn a_log_line_carries_what_the_rig_knew_and_not_only_what_it_ran() {
+    // The field that makes the test above possible. A line whose witness did not survive the
+    // round trip would reproduce a *different* verdict — most likely `Passed`, because an
+    // empty witness demands nothing, which is the direction that turns a recorded violation
+    // into a clean run when somebody investigates it.
+    let rig = rig();
+    let knew = Marks::EMPTY
+        .raising(Stage::Attempted, 4)
+        .raising(Stage::Acknowledged, 3)
+        .raising(Stage::Dispatched, 1);
+    let entry = rig.entry(7, Outcome::Passed, Wear::NONE, knew);
+    let mut line = [0_u8; Entry::LINE_BYTES];
+    let rendered = entry.render(&mut line).expect("a line");
+    let read = Entry::parse(rendered).expect("a line the rig wrote");
+    assert_eq!(read.progress(), knew);
+    assert_eq!(read.progress().attempted(), Some(4));
+    assert_eq!(read.progress().acknowledged(), Some(3));
+    assert_eq!(read.progress().dispatched(), Some(1));
+    assert_eq!(read, entry);
 }

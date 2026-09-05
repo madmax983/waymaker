@@ -24,7 +24,9 @@
 //!
 //! # What the cutter can and cannot do here
 //!
-//! [`Cutter::cut`] is called at a *record boundary*: before the schedule write, before the
+//! [`Cutter`] and [`Dispatcher`] are [`crate::cutter`]'s, not this module's — they are the
+//! board's half of the interface, and they live apart so that this file's public surface can
+//! be pinned by name. `Cutter::cut` is called at a *record boundary*: before the schedule write, before the
 //! dispatch, before the completion write. A board's implementation arms a supply cut with a
 //! short randomised delay and returns, so the cut lands somewhere inside the write that
 //! follows — which is where issue #27's "randomised points" live. A host's implementation
@@ -35,108 +37,20 @@
 
 use waymaker_core::RecordRef;
 use waymaker_flash::append::{AppendError, Journal};
-use waymaker_flash::bank::{
-    self, BankHeader, BankId, BankLayout, Generation, LayoutError, SEAL_BYTES,
-};
+use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation, LayoutError};
 use waymaker_flash::frame::ProgramAlign;
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 use crate::audit::{Audit, Breach};
+use crate::cutter::{Cutter, Dispatcher};
 use crate::log::{Entry, Outcome};
-use crate::phase::{Phase, ResetCause};
+use crate::phase::Phase;
 use crate::plan::{Cut, Plan};
 use crate::wear::{Metered, Traffic, Wear};
 use crate::window::{Window, WindowError};
 use crate::witness::{Mark, Progress, Stage, Witness, WitnessError, WitnessRegion};
 use crate::workload::{Role, Workload};
-
-/// The physical effect a scheduled record stands for.
-///
-/// On a board this toggles a pin, drives a UART, or whatever the rig's operator can observe
-/// afterwards. On a host it counts. What matters to §14's `durable-intent` is only that it
-/// happens *after* the schedule record's commit barrier, which is [`Rig::iterate`]'s job
-/// rather than the implementer's.
-pub trait Dispatcher {
-    /// How this dispatcher reports a refusal.
-    type Error;
-
-    /// Performs the effect `effect` of the current iteration, given the input its schedule
-    /// record described.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the physical effect can fail with. A rig that meets one stops the iteration.
-    fn dispatch(&mut self, effect: u16, input: &[u8]) -> Result<(), Self::Error>;
-}
-
-/// The thing that takes the power away.
-pub trait Cutter {
-    /// The rig has reached `phase` for `effect` and is about to do the work of it.
-    ///
-    /// # Postconditions
-    ///
-    /// On a board this arms the cut and returns `false`, or cuts and never returns. On a host
-    /// it returns `true` to stop the iteration where it stands. A `Cutter` that always
-    /// returned `false` turns the rig into a plain writer, which is what
-    /// [`NeverCut`] is for.
-    fn cut(&mut self, phase: Phase, cause: ResetCause, effect: u16) -> bool;
-}
-
-/// A cutter that never cuts.
-///
-/// The fault-free run, and the baseline every sweep needs: a rig whose clean run does not
-/// pass has nothing to say about the runs that were interrupted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct NeverCut;
-
-impl Cutter for NeverCut {
-    fn cut(&mut self, _phase: Phase, _cause: ResetCause, _effect: u16) -> bool {
-        false
-    }
-}
-
-/// A cutter that stops at the first moment the iteration's own [`Cut`] names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PlannedCut {
-    cut: Cut,
-    effect: u16,
-    fired: bool,
-}
-
-impl PlannedCut {
-    /// Stops at `cut`, on a run of `effects` effects.
-    #[must_use]
-    pub fn new(cut: Cut, effects: u16) -> Self {
-        Self {
-            cut,
-            effect: cut.effect_index(effects),
-            fired: false,
-        }
-    }
-
-    /// Whether the cut has been reached.
-    #[must_use]
-    pub const fn fired(self) -> bool {
-        self.fired
-    }
-
-    /// Which effect it is armed against.
-    #[must_use]
-    pub const fn effect(self) -> u16 {
-        self.effect
-    }
-}
-
-impl Cutter for PlannedCut {
-    fn cut(&mut self, phase: Phase, _cause: ResetCause, effect: u16) -> bool {
-        if !self.fired && phase == self.cut.phase() && effect == self.effect {
-            self.fired = true;
-            return true;
-        }
-        false
-    }
-}
 
 /// Why a rig could not lay a part out, run an iteration, or judge one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -158,6 +72,16 @@ pub enum RigError<E, D = core::convert::Infallible> {
     Append(AppendError<E>),
     /// The caller's page is too small for the rig.
     ShortPage,
+    /// The part programs in units wider than the rig's fixed buffers.
+    ProgramUnitTooWide {
+        /// The widest program unit the rig can serve.
+        limit: u32,
+    },
+    /// The run schedules more effects than a record index can number.
+    TooManyEffects {
+        /// The most effects a run can have.
+        limit: u16,
+    },
     /// The workload asked for a record it does not have.
     Workload,
     /// The part refused.
@@ -214,8 +138,23 @@ impl Rig {
     /// How large a page every call here needs.
     ///
     /// One number rather than four, because a rig's RAM is a constant it declares once. Wide
-    /// enough for a bank header frame, a record frame and a witness slot.
+    /// enough for a bank header frame, a record frame and a witness slot — every one of which
+    /// is padded to a program unit, which is why [`MAX_PROGRAM_BYTES`](Self::MAX_PROGRAM_BYTES)
+    /// exists and is checked.
     pub const PAGE_BYTES: usize = 512;
+
+    /// The widest program unit the rig's fixed buffers can serve.
+    ///
+    /// A generation seal is `waymaker_flash::bank::SEAL_BYTES` rounded *up* to a program unit, and a witness slot
+    /// is [`MARK_BYTES`](crate::witness::MARK_BYTES) rounded up the same way, so both grow
+    /// with the part. A `#![no_std]`, allocation-free rig sizes those buffers once, and the
+    /// number it sizes them to is a limit somebody has to state.
+    ///
+    /// 256 bytes is the standard SPI NOR page. A part above it is refused by
+    /// [`new`](Self::new) with [`RigError::ProgramUnitTooWide`] — which is the point of the
+    /// constant: without it a 256-byte-page part was accepted, and then failed in the middle
+    /// of installing a bank with an opaque [`RigError::Bank`].
+    pub const MAX_PROGRAM_BYTES: u32 = 256;
 
     /// Lays `part` out: the last erase block for the instrument, the rest for the engine.
     ///
@@ -226,6 +165,21 @@ impl Rig {
     /// area cannot hold a mark, and [`RigError::Geometry`] when either area is not a
     /// geometry.
     pub fn new<E>(part: Geometry, plan: Plan, effects: u16) -> Result<Self, RigError<E>> {
+        // Before any layout arithmetic: a seal and a witness slot are both sized in program
+        // units, and this rig's buffers are fixed. Refused here so that a caller learns it
+        // from the constructor rather than from a bank half-installed.
+        // A run is `2 * effects + 2` records and a record index is a `u16`. Refused here so
+        // that every workload a rig holds has a length, rather than one that saturated.
+        if effects > Workload::MAX_EFFECTS {
+            return Err(RigError::TooManyEffects {
+                limit: Workload::MAX_EFFECTS,
+            });
+        }
+        if part.program_size() > Self::MAX_PROGRAM_BYTES {
+            return Err(RigError::ProgramUnitTooWide {
+                limit: Self::MAX_PROGRAM_BYTES,
+            });
+        }
         let witness_bytes = part.erase_size();
         let Some(engine_bytes) = part.capacity().checked_sub(witness_bytes) else {
             return Err(RigError::Window(WindowError::PastTheEnd));
@@ -298,8 +252,11 @@ impl Rig {
     }
 
     /// The cut iteration `iteration` arms.
+    ///
+    /// Named `cut_at` rather than `cut` because [`Cutter::cut`] is in this file too, and the
+    /// `rig-oracle` pin is a list of *names*.
     #[must_use]
-    pub const fn cut(&self, iteration: u32) -> Cut {
+    pub const fn cut_at(&self, iteration: u32) -> Cut {
         self.plan.cut(iteration)
     }
 
@@ -399,7 +356,10 @@ impl Rig {
         let Ok(seal) = bank::seal_for(frame, Self::GENERATION) else {
             return Err(RigError::Bank);
         };
-        let mut sealed = [0_u8; SEAL_BYTES * 4];
+        // Sized to the widest program unit `new` accepts rather than to `SEAL_BYTES`: a
+        // generation seal is padded up to a program unit, so on a 256-byte-page part it is
+        // 256 bytes, not 12.
+        let mut sealed = [0_u8; Self::MAX_PROGRAM_BYTES as usize];
         let Ok(seal_len) = bank::encode_seal(&seal, self.layout.align(), &mut sealed) else {
             return Err(RigError::Bank);
         };
@@ -407,7 +367,9 @@ impl Rig {
             return Err(RigError::Bank);
         };
 
-        let padded = pad_to(written, self.layout.align());
+        let Some(padded) = pad_to(written, self.layout.align()) else {
+            return Err(RigError::Bank);
+        };
         let Some(header_bytes) = page.get(..padded) else {
             return Err(RigError::ShortPage);
         };
@@ -433,7 +395,14 @@ impl Rig {
         let Ok(payload) = usize::try_from(region.payload_bytes()) else {
             return Err(RigError::Bank);
         };
-        let want = payload.min(page.len());
+        // Rounded *down* to the read unit. §12's `validate_read` refuses a length that is not
+        // a multiple of it, and the caller's page length is the caller's business — a rig
+        // that passed it through turned an odd-sized buffer into what reads like a media
+        // fault, which is a refusal a driver author would go looking for in their driver.
+        let Ok(unit) = usize::try_from(engine.geometry().read_size()) else {
+            return Err(RigError::Bank);
+        };
+        let want = payload.min(page.len() - page.len() % unit.max(1));
         let Some(slot) = page.get_mut(..want) else {
             return Err(RigError::ShortPage);
         };
@@ -476,7 +445,10 @@ impl Rig {
             return Err(RigError::ShortPage);
         }
         let workload = self.workload(iteration);
-        let cut = self.cut(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+        let cut = self.cut_at(iteration);
         let cause = cut.cause();
 
         // Before anything is written: exactly one bank must be authoritative. This is what
@@ -507,7 +479,7 @@ impl Rig {
         let mut witness = Witness::new(self.witness);
         let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
 
-        for index in 0..workload.records() {
+        for index in 0..records {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
@@ -556,38 +528,78 @@ impl Rig {
             )
             .map_err(widen)?;
 
-            match role {
-                Role::Schedule(effect) => {
-                    // §07 step 4: the intent is committed and durable, so the effect may
-                    // happen. The dispatch mark goes first, on purpose — see `crate::witness`.
-                    self.mark(
+            if let Role::Schedule(effect) = role
+                && let Some(stop) = self.after_schedule(
+                    iteration,
+                    index,
+                    effect,
+                    DispatchStep {
                         part,
-                        &mut witness,
-                        Mark::new(iteration, index, Stage::Dispatched),
-                        page,
-                    )
-                    .map_err(widen)?;
-                    if cut.phase() == Phase::Dispatch
-                        && effect == cut.effect_index(self.effects)
-                        && cutter.cut(Phase::Dispatch, cause, effect)
-                    {
-                        return Ok(Stop::Cut {
-                            phase: Phase::Dispatch,
-                            effect,
-                        });
-                    }
-                    let Some(input) = workload.effect_input(effect, &mut record_page) else {
-                        return Err(RigError::Workload);
-                    };
-                    dispatcher
-                        .dispatch(effect, input)
-                        .map_err(RigError::Dispatch)?;
-                }
-                Role::Completion(_) => part.credit_effect(),
-                Role::Start | Role::Finish => {}
+                        witness: &mut witness,
+                        dispatcher,
+                        cutter,
+                    },
+                    page,
+                )?
+            {
+                return Ok(stop);
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
             }
         }
         Ok(Stop::Completed)
+    }
+
+    /// §07 step 4, for the schedule record at `index`: mark the dispatch, take the cut point
+    /// if this iteration armed one here, and perform the effect.
+    ///
+    /// A method of its own so that [`iterate`](Self::iterate) stays a loop over records rather
+    /// than a loop with a second protocol inside it. The order is the whole of
+    /// `durable-intent`: the record's commit barrier has already returned, the mark goes down
+    /// *before* the effect so that it over-claims rather than under-claims, and the cutter is
+    /// offered the one window in which nothing is being written.
+    fn after_schedule<S: StableStorage, D: Dispatcher, C: Cutter>(
+        &self,
+        iteration: u32,
+        index: u16,
+        effect: u16,
+        parts: DispatchStep<'_, '_, S, D, C>,
+        page: &mut [u8],
+    ) -> Result<Option<Stop>, RigError<S::Error, D::Error>> {
+        let DispatchStep {
+            part,
+            witness,
+            dispatcher,
+            cutter,
+        } = parts;
+        self.mark(
+            part,
+            witness,
+            Mark::new(iteration, index, Stage::Dispatched),
+            page,
+        )
+        .map_err(widen)?;
+
+        let cut = self.cut_at(iteration);
+        if cut.phase() == Phase::Dispatch
+            && effect == cut.effect_index(self.effects)
+            && cutter.cut(Phase::Dispatch, cut.cause(), effect)
+        {
+            return Ok(Some(Stop::Cut {
+                phase: Phase::Dispatch,
+                effect,
+            }));
+        }
+
+        let mut input = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let Some(bytes) = self.workload(iteration).effect_input(effect, &mut input) else {
+            return Err(RigError::Workload);
+        };
+        dispatcher
+            .dispatch(effect, bytes)
+            .map_err(RigError::Dispatch)?;
+        Ok(None)
     }
 
     /// Programs one witness mark, as the rig's own traffic.
@@ -623,7 +635,7 @@ impl Rig {
             let Some(header) = page.get(..read) else {
                 return Err(RigError::ShortPage);
             };
-            let mut seal = [0_u8; SEAL_BYTES * 4];
+            let mut seal = [0_u8; Self::MAX_PROGRAM_BYTES as usize];
             let Ok(seal_len) = usize::try_from(region.seal_bytes()) else {
                 return Err(RigError::Bank);
             };
@@ -674,6 +686,22 @@ impl Rig {
     /// rebuilt from a log line rather than read off a device — which is issue #27's third
     /// "done when" in one function.
     ///
+    /// # What it does not check about `progress`
+    ///
+    /// That it is *consistent*: nothing here requires `acknowledged <= attempted`, or that a
+    /// dispatched index was ever attempted. It does not need to. Every inconsistency makes
+    /// the audit demand **more** of recovery, so an incoherent witness fails closed — which
+    /// is why `tests/sweep.rs` can hand it a hand-built one and get a breach rather than a
+    /// pass.
+    ///
+    /// # Which bank it walks
+    ///
+    /// [`Rig::BANK`], always. The authority count above is computed the way a boot computes
+    /// it — both banks' headers and seals, through [`bank::select`] — and then only bank A's
+    /// journal is read, because bank A is the only one this rig installs. §10's swap is issue
+    /// [#26](https://github.com/madmax983/waymaker/issues/26)'s, and when it lands this is
+    /// where the selected bank has to start being the one that is walked.
+    ///
     /// # Errors
     ///
     /// As [`verify`](Self::verify).
@@ -712,23 +740,55 @@ impl Rig {
                         return Ok(Outcome::Breached(breach));
                     }
                 }
-                // The scan stopping is history ending, which every `Ending` below says is a
-                // legal thing for a crash to have produced. The audit is what decides whether
-                // the prefix it produced is a prefix the rig will accept.
-                Err(_) => break,
+                // A *decode* failure is history ending: a torn frame, an unsealed one, erased
+                // media. Every one of those is a legal thing for a crash to have produced, and
+                // the audit is what decides whether the prefix before it is one the rig will
+                // accept.
+                Err(RecoveryError::Decode(_)) => break,
+                // Everything else is the instrument failing rather than the subject. A part
+                // that goes read-flaky at record `k`, a page the caller sized wrong, a region
+                // proved against another device — none of those is a statement about §14, and
+                // reading them as "history ended here" reports a driver fault as a clean run.
+                // That is the same failure `Breach::WitnessUnreadable` exists to prevent on
+                // the other half of this function.
+                Err(error) => return Err(RigError::Recovery(unwindow_recovery(error))),
             }
         }
+        // The ending is deliberately not consulted. `Damaged`, `Unsealed` and `Clean` are the
+        // three shapes a crash leaves, and which one it is changes nothing the audit asks:
+        // the obligations come from the witness, and the prefix is the prefix either way.
         let _unused: Option<Ending> = recovery.ending();
         Ok(finish(audit, banks))
     }
 
-    /// A log entry for `iteration`, with the outcome and the wear it cost.
+    /// A log entry for `iteration`: the outcome, the wear it cost, and the witness the
+    /// verdict was computed against.
+    ///
+    /// The witness is not decoration. A seed and an iteration rebuild the *run*, and §14's
+    /// guarantees are statements about what the rig **knew** — so a line without it is a line
+    /// a violation is reproducible from only while the host still has the device.
     #[must_use]
-    pub const fn entry(&self, iteration: u32, outcome: Outcome, wear: Wear) -> Entry {
+    pub const fn entry(
+        &self,
+        iteration: u32,
+        outcome: Outcome,
+        wear: Wear,
+        progress: Progress,
+    ) -> Entry {
         Entry::new(self.plan.seed(), iteration, self.part, self.effects)
             .with_outcome(outcome)
             .with_wear(wear)
+            .with_progress(progress)
     }
+}
+
+/// What [`Rig::after_schedule`] needs, grouped so the signature stays inside the workspace's
+/// argument limit — four borrows that are one thing: the run in progress.
+struct DispatchStep<'part, 'storage, S, D, C> {
+    part: &'part mut Metered<'storage, S>,
+    witness: &'part mut Witness,
+    dispatcher: &'part mut D,
+    cutter: &'part mut C,
 }
 
 /// Turns an audit's closing verdict into an outcome.
@@ -756,10 +816,14 @@ const fn effect_of(role: Role) -> Option<u16> {
     }
 }
 
-/// `len` rounded up to a whole number of program units.
-const fn pad_to(len: usize, align: ProgramAlign) -> usize {
+/// `len` rounded up to a whole number of program units, or `None` on an overflow.
+///
+/// `checked_mul` rather than the bare multiply the structurally identical code in
+/// `WitnessRegion::of` already uses: it is not reachable — `len` is a header frame length
+/// bounded by the page — but an unchecked multiply is a panic, and this crate forbids those.
+const fn pad_to(len: usize, align: ProgramAlign) -> Option<usize> {
     let unit = align.get() as usize;
-    len.div_ceil(unit) * unit
+    len.div_ceil(unit).checked_mul(unit)
 }
 
 /// Widens a rig error that cannot name a dispatcher's failure.
@@ -773,6 +837,8 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::Recovery(inner) => RigError::Recovery(inner),
         RigError::Append(inner) => RigError::Append(inner),
         RigError::ShortPage => RigError::ShortPage,
+        RigError::ProgramUnitTooWide { limit } => RigError::ProgramUnitTooWide { limit },
+        RigError::TooManyEffects { limit } => RigError::TooManyEffects { limit },
         RigError::Workload => RigError::Workload,
         RigError::Storage(inner) => RigError::Storage(inner),
         RigError::Geometry(inner) => RigError::Geometry(inner),

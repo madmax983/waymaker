@@ -59,8 +59,15 @@ pub enum Traffic {
 ///
 /// # Invariants
 ///
-/// Every counter saturates. A wear figure that wrapped would report a part as almost unused
-/// after four billion bytes, and that is the one direction a wear figure must not fail in.
+/// Every counter saturates, and for the six *numerators* — the erase and program counts, the
+/// bytes, the barriers — that is the safe direction: clamping at `u32::MAX` over-reports wear,
+/// and a figure that wrapped would report a part as almost unused after four billion bytes.
+///
+/// [`effects`](Self::effects) is a *denominator*, and saturating it upward biases every
+/// per-effect figure downward, which is the flattering direction. It is unreachable — a run
+/// of four billion effects is not one this rig performs, and
+/// [`Rig::new`](crate::run::Rig::new) refuses a run whose records a `u16` cannot index — but
+/// the invariant is worth stating as it actually is rather than one notch stronger.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Wear {
     erase_operations: u32,

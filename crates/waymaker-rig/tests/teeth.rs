@@ -14,9 +14,10 @@ use waymaker_flash::append::Journal;
 use waymaker_flash::recovery::Recovery;
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_rig::audit::Breach;
+use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Dispatcher, NeverCut, Rig};
+use waymaker_rig::run::Rig;
 use waymaker_rig::wear::{Metered, Traffic};
 use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Mark, Stage, Witness};
@@ -119,7 +120,7 @@ fn wrong_writer(flaw: Flaw, session: &mut Session) -> Result<(), ()> {
         outcome
     };
 
-    for index in 0..workload.records() {
+    for index in 0..workload.records().ok_or(())? {
         let role = workload.role(index).ok_or(())?;
         mark(
             &mut part,
@@ -225,49 +226,71 @@ fn the_control_writer_is_caught_by_nothing() {
     }
 }
 
-#[test]
-fn acknowledging_before_the_commit_seal_is_caught_as_a_lost_record() {
-    // §14 `acknowledged-durability`, and the reason `Rig::iterate` marks the witness *after*
-    // `Sealable::commit` returns rather than after the payload barrier.
-    let found = breaches(Flaw::AcknowledgeBeforeCommit);
-    assert!(
-        found
-            .iter()
-            .any(|breach| matches!(breach, Breach::LostAcknowledgedRecord { .. })),
-        "a writer that acknowledges early was never caught; got {found:?}"
-    );
+/// The guarantee a flaw must break, and the ones it must not.
+///
+/// An exhaustive `match`, so a flaw added to [`Flaw`] and left out of this does not compile —
+/// which is the standard `waymaker-conformance`'s teeth are held to, and the standard the
+/// first version of this file only appeared to meet.
+const fn owed(flaw: Flaw) -> (u8, &'static str) {
+    match flaw {
+        // §14 `acknowledged-durability`. The witness says the barrier returned; recovery does
+        // not have the record.
+        Flaw::AcknowledgeBeforeCommit => (
+            Breach::LostAcknowledgedRecord { index: 0 }.code(),
+            "acknowledged-durability",
+        ),
+        // §14 `durable-intent`, and §02 decision 3: "the schedule record crosses a durability
+        // barrier before dispatch".
+        Flaw::DispatchBeforeCommit => (
+            Breach::DispatchedEffectWithoutSchedule { index: 0 }.code(),
+            "durable-intent",
+        ),
+    }
 }
 
 #[test]
-fn dispatching_before_the_commit_seal_is_caught_as_intent_without_a_record() {
-    // §14 `durable-intent`, and §02 decision 3: "the schedule record crosses a durability
-    // barrier before dispatch". A writer that dispatches after the payload barrier but
-    // before the commit seal has an effect in the world that no committed record accounts
-    // for.
-    let found = breaches(Flaw::DispatchBeforeCommit);
-    assert!(
-        found
+fn each_flaw_is_caught_by_its_own_guarantee_and_by_no_other() {
+    // The half the first version of this file left out. `any(matches!(..))` over the whole
+    // sweep says a flaw produced *some* breach somewhere; it does not say the breach was the
+    // one the flaw opens, and a rig whose every flaw produced `RecordDiffers` would have
+    // passed it while proving nothing about which guarantee is doing the work.
+    for flaw in [Flaw::AcknowledgeBeforeCommit, Flaw::DispatchBeforeCommit] {
+        let (expected, guarantee) = owed(flaw);
+        let found = breaches(flaw);
+        assert!(
+            found.iter().any(|breach| breach.code() == expected),
+            "the {guarantee} flaw was never caught by {guarantee}; got {found:?}"
+        );
+        let others: Vec<Breach> = found
             .iter()
-            .any(|breach| matches!(breach, Breach::DispatchedEffectWithoutSchedule { .. })),
-        "a writer that dispatches early was never caught; got {found:?}"
-    );
+            .copied()
+            .filter(|breach| breach.code() != expected)
+            .collect();
+        assert!(
+            others.is_empty(),
+            "the {guarantee} flaw was also caught by {others:?}, so the sweep does not \
+             distinguish which guarantee it breaks"
+        );
+    }
 }
 
 #[test]
-fn each_flaw_is_caught_by_the_guarantee_that_names_it_and_not_only_by_luck() {
-    // A tooth that produced a breach at *every* crash point would be a tooth that says
-    // nothing about the specific window it opens. Each of these is legal at most crash
-    // points and wrong at some.
+fn a_flaw_is_wrong_in_its_own_window_rather_than_everywhere() {
+    // A tooth that breached at *every* crash point would be a tooth that says nothing about
+    // the specific window it opens — it would be caught by a rig that reported a violation
+    // unconditionally.
     for flaw in [Flaw::AcknowledgeBeforeCommit, Flaw::DispatchBeforeCommit] {
         let found = breaches(flaw);
-        assert!(!found.is_empty(), "a flaw produced no breach at all");
         let harness = Harness::new(geometry());
-        let runs = harness
-            .run(|session| wrong_writer(flaw, session))
-            .expect("the fault-free run succeeds");
+        let Ok(runs) = harness.run(|session| wrong_writer(flaw, session)) else {
+            unreachable!("the fault-free run of a wrong writer still succeeds")
+        };
+        assert!(!found.is_empty(), "a flaw produced no breach at all");
         assert!(
-            found.len() < runs.len(),
-            "every crash point breached, so the tooth is not about its own window"
+            found.len() < runs.len() / 2,
+            "{} of {} crash points breached, so the tooth is not about its own window",
+            found.len(),
+            runs.len()
         );
     }
 }

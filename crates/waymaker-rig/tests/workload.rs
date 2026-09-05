@@ -9,7 +9,7 @@ const SEED: u64 = 0x1234_5678_9ABC_DEF0;
 fn a_run_is_a_start_a_pair_per_effect_and_a_finish() {
     for effects in 0..8_u16 {
         let workload = Workload::new(SEED, 0, effects);
-        assert_eq!(workload.records(), 2 + 2 * effects);
+        assert_eq!(workload.records(), Some(2 + 2 * effects));
         assert_eq!(workload.role(0), Some(Role::Start));
         for effect in 0..effects {
             assert_eq!(workload.role(1 + 2 * effect), Some(Role::Schedule(effect)));
@@ -29,7 +29,7 @@ fn the_same_seed_and_iteration_give_the_same_records() {
     let twin = Workload::new(SEED, 17, 3);
     let mut left = [0_u8; 64];
     let mut right = [0_u8; 64];
-    for index in 0..workload.records() {
+    for index in 0..workload.records().expect("a short run has a length") {
         let a = workload
             .record(index, &mut left)
             .expect("a record of the run");
@@ -124,7 +124,7 @@ fn the_first_record_is_a_run_start_and_the_last_a_run_completion() {
         Some(RecordRef::RunStarted { .. })
     ));
     assert!(matches!(
-        workload.record(workload.records() - 1, &mut page),
+        workload.record(workload.records().expect("a length") - 1, &mut page),
         Some(RecordRef::RunCompleted { .. })
     ));
 }
@@ -133,7 +133,10 @@ fn the_first_record_is_a_run_start_and_the_last_a_run_completion() {
 fn a_record_past_the_end_is_none() {
     let workload = Workload::new(SEED, 0, 1);
     let mut page = [0_u8; 64];
-    assert_eq!(workload.record(workload.records(), &mut page), None);
+    assert_eq!(
+        workload.record(workload.records().expect("a length"), &mut page),
+        None
+    );
     assert_eq!(workload.record(u16::MAX, &mut page), None);
 }
 
@@ -149,7 +152,7 @@ fn a_buffer_too_small_for_the_payload_is_none_rather_than_a_truncated_record() {
 fn the_workload_reports_the_page_every_record_of_it_fits_in() {
     let workload = Workload::new(SEED, 0, 6);
     let mut page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-    for index in 0..workload.records() {
+    for index in 0..workload.records().expect("a short run has a length") {
         assert!(
             workload.record(index, &mut page).is_some(),
             "record {index} did not fit the declared maximum payload"

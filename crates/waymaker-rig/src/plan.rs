@@ -109,10 +109,34 @@ impl Cut {
         // Three phases and two causes taken from opposite ends of one word: the low bits of
         // a SplitMix64 output are as good as the high ones, and taking both from the same
         // end would correlate the phase with the cause.
-        let phase = match selector % (Phase::ALL.len() as u64) {
-            0 => Phase::Schedule,
-            1 => Phase::Dispatch,
-            _ => Phase::Completion,
+        //
+        // Through `from_index` rather than a hand-written match, so the modulus and the
+        // mapping cannot drift: a fourth phase added to `Phase::ALL` would otherwise leave a
+        // residue folding onto `Completion`, no cut would ever reach the new phase, and
+        // `census::Coverage::verdict` would demand a cell nothing can fill — failing closed,
+        // but for a reason that takes a long evening to find.
+        let residue = selector % (Phase::ALL.len() as u64);
+        // Walked rather than matched, and walked through `Phase::from_index`, so the modulus
+        // and the mapping cannot drift: adding a phase changes `Phase::ALL` and every
+        // exhaustive `match` in that file, and this picks up the new residue for free.
+        // A hand-written `_ => Completion` arm would instead fold the new residue onto an old
+        // phase — no cut would ever reach the new one, and `census::Coverage::verdict` would
+        // demand a cell nothing can fill.
+        let mut index = 0_usize;
+        let mut found = None;
+        while index < Phase::ALL.len() {
+            if index as u64 == residue {
+                found = Phase::from_index(index);
+            }
+            index += 1;
+        }
+        let Some(phase) = found else {
+            // Unreachable: a residue of `ALL.len()` is an index into `ALL`.
+            return Self {
+                phase: Phase::Schedule,
+                cause: ResetCause::PowerCut,
+                placement,
+            };
         };
         let cause = if (selector >> 63) == 0 {
             ResetCause::PowerCut

@@ -8,10 +8,11 @@
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_rig::audit::{Audit, Breach};
 use waymaker_rig::census::{Coverage, Gap};
+use waymaker_rig::cutter::{Cutter, NeverCut, PlannedCut};
 use waymaker_rig::log::{Entry, LogError, Outcome};
 use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Cutter, NeverCut, PlannedCut, Rig, Stop};
+use waymaker_rig::run::{Rig, Stop};
 use waymaker_rig::wear::{Metered, Traffic, Wear};
 use waymaker_rig::window::{Window, WindowError, WindowFault};
 use waymaker_rig::witness::{Mark, Progress, Stage, Witness, WitnessError, WitnessRegion};
@@ -235,7 +236,7 @@ fn a_rig_reports_the_layout_it_derived() {
     assert_eq!(rig.effects(), 2);
     assert_eq!(rig.plan().seed(), 3);
     assert_eq!(rig.workload(0).effects(), 2);
-    assert_eq!(rig.cut(0), Plan::new(3).cut(0));
+    assert_eq!(rig.cut_at(0), Plan::new(3).cut(0));
     assert_eq!(
         rig.instrument_base(),
         part().capacity() - part().erase_size()
@@ -257,6 +258,55 @@ fn a_part_too_small_for_two_banks_and_a_witness_is_refused() {
         unreachable!("a legal geometry")
     };
     assert!(Rig::new::<waymaker_fault::FaultError>(small, Plan::new(0), 1).is_err());
+}
+
+#[test]
+fn a_part_whose_program_unit_the_rig_cannot_buffer_is_refused_at_construction() {
+    // A 256-byte page is the ordinary SPI NOR part, not a corner. `Rig::prepare` buffers a
+    // bank's generation seal and a witness slot, and both are sized in program units — so a
+    // part the rig cannot serve has to be refused where a caller can act on it, rather than
+    // surfacing later as an opaque failure from the middle of an install.
+    for program in [1_u32, 4, 16, 32, 64, 256] {
+        let Ok(part) = Geometry::new(16 * 4096, 4096, program, 1) else {
+            unreachable!("a legal geometry")
+        };
+        let built = Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), 2);
+        let Ok(rig) = built else {
+            // Refusing is allowed; failing later is not. Whatever this rig refuses, it
+            // refuses here.
+            continue;
+        };
+        let mut device = waymaker_fault::Device::new(part);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .unwrap_or_else(|error| {
+                panic!("a program unit of {program} B was accepted and then failed: {error:?}")
+            });
+    }
+}
+
+#[test]
+fn a_page_whose_length_is_not_a_read_unit_still_works() {
+    // §12's `validate_read` refuses a length that is not a multiple of the read unit, and a
+    // caller's page length is the caller's business. A rig that passed it straight through
+    // turned `&mut buf[..]` of an odd-sized buffer into what reads like a media fault.
+    let Ok(part) = Geometry::new(6 * 256, 256, 4, 4) else {
+        unreachable!("a legal geometry with a four-byte read unit")
+    };
+    let rig =
+        Rig::new::<waymaker_fault::FaultError>(part, Plan::new(5), 1).expect("a legal layout");
+    let mut device = waymaker_fault::Device::new(part);
+    let mut page = [0_u8; Rig::PAGE_BYTES + 3];
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("an odd-sized page is still a page");
+    }
+    assert!(
+        rig.verify(0, &mut device, &mut page).is_ok(),
+        "an odd-sized page was read as a media fault"
+    );
 }
 
 #[test]
@@ -288,7 +338,7 @@ fn a_never_cutter_never_cuts_and_a_planned_one_cuts_once() {
     assert_eq!(default, NeverCut);
 
     let cut = Plan::new(0).cut(0);
-    let mut planned = PlannedCut::new(cut, 4);
+    let mut planned = PlannedCut::at(cut, 4);
     assert!(!planned.fired());
     let effect = planned.effect();
     assert!(effect < 4);
@@ -308,13 +358,14 @@ fn a_never_cutter_never_cuts_and_a_planned_one_cuts_once() {
 fn a_rig_builds_a_log_entry_from_an_outcome_and_a_wear() {
     let rig =
         Rig::new::<waymaker_fault::FaultError>(part(), Plan::new(77), 3).expect("a legal layout");
-    let entry = rig.entry(5, Outcome::Passed, Wear::NONE);
+    let entry = rig.entry(5, Outcome::Passed, Wear::NONE, Progress::EMPTY);
     assert_eq!(entry.seed(), 77);
     assert_eq!(entry.iteration(), 5);
     assert_eq!(entry.effects(), 3);
     assert_eq!(entry.geometry(), Ok(part()));
     assert_eq!(entry.outcome(), Outcome::Passed);
     assert_eq!(entry.wear(), Wear::NONE);
+    assert_eq!(entry.progress(), Progress::EMPTY);
     let mut bytes = [0_u8; waymaker_rig::log::ENTRY_BYTES];
     entry.encode(&mut bytes).expect("an entry fits");
     assert_eq!(Entry::decode(&bytes), Ok(entry));

@@ -21,7 +21,8 @@ waymaker-core.workspace = true
 #
 # These are host-only, and the gate is unaffected by them: `check_dependency_direction`
 # iterates `policy::LAYERS`, and `xtask` is `policy::HOST_TOOLS`, so this grants no layer
-# anything. What it would catch if it ever became circular is `inputs-incomplete`.
+# anything. A layer that ever depended *back* on `xtask` is what `dependency-direction` would
+# refuse; Cargo would refuse the cycle before any rule ran.
 waymaker-flash.workspace = true
 waymaker-fault.workspace = true
 waymaker-rig.workspace = true

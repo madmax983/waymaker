@@ -129,6 +129,22 @@ pub const STAGES: &[Stage] = &[
         why: "design document §15: a change that only builds on the host is not a change that works",
     },
     Stage {
+        name: "rig-firmware",
+        job: "firmware",
+        // `waymaker-rig` is outside `default-members`, so the stage above never sees it —
+        // and the whole of ADR 0021 rests on it being code a board can link. Without this,
+        // "written to run on the part" is an attribute nothing acts on: the crate is
+        // `#![no_std]` and allocation-free by inspection, and the first `std` import would
+        // be caught by nobody until somebody tried to flash it.
+        //
+        // `--lib`, not `--all-targets`: the tests are host code by design — they drive
+        // `waymaker-fault`, which models media in a `Vec` — and it is the library a board
+        // links.
+        command: "cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi",
+        in_hook: false,
+        why: "ADR 0021: a rig that could only run on a host would be a simulation wearing a rig's name",
+    },
+    Stage {
         name: "probe-lint",
         job: "firmware",
         // The size probe's binary is behind `required-features`, so the `lint` stage above

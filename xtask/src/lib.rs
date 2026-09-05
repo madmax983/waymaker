@@ -896,6 +896,11 @@ mod tests {
                 path: format!("crates/{}", source::RIG_CENSUS_PATH),
                 contents: source::tests_support::clean_rig_census(),
             },
+            size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::RIG_RUN_PATH),
+                contents: source::tests_support::clean_rig_run(),
+            },
         ]
     }
 

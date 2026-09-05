@@ -73,10 +73,14 @@ Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `way
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
 
-Four workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+Six workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
 firmware linked only so that its section sizes can be measured, `waymaker-fault` is the crash
-harness, and `waymaker-spec` is the formal specification of the recovery invariants. None of
-them is built for a firmware target, and no layer may depend on any of them.
+harness, `waymaker-spec` is the formal specification of the recovery invariants,
+`waymaker-conformance` is the storage-contract suite and the `embedded-storage` port, and
+`waymaker-rig` is the power-cut and watchdog-reset rig. No layer may depend on any of them.
+The last two are `#![no_std]` and *are* built for a firmware target — by CI, on
+`thumbv6m-none-eabi` — because both exist to be run on the part rather than only about it;
+neither is in the image the code-flash budget is measured against.
 
 ## Budgets
 
@@ -136,6 +140,7 @@ cargo test   --locked --workspace --no-default-features
 cargo doc    --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features

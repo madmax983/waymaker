@@ -38,10 +38,12 @@ code-flash budget is a delta against, and nothing depends on it. `waymaker-fault
 in-memory storage model and crash injector — is in it for the same reason: it is a
 workspace member, it depends on `waymaker-flash` for the storage contract, and nothing
 depends on it, in any dependency kind. `waymaker-rig` — design document §15's power-cut and
-watchdog-reset rig — is there too, and it is the one crate in the picture that `xtask`
-depends on: the write-amplification figure `cargo xtask size` publishes is measured by running
-the rig rather than transcribed from an arithmetic model. All three crates' edges are dashed,
-and the gate ignores dashed edges — the contract is the solid ones.
+watchdog-reset rig — is there too. `xtask` is in the picture for the first time because it now
+depends on three of these: the write-amplification figure `cargo xtask size` publishes is
+measured by running the real writer through the rig over the fault harness's media model,
+rather than transcribed from an arithmetic model that would agree with the writer right up
+until the writer changed. Every one of these crates' edges is dashed, and the gate ignores
+dashed edges — the contract is the solid ones.
 
 <!-- diagram: crate-dependency-flow -->
 
@@ -67,6 +69,7 @@ graph TD
   waymaker-rig -.-> waymaker-core
   xtask -.-> waymaker-rig
   xtask -.-> waymaker-fault
+  xtask -.-> waymaker-flash
   xtask -.-> waymaker-core
 
   classDef layer fill:#eef4ff,stroke:#3b6fd4,color:#12233f;

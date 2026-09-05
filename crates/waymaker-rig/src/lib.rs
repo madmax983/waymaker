@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod census;
+pub mod cutter;
 pub mod log;
 pub mod phase;
 pub mod plan;

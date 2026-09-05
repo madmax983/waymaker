@@ -80,6 +80,60 @@ fn a_partially_programmed_mark_is_refused() {
 }
 
 #[test]
+fn no_mark_anywhere_survives_being_torn() {
+    // The single-sample version of this test passed while the seal could contain `0xFF`: a
+    // tear that dropped only the seal's high byte left `check | 0xFF00` on media, which
+    // verifies whenever the real check's high byte is `0xFF` — one mark in 256. The claim in
+    // `crate::witness` is that erased, torn and written are three different answers, and a
+    // claim about every mark has to be tested over more than one.
+    for iteration in 0..600_u32 {
+        for index in 0..4_u16 {
+            for stage in [Stage::Attempted, Stage::Acknowledged, Stage::Dispatched] {
+                let mark = Mark::new(iteration, index, stage);
+                let mut whole = [0_u8; MARK_BYTES];
+                mark.encode(&mut whole).expect("a mark fits");
+                for torn in 0..MARK_BYTES {
+                    let mut bytes = [0xFF_u8; MARK_BYTES];
+                    let Some(head) = bytes.get_mut(..torn) else {
+                        unreachable!("torn is within the mark")
+                    };
+                    let Some(source) = whole.get(..torn) else {
+                        unreachable!("torn is within the mark")
+                    };
+                    head.copy_from_slice(source);
+                    assert_eq!(
+                        Mark::decode(&bytes),
+                        Err(WitnessError::NotAMark),
+                        "iteration {iteration}, index {index}, {} torn at byte {torn}",
+                        stage.name()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn no_byte_of_a_mark_is_ever_erased_media() {
+    // The property the masking buys, stated directly: if no byte a whole mark writes is
+    // `0xFF`, then a mark that did not land whole has at least one `0xFF` where a byte should
+    // be, and no amount of luck in the check can rescue it.
+    for iteration in 0..600_u32 {
+        for stage in [Stage::Attempted, Stage::Acknowledged, Stage::Dispatched] {
+            let mut whole = [0_u8; MARK_BYTES];
+            Mark::new(iteration, 1, stage)
+                .encode(&mut whole)
+                .expect("a mark fits");
+            let seal = whole.get(MARK_BYTES - 2..).expect("a mark has a seal");
+            assert!(
+                seal.iter().all(|byte| *byte != 0xFF),
+                "iteration {iteration}: a seal byte is erased media"
+            );
+        }
+    }
+}
+
+#[test]
 fn every_single_byte_mutation_of_a_mark_is_refused_or_is_a_different_mark() {
     let mark = Mark::new(ITERATION, 3, Stage::Acknowledged);
     let mut whole = [0_u8; MARK_BYTES];

@@ -15,6 +15,11 @@
 //! * **the effect count** — the run's shape.
 //! * **the outcome** — a [`Breach`] code and its one detail field, so the host reproduces the
 //!   failure it was told about rather than whichever one it happens to find.
+//! * **the witness** — the three high waters, the mark count and the tear flag. This is the
+//!   field that makes the "done when" true rather than nearly true: the seed rebuilds the
+//!   *run*, but §14's guarantees are entirely statements about what the rig **knew**, and
+//!   without these twelve bytes a violation is only reproducible while the host still has the
+//!   device that produced it.
 //! * **the wear** — issue #27's fourth work item, per iteration, so the published figure is a
 //!   sum of lines rather than a number somebody typed.
 //!
@@ -37,9 +42,10 @@ use waymaker_flash::storage::{Geometry, GeometryError};
 use crate::audit::Breach;
 use crate::plan::Cut;
 use crate::wear::Wear;
+use crate::witness::Progress;
 
 /// How many bytes an encoded entry occupies.
-pub const ENTRY_BYTES: usize = 76;
+pub const ENTRY_BYTES: usize = 88;
 
 /// The magic an entry opens with.
 const ENTRY_MAGIC: u16 = 0x4752;
@@ -112,7 +118,7 @@ impl Outcome {
     #[must_use]
     pub fn detail(self) -> u32 {
         match self {
-            Self::Passed | Self::Breached(Breach::WitnessUnreadable) => 0,
+            Self::Passed | Self::Breached(Breach::WitnessUnreadable | Breach::ShortScratch) => 0,
             Self::Breached(
                 Breach::RecordDiffers { index }
                 | Breach::LostAcknowledgedRecord { index }
@@ -144,22 +150,29 @@ impl Outcome {
         // decoder, and a decoder reading a field the encoder never wrote is exactly the bug a
         // truncating cast hides.
         let index = u16::try_from(detail & 0xFFFF).ok()?;
+        // And the *high* half has to be looked at rather than dropped, for every code that
+        // does not use it. Otherwise `decode` is not the inverse of `encode`: two different
+        // byte strings decode to one outcome, and the bits nothing reads are bits nothing can
+        // detect a change in.
+        let unused_high = detail & 0xFFFF_0000 != 0;
+        let unused_all = detail != 0;
         match code {
-            0 => Some(Self::Passed),
-            1 => Some(Self::Breached(Breach::RecordDiffers { index })),
-            2 => Some(Self::Breached(Breach::LostAcknowledgedRecord { index })),
+            0 if !unused_all => Some(Self::Passed),
+            1 if !unused_high => Some(Self::Breached(Breach::RecordDiffers { index })),
+            2 if !unused_high => Some(Self::Breached(Breach::LostAcknowledgedRecord { index })),
             3 => Some(Self::Breached(Breach::RecoveredPastWhatWasAttempted {
-                recovered: (detail >> 16) as u16,
+                recovered: u16::try_from(detail >> 16).ok()?,
                 attempted: index,
             })),
-            4 => Some(Self::Breached(Breach::DispatchedEffectWithoutSchedule {
+            4 if !unused_high => Some(Self::Breached(Breach::DispatchedEffectWithoutSchedule {
                 index,
             })),
-            5 => Some(Self::Breached(Breach::DispatchMarkIsNotASchedule { index })),
+            5 if !unused_high => Some(Self::Breached(Breach::DispatchMarkIsNotASchedule { index })),
             6 => Some(Self::Breached(Breach::Authority {
                 banks: usize::try_from(detail).ok()?,
             })),
-            7 => Some(Self::Breached(Breach::WitnessUnreadable)),
+            7 if !unused_all => Some(Self::Breached(Breach::WitnessUnreadable)),
+            8 if !unused_all => Some(Self::Breached(Breach::ShortScratch)),
             _ => None,
         }
     }
@@ -204,6 +217,15 @@ impl Writer<'_> {
         self.at = end;
         Some(())
     }
+
+    /// The witness block, whose layout is [`Progress`]'s own.
+    fn progress(&mut self, progress: Progress) -> Option<()> {
+        let end = self.at.checked_add(Progress::ENCODED_BYTES)?;
+        let slot = self.bytes.get_mut(self.at..end)?;
+        progress.encode(slot)?;
+        self.at = end;
+        Some(())
+    }
 }
 
 /// A cursor over a fixed buffer, reading little-endian words.
@@ -240,6 +262,11 @@ impl Reader<'_> {
     fn wear(&mut self) -> Option<Wear> {
         Wear::decode(self.take(Wear::ENCODED_BYTES)?)
     }
+
+    /// The witness block, read back by [`Progress`].
+    fn progress(&mut self) -> Option<Progress> {
+        Progress::decode(self.take(Progress::ENCODED_BYTES)?)
+    }
 }
 
 /// One iteration of the rig, as the log records it.
@@ -254,6 +281,7 @@ pub struct Entry {
     effects: u16,
     outcome: Outcome,
     wear: Wear,
+    progress: Progress,
 }
 
 impl Entry {
@@ -276,7 +304,24 @@ impl Entry {
             effects,
             outcome: Outcome::Passed,
             wear: Wear::NONE,
+            progress: Progress::EMPTY,
         }
+    }
+
+    /// This entry with the witness the verdict was computed against.
+    #[must_use]
+    pub const fn with_progress(self, progress: Progress) -> Self {
+        Self { progress, ..self }
+    }
+
+    /// What the rig durably knew when it was cut.
+    ///
+    /// The obligations §14 puts on a recovery, carried in the line rather than left on the
+    /// device — which is what lets a host re-run [`Rig::judge`](crate::run::Rig::judge)
+    /// against a rebuilt part and reach the same verdict.
+    #[must_use]
+    pub const fn progress(self) -> Progress {
+        self.progress
     }
 
     /// This entry with `outcome` recorded.
@@ -378,6 +423,7 @@ impl Entry {
             writer.u32(self.read_size)?;
             writer.u32(self.outcome.detail())?;
             writer.wear(self.wear)?;
+            writer.progress(self.progress)?;
             Some(writer.at)
         })();
         if written != Some(ENTRY_BODY_BYTES) {
@@ -469,7 +515,7 @@ impl Entry {
         ) else {
             return Err(LogError::NotAnEntry);
         };
-        let Some(wear) = reader.wear() else {
+        let (Some(wear), Some(progress)) = (reader.wear(), reader.progress()) else {
             return Err(LogError::NotAnEntry);
         };
         let Some(outcome) = Outcome::from_parts(code, detail) else {
@@ -486,6 +532,7 @@ impl Entry {
             effects,
             outcome,
             wear,
+            progress,
         })
     }
 
@@ -548,6 +595,11 @@ impl Entry {
     /// [`LogError::NotAnEntry`] for a line that is not one, and whatever
     /// [`decode`](Self::decode) refuses the bytes with.
     pub fn parse(line: &[u8]) -> Result<Self, LogError> {
+        // Trimmed at both ends before anything else. A rig's transport is a serial port and a
+        // host reads lines from it, so the bytes that arrive carry a terminator — and a parser
+        // that refused its own rendering with a newline on the end would make issue #27's
+        // third "done when" true only for a caller who trimmed exactly right.
+        let line = trim_ascii(line);
         let Some(rest) = line.strip_prefix(LINE_PREFIX.as_bytes()) else {
             return Err(LogError::NotAnEntry);
         };
@@ -583,14 +635,50 @@ const fn nibble(value: u8) -> u8 {
     }
 }
 
-/// The nibble a lower-case hex digit names.
+/// The nibble a hex digit names, in either case.
+///
+/// [`nibble`] writes lower case; upper case is accepted because a log that has been through a
+/// terminal, a spreadsheet or somebody's editor is still the log.
 const fn unnibble(digit: u8) -> Option<u8> {
     match digit {
         b'0'..=b'9' => Some(digit - b'0'),
         b'a'..=b'f' => Some(10 + digit - b'a'),
+        b'A'..=b'F' => Some(10 + digit - b'A'),
         _ => None,
     }
 }
+
+/// `line` without leading or trailing ASCII whitespace.
+///
+/// `[u8]::trim_ascii` is stable but not `const`, and this is not a `const fn` — it is spelled
+/// out anyway because the workspace denies indexing and the slicing has to be total.
+fn trim_ascii(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |last| last.saturating_add(1));
+    line.get(start..end).unwrap_or_default()
+}
+
+// The rendered line has to fit the buffer every caller sizes from `LINE_BYTES`, and the
+// widest one is the longest phase name, the longest cause name, the longest breach name,
+// three spaces and the hex. Checked here so that a name somebody lengthens is a build failure
+// rather than a runtime `ShortBuffer` on a board.
+const _: () = assert!(
+    Entry::LINE_BYTES
+        >= LINE_PREFIX.len() + LONGEST_PHASE + LONGEST_CAUSE + LONGEST_BREACH + 3 + 2 * ENTRY_BYTES
+);
+
+/// The longest [`Phase::name`](crate::phase::Phase::name).
+const LONGEST_PHASE: usize = 10;
+/// The longest [`ResetCause::name`](crate::phase::ResetCause::name).
+const LONGEST_CAUSE: usize = 9;
+/// The longest [`Breach::name`] or [`Outcome::name`].
+const LONGEST_BREACH: usize = 31;
 
 // The entry layout is arithmetic the codec trusts, so it is checked where a mistake is a
 // compile error rather than a test run.

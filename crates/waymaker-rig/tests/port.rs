@@ -19,9 +19,10 @@
 use embedded_storage::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use waymaker_conformance::nor::NorFlashStorage;
 use waymaker_flash::storage::{Geometry, StableStorage};
+use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Dispatcher, NeverCut, Rig, Stop};
+use waymaker_rig::run::{Rig, Stop};
 use waymaker_rig::wear::Metered;
 
 const CAPACITY: u32 = 6 * 256;

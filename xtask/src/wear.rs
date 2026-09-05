@@ -31,9 +31,10 @@
 //! to report. `docs::HARDWARE_TARGETS` is where that is written down as owed.
 
 use waymaker_flash::storage::Geometry;
+use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Dispatcher, NeverCut, Rig};
+use waymaker_rig::run::Rig;
 use waymaker_rig::wear::{Metered, Wear};
 
 /// The seed every published figure is measured at.
@@ -243,7 +244,11 @@ pub fn to_json(rows: &[PartWear]) -> String {
                 "programmed_bytes_per_effect": row.engine.programmed_bytes_per_effect(),
                 "program_operations_per_effect": row.engine.program_operations_per_effect(),
                 "barriers_per_effect": row.engine.barriers_per_effect(),
-                "erase_operations_per_effect": row.engine.erase_operations_per_effect(),
+                // Deliberately no `erase_operations_per_effect`. §10 erases a whole bank once
+                // per run, so the figure is zero for every run this measures, and the table
+                // refuses to print it for that reason — a JSON consumer handed exactly the
+                // number the table withholds is a consumer told "this engine does not erase".
+                // The run totals above are what an erase count means here.
                 "instrument_program_operations": row.instrument.program_operations(),
                 "instrument_barriers": row.instrument.barriers(),
             })

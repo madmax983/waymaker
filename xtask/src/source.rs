@@ -1027,6 +1027,37 @@ pub const RIG_CENSUS_SURFACE: &[&str] = &[
     "verdict",
 ];
 
+/// The file whose public surface [`check_rig_oracle`] also pins: the rig's runner.
+///
+/// The oracle decides; this is where the decision is *produced*. A `Rig::verify_lenient`, or
+/// a `judge` that swallowed an [`Outcome`](waymaker_rig::log::Outcome)'s breach, would give
+/// the instrument back from a file the other two pins cannot see — which is the same hole
+/// `recovery-surface`, `storage-contract` and `capacity-reserve` each pin one file against.
+pub const RIG_RUN_PATH: &str = "waymaker-rig/src/run.rs";
+
+/// Every public function the rig's runner is allowed to have.
+///
+/// `at` rather than a second `new`: `Rig::new` is in this file, and the pin is a list of
+/// names, so `PlannedCut` names its constructor differently on purpose.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_RUN_SURFACE: &[&str] = &[
+    "cut_at",
+    "effects",
+    "entry",
+    "instrument_base",
+    "iterate",
+    "judge",
+    "layout",
+    "new",
+    "part",
+    "plan",
+    "prepare",
+    "verify",
+    "witness_region",
+    "workload",
+];
+
 /// Rule: the rig's oracle and its census are exactly the surfaces that were reviewed.
 ///
 /// Two files, one rule id, because they are one decision: what the instrument is obliged to
@@ -1054,6 +1085,15 @@ pub fn check_rig_oracle(sources: &[crate::size::LayerSource]) -> Vec<Violation> 
         "the census is what makes an uncovered cell a refusal rather than a silence, so a \
          way to call a run covered that was not cannot be added without a reviewer writing \
          it down",
+    ));
+    violations.extend(check_pinned_surface(
+        "rig-oracle",
+        "waymaker-rig",
+        RIG_RUN_PATH,
+        RIG_RUN_SURFACE,
+        sources,
+        "the runner is where the oracle's verdict is produced, so a lenient verify or a \
+         judge that swallowed a breach cannot be added without a reviewer writing it down",
     ));
     violations
 }
@@ -6918,6 +6958,12 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_rig_census() -> String {
         surface("A rig census.", super::RIG_CENSUS_SURFACE)
+    }
+
+    /// A `waymaker-rig` runner whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_rig_run() -> String {
+        surface("A rig runner.", super::RIG_RUN_SURFACE)
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.

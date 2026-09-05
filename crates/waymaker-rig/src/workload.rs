@@ -112,22 +112,39 @@ impl Workload {
         ActivityKind(1)
     }
 
-    /// How many records the whole run writes.
+    /// The largest number of effects a run can have.
     ///
-    /// Saturating in the degenerate case: a run with `u16::MAX / 2` effects is not one this
-    /// rig performs, and a wrapped count would silently shorten it.
+    /// A run is `2 * effects + 2` records and a record index is a `u16`, so this is where the
+    /// arithmetic runs out. Stated as a constant and refused at the boundary rather than
+    /// saturated: a saturating count shortens a run exactly as silently as a wrapping one, and
+    /// at 32767 effects the run it produced lost its `RunCompleted` — an §08-legal history
+    /// that can never terminate.
+    pub const MAX_EFFECTS: u16 = (u16::MAX - 2) / 2;
+
+    /// How many records the whole run writes, or `None` for a run too long to index.
+    ///
+    /// `Option` rather than a saturating number, because the only honest answers to "how many
+    /// records does a run of 40000 effects have" are 80002 and "not a run this rig performs".
+    /// [`Rig::new`](crate::run::Rig::new) refuses the second at construction, so every
+    /// workload a rig actually holds answers `Some`.
     #[must_use]
-    pub const fn records(self) -> u16 {
+    pub const fn records(self) -> Option<u16> {
+        if self.effects > Self::MAX_EFFECTS {
+            return None;
+        }
         match self.effects.checked_mul(2) {
-            Some(pairs) => pairs.saturating_add(2),
-            None => u16::MAX,
+            Some(pairs) => pairs.checked_add(2),
+            None => None,
         }
     }
 
     /// What record `index` is for, or `None` past the end of the run.
     #[must_use]
     pub const fn role(self, index: u16) -> Option<Role> {
-        if index >= self.records() {
+        let Some(records) = self.records() else {
+            return None;
+        };
+        if index >= records {
             return None;
         }
         if index == 0 {

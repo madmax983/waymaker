@@ -68,10 +68,26 @@ pub enum Breach {
         /// How many were.
         banks: usize,
     },
-    /// The witness itself could not be read, so nothing about this iteration is known.
+    /// The caller's scratch buffer is shorter than the record it was asked to rebuild.
     ///
-    /// Fails closed. An iteration whose instrument broke is an iteration that proved nothing,
-    /// and reporting it as a pass would be the one bug a rig must not have.
+    /// Not a §14 violation, and that is the whole reason it exists.
+    /// [`Workload::record`](crate::workload::Workload::record) answers `None` for two
+    /// unrelated reasons — past the end of the run, and a buffer too short for the payload —
+    /// and folding the second into [`RecoveredPastWhatWasAttempted`](Self::RecoveredPastWhatWasAttempted)
+    /// makes a rig report a recovery violation that did not happen, which is the one failure
+    /// direction an instrument must not have.
+    ShortScratch,
+    /// The witness says nothing about this iteration.
+    ///
+    /// It could not be read, or — the case that costs a board a night's run — it is a
+    /// *previous* iteration's, still on media because the reset landed before the instrument
+    /// was erased. Auditing run `N` against run `N - 1`'s marks is unsound in both
+    /// directions: it invents a breach on a healthy device, and it excuses a real loss
+    /// whenever the stale marks happen to claim less than this run did.
+    ///
+    /// Fails closed either way. An iteration whose instrument said nothing is an iteration
+    /// that proved nothing, and reporting it as a pass would be the one bug a rig must not
+    /// have.
     WitnessUnreadable,
 }
 
@@ -87,6 +103,7 @@ impl Breach {
             Self::DispatchMarkIsNotASchedule { .. } => 5,
             Self::Authority { .. } => 6,
             Self::WitnessUnreadable => 7,
+            Self::ShortScratch => 8,
         }
     }
 
@@ -101,6 +118,7 @@ impl Breach {
             Self::DispatchMarkIsNotASchedule { .. } => "dispatch-mark-is-not-a-schedule",
             Self::Authority { .. } => "authority",
             Self::WitnessUnreadable => "witness-unreadable",
+            Self::ShortScratch => "short-scratch",
         }
     }
 
@@ -124,6 +142,7 @@ impl Breach {
             5 => Some(Self::DispatchMarkIsNotASchedule { index: 0 }.name()),
             6 => Some(Self::Authority { banks: 0 }.name()),
             7 => Some(Self::WitnessUnreadable.name()),
+            8 => Some(Self::ShortScratch.name()),
             _ => None,
         }
     }
@@ -181,10 +200,12 @@ impl Audit {
     ///
     /// # Errors
     ///
+    /// [`Breach::WitnessUnreadable`] when the witness is a different iteration's,
     /// [`Breach::RecordDiffers`] when the record is not the one declared here, and
     /// [`Breach::RecoveredPastWhatWasAttempted`] when recovery has run past the end of the
     /// run or past what the writer ever began.
     pub fn saw(&mut self, record: &RecordRef<'_>, scratch: &mut [u8]) -> Result<(), Breach> {
+        self.witness_is_this_run()?;
         let index = self.recovered;
         let attempted = self.progress.attempted();
         // A record at position `index` was begun only if the witness saw index `index` or
@@ -198,11 +219,17 @@ impl Audit {
                 });
             }
         }
-        let Some(expected) = self.workload.record(index, scratch) else {
+        // The run's own length, asked first, so that the two reasons `record` can answer
+        // `None` stay apart: past the end of the run is a §14 breach, and a scratch buffer
+        // too short is the caller's mistake.
+        if self.workload.role(index).is_none() {
             return Err(Breach::RecoveredPastWhatWasAttempted {
                 recovered: index.saturating_add(1),
                 attempted: attempted.unwrap_or(0),
             });
+        }
+        let Some(expected) = self.workload.record(index, scratch) else {
+            return Err(Breach::ShortScratch);
         };
         if expected != *record {
             return Err(Breach::RecordDiffers { index });
@@ -211,13 +238,39 @@ impl Audit {
         Ok(())
     }
 
-    /// The three guarantees that are statements about the whole recovery.
+    /// Whether the witness in hand is the one this run wrote.
+    ///
+    /// A [`Mark`](crate::witness::Mark) carries the iteration that wrote it, and
+    /// [`Progress::iteration`] carries it out of a scan. Comparing the two is the whole of
+    /// this check, and without it the field would be a comment: a rig's loop is
+    /// `prepare(n)` → `iterate(n)` → reset → `verify(n)`, and a reset landing anywhere before
+    /// `prepare` erased the instrument leaves iteration `n - 1`'s marks in front of run `n`'s
+    /// declarations.
+    const fn witness_is_this_run(&self) -> Result<(), Breach> {
+        match self.progress.iteration() {
+            // An empty witness names no iteration and demands nothing, which is the state a
+            // part is in before the first mark of a run lands.
+            None => Ok(()),
+            Some(iteration) if iteration == self.workload.iteration() => Ok(()),
+            Some(_) => Err(Breach::WitnessUnreadable),
+        }
+    }
+
+    /// The three guarantees that are statements about the whole recovery, and the one that
+    /// is about the instrument.
     ///
     /// # Errors
     ///
-    /// [`Breach::LostAcknowledgedRecord`], [`Breach::DispatchedEffectWithoutSchedule`],
-    /// [`Breach::DispatchMarkIsNotASchedule`] and [`Breach::Authority`].
+    /// [`Breach::WitnessUnreadable`], [`Breach::LostAcknowledgedRecord`],
+    /// [`Breach::DispatchedEffectWithoutSchedule`], [`Breach::DispatchMarkIsNotASchedule`]
+    /// and [`Breach::Authority`].
     pub const fn finish(self, authoritative_banks: usize) -> Result<(), Breach> {
+        // Checked here as well as in `saw`, because a recovery that produced no records at
+        // all never reaches `saw` — and "no records recovered" against a stale witness that
+        // claims six acknowledged is exactly the shape this must not report as a loss.
+        if let Err(breach) = self.witness_is_this_run() {
+            return Err(breach);
+        }
         if let Some(acknowledged) = self.progress.acknowledged() {
             // Record `acknowledged` had its barrier return, so recovery owes every record up
             // to and including it: `acknowledged + 1` records.
@@ -241,12 +294,19 @@ impl Audit {
         // has none, and reporting that as a violation would fail every run whose crash point
         // fell in the install — which is a third of them.
         //
-        // The witness is what tells "never installed" apart from "lost its authority":
-        // `Rig::iterate` selects an authoritative bank and recovers its journal *before* it
-        // writes its first mark, so a witness with a mark in it is a device that had exactly
-        // one authority at the moment that mark was written. Two authorities is a breach
-        // either way — no crash can produce a second one out of nothing.
-        let began = self.progress.marks() > 0;
+        // The witness is what tells "never installed" apart from "lost its authority", and
+        // the implication that does the work runs the other way from the obvious one. What is
+        // needed is that an *empty* witness excuses a missing authority, and that holds
+        // because `Rig::prepare` erases the instrument *before* it erases and installs the
+        // engine: the only window in which authority is gone is one in which the witness is
+        // already empty. `Rig::iterate`'s own authority pre-check is the converse and is not
+        // what this rests on. Two authorities is a breach either way — no crash makes a
+        // second one out of nothing.
+        // `torn` as well as `marks`: a witness whose *first* mark was interrupted has no
+        // whole marks and yet the device certainly began. Safe today either way — no engine
+        // write precedes the first mark — but the tighter reading costs nothing and does not
+        // depend on that ordering staying true.
+        let began = self.progress.marks() > 0 || self.progress.torn();
         if authoritative_banks > 1 || (began && authoritative_banks != 1) {
             return Err(Breach::Authority {
                 banks: authoritative_banks,
