@@ -317,17 +317,19 @@ fn a_run_cut_after_a_dispatch_still_accounts_for_the_effect() {
                 &mut page,
             )
             .expect("an iteration that stops at its cut");
-        assert!(matches!(
+        assert_eq!(
             stop,
             Stop::Cut {
                 phase: Phase::Dispatch,
-                ..
+                effect: cutter.effect(),
             }
-        ));
-        assert!(
-            !dispatcher.dispatched.is_empty() || cutter.effect() == 0,
-            "the cut lands after at least the first dispatch mark"
         );
+        // Exactly the effects before the armed one went out, and the armed one did not: the
+        // cut lands after its schedule record committed and before its effect. That is the
+        // window §02 decision 3 creates, and the one a media-only sweep cannot see, because
+        // no storage operation is in flight to interrupt.
+        let expected: Vec<u16> = (0..cutter.effect()).collect();
+        assert_eq!(dispatcher.dispatched, expected);
         let outcome = rig
             .verify(iteration, &mut device, &mut page)
             .expect("a verdict");

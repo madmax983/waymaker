@@ -511,10 +511,13 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
+            // The two phases that are *writes*. `Phase::Dispatch` is not one of them and
+            // cannot be reached from here: `phase_of` answers only `Schedule` and
+            // `Completion`, because a dispatch happens between two records rather than at
+            // one, and its cut point is taken below where the effect actually goes out.
             if let Some(phase) = phase_of(role)
                 && phase == cut.phase()
                 && let Some(effect) = effect_of(role)
-                && phase != Phase::Dispatch
                 && cutter.cut(phase, cause, effect)
             {
                 return Ok(Stop::Cut { phase, effect });
