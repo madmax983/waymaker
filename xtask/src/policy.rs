@@ -94,13 +94,26 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// `waymaker-flash` fails [`crate::graph::check_dependency_direction`]. See
 /// [ADR 0016](https://github.com/madmax983/waymaker/blob/main/docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md).
 ///
+/// `waymaker-rig` is issue [#27](https://github.com/madmax983/waymaker/issues/27)'s power-cut
+/// and watchdog-reset rig. It is the second member of this category that is `#![no_std]` and
+/// allocation-free, and for a sharper reason than `waymaker-conformance`'s: a rig that could
+/// only run on a host would be a simulation wearing a rig's name. Design document §15 asks
+/// for supply cuts at randomised points during real writes to real NOR, so the code that
+/// performs them has to be code a board can link — which also means it may not keep what it
+/// knew in RAM, because RAM is the thing a power cut takes. See
+/// [ADR 0021](https://github.com/madmax983/waymaker/blob/main/docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md).
+///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
 /// `waymaker-fault` is still a violation. The harness sits above the layers and the tests
 /// that drive it live with it.
-pub const TEST_SUPPORT_CRATES: &[&str] =
-    &["waymaker-fault", "waymaker-spec", "waymaker-conformance"];
+pub const TEST_SUPPORT_CRATES: &[&str] = &[
+    "waymaker-fault",
+    "waymaker-spec",
+    "waymaker-conformance",
+    "waymaker-rig",
+];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";

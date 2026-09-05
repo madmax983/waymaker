@@ -36,6 +36,7 @@ pub mod pipeline;
 pub mod policy;
 pub mod size;
 pub mod source;
+pub mod wear;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,7 @@ pub const RULES: &[&str] = &[
     "embassy-below-facade",
     "empty-default-features",
     "gate-broken",
+    "hardware-attestation",
     "inputs-incomplete",
     "integrity-check",
     "kernel-owns-no-encoding",
@@ -78,6 +80,7 @@ pub const RULES: &[&str] = &[
     "recovery-surface",
     "release-profile",
     "replay-cursor-surface",
+    "rig-oracle",
     "settled-decisions",
     "size-probe",
     "size-probe-reach",
@@ -88,6 +91,13 @@ pub const RULES: &[&str] = &[
     "workspace-lints",
     "workspace-membership",
 ];
+
+/// The crate whose oracle and census `rig-oracle` pins.
+///
+/// Named here rather than taken from [`policy::TEST_SUPPORT_CRATES`] by position, because a
+/// rule that pinned whichever crate happened to be fourth in that list is a rule that moves
+/// when somebody sorts it.
+pub const RIG_PACKAGE: &str = "waymaker-rig";
 
 /// A single breach of workspace policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,6 +188,13 @@ pub struct WorkspaceInputs {
     /// Every file, not just the crate root: a public function in a submodule costs exactly
     /// as much flash as one in `lib.rs`.
     pub layer_sources: Vec<size::LayerSource>,
+    /// Every Rust source file of `waymaker-rig`, in path order.
+    ///
+    /// Kept apart from [`layer_sources`](Self::layer_sources) rather than folded into it:
+    /// the rig is not a layer, and every rule that iterates the layer sources — bare-metal
+    /// attributes, the kernel's encoding ban, the size probe's reach — would then be run
+    /// against a crate none of them is about.
+    pub rig_sources: Vec<size::LayerSource>,
     /// `CLAUDE.md`, the decision record, the diagrams, and every crate root.
     pub docs: docs::DocsInputs,
 }
@@ -250,6 +267,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
     violations.extend(source::check_append_routing(&inputs.layer_sources));
     violations.extend(source::check_bank_integrity_routing(&inputs.layer_sources));
+    violations.extend(source::check_rig_oracle(&inputs.rig_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -405,6 +423,26 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         }
     }
 
+    let mut rig_sources = Vec::new();
+    if let Some(package) = graph.find(RIG_PACKAGE)
+        && let Some(source_root) = package
+            .lib_source_path
+            .as_ref()
+            .and_then(|path| path.parent())
+    {
+        for path in rust_sources(source_root) {
+            rig_sources.push(size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+                contents: read_to_string(&path)?,
+            });
+        }
+    }
+
     let probe = graph.find(size::PROBE_PACKAGE);
     let probe_manifest = probe
         .and_then(|package| package.manifest_path.as_ref())
@@ -431,6 +469,7 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         probe_manifest,
         probe_source,
         layer_sources,
+        rig_sources,
         docs,
     })
 }
@@ -711,6 +750,9 @@ mod tests {
             // a budget nothing links cannot be measured.
             probe_manifest: None,
             probe_source: None,
+            // No rig sources at all: `rig-oracle` fires, because a pin whose file is gone
+            // is a pin checking nothing — which is the failure mode the rule exists for.
+            rig_sources: Vec::new(),
             // A kernel with a public function the probe does not call: the reach rule
             // fires, because a function nothing links is a function no budget charges for.
             layer_sources: vec![size::LayerSource {
@@ -779,6 +821,7 @@ mod tests {
             "effect-scheduled-fields",
             "embassy-below-facade",
             "empty-default-features",
+            "hardware-attestation",
             "inputs-incomplete",
             "integrity-check",
             "kernel-owns-no-encoding",
@@ -793,6 +836,7 @@ mod tests {
             "recovery-surface",
             "release-profile",
             "replay-cursor-surface",
+            "rig-oracle",
             "settled-decisions",
             "size-probe",
             "size-probe-reach",
@@ -836,6 +880,30 @@ mod tests {
     // Two sources, because both surface pins fail closed when the module they pin
     // is not in the workspace at all: `replay-cursor-surface` for the cursor's
     // public API, `transition-surface` for the replay machine's.
+    /// A `waymaker-rig` whose oracle and census are exactly what `rig-oracle` pins.
+    ///
+    /// The rule fails closed when either file is absent, so a fixture without these would
+    /// describe a workspace the gate rejects for a reason no test here is about.
+    fn clean_rig_sources() -> Vec<size::LayerSource> {
+        vec![
+            size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::RIG_AUDIT_PATH),
+                contents: source::tests_support::clean_rig_audit(),
+            },
+            size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::RIG_CENSUS_PATH),
+                contents: source::tests_support::clean_rig_census(),
+            },
+            size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::RIG_RUN_PATH),
+                contents: source::tests_support::clean_rig_run(),
+            },
+        ]
+    }
+
     fn clean_layer_sources() -> Vec<size::LayerSource> {
         vec![
             size::LayerSource {
@@ -958,6 +1026,7 @@ mod tests {
                 source::tests_support::clean_probe_calls()
             )),
             layer_sources: clean_layer_sources(),
+            rig_sources: clean_rig_sources(),
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a
                 // member the `missing-docs` rule could not be run against.
@@ -1152,12 +1221,17 @@ mod tests {
                            { "name": "embedded-storage", "kind": null }],
           "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/w/conformance/src/lib.rs" }] },
+        { "id": "rig", "name": "waymaker-rig", "source": null,
+          "manifest_path": "/w/rig/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-flash", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/rig/src/lib.rs" }] },
         { "id": "embedded-storage", "name": "embedded-storage",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "dependencies": [], "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
@@ -1166,6 +1240,7 @@ mod tests {
         { "id": "fault", "deps": [{ "pkg": "flash" }] },
         { "id": "spec", "deps": [{ "pkg": "fault" }] },
         { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
+        { "id": "rig", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;
