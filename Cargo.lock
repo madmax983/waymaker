@@ -207,6 +207,8 @@ dependencies = [
 name = "waymaker-rig"
 version = "0.0.0"
 dependencies = [
+ "embedded-storage",
+ "waymaker-conformance",
  "waymaker-core",
  "waymaker-fault",
  "waymaker-flash",

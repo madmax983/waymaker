@@ -14,7 +14,21 @@ waymaker-core.workspace = true
 waymaker-flash.workspace = true
 
 [dev-dependencies]
+# The in-memory NOR model and the crash injector. The rig is driven through it at every crash
+# point the injector lists, which is what makes "at every crash point" a loop rather than a
+# claim.
 waymaker-fault.workspace = true
+
+# Issue #27's first work item is a "concrete `StableStorage` adapter over real NOR flash (via
+# `embedded-storage`)", and that adapter already exists: `waymaker_conformance::nor::NorFlashStorage`,
+# landed for issue #21. These two dependencies are what let `tests/port.rs` drive this rig
+# *through* it, so the adapter and the rig are demonstrated together rather than separately —
+# an adapter nothing runs a workflow over is an adapter whose barrier nobody has relied on.
+#
+# Dev-only, and between two test-support crates: `policy::LAYERS` is what forbids a layer
+# reaching either, and neither of these is a layer.
+waymaker-conformance.workspace = true
+embedded-storage = "0.3.1"
 
 [features]
 default = []
