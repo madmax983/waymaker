@@ -26,6 +26,7 @@ be superseded.
 | [0015](0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md) | The recovery invariants are a ghost model, and the proof over it is exhaustive rather than sampled | accepted |
 | [0016](0016-the-storage-contract-is-a-conformance-suite-and-a-port.md) | The storage contract is a conformance suite and a port, both above the layers | accepted |
 | [0017](0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) | The two-bank layout is geometry-derived and the seal names its header | accepted |
+| [0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md) | Recovery is a position pumped by its caller, and only erased media is an append point | accepted |
 
 ## Reading the numbers
 
@@ -42,7 +43,7 @@ of these are older than their numbers suggest:
   to have an ADR and this one turned out not to.
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
-→ 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017.
+→ 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018.
 
 ## Writing one
 

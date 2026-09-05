@@ -901,6 +901,71 @@ pub fn check_storage_contract(sources: &[crate::size::LayerSource]) -> Vec<Viola
     )
 }
 
+/// The file whose public surface [`RECOVERY_SURFACE`] pins.
+pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
+
+/// Every public function the storage-backed recovery of issue #23 is allowed to have.
+///
+/// Design document §02 decision 2 — "a cursor advances through history in workflow order;
+/// there is no `Journal::get(id)` and no in-memory event index" — is a rule about the
+/// *reader* as much as about the cursor, and this is the reader that touches media. A
+/// `seek(offset)`, a `resume_at(offset)`, a `rewind`, or a `read_all(&mut self) -> Vec<_>`
+/// would each break no layering rule, need no dependency, pass every other gate, and turn a
+/// forward scan whose RAM is one caller-owned page into one that either seeks into the
+/// middle of history or holds it.
+///
+/// One name on this list is load-bearing for a different reason. `append_offset` is the only
+/// way an offset leaves this module, and it answers `Some` only for a scan that ran to
+/// erased media — because appending anywhere else programs cells a cycle has already
+/// cleared, and on NOR that bank never boots again. A second accessor that returned the
+/// stopping offset regardless is the mutation `waymaker-fault`'s sweep demonstrates as
+/// dangerous, and it is a line a reviewer has to write on purpose.
+///
+/// The pin fails in the other direction too, which matters as much: a name this file no
+/// longer declares means the reader was renamed or deleted and the pin has stopped checking
+/// anything. `fmt` is on the list because a trait `impl`'s methods are callable without
+/// `pub`, and `message` because a device with no console still has to report something.
+///
+/// What it does **not** catch: this compares *names*. An `offset` widened to `u64`, or an
+/// `append_offset` that started answering for a damaged journal, are both invisible to it —
+/// `crates/waymaker-flash/tests/recovery.rs` and `waymaker-fault`'s crash sweep are what
+/// hold the behaviour.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RECOVERY_SURFACE: &[&str] = &[
+    "align",
+    "append_offset",
+    "base",
+    "bytes",
+    "ending",
+    "fmt",
+    "message",
+    "new",
+    "next",
+    "of",
+    "offset",
+    "spanning",
+    "with_integrity",
+];
+
+/// Rule: the recovery reader's public surface is exactly the one that was reviewed.
+///
+/// The same shape as [`check_replay_cursor_surface`], for the reader that walks a journal on
+/// media rather than one in RAM.
+#[must_use]
+pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    check_pinned_surface(
+        "recovery-surface",
+        "waymaker-flash",
+        RECOVERY_SURFACE_PATH,
+        RECOVERY_SURFACE,
+        sources,
+        "the reader's public API is where design document \u{a7}02 decision 2 and the rule \
+         that an append offset is only ever erased media are both enforced, so a seek or a \
+         second way to an offset cannot be added without a reviewer writing it down",
+    )
+}
+
 /// The file whose `EffectScheduled` field set [`EFFECT_SCHEDULED_FIELDS`] pins.
 pub const EFFECT_SCHEDULED_PATH: &str = "waymaker-core/src/record.rs";
 
@@ -1006,14 +1071,33 @@ pub const INTEGRITY_SHIPPED_IMPL: &str = "impl IntegrityCheck for Catalogued";
 /// The codec, which must reach a seal through the trait rather than around it.
 pub const INTEGRITY_ROUTING_PATH: &str = "waymaker-flash/src/frame.rs";
 
-/// The two codec functions whose bodies compute a seal.
+/// The codec's functions generic over the integrity check, and which seals each must route
+/// through.
 ///
 /// A binding rule that reads only `integrity.rs` pins a trait nothing is obliged to call.
 /// Review of this change found exactly that: a codec re-hard-wired to `crc16` and `crc32`,
 /// with `integrity.rs` left perfectly intact, passed every rule. So the routing is pinned
-/// too — these two bodies must name `C::header_check` and `C::frame_check`, and must not
-/// name a checksum function at all.
-pub const SEALING_FUNCTIONS: &[&str] = &["encode_with", "decode_with"];
+/// too — each body below must name the seals its row lists, exactly once and with the answer
+/// used, and must not name a checksum function at all.
+///
+/// Named per function rather than "both seals in both bodies", for the reason
+/// [`BANK_SEALING_FUNCTIONS`] is: the header seal is computed in exactly one place.
+/// [`verify_header_with`] is that place, and [`decode_with`] routes through it, which is
+/// what [`HEADER_STEP`] holds. An empty method list is "this body must compute no seal of
+/// its own": the file-wide checksum ban is what holds it, and the row exists because the
+/// derived scan in [`check_integrity_routing`] requires every function generic over the
+/// check to be accounted for — a `frame_len_of_with` that took `C`, ignored it and called
+/// `crc16` is exactly the mutation that scan exists to catch.
+///
+/// [`verify_header_with`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/frame.rs
+/// [`decode_with`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/frame.rs
+pub const SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
+    ("encode_with", &["header_check", "frame_check"]),
+    ("verify_header_with", &["header_check"]),
+    ("decode_with", &["frame_check"]),
+    ("frame_len_of_with", &[]),
+    ("input_digest_with", &["frame_check"]),
+];
 
 /// The bank codec of design document §10, which seals two more structures.
 ///
@@ -1059,6 +1143,22 @@ pub const DIGEST_FUNCTION: (&str, &str) = ("input_digest", "crc32");
 /// decorative: every scan would verify with the shipped check whatever its caller asked
 /// for, which is a reader silently disagreeing with the writer.
 pub const SCAN_STEP: (&str, &str) = ("next", "decode_with");
+
+/// The decoder's header step, and the one function it must verify a header with.
+///
+/// [`SEALING_FUNCTIONS`] says `decode_with` computes no header seal of its own; without
+/// this, "no header seal" would be satisfied by a `decode_with` that skipped the header
+/// check altogether and read `payload_len` out of bytes nothing verified. That is the whole
+/// of §09's first checksum undone, and it is the shape a page-bounded reader depends on:
+/// `frame_len_of` promises a length the writer is known to have written.
+pub const HEADER_STEP: (&str, &str) = ("decode_with", "verify_header_with");
+
+/// The header-length accessor, and the one function it must verify a header with.
+///
+/// The same decision as [`HEADER_STEP`], for the function a recovery calls before it decides
+/// how many bytes to stage. A `frame_len_of_with` that returned a length without checking
+/// the seal over it would let an erased page send a reader anywhere.
+pub const FRAME_LEN_STEP: (&str, &str) = ("frame_len_of_with", "verify_header_with");
 
 /// One seal: what the trait returns for it, and what the shipped implementation computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1572,8 +1672,45 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     let mut violations = Vec::new();
     let checksums: Vec<&str> = SEAL_BINDINGS.iter().map(|seal| seal.delegates_to).collect();
 
-    let seals: Vec<&SealBinding> = SEAL_BINDINGS.iter().collect();
-    for function in SEALING_FUNCTIONS {
+    // Derived, not whitelisted, for the reason `check_bank_routing` derives: a table of five
+    // names pins five bodies and says nothing about a sixth. A
+    // `pub fn frame_len_of_with<C: IntegrityCheck>` that took the type parameter, ignored it
+    // and called `crc16` would be a second reader of a header sealed by a check its caller
+    // did not choose, with every other rule green.
+    for name in integrity_generic_functions(&code) {
+        if !SEALING_FUNCTIONS.iter().any(|(pinned, _)| *pinned == name) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_ROUTING_PATH} declares `fn {name}` generic over the integrity \
+                     check and no row of `SEALING_FUNCTIONS` pins it, so a body that can \
+                     compute a seal is pinned by nothing; add a row naming the seals it must \
+                     route through, or stop taking `C`"
+                ),
+            ));
+        }
+    }
+
+    for (function, methods) in SEALING_FUNCTIONS {
+        // Filtered from `SEAL_BINDINGS` rather than described here, so a seal whose width or
+        // name changes changes in one place. A method named in a row that no longer exists
+        // in `SEAL_BINDINGS` selects nothing, which is why the count is checked.
+        let seals: Vec<&SealBinding> = SEAL_BINDINGS
+            .iter()
+            .filter(|seal| methods.contains(&seal.method))
+            .collect();
+        if seals.len() != methods.len() {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{function}` is pinned to a seal `SEAL_BINDINGS` does not declare, so \
+                     the row checks less than it says it does"
+                ),
+            ));
+            continue;
+        }
         violations.extend(sealing_function_violations(
             INTEGRITY_ROUTING_PATH,
             function,
@@ -1603,6 +1740,16 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
         "so a scan verifies with whichever check the codec defaults to rather than the one \
          its caller asked for",
     ));
+
+    for (function, verified_with) in [HEADER_STEP, FRAME_LEN_STEP] {
+        violations.extend(used_call(
+            &code,
+            function,
+            verified_with,
+            "so a header's `payload_len` decides where a frame ends without the seal over it \
+             having been checked, which is design document \u{a7}09's first checksum undone",
+        ));
+    }
 
     violations
 }
@@ -3433,6 +3580,109 @@ mod tests {
             assert_eq!(other.len(), 1);
             assert!(other[0].detail.contains("checking nothing"), "{other:?}");
         }
+
+        // And the fourth, which reads a second module of the same crate as the third — the
+        // pair most likely to be satisfied by each other if a path were ever wrong.
+        let recovery_only = recovery_source("");
+        assert!(check_recovery_surface(&recovery_only).is_empty());
+        for handed in [&replay_only, &transition_only, &storage_only] {
+            let missing_recovery = check_recovery_surface(handed);
+            assert_eq!(missing_recovery.len(), 1);
+            assert_eq!(missing_recovery[0].rule, "recovery-surface");
+            assert_eq!(missing_recovery[0].subject, "waymaker-flash");
+            assert!(
+                missing_recovery[0].detail.contains("checking nothing"),
+                "{}",
+                missing_recovery[0].detail
+            );
+        }
+        let missing_storage = check_storage_contract(&recovery_only);
+        assert_eq!(missing_storage.len(), 1);
+        assert!(
+            missing_storage[0].detail.contains("checking nothing"),
+            "{}",
+            missing_storage[0].detail
+        );
+    }
+
+    fn recovery_source(extra: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
+        }]
+    }
+
+    #[test]
+    fn the_pinned_recovery_surface_passes() {
+        assert!(check_recovery_surface(&recovery_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_seek_or_a_second_route_to_an_offset_is_rejected_by_name() {
+        // The four shapes the pin exists for. The first three turn a forward scan whose RAM
+        // is one page into one that seeks or indexes, which is what §02 decision 2 rules
+        // out. The fourth is the dangerous one: an offset that comes back whatever the
+        // ending points at cells a program cycle has already cleared, and on NOR a bank
+        // written there never boots again — `waymaker-fault`'s sweep is what demonstrates
+        // that, and this is what stops the door being reopened.
+        for door in [
+            "pub fn seek(&mut self, offset: u32) {}
+",
+            "pub fn resume_at(&mut self, offset: u32) {}
+",
+            "pub fn read_all(&mut self) -> Vec<u8> { Vec::new() }
+",
+            "pub fn stopping_offset(&self) -> u32 { 0 }
+",
+        ] {
+            let violations = check_recovery_surface(&recovery_source(door));
+            assert_eq!(violations.len(), 1, "{door}");
+            assert_eq!(violations[0].rule, "recovery-surface");
+            assert_eq!(violations[0].subject, "waymaker-flash");
+        }
+    }
+
+    #[test]
+    fn a_recovery_function_that_disappeared_is_reported_too() {
+        // The direction that matters more: `append_offset` gone means the module was
+        // renamed or rewritten and the pin has stopped checking anything.
+        let thinned =
+            tests_support::clean_recovery_surface().replace("pub fn append_offset() {}\n", "");
+        let violations = check_recovery_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents: thinned,
+        }]);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].detail.contains("append_offset"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_recovery_module_fails_closed() {
+        let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "recovery-surface");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(
+            violations[0].detail.contains("checking nothing"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_windows_path_separator_still_finds_the_recovery_module() {
+        let violations = check_recovery_surface(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
+            contents: tests_support::clean_recovery_surface(),
+        }]);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -5053,8 +5303,8 @@ pub mod tests_support {
 
     use super::{
         BANK_SEALING_FUNCTIONS, CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
-        INTEGRITY_CHECK_PARAMETERS, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
-        STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
+        FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS, RECOVERY_SURFACE, REPLAY_SURFACE,
+        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -5088,6 +5338,12 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_storage_contract() -> String {
         surface("A storage module.", STORAGE_CONTRACT_SURFACE)
+    }
+
+    /// A recovery module declaring exactly [`RECOVERY_SURFACE`] and nothing else.
+    #[must_use]
+    pub fn clean_recovery_surface() -> String {
+        surface("A recovery module.", RECOVERY_SURFACE)
     }
 
     /// A record module declaring exactly [`EFFECT_SCHEDULED_FIELDS`] and nothing else.
@@ -5186,14 +5442,19 @@ pub mod tests_support {
         use std::fmt::Write as _;
 
         let mut source = String::from("//! The codec.\n");
-        for function in SEALING_FUNCTIONS {
+        for (function, methods) in SEALING_FUNCTIONS {
             let _ = writeln!(source, "pub fn {function}<C: IntegrityCheck>() -> u32 {{");
-            for seal in SEAL_BINDINGS {
+            for method in *methods {
                 let _ = writeln!(
                     source,
-                    "    let seal_{} = C::{}(bytes).to_le_bytes();",
-                    seal.method, seal.method
+                    "    let seal_{method} = C::{method}(bytes).to_le_bytes();"
                 );
+            }
+            // The routed calls each body owes, rendered from the same pins the rule reads.
+            for (owner, callee) in [HEADER_STEP, FRAME_LEN_STEP] {
+                if owner == *function {
+                    let _ = writeln!(source, "    let routed = {callee}::<C>(bytes);");
+                }
             }
             source.push_str("    0\n}\n");
         }
@@ -5250,8 +5511,9 @@ pub mod tests_support {
             .iter()
             .chain(TRANSITION_SURFACE)
             .chain(STORAGE_CONTRACT_SURFACE)
+            .chain(RECOVERY_SURFACE)
             .chain(seals)
-            .chain(SEALING_FUNCTIONS)
+            .chain(SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .chain([&DIGEST_FUNCTION.0])
             .chain(BANK_SEALING_FUNCTIONS.iter().map(|(name, _)| name))
             .collect();

@@ -155,9 +155,9 @@ impl core::error::Error for RegionError {}
 ///
 /// Every value of this type is a legal read on the device it was built against: the base and
 /// the length are whole read units, the region is inside the device, and it is not empty.
-/// [`new`](Self::new) and [`of`](Self::of) are the only constructors, and [`of`] goes through
-/// [`new`]. So a region that exists is one every read this module performs inside it is legal
-/// for — which is why the scan validates once here rather than on every frame.
+/// [`spanning`](Self::spanning) and [`of`](Self::of) are the only constructors, and
+/// [`of`](Self::of) goes through [`spanning`](Self::spanning). So a region that exists is one every read this module
+/// performs inside it is legal for — which is why the scan validates once here rather than on every frame.
 ///
 /// And the recorded granularity is at least the device's read unit, so every frame boundary
 /// inside the region is an offset the device can read at.
@@ -175,13 +175,18 @@ impl JournalRegion {
     /// one here; a caller using this crate's two-bank layout uses [`of`](Self::of), which
     /// computes the two numbers from §10's chain rather than asking a caller to.
     ///
+    /// Named `spanning` rather than `new` because [`Recovery::new`] is in this file too, and
+    /// the `recovery-surface` pin is a list of names: a second `new` would be a second
+    /// public function invisible to it and to `size-probe-reach`, which is the shape both
+    /// rules exist to catch.
+    ///
     /// # Errors
     ///
     /// [`RegionError::EmptyRegion`] for a region of no bytes,
     /// [`RegionError::AlignBelowReadUnit`] when `align` is finer than the device's read unit
     /// — see that variant for why that is refused rather than tolerated — and
     /// [`RegionError::Geometry`] when the region is misaligned or reaches past the device.
-    pub fn new(
+    pub fn spanning(
         geometry: Geometry,
         base: u32,
         bytes: u32,
@@ -210,7 +215,7 @@ impl JournalRegion {
     /// # Errors
     ///
     /// [`RegionError::NoJournalRoom`] when the header's padded frame fills the bank's
-    /// payload region, and otherwise as [`new`](Self::new).
+    /// payload region, and otherwise as [`spanning`](Self::spanning).
     pub fn of(
         layout: BankLayout,
         bank: BankId,
@@ -232,7 +237,7 @@ impl JournalRegion {
         if bytes == 0 {
             return Err(RegionError::NoJournalRoom);
         }
-        Self::new(layout.geometry(), base, bytes, header.align)
+        Self::spanning(layout.geometry(), base, bytes, header.align)
     }
 
     /// The device offset the journal starts at.
@@ -302,11 +307,15 @@ pub enum Ending {
 /// Generic over the driver's error, because §12 lets every port name its own and a recovery
 /// that flattened them would be throwing away the only thing a driver author can act on.
 ///
-/// Deliberately no [`Display`](fmt::Display): writing one needs `E: Display`, and a bound
-/// like that on an error type spreads to every signature that mentions it. [`message`] is
-/// what a device with no console needs and costs no formatter.
+/// Deliberately no [`Display`](fmt::Display) and no `message` accessor of its own, which is
+/// the one place this type breaks with every other error in the workspace. `Display` would
+/// need `E: Display`, and a bound like that spreads to every signature the type appears in.
+/// A `message` would be a *second* one in this file — [`RegionError`] has the name — and the
+/// `recovery-surface` pin is a list of names, so the second would be invisible to it.
 ///
-/// [`message`]: Self::message
+/// Nothing is lost. Every variant already carries something better than a string: the
+/// driver's own error, [`DecodeError::message`] behind a one-line `match`, and a byte count
+/// that says exactly how much larger the page would have to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecoveryError<E> {
     /// The media could not be read. Nothing was learned about what is on it.
@@ -322,24 +331,6 @@ pub enum RecoveryError<E> {
         /// Bytes the page would have had to hold.
         needed: usize,
     },
-}
-
-impl<E> RecoveryError<E> {
-    /// A short static description of this failure.
-    ///
-    /// # Postconditions
-    ///
-    /// Non-empty, ASCII, and distinct per variant. For
-    /// [`Storage`](Self::Storage) it says only that the read failed: what the *driver*
-    /// said is the wrapped value, which a caller that has one can print for itself.
-    #[must_use]
-    pub const fn message(&self) -> &'static str {
-        match self {
-            Self::Storage(_) => "the media could not be read",
-            Self::Decode(error) => error.message(),
-            Self::PageTooSmall { .. } => "a frame is longer than the scratch page",
-        }
-    }
 }
 
 /// A position in one journal, walked forward through §12's storage contract.
@@ -658,7 +649,7 @@ impl<C: IntegrityCheck> Recovery<C> {
             ));
         }
         // At most `stride`, because the region's granularity is at least the device's read
-        // unit — which `JournalRegion::new` is what guarantees. So this read stays inside the
+        // unit — which `JournalRegion::spanning` is what guarantees. So this read stays inside the
         // region without a second bounds check.
         let Some(need) = round_up(frame_width, read_unit) else {
             return Some(Err(
@@ -784,7 +775,7 @@ mod tests {
         // The invariant stated over the type rather than over a journal: there is no way to
         // get an offset out of a recovery that did not run to erased media.
         let geometry = Geometry::new(64, 32, 8, 1).expect("two whole blocks");
-        let region = JournalRegion::new(geometry, 0, 32, ProgramAlign::BYTE)
+        let region = JournalRegion::spanning(geometry, 0, 32, ProgramAlign::BYTE)
             .expect("this region is a legal read");
         for (ending, expected) in [
             (Ending::Clean { append_at: 8 }, Some(8)),

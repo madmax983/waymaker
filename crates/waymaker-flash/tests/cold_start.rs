@@ -475,3 +475,301 @@ fn an_effect_appended_past_the_prefix_recovers_under_the_identity_it_was_dispatc
     );
     assert_eq!(recovered.pending(), live.pending());
 }
+
+// ---------------------------------------------------------------------------------------
+// The same six steps, read off a device rather than out of a slice.
+//
+// Everything above this line replays a journal that is in RAM, which is what a host can do
+// and what §04's 768 B runtime budget says a device cannot. Issue #23's recovery reads
+// through §12's storage contract with one caller-owned page, and the seam it makes — a bank
+// selected, a header decoded, its journal walked, the records handed to the kernel's cursor
+// — is the whole of design document §06 step 1, so it is tested end to end here rather than
+// implied by two halves that each pass on their own.
+// ---------------------------------------------------------------------------------------
+
+use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
+use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
+use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
+
+/// NOR-shaped media: erased is `0xFF`, and programming only ever clears bits.
+struct Device {
+    geometry: Geometry,
+    media: Vec<u8>,
+}
+
+impl Device {
+    fn new(geometry: Geometry) -> Self {
+        let Ok(capacity) = usize::try_from(geometry.capacity()) else {
+            unreachable!("a host holds any capacity this file describes")
+        };
+        Self {
+            geometry,
+            media: std::vec![ERASED_BYTE; capacity],
+        }
+    }
+
+    fn put(&mut self, at: u32, bytes: &[u8]) {
+        let Ok(start) = usize::try_from(at) else {
+            unreachable!("a host holds any offset this file describes")
+        };
+        for (index, wanted) in bytes.iter().enumerate() {
+            let Some(cell) = start
+                .checked_add(index)
+                .and_then(|at| self.media.get_mut(at))
+            else {
+                unreachable!("the fixtures in this file fit the device")
+            };
+            *cell &= *wanted;
+        }
+    }
+}
+
+impl StableStorage for Device {
+    type Error = GeometryError;
+
+    fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let len = u32::try_from(dst.len()).map_err(|_| GeometryError::OutOfBounds)?;
+        self.geometry.validate_read(offset, len)?;
+        let start = usize::try_from(offset).map_err(|_| GeometryError::OutOfBounds)?;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or(GeometryError::OutOfBounds)?;
+        dst.copy_from_slice(
+            self.media
+                .get(start..end)
+                .ok_or(GeometryError::OutOfBounds)?,
+        );
+        Ok(())
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        let len = u32::try_from(src.len()).map_err(|_| GeometryError::OutOfBounds)?;
+        self.geometry.validate_program(offset, len)?;
+        self.put(offset, src);
+        Ok(())
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.geometry.validate_erase(offset, len)?;
+        let start = usize::try_from(offset).map_err(|_| GeometryError::OutOfBounds)?;
+        let end = start
+            .checked_add(usize::try_from(len).map_err(|_| GeometryError::OutOfBounds)?)
+            .ok_or(GeometryError::OutOfBounds)?;
+        self.media
+            .get_mut(start..end)
+            .ok_or(GeometryError::OutOfBounds)?
+            .fill(ERASED_BYTE);
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// A device with one bank written, sealed and filled with `records`.
+///
+/// The whole of §10's write side, done by hand because the writer that will do it is issue
+/// #24's. What matters here is that every byte the recovery reads back was put there through
+/// the same encoders a driver would use.
+fn boot_disk(records: &[RecordRef<'_>]) -> (Device, BankLayout, BankId, u32) {
+    let Ok(geometry) = Geometry::new(8192, 4096, 8, 1) else {
+        unreachable!("8192 is two whole 4096-byte blocks")
+    };
+    let Ok(layout) = BankLayout::new(geometry) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    let mut device = Device::new(geometry);
+    let id = BankId::B;
+    let region = layout.bank(id);
+
+    let header = BankHeader {
+        run: RUN,
+        align: layout.align(),
+        workflow_kind: 0x0042,
+        workflow_version: 3,
+        input_schema: 1,
+        input: b"run-input",
+    };
+    let mut staging = [0_u8; 256];
+    let Ok(header_len) = bank::encode_header(&header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    device.put(region.base(), header_frame);
+
+    let Ok(seal) = bank::seal_for(header_frame, Generation(7)) else {
+        unreachable!("a header frame can be sealed")
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, layout.align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    device.put(region.seal_offset(), sealed);
+
+    let Ok(journal) = JournalRegion::of(layout, id, &header) else {
+        unreachable!("this bank has room for a journal")
+    };
+    let mut at = journal.base();
+    for record in records {
+        let Ok(written) = frame::encode(record, journal.align(), &mut staging) else {
+            unreachable!("the fixtures in this file fit the staging buffer")
+        };
+        let (Some(bytes), Ok(width)) = (staging.get(..written), u32::try_from(written)) else {
+            unreachable!("a frame is shorter than a bank")
+        };
+        device.put(at, bytes);
+        at = at.saturating_add(width);
+    }
+    (device, layout, id, at - journal.base())
+}
+
+/// Reads a bank's header back off media, the way a cold boot has to.
+fn read_header(device: &mut Device, layout: BankLayout, id: BankId, page: &mut [u8]) -> usize {
+    let region = layout.bank(id);
+    let Some(window) = page.get_mut(..64) else {
+        unreachable!("the page in this file is larger than a bank header")
+    };
+    let Ok(()) = device.read(region.base(), window) else {
+        unreachable!("a bank header is inside the device")
+    };
+    64
+}
+
+#[test]
+fn a_cold_boot_selects_a_bank_recovers_its_prefix_and_replays_it() {
+    // §06's six steps against a device, with a 512 B page as the only buffer in sight. Steps
+    // 3 and 4 are the workflow future's, which is rung 0.4's; everything else is here.
+    let [schedule_zero, complete_zero] = effect(0, b"first", b"one");
+    let (mut device, layout, id, end) = boot_disk(&[
+        RecordRef::RunStarted {
+            workflow_kind: 0x0042,
+            workflow_version: 3,
+            input: b"run-input",
+        },
+        schedule_zero,
+        complete_zero,
+        RecordRef::EffectScheduled {
+            seq: EffectSeq(1),
+            kind: DOWNLOAD,
+            input_len: 6,
+            input_crc: frame::input_digest(b"second"),
+        },
+    ]);
+
+    // The one page a device has. Everything below borrows it and gives it back.
+    let mut page = [0_u8; 512];
+
+    // Which bank is authoritative — §10's generation seal, read off media.
+    let mut seal_bytes = [0_u8; 64];
+    let region = layout.bank(id);
+    let seal_len = usize::try_from(region.seal_bytes()).expect("a host holds a seal");
+    device
+        .read(region.seal_offset(), &mut seal_bytes[..seal_len])
+        .expect("a seal is inside the device");
+    let header_len = read_header(&mut device, layout, id, &mut page);
+    let generation = bank::sealed_generation(&page[..header_len], &seal_bytes[..seal_len]);
+    assert_eq!(generation, Some(Generation(7)));
+
+    // Step 1: the committed record prefix, through §12's contract and this page.
+    let header = bank::decode_header(&page[..header_len]).expect("this bank has a header");
+    assert_eq!(header.run, RUN);
+    let journal = JournalRegion::of(layout, id, &header).expect("this bank has a journal");
+    // Step 2: the run input, copied into caller-owned storage before the page moves on.
+    let mut run_input = [0_u8; 32];
+    let run_input_len = header.input.len();
+    run_input[..run_input_len].copy_from_slice(header.input);
+    assert_eq!(&run_input[..run_input_len], b"run-input");
+
+    let mut cursor = ReplayCursor::new(header.run);
+    let mut recovery = Recovery::new(journal);
+    let mut results: Vec<Vec<u8>> = Vec::new();
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let record = step.expect("every frame in this journal is sound");
+        // Step 5: each record either resolves an effect or identifies the first unresolved
+        // one. The cursor is the only thing that knows which.
+        if let Step::EffectCompleted { id, result } = cursor.advance(record).expect("legal") {
+            assert_eq!(id.run, RUN);
+            results.push(result.to_vec());
+        }
+    }
+
+    assert_eq!(results, [b"one".to_vec()]);
+    assert_eq!(recovery.offset(), end);
+    assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: end }));
+    // Step 6: stopped at pending work, under the identity the dispatcher already had.
+    assert_eq!(cursor.position(), Position::AwaitingOutcome);
+    assert_eq!(
+        cursor.pending().map(|effect| effect.id),
+        Some(EffectId {
+            run: RUN,
+            seq: EffectSeq(1)
+        })
+    );
+    // And the append point for the outcome that resolves it.
+    assert_eq!(recovery.append_offset(), Some(end));
+}
+
+#[test]
+fn an_out_of_sequence_frame_stops_a_cold_boot_and_withholds_the_append_point() {
+    // §09 lists out-of-sequence beside malformed and integrity-failed, and it is the one of
+    // the four the recovery cannot see for itself: ordering is a fact about the run rather
+    // than about the bytes, so `waymaker_core::ReplayCursor` owns it (ADR 0008). This is the
+    // composition, and the property that makes it sound — a caller that stops pumping gets
+    // no append offset, because an unfinished scan has none.
+    let (mut device, layout, id, _) = boot_disk(&[
+        RecordRef::RunStarted {
+            workflow_kind: 0x0042,
+            workflow_version: 3,
+            input: b"run-input",
+        },
+        // A completion for an effect that was never scheduled: every byte of it is sound and
+        // no reader of bytes can say it is wrong.
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(4),
+            result: b"nope",
+        },
+        RecordRef::RunCompleted { result: b"late" },
+    ]);
+
+    let mut page = [0_u8; 512];
+    let header_len = read_header(&mut device, layout, id, &mut page);
+    let header = bank::decode_header(&page[..header_len]).expect("this bank has a header");
+    let journal = JournalRegion::of(layout, id, &header).expect("this bank has a journal");
+
+    let mut cursor = ReplayCursor::new(header.run);
+    let mut recovery = Recovery::new(journal);
+    let mut accepted = 0_usize;
+    let mut refusal = None;
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let record = step.expect("every frame in this journal is sound");
+        match cursor.advance(record) {
+            Ok(_) => accepted += 1,
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+
+    assert_eq!(accepted, 1, "only `RunStarted` was legal history");
+    assert_eq!(refusal, Some(KernelError::MalformedHistory));
+    // The bytes were sound, so the recovery itself never failed — and it never finished
+    // either, which is why there is nothing to append with.
+    assert_eq!(recovery.ending(), None);
+    assert_eq!(recovery.append_offset(), None);
+    // And the refusal is terminal: there is no way back into replaying this history.
+    assert_eq!(
+        cursor.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}

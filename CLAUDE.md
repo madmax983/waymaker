@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 37 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 38 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -205,7 +205,7 @@ gate renders it; the `claude-md` rule compares the two.
 | Crate | Owns | May depend on |
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
-| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the two-bank layout, bank selection, append scanning, compaction transition | waymaker-core |
+| `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
@@ -362,7 +362,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 37 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 38 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -377,6 +377,7 @@ this table is how you find out what a red build is telling you.
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts: `encode_with` or `decode_with` stops computing a seal through `C::header_check`/`C::frame_check` exactly once, names a checksum function directly, `input_digest` stops calling `crc32` once, or the scan's `next` stops walking with `decode_with` — a trait nothing is obliged to call is a swap point that selects nothing. The same routing pin covers `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names: a firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
+| `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
@@ -692,6 +693,32 @@ is 8180 B to 10976 B of code flash against an 8192 B budget, which is the budget
 [ADR 0013](docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md) said had to happen
 before these were written; ADR 0017 has it, raises the gate to 16 KiB, and writes down that a
 third of the measured figure is the size probe rather than the engine.
+Issue #23 then makes recovery a thing a *device* does. `frame::Scan` walks a journal that is
+already in RAM, which §04's 768 B runtime budget — stated with a 512 B scratch page — says a
+device cannot do with a 4 KiB bank; `waymaker-flash`'s `recovery` module is the other reader.
+`JournalRegion` is the bytes between a bank's header and its seal, validated once as a legal
+read and refusing a granularity below the device's read unit, so every frame boundary inside
+it is an offset the device can name. `Recovery` is a position in that region and nothing else
+— twenty-four bytes, asserted at compile time — pumped by its caller with a page it never
+retains, which is [ADR 0008](docs/adr/0008-the-replay-cursor-is-pumped-by-its-caller.md)'s
+decision made twice for the same reason. And `Ending` is what a finished scan learned, with
+the append offset carried by exactly one of its three shapes: a scan that stopped at damage
+has nowhere safe to write, because without §09's commit seal it may have stopped at a
+half-programmed header, and on NOR appending there — or past it — is a bank that never boots
+again. The invariant is that an append offset is always the start of an erased run reaching
+the end of the region, and it is *swept* rather than asserted: `waymaker-fault` drives the
+real reader over media a real crash left behind, at every point a power loss can land, with a
+tooth that finds a crash point at which the obvious implementation would have pointed at
+programmed media. Two readers of one format drift, so they are held to each other — 256
+generated journals in `waymaker-flash` and every crash image in `waymaker-fault`, walked both
+ways and required to agree record for record and offset for offset. `frame::frame_len_of` is
+what makes a page-bounded reader possible at all, and is §09's first checksum finally used
+rather than only explained: a length that is known to be the one the writer wrote, read
+before the payload is in hand. See
+[ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md),
+which also says what is owed — "unsealed" is issue #24's, so a torn tail and a damaged frame
+still stop the scan in the same place, and out-of-sequence stays the replay cursor's, held
+sound by an append offset derived from the ending rather than from the offset.
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1; the commit
 seal and the bank swap arrive with 0.2, and the async `Ctx` and dispatcher with 0.4. The

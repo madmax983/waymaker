@@ -73,6 +73,7 @@ pub const RULES: &[&str] = &[
     "no-build-scripts",
     "pre-commit-hook",
     "recovery-spec",
+    "recovery-surface",
     "release-profile",
     "replay-cursor-surface",
     "settled-decisions",
@@ -237,6 +238,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
     violations.extend(source::check_storage_contract(&inputs.layer_sources));
+    violations.extend(source::check_recovery_surface(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
@@ -780,6 +782,7 @@ mod tests {
             "no-build-scripts",
             "pre-commit-hook",
             "recovery-spec",
+            "recovery-surface",
             "release-profile",
             "replay-cursor-surface",
             "settled-decisions",
@@ -893,6 +896,13 @@ mod tests {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
                     contents: source::tests_support::clean_storage_contract(),
+                },
+                // And the storage-backed recovery reader of issue #23, pinned for the
+                // reason the other three are: renamed or deleted, the pin checks nothing.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::RECOVERY_SURFACE_PATH),
+                    contents: source::tests_support::clean_recovery_surface(),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),

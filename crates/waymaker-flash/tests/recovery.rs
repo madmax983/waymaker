@@ -175,7 +175,7 @@ fn align(bytes: u16) -> ProgramAlign {
 
 /// A journal region carved out of a device by hand, so a test can name its bounds.
 fn region(geometry: Geometry, base: u32, bytes: u32, unit: u16) -> JournalRegion {
-    let Ok(region) = JournalRegion::new(geometry, base, bytes, align(unit)) else {
+    let Ok(region) = JournalRegion::spanning(geometry, base, bytes, align(unit)) else {
         unreachable!("the regions in this file are legal reads")
     };
     region
@@ -816,14 +816,14 @@ fn a_region_refuses_a_granularity_the_device_cannot_read_at() {
     // and called it the end of history.
     let geometry = Geometry::new(8192, 4096, 8, 4).expect("a device that reads four at a time");
     assert_eq!(
-        JournalRegion::new(geometry, 0, 512, ProgramAlign::BYTE),
+        JournalRegion::spanning(geometry, 0, 512, ProgramAlign::BYTE),
         Err(RegionError::AlignBelowReadUnit)
     );
     assert_eq!(
-        JournalRegion::new(geometry, 0, 512, align(2)),
+        JournalRegion::spanning(geometry, 0, 512, align(2)),
         Err(RegionError::AlignBelowReadUnit)
     );
-    assert!(JournalRegion::new(geometry, 0, 512, align(4)).is_ok());
+    assert!(JournalRegion::spanning(geometry, 0, 512, align(4)).is_ok());
 }
 
 #[test]
@@ -833,15 +833,15 @@ fn a_region_refuses_what_the_device_would_refuse() {
     // it is legal for.
     let geometry = nor();
     assert_eq!(
-        JournalRegion::new(geometry, 8192, 8, align(8)),
+        JournalRegion::spanning(geometry, 8192, 8, align(8)),
         Err(RegionError::Geometry(GeometryError::OutOfBounds))
     );
     assert_eq!(
-        JournalRegion::new(geometry, 0, 8_200, align(8)),
+        JournalRegion::spanning(geometry, 0, 8_200, align(8)),
         Err(RegionError::Geometry(GeometryError::OutOfBounds))
     );
     assert_eq!(
-        JournalRegion::new(geometry, 0, 0, align(8)),
+        JournalRegion::spanning(geometry, 0, 0, align(8)),
         Err(RegionError::EmptyRegion)
     );
 }

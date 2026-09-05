@@ -201,6 +201,7 @@ fn engine() -> usize {
     core::hint::black_box(show_decode);
 
     kept = kept.wrapping_add(record_codec());
+    kept = kept.wrapping_add(journal_recovery());
     kept = kept.wrapping_add(replay_cursor());
     kept = kept.wrapping_add(transition_table());
 
@@ -943,6 +944,164 @@ fn bank_seal_and_selection(page: &[u8]) -> usize {
     kept = kept.wrapping_add(quoted.header_check as usize);
 
     core::hint::black_box(kept)
+}
+
+/// Recovery: the forward scan that turns an authoritative bank into a committed prefix.
+///
+/// Issue [#23](https://github.com/madmax983/waymaker/issues/23), and the row of the delta
+/// that a device really pays on every cold boot. Every public function of
+/// `waymaker_flash::recovery` is called from here, which is `size-probe-reach`'s
+/// requirement, and both of the endings a firmware branches on are linked: a journal that
+/// ran to erased media and one that stopped at a frame it could not accept. A delta that
+/// charged only for the first would understate the firmware that has to *refuse* to append,
+/// which is the branch the whole module exists for.
+///
+/// The scratch page is a local rather than a `static` for the reason [`replay_cursor`] has
+/// none at all: §04 states the runtime-RAM budget with the caller's page excluded, so a
+/// page in `.bss` would charge the engine's RAM row for memory the budget does not count.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn journal_recovery() -> usize {
+    use waymaker_core::{RecordRef, RunId};
+    use waymaker_flash::bank::{BankHeader, BankId, BankLayout};
+    use waymaker_flash::frame::{self, ProgramAlign};
+    use waymaker_flash::integrity::Catalogued;
+    use waymaker_flash::recovery::{JournalRegion, RegionError};
+    use waymaker_flash::storage::Geometry;
+
+    let Ok(geometry) = Geometry::new(
+        core::hint::black_box(512),
+        core::hint::black_box(256),
+        core::hint::black_box(4),
+        core::hint::black_box(1),
+    ) else {
+        return 0;
+    };
+    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
+        return 0;
+    };
+
+    // Both constructors: the primitive a port uses, and §10's chain a bank boot uses.
+    let region = match JournalRegion::spanning(geometry, 0, core::hint::black_box(128), align) {
+        Ok(region) => region,
+        Err(error) => return error.message().len(),
+    };
+    let mut kept = (region.base() as usize)
+        .wrapping_add(region.bytes() as usize)
+        .wrapping_add(usize::from(region.align().get()));
+    let Ok(layout) = BankLayout::new(geometry) else {
+        return kept;
+    };
+    let header = BankHeader {
+        run: RunId(core::hint::black_box(9)),
+        align,
+        workflow_kind: core::hint::black_box(1),
+        workflow_version: core::hint::black_box(1),
+        input_schema: core::hint::black_box(1),
+        input: core::hint::black_box(b"probe"),
+    };
+    kept = kept.wrapping_add(JournalRegion::of(layout, BankId::A, &header).map_or_else(
+        |error| error.message().len(),
+        |journal| journal.bytes() as usize,
+    ));
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Taken as a function
+    // pointer for the reason §12's is: formatting would link `core::fmt::write` and charge
+    // this row for machinery the `message` accessors were written to avoid.
+    let show: fn(&RegionError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <RegionError as core::fmt::Display>::fmt;
+    core::hint::black_box(show);
+
+    // A frame staged into the page, so the header-length step has a header to read. §09's
+    // two checksums are what make that step possible at all: `payload_len` is verified
+    // before it is trusted to say where the frame ends.
+    let mut page = [0_u8; 64];
+    let staged = frame::encode(
+        &RecordRef::RunCompleted {
+            result: core::hint::black_box(b"ok"),
+        },
+        align,
+        &mut page,
+    )
+    .unwrap_or(0);
+    kept = kept.wrapping_add(staged);
+    kept = kept.wrapping_add(match frame::frame_len_of(&page) {
+        Ok(frame_len) => frame_len,
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(frame::frame_len_of_with::<Catalogued>(&page).unwrap_or(0));
+
+    kept.wrapping_add(recovery_walk(geometry, region, &mut page))
+}
+
+/// One recovery driven to its end, and the two endings a firmware branches on.
+///
+/// Split out of [`journal_recovery`] because clippy's line budget refuses the two together,
+/// and called unconditionally from there — so no figure the size report prints changes
+/// either way.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn recovery_walk(
+    geometry: waymaker_flash::storage::Geometry,
+    region: waymaker_flash::recovery::JournalRegion,
+    page: &mut [u8],
+) -> usize {
+    use waymaker_flash::integrity::Catalogued;
+    use waymaker_flash::recovery::{Ending, Recovery, RecoveryError};
+
+    let mut media = ProbeMedia { geometry };
+    // `ProbeMedia::read` validates and copies nothing, so the frame staged above is what
+    // every step decodes. That is what links the *record* arm; the arms below link the rest.
+    let mut recovery = Recovery::<Catalogued>::with_integrity(region);
+    let mut kept = 0_usize;
+    while let Some(step) = recovery.next(&mut media, page) {
+        kept = kept.wrapping_add(match step {
+            Ok(record) => record.kind().0 as usize,
+            Err(error) => recovery_error_cost(&error),
+        });
+    }
+    kept = kept.wrapping_add(recovery.offset() as usize);
+    kept = kept.wrapping_add(match recovery.ending() {
+        Some(Ending::Clean { append_at }) => append_at as usize,
+        Some(Ending::Damaged { at } | Ending::Incomplete { at }) => at as usize,
+        None => 0,
+    });
+    kept = kept.wrapping_add(recovery.append_offset().unwrap_or(0) as usize);
+
+    // The page-too-small refusal, which is the one ending a caller cannot reach by having a
+    // damaged device: a record longer than the page it was handed.
+    let mut cramped = Recovery::new(region);
+    let mut crumb = [0_u8; 2];
+    kept = kept.wrapping_add(match cramped.next(&mut media, &mut crumb) {
+        Some(Ok(record)) => record.kind().0 as usize,
+        Some(Err(error)) => recovery_error_cost(&error),
+        None => 0,
+    });
+
+    core::hint::black_box(kept)
+}
+
+/// Every arm of a recovery's refusal, so the delta charges for all three.
+///
+/// `RecoveryError` carries no `message` of its own — see its documentation for why — so this
+/// is what a driver's own reporting looks like, and linking it is what makes the row honest.
+#[cfg(feature = "engine")]
+fn recovery_error_cost(
+    error: &waymaker_flash::recovery::RecoveryError<waymaker_flash::storage::GeometryError>,
+) -> usize {
+    use waymaker_flash::recovery::RecoveryError;
+
+    match error {
+        RecoveryError::PageTooSmall { needed } => *needed,
+        RecoveryError::Storage(inner) => inner.message().len(),
+        RecoveryError::Decode(inner) => inner.message().len(),
+    }
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn journal_recovery() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in the baseline image that measures a firmware without Waymaker in it.

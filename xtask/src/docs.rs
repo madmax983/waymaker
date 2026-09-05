@@ -539,6 +539,24 @@ pub const CRASH_INJECTION_LABELS: &[&str] = &[
     "Acknowledged",
 ];
 
+/// What a forward recovery decides, and how it can end, from design document §09 and §14.
+///
+/// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted. The first
+/// four are the reader's own stop conditions — §09 lists a fifth, out-of-sequence, which
+/// belongs to the replay cursor and is prose in that section rather than a node. The last
+/// three are the endings, and they are the load-bearing half: exactly one of them carries an
+/// append offset, and a picture that collapsed `Incomplete` into `Damaged` would say a
+/// recovery that could not finish had found the end of history.
+pub const JOURNAL_RECOVERY_LABELS: &[&str] = &[
+    "erased header",
+    "frame_len_of",
+    "decode_with",
+    "longer than the page",
+    "Clean",
+    "Damaged",
+    "Incomplete",
+];
+
 /// The fields of the record frame, from design document §09.
 ///
 /// Named here rather than inside [`DIAGRAMS`] so that the count can be asserted, and named
@@ -660,6 +678,16 @@ pub const DIAGRAMS: &[DiagramSpec] = &[
         title: "the five-row replay transition table",
         required_labels: TRANSITION_TABLE_ROWS,
         source_section: "§08 Replay and determinism",
+    },
+    DiagramSpec {
+        id: "journal-recovery",
+        title: "the forward scan and the three ways it can end",
+        // The four stop conditions the reader owns, and the three endings — because the
+        // decision the whole module exists to make is *which* ending yields a place to
+        // write. A picture with `Clean` and `Damaged` and no `Incomplete` would say a
+        // recovery that could not finish is a recovery that found the end of history.
+        required_labels: JOURNAL_RECOVERY_LABELS,
+        source_section: "\u{a7}09 Journal and wire format and \u{a7}14 Failure semantics",
     },
     DiagramSpec {
         id: "crash-injection",
