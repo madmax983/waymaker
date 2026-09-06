@@ -130,6 +130,7 @@ use waymaker_core::{DecodeError, EffectIdAllocator, RunId};
 
 use crate::append::Journal;
 use crate::bank::{self, Authority, BankHeader, BankId, BankLayout, BankRegion, Generation};
+use crate::frame::{self, RUN_STARTED_PREFIX_BYTES};
 use crate::integrity::{Catalogued, IntegrityCheck};
 use crate::recovery::{JournalRegion, Recovery, RegionError};
 use crate::storage::StableStorage;
@@ -218,16 +219,25 @@ pub enum SwapError {
     /// makes, taken one step earlier: every offset below is derived from the layout, and a
     /// region proved legal on another device says nothing about this one.
     WrongDevice,
-    /// The next run's input leaves the installed bank no room for a record.
+    /// The next run's input leaves the installed bank no room for the record that run must
+    /// write first.
     ///
-    /// §10's roll-over is only an exit if the run it installs can *write* something, and
-    /// [`Region`](Self::Region) below is a weaker test than that: [`JournalRegion::of`]
-    /// refuses only a journal of zero bytes, so an input one program unit short of the bank
-    /// would install a run with a journal too small for its own opening record — durably,
-    /// with no error anywhere and no way out but another swap. The ceiling here is
-    /// [`BankRegion::max_run_input_bytes`], which is the one [`BankLayout::new`] and
-    /// [`Reserve::for_layout`] both already trust, and it reserves a whole record: a frame
-    /// body *and* the commit seal issue #24 made part of one.
+    /// §10's roll-over is only an exit if the run it installs can *write* something, and two
+    /// weaker tests are available here that both look like this one.
+    /// [`Region`](Self::Region) below refuses only a journal of zero bytes.
+    /// [`BankRegion::max_run_input_bytes`] reserves one *empty* record — and §09's
+    /// `RunStarted` repeats the whole run input and adds four bytes of workflow identity in
+    /// front of it, so an input at that ceiling installs a bank whose journal is twenty-four
+    /// bytes and whose mandatory first record is four thousand. Durably, with the swap
+    /// reporting success and no way out but another swap. Codex found that on this change's
+    /// first review round; `an_installed_run_can_write_the_opening_record_it_must_write`
+    /// drives it.
+    ///
+    /// So the bound is the header **and** a `RunStarted` carrying this input, both padded to
+    /// the granularity, inside the bank's payload. What it deliberately does not price is the
+    /// rest of a run — an effect scheduled, its outcome, a terminal record — which is
+    /// [`Reserve::for_layout`]'s floor and a policy rather than a fact about whether the
+    /// installed run can start.
     ///
     /// [`Reserve::for_layout`]: crate::capacity::Reserve::for_layout
     InputTooLong,
@@ -262,7 +272,7 @@ impl SwapError {
             Self::RunReused => "the next run repeats the retired run",
             Self::NotTheActiveBank => "that reader is not the active bank",
             Self::WrongDevice => "that reader is on another device",
-            Self::InputTooLong => "the next run's input leaves no record",
+            Self::InputTooLong => "the next run cannot write its first record",
             Self::Region(inner) => inner.message(),
         }
     }
@@ -439,13 +449,27 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
         // Never a parameter: the bank installed into is the one the device did *not* boot.
         let installed = id.other();
         let installing = layout.bank(installed);
-        // §10 step 3's header has to leave a journal a run can be used in, which is a
-        // stronger test than one that exists: `JournalRegion::of` below refuses only a
-        // journal of *zero* bytes, and a run whose journal cannot hold its opening record is
-        // installed for ever. `max_run_input_bytes` reserves a whole record — the same
-        // ceiling `BankLayout::new` refuses a device under and `Reserve::for_layout` prices
-        // against — so the two gates agree rather than differing by a frame.
-        if next.input.len() > installing.max_run_input_bytes(layout.align()) {
+        // §10 step 3's header has to leave a journal the installed run can be *used* in,
+        // which is two tests stronger than one that leaves a journal at all.
+        //
+        // `JournalRegion::of` below refuses only a journal of *zero* bytes.
+        // `BankRegion::max_run_input_bytes` is stronger and still not enough, which is what
+        // Codex found on the first review round: it reserves `encoded_len_for(0)`, an *empty*
+        // record, and the record §08 obliges this run to write first is a `RunStarted` that
+        // repeats the whole input and adds four bytes of workflow identity in front of it. So
+        // the bound is the header *and* that record, both padded, inside the bank's payload —
+        // and an input at the old ceiling installed a bank with a 24-byte journal and a
+        // 4064-byte first record, durably, with the swap reporting success.
+        let (Some(header), Ok(opening)) = (
+            bank::header_len_for(next.input.len(), layout.align()),
+            frame::encoded_len_for(
+                RUN_STARTED_PREFIX_BYTES.saturating_add(next.input.len()),
+                layout.align(),
+            ),
+        ) else {
+            return Err(SwapError::InputTooLong);
+        };
+        if header.saturating_add(opening) > installing.payload_bytes() as usize {
             return Err(SwapError::InputTooLong);
         }
         // Both are decided before the erase of step 2, because a swap that erased the spare

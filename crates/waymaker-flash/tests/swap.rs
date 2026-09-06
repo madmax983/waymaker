@@ -800,38 +800,52 @@ fn a_swap_refuses_a_reader_validated_against_another_device() {
     );
 }
 
-#[test]
-fn a_swap_refuses_an_input_that_leaves_no_room_for_a_record() {
-    // The refusal `JournalRegion::of` is too weak to make. A journal of one program unit is
-    // a journal that *exists*, so the region gate accepts it — and the run installed behind
-    // it can never commit its opening record, durably, with no error anywhere. The ceiling
-    // is `BankRegion::max_run_input_bytes`, which reserves a whole record: a frame body and
-    // the commit seal issue #24 made part of one.
-    let ceiling = layout().bank(BankId::B).max_run_input_bytes(align());
-    let just_over = std::vec![0x5A_u8; ceiling + 1];
-
-    // One byte under the ceiling is accepted, so the bound is exact rather than merely safe.
-    let mut device = booted();
-    let at_ceiling = std::vec![0x5A_u8; ceiling];
-    let retired = Retired::Journal(current_journal(&mut device));
-    assert!(
-        Swap::beginning(
+/// The largest next-run input this layout's swap accepts.
+///
+/// Found by asking rather than by restating the bound: a test that recomputed the formula
+/// would pass a joint mistake in both. `Swap::beginning` reads no media, so the scan costs
+/// nothing but arithmetic.
+fn accepted_ceiling() -> usize {
+    let mut input = layout().bank(BankId::B).max_run_input_bytes(align());
+    loop {
+        let bytes = std::vec![0x3C_u8; input];
+        let planned = Swap::beginning(
             layout(),
             Authority::Bank {
                 id: BankId::A,
-                generation: CURRENT
+                generation: CURRENT,
             },
             RUN,
-            retired,
+            Retired::Recovery(Recovery::new(current_region())),
             BankHeader {
-                input: &at_ceiling,
+                input: &bytes,
                 ..next_header()
             },
-        )
-        .is_ok(),
-        "an input at the ceiling is one a bank can be used with"
+        );
+        if planned.is_ok() {
+            return input;
+        }
+        let Some(smaller) = input.checked_sub(1) else {
+            unreachable!("some run input fits a bank")
+        };
+        input = smaller;
+    }
+}
+
+#[test]
+fn a_swap_refuses_an_input_that_leaves_no_room_for_the_opening_record() {
+    // The refusal `JournalRegion::of` is too weak to make, and the one
+    // `BankRegion::max_run_input_bytes` is *also* too weak to make. A journal of one program
+    // unit is a journal that exists, so the region gate accepts it; a journal of one empty
+    // record is what that ceiling reserves, and §09's `RunStarted` repeats the whole input.
+    let ceiling = accepted_ceiling();
+    let weaker = layout().bank(BankId::B).max_run_input_bytes(align());
+    assert!(
+        ceiling < weaker,
+        "the swap's bound is meant to be stricter than the one that reserves an empty record"
     );
 
+    let over = std::vec![0x5A_u8; ceiling + 1];
     refuses(
         Authority::Bank {
             id: BankId::A,
@@ -840,32 +854,112 @@ fn a_swap_refuses_an_input_that_leaves_no_room_for_a_record() {
         RUN,
         |device| Retired::Journal(current_journal(device)),
         BankHeader {
-            input: &just_over,
+            input: &over,
             ..next_header()
         },
         SwapError::InputTooLong,
     );
 
-    // And the state the old gate would have installed: a journal `JournalRegion::of` accepts
-    // and no record fits in. Driven rather than argued, because "too weak" is a claim about
-    // what the weaker gate would have let through.
+    // And the input the weaker ceiling would have accepted is refused, which is the
+    // regression this bound exists for.
+    let at_the_weaker_ceiling = std::vec![0x5A_u8; weaker];
+    refuses(
+        Authority::Bank {
+            id: BankId::A,
+            generation: CURRENT,
+        },
+        RUN,
+        |device| Retired::Journal(current_journal(device)),
+        BankHeader {
+            input: &at_the_weaker_ceiling,
+            ..next_header()
+        },
+        SwapError::InputTooLong,
+    );
+
+    // The state that ceiling would have installed: a journal `JournalRegion::of` accepts and
+    // the run's own first record cannot fit in. Driven rather than argued, because "too weak"
+    // is a claim about what the weaker gate would have let through.
     let Ok(region) = JournalRegion::of(
         layout(),
         BankId::B,
         &BankHeader {
-            input: &just_over,
+            input: &at_the_weaker_ceiling,
             ..next_header()
         },
     ) else {
-        unreachable!("a header one byte over the ceiling still leaves a journal")
+        unreachable!("a header at that ceiling still leaves a journal")
     };
-    let Ok(frame) = frame::encoded_len_for(0, align()) else {
-        unreachable!("an empty record has a length")
+    let Ok(opening) = frame::encoded_len_for(4 + weaker, align()) else {
+        unreachable!("that record has a length")
     };
     assert!(
-        (region.bytes() as usize) < frame,
-        "the input the swap now refuses left {} bytes for a {frame}-byte record",
+        (region.bytes() as usize) < opening,
+        "the input the swap now refuses left {} bytes for a {opening}-byte opening record",
         region.bytes()
+    );
+}
+
+#[test]
+fn an_installed_run_can_write_the_opening_record_it_must_write() {
+    // Codex found this on the first review round, and it is the same mistake one step
+    // further in than the one above: `BankRegion::max_run_input_bytes` reserves
+    // `encoded_len_for(0)` — an *empty* record — but §09's `RunStarted` repeats the run
+    // input and adds four bytes of workflow identity in front of it. So an input at that
+    // ceiling installs a bank whose journal is twenty-four bytes and whose mandatory first
+    // record is four thousand, durably, with the swap reporting success.
+    //
+    // Driven rather than argued: the run is installed, and then the record §08 says must
+    // come first is written into the journal the swap handed back.
+    let mut device = booted();
+    let at_ceiling = std::vec![0x3C_u8; accepted_ceiling()];
+
+    let retired = Retired::Journal(current_journal(&mut device));
+    let planned = Swap::beginning(
+        layout(),
+        Authority::Bank {
+            id: BankId::A,
+            generation: CURRENT,
+        },
+        RUN,
+        retired,
+        BankHeader {
+            input: &at_ceiling,
+            ..next_header()
+        },
+    );
+
+    let Ok(swap) = planned else {
+        unreachable!("`accepted_ceiling` is the largest input the swap accepts")
+    };
+
+    let mut page = std::vec![0_u8; 8192];
+    let Ok(installed) = swap
+        .prepare(&mut device)
+        .and_then(|prepared| prepared.stage(&mut device, &mut page))
+        .and_then(|staged| staged.payload_barrier(&mut device))
+        .and_then(|sealable| sealable.commit(&mut device))
+    else {
+        unreachable!("a swap on a device that accepts every mutation succeeds")
+    };
+
+    let mut recovery = Recovery::new(installed.region());
+    while recovery.next(&mut device, &mut page).is_some() {}
+    let Some(mut journal) = Journal::after(recovery) else {
+        unreachable!("an erased journal has an append point")
+    };
+    let opening = RecordRef::RunStarted {
+        workflow_kind: 0x0042,
+        workflow_version: 4,
+        input: &at_ceiling,
+    };
+    let outcome = journal
+        .stage(&mut device, &opening, &mut page)
+        .and_then(|staged| staged.payload_barrier(&mut device))
+        .and_then(|sealable| sealable.commit(&mut device));
+    assert!(
+        outcome.is_ok(),
+        "the swap installed a run that can never write its opening record: {outcome:?}"
     );
 }
 

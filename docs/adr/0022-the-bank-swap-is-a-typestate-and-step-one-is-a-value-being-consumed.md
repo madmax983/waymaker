@@ -134,7 +134,7 @@ changes closed it and both were real defects rather than gaming: the plan carrie
 eighty-odd-byte plan *by value* to compare one field of it. Passing it by reference and
 dropping the duplicate field, together with trimming the probe row's own arithmetic — a
 three-armed `match` over `Authority` and four `black_box` calls that charged the engine for
-this file — took the figure to **18030 B**, 402 B under the gate. That last part is issue
+this file — took the figure to **18098 B**, 334 B under the gate. That last part is issue
 [#72](https://github.com/madmax983/waymaker/issues/72) in miniature, and is why that issue
 should be fixed before the next raise is argued.
 
@@ -156,6 +156,17 @@ not offered: `Journal::after` taking a finished `Recovery` and nothing else is w
 provably correct one, is a second way to reach an append offset no scan vouched for. The cost
 is a scan of an erased journal on the swap path, which is ADR 0018's erased-tail walk again
 and is filed there rather than worked around here.
+
+**The roll-over gate is the header plus the run's first record, and nothing further.**
+`JournalRegion::of` refuses only a journal of zero bytes, and `BankRegion::max_run_input_bytes`
+— whose own postcondition claimed to be the "can be used with" bound, and was not — reserves
+one *empty* record. §09's `RunStarted` repeats the whole run input, so an input at that
+ceiling installed a bank with a 24-byte journal and a 4064-byte mandatory first record,
+durably, with the swap reporting success. Codex found it on the first review round.
+`SwapError::InputTooLong` now prices the header and that record together. It deliberately
+stops there: an effect scheduled, its outcome and a terminal record are `Reserve::for_layout`'s
+floor, which is a policy about what a run may do rather than a fact about whether the run the
+swap installs can start.
 
 ## Alternatives considered
 

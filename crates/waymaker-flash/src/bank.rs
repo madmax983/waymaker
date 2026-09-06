@@ -372,10 +372,19 @@ impl BankRegion {
     /// # Postconditions
     ///
     /// A header whose input is this long, padded to the layout's granularity, leaves at
-    /// least one record frame of journal behind it — so an input at this ceiling is one a
-    /// bank can actually be used with, not merely one that fits.
-    /// [`BankLayout::new`] refuses a geometry for which that would be zero, so this is never
-    /// larger than [`MAX_RUN_INPUT_BYTES`] and is never negative.
+    /// least one *empty* record frame of journal behind it. [`BankLayout::new`] refuses a
+    /// geometry for which that would be zero, so this is never larger than
+    /// [`MAX_RUN_INPUT_BYTES`] and is never negative.
+    ///
+    /// An empty frame, and not the run's own first record. §09's `RunStarted` repeats the
+    /// whole run input and adds four bytes of workflow identity in front of it, so an input
+    /// at this ceiling leaves a journal two orders of magnitude too small for the record §08
+    /// obliges that run to write first — this is a bound on what a *header* may carry, and a
+    /// caller asking whether a run can be *used* wants
+    /// [`Reserve::for_layout`](crate::capacity::Reserve::for_layout)'s floor or
+    /// [`crate::swap::Swap::beginning`]'s gate, both of which price the record. An earlier
+    /// version of this sentence claimed the stronger thing, and issue #26's swap believed
+    /// it.
     #[must_use]
     pub const fn max_run_input_bytes(self, align: ProgramAlign) -> usize {
         // A whole record, not a frame body: since issue #24 a record ends in a commit seal
