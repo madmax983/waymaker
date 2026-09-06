@@ -226,8 +226,8 @@ fn strip_visibility(line: &str) -> &str {
     }
 }
 
-/// Rule: no source file of any layer re-admits `std` or `alloc`.
-/// Rule: no source file of any layer re-admits `std` or `alloc`.
+/// Rule: no source file of a layer, or of a `no_std` test-support crate, re-admits `std` or
+/// `alloc`.
 ///
 /// The other half of [`check_crate_attributes`]'s `extern crate` scan, which reads crate
 /// roots. A nested module may declare `extern crate alloc;` perfectly legally, and nothing
@@ -236,13 +236,21 @@ fn strip_visibility(line: &str) -> &str {
 /// and `waymaker-spec`'s `bounded-decoding` row still claiming allocation-freedom is
 /// structural. It is structural only because of this.
 ///
+/// The same hole exists for the three crates in
+/// [`NO_STD_TEST_SUPPORT_CRATES`](crate::policy::NO_STD_TEST_SUPPORT_CRATES), and it is worse
+/// there: their firmware-target stages build `--lib`, which produces an rlib and never links,
+/// so no global allocator is required and `cargo build` stays green either way. They are read
+/// here for that reason.
+///
 /// Fires under `crate-attributes` rather than under an id of its own: it is the same rule
 /// about the same thing, read over more files.
 #[must_use]
 pub fn check_layer_sources_are_bare_metal(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
     let mut violations = Vec::new();
     for source in sources {
-        if crate::policy::layer(&source.crate_name).is_none() {
+        let covered = crate::policy::layer(&source.crate_name).is_some()
+            || crate::policy::NO_STD_TEST_SUPPORT_CRATES.contains(&source.crate_name.as_str());
+        if !covered {
             continue;
         }
         for name in extern_crates(&source.contents) {
@@ -274,6 +282,36 @@ mod bare_metal_tests {
             path: path.to_owned(),
             contents: contents.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_no_std_test_support_crate_is_read_the_same_way() {
+        // Codex, pull request #89. The three crates in `NO_STD_TEST_SUPPORT_CRATES` claim
+        // `#![no_std]`, and their firmware-target stages build `--lib` — an rlib, which
+        // never links, so no global allocator is required and `cargo build` stays green
+        // whatever a nested module declares. This rule is the whole of the check.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-drive",
+            "crates/waymaker-drive/src/activity.rs",
+            "extern crate alloc;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("activity.rs"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_side_test_support_crate_is_left_alone() {
+        // `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state
+        // space. Asking either for `#![no_std]` would be asking it to stop doing its job.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-fault",
+            "crates/waymaker-fault/src/device.rs",
+            "extern crate alloc;\n",
+        )]);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]

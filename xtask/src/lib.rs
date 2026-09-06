@@ -204,6 +204,15 @@ pub struct WorkspaceInputs {
     /// attributes, the kernel's encoding ban, the size probe's reach — would then be run
     /// against a crate none of them is about.
     pub rig_sources: Vec<size::LayerSource>,
+    /// Every Rust source file of every crate in `policy::NO_STD_TEST_SUPPORT_CRATES`.
+    ///
+    ///
+    /// Separate from [`layer_sources`](Self::layer_sources) because those crates are not
+    /// layers, and separate from the two fields below because this is about every file
+    /// rather than about one pinned module. `crate-attributes` reads it for the `extern
+    /// crate` scan their firmware-target build stages cannot perform: `--lib` produces an
+    /// rlib and never links, so `alloc` under any of them compiles clean.
+    pub no_std_support_sources: Vec<size::LayerSource>,
     /// Every Rust source file of `waymaker-drive`, in path order.
     ///
     /// Kept apart from [`layer_sources`](Self::layer_sources) for
@@ -267,6 +276,9 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_crate_attributes(&sources));
     violations.extend(source::check_layer_sources_are_bare_metal(
         &inputs.layer_sources,
+    ));
+    violations.extend(source::check_layer_sources_are_bare_metal(
+        &inputs.no_std_support_sources,
     ));
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
@@ -444,6 +456,11 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         }
     }
 
+    let mut no_std_support_sources = Vec::new();
+    for name in policy::NO_STD_TEST_SUPPORT_CRATES {
+        no_std_support_sources.extend(package_sources(&graph, name, root)?);
+    }
+
     let driver_sources = package_sources(&graph, DRIVER_PACKAGE, root)?;
     let rig_sources = package_sources(&graph, RIG_PACKAGE, root)?;
 
@@ -474,6 +491,7 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         probe_source,
         layer_sources,
         rig_sources,
+        no_std_support_sources,
         driver_sources,
         docs,
     })
@@ -790,6 +808,7 @@ mod tests {
             // No rig sources at all: `rig-oracle` fires, because a pin whose file is gone
             // is a pin checking nothing — which is the failure mode the rule exists for.
             rig_sources: Vec::new(),
+            no_std_support_sources: Vec::new(),
             driver_sources: Vec::new(),
             // A kernel with a public function the probe does not call: the reach rule
             // fires, because a function nothing links is a function no budget charges for.
@@ -1087,6 +1106,7 @@ mod tests {
             )),
             layer_sources: clean_layer_sources(),
             rig_sources: clean_rig_sources(),
+            no_std_support_sources: Vec::new(),
             driver_sources: clean_driver_sources(),
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a

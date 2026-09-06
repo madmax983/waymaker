@@ -396,9 +396,14 @@ where
 /// be finished — a run that ends in this boot has a writer open, and a writer knows the scan
 /// is behind it.
 ///
-/// A frame that fails to decode is **not** refused. §14 is explicit that a damaged frame is
+/// A frame that fails to **decode** is not refused. §14 is explicit that a damaged frame is
 /// ignored and the previous history prefix wins, and for a finished run that prefix is the
 /// whole run. Only a *valid sealed* record after the end is impossible.
+///
+/// Every other recovery failure is. A read that failed, a device that is not the one the
+/// region was validated against, a page too small for the next record: none of them says
+/// "nothing follows", they say the driver could not find out. Reporting a clean finish on
+/// one of those is the same mistake as reporting it on a record that does follow.
 fn nothing_follows<S, C>(
     source: &mut Source<C>,
     storage: &mut S,
@@ -413,7 +418,8 @@ where
         Source::Writing(_) | Source::Spent => Ok(()),
         Source::Scanning(recovery) => match recovery.next(storage, page) {
             Some(Ok(_)) => Err(DriveError::HistoryContinues),
-            Some(Err(_)) | None => Ok(()),
+            Some(Err(RecoveryError::Decode(_))) | None => Ok(()),
+            Some(Err(error)) => Err(DriveError::Recovery(error)),
         },
     }
 }

@@ -19,7 +19,7 @@ use waymaker_flash::append::Journal;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
 use waymaker_flash::frame::{self, ProgramAlign};
-use waymaker_flash::recovery::{JournalRegion, Recovery};
+use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::Geometry;
 
 const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
@@ -538,5 +538,58 @@ fn a_damaged_frame_after_the_run_ended_is_ignored_rather_than_refused() {
             conclusion: Conclusion::Completed,
             result_len: HASHED.len()
         }
+    );
+}
+
+#[test]
+fn a_read_that_failed_after_the_run_ended_is_reported_rather_than_taken_for_the_end() {
+    // A record after the terminal one that is longer than the caller's page. The run's own
+    // records all fit, so the scan gets that far and then cannot answer — which is not the
+    // same as answering "nothing follows", and reporting a clean finish on it would be the
+    // same mistake as reporting one on a record that really does follow.
+    let mut device = a_completed_run();
+    let mut roomy = [0_u8; 256];
+    {
+        let mut scan = Recovery::new(region());
+        while scan.next(&mut device, &mut roomy).is_some() {}
+        let Some(mut journal) = Journal::after(scan) else {
+            unreachable!("the completed run ends in erased media")
+        };
+        let record = RecordRef::EffectCompleted {
+            seq: EffectSeq(2),
+            result: &[0x5A; 100],
+        };
+        let Ok(staged) = journal.stage(&mut device, &record, &mut roomy) else {
+            unreachable!("the record fits the region")
+        };
+        let Ok(sealable) = staged.payload_barrier(&mut device) else {
+            unreachable!("the model's barrier cannot fail")
+        };
+        let Ok(_) = sealable.commit(&mut device) else {
+            unreachable!("the model's program cannot fail here")
+        };
+    }
+
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 64];
+    let mut result = [0_u8; 64];
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a read the driver could not complete is not an end of history")
+    };
+    assert!(
+        matches!(
+            error,
+            DriveError::Recovery(RecoveryError::PageTooSmall { .. })
+        ),
+        "{error:?}"
     );
 }
