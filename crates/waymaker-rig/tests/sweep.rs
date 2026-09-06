@@ -29,39 +29,45 @@
 //!
 //! # What the filled watchdog cells buy, stated exactly
 //!
-//! Less than a reader would assume, and the exact amount is measured rather than described.
+//! Less at a write point than a reader would assume, and the amount is measured rather than
+//! described.
 //!
 //! On media a watchdog reset is *weaker* than a brownout: `waymaker-fault`'s
 //! `every_watchdog_image_is_one_a_power_cut_also_produces` proves it. The two causes part
-//! company over what the *call* answered, so they can only diverge where something other than
-//! another storage call follows a completed operation. In this rig that is the dispatch, and
-//! nowhere else — at a schedule or a completion write the next thing is another storage call,
-//! which fails under either cause.
+//! company over what the *call* answered, so at a *completed* operation they can only diverge
+//! where something other than another storage call follows — which in this rig is the
+//! dispatch, and nowhere else.
 //!
 //! [`the_two_causes_part_company_only_where_an_effect_follows_a_completed_call`] is that,
-//! measured: identical media at every operation, identical dispatch wherever the *engine* was
-//! interrupted, and a divergence somewhere. So the `(Schedule, Watchdog)` and
-//! `(Completion, Watchdog)` cells record that the cause was performed and that recovery
-//! survived it; they do not record a run their power-cut twins did not also produce. Saying
-//! so is the difference between a census and a tally.
+//! measured over whole operations: identical media at every one, identical dispatch wherever
+//! the *engine* was interrupted, and a divergence somewhere. So at a schedule or a completion
+//! write the watchdog cell records that the cause was performed and that recovery survived it;
+//! it does not record a run its power-cut twin did not also produce. Saying so is the
+//! difference between a census and a tally.
 //!
-//! # Five cells, not six
+//! # How the dispatch cell fills under a watchdog reset
 //!
-//! The one cell where the causes really do diverge is the one a host cannot fill, and that is
-//! not a coincidence — it is the same sentence read the other way. Being *in* the dispatch
-//! window needs the dispatch mark's commit barrier to have returned, and a watchdog reset is
-//! the reset that does not return.
-//! [`the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth`] requires the census to
-//! name that cell rather than pass over it. A board's watchdog fires on a timer rather than at
-//! a call boundary, so it can land inside the window; that is the thing this injector, whose
-//! every crash point is a storage operation, does not supply.
+//! Not at the dispatch mark's own commit barrier — that barrier does not return under this
+//! cause, so the effect never goes out. It fills one operation later: the reset lands inside
+//! the *next* witness mark, with the schedule record committed, the dispatch mark whole and
+//! the dispatcher already entered. That is the window design document §02 decision 3 opens,
+//! and [`phase_of`] earns the cell from `effects` rather than from the mark, exactly as it
+//! does for a power cut.
+//!
+//! It is reachable only because a watchdog reset is enumerated at interior unit boundaries as
+//! well as at whole operations. An earlier version of this change enumerated whole operations
+//! only, arguing the interior points were power-cut points already listed; Codex found the
+//! hole in that argument — the two causes hand the writer different errors, and this crate's
+//! writer is under no obligation to propagate — and closing it closed this cell too.
 //!
 //! # What the boards still owe
 //!
-//! The sixth cell, and everything physical for both causes. A real part may abort the unit in
-//! flight, may leave a bit at neither level, and has a reset-cause register no model has; RAM
-//! retention is real there and is modelled here only in `tests/teeth.rs`, as the shortcut it
-//! makes available. `xtask::docs::HARDWARE_TARGETS` carries both rows and both stay `Not run`.
+//! Everything physical, for both causes. A real part may abort the unit in flight rather than
+//! finish it, may leave a bit at neither level, has a reset-cause register no model has, and
+//! runs a watchdog off a timer rather than at a call boundary; RAM retention is real there and
+//! is modelled here only in `tests/teeth.rs`, as the shortcut it makes available.
+//! `xtask::docs::HARDWARE_TARGETS` carries both rows and both stay `Not run`. A complete
+//! census here is a complete census *of the model*.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -374,7 +380,7 @@ fn every_crash_point_leaves_media_the_oracle_accepts() {
 }
 
 #[test]
-fn the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth() {
+fn the_sweep_covers_every_cell_of_the_census() {
     // Issue #27's census, all six cells. A sweep that never reached a dispatch-phase reset has
     // said nothing about that cell, and this is what makes the silence a failure.
     let harness = Harness::new(geometry());
@@ -428,9 +434,7 @@ fn the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth() {
             coverage = coverage.record(phase, cause);
         }
     }
-    // Five of the six. The write points are reached under both causes; the dispatch *window*
-    // is reached under a power cut only, for the reason below.
-    for phase in [Phase::Schedule, Phase::Completion] {
+    for phase in Phase::ALL {
         for cause in ResetCause::ALL {
             assert!(
                 coverage.iterations(phase, cause) > 0,
@@ -440,22 +444,9 @@ fn the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth() {
             );
         }
     }
-    assert!(coverage.iterations(Phase::Dispatch, ResetCause::PowerCut) > 0);
-
-    // The sixth is a board's, and the census names it rather than passing over it. Reaching
-    // the dispatch window needs the mark's commit barrier to have *returned*, and a watchdog
-    // reset is the reset that does not return: the effect never goes out, so no host run is
-    // ever in the window. A board's watchdog fires on a timer rather than at a call boundary,
-    // which is exactly the thing a model cannot supply.
-    let gap = coverage
+    coverage
         .verdict()
-        .expect_err("a host cannot be in the dispatch window under a watchdog reset");
-    assert_eq!(gap.phase(), Phase::Dispatch);
-    assert_eq!(gap.cause(), ResetCause::Watchdog);
-    assert_eq!(
-        coverage.iterations(Phase::Dispatch, ResetCause::Watchdog),
-        0
-    );
+        .expect("every cell of the census was reached");
 }
 
 #[test]

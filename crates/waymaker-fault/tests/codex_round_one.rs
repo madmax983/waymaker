@@ -191,17 +191,14 @@ fn a_writer_that_renumbers_its_records_between_runs_is_refused() {
 
 #[test]
 fn a_writer_that_issues_no_operations_still_sweeps() {
-    // `injections(&[], geometry)` returns the one crash point that precedes everything, and
-    // an empty sequence is explicitly supported. A sweep that refused it would report a
-    // determinism failure for a writer that is perfectly deterministic.
-    //
-    // Two runs rather than three: `Interruption::Watchdog` is enumerated only at whole
-    // operations, and there are none.
+    // `injections(&[], geometry)` returns the crash points that precede everything — one per
+    // reset cause — and an empty sequence is explicitly supported. A sweep that refused it
+    // would report a determinism failure for a writer that is perfectly deterministic.
     let runs = match Harness::new(geometry()).run(|_session| Ok::<(), FaultError>(())) {
         Ok(runs) => runs,
         Err(error) => unreachable!("{error}"),
     };
-    assert_eq!(runs.len(), 2);
+    assert_eq!(runs.len(), 3);
     assert!(runs.iter().all(|run| run.ops().is_empty()));
     assert!(runs.iter().all(|run| run.ledger().is_empty()));
     assert!(runs.iter().all(|run| run.image() == [0xFF; 64]));
@@ -216,7 +213,7 @@ fn a_writer_that_only_declares_a_record_still_sweeps() {
         Ok(runs) => runs,
         Err(error) => unreachable!("{error}"),
     };
-    assert_eq!(runs.len(), 2);
+    assert_eq!(runs.len(), 3);
     for run in &runs {
         assert_eq!(run.ledger().state(RecordId(0)), Some(Durability::Attempted));
         assert_eq!(verify_recovery(run.ledger(), &[]), Ok(()));

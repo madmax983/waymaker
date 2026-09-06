@@ -47,9 +47,15 @@ fn a_four_byte_program_tears_at_every_byte_inside_it() {
             power(Progress::Bytes(2)),
             power(Progress::Bytes(3)),
             power(Progress::Whole),
-            // Watchdog: the operation completed and the core stopped before the call
-            // returned. One point, because every other watchdog world is a power-cut world
-            // this list already has — see `Interruption::Watchdog`.
+            // Watchdog: the reset before anything, then the whole operation with the core
+            // stopping before the call returned. No interior point, because a four-byte
+            // program on a four-byte unit has no unit boundary inside it — see
+            // `Interruption::Watchdog`.
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
             Injection {
                 op: 0,
                 progress: Progress::Whole,
@@ -163,27 +169,37 @@ fn the_enumeration_is_a_pure_function_and_has_no_duplicates() {
 #[test]
 fn the_count_is_the_arithmetic_the_sequence_implies() {
     // Power loss: one before anything, plus one per tear point, plus one after each op.
-    // Watchdog: one per op, because only a whole operation is a world of its own.
+    // Watchdog: the same shape at unit boundaries — one before anything, one per interior
+    // boundary, one after each op. Eight bytes of four-byte units has one interior boundary.
     // Failure: one per tear point plus `None` and `Whole` for each mutating op, and a
     // single point for each barrier.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let points = injections(&ops, geometry());
     let power = 1 + 7 + 1 + 1;
-    let watchdog = 1 + 1;
+    let watchdog = 1 + 1 + 1 + 1;
     let failure = (7 + 2) + 1;
     assert_eq!(points.len(), power + watchdog + failure);
 }
 
 #[test]
-fn an_empty_sequence_still_has_the_crash_point_before_it_started() {
+fn an_empty_sequence_still_has_the_crash_points_before_it_started() {
+    // One per reset cause. Both leave media untouched; they differ in what the writer's first
+    // call is told, which is the whole of the difference between the two causes.
     let points = injections(&[], geometry());
     assert_eq!(
         points,
-        vec![Injection {
-            op: 0,
-            progress: Progress::None,
-            interruption: Interruption::PowerLoss,
-        }]
+        vec![
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::PowerLoss,
+            },
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+        ]
     );
 }
 
@@ -206,6 +222,11 @@ fn an_operation_that_mutates_nothing_contributes_no_duplicate_worlds() {
                 op: 0,
                 progress: Progress::None,
                 interruption: Interruption::PowerLoss,
+            },
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
             },
             // The call still fails, and the writer still reacts to it: that is a crash
             // point, and it is the only one either operation has.

@@ -51,21 +51,28 @@ dispatches after a power cut and does not after a watchdog reset.
 **RAM survives.** Nothing in `waymaker-fault` models RAM. `waymaker-rig` owns that half,
 because a durable witness is exactly what RAM retention would let a reader skip.
 
-Only `(i, Whole, Watchdog)` is enumerated. Every other watchdog world is a power-cut world the
-list already has: rounding up maps a reset inside a unit onto the power cut at the boundary
-above it, the writer is dead in both, and an exhaustive list that counts one crash point twice
-is no longer a count of anything. `tests/watchdog.rs` measures both halves of that claim —
-`a_watchdog_reset_inside_a_unit_is_a_power_cut_at_the_boundary_above_it` for the worlds left
-out, and `a_watchdog_reset_at_a_whole_operation_is_not_a_power_cut_at_one` for the one kept.
+The enumeration is the same shape as the power-cut half at a coarser granularity: a reset
+before the sequence, an interior point per *unit* boundary, and one per whole operation. A
+point inside a unit is the boundary above it — the unit completes, so the media are the same
+and the caller is answered the same — and an exhaustive list that counts one crash point twice
+is no longer a count of anything. `a_watchdog_reset_inside_a_unit_is_the_watchdog_reset_at_the_boundary_above_it`
+measures that; `a_watchdog_reset_at_a_unit_boundary_is_not_the_power_cut_beside_it` measures
+why it stops there.
 
-On media a watchdog reset is therefore *weaker* than a brownout, and that is stated as a
+That second test is Codex's, from the first review round on this pull request, and the version
+of this ADR it reviewed had the argument wrong. It said the interior watchdog points were
+power-cut points already listed, on the grounds that the media agreed and "the writer is dead
+in both". The writer is not dead: this crate's writer is any `FnMut` over a `Session`, the two
+causes hand it different errors, and nothing obliges it to propagate one. A writer that reacts
+takes a different path, and a sweep that listed only the brownout would never run it.
+
+On media a watchdog reset is nevertheless *weaker* than a brownout, and that is stated as a
 theorem rather than left as a silence:
 `every_watchdog_image_is_one_a_power_cut_also_produces` proves the inclusion over the real
 journal writer. What rules out a relabelling is not that inclusion — it is proper for a
 structural reason, since a power cut is enumerated at every interior byte and a watchdog reset
-only at whole operations, so the count would separate them however they behaved. It is
-`a_watchdog_reset_at_a_whole_operation_is_not_a_power_cut_at_one`, where the two answer the
-caller differently.
+only at unit boundaries, so the count would separate them however they behaved. It is the two
+tests above, where the two causes answer the caller differently.
 
 `waymaker-rig`'s census credits a cell from the injector's own cause. `cause_of` reads
 `injection.interruption` and nothing else, and
@@ -74,29 +81,29 @@ rather than the progress. That is the rule the rejected first attempt broke.
 
 ## Consequences
 
-**Five of the six census cells are now filled on a host, and the sixth is named.** The
-schedule and completion write points are reached under both causes. The *dispatch window* is
-reached under a power cut only, and the reason is the second difference above: being in that
-window needs the dispatch mark's commit barrier to have returned, and a watchdog reset is the
-reset that does not return. No host run is ever in the window under one. A board's watchdog
-fires on a timer rather than at a call boundary, so it can land inside the window; this
-injector, whose every crash point is a storage operation, cannot.
+**All six census cells are now filled on a host**, and
+`the_sweep_covers_every_cell_of_the_census` requires `Coverage::verdict` to pass rather than
+name a gap. The dispatch cell is the one worth explaining. It does *not* fill at the dispatch
+mark's own commit barrier — that barrier does not return under this cause, so the effect never
+goes out. It fills one operation later, when the reset lands inside the next witness mark with
+the schedule record committed, the dispatch mark whole and the dispatcher already entered.
+`phase_of` earns the cell from the dispatcher having run rather than from the mark, exactly as
+it does for a power cut.
 
-**And the two cells that are filled buy less than a reader would assume.** The same sentence,
-read forwards: the causes can only diverge where something other than another storage call
-follows a completed operation, so at a schedule or a completion write they do not diverge at
-all — the media, the ledger and the dispatch are the same as the power-cut twin's, and only
-the cause the injector armed differs.
-`the_two_causes_part_company_only_where_an_effect_follows_a_completed_call` measures all three
-of those and requires a divergence to exist somewhere, so the claim is checked in both
-directions. Those cells therefore record that the cause was performed and that recovery
-survived it. They are not new coverage of media, and saying so is the difference between a
-census and a tally. It is also the strongest objection to this change, which is why it is a
-test rather than a paragraph.
+That cell was unreachable under the whole-operations-only enumeration, and the correction
+Codex forced closed it. Two things that were owed to hardware are therefore not.
 
-`the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth` asserts the five and
-requires `Coverage::verdict` to refuse the run, naming `(Dispatch, Watchdog)`. A census that
-reported six would be reporting coverage nothing produced.
+**At a write point, though, the filled watchdog cells buy less than a reader would assume.**
+At a *completed* operation the causes can only diverge where something other than another
+storage call follows, so at a schedule or a completion write they do not diverge at all — the
+media, the ledger and the dispatch are the power-cut twin's, and only the cause the injector
+armed differs.
+`the_two_causes_part_company_only_where_an_effect_follows_a_completed_call` measures the media
+at every operation, the dispatch wherever the engine was interrupted, and requires a divergence
+to exist somewhere, so the claim is checked in both directions. Those cells record that the
+cause was performed and that recovery survived it. Saying so is the difference between a census
+and a tally, and it is the strongest objection to this change, which is why it is a test rather
+than a paragraph.
 
 **The third difference is measured as a cost rather than modelled as a state.** RAM retention
 makes two shortcuts available on a board that a brownout forbids, and the rig's teeth take one
@@ -140,23 +147,24 @@ the caller said did nothing, which is a check failing in the direction a check m
 here, with `a_barrier_stopped_at_zero_bytes_is_a_barrier_that_did_nothing`, because the new
 cause adds a second way to reach it.
 
-**The boards still owe both causes, and now owe one more thing.** A real part may abort the
-unit in flight rather than finish it, may leave a bit at neither level, and has a reset-cause
-register no model has. `HARDWARE_TARGETS` carries both rows and both stay `Not run`. The
-dispatch-window watchdog cell is inside them.
+**The boards still owe both causes.** A real part may abort the unit in flight rather than
+finish it, may leave a bit at neither level, has a reset-cause register no model has, and runs
+its watchdog off a timer rather than at a call boundary. RAM retention is real there and is
+modelled nowhere. `HARDWARE_TARGETS` carries both rows and both stay `Not run`: a complete
+census here is a complete census *of the model*.
 
 ## Alternatives considered
 
-**Enumerate a watchdog reset at every byte, like a brownout.** Rejected: with the rounding,
-those runs are the power-cut runs at the unit boundary above, so the sweep would have doubled
-in the places it is largest to re-verify images it had already verified. The crate's own rule
-against counting a crash point twice decides it.
+**Enumerate a watchdog reset at every byte, like a brownout.** Rejected: a reset inside a unit
+leaves what the reset at the boundary above it leaves *and* answers the caller the same way, so
+those runs are duplicates of one another. The crate's own rule against counting a crash point
+twice decides it.
 
-**Enumerate a watchdog reset at unit boundaries.** The first version of this change did, and
-it is still a duplicate: a reset at `Bytes(k * unit)` leaves what a power cut there leaves,
-and the writer is dead in both. It survived one round of thinking because "unit-aligned" reads
-like new information; it is not, and `a_watchdog_reset_inside_a_unit_is_a_power_cut_at_the_boundary_above_it`
-is that realisation kept as a test.
+**Enumerate a watchdog reset at whole operations only.** The version of this change Codex
+reviewed did, arguing that an interior watchdog point was the power cut beside it. That is
+wrong, and it is wrong in the direction that loses coverage: the media agree, the *answers* do
+not, and a writer that reacts to an error rather than propagating it takes a different path
+under each. It also cost the dispatch census cell, which the correction returns.
 
 **Model the reset-cause register.** A durable byte the rig reads back after a reset. It would
 be true on a board and vacuous here: nothing in the model would read it that does not already
@@ -169,6 +177,5 @@ would stop being reusable by any writer. The rig is where the writer lives, so t
 where the cost is measured.
 
 **Leave the three cells to hardware.** The status quo, and the thing this ADR argues against.
-It is defensible for the dispatch cell, where the model genuinely cannot produce the world,
-and it was not defensible for the other two, where it produced no coverage for an acceptance
-criterion that had none.
+It produced no coverage at all for an acceptance criterion that had none, on a standard the
+power-cut half is not held to.

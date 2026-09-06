@@ -12,14 +12,16 @@
 //!
 //! # Where the six stand
 //!
-//! A host sweep fills five. `waymaker_fault::Interruption::Watchdog` performs a real core
-//! reset, so the schedule and completion write points are reached under both causes.
+//! A host sweep fills all six: `waymaker_fault::Interruption::Watchdog` performs a real core
+//! reset, at every unit boundary and after every operation.
 //!
-//! The sixth — a watchdog reset in the *dispatch window* — is a board's, and for a stated
-//! reason rather than for want of trying: being in that window needs the dispatch mark's
-//! commit barrier to have returned, and a watchdog reset is the reset that does not return. A
-//! board's watchdog fires on a timer instead. So this type keeps refusing a host run, and
-//! `xtask::docs::HARDWARE_TARGETS` is where the cell is owed.
+//! The dispatch cell fills a little later under that cause than under a power cut. A watchdog
+//! reset at the dispatch mark's commit barrier never dispatches, because that barrier does not
+//! return; the cell is earned one operation on, when the reset lands inside the next mark with
+//! the effect already out.
+//!
+//! A complete census here is a complete census *of the model*. The physical half of both
+//! causes is owed by `xtask::docs::HARDWARE_TARGETS`, whose two rows stay `Not run`.
 
 use crate::phase::{Phase, ResetCause};
 

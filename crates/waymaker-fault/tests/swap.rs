@@ -434,17 +434,20 @@ const COMMIT_OP: usize = FIRST_OP + 5;
 /// How many crash points [`waymaker_fault::injections`] gives one program of `len` bytes.
 ///
 /// Every interior byte is a tear point and each tear is enumerated twice — once as a power
-/// loss and once as a failure the writer sees — and then four more: the whole operation
-/// followed by a power loss, the whole operation followed by a watchdog reset, a failure
-/// before it, and a failure after it. Derived rather than measured, so the census below fails
-/// when the sweep *shrinks* rather than when a fixture's input length changes.
-const fn points_in_a_program(len: u32) -> usize {
-    2 * (len as usize - 1) + 4
+/// loss and once as a failure the writer sees — and every interior *unit* boundary once more,
+/// as a watchdog reset. Then four: the whole operation followed by a power loss, the whole
+/// operation followed by a watchdog reset, a failure before it, and a failure after it.
+/// Derived rather than measured, so the census below fails when the sweep *shrinks* rather
+/// than when a fixture's input length changes.
+fn points_in_a_program(len: u32) -> usize {
+    let units = (len / geometry().program_size()) as usize;
+    2 * (len as usize - 1) + 4 + units - 1
 }
 
-/// The same, for an erase: interrupted at erase blocks and nowhere else.
+/// The same, for an erase: interrupted at erase blocks and nowhere else, so its tear points
+/// and its reset points are the same boundaries.
 const fn points_in_an_erase(blocks: u32) -> usize {
-    2 * (blocks as usize - 1) + 4
+    3 * (blocks as usize - 1) + 4
 }
 
 /// The same, for a barrier: it has no interior, so a power loss after it, a watchdog reset
@@ -719,9 +722,11 @@ fn the_recovery_rules_hold_at_every_crash_point_of_the_swap() {
             Op::Barrier => POINTS_IN_A_BARRIER,
         })
         .sum();
+    // Plus the fault-free run and the two crash points that precede the whole sequence, one
+    // per reset cause.
     assert_eq!(
         runs.len(),
-        enumerated + 2,
+        enumerated + 3,
         "the sweep is not the enumeration"
     );
 
@@ -813,7 +818,8 @@ fn every_step_of_the_protocol_has_crash_points_in_the_sweep() {
 
     // And the two erases really are interrupted part-way, which is what four blocks a bank
     // buys: a bank half erased is the state §10 step 7's crash-safety is about. Two erases,
-    // each torn at every interior block, each tear enumerated twice.
+    // each torn at every interior block, each boundary enumerated three times — a power cut,
+    // a watchdog reset and a failure.
     let torn_erases = runs
         .iter()
         .filter(|run| {
@@ -830,7 +836,7 @@ fn every_step_of_the_protocol_has_crash_points_in_the_sweep() {
         .count();
     assert_eq!(
         torn_erases,
-        2 * 2 * (blocks_per_bank() as usize - 1),
+        2 * 3 * (blocks_per_bank() as usize - 1),
         "a half-erased bank is the state §10 step 7's crash-safety is about"
     );
     assert!(

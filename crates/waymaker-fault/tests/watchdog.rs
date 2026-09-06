@@ -22,9 +22,11 @@
 //! leaves is an image some power cut also leaves, and
 //! [`every_watchdog_image_is_one_a_power_cut_also_produces`] proves it over the real journal
 //! writer rather than asserting it. So the difference between the two causes is never on
-//! media. It is in what the *call* answered, and it is only observable where something other
-//! than another storage call follows a completed operation — which in `waymaker-rig` is the
-//! dispatch, and nowhere else.
+//! media. It is in what the *call* answered — at every crash point, not only at
+//! [`Progress::Whole`] — which is why a watchdog reset is enumerated at boundaries of its own
+//! rather than folded into the brownout that left the same bytes. For a writer that
+//! propagates, the difference then shows only where something other than another storage call
+//! follows a *completed* operation, which in `waymaker-rig` is the dispatch and nowhere else.
 //!
 //! # What is still owed to a board
 //!
@@ -323,10 +325,11 @@ fn a_watchdog_reset_acknowledges_a_record_the_writer_never_saw_ordered() {
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn a_watchdog_reset_is_enumerated_at_whole_operations_and_nowhere_else() {
-    // Every other watchdog world is a power-cut world this list already has, and an
-    // enumeration that counts one crash point twice is no longer a count of anything. The two
-    // tests below are what makes that a measurement rather than an assumption.
+fn a_watchdog_reset_is_enumerated_at_unit_boundaries_and_nowhere_else() {
+    // The same shape as the power-cut half, at a coarser granularity: a reset before anything,
+    // an interior point per unit, and a whole operation. A point *inside* a unit would be the
+    // boundary above it, and an enumeration that counts one crash point twice is no longer a
+    // count of anything.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let watchdog: Vec<_> = injections(&ops, geometry())
         .into_iter()
@@ -336,13 +339,26 @@ fn a_watchdog_reset_is_enumerated_at_whole_operations_and_nowhere_else() {
     assert_eq!(
         watchdog,
         vec![
+            // The core resets before the sequence begins.
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+            // One unit landed and the core stopped. Eight bytes of 4-byte units has one
+            // interior boundary.
+            Injection {
+                op: 0,
+                progress: Progress::Bytes(UNIT),
+                interruption: Interruption::Watchdog,
+            },
             Injection {
                 op: 0,
                 progress: Progress::Whole,
                 interruption: Interruption::Watchdog,
             },
-            // A barrier has no interior and still has this point: it completed, and the core
-            // stopped before it returned. Design document §02 decision 3 is about that state.
+            // A barrier has no interior and still has the last point: it completed, and the
+            // core stopped before it returned. §02 decision 3 is about that state.
             Injection {
                 op: 1,
                 progress: Progress::Whole,
@@ -353,15 +369,15 @@ fn a_watchdog_reset_is_enumerated_at_whole_operations_and_nowhere_else() {
 }
 
 #[test]
-fn a_watchdog_reset_inside_a_unit_is_a_power_cut_at_the_boundary_above_it() {
-    // Why the interior points are left out, measured. The controller finishes the unit, so a
-    // reset one byte in leaves what a power cut four bytes in leaves, and the writer is dead
-    // in both.
+fn a_watchdog_reset_inside_a_unit_is_the_watchdog_reset_at_the_boundary_above_it() {
+    // Why the interior of a unit is not enumerated, measured. The controller finishes the
+    // unit, so the media are the same — and the cause is the same, so the caller is answered
+    // the same. One crash point.
     let boundary = run_one(
         Injection {
             op: 0,
             progress: Progress::Bytes(UNIT),
-            interruption: Interruption::PowerLoss,
+            interruption: Interruption::Watchdog,
         },
         one_program,
     );
@@ -377,9 +393,48 @@ fn a_watchdog_reset_inside_a_unit_is_a_power_cut_at_the_boundary_above_it() {
         assert_eq!(
             watchdog.image(),
             boundary.image(),
-            "a watchdog reset {inside} bytes in is not the power cut at the unit above it"
+            "a watchdog reset {inside} bytes in is not the one at the unit above it"
         );
     }
+}
+
+#[test]
+fn a_watchdog_reset_at_a_unit_boundary_is_not_the_power_cut_beside_it() {
+    // Why an interior watchdog point is *not* folded into the brownout that left the same
+    // bytes. Codex found this on the first review round, and it is a defect in an argument
+    // rather than in the media: the two causes leave the same image and hand the writer
+    // different errors, and this crate's writer is any `FnMut` over a `Session`. Nothing
+    // obliges it to propagate. One that catches the error and does something which is not a
+    // storage call — dispatch an effect, take a branch — behaves differently under the two,
+    // so a sweep that listed only one of them would never run the other path.
+    let seen = RefCell::new(Vec::new());
+    let mut writer = |session: &mut Session| {
+        // A writer that reacts rather than propagates, which is what makes the point.
+        let result = session.program(0, PAYLOAD);
+        seen.borrow_mut().push(result);
+        Ok(())
+    };
+    for interruption in [Interruption::PowerLoss, Interruption::Watchdog] {
+        drop(run_one(
+            Injection {
+                op: 0,
+                progress: Progress::Bytes(UNIT),
+                interruption,
+            },
+            &mut writer,
+        ));
+    }
+    let seen = seen.into_inner();
+    assert_eq!(
+        seen.get(1),
+        Some(&Err(FaultError::PowerLoss)),
+        "a power cut at a unit boundary tells the writer the power went"
+    );
+    assert_eq!(
+        seen.get(3),
+        Some(&Err(FaultError::WatchdogReset)),
+        "a watchdog reset at the same boundary tells the writer the core went"
+    );
 }
 
 #[test]
