@@ -257,7 +257,12 @@ fn width(record: &RecordRef<'_>) -> u32 {
 
 /// Writes a bank header and its generation seal, and hands back the journal behind them.
 ///
-/// §10's steps 3 to 6, done by hand because the writer that will do them is issue #26's.
+/// §10's steps 3 to 6, done by hand.
+///
+/// Not `waymaker_flash::swap`, which does them for real: that writer installs a run into the
+/// bank the device did *not* boot, and what these tests need is a bank set up from nothing.
+/// A fixture built with the writer under test in the next file over would also be a fixture
+/// that agrees with it.
 fn install(device: &mut Nor, id: BankId, generation: Generation, input: &[u8]) -> JournalRegion {
     install_on(device, layout(), id, generation, input)
 }

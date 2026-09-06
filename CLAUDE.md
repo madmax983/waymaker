@@ -349,11 +349,12 @@ last raise that should happen before issue
 a figure a third of which is the probe is a raise argued from the wrong number. Issue
 [#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap is to be measured against
 a corrected figure rather than against a third raise, and it was: §10's seven-step swap
-lands at **17966 B** against the same 18 KiB gate, with no raise asked for.
+lands at **18030 B** against the same 18 KiB gate, with no raise asked for.
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md)
 records what it took, because the first measurement was 42 B *over* — a plan carrying a
 geometry the region beside it already held, and five steps taking that plan by value to
-compare one field of it. Both were real defects and fixing them bought 460 B. A third of the
+compare one field of it. Both were real defects, and with a trim of the probe's own
+arithmetic beside them they are 444 B. A third of the
 measured "core + flash adapter" figure is still the probe rather than either, which is a
 defect in the measurement and is filed as issue
 [#72](https://github.com/madmax983/waymaker/issues/72).
@@ -637,7 +638,7 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
 - **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
   the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 5 KiB of 17966 B at rung 0.2. ADR 0002 says so, ADR
+  calls "core + flash adapter" — roughly 5 KiB of 18030 B at rung 0.2. ADR 0002 says so, ADR
   0017 attributes rung 0.2's first figure by symbol, ADR 0019 splits the writer out and
   ADR 0020 the reserve, but nothing *checks* the split: doing so needs a call graph, and all
   three attributions are readings of measurements rather than gates.
@@ -708,6 +709,16 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
+- **That the authority a swap was planned from is the device's.** `Swap::beginning` takes
+  `bank::select`'s answer and the retiring run's id as arguments and reads no media, so
+  neither is verified. A wrong `run` disables the `SwapError::RunReused` refusal; a *stale*
+  `booted`, naming a bank that has since lost a swap, makes `Swap::prepare` erase the bank
+  that is really authoritative — and every check in the module passes, because the retired
+  reader genuinely is over the bank `booted` named. The refusal that would close it is a read
+  of the spare bank's seal and it cannot be made fail-closed: the header it would decode is as
+  long as the previous run's input, which the caller's page need not hold. It is a
+  precondition on `Swap::beginning`, and closing it by construction is the dispatcher's, at
+  0.4 — the same standing as "nothing obliges a future dispatcher to use the gated writer".
 - **A swap step added to §10's protocol from another file, and what a swap really erases.**
   `swap-discipline` pins one file, exactly as `capacity-reserve`, `recovery-surface` and
   `storage-contract` each say of the one they pin: an `impl Prepared { pub fn commit(..) }` in
@@ -1027,26 +1038,33 @@ holds. Which bank is erased is never a parameter, at either end: the bank instal
 the one the device did not boot and the bank reclaimed is the one it did, both fixed at
 `beginning`, which is what makes §10's lazy step 7 crash-safe by construction — the new bank
 already carries a strictly higher generation, so an interrupted erase of the old one can only
-remove a candidate and never promote one. The seal is computed from the bytes the `program`
-call accepted rather than from the header the writer meant to write, which is the difference
-between the real writer and `waymaker-fault`'s `swap_that_seals_whatever_landed`. Three
+remove a candidate and never promote one. A seal is never programmed over a header that did not land, and
+the reason is the `?` on the program call rather than where the digest came from —
+`waymaker-fault`'s `swap_that_seals_whatever_landed` has two bugs and the real writer avoids
+the second. Three
 different mechanisms hold three different claims, and the ADR is explicit about which:
 `swap-discipline` and a `compile_fail` doctest hold the step order; the crash windows are
 `crates/waymaker-fault/tests/swap.rs`, which drives the real writer at every crash point of
 every step, censuses the steps so a thinning sweep fails the build, and keeps three mutant
 swaps as teeth — one that clears the bank it booted, one that repeats a generation, and one
 that takes step 7 before step 6; and that the barriers are *real* is still §12's contract and
-`waymaker-conformance`'s across-reset witness. Effect identity is the third "done when" and
-is structural rather than remembered: `Installed::allocator` is the run the swap installed,
-starting at `EffectSeq::FIRST`, and `SwapError::RunReused` is what stops the two runs' `(RunId,
-EffectSeq)` pairs from collapsing into one. Two things came out of this rather than out of
+`waymaker-conformance`'s across-reset witness. Effect identity is the third "done when":
+`Installed::allocator` is the run the swap installed, starting at `EffectSeq::FIRST`, and
+`SwapError::RunReused` refuses the one input under which the two runs' `(RunId, EffectSeq)`
+pairs would collide — as far as the `run` it is handed is the real one, which is a
+precondition and not a check. Two things came out of this rather than out of
 reading the code. The first measurement was 42 B *over* the 18 KiB gate, and the two defects
 that closed it were a plan carrying a geometry the region beside it already held and five
-steps taking that eighty-byte plan by value to compare one field — 460 B, and no third raise,
-which is what ADR 0020 asked for. And what is still owed is written down: `waymaker-spec`'s
+steps taking that eighty-byte plan by value to compare one field. Those two and a trim of the
+probe's own arithmetic are 444 B between them, and no third raise, which is what ADR 0020
+asked for. And what is still owed is written down: `waymaker-spec`'s
 banks hold no records, so §14's "never recover the old run as current" is still proved about
-a model rather than about this code, and nothing obliges a caller to consult the capacity
-reserve before swapping — that is rung 0.4's dispatcher. See
+a model rather than about this code; nothing obliges a caller to consult the capacity reserve
+before swapping; and two of `Swap::beginning`'s arguments are preconditions this module
+cannot check — all three are rung 0.4's dispatcher. Review found the sharper half of that
+last one, and it is in [what is not checked](#what-is-not-checked) rather than implied: a
+*stale* `booted` makes the swap erase the bank that is really authoritative, and every check
+in the module passes. See
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md).
 
 [`swap`]: crates/waymaker-flash/src/swap.rs

@@ -1181,6 +1181,17 @@ pub const APPEND_COMMIT_STEP: &str = "commit";
 /// [`Sealable`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
 pub const APPEND_BARRIER_CALL: &str = "storage.barrier().map_err(AppendError::Storage)?";
 
+/// The whole expression a commit seal must be programmed with.
+///
+/// §07 step 3's other half. [`APPEND_BARRIER_CALL`] pins the *payload* barrier, and until a
+/// review of issue #26's swap found the same shape missing there, the commit's own program
+/// and barrier were pinned by nothing: a `let _ = storage.barrier();` here leaves a caller
+/// holding a `WriteAmplification` for a record whose seal never became durable, and the
+/// journal advances over it. Neither the fault sweep nor any test can see it —
+/// `waymaker_fault::Device`'s barrier changes no media, so the image is identical either way.
+pub const APPEND_COMMIT_CALL: &str =
+    "storage.program(self.seal_at, self.seal).map_err(AppendError::Storage)?";
+
 /// Rule: a commit seal cannot be programmed without the payload barrier in front of it.
 ///
 /// Issue #24's second "done when" is a `compile_fail` doctest in the crate itself, which
@@ -1322,6 +1333,8 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
         invocation(body, "storage.barrier") == Invocation::Once
             && squeezed(body).contains(&squeezed(APPEND_BARRIER_CALL))
     });
+
+    violations.extend(check_append_commit(&code));
     if !takes_the_barrier {
         violations.push(Violation::new(
             RULE,
@@ -1336,6 +1349,40 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
     }
 
     violations
+}
+
+/// §07 step 3: the seal's own program, and the commit barrier after it.
+///
+/// Split out of [`check_append_typestate`] for clippy's line budget. The same pin the payload
+/// barrier has had, for the step that had none until a review of issue #26's swap found the
+/// same shape missing here.
+fn check_append_commit(code: &str) -> Vec<Violation> {
+    const RULE: &str = "commit-discipline";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let commit = braced_body(code, &format!("fn {APPEND_COMMIT_STEP}")).map(tightened);
+    let sealed_then_barriered = commit.as_ref().is_some_and(|body| {
+        match (
+            body.find(tightened(APPEND_COMMIT_CALL).as_str()),
+            body.find(tightened(APPEND_BARRIER_CALL).as_str()),
+        ) {
+            (Some(programmed), Some(barriered)) => barriered > programmed,
+            _ => false,
+        }
+    });
+    if sealed_then_barriered {
+        return Vec::new();
+    }
+    vec![Violation::new(
+        RULE,
+        ADAPTER,
+        format!(
+            "`{APPEND_COMMIT_STEP}` does not program the seal as `{APPEND_COMMIT_CALL}` and \
+             then take `{APPEND_BARRIER_CALL}`: a commit that swallowed either would advance \
+             the journal over a record whose seal is not durable, and no test in this \
+             workspace can see it"
+        ),
+    )]
 }
 
 /// The file whose public surface and admission order [`check_capacity_reserve`] pins.
@@ -1602,7 +1649,7 @@ pub const SWAP_CONSTRUCTIONS: [(&str, &str); 2] =
 /// A pin on the *spelling*, like [`APPEND_BARRIER_CALL`], and for that rule's reason: a body
 /// that calls `storage.barrier()` and does not propagate the failure hands back a value
 /// whose next step programs over media no barrier ever ordered.
-pub const SWAP_BARRIER_CALL: &str = "storage.barrier().map_err(SwapFailure::Storage)?";
+pub const SWAP_BARRIER_CALL: &str = "storage.barrier().map_err(SwapStepError::Storage)?";
 
 /// The two erases of §10, the body each belongs to, and the bank each may name.
 ///
@@ -1617,15 +1664,35 @@ pub const SWAP_BARRIER_CALL: &str = "storage.barrier().map_err(SwapFailure::Stor
 pub const SWAP_ERASE_CALLS: [(&str, &str, &str); 2] = [
     (
         "prepare",
-        "storage.erase(self.plan.installing.base(), self.plan.installing.bytes())",
+        "storage.erase(self.plan.installing.base(), self.plan.installing.bytes()).map_err(SwapStepError::Storage)?",
         "retiring",
     ),
     (
         "reclaim",
-        "storage.erase(self.plan.retiring.base(), self.plan.retiring.bytes())",
+        "storage.erase(self.plan.retiring.base(), self.plan.retiring.bytes()).map_err(SwapStepError::Storage)?",
         "installing",
     ),
 ];
+
+/// §10 step 5's program and step 6's barrier, and the bank the commit may not name.
+///
+/// Every other barrier in the protocol is pinned by [`SWAP_ERASE_CALLS`] or by
+/// `payload_barrier`'s own row, and this one — the barrier that *is* §10 step 6, the moment
+/// "a crash after step 6 recovers the new run" becomes true — was pinned by nothing until a
+/// review found it. The hole is not theoretical: `let _ = storage.barrier();` here passes
+/// `swap-discipline`, `integrity-check`, and both crash sweeps, because
+/// `waymaker_fault::Device`'s barrier changes no media and the seal is on it either way. What
+/// it leaves is a caller holding an `Installed` after a barrier that failed, which then
+/// erases the retiring bank — a device whose new seal never became durable and whose old bank
+/// is gone.
+///
+/// The program is pinned beside it for [`SWAP_ERASE_CALLS`]' reason: a seal aimed at the
+/// retiring bank's offset is a swap that seals the run it is replacing.
+pub const SWAP_COMMIT_STEP: (&str, &str, &str) = (
+    "commit",
+    "storage.program(self.plan.installing.seal_offset(), self.seal).map_err(SwapStepError::Storage)?",
+    "retiring",
+);
 
 /// Rule: §10's seven steps happen in §10's order, and no step can be reached without them.
 ///
@@ -1746,7 +1813,11 @@ fn check_swap_barriers(code: &str) -> Vec<Violation> {
         ));
     }
 
-    for (step, erase, forbidden) in SWAP_ERASE_CALLS {
+    // The two erases and the commit, each held to the one media call its row names, before a
+    // barrier, without naming the other bank. One loop, because the three fail the same way.
+    let steps: [(&str, &str, &str); 3] =
+        [SWAP_ERASE_CALLS[0], SWAP_ERASE_CALLS[1], SWAP_COMMIT_STEP];
+    for (step, erase, forbidden) in steps {
         let Some(body) = braced_body(code, &format!("fn {step}")) else {
             violations.push(Violation::new(
                 RULE,
@@ -1764,9 +1835,10 @@ fn check_swap_barriers(code: &str) -> Vec<Violation> {
                 RULE,
                 ADAPTER,
                 format!(
-                    "`{step}` does not erase as `{erase}`: which bank a swap clears is derived \
-                     from the authority the device booted, and an erase spelled any other way \
-                     is one a reviewer has to check by eye"
+                    "`{step}` does not mutate media as `{erase}`: which bank a swap touches is \
+                     derived from the authority the device booted rather than from an \
+                     argument, and a call spelled any other way — a dropped `?` included — is \
+                     one a reviewer has to check by eye"
                 ),
             ));
             continue;
@@ -1791,9 +1863,10 @@ fn check_swap_barriers(code: &str) -> Vec<Violation> {
                 RULE,
                 ADAPTER,
                 format!(
-                    "`{step}` does not take `{SWAP_BARRIER_CALL}` after its erase: without it \
-                     \u{a7}12 permits what follows to become durable before the erase that \
-                     would take it"
+                    "`{step}` does not take `{SWAP_BARRIER_CALL}` after its mutation: \u{a7}12 \
+                     orders only what a completed barrier ordered, so without it what follows \
+                     may become durable first — and for `commit` the barrier *is* \u{a7}10 \
+                     step 6, the moment the new run becomes the one a reader boots"
                 ),
             )),
         }
@@ -6302,6 +6375,190 @@ mod deferred_answer_pins {
     }
 
     // -----------------------------------------------------------------------------------
+    // `swap-discipline` and the swap routing
+    // -----------------------------------------------------------------------------------
+
+    /// The real swap, read off disk, so a rule that only the fixture satisfies is caught.
+    ///
+    /// The fixture is rendered from the pins, so it can only ever prove that the pins agree
+    /// with themselves. Review of issue #26 measured what that is worth: with the fixture as
+    /// the only witness, `let _ = storage.barrier();` in `Sealable::commit` passed the gate,
+    /// every test in the workspace, and both crash sweeps.
+    fn real_swap_module() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(SWAP_SURFACE_PATH);
+        std::fs::read_to_string(&path).expect("the swap should exist")
+    }
+
+    fn swap_violations(contents: &str) -> Vec<Violation> {
+        check_swap_discipline(&[layer(SWAP_SURFACE_PATH, contents)])
+    }
+
+    #[test]
+    fn the_real_swap_satisfies_the_discipline_it_is_pinned_by() {
+        let contents = real_swap_module();
+        let violations = swap_violations(&contents);
+        assert!(violations.is_empty(), "{violations:?}");
+        let routing = check_swap_routing(&[layer(SWAP_SURFACE_PATH, &contents)]);
+        assert!(routing.is_empty(), "{routing:?}");
+    }
+
+    #[test]
+    fn a_swallowed_barrier_is_reported_wherever_the_protocol_puts_one() {
+        // The four barriers of \u{a7}10, each swallowed in turn. The `commit` one is the
+        // regression this test exists for: it is \u{a7}10 step 6 itself, it was pinned by
+        // nothing, and it reached a commit on this branch before a review caught it.
+        let contents = real_swap_module();
+        let swallowed = "let _ = storage.barrier();";
+        let occurrences = contents.matches(SWAP_BARRIER_CALL).count();
+        assert_eq!(
+            occurrences, 4,
+            "\u{a7}10 has four barriers; the mutants below assume the file spells all four"
+        );
+        for index in 0..occurrences {
+            let mut mutant = String::new();
+            let mut rest = contents.as_str();
+            for seen in 0..=index {
+                let Some(at) = rest.find(SWAP_BARRIER_CALL) else {
+                    unreachable!("the count above says there are {occurrences}")
+                };
+                let (before, after) = rest.split_at(at);
+                mutant.push_str(before);
+                if seen == index {
+                    mutant.push_str(swallowed);
+                }
+                rest = after.get(SWAP_BARRIER_CALL.len()..).unwrap_or_default();
+                if seen != index {
+                    mutant.push_str(SWAP_BARRIER_CALL);
+                }
+            }
+            mutant.push_str(rest);
+            assert!(
+                !swap_violations(&mutant).is_empty(),
+                "barrier {index} could be swallowed with the rule silent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_step_that_touches_the_other_bank_is_reported() {
+        // Which bank a swap erases or seals is derived from the authority the device booted.
+        // A step that reached for the other one would erase the run it is executing, or seal
+        // the bank it is replacing.
+        // The arguments rather than the whole pinned call: rustfmt breaks these bodies over
+        // three lines, so the pin's own spelling is not a substring of the file. The
+        // `assert!` below is what keeps that from turning into a mutant nobody applied.
+        const MUTATIONS: [(&str, &str, &str); 3] = [
+            (
+                "prepare",
+                ".erase(self.plan.installing.base(), self.plan.installing.bytes())",
+                ".erase(self.plan.retiring.base(), self.plan.retiring.bytes())",
+            ),
+            (
+                "reclaim",
+                ".erase(self.plan.retiring.base(), self.plan.retiring.bytes())",
+                ".erase(self.plan.installing.base(), self.plan.installing.bytes())",
+            ),
+            (
+                "commit",
+                ".program(self.plan.installing.seal_offset(), self.seal)",
+                ".program(self.plan.retiring.seal_offset(), self.seal)",
+            ),
+        ];
+        for (step, call, instead) in MUTATIONS {
+            let contents = real_swap_module();
+            assert!(
+                contents.contains(call),
+                "{step}: the pin should be findable"
+            );
+            let violations = swap_violations(&contents.replace(call, instead));
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(step)),
+                "{step} reached for the other bank with the rule silent: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_that_grows_a_second_method_is_reported() {
+        // Every state \u{a7}10 puts a barrier in front of may do exactly one thing. A
+        // `Prepared::commit` skipping the header, or a `Staged::seal_now` skipping the
+        // payload barrier, is a step order given back.
+        const ANCHOR: &str = "/// Whether `region` lies inside `bank`'s payload.";
+        for (state, step) in SWAP_TYPESTATE {
+            let contents = real_swap_module();
+            assert!(
+                contents.contains(ANCHOR),
+                "the mutant needs somewhere to go"
+            );
+            let contents = contents.replace(
+                ANCHOR,
+                &format!(
+                    "impl<C: IntegrityCheck> {state}<'_, C> {{ pub fn shortcut(self) {{}} }}\n\n                     {ANCHOR}"
+                ),
+            );
+            let violations = swap_violations(&contents);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(state)),
+                "{state} grew a second method beside `{step}` with the rule silent: \
+                 {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_construction_of_a_post_barrier_value_is_reported() {
+        // `Sealable` is the only value that can program a generation seal and `Installed` the
+        // only one that can erase the retired bank. A second construction of either is a
+        // second route to a step \u{a7}10 puts after a barrier.
+        for (value, from) in SWAP_CONSTRUCTIONS {
+            let contents = real_swap_module();
+            assert!(
+                contents.contains("/// Whether `region` lies inside `bank`'s payload."),
+                "the mutant needs somewhere to go"
+            );
+            let contents = contents.replace(
+                "/// Whether `region` lies inside `bank`'s payload.",
+                &format!(
+                    "fn back_door(plan: Plan) -> {value} {{ {value} {{ plan }} }}\n\n\
+                     /// Whether `region` lies inside `bank`'s payload."
+                ),
+            );
+            let violations = swap_violations(&contents);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains(value)),
+                "{value} was built outside `{from}` with the rule silent: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_swap_that_seals_with_the_shipped_check_is_reported() {
+        // The routing half. A device whose two banks were sealed by two algorithms is a
+        // device only half of which boots.
+        for (_, entries) in SWAP_ROUTING_STEPS {
+            for through in *entries {
+                let contents = real_swap_module().replace(&format!("{through}::<C>"), through);
+                let violations = check_swap_routing(&[layer(SWAP_SURFACE_PATH, &contents)]);
+                assert!(
+                    violations
+                        .iter()
+                        .any(|violation| violation.detail.contains(through)),
+                    "{through} lost its turbofish with the rule silent: {violations:?}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
     // `capacity-reserve`
     // -----------------------------------------------------------------------------------
 
@@ -7270,13 +7527,14 @@ pub mod tests_support {
     use std::collections::BTreeSet;
 
     use super::{
-        APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_STEP, APPEND_ROUTING_STEPS,
-        APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS, CAPACITY_ADMISSION_CALL,
-        CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, DIGEST_FUNCTION,
-        EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
-        RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS,
-        SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_CONSTRUCTIONS,
-        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TRANSITION_SURFACE,
+        APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_CALL, APPEND_COMMIT_STEP,
+        APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
+        CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE,
+        CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
+        INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
+        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
+        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
+        SWAP_TYPESTATE, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -7561,7 +7819,7 @@ pub mod tests_support {
         );
         let _ = writeln!(
             source,
-            "impl {sealable} {{\n    pub fn {APPEND_COMMIT_STEP}(self) {{}}\n}}"
+            "impl {sealable} {{\n    pub fn {APPEND_COMMIT_STEP}(self) {{\n                     {APPEND_COMMIT_CALL};\n        {APPEND_BARRIER_CALL};\n    }}\n}}"
         );
         source
     }
@@ -7614,6 +7872,10 @@ pub mod tests_support {
                 .map(|(value, _)| *value);
             let _ = writeln!(source, "impl {state} {{\n    pub fn {step}() {{");
             if step == "payload_barrier" {
+                let _ = writeln!(source, "        {SWAP_BARRIER_CALL};");
+            }
+            if step == SWAP_COMMIT_STEP.0 {
+                let _ = writeln!(source, "        {};", SWAP_COMMIT_STEP.1);
                 let _ = writeln!(source, "        {SWAP_BARRIER_CALL};");
             }
             for (routed, entries) in SWAP_ROUTING_STEPS {

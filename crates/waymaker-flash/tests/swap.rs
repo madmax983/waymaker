@@ -27,10 +27,10 @@
 use waymaker_core::{EffectId, EffectIdAllocator, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout, Generation};
-use waymaker_flash::frame::{ERASED_BYTE, ProgramAlign};
+use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
-use waymaker_flash::swap::{Installed, Retired, Swap, SwapError, SwapFailure};
+use waymaker_flash::swap::{Installed, Retired, Swap, SwapError, SwapStepError};
 
 // ---------------------------------------------------------------------------------------
 // Media
@@ -55,7 +55,7 @@ struct Nor {
     /// How many mutations to accept before refusing every one that follows.
     ///
     /// [`usize::MAX`] is a device that never fails, which is what most of this file wants.
-    /// A smaller number is how the tests below reach [`SwapFailure::Storage`] at a chosen
+    /// A smaller number is how the tests below reach [`SwapStepError::Storage`] at a chosen
     /// step without an injector: §12 says `program` and `erase` may fail, and a swap that
     /// carried on past one would be a swap sealing a bank it never wrote.
     accepts: usize,
@@ -778,12 +778,60 @@ fn a_swap_refuses_a_reader_that_is_not_the_bank_it_is_retiring() {
 }
 
 #[test]
-fn a_swap_refuses_a_next_run_input_a_bank_cannot_hold_a_journal_behind() {
-    // §10's roll-over is only an exit if the run it installs can do something. A header
-    // that fills its bank is a run with nowhere to write its opening record, and the
-    // reserve prices exactly this — but the reserve is a policy, and a swap that was handed
-    // an over-long input directly must refuse it too.
-    let oversized = std::vec![0x5A_u8; layout().bank(BankId::B).payload_bytes() as usize];
+fn a_swap_refuses_a_reader_validated_against_another_device() {
+    // Every offset a swap programs or erases is derived from the layout, and a region proved
+    // legal on another device says nothing about this one. Distinct from the sub-bank check
+    // below it: this reader may be at a perfectly good offset — on the wrong part.
+    let Ok(elsewhere) = Geometry::new(16384, 4096, 8, 1) else {
+        unreachable!("16384 is four whole 4096-byte blocks")
+    };
+    let Ok(foreign) = JournalRegion::spanning(elsewhere, 0, 64, align()) else {
+        unreachable!("a 64-byte journal at zero is a legal region on that device")
+    };
+    refuses(
+        Authority::Bank {
+            id: BankId::A,
+            generation: CURRENT,
+        },
+        RUN,
+        |_device| Retired::Recovery(Recovery::new(foreign)),
+        next_header(),
+        SwapError::WrongDevice,
+    );
+}
+
+#[test]
+fn a_swap_refuses_an_input_that_leaves_no_room_for_a_record() {
+    // The refusal `JournalRegion::of` is too weak to make. A journal of one program unit is
+    // a journal that *exists*, so the region gate accepts it — and the run installed behind
+    // it can never commit its opening record, durably, with no error anywhere. The ceiling
+    // is `BankRegion::max_run_input_bytes`, which reserves a whole record: a frame body and
+    // the commit seal issue #24 made part of one.
+    let ceiling = layout().bank(BankId::B).max_run_input_bytes(align());
+    let just_over = std::vec![0x5A_u8; ceiling + 1];
+
+    // One byte under the ceiling is accepted, so the bound is exact rather than merely safe.
+    let mut device = booted();
+    let at_ceiling = std::vec![0x5A_u8; ceiling];
+    let retired = Retired::Journal(current_journal(&mut device));
+    assert!(
+        Swap::beginning(
+            layout(),
+            Authority::Bank {
+                id: BankId::A,
+                generation: CURRENT
+            },
+            RUN,
+            retired,
+            BankHeader {
+                input: &at_ceiling,
+                ..next_header()
+            },
+        )
+        .is_ok(),
+        "an input at the ceiling is one a bank can be used with"
+    );
+
     refuses(
         Authority::Bank {
             id: BankId::A,
@@ -792,10 +840,32 @@ fn a_swap_refuses_a_next_run_input_a_bank_cannot_hold_a_journal_behind() {
         RUN,
         |device| Retired::Journal(current_journal(device)),
         BankHeader {
-            input: &oversized,
+            input: &just_over,
             ..next_header()
         },
-        SwapError::Region(RegionError::NoJournalRoom),
+        SwapError::InputTooLong,
+    );
+
+    // And the state the old gate would have installed: a journal `JournalRegion::of` accepts
+    // and no record fits in. Driven rather than argued, because "too weak" is a claim about
+    // what the weaker gate would have let through.
+    let Ok(region) = JournalRegion::of(
+        layout(),
+        BankId::B,
+        &BankHeader {
+            input: &just_over,
+            ..next_header()
+        },
+    ) else {
+        unreachable!("a header one byte over the ceiling still leaves a journal")
+    };
+    let Ok(frame) = frame::encoded_len_for(0, align()) else {
+        unreachable!("an empty record has a length")
+    };
+    assert!(
+        (region.bytes() as usize) < frame,
+        "the input the swap now refuses left {} bytes for a {frame}-byte record",
+        region.bytes()
     );
 }
 
@@ -843,7 +913,7 @@ fn every_step_refuses_a_device_the_swap_was_not_planned_for() {
     let swap = planned(&mut device);
     assert_eq!(
         swap.prepare(&mut elsewhere).err(),
-        Some(SwapFailure::WrongDevice)
+        Some(SwapStepError::WrongDevice)
     );
 
     let Ok(prepared) = planned(&mut device).prepare(&mut device) else {
@@ -852,7 +922,7 @@ fn every_step_refuses_a_device_the_swap_was_not_planned_for() {
     let Err(refusal) = prepared.stage(&mut elsewhere, &mut page) else {
         unreachable!("a swap must not program a header on another device")
     };
-    assert_eq!(refusal, SwapFailure::WrongDevice);
+    assert_eq!(refusal, SwapStepError::WrongDevice);
 
     let Ok(staged) = planned(&mut device)
         .prepare(&mut device)
@@ -862,7 +932,7 @@ fn every_step_refuses_a_device_the_swap_was_not_planned_for() {
     };
     assert_eq!(
         staged.payload_barrier(&mut elsewhere).err(),
-        Some(SwapFailure::WrongDevice)
+        Some(SwapStepError::WrongDevice)
     );
 
     let mut second = [0_u8; PAGE];
@@ -875,13 +945,13 @@ fn every_step_refuses_a_device_the_swap_was_not_planned_for() {
     };
     assert_eq!(
         sealable.commit(&mut elsewhere).err(),
-        Some(SwapFailure::WrongDevice)
+        Some(SwapStepError::WrongDevice)
     );
 
     let installed = perform(&mut device);
     assert_eq!(
         installed.reclaim(&mut elsewhere).err(),
-        Some(SwapFailure::WrongDevice),
+        Some(SwapStepError::WrongDevice),
         "an erase aimed at a bank another device does not have is the worst of the five"
     );
 }
@@ -898,7 +968,7 @@ fn a_swap_refuses_a_page_too_small_for_the_next_runs_header() {
         unreachable!("a header does not fit eight bytes")
     };
     assert!(
-        matches!(refusal, SwapFailure::Encode(_)),
+        matches!(refusal, SwapStepError::Encode(_)),
         "a page too small is the caller's buffer, not the media: {refusal:?}"
     );
 }
@@ -923,7 +993,7 @@ fn fails_at(accepts: usize) {
         .and_then(|staged| staged.payload_barrier(&mut device))
         .and_then(|sealable| sealable.commit(&mut device));
     assert!(
-        matches!(outcome, Err(SwapFailure::Storage(_))),
+        matches!(outcome, Err(SwapStepError::Storage(_))),
         "the device refused mutation {accepts} and the swap carried on"
     );
 
@@ -951,6 +1021,37 @@ fn a_swap_that_fails_before_its_seal_leaves_the_old_run_authoritative() {
 }
 
 #[test]
+fn a_swap_that_fails_at_its_commit_barrier_says_so() {
+    // §10 step 6, and the one step `a_swap_that_fails_before_its_seal...` cannot cover: by
+    // the time this barrier runs the seal is already on media, so the *device* is legally
+    // installed either way and only the return value can tell the caller that the barrier
+    // did not return. A `commit` that swallowed it would hand back an `Installed`, and the
+    // caller would then reclaim the retiring bank on the strength of a seal that may not be
+    // durable. That is the third tooth in `waymaker-fault`'s sweep, reached here through the
+    // real writer rather than a mutant of it.
+    let mut device = booted().failing_after(5);
+    let mut page = [0_u8; PAGE];
+
+    let outcome = planned(&mut device)
+        .prepare(&mut device)
+        .and_then(|prepared| prepared.stage(&mut device, &mut page))
+        .and_then(|staged| staged.payload_barrier(&mut device))
+        .and_then(|sealable| sealable.commit(&mut device));
+
+    assert!(
+        matches!(outcome, Err(SwapStepError::Storage(_))),
+        "a commit barrier that failed was reported as a completed swap: {outcome:?}"
+    );
+    // And the caller got no `Installed`, so there is nothing that could erase the retiring
+    // bank — which is still there, still sealed, and still what a reader boots.
+    assert_eq!(
+        sealed_generation(&mut device, BankId::A),
+        Some(CURRENT),
+        "a swap that could not commit reclaimed the bank it was replacing"
+    );
+}
+
+#[test]
 fn a_swap_error_says_which_refusal_it_is() {
     // The same contract every other error in this workspace keeps: a device with no
     // debugger attached still has to be able to say which refusal it met.
@@ -959,6 +1060,8 @@ fn a_swap_error_says_which_refusal_it_is() {
         SwapError::GenerationExhausted,
         SwapError::RunReused,
         SwapError::NotTheActiveBank,
+        SwapError::WrongDevice,
+        SwapError::InputTooLong,
         SwapError::Region(RegionError::NoJournalRoom),
     ]
     .map(SwapError::message);

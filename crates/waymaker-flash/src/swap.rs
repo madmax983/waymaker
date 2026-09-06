@@ -56,13 +56,49 @@
 //! and a seal that names one. The whole point of §10's crash windows is that no such state
 //! is reachable.
 //!
-//! # The seal names the header that landed
+//! # A seal is never programmed over a header that did not land
 //!
-//! [`Prepared::stage`] computes the seal from the bytes it just programmed rather than from
-//! the header it meant to program, and the digest travels in [`Staged`] to the commit. A
-//! writer that sealed its intention would seal a header a failed program never put there —
-//! which is `waymaker-fault`'s `swap_that_seals_whatever_landed`, a writer whose device can
-//! carry a torn header under a perfectly valid highest-generation seal.
+//! `waymaker-fault`'s `swap_that_seals_whatever_landed` is a writer whose device can carry a
+//! torn header under a perfectly valid highest-generation seal, and it has two bugs rather
+//! than one: it seals the header it *intended* to write, and it carries on past a failed
+//! program. What separates [`Prepared::stage`] from it is the second — the `?` on the
+//! program call — and it is worth being exact about that, because the first would not have
+//! helped. The seal is computed from the buffer the header was encoded into, before the
+//! program, so sealing the [`BankHeader`] argument directly would produce the same digest
+//! byte for byte. Reading the header back after programming it would be a third answer, and
+//! it is not taken: a successful `program` is §12 saying those bytes are on media, and a
+//! read-back would cost a second pass over the caller's page to learn what the contract
+//! already says.
+//!
+//! What the digest *does* buy is that a seal names one header. A frame torn by a power loss
+//! part-way through the program cannot match the seal computed for the whole one, so a
+//! half-written bank is not a candidate at any generation — which is [`crate::bank`]'s
+//! guarantee, reached here rather than re-argued.
+//!
+//! # What the types cannot make impossible
+//!
+//! Two things, stated because the rest of this module argues that step order is a fact about
+//! types rather than a convention, and a reader is owed the edges of that claim.
+//!
+//! `booted` is a [`bank::select`] answer the caller supplies, and nothing here reads media to
+//! confirm it. A caller that supplies a *stale* one — naming a bank that lost a swap since —
+//! makes [`Swap::prepare`] erase the bank that is actually authoritative, and every check in
+//! this module passes, because the retired reader really is over the bank `booted` named.
+//! The refusal that would close it is a read of the spare bank's seal, and it cannot be made
+//! fail-closed: the header it would have to decode is as long as the previous run's input,
+//! which is bounded by the bank rather than by the caller's page, so a small page would turn
+//! it into a guard that silently allows what it exists to refuse. It is stated as a
+//! precondition on [`Swap::beginning`] instead, and closing it by construction is the
+//! dispatcher's — rung 0.4's — because a dispatcher that selects and swaps in one place
+//! cannot hold a `booted` older than the swap it is planning.
+//!
+//! And a [`Sealable`] is linear within one chain but not across two. A caller that reaches
+//! [`Sealable`], leaves it, runs a second swap to completion with a second page, and *then*
+//! commits the first would program a stale seal over a live one — on NOR the two `AND`
+//! together into a seal that decodes as neither, and if the second swap also reclaimed, the
+//! device has no authoritative bank. It needs two pages and a deliberate second swap, so it
+//! is a line somebody writes rather than a mistake, which is the same standing
+//! [`crate::append`] gives two writers over one journal.
 //!
 //! # Why the retired reader is consumed
 //!
@@ -112,6 +148,12 @@ pub enum Retired<C: IntegrityCheck = Catalogued> {
     Journal(Journal<C>),
     /// A scan of the retiring bank, for a run that has no writer — a journal that ended
     /// damaged or unsealed, which is the bank §10 recycles.
+    ///
+    /// Any [`Recovery`] over the retiring bank is accepted, finished or not: what §10 step 1
+    /// asks for is that the reader be given up, and a scan half-way through one is still a
+    /// reader. The wording above is what this variant is *for* rather than what it requires,
+    /// and the probe and the crash sweep both hand it an unscanned one, because a scan reads
+    /// and step 1 is about what can write.
     Recovery(Recovery<C>),
 }
 
@@ -176,11 +218,31 @@ pub enum SwapError {
     /// makes, taken one step earlier: every offset below is derived from the layout, and a
     /// region proved legal on another device says nothing about this one.
     WrongDevice,
+    /// The next run's input leaves the installed bank no room for a record.
+    ///
+    /// §10's roll-over is only an exit if the run it installs can *write* something, and
+    /// [`Region`](Self::Region) below is a weaker test than that: [`JournalRegion::of`]
+    /// refuses only a journal of zero bytes, so an input one program unit short of the bank
+    /// would install a run with a journal too small for its own opening record — durably,
+    /// with no error anywhere and no way out but another swap. The ceiling here is
+    /// [`BankRegion::max_run_input_bytes`], which is the one [`BankLayout::new`] and
+    /// [`Reserve::for_layout`] both already trust, and it reserves a whole record: a frame
+    /// body *and* the commit seal issue #24 made part of one.
+    ///
+    /// [`Reserve::for_layout`]: crate::capacity::Reserve::for_layout
+    InputTooLong,
     /// The next run's header leaves no usable journal in the bank it would be installed in.
     ///
-    /// §10's roll-over is only an exit if the run it installs can write something. Carries
-    /// [`JournalRegion::of`]'s own refusal, so the caller learns whether the input was too
-    /// long or the granularity disagreed.
+    /// The residual refusal, after [`InputTooLong`](Self::InputTooLong) has taken the case
+    /// that matters. Carries [`JournalRegion::of`]'s own answer, so the caller learns whether
+    /// the geometry or the granularity was what disagreed.
+    ///
+    /// [`RegionError::NoJournalRoom`] is not reachable through it on any layout
+    /// [`BankLayout::new`] accepts — an input that would fill the bank exceeds
+    /// [`InputTooLong`](Self::InputTooLong)'s ceiling first, by a whole record — so what a
+    /// caller really meets here is [`RegionError::AlignDisagreesWithBank`]. The variant keeps
+    /// the other shapes rather than flattening them, because a refusal that named the wrong
+    /// cause would send an operator to the wrong place.
     Region(RegionError),
 }
 
@@ -200,6 +262,7 @@ impl SwapError {
             Self::RunReused => "the next run repeats the retired run",
             Self::NotTheActiveBank => "that reader is not the active bank",
             Self::WrongDevice => "that reader is on another device",
+            Self::InputTooLong => "the next run's input leaves no record",
             Self::Region(inner) => inner.message(),
         }
     }
@@ -226,7 +289,7 @@ impl core::error::Error for SwapError {}
 /// [`fmt::Display`] either, and for the same reason — the bound would spread to every
 /// signature this type appears in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SwapFailure<E> {
+pub enum SwapStepError<E> {
     /// The media refused an erase, a program or a barrier.
     ///
     /// What is on media afterwards is deliberately not guessed at. §12 says a failed
@@ -284,11 +347,11 @@ impl Plan {
     /// By reference, and answering `()`: a plan is eighty-odd bytes and there are five
     /// steps, so a check that handed the plan back would copy it five times for a comparison
     /// that reads one field.
-    fn on<S: StableStorage>(&self, storage: &S) -> Result<(), SwapFailure<S::Error>> {
+    fn on<S: StableStorage>(&self, storage: &S) -> Result<(), SwapStepError<S::Error>> {
         if storage.geometry() == self.region.geometry() {
             Ok(())
         } else {
-            Err(SwapFailure::WrongDevice)
+            Err(SwapStepError::WrongDevice)
         }
     }
 }
@@ -317,12 +380,19 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     ///
     /// # Preconditions
     ///
-    /// `booted` is [`bank::select`]'s answer for this device, and `run` is the run id the
-    /// header of the bank it named carries. Neither can be checked here without reading
-    /// media, and both are what the caller already decoded to get this far. Passing another
-    /// bank's `run` weakens exactly one thing — the [`SwapError::RunReused`] refusal — and
-    /// passing another device's `booted` is caught by [`SwapError::NotTheActiveBank`],
-    /// because `retired` is over a real region of a real device.
+    /// `booted` is [`bank::select`]'s answer for this device **now**, and `run` is the run id
+    /// the header of the bank it named carries. Neither is checked here — this call reads no
+    /// media — and both are what the caller already decoded to get this far.
+    ///
+    /// Each is load-bearing in a different way, and neither failure has a symptom. A wrong
+    /// `run` weakens exactly one thing, the [`SwapError::RunReused`] refusal, and the result
+    /// is two runs whose `(RunId, EffectSeq)` pairs collide for ever. A *stale* `booted` —
+    /// one naming a bank that has since lost a swap — is worse: [`prepare`](Self::prepare)
+    /// would erase the bank that is really authoritative, and every check below passes,
+    /// because the retired reader genuinely is over the bank `booted` named. Only a `booted`
+    /// from another *device* is caught, by [`SwapError::NotTheActiveBank`]. See the module
+    /// documentation for why the refusal that would close the stale case cannot be made
+    /// fail-closed here, and whose it is.
     ///
     /// # Postconditions
     ///
@@ -366,12 +436,21 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
             return Err(SwapError::NotTheActiveBank);
         }
 
+        // Never a parameter: the bank installed into is the one the device did *not* boot.
         let installed = id.other();
         let installing = layout.bank(installed);
-        // §10 step 3's header has to leave a usable journal behind it, and `JournalRegion::of`
-        // is where that is decided — before the erase of step 2, because a swap that erased
-        // the spare bank and *then* found the header would not fit has destroyed the only
-        // other copy of anything this device holds.
+        // §10 step 3's header has to leave a journal a run can be used in, which is a
+        // stronger test than one that exists: `JournalRegion::of` below refuses only a
+        // journal of *zero* bytes, and a run whose journal cannot hold its opening record is
+        // installed for ever. `max_run_input_bytes` reserves a whole record — the same
+        // ceiling `BankLayout::new` refuses a device under and `Reserve::for_layout` prices
+        // against — so the two gates agree rather than differing by a frame.
+        if next.input.len() > installing.max_run_input_bytes(layout.align()) {
+            return Err(SwapError::InputTooLong);
+        }
+        // Both are decided before the erase of step 2, because a swap that erased the spare
+        // bank and *then* found the header would not fit has destroyed the only other copy
+        // of anything this device holds.
         let region = JournalRegion::of(layout, installed, &next).map_err(SwapError::Region)?;
 
         Ok(Self {
@@ -404,17 +483,17 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapFailure::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapFailure::Storage`] when the erase or the barrier fails.
+    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
+    /// against, and [`SwapStepError::Storage`] when the erase or the barrier fails.
     pub fn prepare<S: StableStorage>(
         self,
         storage: &mut S,
-    ) -> Result<Prepared<'next, C>, SwapFailure<S::Error>> {
+    ) -> Result<Prepared<'next, C>, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
         storage
             .erase(self.plan.installing.base(), self.plan.installing.bytes())
-            .map_err(SwapFailure::Storage)?;
-        storage.barrier().map_err(SwapFailure::Storage)?;
+            .map_err(SwapStepError::Storage)?;
+        storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(Prepared {
             plan: self.plan,
             next: self.next,
@@ -448,45 +527,53 @@ impl<C: IntegrityCheck> Prepared<'_, C> {
     /// # Postconditions
     ///
     /// On success the padded header frame is on media at the bank's base and the seal in
-    /// `page` names *that* frame's digest — computed from the bytes this call programmed
-    /// rather than from the header it was handed, so a header a failed program never put
-    /// there cannot be sealed. The bank is not yet authoritative and will not be until step
-    /// 6: nothing before that barrier changes which run a reader boots.
+    /// `page` carries *that* frame's digest, so no other header can ever be committed under
+    /// it. The bank is not yet authoritative and will not be until step 6: nothing before
+    /// that barrier changes which run a reader boots.
+    ///
+    /// On failure the bank is at worst written and unsealed, which is not a candidate at any
+    /// generation — but "at worst" is doing real work here, and this is the one step whose
+    /// failure can leave media changed. A refusal before the program leaves the erased bank
+    /// of step 2; a failed program leaves whatever §12 says a failed program leaves; and a
+    /// seal that cannot be *encoded* leaves a whole header on media with no seal coming. All
+    /// three boot the run the device was already running, and all three are recycled by the
+    /// next swap's step 2 rather than repaired.
     ///
     /// # Errors
     ///
-    /// [`SwapFailure::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, [`SwapFailure::Encode`] when `page` cannot hold the header or the seal, and
-    /// [`SwapFailure::Storage`] when the program fails.
+    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
+    /// against, [`SwapStepError::Encode`] when `page` cannot hold the header or the seal, and
+    /// [`SwapStepError::Storage`] when the program fails.
     pub fn stage<'page, S: StableStorage>(
         self,
         storage: &mut S,
         page: &'page mut [u8],
-    ) -> Result<Staged<'page, C>, SwapFailure<S::Error>> {
+    ) -> Result<Staged<'page, C>, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
 
         let written =
-            bank::encode_header_with::<C>(&self.next, page).map_err(SwapFailure::Encode)?;
+            bank::encode_header_with::<C>(&self.next, page).map_err(SwapStepError::Encode)?;
         let Some(frame) = page.get(..written) else {
-            return Err(SwapFailure::Encode(DecodeError::LengthOutOfBounds));
+            return Err(SwapStepError::Encode(DecodeError::LengthOutOfBounds));
         };
-        // The digest of what is about to be on media, taken before the page is reused. A
-        // seal computed from the caller's `BankHeader` instead would be a seal for a header
-        // that may never have landed.
+        // Taken before the page is reused for the seal. This is the *encoded* header rather
+        // than a read-back, and deliberately: what stops a seal reaching a header that never
+        // landed is the `?` on the program below, not where the digest came from. See the
+        // module documentation.
         let seal =
-            bank::seal_for_with::<C>(frame, self.plan.generation).map_err(SwapFailure::Encode)?;
+            bank::seal_for_with::<C>(frame, self.plan.generation).map_err(SwapStepError::Encode)?;
         storage
             .program(self.plan.installing.base(), frame)
-            .map_err(SwapFailure::Storage)?;
+            .map_err(SwapStepError::Storage)?;
 
         let align = self.plan.region.align();
         let sealed =
-            bank::encode_seal_with::<C>(&seal, align, page).map_err(SwapFailure::Encode)?;
+            bank::encode_seal_with::<C>(&seal, align, page).map_err(SwapStepError::Encode)?;
         // The page is frozen from here: the seal rides on the caller's buffer rather than
         // being copied into this type.
         let frozen: &'page [u8] = &*page;
         let Some(bytes) = frozen.get(..sealed) else {
-            return Err(SwapFailure::Encode(DecodeError::LengthOutOfBounds));
+            return Err(SwapStepError::Encode(DecodeError::LengthOutOfBounds));
         };
         Ok(Staged {
             plan: self.plan,
@@ -531,14 +618,14 @@ impl<'page, C: IntegrityCheck> Staged<'page, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapFailure::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapFailure::Storage`] if the barrier fails.
+    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
+    /// against, and [`SwapStepError::Storage`] if the barrier fails.
     pub fn payload_barrier<S: StableStorage>(
         self,
         storage: &mut S,
-    ) -> Result<Sealable<'page, C>, SwapFailure<S::Error>> {
+    ) -> Result<Sealable<'page, C>, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
-        storage.barrier().map_err(SwapFailure::Storage)?;
+        storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(Sealable {
             plan: self.plan,
             seal: self.seal,
@@ -578,17 +665,17 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapFailure::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapFailure::Storage`] if the program or the barrier fails.
+    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
+    /// against, and [`SwapStepError::Storage`] if the program or the barrier fails.
     pub fn commit<S: StableStorage>(
         self,
         storage: &mut S,
-    ) -> Result<Installed, SwapFailure<S::Error>> {
+    ) -> Result<Installed, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
         storage
             .program(self.plan.installing.seal_offset(), self.seal)
-            .map_err(SwapFailure::Storage)?;
-        storage.barrier().map_err(SwapFailure::Storage)?;
+            .map_err(SwapStepError::Storage)?;
+        storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(Installed { plan: self.plan })
     }
 }
@@ -678,18 +765,18 @@ impl Installed {
     ///
     /// # Errors
     ///
-    /// [`SwapFailure::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapFailure::Storage`] when the erase or the barrier fails. Neither is
+    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
+    /// against, and [`SwapStepError::Storage`] when the erase or the barrier fails. Neither is
     /// fatal to the run that was installed — a bank that is still there is a bank the next
     /// swap erases again.
-    pub fn reclaim<S: StableStorage>(self, storage: &mut S) -> Result<(), SwapFailure<S::Error>> {
+    pub fn reclaim<S: StableStorage>(self, storage: &mut S) -> Result<(), SwapStepError<S::Error>> {
         self.plan.on(storage)?;
         storage
             .erase(self.plan.retiring.base(), self.plan.retiring.bytes())
-            .map_err(SwapFailure::Storage)?;
+            .map_err(SwapStepError::Storage)?;
         // Spelled with the `?` its sibling in `prepare` uses rather than as a tail
         // expression, so that one pinned spelling means the same thing in both bodies.
-        storage.barrier().map_err(SwapFailure::Storage)?;
+        storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(())
     }
 }

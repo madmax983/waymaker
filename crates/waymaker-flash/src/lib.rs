@@ -57,4 +57,4 @@ pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
 pub use recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 pub use storage::{Geometry, GeometryError, StableStorage};
-pub use swap::{Installed, Prepared, Retired, Swap, SwapError, SwapFailure};
+pub use swap::{Installed, Prepared, Retired, Swap, SwapError, SwapStepError};

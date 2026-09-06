@@ -1397,16 +1397,16 @@ const fn swap_error_cost(error: waymaker_flash::swap::SwapError) -> usize {
 
 /// Every arm of a swap step's refusal.
 ///
-/// `SwapFailure` carries no `message` of its own — see its documentation for why — so this
+/// `SwapStepError` carries no `message` of its own — see its documentation for why — so this
 /// is what a driver's own reporting looks like, and linking it is what makes the row honest.
 #[cfg(feature = "engine")]
 const fn swap_failure_cost(
-    error: waymaker_flash::swap::SwapFailure<waymaker_flash::storage::GeometryError>,
+    error: waymaker_flash::swap::SwapStepError<waymaker_flash::storage::GeometryError>,
 ) -> usize {
     match error {
-        waymaker_flash::swap::SwapFailure::Storage(inner) => inner.message().len(),
-        waymaker_flash::swap::SwapFailure::Encode(inner) => inner.message().len(),
-        waymaker_flash::swap::SwapFailure::WrongDevice => 1,
+        waymaker_flash::swap::SwapStepError::Storage(inner) => inner.message().len(),
+        waymaker_flash::swap::SwapStepError::Encode(inner) => inner.message().len(),
+        waymaker_flash::swap::SwapStepError::WrongDevice => 1,
     }
 }
 

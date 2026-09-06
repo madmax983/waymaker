@@ -45,8 +45,14 @@ frame with no valid seal over it was never committed and recovery says so. §10'
 reserve is the last thing rung 0.2's record format owed, and it writes nothing at all: a run
 declares what its records may be worth, the reserve prices the two ways out — a terminal
 record and a `continue_as_new` header — and ordinary scheduling is refused with
-`HistoryNearCapacity` while both are still affordable, before the device is called at all. Timers and the two timer records are the rest of 0.1; the bank swap arrives
-with 0.2.
+`HistoryNearCapacity` while both are still affordable, before the device is called at all.
+§10's bank swap is the last thing rung 0.2 owed, and it is five types rather than one
+function: the run being retired gives up its writer at step 1, so a swap in progress is a run
+with nothing left to append with, and a generation seal cannot be programmed without the
+payload barrier of step 4 in front of it. Every crash point of all seven steps is swept
+against §10's two recovery rules — a crash before step 5 recovers the old run, a crash after
+step 6 recovers the new one — with five wrong swaps required to be caught. Timers and the two
+timer records are the rest of 0.1.
 
 Design document §16's five deferred questions are tracked in `xtask::docs::DEFERRED_QUESTIONS`
 rather than only in the design document. Two are settled: the integrity check

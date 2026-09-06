@@ -40,7 +40,7 @@ use waymaker_flash::frame::ProgramAlign;
 use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
 use waymaker_flash::storage::StableStorage;
-use waymaker_flash::swap::{Retired, Swap, SwapError, SwapFailure};
+use waymaker_flash::swap::{Retired, Swap, SwapError, SwapStepError};
 
 // ---------------------------------------------------------------------------------------
 // The device, and the runs on it
@@ -147,7 +147,7 @@ fn expected_header(generation: Generation) -> BankHeader<'static> {
 enum Failed {
     Media(FaultError),
     Plan(SwapError),
-    Step(SwapFailure<FaultError>),
+    Step(SwapStepError<FaultError>),
 }
 
 impl From<FaultError> for Failed {
@@ -162,8 +162,8 @@ impl From<SwapError> for Failed {
     }
 }
 
-impl From<SwapFailure<FaultError>> for Failed {
-    fn from(error: SwapFailure<FaultError>) -> Self {
+impl From<SwapStepError<FaultError>> for Failed {
+    fn from(error: SwapStepError<FaultError>) -> Self {
         Self::Step(error)
     }
 }
@@ -294,6 +294,65 @@ fn swap(session: &mut Session) -> Result<(), Failed> {
     Ok(())
 }
 
+/// The swap that programs a seal no reader can validate.
+///
+/// The same eight operations in the same order — so the step map above still says what it
+/// says — and the seal is bytes rather than a seal. Bank B is never authoritative, bank A
+/// is erased anyway, and §10's "a crash after step 6 recovers the new run" is false from
+/// the moment the commit barrier returns.
+fn swap_whose_seal_is_not_a_seal(session: &mut Session) -> Result<(), Failed> {
+    previous_life(session)?;
+
+    let (spare, retiring) = (layout().bank(BankId::B), layout().bank(BankId::A));
+    session.erase(spare.base(), spare.bytes())?;
+    session.barrier()?;
+    program_header(session, BankId::B, &next_header())?;
+    session.barrier()?;
+
+    session.begin_record(SWAP);
+    let mut rubbish = [0_u8; 16];
+    let Ok(seal_len) = usize::try_from(spare.seal_bytes()) else {
+        unreachable!("a host holds a seal")
+    };
+    let Some(bytes) = rubbish.get_mut(..seal_len) else {
+        unreachable!("a seal fits 16 bytes at a 4-byte program unit")
+    };
+    bytes.fill(0x5A);
+    session.program(spare.seal_offset(), bytes)?;
+    session.barrier()?;
+    session.end_record();
+
+    session.erase(retiring.base(), retiring.bytes())?;
+    session.barrier()?;
+    Ok(())
+}
+
+/// The swap that installs the new generation over the *previous* run's header.
+///
+/// Every structure on media is intact and self-consistent — the seal names the header
+/// beneath it, so `sealed_generation` answers `Some(NEXT)` — and the run it names is the one
+/// two generations ago. A reader boots generation `NEXT` and finds the stale run's input
+/// under it, which is §10's "recovery never combines their footprints" broken in the one way
+/// no count, no oracle and no checksum can see.
+fn swap_that_installs_the_wrong_run(session: &mut Session) -> Result<(), Failed> {
+    previous_life(session)?;
+
+    let (spare, retiring) = (layout().bank(BankId::B), layout().bank(BankId::A));
+    session.erase(spare.base(), spare.bytes())?;
+    session.barrier()?;
+    program_header(session, BankId::B, &stale_header())?;
+    session.barrier()?;
+
+    session.begin_record(SWAP);
+    program_seal(session, BankId::B, NEXT)?;
+    session.barrier()?;
+    session.end_record();
+
+    session.erase(retiring.base(), retiring.bytes())?;
+    session.barrier()?;
+    Ok(())
+}
+
 fn drive(writer: fn(&mut Session) -> Result<(), Failed>) -> Vec<Run> {
     match Harness::new(geometry()).run(writer) {
         Ok(runs) => runs,
@@ -372,6 +431,30 @@ const SEAL_OP: usize = FIRST_OP + 4;
 /// The index of the commit barrier: §10 step 6.
 const COMMIT_OP: usize = FIRST_OP + 5;
 
+/// How many crash points [`waymaker_fault::injections`] gives one program of `len` bytes.
+///
+/// Every interior byte is a tear point and each tear is enumerated twice — once as a power
+/// loss and once as a failure the writer sees — and then three more: the whole operation
+/// followed by a power loss, a failure before it, and a failure after it. Derived rather
+/// than measured, so the census below fails when the sweep *shrinks* rather than when a
+/// fixture's input length changes.
+const fn points_in_a_program(len: u32) -> usize {
+    2 * (len as usize - 1) + 3
+}
+
+/// The same, for an erase: interrupted at erase blocks and nowhere else.
+const fn points_in_an_erase(blocks: u32) -> usize {
+    2 * (blocks as usize - 1) + 3
+}
+
+/// The same, for a barrier: it has no interior, so a power loss after it and a failure.
+const POINTS_IN_A_BARRIER: usize = 2;
+
+/// How many erase blocks a bank of this geometry is.
+fn blocks_per_bank() -> u32 {
+    layout().bank(BankId::A).bytes() / geometry().erase_size()
+}
+
 /// Which step `op` belongs to, or [`None`] for the previous life.
 fn step_of(op: usize) -> Option<Step> {
     let within = op.checked_sub(FIRST_OP)?;
@@ -388,6 +471,22 @@ fn check_shape(runs: &[Run]) -> &Run {
     };
     let spare = layout().bank(BankId::B);
     let retiring = layout().bank(BankId::A);
+    let Some(previous) = clean.ops().get(..FIRST_OP) else {
+        unreachable!("the previous life precedes the swap's own operations")
+    };
+    // Pinned so that `FIRST_COMMIT` stays the barrier it names. Two installs, each a header,
+    // a barrier, a seal and a barrier — so operation 3 is the first commit and operations 0
+    // to 3 are the device's first bank.
+    assert_eq!(previous.len(), FIRST_OP);
+    assert!(
+        matches!(previous.get(FIRST_COMMIT), Some(Op::Barrier)),
+        "operation {FIRST_COMMIT} is no longer the first install's commit barrier: {previous:?}"
+    );
+    assert_eq!(
+        previous.iter().filter(|op| **op == Op::Barrier).count(),
+        4,
+        "the previous life is two installs of two barriers each: {previous:?}"
+    );
     let Some(protocol) = clean.ops().get(FIRST_OP..) else {
         unreachable!("the swap's own operations follow the previous life")
     };
@@ -476,12 +575,17 @@ fn recovered(image: &[u8]) -> Vec<RecordId> {
     }
 }
 
-/// Whether `run` happened at or after the device's first durable commit.
+/// The index of the barrier that ends the previous life's first install.
 ///
-/// Before it, the device has never committed anything and has no authoritative bank to have
-/// lost. The first commit is the barrier that ends the previous life's first install.
+/// Before it the device has never committed anything and has no authoritative bank to have
+/// lost. Hard-coded, and therefore pinned: [`check_shape`] asserts the whole of the previous
+/// life's write sequence, so a reordering inside `previous_life` that kept the operation
+/// count would otherwise move what "after the first commit" means and silently change which
+/// runs [`audit`] excuses.
+const FIRST_COMMIT: usize = 3;
+
+/// Whether `run` happened at or after the device's first durable commit.
 fn after_first_commit(run: &Run) -> bool {
-    const FIRST_COMMIT: usize = 3;
     match run.injection() {
         None => true,
         Some(Injection { op, progress, .. }) => {
@@ -518,12 +622,6 @@ fn audit(run: &Run) -> Result<(), String> {
     let authority = authority(image);
     let count = authoritative_banks(authority);
 
-    if authority == (Authority::Ambiguous { generation: NEXT }) {
-        return Err(format!(
-            "at {:?}: two banks claim {NEXT:?}",
-            run.injection()
-        ));
-    }
     if !after_first_commit(run) {
         // A device that has never committed has no authoritative bank to have lost, and
         // §15's oracle would report `NoAuthoritativeBank` for the ordinary state of a part
@@ -531,11 +629,20 @@ fn audit(run: &Run) -> Result<(), String> {
         // history rather than about its bytes, which is why it is decided here.
         return Ok(());
     }
-    if count != 1 {
-        return Err(format!(
-            "at {:?}: a committed device has {count} authoritative banks",
-            run.injection()
-        ));
+    match count {
+        0 => {
+            return Err(format!(
+                "at {:?}: a committed device has nothing to boot from",
+                run.injection()
+            ));
+        }
+        1 => {}
+        _ => {
+            return Err(format!(
+                "at {:?}: a committed device has {count} authoritative banks",
+                run.injection()
+            ));
+        }
     }
 
     // §10: "a crash before step 5 recovers the old run", and "a crash after step 6 recovers
@@ -597,14 +704,41 @@ fn audit(run: &Run) -> Result<(), String> {
 #[test]
 fn the_recovery_rules_hold_at_every_crash_point_of_the_swap() {
     let runs = drive(swap);
-    check_shape(&runs);
-    assert!(runs.len() > 100, "only {} runs", runs.len());
+    let clean = check_shape(&runs);
+
+    // The fault-free run, the crash point that precedes the whole sequence, and then every
+    // point in every operation. Exact, and derived from the sequence rather than from a
+    // previous run of this test: a sweep that lost two thirds of its runs would pass a floor.
+    let enumerated: usize = clean
+        .ops()
+        .iter()
+        .map(|op| match op {
+            Op::Program { len, .. } => points_in_a_program(*len),
+            Op::Erase { len, .. } => points_in_an_erase(len / geometry().erase_size()),
+            Op::Barrier => POINTS_IN_A_BARRIER,
+        })
+        .sum();
+    assert_eq!(
+        runs.len(),
+        enumerated + 2,
+        "the sweep is not the enumeration"
+    );
 
     let mut installed = 0_usize;
     let mut still_the_old_run = 0_usize;
+    let (mut before_five, mut after_six) = (0_usize, 0_usize);
     for run in &runs {
         if let Err(complaint) = audit(run) {
             unreachable!("{complaint}");
+        }
+        if !after_first_commit(run) {
+            continue;
+        }
+        if before_the_seal(run) {
+            before_five += 1;
+        }
+        if after_the_commit_barrier(run) {
+            after_six += 1;
         }
         match authority(run.image()) {
             Authority::Bank { generation, .. } if generation == NEXT => installed += 1,
@@ -618,6 +752,14 @@ fn the_recovery_rules_hold_at_every_crash_point_of_the_swap() {
     assert!(
         installed > 0 && still_the_old_run > 0,
         "{installed} runs installed the new run and {still_the_old_run} kept the old one"
+    );
+    // And both of §10's recovery rules have to have been *applied*, or "no run broke them"
+    // is a statement about an empty set. `audit` checks each on the runs that fall its side
+    // of the boundary; these are how many that was.
+    assert!(
+        before_five > 0 && after_six > 0,
+        "§10's two recovery rules were checked against {before_five} runs before step 5 and \
+         {after_six} after step 6"
     );
 }
 
@@ -646,20 +788,31 @@ fn every_step_of_the_protocol_has_crash_points_in_the_sweep() {
         }
     }
 
+    // Exact rather than "at least one". A step that kept a single crash point would pass a
+    // floor and would have stopped being a sweep, and `waymaker-spec`'s own census pins
+    // counts for that reason: the dangerous direction is an enumeration that silently shrank.
+    let erase = points_in_an_erase(blocks_per_bank());
+    let expected = [
+        // Step 1 touches no media, so a crash point in it would mean the writer does.
+        0,
+        erase + POINTS_IN_A_BARRIER,
+        points_in_a_program(header_bytes()),
+        POINTS_IN_A_BARRIER,
+        points_in_a_program(layout().bank(BankId::B).seal_bytes()),
+        POINTS_IN_A_BARRIER,
+        erase + POINTS_IN_A_BARRIER,
+    ];
     for (index, step) in Step::ALL.into_iter().enumerate() {
-        let seen = counted.get(index).copied().unwrap_or_default();
-        if step == Step::StopEffects {
-            assert_eq!(
-                seen, 0,
-                "step 1 touches no media, so a crash point in it would mean the writer does"
-            );
-            continue;
-        }
-        assert!(seen > 0, "{step:?} has no crash point in the sweep");
+        assert_eq!(
+            counted.get(index).copied(),
+            expected.get(index).copied(),
+            "{step:?} has the wrong number of crash points in the sweep"
+        );
     }
 
     // And the two erases really are interrupted part-way, which is what four blocks a bank
-    // buys: a bank half erased is the state §10 step 7's crash-safety is about.
+    // buys: a bank half erased is the state §10 step 7's crash-safety is about. Two erases,
+    // each torn at every interior block, each tear enumerated twice.
     let torn_erases = runs
         .iter()
         .filter(|run| {
@@ -674,9 +827,15 @@ fn every_step_of_the_protocol_has_crash_points_in_the_sweep() {
             )
         })
         .count();
+    assert_eq!(
+        torn_erases,
+        2 * 2 * (blocks_per_bank() as usize - 1),
+        "a half-erased bank is the state §10 step 7's crash-safety is about"
+    );
     assert!(
-        torn_erases >= 6,
-        "only {torn_erases} runs tore an erase, so a half-erased bank was barely reached"
+        torn_erases > 0,
+        "a bank of one erase block has no interior tear point, so this fixture measures \
+         nothing about a partial erase"
     );
 }
 
@@ -720,9 +879,10 @@ fn the_lazy_erase_never_returns_the_old_bank_to_authority() {
         }
     }
 
-    assert!(
-        during_the_reclaim >= 8,
-        "only {during_the_reclaim} crash points fell in the lazy erase"
+    assert_eq!(
+        during_the_reclaim,
+        points_in_an_erase(blocks_per_bank()) + POINTS_IN_A_BARRIER,
+        "the lazy erase is an erase and a barrier, and every point in both is swept"
     );
     assert!(
         old_bank_gone > 0,
@@ -828,6 +988,39 @@ fn a_reclaim_taken_before_the_commit_barrier_can_lose_both_runs() {
     assert!(
         rejected(swap_that_reclaims_before_the_commit_barrier) > 0,
         "a reclaim before the commit barrier was never caught"
+    );
+}
+
+#[test]
+fn a_swap_whose_seal_is_not_a_seal_never_installs_the_run_it_claims_to() {
+    // §10's second recovery rule, as a thing that can fail: "a crash after step 6 recovers
+    // the new run". This writer reaches step 6 and installs nothing.
+    assert!(
+        rejected(swap_whose_seal_is_not_a_seal) > 0,
+        "a swap that sealed with rubbish was never caught"
+    );
+}
+
+#[test]
+fn a_swap_that_installs_another_runs_header_is_caught_by_the_footprint_rule() {
+    // §10's prohibition, as a thing that can fail: "recovery never combines their
+    // footprints". Nothing here is damaged — the seal names the header beneath it — so no
+    // count, no oracle and no decode failure sees it. The only rule that does is the one
+    // that reads the run out of the bank the generation named, which is why that rule is in
+    // `audit` rather than left to `bank::select`.
+    let complaints: Vec<String> = drive(swap_that_installs_the_wrong_run)
+        .iter()
+        .filter_map(|run| audit(run).err())
+        .collect();
+    assert!(
+        !complaints.is_empty(),
+        "a swap that installed the previous run's header was never caught"
+    );
+    assert!(
+        complaints
+            .iter()
+            .any(|complaint| complaint.contains("carries")),
+        "the footprint rule was not what caught it: {complaints:?}"
     );
 }
 

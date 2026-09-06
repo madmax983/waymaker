@@ -65,11 +65,15 @@ of `Sealable` and `Installed` may be constructed in, the spelling every barrier 
 with, and — the sharpest of the five — the two erases, each held to the bank its row names,
 before a barrier, without naming the other one.
 
-**The seal names the header that landed.** `stage` computes the digest from the bytes it just
-programmed rather than from the `BankHeader` it was handed, and carries the seal in the
-caller's page. A writer that sealed its intention would seal a header a failed program never
-put there, which is a device carrying a torn header under a perfectly valid
-highest-generation seal.
+**A seal is never programmed over a header that did not land** — and the reason is the `?` on
+the program call, not where the digest came from. `waymaker-fault`'s
+`swap_that_seals_whatever_landed` has two bugs, and this is worth being exact about because
+an earlier draft of this ADR credited the wrong one: it seals the header it *intended* to
+write, and it carries on past a failed program. `Prepared::stage` computes its digest from
+the buffer the header was encoded into, before the program, so sealing the `BankHeader`
+argument directly would be byte-for-byte the same. What the digest buys is that a seal names
+one header, so a frame torn part-way through its program is not a candidate at any
+generation.
 
 **Which bank is erased is never a parameter.** The bank to install into is
 `authority.bank.other()` and the bank to reclaim is the one the device booted, both fixed at
@@ -80,8 +84,9 @@ so an interrupted erase of the old one can only remove a candidate, never promot
 **Effect identity restarts, and stays distinguishable.** `Installed::allocator` is
 `EffectIdAllocator::for_run` with the run id the swap installed. §07 identifies an effect by
 the pair `(RunId, EffectSeq)` and the sequence restarts at zero, so the pair is the whole of
-what keeps the two runs apart — which is why `SwapError::RunReused` exists and why it is
-refused at `beginning`, the last moment before the collision becomes durable.
+what keeps the two runs apart, and `SwapError::RunReused` is what refuses the one input under
+which it cannot. That refusal is only as good as the `run` it is given, which is a caller's
+argument this module cannot check — see Consequences.
 
 Three things are held by three different mechanisms, and it is worth being explicit about
 which:
@@ -94,10 +99,31 @@ which:
 
 ## Consequences
 
-**Five types and eleven public functions for what a caller experiences as one operation.**
+**Eight public types and eleven public functions for what a caller experiences as one
+operation** — five states, the `Retired` enum, and two errors. Two of the five states cannot
+be reached from the crate root: `waymaker_flash::Staged` and `Sealable` are already
+`append`'s, so the swap's are `swap::Staged` and `swap::Sealable` and only the other three
+are re-exported. That is a wart, and the alternative — renaming one pair — would make the two
+protocols read as different things when they are deliberately the same shape.
 That is the price of the ordering being a compile error, and it is the same price
 [ADR 0019](0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md) paid for
 §07's two barriers. A caller writes a five-call chain; `and_then` makes it one expression.
+
+**Two arguments this module cannot check, and what each costs.** `Swap::beginning` takes
+`booted` and `run`, and reads no media, so neither is verified. A wrong `run` disables
+`SwapError::RunReused` and leaves two runs whose effect identities collide for ever. A
+*stale* `booted` — one naming a bank that has since lost a swap — is worse: `prepare` erases
+the bank that is really authoritative, every check passes, and the live run is gone. The
+refusal that would close the second is a read of the spare bank's seal, and it cannot be made
+fail-closed here: the header it would have to decode is as long as the previous run's input,
+bounded by the bank rather than by the caller's page, so a small page would turn it into a
+guard that silently allows what it exists to refuse. Both are stated as preconditions and
+recorded in CLAUDE.md's "What is not checked", and closing them by construction is the
+dispatcher's — rung 0.4's — because a dispatcher that selects and swaps in one place cannot
+hold a `booted` older than the swap it is planning. This is the alternative that was
+considered and not taken: `beginning` could take the retiring bank's decoded `BankHeader`
+instead of a bare `RunId`, which would make `run` *read* rather than asserted — it closes
+half of it, and it does not close the half that matters.
 
 **No budget raise, but only after the writer was made to stop copying itself.** The first
 measurement was 18474 B against the 18432 B gate — 42 B over. ADR 0020 asked that issue #26
@@ -106,10 +132,10 @@ argued from 42 B would have been the worst version of the thing that ADR objecte
 changes closed it and both were real defects rather than gaming: the plan carried a
 `Geometry` that the `JournalRegion` beside it already held, and each step took the whole
 eighty-odd-byte plan *by value* to compare one field of it. Passing it by reference and
-dropping the duplicate field took the figure to **17966 B**, 466 B under the gate. The probe
-row was trimmed too — a three-armed `match` over `Authority` and four `black_box` calls that
-charged the engine's row for this file's arithmetic — which is issue
-[#72](https://github.com/madmax983/waymaker/issues/72) in miniature and is why that issue
+dropping the duplicate field, together with trimming the probe row's own arithmetic — a
+three-armed `match` over `Authority` and four `black_box` calls that charged the engine for
+this file — took the figure to **18030 B**, 402 B under the gate. That last part is issue
+[#72](https://github.com/madmax983/waymaker/issues/72) in miniature, and is why that issue
 should be fixed before the next raise is argued.
 
 **`waymaker-spec` still cannot describe this.** The ghost model's banks hold no records and
