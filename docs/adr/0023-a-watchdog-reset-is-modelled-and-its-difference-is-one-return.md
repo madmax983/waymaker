@@ -139,6 +139,24 @@ that had a case to think about: `FaultError::message`, `Session::completed`,
 `Session::interrupt` and the rig's `cause_of`. The last was the only one outside
 `waymaker-fault`, which is the layering working.
 
+**A barrier acknowledges what it returned from, not what it completed.** Codex's second round
+found the model raising an obligation off a media fact: a barrier interrupted at
+`Progress::Whole` was recorded in `Session::barriers` whatever it answered, so a record ordered
+by one was `Durability::Acknowledged` even though the call never returned. §15's guarantee is
+about a promise — "any record acknowledged after its barrier is recovered after reset" — and a
+call that handed back an error, or never handed back at all, promised nothing. Requiring such a
+record would make the oracle reject a reader that stopped one record short of a record nobody
+was told about, which is the direction an instrument must not fail in.
+
+Fixed for both non-returning causes rather than only for the new one, because the argument does
+not distinguish them: a watchdog reset never returns and an injected failure returns an error,
+so neither acknowledges, while a power cut at `Progress::Whole` returns first and still does.
+The cost is that such a record reads `PossiblyDurable` when it is durable in fact, which
+understates in the safe direction, and
+`a_barrier_that_did_not_return_orders_a_record_without_acknowledging_it` holds both halves: the
+watchdog run's record is complete and unrequired, and the power-cut run at the same operation
+leaves identical media and *is* required.
+
 **One pre-existing defect surfaced beside it.** `Session::barrier` decided "the barrier ran"
 by matching the `Progress` *variant*, so a hand-built `Progress::Bytes(0)` — which
 `Progress::Bytes` documents as meaning `Progress::None` — was read as a completed barrier and

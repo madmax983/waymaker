@@ -488,11 +488,28 @@ impl StableStorage for Session {
             {
                 Err(self.interrupt(injection.interruption))
             }
-            // The barrier completed. Whether the power then went away or the call merely
-            // reported a failure, the ordering it established is on media.
+            // The barrier completed, so the ordering it established is on media. Whether it
+            // *acknowledged* anything is a different question, and the answer is what the
+            // call returned.
+            //
+            // Only a barrier that returned `Ok` acknowledges. Design document §15's
+            // guarantee is about a promise — "any record acknowledged after its barrier is
+            // recovered after reset" — and a call that handed back an error promised
+            // nothing. A power cut at `Progress::Whole` returns first and so still
+            // acknowledges; a watchdog reset never returns, and an injected failure returns
+            // an error, so neither does.
+            //
+            // The cost is that such a record is [`Durability::PossiblyDurable`] when it is
+            // in fact durable, which understates. That is the safe direction: recovery may
+            // produce it or not, and both are legal. Raising the obligation instead would
+            // make the oracle reject a reader that stopped one record short of a record
+            // nobody was ever told about.
             Some(injection) => {
-                self.barriers.push(index);
-                self.completed(injection)
+                let outcome = self.completed(injection);
+                if outcome.is_ok() {
+                    self.barriers.push(index);
+                }
+                outcome
             }
             None => {
                 self.barriers.push(index);

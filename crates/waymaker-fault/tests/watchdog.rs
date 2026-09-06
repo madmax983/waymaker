@@ -298,10 +298,17 @@ fn a_watchdog_reset_never_hands_the_writer_an_ok() {
 }
 
 #[test]
-fn a_watchdog_reset_acknowledges_a_record_the_writer_never_saw_ordered() {
-    // The consequence of the difference above. The barrier completes on media, so the record
-    // is durable and recovery owes it; the writer got an error and knows none of that.
-    let run = run_one(
+fn a_barrier_that_did_not_return_orders_a_record_without_acknowledging_it() {
+    // The consequence of the difference above, and Codex's second review round. The barrier
+    // completes on media, so the record really is durable — every byte of it is there, and a
+    // forward scan will produce it. What did not happen is the promise: the call never
+    // returned, so nothing was told to anyone.
+    //
+    // §15's guarantee is about the promise, so recovery is *permitted* to produce this record
+    // and not *required* to. Requiring it would make the oracle reject a reader that stopped
+    // one record short of a record nobody was ever told about, which is the direction an
+    // instrument must not fail in.
+    let watchdog = run_one(
         Injection {
             op: 1,
             progress: Progress::Whole,
@@ -310,13 +317,33 @@ fn a_watchdog_reset_acknowledges_a_record_the_writer_never_saw_ordered() {
         one_program,
     );
     assert_eq!(
-        run.ledger().state(RecordId(1)),
+        watchdog.ledger().state(RecordId(1)),
+        Some(waymaker_fault::Durability::PossiblyDurable)
+    );
+    assert_eq!(watchdog.ledger().torn(RecordId(1)), Some(false));
+    // Both answers are legal, which is what "permitted and not required" means.
+    assert!(verify_recovery(watchdog.ledger(), &[RecordId(1)]).is_ok());
+    assert!(verify_recovery(watchdog.ledger(), &[]).is_ok());
+
+    // The tooth: a power cut at the same point *does* acknowledge, because the barrier
+    // returned before the supply went. The two crash points leave identical media and
+    // different obligations, and that is the whole of the difference.
+    let power = run_one(
+        Injection {
+            op: 1,
+            progress: Progress::Whole,
+            interruption: Interruption::PowerLoss,
+        },
+        one_program,
+    );
+    assert_eq!(power.image(), watchdog.image());
+    assert_eq!(
+        power.ledger().state(RecordId(1)),
         Some(waymaker_fault::Durability::Acknowledged)
     );
-    assert!(verify_recovery(run.ledger(), &[RecordId(1)]).is_ok());
     assert!(
-        verify_recovery(run.ledger(), &[]).is_err(),
-        "an acknowledged record recovery lost is a breach whatever reset it survived"
+        verify_recovery(power.ledger(), &[]).is_err(),
+        "an acknowledged record recovery lost is a breach"
     );
 }
 
