@@ -194,6 +194,9 @@ fn a_writer_that_issues_no_operations_still_sweeps() {
     // `injections(&[], geometry)` returns the one crash point that precedes everything, and
     // an empty sequence is explicitly supported. A sweep that refused it would report a
     // determinism failure for a writer that is perfectly deterministic.
+    //
+    // Two runs rather than three: `Interruption::Watchdog` is enumerated only at whole
+    // operations, and there are none.
     let runs = match Harness::new(geometry()).run(|_session| Ok::<(), FaultError>(())) {
         Ok(runs) => runs,
         Err(error) => unreachable!("{error}"),

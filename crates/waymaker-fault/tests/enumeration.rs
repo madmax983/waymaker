@@ -47,6 +47,14 @@ fn a_four_byte_program_tears_at_every_byte_inside_it() {
             power(Progress::Bytes(2)),
             power(Progress::Bytes(3)),
             power(Progress::Whole),
+            // Watchdog: the operation completed and the core stopped before the call
+            // returned. One point, because every other watchdog world is a power-cut world
+            // this list already has — see `Interruption::Watchdog`.
+            Injection {
+                op: 0,
+                progress: Progress::Whole,
+                interruption: Interruption::Watchdog,
+            },
             // Failure: the call returns an error having done nothing, part of it, or all
             // of it. The last is not a contradiction — an operation whose status read
             // fails after the media changed is a real device.
@@ -155,13 +163,15 @@ fn the_enumeration_is_a_pure_function_and_has_no_duplicates() {
 #[test]
 fn the_count_is_the_arithmetic_the_sequence_implies() {
     // Power loss: one before anything, plus one per tear point, plus one after each op.
+    // Watchdog: one per op, because only a whole operation is a world of its own.
     // Failure: one per tear point plus `None` and `Whole` for each mutating op, and a
     // single point for each barrier.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let points = injections(&ops, geometry());
     let power = 1 + 7 + 1 + 1;
+    let watchdog = 1 + 1;
     let failure = (7 + 2) + 1;
-    assert_eq!(points.len(), power + failure);
+    assert_eq!(points.len(), power + watchdog + failure);
 }
 
 #[test]

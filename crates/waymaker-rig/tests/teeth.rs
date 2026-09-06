@@ -13,14 +13,14 @@ use waymaker_fault::{Device, Harness, Session};
 use waymaker_flash::append::Journal;
 use waymaker_flash::recovery::Recovery;
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_rig::audit::Breach;
+use waymaker_rig::audit::{Audit, Breach};
 use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Rig, Verdict};
 use waymaker_rig::wear::{Metered, Traffic};
 use waymaker_rig::window::Window;
-use waymaker_rig::witness::{Mark, Stage, Witness};
+use waymaker_rig::witness::{Mark, Progress, Stage, Witness};
 use waymaker_rig::workload::{Role, Workload};
 
 const SEED: u64 = 0x0BAD_1DEA_0BAD_1DEA;
@@ -295,4 +295,124 @@ fn a_flaw_is_wrong_in_its_own_window_rather_than_everywhere() {
             runs.len()
         );
     }
+}
+
+/// What the witness on `device` says about iteration zero.
+fn marks_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Progress> {
+    let mut instrument =
+        Window::new(device, rig.instrument_base(), geometry().erase_size()).ok()?;
+    Witness::new(rig.witness_region())
+        .scan(&mut instrument, page)
+        .ok()
+}
+
+/// The verdict a rig would reach if it judged from the history it still held in RAM.
+///
+/// The witness is read from media, because that half is durable either way. What is
+/// *remembered* is the recovered history: every record the writer began, in order, rather
+/// than the records a fresh scan of the journal produces.
+fn verdict_from_retained_ram(rig: &Rig, progress: Progress, banks: usize) -> Result<(), Breach> {
+    let workload = rig.workload(0);
+    let mut audit = Audit::new(workload, progress);
+    let mut scratch = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    let mut declared = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    // Only what the writer began. A run that began nothing remembers nothing, which is the
+    // state a reset before the first mark leaves.
+    if let Some(attempted) = progress.attempted() {
+        for index in 0..=attempted {
+            let Some(record) = workload.record(index, &mut declared) else {
+                break;
+            };
+            audit.saw(&record, &mut scratch)?;
+        }
+    }
+    audit.finish(banks)
+}
+
+#[test]
+fn a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch() {
+    // A watchdog reset holds the supply, so RAM survives it. That makes a shortcut available
+    // that a brownout forbids: judge the run from the history the rig still holds, instead of
+    // from a fresh scan of media. This measures what the shortcut costs.
+    //
+    // Nothing here is a defect in `Rig::verify`. It is the reason `Rig::verify` reads media,
+    // stated as a number rather than as a comment — and the third of the three differences
+    // `waymaker-fault`'s watchdog model names, the two on media being covered there.
+    let harness = Harness::new(geometry());
+    let Ok(runs) = harness.run(|session| wrong_writer(Flaw::AcknowledgeBeforeCommit, session))
+    else {
+        unreachable!("the fault-free run of a wrong writer still succeeds")
+    };
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut caught = 0_usize;
+    let mut excused = 0_usize;
+    for run in &runs {
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            continue;
+        };
+        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+            continue;
+        };
+        if !matches!(
+            verdict.outcome(),
+            Outcome::Breached(Breach::LostAcknowledgedRecord { .. })
+        ) {
+            continue;
+        }
+        caught += 1;
+        let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
+            continue;
+        };
+        if verdict_from_retained_ram(&rig, progress, verdict.banks()).is_ok() {
+            excused += 1;
+        }
+    }
+    assert!(caught > 0, "the media-reading rig caught no loss at all");
+    assert_eq!(
+        excused, caught,
+        "a rig judging from retained RAM excused {excused} of the {caught} losses the real \
+         one catches"
+    );
+}
+
+#[test]
+fn the_real_rig_reads_the_history_from_media() {
+    // The other half, so the test above is a measurement rather than an accusation: on the
+    // *correct* writer both readings agree, which is what makes the disagreement above a
+    // property of the loss and not of the two code paths.
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(|session| {
+            let rig = rig();
+            let mut page = [0_u8; Rig::PAGE_BYTES];
+            let mut part = Metered::new(session);
+            rig.prepare(&mut part, 0, &mut page).map_err(|_| ())?;
+            rig.iterate(0, &mut part, &mut Silent, &mut NeverCut, &mut page)
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+        .expect("the fault-free run succeeds");
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut compared = 0_usize;
+    for run in &runs {
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            continue;
+        };
+        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+            continue;
+        };
+        let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
+            continue;
+        };
+        assert_eq!(
+            verdict_from_retained_ram(&rig, progress, verdict.banks()).is_ok(),
+            verdict.outcome() == Outcome::Passed,
+            "the two readings disagree on the correct writer at {:?}",
+            run.injection()
+        );
+        compared += 1;
+    }
+    assert!(compared > 0, "no run was compared");
 }

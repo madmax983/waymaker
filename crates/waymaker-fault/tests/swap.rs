@@ -434,21 +434,22 @@ const COMMIT_OP: usize = FIRST_OP + 5;
 /// How many crash points [`waymaker_fault::injections`] gives one program of `len` bytes.
 ///
 /// Every interior byte is a tear point and each tear is enumerated twice — once as a power
-/// loss and once as a failure the writer sees — and then three more: the whole operation
-/// followed by a power loss, a failure before it, and a failure after it. Derived rather
-/// than measured, so the census below fails when the sweep *shrinks* rather than when a
-/// fixture's input length changes.
+/// loss and once as a failure the writer sees — and then four more: the whole operation
+/// followed by a power loss, the whole operation followed by a watchdog reset, a failure
+/// before it, and a failure after it. Derived rather than measured, so the census below fails
+/// when the sweep *shrinks* rather than when a fixture's input length changes.
 const fn points_in_a_program(len: u32) -> usize {
-    2 * (len as usize - 1) + 3
+    2 * (len as usize - 1) + 4
 }
 
 /// The same, for an erase: interrupted at erase blocks and nowhere else.
 const fn points_in_an_erase(blocks: u32) -> usize {
-    2 * (blocks as usize - 1) + 3
+    2 * (blocks as usize - 1) + 4
 }
 
-/// The same, for a barrier: it has no interior, so a power loss after it and a failure.
-const POINTS_IN_A_BARRIER: usize = 2;
+/// The same, for a barrier: it has no interior, so a power loss after it, a watchdog reset
+/// after it, and a failure.
+const POINTS_IN_A_BARRIER: usize = 3;
 
 /// How many erase blocks a bank of this geometry is.
 fn blocks_per_bank() -> u32 {

@@ -14,29 +14,40 @@
 //!   model has. That is precisely why the boards are still owed, and
 //!   `xtask::docs::HARDWARE_TARGETS` says so.
 //!
-//! # Why every cell this file fills is a power cut
+//! # Which cell a run fills, and what a cell is worth
 //!
-//! An earlier version of this file partitioned the injector's enumeration into the two reset
-//! causes — a torn program for a brownout, a whole or unstarted one for a watchdog — and
-//! reported a complete census. Codex was right to reject it, and the reason is worth keeping
-//! here rather than in a commit message.
+//! A cell is credited from the injector's own cause, never from a reading of `Progress`. An
+//! earlier version of this file partitioned power cuts by how much of an operation completed
+//! and called half of them watchdog resets. Codex was right to reject it: that groups power
+//! cuts, it does not perform a reset the supply survives.
 //!
-//! Every injection the harness performs is an [`Interruption::PowerLoss`], whose documented
-//! contract is "the world stops here": nothing runs afterwards, the session is dead, and the
-//! image is what media held at that instant. What separates a watchdog reset from a brownout
-//! is that the supply *holds* — the flash controller may finish a unit the core has stopped
-//! believing in, RAM is not cleared, and the reset-cause register says which happened. The
-//! model has none of those. Splitting `Progress` two ways groups power cuts by how much of an
-//! operation completed; it does not perform a watchdog reset, and calling the result watchdog
-//! coverage is the relabelling this crate exists to avoid.
+//! The harness now performs one. [`Interruption::Watchdog`] holds the supply, so the flash
+//! controller finishes the unit the core stopped believing in and the writer is never told the
+//! operation completed. [`cause_of`] reads the cause off the injection, and
+//! [`a_watchdog_cell_is_credited_only_by_a_watchdog_reset`] is what keeps it reading the cause
+//! rather than the progress.
 //!
-//! So this file fills the three [`ResetCause::PowerCut`] cells and says so. The three
-//! [`ResetCause::Watchdog`] cells are a **hardware** obligation, and they are inside the rows
-//! `xtask::docs::HARDWARE_TARGETS` already carries — both of which name "power-cut *and
-//! watchdog-reset* loops". What this crate does supply for them is everything but the
-//! evidence: the plan arms the cause, [`PlannedCut`] hands it to the cutter, the log line
-//! records it, and the census refuses a run that never reached them. That refusal is a tested
-//! property below rather than a claim.
+//! On media a watchdog reset is *weaker* than a brownout: `waymaker-fault`'s
+//! `every_watchdog_image_is_one_a_power_cut_also_produces` proves it. So the watchdog cells do
+//! not buy new media states. They buy the difference media cannot show — the writer is never
+//! told the operation completed — and
+//! [`a_watchdog_reset_does_not_dispatch_where_a_power_cut_does`] measures it.
+//!
+//! # Five cells, not six
+//!
+//! That same difference costs the sixth. Being *in* the dispatch window needs the dispatch
+//! mark's commit barrier to have returned, and a watchdog reset is the reset that does not
+//! return. So no host run is ever in the window under a watchdog reset, and
+//! [`the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth`] requires the census to
+//! name that cell rather than pass over it. A board's watchdog fires on a timer rather than at
+//! a call boundary, which is the thing no model supplies.
+//!
+//! # What the boards still owe
+//!
+//! The sixth cell, and everything physical for both causes. A real part may abort the unit in
+//! flight, may leave a bit at neither level, and has a reset-cause register no model has; RAM
+//! retention is real there and is modelled here only in `tests/teeth.rs`, as the shortcut it
+//! makes available. `xtask::docs::HARDWARE_TARGETS` carries both rows and both stay `Not run`.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -100,13 +111,14 @@ fn records() -> u16 {
 
 /// The reset cause an injection models.
 ///
-/// One answer, because the harness has one: `Interruption::PowerLoss` is a power cut whatever
-/// `Progress` it stopped at. See the module documentation for why this used to have two.
+/// Read off the injection's own cause. `Progress` says how much of an operation landed, which
+/// is not a reset cause — see the module documentation for the version of this that read one.
 const fn cause_of(injection: Injection) -> Option<ResetCause> {
     match injection.interruption {
         // A failed call the writer reacts to is not a reset at all.
         Interruption::Failure => None,
         Interruption::PowerLoss => Some(ResetCause::PowerCut),
+        Interruption::Watchdog => Some(ResetCause::Watchdog),
     }
 }
 
@@ -144,8 +156,7 @@ fn interrupted_the_engine(run: &Run, rig: &Rig) -> bool {
 /// out — deliberately, so it over-claims rather than under-claims — so a power loss that takes
 /// the mark's own commit barrier leaves the mark whole on media with `dispatch` never called.
 /// Crediting the dispatch cell from the mark alone would report a cut in the instrument's
-/// write as a cut in the dispatch window, which is the same relabelling the watchdog cells are
-/// left empty to avoid.
+/// write as a cut in the dispatch window, which is the same relabelling [`cause_of`] refuses.
 ///
 /// What makes the cell reachable at all is [`Interruption::PowerLoss`] at `Progress::Whole`:
 /// the operation returns `Ok(())` and the writer meets the power at its *next* storage call.
@@ -349,10 +360,9 @@ fn every_crash_point_leaves_media_the_oracle_accepts() {
 }
 
 #[test]
-fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
-    // Issue #27's census, over the half a host can supply. A sweep that never reached a
-    // dispatch-phase cut has said nothing about that cell, and this is what makes the silence
-    // a failure.
+fn the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth() {
+    // Issue #27's census, all six cells. A sweep that never reached a dispatch-phase reset has
+    // said nothing about that cell, and this is what makes the silence a failure.
     let harness = Harness::new(geometry());
     // What the dispatcher was entered for, one entry per run. `Harness::run` calls the writer
     // once for the fault-free run and then once per crash point, in the order it returns them,
@@ -404,25 +414,63 @@ fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
             coverage = coverage.record(phase, cause);
         }
     }
-    for phase in Phase::ALL {
-        assert!(
-            coverage.iterations(phase, ResetCause::PowerCut) > 0,
-            "the sweep never cut the {} write",
-            phase.name()
-        );
+    // Five of the six. The write points are reached under both causes; the dispatch *window*
+    // is reached under a power cut only, for the reason below.
+    for phase in [Phase::Schedule, Phase::Completion] {
+        for cause in ResetCause::ALL {
+            assert!(
+                coverage.iterations(phase, cause) > 0,
+                "the sweep never reset the {} write with a {}",
+                phase.name(),
+                cause.name()
+            );
+        }
     }
+    assert!(coverage.iterations(Phase::Dispatch, ResetCause::PowerCut) > 0);
 
-    // And the half it cannot: the census must still refuse this run, because a watchdog reset
-    // has not happened. A host sweep that reported a complete census would be reporting
-    // coverage nothing produced — which is what this file used to do.
+    // The sixth is a board's, and the census names it rather than passing over it. Reaching
+    // the dispatch window needs the mark's commit barrier to have *returned*, and a watchdog
+    // reset is the reset that does not return: the effect never goes out, so no host run is
+    // ever in the window. A board's watchdog fires on a timer rather than at a call boundary,
+    // which is exactly the thing a model cannot supply.
     let gap = coverage
         .verdict()
-        .expect_err("a host sweep performs no watchdog reset, so the census is not complete");
+        .expect_err("a host cannot be in the dispatch window under a watchdog reset");
+    assert_eq!(gap.phase(), Phase::Dispatch);
+    assert_eq!(gap.cause(), ResetCause::Watchdog);
     assert_eq!(
-        gap.cause(),
-        ResetCause::Watchdog,
-        "the only cells a host cannot fill are the watchdog ones"
+        coverage.iterations(Phase::Dispatch, ResetCause::Watchdog),
+        0
     );
+}
+
+#[test]
+fn a_watchdog_cell_is_credited_only_by_a_watchdog_reset() {
+    // The rule that keeps the census from being a relabelling. A cell is credited from the
+    // injector's cause, so a sweep that performed no watchdog reset cannot fill a watchdog
+    // cell however its power cuts are grouped.
+    //
+    // Stated over `cause_of` itself, which is the one function the census reads.
+    for progress in [Progress::None, Progress::Bytes(1), Progress::Whole] {
+        let power = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::PowerLoss,
+        };
+        assert_eq!(cause_of(power), Some(ResetCause::PowerCut));
+        let watchdog = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::Watchdog,
+        };
+        assert_eq!(cause_of(watchdog), Some(ResetCause::Watchdog));
+        let failure = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::Failure,
+        };
+        assert_eq!(cause_of(failure), None, "a failed call is not a reset");
+    }
 }
 
 #[test]
@@ -493,28 +541,81 @@ fn a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran() {
 }
 
 #[test]
-fn the_watchdog_cells_are_owed_by_hardware_and_the_census_says_so() {
-    // The rig supplies everything for a watchdog reset but the reset. This is that stated as a
-    // test rather than as a comment: a census with every power-cut cell filled is still
-    // incomplete, and the gap it names is a watchdog cell every time.
+fn a_power_cut_only_census_is_still_incomplete() {
+    // The census's own rule, independent of what any sweep reached: three filled cells are not
+    // six. A `Coverage::verdict` that stopped saying so would let a sweep whose watchdog half
+    // silently stopped running report a pass.
     let mut coverage = Coverage::EMPTY;
     for phase in Phase::ALL {
         coverage = coverage.record(phase, ResetCause::PowerCut);
     }
     let gap = coverage
         .verdict()
-        .expect_err("three of the six cells are hardware's");
+        .expect_err("half a census is not a census");
     assert_eq!(gap.cause(), ResetCause::Watchdog);
     assert_eq!(gap.phase(), Phase::Schedule);
 
-    // And the cause is carried end to end, so a board that *can* perform one is armed for it:
-    // the plan draws it, and the cutter is handed it.
+    // And the cause is carried end to end, so a board is armed for it: the plan draws it, and
+    // the cutter is handed it.
     let rig = rig();
     let armed = (0..64_u32)
         .map(|iteration| rig.cut_at(iteration))
         .filter(|cut| cut.cause() == ResetCause::Watchdog)
         .count();
     assert!(armed > 0, "no iteration in 64 armed a watchdog reset");
+}
+
+#[test]
+fn a_watchdog_reset_does_not_dispatch_where_a_power_cut_does() {
+    // What the three watchdog cells buy, measured. The two causes leave the same media here —
+    // `waymaker-fault` proves that — so the difference has to be found in the run rather than
+    // in the image.
+    //
+    // A power cut at `Progress::Whole` returns `Ok(())` and takes the world at the *next*
+    // call, so the rig marks the dispatch and dispatches. A watchdog reset stops the core
+    // before that return, so the effect never goes out. Design document §02 decision 3 is
+    // about exactly this window, and a sweep that could not tell the two apart would be
+    // covering one of them twice.
+    let harness = Harness::new(geometry());
+    let baseline = harness
+        .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
+        .expect("the fault-free run succeeds");
+    let Some(clean) = baseline.first() else {
+        unreachable!("the fault-free run is first")
+    };
+    let operations = clean.ops().len();
+
+    let effects_at = |op: usize, interruption: Interruption| {
+        let dispatched = RefCell::new(0_usize);
+        let outcome = harness.run_one(
+            Injection {
+                op,
+                progress: Progress::Whole,
+                interruption,
+            },
+            |session: &mut waymaker_fault::Session| {
+                let (result, effects) = drive_counting(session);
+                *dispatched.borrow_mut() = effects;
+                result.map(|_| ()).map_err(|_| ())
+            },
+        );
+        outcome.map(|_| dispatched.into_inner()).ok()
+    };
+
+    let divergent = (0..operations).find(|op| {
+        matches!(
+            (
+                effects_at(*op, Interruption::PowerLoss),
+                effects_at(*op, Interruption::Watchdog),
+            ),
+            (Some(power), Some(watchdog)) if power > watchdog
+        )
+    });
+    assert!(
+        divergent.is_some(),
+        "no operation dispatched under a power cut and not under a watchdog reset, so the two \
+         causes are the same run"
+    );
 }
 
 #[test]

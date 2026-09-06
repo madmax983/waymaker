@@ -31,6 +31,7 @@ be superseded.
 | [0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) | The capacity reserve is an outcome and a terminal record, and the gate is a type | accepted |
 | [0021](0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md) | The rig is a `no_std` library, and what it knew survives the cut | accepted |
 | [0022](0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md) | The bank swap is a typestate, and step one is a value being consumed | accepted |
+| [0023](0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md) | A watchdog reset is modelled, and its difference is one return | accepted |
 
 ## Reading the numbers
 
@@ -48,7 +49,7 @@ of these are older than their numbers suggest:
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
-0022.
+0022 → 0023.
 
 ## Writing one
 

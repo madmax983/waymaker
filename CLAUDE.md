@@ -210,7 +210,7 @@ All 2 hardware targets, with the id to cite when a change touches one:
 
 | Id | Target | Where it stands | What would discharge it |
 | --- | --- | --- | --- |
-| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one — and the census cannot complete without one, because half its cells are watchdog resets a host cannot perform. |
+| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one — and the census cannot complete without one, because its sixth cell is a watchdog reset inside the dispatch window, which no model can produce. |
 | `cortex-m4` | power-cut and watchdog-reset loops on a Cortex-M4 board | Not run | the same log from a second core, because a rig that only ever ran on one part has measured that part rather than the protocol. |
 
 Moving a row to `Passed` needs an accepted ADR carrying the attestation marker and the id, in
@@ -220,20 +220,35 @@ guards against for §16's open questions.
 
 What *is* discharged is everything a host can discharge, and it is worth being exact about
 which. `waymaker-rig` is driven at every crash point `waymaker-fault` enumerates — every byte
-of every program, every block of every erase, before and after every barrier — and its own
-oracle accepts every one; the census's three power-cut cells are filled and its three watchdog
-cells are refused, which is the honest shape of a host run; and two writers wrong in one way
-each are required to be caught by the guarantee they break and by no other. The dispatch cell
-is filled on evidence that execution entered the dispatcher rather than on the mark that
-precedes it — a mark is not evidence of the thing it marks, and `Dispatched` is deliberately
-written *before* the effect, so a power cut taking that mark's own commit barrier leaves it
-whole on media with no effect behind it. `a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran`
-requires such runs to exist, so the qualification cannot quietly stop qualifying. What a host cannot
-supply is a watchdog reset — every injection the harness performs is a power loss, and nothing
-models a core-only reset or retained RAM — nor media that behaves like a part: the model starts
-erased and only clears bits, its barrier is a no-op, and a bit that programmed weakly is not a
-state it has. §12's `barrier-is-durable` and `barrier-orders-what-follows` are still
-`waymaker-conformance`'s across-reset witness's, and still owed against a real driver.
+of every program, every block of every erase, before and after every barrier, and now a
+watchdog reset after every operation that changes media — and its own oracle accepts every
+one; **five of the census's six cells are filled and the sixth is named**; and two writers
+wrong in one way each are required to be caught by the guarantee they break and by no other.
+The dispatch cell is filled on evidence that execution entered the dispatcher rather than on
+the mark that precedes it — a mark is not evidence of the thing it marks, and `Dispatched` is
+deliberately written *before* the effect, so a power cut taking that mark's own commit barrier
+leaves it whole on media with no effect behind it.
+`a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran` requires such runs to exist, so the
+qualification cannot quietly stop qualifying.
+
+The sixth cell is a watchdog reset *inside the dispatch window*, and it is refused for a
+reason rather than for want of trying.
+[ADR 0023](docs/adr/0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md)
+models the watchdog reset as a fault of its own — the unit in flight completes, and the call
+never returns — and that second half is what closes the cell: reaching the dispatch window
+needs the mark's commit barrier to have returned, and this is the reset that does not return.
+A board's watchdog fires on a timer rather than at a call boundary. So the cell is inside the
+two rows above, and `the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth`
+requires the census to keep refusing the run.
+
+What a host cannot supply beyond that is media that behaves like a part: the model starts
+erased and only clears bits, its barrier is a no-op, a bit that programmed weakly is not a
+state it has, and a real part may abort the unit in flight where this one finishes it. Nor
+retained RAM — a watchdog reset really leaves it, and nothing here models it; what the rig
+measures instead is the *cost* of trusting it, in
+`a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch`. §12's
+`barrier-is-durable` and `barrier-orders-what-follows` are still `waymaker-conformance`'s
+across-reset witness's, and still owed against a real driver.
 
 ## The layering
 
@@ -549,6 +564,14 @@ Stated so that nobody mistakes silence for coverage:
   forbids never reaches media — and a model wrong in the same direction as the code it
   tests would agree with it. §15's hardware half, "run hardware power-cut loops against real
   NOR flash", is owed at rung 0.2, where the boards are.
+- **That a watchdog reset behaves the way this part's does.** `Interruption::Watchdog` says
+  the controller finishes the unit in flight and the call never returns. Both are choices, and
+  the first is the optimistic one: a part that *aborts* the unit leaves a partial program a
+  brownout would leave, which is a world the power-cut half already sweeps, so the model errs
+  toward the world the sweep would otherwise miss. What no model supplies is the reset-cause
+  register, retained RAM, and a watchdog that fires on a timer rather than at a call boundary
+  — the last of which is why the dispatch-window cell is a board's. See
+  [ADR 0023](docs/adr/0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md).
 - **A lookup table outside the checksum module.** `integrity-check`'s table scan reads
   `waymaker-flash/src/crc.rs` and the modules it is split into, so a table in a sibling
   module that `crc.rs` calls is out of its scope.
@@ -1087,6 +1110,30 @@ in the module passes. See
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md).
 
 [`swap`]: crates/waymaker-flash/src/swap.rs
+
+Issue #27's third bullet — "watchdog-reset tests at the same three points" — was the one
+acceptance criterion in this repository with no coverage at all, and
+[ADR 0023](docs/adr/0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md)
+closes as much of it as a host can. `waymaker_fault::Interruption` gains a third variant, and
+it is a fault of its own rather than a label on an existing one: the supply holds, so the
+flash controller finishes the unit the core stopped believing in, and the call never returns —
+where a power cut at `Progress::Whole` returns `Ok(())` first and lets §02 decision 3's
+dispatch happen. Only that second world is enumerated, because rounding a reset inside a unit
+up to the boundary above it maps every other watchdog world onto a power cut the list already
+had, and an exhaustive list that counts one crash point twice is no longer a count of
+anything. Both halves of that are measured rather than argued, and so is the consequence: on
+media a watchdog reset is *weaker* than a brownout, and
+`every_watchdog_image_is_one_a_power_cut_also_produces` proves the inclusion over the real
+journal writer and requires it to be proper, so the two causes cannot become one model wearing
+two names. The rig's census credits a cell from the injector's own cause and never from a
+reading of `Progress`, which is the rule the first attempt at this broke and Codex was right
+to reject. Five of the six cells are now filled on a host; the sixth is a watchdog reset
+inside the dispatch window, it is unreachable for a stated reason, and the census still
+refuses the run and names it. The third difference a watchdog reset has — RAM survives it — is
+modelled nowhere and measured as a cost:
+`a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch` shows a rig that judged
+from the history it still held excusing *every* loss the media-reading rig catches, which is
+why the witness is durable.
 
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async

@@ -9,6 +9,17 @@
 //! Issue [#27](https://github.com/madmax983/waymaker/issues/27) asks for cuts at three write
 //! points and, separately, for "watchdog-reset tests at the same three points". Six cells,
 //! and a run that missed one is not a run that passed.
+//!
+//! # Where the six stand
+//!
+//! A host sweep fills five. `waymaker_fault::Interruption::Watchdog` performs a real core
+//! reset, so the schedule and completion write points are reached under both causes.
+//!
+//! The sixth — a watchdog reset in the *dispatch window* — is a board's, and for a stated
+//! reason rather than for want of trying: being in that window needs the dispatch mark's
+//! commit barrier to have returned, and a watchdog reset is the reset that does not return. A
+//! board's watchdog fires on a timer instead. So this type keeps refusing a host run, and
+//! `xtask::docs::HARDWARE_TARGETS` is where the cell is owed.
 
 use crate::phase::{Phase, ResetCause};
 

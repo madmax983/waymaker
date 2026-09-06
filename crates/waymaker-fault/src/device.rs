@@ -43,6 +43,19 @@ pub enum FaultError {
     BitSetWithoutErase,
     /// The power went away. Nothing after this observation happened, or ever will.
     PowerLoss,
+    /// The core was reset while the supply held. Nothing after this observation happened.
+    ///
+    /// The supply holds, so two things differ from [`PowerLoss`](Self::PowerLoss). The flash
+    /// controller finishes the program unit the core stopped believing in, so media holds a
+    /// whole number of units. And the call never returns, so the writer is never told the
+    /// operation completed — where a power cut at [`Progress::Whole`] returns `Ok(())`
+    /// first.
+    ///
+    /// A real core returns from neither. This is an error because the model has no way to
+    /// stop the thread.
+    ///
+    /// [`Progress::Whole`]: crate::Progress::Whole
+    WatchdogReset,
     /// The injected failure of a `program` or an `erase`: the call returns an error, media
     /// may already have changed, and the caller carries on.
     ///
@@ -60,6 +73,7 @@ impl FaultError {
             Self::Geometry(error) => error.message(),
             Self::BitSetWithoutErase => "a program would set a bit that only an erase restores",
             Self::PowerLoss => "power was lost; nothing after this point happened",
+            Self::WatchdogReset => "the core was reset; nothing after this point happened",
             Self::InjectedFailure => "the injected failure of a program or an erase",
         }
     }

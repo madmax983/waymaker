@@ -15,12 +15,16 @@
 //! that: only one injection is armed per run, and everything before it is identical by
 //! construction.
 //!
-//! # The two effects are different questions
+//! # The three effects are different questions
 //!
 //! [`Interruption::PowerLoss`] asks "what is on media if the world stops here" — nothing after it
-//! runs, ever. [`Interruption::Failure`] asks "what does the writer do when this call returns an
-//! error" — the media may already have changed, and the writer carries on. Design document
-//! §12 requires both: `program` and `erase` "may fail **or** be interrupted".
+//! runs, ever. [`Interruption::Watchdog`] asks the same of a reset the supply survives, which
+//! leaves a whole number of units on media and tells the writer nothing. [`Interruption::Failure`]
+//! asks "what does the writer do when this call returns an error" — the media may already have
+//! changed, and the writer carries on. Design document §12 requires the last of the three:
+//! `program` and `erase` "may fail **or** be interrupted"; issue
+//! [#27](https://github.com/madmax983/waymaker/issues/27) requires the first two, and requires
+//! them to be different.
 //!
 //! # None of these enums is `#[non_exhaustive]`
 //!
@@ -140,6 +144,50 @@ pub enum Interruption {
     ///
     /// [`FaultError::PowerLoss`]: crate::FaultError::PowerLoss
     PowerLoss,
+    /// The core was reset while the supply held.
+    ///
+    /// Issue [#27](https://github.com/madmax983/waymaker/issues/27): "a watchdog reset is not
+    /// identical to a brownout and both must be covered". It differs in three ways, and the
+    /// first two are here.
+    ///
+    /// **The unit in flight completes.** The supply holds, so the flash controller finishes
+    /// the program unit or the erase block the core stopped believing in. Media after a
+    /// watchdog reset always holds a whole number of units; a brownout can stop inside one.
+    /// A [`Progress::Bytes`] armed here is therefore rounded *up* to the unit.
+    ///
+    /// **The writer is never told.** The call returns [`FaultError::WatchdogReset`] at every
+    /// [`Progress`], including [`Whole`](Progress::Whole) — where a power cut returns
+    /// `Ok(())` first. Design document §02 decision 3 is about that state: a writer that does
+    /// `barrier()?` and then dispatches dispatches after a power cut and does not after a
+    /// watchdog reset.
+    ///
+    /// The third difference is retained RAM, which this crate does not model. `waymaker-rig`
+    /// owns it, because a durable witness is what RAM retention would let a reader skip.
+    ///
+    /// # Why only `Whole` is enumerated
+    ///
+    /// Because the other watchdog worlds are power-cut worlds this list already has, and an
+    /// exhaustive list that counts one crash point twice is no longer a count of anything.
+    ///
+    /// Rounding up is what makes that true. A watchdog reset armed inside a unit leaves the
+    /// unit whole, which is what a power cut at that boundary leaves; the writer is dead in
+    /// both, so the two runs differ in the name of an error and in nothing else. At
+    /// [`Whole`](Progress::Whole) they stop differing in the name and start differing in the
+    /// answer: a power cut returns `Ok(())`, and everything the writer does next happens.
+    ///
+    /// So a watchdog reset is *weaker* than a brownout on media: every image it leaves is one
+    /// some power cut also leaves. `tests/watchdog.rs`'s
+    /// `every_watchdog_image_is_one_a_power_cut_also_produces` proves it over the real journal
+    /// writer, and the rounding is proved beside it against crash points a caller builds by
+    /// hand for [`Harness::run_one`](crate::Harness::run_one).
+    ///
+    /// One cost of this falls on the rig rather than here, and it is stated where it lands: a
+    /// watchdog reset can never be *in* the dispatch window, because reaching that window
+    /// needs the mark's barrier to have returned and a watchdog reset is the reset that does
+    /// not return. That cell is a board's.
+    ///
+    /// [`FaultError::WatchdogReset`]: crate::FaultError::WatchdogReset
+    Watchdog,
     /// The call returns an error and the writer carries on. Design document §12's "program
     /// and erase may fail".
     Failure,
@@ -173,6 +221,10 @@ pub struct Injection {
 ///   completes and returns, the power then goes, and the writer meets it at its next
 ///   storage call. That is also "power loss *before* operation `i + 1`", so the two are one
 ///   entry rather than two;
+/// * `(i, Whole, Watchdog)` for every operation that can change media — the operation
+///   completes on media and the core stops before the call returns. That is the *only*
+///   watchdog world this crate can tell from a brownout, and the doc comment on
+///   [`Interruption::Watchdog`] says why the others are not enumerated;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
 ///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
 ///   or for an operation that moves no bytes.
@@ -201,6 +253,16 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
                 op: index,
                 progress: Progress::Whole,
                 interruption: Interruption::PowerLoss,
+            });
+        }
+    }
+
+    for (index, op) in ops.iter().enumerate() {
+        if !op.mutates_nothing() {
+            points.push(Injection {
+                op: index,
+                progress: Progress::Whole,
+                interruption: Interruption::Watchdog,
             });
         }
     }

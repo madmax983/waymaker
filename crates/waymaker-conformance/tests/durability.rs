@@ -83,7 +83,11 @@ impl StableStorage for Blind {
 ///
 /// Pinned, for the reason `waymaker-spec`'s census is: a sweep that silently shrank is the
 /// direction that turns a proof into a formality.
-const SWEEP: usize = 48;
+///
+/// It moved from 48 to 59 when `waymaker-fault` grew a third cause, `Interruption::Watchdog`.
+/// A watchdog reset is enumerated at whole operations only — every other watchdog world is a
+/// power-cut world the list already had — so it adds one point per mutating operation.
+const SWEEP: usize = 59;
 
 fn nested() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 64, 4, 2) else {
