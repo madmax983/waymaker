@@ -1237,7 +1237,10 @@ fn capacity_reserve(
     let mut kept = frame::encoded_len_for(core::hint::black_box(8), layout.align()).unwrap_or(0);
     kept = kept
         .wrapping_add(reserve.tail_bytes() as usize)
-        .wrapping_add(reserve.rollover_bytes() as usize);
+        .wrapping_add(reserve.rollover_bytes() as usize)
+        // The bound a caller sizes an effect's result buffer to. §07 step 5 records bounded
+        // result bytes, and this is where the bound comes from.
+        .wrapping_add(reserve.bounds().effect_result_bytes as usize);
 
     let schedule = RecordRef::EffectScheduled {
         seq: EffectSeq(core::hint::black_box(0)),

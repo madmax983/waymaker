@@ -446,6 +446,16 @@ impl Reserve {
         })
     }
 
+    /// What the run declared its records may be worth.
+    ///
+    /// The ceilings [`for_layout`](Self::for_layout) priced this bank against. A caller
+    /// sizes an effect's result buffer to `effect_result_bytes` from here rather than from
+    /// a number of its own, so that the buffer bound and the recorded bound are one bound.
+    #[must_use]
+    pub const fn bounds(&self) -> Bounds {
+        self.bounds
+    }
+
     /// Bytes of journal tail this reserve keeps free while an ordinary record is admitted.
     ///
     /// The worst-case outcome and the worst-case terminal record, which is what a run with

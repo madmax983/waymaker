@@ -1,24 +1,32 @@
 //! The world's half of the boundary: what happens when the kernel says dispatch.
 //!
-//! Synchronous, and bounded by the caller's buffer. An activity that cannot answer now says
-//! [`Performed::Pending`] rather than blocking, which is how a driver with no executor
-//! still has a way to wait.
+//! Synchronous, and bounded by the run's declared result bound. An activity that cannot
+//! answer now says [`Performed::Pending`] rather than blocking, which is how a driver with
+//! no executor still has a way to wait.
 
-use waymaker_core::{ActivityKind, EffectId};
+use waymaker_core::ActivityKind;
+
+use crate::effect::DurableIntent;
 
 /// What an activity did.
 ///
-/// The length is how many bytes the activity **produced**, not how many of them fit. An
-/// activity whose answer is larger than the buffer still reports the answer's own length,
-/// and the driver refuses with [`DriveError::ResultTooLong`](crate::DriveError). Reporting
-/// the truncated length instead would record the short answer as history and replay it for
-/// ever.
+/// `out` is exactly `Bounds::effect_result_bytes` wide, so "what fits" and "what the run
+/// declared" are one bound. An activity whose answer is wider says
+/// [`Exhausted`](Self::Exhausted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Performed {
-    /// Success. The first `len` bytes of the buffer are the result.
+    /// Success. The first `len` bytes of `out` are the result, and `len <= out.len()`.
     Completed(usize),
-    /// Failure. The first `len` bytes of the buffer are the failure payload.
+    /// Failure. The first `len` bytes of `out` are the failure payload.
     Failed(usize),
+    /// The answer does not fit `out`.
+    ///
+    /// The effect is recorded as a failure with no payload — see
+    /// [`Resolution::Exhausted`](crate::Resolution::Exhausted) — so the run makes progress
+    /// and the workflow sees no part of the answer. A `Completed(len)` with `len` larger
+    /// than `out` is a broken activity rather than this, and the driver refuses it with
+    /// [`DriveError::ResultTooLong`](crate::DriveError).
+    Exhausted,
     /// Not now. The run suspends under the identity it was dispatched with, and the next
     /// boot redelivers it — design document §14's redelivery contract.
     Pending,
@@ -26,14 +34,14 @@ pub enum Performed {
 
 /// The activities a workflow can call.
 pub trait Activities {
-    /// Perform `id`'s effect and write its outcome into `out`.
+    /// Perform `intent`'s effect and write its outcome into `out`.
     ///
-    /// `id` is the identity the schedule record already committed, so an activity that
-    /// deduplicates downstream sees a repeat rather than a second effect when a reset
-    /// redelivers it.
+    /// `intent` is design document §07 step 4's argument, and it exists only because steps 1
+    /// to 3 completed. An activity that deduplicates downstream sees a repeat rather than a
+    /// second effect when a reset redelivers it.
     fn perform(
         &mut self,
-        id: EffectId,
+        intent: DurableIntent,
         kind: ActivityKind,
         input: &[u8],
         out: &mut [u8],

@@ -13,6 +13,10 @@
 //!   whose intent did not survive is an effect the next boot cannot account for.
 //! * **prefix safety** (§14). The history the crash image recovers to is a prefix of the
 //!   history the fault-free run wrote.
+//! * **whole results** (§07 steps 5 to 7, and issue #29). No outcome the image recovers to
+//!   holds part of an answer. A torn outcome frame has no commit seal, so the scan stops at
+//!   it; the tooth for that is `crates/waymaker-fault/tests/commit_discipline.rs`, whose
+//!   seal-before-frame writer reaches the state this asserts is unreachable.
 //!
 //! # The tooth
 //!
@@ -127,13 +131,42 @@ const fn unresolved(history: &[Summary]) -> Option<u32> {
     }
 }
 
+/// Every effect outcome the image recovers to, with its payload.
+fn recovered_outcomes(image: &[u8]) -> Vec<Vec<u8>> {
+    let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
+        unreachable!("the image is device-sized")
+    };
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut out = Vec::new();
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        match record {
+            RecordRef::EffectCompleted { result, .. } => out.push(result.to_vec()),
+            RecordRef::EffectFailed { error, .. } => out.push(error.to_vec()),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// One boot of the reference workflow over `session`, and the sequences it dispatched.
 fn drive(
     session: &mut Session,
     dispatched: &RefCell<Vec<u32>>,
 ) -> Result<(), DriveError<FaultError>> {
+    drive_world(session, dispatched, World::new())
+}
+
+/// The same, for a world that answers differently.
+fn drive_world(
+    session: &mut Session,
+    dispatched: &RefCell<Vec<u32>>,
+    mut world: World,
+) -> Result<(), DriveError<FaultError>> {
     let mut workflow = Pipeline::new();
-    let mut world = World::new();
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
     let ended = Driver::new(region(), RUN, reserve()).boot(
@@ -396,4 +429,88 @@ fn append(
         .payload_barrier(session)?
         .commit(session)
         .map(|_| ())
+}
+
+#[test]
+fn no_recovered_outcome_holds_part_of_an_answer_at_any_crash_point() {
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(|session| drive(session, &RefCell::new(Vec::new())))
+        .expect("the fault-free run completes");
+
+    let mut seen = 0_usize;
+    for run in &runs {
+        for payload in recovered_outcomes(run.image()) {
+            seen = seen.saturating_add(1);
+            assert!(
+                payload == DOWNLOADED || payload == HASHED,
+                "a committed outcome holds {} bytes, which is part of an answer, at {:?}",
+                payload.len(),
+                run.injection()
+            );
+        }
+    }
+    assert!(
+        seen > 0,
+        "a sweep that recovered no outcome at all measured nothing"
+    );
+}
+
+#[test]
+fn an_exhausted_answer_stays_empty_and_keeps_its_intent_at_every_crash_point() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
+
+    let runs = harness
+        .run(|session| {
+            logs.borrow_mut().push(Vec::new());
+            let mine = RefCell::new(Vec::new());
+            // The first effect's answer is wider than the bound the world is handed.
+            let ended = drive_world(session, &mine, World::exhausting_at(0));
+            if let Some(last) = logs.borrow_mut().last_mut() {
+                last.clone_from(&mine.borrow());
+            }
+            ended
+        })
+        .expect("the fault-free run completes");
+
+    let logs = logs.into_inner();
+    let whole = recovered(runs.first().expect("the fault-free run is first").image());
+    assert_eq!(
+        whole,
+        [
+            Summary::RunStarted,
+            Summary::EffectScheduled(0),
+            Summary::EffectResolved(0),
+            Summary::Terminal,
+        ],
+        "an exhausted effect resolves, and the workflow's failure branch ends the run"
+    );
+
+    for (run, dispatched) in runs.iter().zip(&logs) {
+        let history = recovered(run.image());
+        assert!(
+            whole.starts_with(&history),
+            "{:?} is not a prefix of the fault-free history: {history:?}",
+            run.injection()
+        );
+        for payload in recovered_outcomes(run.image()) {
+            assert!(
+                payload.is_empty(),
+                "an exhausted effect committed {} bytes at {:?}",
+                payload.len(),
+                run.injection()
+            );
+        }
+        for seq in dispatched {
+            assert!(
+                history
+                    .iter()
+                    .filter_map(|record| record.scheduled())
+                    .any(|s| s == *seq),
+                "effect {seq} was dispatched with no recoverable schedule record, at {:?}",
+                run.injection()
+            );
+        }
+    }
 }

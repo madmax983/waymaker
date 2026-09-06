@@ -1493,6 +1493,7 @@ pub const CAPACITY_SURFACE_PATH: &str = "waymaker-flash/src/capacity.rs";
 /// [`Journal::stage`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
 pub const CAPACITY_SURFACE: &[&str] = &[
     "admits",
+    "bounds",
     "exit_bytes_after",
     "fmt",
     "for_layout",
@@ -2312,6 +2313,71 @@ pub const BOUNDARY_DECISIONS: &[&str] = &[
 /// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
 /// names both rather than leaving them implied.
 pub const DRIVER_FORBIDDEN_VOCABULARY: &[&str] = &["RecordKind", "Step"];
+
+/// The file whose surface and step order [`check_effect_protocol`] pins.
+pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
+
+/// Every public function design document §07's protocol is allowed to have.
+///
+/// Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be
+/// unreachable without step 3, "structurally, not by review". The structure is an absence: no
+/// function here hands out an effect identity, a writer, or an outcome without the barrier
+/// that earns it.
+///
+/// An `Effect::dispatchable_now`, a `Dispatchable::into_writer`, a `Resolution::outcome`
+/// reachable before step 7, or a `DurableIntent::forge` would each break no other rule, need
+/// no dependency, and turn §02 decision 3 back into a convention.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
+    "id",
+    "intent",
+    "into_writer",
+    "over",
+    "redelivering",
+    "resolve",
+    "schedule",
+];
+
+/// The state that holds a durable intent, and the two things it may do.
+///
+/// `Effect` is not here: it has a constructor and a way to give the writer back, which is
+/// what a protocol *between* effects is. `Dispatchable` is the state in which the world may
+/// be asked, and it may name the effect or resolve it and nothing else.
+pub const EFFECT_DISPATCH_STATE: (&str, [&str; 2]) = ("Dispatchable", ["intent", "resolve"]);
+
+/// The values that prove a schedule record is durable, and the bodies that may build them.
+///
+/// Two bodies each, and both are a durability proof: [`schedule`](EFFECT_STEP_BODIES) after
+/// step 3's commit barrier returned, and `redelivering` for a record committed before this
+/// boot. A third construction is a third way to reach step 4.
+pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
+    ("DurableIntent", ["schedule", "redelivering"]),
+    ("Dispatchable", ["schedule", "redelivering"]),
+];
+
+/// The two bodies that take all of §07's storage steps, in §07's order.
+pub const EFFECT_STEP_BODIES: [&str; 2] = ["schedule", "resolve"];
+
+/// §07's three storage steps, in the order §07 puts them in.
+///
+/// Steps 1, 2 and 3 for a schedule record; steps 5, 6 and 7 for an outcome. The same three
+/// calls, because §07 states them twice.
+pub const EFFECT_STEPS: [&str; 3] = ["stage", "payload_barrier", "commit"];
+
+/// What the already-durable path may not name.
+///
+/// `redelivering` writes nothing: the schedule record committed in an earlier boot. A body
+/// that programmed anything here would be a second schedule record for one effect.
+pub const EFFECT_REDELIVERY_FORBIDDEN: [&str; 4] =
+    ["stage", "payload_barrier", "commit", "program"];
+
+/// The types whose fields must stay private.
+///
+/// A `pub` field is a constructor. `DurableIntent` with a public id is an intent anybody can
+/// forge, `Dispatchable` with public fields is a dispatch nobody committed, and `Effect` with
+/// a public writer is §10's gate handed out mid-effect.
+pub const EFFECT_OPAQUE: [&str; 3] = ["DurableIntent", "Dispatchable", "Effect"];
 
 /// The file whose contents [`INTEGRITY_CHECK_PARAMETERS`] pins.
 pub const INTEGRITY_CHECK_PATH: &str = "waymaker-flash/src/crc.rs";
@@ -3943,6 +4009,221 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
         ));
     }
 
+    violations
+}
+
+/// Rule: design document §07's seven steps happen in §07's order, and step 4 cannot be
+/// reached without step 3.
+///
+/// Four halves, one id, because it is one decision. The surface is a set comparison; the
+/// dispatch state is a shape; the constructions are where a durable intent may come from;
+/// and the step bodies are where §07's barriers are.
+///
+/// Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason: a construction
+/// under `cfg(test)` discharges nothing about the code that ships.
+///
+/// What it cannot see is a protocol step added from another file — it pins one file, exactly
+/// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — and whether the
+/// barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset
+/// witness. The crash windows are `crates/waymaker-drive/tests/crash.rs`.
+#[must_use]
+pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = check_pinned_surface(
+        RULE,
+        DRIVER,
+        EFFECT_PROTOCOL_PATH,
+        EFFECT_PROTOCOL_SURFACE,
+        driver,
+        "design document \u{a7}07 says a physical effect never precedes its committed intent, \
+         and the protocol's public API is where that stops being a sentence: a way to name an \
+         effect identity, or to observe an outcome, without the barrier that earns it cannot \
+         be added by accident",
+    );
+
+    let Some(source) = find_source(driver, EFFECT_PROTOCOL_PATH) else {
+        // `check_pinned_surface` has already reported the missing file.
+        return violations;
+    };
+    let code = without_test_modules(&code_only(&source.contents));
+    violations.extend(check_effect_dispatch_state(&code));
+    violations.extend(check_effect_constructions(&code));
+    violations.extend(check_effect_steps(&code));
+    violations
+}
+
+/// The dispatch state and the opaque types, over one file's text.
+fn check_effect_dispatch_state(code: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    let (state, allowed) = EFFECT_DISPATCH_STATE;
+    let blocks = inherent_impl_bodies(code, state);
+    if blocks.is_empty() {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} declares no inherent `impl` for `{state}`, so the \
+                 state \u{a7}07 puts step 4 in is pinned against nothing"
+            ),
+        ));
+    } else {
+        let methods = declared_function_names(&blocks.join("\n"));
+        let expected: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
+        if methods != expected {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "`{state}` declares {methods:?} rather than {expected:?}: an effect whose \
+                     intent is durable may name itself and resolve itself, and nothing else"
+                ),
+            ));
+        }
+    }
+
+    for opaque in EFFECT_OPAQUE {
+        let Some(body) = braced_body(code, &format!("pub struct {opaque}")) else {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{EFFECT_PROTOCOL_PATH} declares no `pub struct {opaque}`, so the type \
+                     whose fields carry \u{a7}07's proof is pinned against nothing"
+                ),
+            ));
+            continue;
+        };
+        if count_tokens(body, "pub") != 0 {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "`{opaque}` declares a public field: a public field is a constructor, and \
+                     a forged proof of durable intent is a dispatch nobody committed"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// Where a durable intent may be built, over one file's text.
+fn check_effect_constructions(code: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    for (value, bodies) in EFFECT_CONSTRUCTIONS {
+        let total = struct_literals(code, value);
+        let mut inside = 0_usize;
+        for body in bodies {
+            let built = braced_body(code, &format!("fn {body}"))
+                .map_or(0, |text| struct_literals(text, value));
+            if built == 0 {
+                violations.push(Violation::new(
+                    RULE,
+                    DRIVER,
+                    format!(
+                        "`{value}` is not built inside `{body}`: \u{a7}07 has two ways an \
+                         intent becomes durable, and each has to be one of them"
+                    ),
+                ));
+            }
+            inside = inside.saturating_add(built);
+        }
+        if total != inside {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "`{value}` is built {total} time(s), {inside} of them inside {bodies:?}: a \
+                     proof of durable intent has to come from a barrier that returned and \
+                     from nowhere else"
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// §07's storage steps, in §07's order, over one file's text.
+fn check_effect_steps(code: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    for body_name in EFFECT_STEP_BODIES {
+        let Some(body) = braced_body(code, &format!("fn {body_name}")) else {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{EFFECT_PROTOCOL_PATH} declares no `fn {body_name}`, so one half of \
+                     \u{a7}07's protocol is pinned against nothing"
+                ),
+            ));
+            continue;
+        };
+        let mut previous = 0_usize;
+        for step in EFFECT_STEPS {
+            if count_tokens(body, step) != 1 {
+                violations.push(Violation::new(
+                    RULE,
+                    DRIVER,
+                    format!(
+                        "`{body_name}` does not name `{step}` exactly once: \u{a7}07 states \
+                         the frame, the payload barrier and the seal as three steps, and a \
+                         body that takes one of them twice or not at all is not that protocol"
+                    ),
+                ));
+                continue;
+            }
+            let Some(at) = body.find(step) else {
+                continue;
+            };
+            if at < previous {
+                violations.push(Violation::new(
+                    RULE,
+                    DRIVER,
+                    format!(
+                        "`{body_name}` names `{step}` before the step \u{a7}07 puts in front \
+                         of it: the order is the guarantee, not the calls"
+                    ),
+                ));
+            }
+            previous = at;
+        }
+    }
+
+    let Some(body) = braced_body(code, "fn redelivering") else {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} declares no `fn redelivering`, so \u{a7}08's \
+                 redelivery row is pinned against nothing"
+            ),
+        ));
+        return violations;
+    };
+    for forbidden in EFFECT_REDELIVERY_FORBIDDEN {
+        if count_tokens(body, forbidden) != 0 {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "`redelivering` names `{forbidden}`: the schedule record committed in an \
+                     earlier boot, so a body that writes here writes a second one"
+                ),
+            ));
+        }
+    }
     violations
 }
 
@@ -6017,6 +6298,208 @@ mod deferred_answer_pins {
             path: format!("crates/{path}"),
             contents: contents.to_owned(),
         }
+    }
+
+    // `effect-protocol`: design document §07's seven steps, pinned.
+
+    fn effect_sources(contents: &str) -> Vec<crate::size::LayerSource> {
+        vec![layer(EFFECT_PROTOCOL_PATH, contents)]
+    }
+
+    #[test]
+    fn the_clean_effect_protocol_passes() {
+        let violations =
+            check_effect_protocol(&effect_sources(&tests_support::clean_effect_module()));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_missing_effect_protocol_fails_closed() {
+        let violations = check_effect_protocol(&[]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("checking nothing")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_public_function_the_effect_protocol_pin_does_not_list_is_reported() {
+        let source = tests_support::clean_effect_module()
+            + "pub fn dispatch_now() {}
+";
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("dispatch_now")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_state_that_grows_a_method_is_reported() {
+        let source = tests_support::clean_effect_module().replace(
+            "    pub fn intent(&self) -> DurableIntent {",
+            "    pub fn writer(&self) -> u32 {
+        0
+    }
+             \x20   pub fn intent(&self) -> DurableIntent {",
+        );
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("and nothing else")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_state_that_is_not_declared_is_reported() {
+        let source =
+            tests_support::clean_effect_module().replace("impl Dispatchable {", "impl Elsewhere {");
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("pinned against nothing")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_public_field_on_a_proof_of_durable_intent_is_reported() {
+        for opaque in EFFECT_OPAQUE {
+            let source = tests_support::clean_effect_module().replace(
+                &format!("pub struct {opaque} {{\n    "),
+                &format!("pub struct {opaque} {{\n    pub "),
+            );
+            let violations = check_effect_protocol(&effect_sources(&source));
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("public field")),
+                "{opaque}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_opaque_type_is_reported() {
+        let source = tests_support::clean_effect_module()
+            .replace("pub struct DurableIntent {", "struct DurableIntent {");
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("pub struct DurableIntent")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_durable_intent_built_outside_a_barrier_is_reported() {
+        let source = tests_support::clean_effect_module()
+            + "pub fn forge() -> DurableIntent {\n    DurableIntent { id: 2 }\n}\n";
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("from nowhere else")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_stops_building_the_proof_is_reported() {
+        let source = tests_support::clean_effect_module().replace(
+            "        Dispatchable {\n            intent: DurableIntent { id: 1 },\n        }\n    }\n}",
+            "        panic!()\n    }\n}",
+        );
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("is not built inside `redelivering`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_body_that_skips_a_barrier_is_reported() {
+        for step in EFFECT_STEPS {
+            let source = tests_support::clean_effect_module().replacen(
+                &format!("let _ = {step}();\n"),
+                "",
+                1,
+            );
+            let violations = check_effect_protocol(&effect_sources(&source));
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.detail.contains("exactly once")),
+                "{step}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_step_body_that_seals_before_its_payload_barrier_is_reported() {
+        let source = tests_support::clean_effect_module().replacen(
+            "        let _ = stage();\n        let _ = payload_barrier();\n        let _ = commit();",
+            "        let _ = stage();\n        let _ = commit();\n        let _ = payload_barrier();",
+            1,
+        );
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("the order is the guarantee")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_body_that_is_gone_is_reported() {
+        let source =
+            tests_support::clean_effect_module().replace("pub fn schedule", "pub fn was_schedule");
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `fn schedule`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_redelivery_that_writes_a_second_schedule_record_is_reported() {
+        let source = tests_support::clean_effect_module().replace(
+            "    pub fn redelivering(self) -> Dispatchable {\n",
+            "    pub fn redelivering(self) -> Dispatchable {\n        let _ = program();\n",
+        );
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("writes a second one")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_redelivery_path_is_reported() {
+        let source = tests_support::clean_effect_module()
+            .replace("pub fn redelivering", "pub fn was_redelivering");
+        let violations = check_effect_protocol(&effect_sources(&source));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `fn redelivering`")),
+            "{violations:?}"
+        );
     }
 
     // `effect-scheduled-fields`: ADR 0011's answer, pinned.
@@ -8245,6 +8728,36 @@ pub mod tests_support {
         }
         source.push_str("}\n");
         source
+    }
+
+    /// An effect protocol §07's rule accepts: the pinned surface, the pinned order, and a
+    /// durable intent built only where a barrier earned it.
+    #[must_use]
+    pub fn clean_effect_module() -> String {
+        String::from(
+            "//! \u{a7}07's protocol.\n\
+             pub struct DurableIntent {\n    id: u64,\n}\n\
+             impl DurableIntent {\n    pub fn id(&self) -> u64 {\n        self.id\n    }\n}\n\
+             pub struct Effect {\n    writer: u32,\n}\n\
+             impl Effect {\n\
+             \x20   pub fn over(writer: u32) -> Self {\n        Self { writer }\n    }\n\
+             \x20   pub fn into_writer(self) -> u32 {\n        self.writer\n    }\n\
+             \x20   pub fn schedule(self) -> Dispatchable {\n\
+             \x20       let _ = stage();\n        let _ = payload_barrier();\n\
+             \x20       let _ = commit();\n\
+             \x20       Dispatchable {\n            intent: DurableIntent { id: 0 },\n\
+             \x20       }\n    }\n\
+             \x20   pub fn redelivering(self) -> Dispatchable {\n\
+             \x20       Dispatchable {\n            intent: DurableIntent { id: 1 },\n\
+             \x20       }\n    }\n}\n\
+             pub struct Dispatchable {\n    intent: DurableIntent,\n}\n\
+             impl Dispatchable {\n\
+             \x20   pub fn intent(&self) -> DurableIntent {\n        self.intent\n    }\n\
+             \x20   pub fn resolve(self) -> Effect {\n\
+             \x20       let _ = stage();\n        let _ = payload_barrier();\n\
+             \x20       let _ = commit();\n\
+             \x20       Effect { writer: 0 }\n    }\n}\n",
+        )
     }
 
     /// A storage module declaring exactly [`STORAGE_CONTRACT_SURFACE`] and nothing else.

@@ -11,8 +11,8 @@ use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Activities, Boundary, Conclusion, DriveError, Driver, Identity, Performed, Progress, Scratch,
-    Suspended, Workflow,
+    Activities, Boundary, Conclusion, DriveError, Driver, DurableIntent, Identity, Performed,
+    Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
@@ -252,12 +252,15 @@ fn a_workflow_that_ends_while_history_continues_is_refused() {
 }
 
 /// A world that claims to have written more than the buffer holds.
+///
+/// A broken activity rather than an exhausted one: an answer that does not fit is
+/// [`Performed::Exhausted`], and the driver records it. This one lies about a length.
 struct Greedy;
 
 impl Activities for Greedy {
     fn perform(
         &mut self,
-        _id: EffectId,
+        _intent: DurableIntent,
         _kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
@@ -275,8 +278,8 @@ fn a_result_longer_than_the_callers_buffer_is_refused_rather_than_truncated() {
     assert_eq!(
         error,
         DriveError::ResultTooLong {
-            produced: 65,
-            available: 64
+            produced: 33,
+            available: 32
         }
     );
 }
