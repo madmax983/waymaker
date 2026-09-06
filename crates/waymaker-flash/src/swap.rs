@@ -104,9 +104,11 @@
 //!
 //! §10 step 1 is "stop accepting new effects for the current run", and the only way to make
 //! that a fact rather than a discipline is to take away the thing that appends.
-//! [`Retired::Journal`] is the ordinary path — a run that met
-//! [`Refusal::NearCapacity`](crate::capacity::Refusal::NearCapacity) is a run holding a
-//! writer — and [`Retired::Recovery`] is the other one: a bank whose scan ended
+//! [`Retired::Reserved`] is the ordinary path — a run that met
+//! [`Refusal::NearCapacity`](crate::capacity::Refusal::NearCapacity) is a run holding the
+//! *gated* writer, which is the whole reason §10's reserve refuses early — [`Retired::Journal`]
+//! is the same for a caller that never gated one, and [`Retired::Recovery`] is the other one:
+//! a bank whose scan ended
 //! [`Damaged`](crate::recovery::Ending::Damaged) or
 //! [`Unsealed`](crate::recovery::Ending::Unsealed) has no writer at all, and it is exactly
 //! the bank §10 says to recycle. Requiring a [`Journal`] would have made the swap
@@ -147,6 +149,21 @@ use crate::storage::StableStorage;
 pub enum Retired<C: IntegrityCheck = Catalogued> {
     /// The writer the run was appending with.
     Journal(Journal<C>),
+    /// The capacity-gated writer the run was appending through.
+    ///
+    /// The *ordinary* path, and it is a variant rather than a `Reserved::into_journal`
+    /// because those are not the same thing: §10's roll-over is what a run does when
+    /// [`Refusal::NearCapacity`](crate::capacity::Refusal::NearCapacity) refuses its next
+    /// record, and at that moment the writer it holds is a
+    /// [`Reserved`](crate::capacity::Reserved), which is the type that enforces the reserve.
+    /// `Reserved` deliberately has no way to hand its inner writer back — an ungated writer
+    /// escaping is the whole of what `capacity-reserve` exists to make expensive — so
+    /// without this variant the one flow the reserve was written for could only be reached by
+    /// dropping the writer and scanning the bank again.
+    ///
+    /// Codex found that on the third review round. Nothing ungated escapes here either: the
+    /// `Reserved` goes in and the swap is what comes out.
+    Reserved(crate::capacity::Reserved<C>),
     /// A scan of the retiring bank, for a run that has no writer — a journal that ended
     /// damaged or unsealed, which is the bank §10 recycles.
     ///
@@ -167,6 +184,7 @@ impl<C: IntegrityCheck> Retired<C> {
     const fn into_region(self) -> JournalRegion {
         match self {
             Self::Journal(journal) => journal.region(),
+            Self::Reserved(reserved) => reserved.journal().region(),
             Self::Recovery(recovery) => recovery.region(),
         }
     }

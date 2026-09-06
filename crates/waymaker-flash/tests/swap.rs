@@ -24,9 +24,10 @@
 //! [ADR 0013](https://github.com/madmax983/waymaker/blob/main/docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)
 //! makes for every other writer in this workspace.
 
-use waymaker_core::{EffectId, EffectIdAllocator, EffectSeq, RecordRef, RunId};
+use waymaker_core::{EffectId, EffectIdAllocator, EffectSeq, KernelError, RecordRef, RunId};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout, Generation};
+use waymaker_flash::capacity::{Bounds, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
@@ -623,6 +624,99 @@ fn recovery_never_combines_the_footprints_of_the_two_runs() {
 // ---------------------------------------------------------------------------------------
 // Effect identity across the boundary
 // ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_run_refused_for_capacity_rolls_over_with_the_writer_it_was_refused_on() {
+    // §10's whole flow, end to end, and the one Codex found unreachable on the third review
+    // round: a run appends until the reserve refuses its next record with
+    // `HistoryNearCapacity`, and *that* is when it rolls over. The writer it holds at that
+    // moment is a `Reserved` — the type that enforces the reserve — and `Reserved` has no way
+    // to hand its inner writer back, because an ungated writer escaping is what
+    // `capacity-reserve` exists to make expensive. So the swap takes the `Reserved` itself.
+    let mut device = booted();
+    let mut page = [0_u8; PAGE];
+
+    let bounds = Bounds {
+        run_input_bytes: 32,
+        effect_result_bytes: 32,
+        terminal_bytes: 16,
+    };
+    let Ok(reserve) = Reserve::for_layout(bounds, layout()) else {
+        unreachable!("these bounds fit the banks this file describes")
+    };
+    let Ok(mut writer) = Reserved::over(current_journal(&mut device), reserve) else {
+        unreachable!("this reserve was priced for this journal")
+    };
+
+    // Append until the reserve says no. The record is at the declared bound, so the refusal
+    // when it comes is about room rather than about the bound.
+    let result = [0x5A_u8; 32];
+    let mut committed = 0_usize;
+    let refusal = loop {
+        let record = RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: &result,
+        };
+        match writer
+            .stage(&mut device, &record, &mut page)
+            .map(|staged| staged.payload_barrier(&mut device))
+        {
+            Ok(Ok(sealable)) => {
+                let Ok(_written) = sealable.commit(&mut device) else {
+                    unreachable!("this device accepts every mutation")
+                };
+                committed += 1;
+            }
+            Err(ReservedError::Capacity(refusal)) => break refusal,
+            other => unreachable!("the reserve refuses before the media does: {other:?}"),
+        }
+    };
+    assert_eq!(
+        refusal.kernel_error(),
+        KernelError::HistoryNearCapacity,
+        "§10: ordinary scheduling fails early, and this is the word it fails with"
+    );
+    // The refusal has to be about a journal that filled up, not about a bound or an empty
+    // one: a test that reached `NearCapacity` on its first append would be testing arithmetic
+    // rather than a run that ran out of room.
+    assert!(
+        committed > 8,
+        "only {committed} records committed before the reserve refused"
+    );
+
+    // And now the roll-over, with the writer the refusal was raised on. Nothing ungated
+    // escapes: the `Reserved` goes in, and what comes out is a swap.
+    let Ok(swap) = Swap::beginning(
+        layout(),
+        Authority::Bank {
+            id: BankId::A,
+            generation: CURRENT,
+        },
+        RUN,
+        Retired::Reserved(writer),
+        next_header(),
+    ) else {
+        unreachable!("a run at its reserve boundary is a run that can roll over")
+    };
+    let Ok(installed) = swap
+        .prepare(&mut device)
+        .and_then(|prepared| prepared.stage(&mut device, &mut page))
+        .and_then(|staged| staged.payload_barrier(&mut device))
+        .and_then(|sealable| sealable.commit(&mut device))
+    else {
+        unreachable!("a swap on a device that accepts every mutation succeeds")
+    };
+
+    assert_eq!(
+        authority(&mut device),
+        Authority::Bank {
+            id: BankId::B,
+            generation: NEXT
+        },
+        "the run that ran out of room is the one that was replaced"
+    );
+    assert_eq!(installed.allocator().run(), NEXT_RUN);
+}
 
 #[test]
 fn the_new_run_starts_its_effect_sequence_at_the_first_one() {

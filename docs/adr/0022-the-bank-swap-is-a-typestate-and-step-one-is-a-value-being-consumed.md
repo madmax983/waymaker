@@ -168,6 +168,17 @@ stops there: an effect scheduled, its outcome and a terminal record are `Reserve
 floor, which is a policy about what a run may do rather than a fact about whether the run the
 swap installs can start.
 
+**The ordinary path is `Retired::Reserved`, and it was missing.** §10's roll-over is what a
+run does when `Refusal::NearCapacity` refuses its next record, and the writer it holds at that
+moment is a `Reserved` — the type that enforces the reserve. `Reserved` deliberately has no
+way to hand its inner writer back, because an ungated writer escaping is what
+`capacity-reserve` exists to make expensive, so the first version of `Retired` left the one
+flow the reserve was written for reachable only by dropping the writer and scanning the bank
+again. Every test in the swap suite sidestepped it by building a raw `Journal`, which is how
+it went unnoticed; Codex found it on the third review round. A variant fixes it and costs no
+public function: the `Reserved` goes in and the swap is what comes out, so nothing ungated
+escapes.
+
 **Two limits the second review round drew, both stated rather than closed.** A "device" here
 is a `Geometry`, so two parts of the same model are one device and a caller with two chips
 can prepare on one and commit on the other — that is the contract `append`, `recovery` and
