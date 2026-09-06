@@ -2096,6 +2096,263 @@ fn deferred_question_claims(contents: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The line an ADR carries when a board run has actually happened.
+///
+/// The same shape as [`DEFERRED_QUESTION_MARKER`], and for the same reason: a rule cannot
+/// read prose, so the claim has to be a line somebody wrote on purpose.
+pub const HARDWARE_ATTESTATION_MARKER: &str = "Attests hardware target:";
+
+/// Whether a board run has happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attestation {
+    /// It has not. No board has run the rig.
+    NotRun,
+    /// It has, and an accepted ADR carries the [`HARDWARE_ATTESTATION_MARKER`] for it.
+    Passed,
+}
+
+/// A board issue [#27](https://github.com/madmax983/waymaker/issues/27) requires the rig to
+/// pass on, and whether it has.
+///
+/// # Why this table exists
+///
+/// Because "the power-cut loops pass on one Cortex-M0+ board and one Cortex-M4 board" is an
+/// exit criterion no amount of host-side work discharges, and a repository whose CI is green
+/// is a repository somebody will read as finished. Design document §15's opening sentence is
+/// that crash testing is part of the design; §16's rung 0.2 exit criterion is that it happen
+/// on hardware. Everything in `waymaker-rig` is written to run on a board and has never been
+/// on one.
+///
+/// This is the same move [`SPEC_CLAUSES`]'s `owed` column and
+/// [`STORAGE_CONTRACT_CLAUSES`]'s "Discharged by" column make: the thing that is *not*
+/// covered is a row, in a table, that a rule compares against the documentation. A
+/// measurement that did not happen is not a measurement that passed, and the way to keep that
+/// true is to make the absence as checked as the presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareTarget {
+    /// Stable id, cited when a change touches this target.
+    pub id: &'static str,
+    /// What the target is, as `CLAUDE.md`'s row must say.
+    pub headline: &'static str,
+    /// Whether the run has happened.
+    pub attestation: Attestation,
+    /// What would discharge it, or what did.
+    pub evidence: &'static str,
+}
+
+impl HardwareTarget {
+    /// The status as `CLAUDE.md`'s row must render it.
+    #[must_use]
+    pub const fn render_status(&self) -> &'static str {
+        match self.attestation {
+            Attestation::NotRun => "Not run",
+            Attestation::Passed => "Passed",
+        }
+    }
+}
+
+/// The two boards rung 0.2's exit criterion names.
+///
+/// Both `NotRun`. Flipping one to [`Attestation::Passed`] without an accepted ADR carrying
+/// `Attests hardware target:` and the id fails the build, and so does writing that ADR line
+/// without flipping the row — which is the pair of failures a list like this normally rots
+/// through.
+pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
+    HardwareTarget {
+        id: "cortex-m0plus",
+        headline: "power-cut and watchdog-reset loops on a Cortex-M0+ board",
+        attestation: Attestation::NotRun,
+        evidence: "a rig log from a board, with the census complete and no breach; \
+                   `waymaker-rig` is written to link on the target and has never been on one",
+    },
+    HardwareTarget {
+        id: "cortex-m4",
+        headline: "power-cut and watchdog-reset loops on a Cortex-M4 board",
+        attestation: Attestation::NotRun,
+        evidence: "the same log from a second core, because a rig that only ever ran on one \
+                   part has measured that part rather than the protocol",
+    },
+];
+
+/// Every hardware target an ADR claims to have attested.
+fn hardware_attestation_claims(contents: &str) -> Vec<&str> {
+    contents
+        .lines()
+        .filter_map(|line| line.split_once(HARDWARE_ATTESTATION_MARKER))
+        .map(|(_, rest)| rest.trim().trim_matches('`').trim())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Rule: the board runs rung 0.2 owes are written down, and none is claimed without evidence.
+///
+/// Three things:
+///
+/// * every target in [`HARDWARE_TARGETS`] has exactly one `CLAUDE.md` table row naming it in
+///   backticks, carrying its headline and the status the table renders;
+/// * a target marked [`Attestation::Passed`] is claimed by exactly one accepted ADR through
+///   [`HARDWARE_ATTESTATION_MARKER`], and a target marked [`Attestation::NotRun`] is claimed
+///   by none;
+/// * an ADR claiming a target this table never declared is a violation, because an
+///   attestation for a board nobody asked for is an attestation nobody will notice is wrong.
+///
+/// What it cannot check is that a `Passed` row is *true*. Nothing mechanical can: the
+/// evidence is a log from a bench. What it can do is make the claim a line in an accepted
+/// decision record with a reviewer's name on it, rather than a status somebody flipped.
+#[must_use]
+fn check_hardware_attestation(claude_md: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
+    let mut violations = check_hardware_targets_are_written_down(claude_md);
+
+    for target in HARDWARE_TARGETS {
+        let claiming: Vec<&AdrFile> = adrs
+            .iter()
+            .filter(|adr| hardware_attestation_claims(&adr.contents).contains(&target.id))
+            .collect();
+        match (target.attestation, claiming.as_slice()) {
+            (Attestation::NotRun, []) | (Attestation::Passed, [_]) => {}
+            (Attestation::NotRun, [first, ..]) => violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                format!(
+                    "{} attests this target, but HARDWARE_TARGETS still records it as not \
+                     run; an attestation written without moving the row is a board run \
+                     nobody can find",
+                    first.name
+                ),
+            )),
+            (Attestation::Passed, []) => violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                format!(
+                    "HARDWARE_TARGETS records this target as passed, and no ADR carries \
+                     `{HARDWARE_ATTESTATION_MARKER} {}`; a hardware result with no decision \
+                     record behind it is a status somebody flipped",
+                    target.id
+                ),
+            )),
+            (Attestation::Passed, claims) => violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                format!(
+                    "{} ADRs attest this target, so which board run it refers to depends on \
+                     which a reader opens first",
+                    claims.len()
+                ),
+            )),
+        }
+        for adr in claiming {
+            if adr_status(&adr.contents).as_deref() != Some("accepted") {
+                violations.push(Violation::new(
+                    "hardware-attestation",
+                    target.id,
+                    format!(
+                        "{} attests this target but is not accepted, so the board run rests \
+                         on a decision record nobody has agreed to",
+                        adr.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    for adr in adrs {
+        for claimed in hardware_attestation_claims(&adr.contents) {
+            if !HARDWARE_TARGETS.iter().any(|target| target.id == claimed) {
+                violations.push(Violation::new(
+                    "hardware-attestation",
+                    adr.name.clone(),
+                    format!(
+                        "attests `{claimed}`, which HARDWARE_TARGETS does not declare; an \
+                         attestation for a target nobody asked for is one nobody will notice \
+                         is wrong"
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+/// The half of `hardware-attestation` that reads `CLAUDE.md`.
+#[must_use]
+fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        return vec![Violation::new(
+            "hardware-attestation",
+            CLAUDE_MD_PATH,
+            "the repository has no CLAUDE.md, so what the boards still owe is recorded \
+             nowhere a contributor reads",
+        )];
+    };
+
+    let contents = without_html_comments(contents);
+    let mut violations = Vec::new();
+
+    for target in HARDWARE_TARGETS {
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", target.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this hardware target in backticks, so \
+                     a reader cannot tell that rung 0.2's exit criterion is unmet"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this hardware target, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+        if !row.contains(target.headline) {
+            violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                format!(
+                    "CLAUDE.md's table row for this target does not carry its headline, \
+                     which reads `{}`",
+                    target.headline
+                ),
+            ));
+        }
+        if !row.contains(target.render_status()) {
+            violations.push(Violation::new(
+                "hardware-attestation",
+                target.id,
+                format!(
+                    "CLAUDE.md's table row does not say where it stands, which \
+                     HARDWARE_TARGETS renders as `{}`; a row free to disagree with the table \
+                     is a row that eventually does",
+                    target.render_status()
+                ),
+            ));
+        }
+    }
+
+    let count = format!("{} hardware target", HARDWARE_TARGETS.len());
+    if !contents.contains(&count) {
+        violations.push(Violation::new(
+            "hardware-attestation",
+            "target count",
+            format!(
+                "CLAUDE.md does not say `{count}s`, which is what rung 0.2's exit criterion \
+                 names"
+            ),
+        ));
+    }
+
+    violations
+}
+
 /// Rule: §16's deferred questions are tracked, and a settled one has an accepted ADR.
 ///
 /// Three things, and the second and third are the ones that make this more than a list.
@@ -2587,6 +2844,10 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         &inputs.adrs,
         inputs.storage_clauses.as_deref(),
     ));
+    violations.extend(check_hardware_attestation(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+    ));
     violations.extend(check_diagrams(inputs.architecture.as_deref()));
     violations.extend(check_missing_docs(&inputs.crate_roots));
     violations
@@ -2599,9 +2860,9 @@ pub mod tests_support {
 
     use super::{
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
-        DIAGRAMS, DocsInputs, QuestionStatus, RECOVERY_SPEC_ADR, SETTLED_DECISIONS,
-        SETTLED_DECISIONS_ADR, SPEC_CLAUSES, STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES,
-        adr_number, rule_count_phrases,
+        DIAGRAMS, DocsInputs, HARDWARE_TARGETS, QuestionStatus, RECOVERY_SPEC_ADR,
+        SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, SPEC_CLAUSES, STORAGE_CONFORMANCE_ADR,
+        STORAGE_CONTRACT_CLAUSES, adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
 
@@ -2714,6 +2975,23 @@ pub mod tests_support {
         line(
             &mut body,
             format_args!("All {} deferred questions.", DEFERRED_QUESTIONS.len()),
+        );
+        line(&mut body, format_args!("| Id | Target | Where it stands |"));
+        line(&mut body, format_args!("| --- | --- | --- |"));
+        for target in HARDWARE_TARGETS {
+            line(
+                &mut body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    target.id,
+                    target.headline,
+                    target.render_status()
+                ),
+            );
+        }
+        line(
+            &mut body,
+            format_args!("All {} hardware targets.", HARDWARE_TARGETS.len()),
         );
         for clause in SPEC_CLAUSES {
             line(
@@ -5148,6 +5426,7 @@ mod tests {
                 "claude-md",
                 "deferred-questions",
                 "diagrams",
+                "hardware-attestation",
                 "recovery-spec",
                 "settled-decisions",
                 "storage-conformance"

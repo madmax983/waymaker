@@ -204,6 +204,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymaker-rig"
+version = "0.0.0"
+dependencies = [
+ "embedded-storage",
+ "waymaker-conformance",
+ "waymaker-core",
+ "waymaker-fault",
+ "waymaker-flash",
+]
+
+[[package]]
 name = "waymaker-size-probe"
 version = "0.0.0"
 dependencies = [
@@ -234,6 +245,9 @@ dependencies = [
  "serde_json",
  "toml",
  "waymaker-core",
+ "waymaker-fault",
+ "waymaker-flash",
+ "waymaker-rig",
 ]
 
 [[package]]

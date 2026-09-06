@@ -14,6 +14,18 @@ publish = false
 # transcribing them. A number that lives in two places is a number that ends up
 # disagreeing with itself, and the compile-time assertions and the CI gate must not.
 waymaker-core.workspace = true
+# The write-amplification figure design document §15 and issue #27 ask to be published
+# alongside the size report is *measured*, by running the real journal writer over a modelled
+# part, rather than transcribed. Three dependencies, for the same reason `waymaker-core` is
+# one: a number that lives in two places is a number that ends up disagreeing with itself.
+#
+# These are host-only, and the gate is unaffected by them: `check_dependency_direction`
+# iterates `policy::LAYERS`, and `xtask` is `policy::HOST_TOOLS`, so this grants no layer
+# anything. A layer that ever depended *back* on `xtask` is what `dependency-direction` would
+# refuse; Cargo would refuse the cycle before any rule ran.
+waymaker-flash.workspace = true
+waymaker-fault.workspace = true
+waymaker-rig.workspace = true
 serde_json = "1"
 toml = "1"
 
