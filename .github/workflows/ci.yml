@@ -120,6 +120,13 @@ jobs:
       - name: Build the rig for the firmware target
         run: cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 
+      # `waymaker-drive` is outside `default-members` too, and issue #28's "done when" is a
+      # workflow driven to completion with no `Future`, no Embassy and no allocation. A host
+      # build would never notice an `extern crate alloc` appearing under it. `--lib` because
+      # its tests drive `waymaker-fault`, which models media in a `Vec`.
+      - name: Build the synchronous driver for the firmware target
+        run: cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
+
       # The size probe's binary is behind `required-features`, so the `check` job's clippy
       # stage — `--all-targets` on the host — never compiles it. Without this step the
       # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and

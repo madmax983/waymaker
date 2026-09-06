@@ -103,6 +103,16 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// knew in RAM, because RAM is the thing a power cut takes. See
 /// [ADR 0021](https://github.com/madmax983/waymaker/blob/main/docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md).
 ///
+/// `waymaker-drive` is issue [#28](https://github.com/madmax983/waymaker/issues/28)'s
+/// synchronous driver for design document §06's explicit kernel boundary. It is the third
+/// member of this category that is `#![no_std]` and allocation-free, and the reason is the
+/// claim it exists to make: a workflow runs to completion with "no `Future`, no Embassy and
+/// no allocation", and a driver that could only be built for the host would leave the last
+/// third of that unchecked. It is not the Embassy façade either — `Ctx`, the async
+/// dispatcher and wakeups are rung 0.4's — and driving the protocol here is what makes
+/// "`waymaker-embassy` is a façade and nothing more" falsifiable rather than intended. See
+/// [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
+///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
@@ -113,6 +123,7 @@ pub const TEST_SUPPORT_CRATES: &[&str] = &[
     "waymaker-spec",
     "waymaker-conformance",
     "waymaker-rig",
+    "waymaker-drive",
 ];
 
 /// The crate that is allowed to know about Embassy.

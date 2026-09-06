@@ -2141,6 +2141,94 @@ pub const EFFECT_SCHEDULED_PATH: &str = "waymaker-core/src/record.rs";
 /// Sorted, so that the comparison below can be a set comparison and the list can be read.
 pub const EFFECT_SCHEDULED_FIELDS: &[&str] = &["input_crc", "input_len", "kind", "seq"];
 
+/// The file whose kernel-boundary types [`BOUNDARY_TYPES`] pins.
+pub const KERNEL_BOUNDARY_PATH: &str = "waymaker-core/src/transition.rs";
+
+/// One type at design document §06's kernel boundary, and the shape it is pinned at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryType {
+    /// The declaration, as the source writes it: `enum Resolve<'a>` becomes `enum Resolve`,
+    /// because the scanner matches a header at a token boundary.
+    pub header: &'static str,
+    /// The variants — or, for a struct, the fields — it is allowed to declare, sorted.
+    pub members: &'static [&'static str],
+}
+
+/// Every type issue #28's boundary is made of, and the members each may declare.
+///
+/// Issue [#28](https://github.com/madmax983/waymaker/issues/28)'s second "done when" is that
+/// "adding a new record kind does not change this signature", and that is an *absence*: no
+/// type below names a record, a record kind or a step. Design document §09 has five record
+/// kinds spent and six more reserved — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`,
+/// `SIGNAL_RECEIVED`, `CHILD_STARTED` — and every one of them is a body somebody will write.
+/// A `Resolve::TimerFired`, an `Intent::Signal`, or a `kind: RecordKind` field on
+/// `EffectRequest` would each break no other rule, need no dependency, and turn one boundary
+/// into a boundary per record.
+///
+/// The pin fails in both directions, and the second matters more: a member the list no
+/// longer finds means the type was renamed or deleted and the pin is checking nothing.
+///
+/// What it does **not** catch is a *widened* member: a `Resolve::Replayed` that grew a
+/// third field, or an `EffectRequest::kind` retyped, is invisible to a comparison of names.
+/// `transition-surface` pins the machine's functions and
+/// `crates/waymaker-core/tests/transition.rs` holds the behaviour; this raises the cost of a
+/// new door, not of widening an existing one.
+///
+/// Sorted, so that the comparisons below can be set comparisons and the lists can be read.
+pub const BOUNDARY_TYPES: &[BoundaryType] = &[
+    BoundaryType {
+        header: "pub struct EffectRequest",
+        members: &["input_crc", "input_len", "kind"],
+    },
+    BoundaryType {
+        header: "pub enum Intent",
+        members: &["Finished", "Recorded", "Schedule"],
+    },
+    BoundaryType {
+        header: "pub enum Resolve",
+        members: &["Redeliver", "Replayed"],
+    },
+    BoundaryType {
+        header: "pub enum Outcome",
+        members: &["Completed", "Failed"],
+    },
+    BoundaryType {
+        header: "pub enum Next",
+        members: &["EndOfHistory", "Record"],
+    },
+];
+
+/// The file whose decisions [`BOUNDARY_DECISIONS`] pins.
+pub const DRIVER_PATH: &str = "waymaker-drive/src/drive.rs";
+
+/// Every kernel answer the synchronous driver is required to decide from.
+///
+/// Issue #28's first work item is to "drive the whole protocol through this boundary so
+/// `waymaker-embassy` is provably a façade and nothing more", and the claim only holds while
+/// the driver's *decisions* come from [`BOUNDARY_TYPES`]. A driver that read a record and
+/// decided for itself whether it was a schedule would be a second transition table, and the
+/// one below it would no longer be where §08 is enforced.
+///
+/// Every row is one row of §08's table, so a row lost means an arm was deleted or renamed
+/// and the driver is deciding somewhere else.
+pub const BOUNDARY_DECISIONS: &[&str] = &[
+    "Intent::Finished",
+    "Intent::Recorded",
+    "Intent::Schedule",
+    "Resolve::Redeliver",
+    "Resolve::Replayed",
+];
+
+/// Vocabulary the driver may not name, because naming it is deciding.
+///
+/// `RecordKind` is §09's numbering and `Step` is what the cursor answers an `advance` with:
+/// a driver that matched on either would be reading history rather than being told about it.
+/// The driver does construct [`waymaker_core::RecordRef`] values — it has to, because the
+/// kernel names the record it wants written and something has to write it — and writing a
+/// record the kernel asked for is not deciding, which is why `RecordRef` is not on this
+/// list.
+pub const DRIVER_FORBIDDEN_VOCABULARY: &[&str] = &["RecordKind", "Step::"];
+
 /// The file whose contents [`INTEGRITY_CHECK_PARAMETERS`] pins.
 pub const INTEGRITY_CHECK_PATH: &str = "waymaker-flash/src/crc.rs";
 
@@ -3774,6 +3862,151 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
     violations
 }
 
+/// Rule: design document §06's kernel boundary is the one that was reviewed, and the driver
+/// decides from it.
+///
+/// Two halves, one id, because it is one decision. The *shape* half pins the types issue #28
+/// names — [`BOUNDARY_TYPES`] — in both directions, which is that issue's second "done when"
+/// as a build failure: §09 has six record kinds reserved and not yet decoded, and a
+/// `Resolve::TimerFired` added when the first of them lands would turn one boundary into a
+/// boundary per record. The *routing* half pins that `waymaker-drive` decides from
+/// [`BOUNDARY_DECISIONS`] and names none of [`DRIVER_FORBIDDEN_VOCABULARY`], which is what
+/// makes "the protocol is driven through this boundary" a check rather than a reading.
+///
+/// Scanned over code with comments and string literals stripped, like every rule here, so a
+/// doc comment naming `Resolve::Replayed` cannot vouch for an arm that is not there and a
+/// commented-out variant cannot fail the pin.
+///
+/// What it cannot see: a widened member behind a name already on the list, and a driver that
+/// names every decision and then ignores one. `crates/waymaker-drive/tests/` is what holds
+/// the behaviour — a diverging workflow that dispatches nothing, a redelivery that reuses
+/// its identity, and the whole protocol swept at every crash point the injector lists.
+#[must_use]
+pub fn check_kernel_boundary(
+    layers: &[crate::size::LayerSource],
+    driver: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    const RULE: &str = "kernel-boundary";
+    const KERNEL: &str = "waymaker-core";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+
+    match find_source(layers, KERNEL_BOUNDARY_PATH) {
+        None => violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {KERNEL_BOUNDARY_PATH} in the workspace, so the pinned boundary is \
+                 checking nothing; issue #28 asks that adding a record kind not change this \
+                 signature, and a pin that cannot find the types checks neither direction"
+            ),
+        )),
+        Some(source) => {
+            let code = code_only(&source.contents);
+            for pinned in BOUNDARY_TYPES {
+                violations.extend(check_boundary_type(RULE, KERNEL, &code, pinned));
+            }
+        }
+    }
+
+    let Some(source) = find_source(driver, DRIVER_PATH) else {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "no {DRIVER_PATH} in the workspace, so nothing shows that the protocol is \
+                 driven through the kernel boundary; issue #28's first work item is that \
+                 `waymaker-embassy` be provably a fa\u{e7}ade and nothing more"
+            ),
+        ));
+        return violations;
+    };
+
+    let code = code_only(&source.contents);
+    for decision in BOUNDARY_DECISIONS {
+        if !code.contains(decision) {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{DRIVER_PATH} names no `{decision}`, so one row of \u{a7}08's table is \
+                     decided somewhere other than the kernel boundary"
+                ),
+            ));
+        }
+    }
+    for forbidden in DRIVER_FORBIDDEN_VOCABULARY {
+        if code.contains(forbidden) {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{DRIVER_PATH} names `{forbidden}`, which is the record vocabulary the \
+                     kernel decides from; a driver that reads it is a second transition \
+                     table, and the one below it is no longer where \u{a7}08 is enforced"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// One pinned boundary type, compared against what the kernel declares.
+fn check_boundary_type(
+    rule: &'static str,
+    subject: &str,
+    code: &str,
+    pinned: &BoundaryType,
+) -> Vec<Violation> {
+    let Some(body) = braced_body(code, pinned.header) else {
+        return vec![Violation::new(
+            rule,
+            subject,
+            format!(
+                "{KERNEL_BOUNDARY_PATH} declares no `{}`, so its pinned members are checking \
+                 nothing",
+                pinned.header
+            ),
+        )];
+    };
+    let declared = if pinned.header.starts_with("pub struct") {
+        field_names(body)
+    } else {
+        variant_names(body)
+    };
+    let expected: BTreeSet<&str> = pinned.members.iter().copied().collect();
+    let found: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+
+    let mut violations = Vec::new();
+    for added in found.difference(&expected) {
+        violations.push(Violation::new(
+            rule,
+            subject,
+            format!(
+                "`{}` declares `{added}`, which BOUNDARY_TYPES does not pin; issue #28 asks \
+                 that adding a record kind not change this signature, and \u{a7}09 reserves \
+                 six kinds nobody has written a body for yet",
+                pinned.header
+            ),
+        ));
+    }
+    for removed in expected.difference(&found) {
+        violations.push(Violation::new(
+            rule,
+            subject,
+            format!(
+                "`{}` no longer declares `{removed}`, which BOUNDARY_TYPES pins; a member \
+                 the pin cannot find means the boundary was renamed and the pin has stopped \
+                 checking it",
+                pinned.header
+            ),
+        ));
+    }
+    violations
+}
+
 /// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
 ///
 /// Two things. The algorithm parameters have to still be there, because a polynomial is the
@@ -4017,6 +4250,57 @@ fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// The variant names declared directly in an enum `body`, ignoring anything nested.
+///
+/// A variant is the first identifier of each top-level comma-separated segment. Attribute
+/// contents are inside brackets and so are nested; a `#` at depth zero is not an identifier
+/// character, so it clears the token rather than becoming one.
+#[must_use]
+fn variant_names(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut depth = 0_u32;
+    let mut token = String::new();
+    let mut recorded = false;
+
+    for character in body.chars() {
+        match character {
+            '{' | '(' | '[' | '<' => {
+                if depth == 0 && !recorded && !token.is_empty() {
+                    names.push(token.clone());
+                    recorded = true;
+                }
+                depth += 1;
+                token.clear();
+            }
+            '}' | ')' | ']' | '>' => {
+                depth = depth.saturating_sub(1);
+                token.clear();
+            }
+            ',' if depth == 0 => {
+                if !recorded && !token.is_empty() {
+                    names.push(token.clone());
+                }
+                token.clear();
+                recorded = false;
+            }
+            c if depth == 0 && (c.is_alphanumeric() || c == '_') => token.push(c),
+            _ => {
+                if depth == 0 && !recorded && !token.is_empty() {
+                    names.push(token.clone());
+                    recorded = true;
+                }
+                token.clear();
+            }
+        }
+    }
+    if !recorded && !token.is_empty() {
+        names.push(token);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// The `name:` field names declared directly in `body`, ignoring anything nested.
@@ -7529,12 +7813,12 @@ pub mod tests_support {
     use super::{
         APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_CALL, APPEND_COMMIT_STEP,
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
-        CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE,
-        CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
-        INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
-        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
-        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TRANSITION_SURFACE,
+        BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
+        CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
+        FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS,
+        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
+        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -7558,10 +7842,41 @@ pub mod tests_support {
         surface("A replay module.", REPLAY_SURFACE)
     }
 
-    /// A transition module declaring exactly [`TRANSITION_SURFACE`] and nothing else.
+    /// A transition module declaring exactly [`TRANSITION_SURFACE`] and [`BOUNDARY_TYPES`].
+    ///
+    /// Both pins read this one file, so a fixture carrying only the function surface would
+    /// describe a workspace `kernel-boundary` rejects for a reason no test here is about.
     #[must_use]
     pub fn clean_transition_surface() -> String {
-        surface("A transition module.", TRANSITION_SURFACE)
+        use std::fmt::Write as _;
+
+        let mut source = surface("A transition module.", TRANSITION_SURFACE);
+        for pinned in BOUNDARY_TYPES {
+            let _ = writeln!(source, "{} {{", pinned.header);
+            for member in pinned.members {
+                if pinned.header.starts_with("pub struct") {
+                    let _ = writeln!(source, "    pub {member}: u32,");
+                } else {
+                    let _ = writeln!(source, "    {member},");
+                }
+            }
+            source.push_str("}\n");
+        }
+        source
+    }
+
+    /// A driver module deciding from exactly [`BOUNDARY_DECISIONS`] and naming none of
+    /// [`DRIVER_FORBIDDEN_VOCABULARY`].
+    #[must_use]
+    pub fn clean_driver_module() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! A synchronous driver.\npub fn drive() {\n");
+        for decision in BOUNDARY_DECISIONS {
+            let _ = writeln!(source, "    let _ = {decision};");
+        }
+        source.push_str("}\n");
+        source
     }
 
     /// A storage module declaring exactly [`STORAGE_CONTRACT_SURFACE`] and nothing else.

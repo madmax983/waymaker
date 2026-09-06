@@ -68,6 +68,7 @@ pub const RULES: &[&str] = &[
     "hardware-attestation",
     "inputs-incomplete",
     "integrity-check",
+    "kernel-boundary",
     "kernel-owns-no-encoding",
     "kernel-zero-dependencies",
     "layer-missing",
@@ -92,6 +93,13 @@ pub const RULES: &[&str] = &[
     "workspace-lints",
     "workspace-membership",
 ];
+
+/// The crate whose driver `kernel-boundary`'s routing half pins.
+///
+/// Named here rather than taken from [`policy::TEST_SUPPORT_CRATES`] by position, for
+/// [`RIG_PACKAGE`]'s reason: a rule that pinned whichever crate happened to be fifth in that
+/// list is a rule that moves when somebody sorts it.
+pub const DRIVER_PACKAGE: &str = "waymaker-drive";
 
 /// The crate whose oracle and census `rig-oracle` pins.
 ///
@@ -196,6 +204,12 @@ pub struct WorkspaceInputs {
     /// attributes, the kernel's encoding ban, the size probe's reach — would then be run
     /// against a crate none of them is about.
     pub rig_sources: Vec<size::LayerSource>,
+    /// Every Rust source file of `waymaker-drive`, in path order.
+    ///
+    /// Kept apart from [`layer_sources`](Self::layer_sources) for
+    /// [`rig_sources`](Self::rig_sources)'s reason: the driver is not a layer, and every
+    /// rule that iterates the layer sources is about crates that are.
+    pub driver_sources: Vec<size::LayerSource>,
     /// `CLAUDE.md`, the decision record, the diagrams, and every crate root.
     pub docs: docs::DocsInputs,
 }
@@ -271,6 +285,10 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_bank_integrity_routing(&inputs.layer_sources));
     violations.extend(source::check_swap_routing(&inputs.layer_sources));
     violations.extend(source::check_rig_oracle(&inputs.rig_sources));
+    violations.extend(source::check_kernel_boundary(
+        &inputs.layer_sources,
+        &inputs.driver_sources,
+    ));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -426,25 +444,8 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         }
     }
 
-    let mut rig_sources = Vec::new();
-    if let Some(package) = graph.find(RIG_PACKAGE)
-        && let Some(source_root) = package
-            .lib_source_path
-            .as_ref()
-            .and_then(|path| path.parent())
-    {
-        for path in rust_sources(source_root) {
-            rig_sources.push(size::LayerSource {
-                crate_name: RIG_PACKAGE.to_owned(),
-                path: path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string(),
-                contents: read_to_string(&path)?,
-            });
-        }
-    }
+    let driver_sources = package_sources(&graph, DRIVER_PACKAGE, root)?;
+    let rig_sources = package_sources(&graph, RIG_PACKAGE, root)?;
 
     let probe = graph.find(size::PROBE_PACKAGE);
     let probe_manifest = probe
@@ -473,8 +474,41 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         probe_source,
         layer_sources,
         rig_sources,
+        driver_sources,
         docs,
     })
+}
+
+/// Every Rust source file of one workspace package, in path order.
+///
+/// Empty for a package the graph does not have, which is how a workspace from before that
+/// crate existed is recognised rather than reported: the rules that read these lists fail
+/// closed on their own, and each says so.
+fn package_sources(
+    graph: &graph::PackageGraph,
+    name: &str,
+    root: &Path,
+) -> Result<Vec<size::LayerSource>, CheckError> {
+    let mut sources = Vec::new();
+    if let Some(package) = graph.find(name)
+        && let Some(source_root) = package
+            .lib_source_path
+            .as_ref()
+            .and_then(|path| path.parent())
+    {
+        for path in rust_sources(source_root) {
+            sources.push(size::LayerSource {
+                crate_name: name.to_owned(),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+                contents: read_to_string(&path)?,
+            });
+        }
+    }
+    Ok(sources)
 }
 
 /// Reads `CLAUDE.md`, the decision record, the architecture document, and every crate root.
@@ -756,6 +790,7 @@ mod tests {
             // No rig sources at all: `rig-oracle` fires, because a pin whose file is gone
             // is a pin checking nothing — which is the failure mode the rule exists for.
             rig_sources: Vec::new(),
+            driver_sources: Vec::new(),
             // A kernel with a public function the probe does not call: the reach rule
             // fires, because a function nothing links is a function no budget charges for.
             layer_sources: vec![size::LayerSource {
@@ -827,6 +862,7 @@ mod tests {
             "hardware-attestation",
             "inputs-incomplete",
             "integrity-check",
+            "kernel-boundary",
             "kernel-owns-no-encoding",
             "kernel-zero-dependencies",
             "layer-missing",
@@ -884,6 +920,18 @@ mod tests {
     // Two sources, because both surface pins fail closed when the module they pin
     // is not in the workspace at all: `replay-cursor-surface` for the cursor's
     // public API, `transition-surface` for the replay machine's.
+    /// A `waymaker-drive` whose driver decides from exactly what `kernel-boundary` pins.
+    ///
+    /// The routing half fails closed when the module is absent, so a fixture without this
+    /// would describe a workspace the gate rejects for a reason no test here is about.
+    fn clean_driver_sources() -> Vec<size::LayerSource> {
+        vec![size::LayerSource {
+            crate_name: DRIVER_PACKAGE.to_owned(),
+            path: format!("crates/{}", source::DRIVER_PATH),
+            contents: source::tests_support::clean_driver_module(),
+        }]
+    }
+
     /// A `waymaker-rig` whose oracle and census are exactly what `rig-oracle` pins.
     ///
     /// The rule fails closed when either file is absent, so a fixture without these would
@@ -1039,6 +1087,7 @@ mod tests {
             )),
             layer_sources: clean_layer_sources(),
             rig_sources: clean_rig_sources(),
+            driver_sources: clean_driver_sources(),
             docs: docs::DocsInputs {
                 // A root per workspace member, because `inputs-incomplete` now reports a
                 // member the `missing-docs` rule could not be run against.
@@ -1238,12 +1287,17 @@ mod tests {
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null }],
           "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/rig/src/lib.rs" }] },
+        { "id": "drive", "name": "waymaker-drive", "source": null,
+          "manifest_path": "/w/drive/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-flash", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/drive/src/lib.rs" }] },
         { "id": "embedded-storage", "name": "embedded-storage",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "dependencies": [], "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
@@ -1253,6 +1307,7 @@ mod tests {
         { "id": "spec", "deps": [{ "pkg": "fault" }] },
         { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
         { "id": "rig", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
+        { "id": "drive", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;

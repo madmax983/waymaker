@@ -79,14 +79,15 @@ Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `way
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
 
-Six workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+Seven workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
 firmware linked only so that its section sizes can be measured, `waymaker-fault` is the crash
 harness, `waymaker-spec` is the formal specification of the recovery invariants,
-`waymaker-conformance` is the storage-contract suite and the `embedded-storage` port, and
-`waymaker-rig` is the power-cut and watchdog-reset rig. No layer may depend on any of them.
-The last two are `#![no_std]` and *are* built for a firmware target — by CI, on
-`thumbv6m-none-eabi` — because both exist to be run on the part rather than only about it;
-neither is in the image the code-flash budget is measured against.
+`waymaker-conformance` is the storage-contract suite and the `embedded-storage` port,
+`waymaker-rig` is the power-cut and watchdog-reset rig, and `waymaker-drive` is the
+synchronous driver that runs a workflow to completion through the kernel boundary. No layer
+may depend on any of them. The last three are `#![no_std]` and *are* built for a firmware
+target — by CI, on `thumbv6m-none-eabi` — because each exists to be run on the part rather
+than only about it; none is in the image the code-flash budget is measured against.
 
 ## Budgets
 
@@ -147,6 +148,7 @@ cargo doc    --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
@@ -318,6 +320,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `size-probe` | the size probe is missing, its binary leaves `required-features`, a layer stops being an optional dependency of it, one of its features stops enabling the crates its row measures, or its crate root stops being bare-metal firmware |
 | `replay-cursor-surface` | the replay cursor's public surface differs from the pinned list, so a lookup by effect id could arrive without a reviewer writing it down |
 | `transition-surface` | the replay machine's public surface differs from the pinned list, so a way out of a divergence — a `reset`, a `clear_divergence` — could arrive without a reviewer writing it down |
+| `kernel-boundary` | design document §06's boundary types gain or lose a member the pin does not have — a `Resolve::TimerFired` when §09's reserved record kinds land, a `RecordKind` field on `EffectRequest` — or `waymaker-drive` stops deciding from `Intent` and `Resolve`, so the protocol would be driven somewhere other than through the kernel boundary |
 | `rig-oracle` | the rig's oracle or its census gains a public function the pin does not list — an `Audit::assume_passed`, a `Coverage::force_complete` — so an instrument whose bugs show up as *passing* tests could be turned off without a reviewer writing it down |
 | `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `recovery-surface` | the storage-backed recovery reader's public surface differs from the pinned list, so a `seek`, a `resume_at`, or a second route to an append offset could arrive without a reviewer writing it down |

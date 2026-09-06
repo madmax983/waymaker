@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 43 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 44 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -33,6 +33,7 @@ cargo doc --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
@@ -296,7 +297,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Six crates are in the workspace and are *not* layers:
+Seven crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
@@ -331,6 +332,20 @@ Six crates are in the workspace and are *not* layers:
   cuts the supply has to be code a board can link — which also means it may not keep what it
   knew in RAM, because RAM is the thing a power cut takes. See
   [ADR 0021](docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md).
+- `waymaker-drive` — issue [#28](https://github.com/madmax983/waymaker/issues/28)'s
+  synchronous driver for §06's explicit kernel boundary, also
+  `policy::TEST_SUPPORT_CRATES`. The workflow's half of the boundary and the world's, the
+  loop that joins `waymaker-flash`'s recovery scan and two-barrier writer to
+  `waymaker-core`'s transition table, and a reference workflow the firmware target builds.
+  Outside `default-members`, and nothing depends on it. It is the third member of this
+  category that is `#![no_std]` and allocation-free, and the reason is the claim it exists to
+  make: issue #28 asks for a workflow driven to completion with "no `Future`, no Embassy, and
+  no allocation", and a driver that could only be built for the host would leave the last
+  third of that unchecked — so the `drive-firmware` stage builds its library for
+  `thumbv6m-none-eabi`. It is deliberately not `waymaker-embassy`: `Ctx`, the async
+  dispatcher and wakeups are rung 0.4's, and a façade that contained the protocol would be
+  the opposite of the thing #28 asks to be proved. See
+  [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
 - `waymaker-spec` — the formal specification of the recovery invariants, also
   `policy::TEST_SUPPORT_CRATES`. The ghost model of committed history, the journal and bank
   state machines, and the exhaustive search that discharges design document §14's guarantees
@@ -470,7 +485,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 43 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 44 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -491,6 +506,7 @@ this table is how you find out what a red build is telling you.
 | `swap-discipline` | §10's bank swap gains a public function `source::SWAP_SURFACE` does not list, in either direction — or its step order comes apart: a state in `source::SWAP_TYPESTATE` declares anything but the one method its row names, `Staged` names `program`, a value in `source::SWAP_CONSTRUCTIONS` is built anywhere but inside the body its row names, `payload_barrier` stops taking `source::SWAP_BARRIER_CALL`, or a row of `source::SWAP_ERASE_CALLS` stops erasing exactly the bank it names, before a barrier, without naming the other one. Issue [#26](https://github.com/madmax983/waymaker/issues/26) states §10 as seven steps and two recovery rules — "a crash before step 5 recovers the old run, a crash after step 6 recovers the new run" — and every one of those is a statement about *where the barriers are*. A `Prepared::commit` skipping the header, a `Staged::seal_now` skipping the payload barrier, an `Installed` built anywhere but in `commit`, or a `Swap::install(bank)` taking the bank to erase from its caller would each break no other rule and turn a protocol into a convention. The erase rows are the sharpest: which bank a swap clears is derived from the authority the device booted, and a `prepare` that erased the *retiring* bank is a device clearing the run it is executing. What it cannot see is whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness, nor whether the crash windows behave — that is `crates/waymaker-fault/tests/swap.rs`, at every crash point of all seven steps. |
 | `rig-oracle` | `waymaker-rig`'s oracle or its census gains a public function `source::RIG_AUDIT_SURFACE` or `source::RIG_CENSUS_SURFACE` does not list, in either direction — or either file is gone, so the pin checks nothing. A rig is the one piece of code here whose bugs are *invisible*: a firmware bug shows up as a failing test, a rig bug as a passing one. Every way of giving the instrument back is an addition — an `Audit::assume_passed`, an `Audit::ignore`, a `Breach::suppress`, a second `finish` taking the authority count as advisory, a `Coverage::force_complete`, a `Gap::ignore` — and each would break no other rule, need no dependency and pass every test that exists. The census is a file of its own rather than part of `phase.rs` for this rule's sake: `Phase` and `ResetCause` each declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell two such declarations apart. What it cannot see is whether the oracle's arithmetic is right — `crates/waymaker-rig/tests/teeth.rs` is what holds that, with two writers wrong in one way each and a control writer required to pass. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
+| `kernel-boundary` | Design document §06's kernel boundary stops being the one that was reviewed, in either half. The *shape* half: a type in `source::BOUNDARY_TYPES` — `EffectRequest`, `Intent`, `Resolve`, `Outcome`, `Next` — declares a member the pin does not have, or stops declaring one it does, or is gone so the pin checks nothing. Issue [#28](https://github.com/madmax983/waymaker/issues/28) asks that "adding a new record kind does not change this signature", and §09 reserves six kinds — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`, `SIGNAL_RECEIVED`, `CHILD_STARTED` — that nobody has written a body for. A `Resolve::TimerFired` arriving with the first of them would break no other rule, need no dependency, and turn one boundary into a boundary per record. The *routing* half: `waymaker-drive`'s driver stops naming a row of `source::BOUNDARY_DECISIONS`, or grows one of `source::DRIVER_FORBIDDEN_VOCABULARY` — `RecordKind` or `Step::`. A driver that decided from a record rather than from `Intent` and `Resolve` would be a second transition table, and the one below it would no longer be where §08 is enforced; it constructs `RecordRef` values, which is why that name is not forbidden — writing a record the kernel asked for is not deciding. One rule id because it is one decision. What it cannot see is a *widened* member behind a name already on the list, and a driver that names every decision and then ignores one; `crates/waymaker-drive/tests/` is what holds the behaviour. [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md). |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
@@ -800,6 +816,27 @@ Stated so that nobody mistakes silence for coverage:
   0021's claim — that the rig *fits*, in flash or in RAM, next to an engine. There is no size
   probe for it and no budget it is measured against, because the board it would be measured on
   is the thing that is owed.
+- **A widened member of the kernel boundary, or a driver that names a row and ignores it.**
+  `kernel-boundary` compares *names*, exactly as `effect-scheduled-fields` and every surface
+  pin do: a `Resolve::Replayed` that grew a third field, an `EffectRequest::kind` retyped, or
+  a `match` arm that names `Intent::Schedule` and then does the wrong thing are each
+  invisible to it. `crates/waymaker-core/tests/transition.rs` holds the kernel's behaviour
+  and `crates/waymaker-drive/tests/` the driver's — a diverging workflow that dispatches
+  nothing, a redelivery that reuses its identity, and the protocol swept at every crash point
+  the injector lists. The routing half also pins one file, the way `capacity-reserve`,
+  `recovery-surface` and `storage-contract` each do: a decision taken in a sibling module of
+  `waymaker-drive` is a decision the rule cannot see.
+- **That the synchronous driver is a driver anything is obliged to use.** `waymaker-drive` is
+  above the layers and nothing depends on it, so it demonstrates that the boundary is
+  sufficient rather than obliging a future dispatcher to go through it. That is rung 0.4's,
+  and it is the same standing as "nothing obliges a future dispatcher to use the gated
+  writer".
+- **What the synchronous driver does after a crash that leaves no append point.** It refuses.
+  A torn or unsealed tail has no append offset — ADR 0018's anti-bricking rule — and
+  recovering from that is §10's `continue_as_new`, which `waymaker-flash`'s `swap` owns and
+  which this driver does not call. `crates/waymaker-drive/tests/crash.rs` measures how often
+  each happens rather than assuming, and requires both a crash image the run carries on from
+  and one it cannot.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -1156,6 +1193,34 @@ written as one. The witness half is the one that can fail and does not:
 retained witness, derived per run rather than from a finished one, accuses no healthy run,
 because every mark goes down after the thing it attests — and the tooth beside it shows a
 writer with that order reversed accusing one.
+
+Issue #28 is rung 0.3's first arrival, and what it asks for is a thing the workspace *does*
+rather than a thing it argues. §06's explicit kernel boundary has existed since issue #15 —
+`EffectRequest`, `Intent`, `Resolve`, `Outcome` and `Next`, with `ReplayMachine` answering in
+them — and `waymaker-flash` has had both halves it is answered from since issues #23 and #24.
+Nothing joined them, so "the protocol goes through this boundary, and `waymaker-embassy` is a
+façade and nothing more" was an argument. `waymaker-drive` is the join: a synchronous driver
+that recovers a journal, replays it through the machine, dispatches what the machine says to
+dispatch, and records what comes back — with no `Future` and no executor anywhere in it. A
+workflow is a plain value with a method, and it suspends by propagating `Suspended` with `?`,
+which is the place `.await` will go. The claim that it allocates nothing is a *build*: the
+crate is `#![no_std]` and the `drive-firmware` stage links its library for
+`thumbv6m-none-eabi`, so the reference workflow a board would run is a workflow a board can
+link. §02 decision 3 stops being a comment and becomes the order of two calls — the schedule
+record is committed in one and the world is not heard from until the other, which cannot be
+reached without it — and that is swept at every crash point `waymaker-fault` enumerates, with
+a hand-written driver that dispatches first as the tooth. The lifetime discipline #28 asks to
+be *documented* is enforced instead: every borrowed result points into a buffer the caller
+owns and the driver reuses, and `Boundary::call` derives its borrow from `&mut self`, so a
+workflow holding one across the next boundary does not compile — a `compile_fail` doctest
+beside a compiling twin. The second "done when" is `kernel-boundary`, a rule with two halves:
+adding a record kind cannot change the boundary's signature, because the member sets are
+pinned in both directions, and the driver has to decide from `Intent` and `Resolve` rather
+than from a record. What is owed is written down rather than implied: this driver does not
+swap banks, so a crash that leaves a torn tail is refused rather than repaired; nothing
+obliges anybody to use it; and bank selection stays `waymaker-flash`'s. All three are rung
+0.4's dispatcher. See
+[ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
 
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async
