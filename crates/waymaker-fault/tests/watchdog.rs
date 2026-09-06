@@ -21,9 +21,10 @@
 //! It makes a watchdog reset *weaker* than a brownout on media. Every image a watchdog reset
 //! leaves is an image some power cut also leaves, and
 //! [`every_watchdog_image_is_one_a_power_cut_also_produces`] proves it over the real journal
-//! writer rather than asserting it. A reader who is told only that the census now has six
-//! filled cells would otherwise be entitled to think three of them bought new media states.
-//! They buy the two other differences.
+//! writer rather than asserting it. So the difference between the two causes is never on
+//! media. It is in what the *call* answered, and it is only observable where something other
+//! than another storage call follows a completed operation — which in `waymaker-rig` is the
+//! dispatch, and nowhere else.
 //!
 //! # What is still owed to a board
 //!
@@ -135,6 +136,95 @@ fn a_brownout_can_stop_inside_a_program_unit() {
         one_program,
     );
     assert_eq!(programmed_prefix(&run), 1);
+}
+
+/// Four 64-byte erase blocks, so an erase has an interior.
+fn blocky() -> Geometry {
+    let Ok(geometry) = Geometry::new(256, 64, 4, 1) else {
+        unreachable!("256 is four 64-byte blocks of 4-byte units")
+    };
+    geometry
+}
+
+/// Programs the whole part, then erases it, so an erase can be watched.
+fn program_then_erase(session: &mut Session) -> Result<(), FaultError> {
+    session.program(0, &[0x00; 256])?;
+    session.barrier()?;
+    session.erase(0, 256)?;
+    session.barrier()
+}
+
+/// How many bytes at the start of `run`'s media are erased.
+fn erased_prefix(run: &Run) -> usize {
+    run.image()
+        .iter()
+        .take_while(|byte| **byte == ERASED)
+        .count()
+}
+
+/// [`program_then_erase`] on a [`blocky`] part, interrupted at `injection`.
+fn erase_run(progress: Progress, interruption: Interruption) -> Run {
+    let injection = Injection {
+        // Operation 2 is the erase: program, barrier, erase, barrier.
+        op: 2,
+        progress,
+        interruption,
+    };
+    match Harness::new(blocky()).run_one(injection, program_then_erase) {
+        Ok(run) => run,
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
+#[test]
+fn a_watchdog_reset_leaves_a_whole_number_of_erase_blocks() {
+    // The erase half of the same rule. The controller finishes the block the core stopped
+    // believing in, so a reset one byte into a block leaves the whole block erased.
+    //
+    // Reachable only through a crash point a caller builds by hand, because the enumeration
+    // offers a watchdog reset at whole operations only — which is where this branch and the
+    // power-cut branch agree, and therefore where a wrong one would be invisible.
+    for (stopped, erased) in [
+        (1, 64),
+        (63, 64),
+        (64, 64),
+        (65, 128),
+        (191, 192),
+        (192, 192),
+    ] {
+        let run = erase_run(Progress::Bytes(stopped), Interruption::Watchdog);
+        assert_eq!(
+            erased_prefix(&run),
+            erased,
+            "a watchdog reset {stopped} bytes into the erase left a partial block"
+        );
+    }
+}
+
+#[test]
+fn a_brownout_leaves_the_erase_block_it_was_inside_unerased() {
+    // The tooth. A power cut rounds the other way — no device erases half a block, and the
+    // block in flight is the one that did not finish — so a model that rounded both causes up
+    // would pass the test above and lose the difference it is about.
+    for (stopped, erased) in [(1, 0), (63, 0), (64, 64), (65, 64), (191, 128), (192, 192)] {
+        let run = erase_run(Progress::Bytes(stopped), Interruption::PowerLoss);
+        assert_eq!(
+            erased_prefix(&run),
+            erased,
+            "a power cut {stopped} bytes into the erase erased a block it was still inside"
+        );
+    }
+}
+
+#[test]
+fn a_whole_erase_is_the_same_under_either_reset() {
+    // Which is why the enumeration lists one of them. The two causes part company over what
+    // the *call* answers, and `a_watchdog_reset_at_a_whole_operation_is_not_a_power_cut_at_one`
+    // is where that is measured.
+    let power = erase_run(Progress::Whole, Interruption::PowerLoss);
+    let watchdog = erase_run(Progress::Whole, Interruption::Watchdog);
+    assert_eq!(erased_prefix(&watchdog), 256);
+    assert_eq!(power.image(), watchdog.image());
 }
 
 #[test]
@@ -478,18 +568,25 @@ fn every_watchdog_image_is_one_a_power_cut_also_produces() {
         watchdog.is_subset(&power),
         "a watchdog reset left media no power cut can leave"
     );
-    // And it is a *proper* subset, so the two causes are not the same model wearing two
-    // names. Without this the theorem above would also hold of a relabelling.
-    assert!(
-        watchdog.len() < power.len(),
-        "the two causes produce the same images, so one of them is a label"
-    );
+    // The inclusion is proper, and that is a remark rather than a check: a power cut is
+    // enumerated at every interior byte and a watchdog reset only at whole operations, so the
+    // inequality holds however the two causes behave. What rules out a relabelling is
+    // `a_watchdog_reset_at_a_whole_operation_is_not_a_power_cut_at_one`, where the two answer
+    // the caller differently, and the rig's
+    // `the_two_causes_part_company_only_where_an_effect_follows_a_completed_call`, where
+    // that difference changes what a run did.
+    assert!(watchdog.len() < power.len());
 }
 
 #[test]
 fn the_oracle_accepts_the_real_writer_at_every_watchdog_reset() {
     // Design document §15's core property, over the third cause. The engine has to survive a
     // watchdog reset as it survives a brownout, and this is the sweep that says so.
+    //
+    // What it is not is new oracle reach, and the theorem above is why: every watchdog image
+    // is a power-cut image, so this cannot go red without a power-cut run in the same sweep
+    // going red first. It confirms the writer under the new cause rather than reaching a
+    // state the old sweep could not.
     let runs = drive(journal_writer);
     let mut swept = 0_usize;
     for run in &runs {
@@ -511,7 +608,13 @@ fn the_oracle_accepts_the_real_writer_at_every_watchdog_reset() {
 fn a_watchdog_reset_leaves_no_partial_unit_in_the_journal_either() {
     // The targeted test at the top, restated over the real writer: at every watchdog reset,
     // the programmed prefix of the journal ends on a program-unit boundary.
+    //
+    // What it does not do is catch a rounding regression. Every point it sees is a whole
+    // operation, where the rounding is a no-op; the direction of the rounding is held by the
+    // hand-built crash points above. It is here so that an enumeration which later broadens
+    // `Interruption::Watchdog` is held to the rule from its first run.
     let runs = drive(journal_writer);
+    let mut swept = 0_usize;
     for run in &runs {
         let Some(point) = run.injection() else {
             continue;
@@ -519,6 +622,7 @@ fn a_watchdog_reset_leaves_no_partial_unit_in_the_journal_either() {
         if point.interruption != Interruption::Watchdog {
             continue;
         }
+        swept += 1;
         let landed = programmed_prefix(run);
         assert_eq!(
             u32::try_from(landed).unwrap_or(u32::MAX) % UNIT,
@@ -526,6 +630,7 @@ fn a_watchdog_reset_leaves_no_partial_unit_in_the_journal_either() {
             "{point:?} left a partial program unit"
         );
     }
+    assert!(swept > 0, "no watchdog reset was swept");
 }
 
 /// The ledger of the fault-free run, for the assertion below.

@@ -476,9 +476,16 @@ impl StableStorage for Session {
 
         match self.armed_for(index) {
             // A barrier that returned an error establishes nothing a caller may rely on,
-            // whatever really happened on the wire. It has no interior, so any progress
-            // other than `None` says it ran — there is no half of a barrier to land.
-            Some(injection) if injection.progress == Progress::None => {
+            // whatever really happened on the wire. It has no interior, so any progress that
+            // is not zero says it ran — there is no half of a barrier to land.
+            //
+            // Zero is read rather than matched on the variant. [`Progress::Bytes`] documents
+            // that a hand-built zero *is* [`Progress::None`], and a guard that compared the
+            // variant let `Bytes(0)` through as a completed barrier — acknowledging a record
+            // from a barrier the caller had said did nothing.
+            Some(injection)
+                if matches!(injection.progress, Progress::None | Progress::Bytes(0)) =>
+            {
                 Err(self.interrupt(injection.interruption))
             }
             // The barrier completed. Whether the power then went away or the call merely

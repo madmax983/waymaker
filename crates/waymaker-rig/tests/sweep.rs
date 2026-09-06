@@ -27,20 +27,34 @@
 //! [`a_watchdog_cell_is_credited_only_by_a_watchdog_reset`] is what keeps it reading the cause
 //! rather than the progress.
 //!
+//! # What the filled watchdog cells buy, stated exactly
+//!
+//! Less than a reader would assume, and the exact amount is measured rather than described.
+//!
 //! On media a watchdog reset is *weaker* than a brownout: `waymaker-fault`'s
-//! `every_watchdog_image_is_one_a_power_cut_also_produces` proves it. So the watchdog cells do
-//! not buy new media states. They buy the difference media cannot show — the writer is never
-//! told the operation completed — and
-//! [`a_watchdog_reset_does_not_dispatch_where_a_power_cut_does`] measures it.
+//! `every_watchdog_image_is_one_a_power_cut_also_produces` proves it. The two causes part
+//! company over what the *call* answered, so they can only diverge where something other than
+//! another storage call follows a completed operation. In this rig that is the dispatch, and
+//! nowhere else — at a schedule or a completion write the next thing is another storage call,
+//! which fails under either cause.
+//!
+//! [`the_two_causes_part_company_only_where_an_effect_follows_a_completed_call`] is that,
+//! measured: identical media at every operation, identical dispatch wherever the *engine* was
+//! interrupted, and a divergence somewhere. So the `(Schedule, Watchdog)` and
+//! `(Completion, Watchdog)` cells record that the cause was performed and that recovery
+//! survived it; they do not record a run their power-cut twins did not also produce. Saying
+//! so is the difference between a census and a tally.
 //!
 //! # Five cells, not six
 //!
-//! That same difference costs the sixth. Being *in* the dispatch window needs the dispatch
-//! mark's commit barrier to have returned, and a watchdog reset is the reset that does not
-//! return. So no host run is ever in the window under a watchdog reset, and
+//! The one cell where the causes really do diverge is the one a host cannot fill, and that is
+//! not a coincidence — it is the same sentence read the other way. Being *in* the dispatch
+//! window needs the dispatch mark's commit barrier to have returned, and a watchdog reset is
+//! the reset that does not return.
 //! [`the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth`] requires the census to
 //! name that cell rather than pass over it. A board's watchdog fires on a timer rather than at
-//! a call boundary, which is the thing no model supplies.
+//! a call boundary, so it can land inside the window; that is the thing this injector, whose
+//! every crash point is a storage operation, does not supply.
 //!
 //! # What the boards still owe
 //!
@@ -566,16 +580,21 @@ fn a_power_cut_only_census_is_still_incomplete() {
 }
 
 #[test]
-fn a_watchdog_reset_does_not_dispatch_where_a_power_cut_does() {
-    // What the three watchdog cells buy, measured. The two causes leave the same media here —
-    // `waymaker-fault` proves that — so the difference has to be found in the run rather than
-    // in the image.
+fn the_two_causes_part_company_only_where_an_effect_follows_a_completed_call() {
+    // What the two filled watchdog cells buy, measured rather than asserted — and the
+    // adversarial reading of this change answered rather than left open.
     //
-    // A power cut at `Progress::Whole` returns `Ok(())` and takes the world at the *next*
-    // call, so the rig marks the dispatch and dispatches. A watchdog reset stops the core
-    // before that return, so the effect never goes out. Design document §02 decision 3 is
-    // about exactly this window, and a sweep that could not tell the two apart would be
-    // covering one of them twice.
+    // Three claims, over every operation of the run at `Progress::Whole`:
+    //
+    // 1. the media are identical, whichever cause was armed;
+    // 2. wherever the *engine* was the thing interrupted — which is every run the schedule and
+    //    completion cells are credited from — the dispatch is identical too, so those cells
+    //    record no run their power-cut twins did not also produce;
+    // 3. somewhere the dispatch is *not* identical, so the two causes are two.
+    //
+    // The third is the dispatch mark's commit barrier, and the second is why it is the only
+    // one: everywhere else a completed call is followed by another storage call, which fails
+    // under either cause.
     let harness = Harness::new(geometry());
     let baseline = harness
         .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
@@ -584,8 +603,9 @@ fn a_watchdog_reset_does_not_dispatch_where_a_power_cut_does() {
         unreachable!("the fault-free run is first")
     };
     let operations = clean.ops().len();
+    let rig = rig();
 
-    let effects_at = |op: usize, interruption: Interruption| {
+    let at = |op: usize, interruption: Interruption| {
         let dispatched = RefCell::new(0_usize);
         let outcome = harness.run_one(
             Injection {
@@ -599,22 +619,41 @@ fn a_watchdog_reset_does_not_dispatch_where_a_power_cut_does() {
                 result.map(|_| ()).map_err(|_| ())
             },
         );
-        outcome.map(|_| dispatched.into_inner()).ok()
+        outcome.ok().map(|run| (dispatched.into_inner(), run))
     };
 
-    let divergent = (0..operations).find(|op| {
-        matches!(
-            (
-                effects_at(*op, Interruption::PowerLoss),
-                effects_at(*op, Interruption::Watchdog),
-            ),
-            (Some(power), Some(watchdog)) if power > watchdog
-        )
-    });
+    let mut divergent = 0_usize;
+    let mut engine_points = 0_usize;
+    for op in 0..operations {
+        let (Some((power_effects, power)), Some((watchdog_effects, watchdog))) = (
+            at(op, Interruption::PowerLoss),
+            at(op, Interruption::Watchdog),
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            power.image(),
+            watchdog.image(),
+            "operation {op} left different media under the two causes"
+        );
+        if interrupted_the_engine(&power, &rig) {
+            engine_points += 1;
+            assert_eq!(
+                power_effects, watchdog_effects,
+                "operation {op} is an engine write and the two causes dispatched differently"
+            );
+        }
+        if power_effects != watchdog_effects {
+            divergent += 1;
+        }
+    }
     assert!(
-        divergent.is_some(),
-        "no operation dispatched under a power cut and not under a watchdog reset, so the two \
-         causes are the same run"
+        engine_points > 0,
+        "no operation interrupted the engine, so claim 2 is about nothing"
+    );
+    assert!(
+        divergent > 0,
+        "no operation dispatched differently, so the two causes are one run"
     );
 }
 

@@ -306,38 +306,49 @@ fn marks_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Progress>
         .ok()
 }
 
-/// The verdict a rig would reach if it judged from the history it still held in RAM.
+/// The verdict a rig reaches from `history` records and the marks in `progress`.
 ///
-/// The witness is read from media, because that half is durable either way. What is
-/// *remembered* is the recovered history: every record the writer began, in order, rather
-/// than the records a fresh scan of the journal produces.
-fn verdict_from_retained_ram(rig: &Rig, progress: Progress, banks: usize) -> Result<(), Breach> {
+/// The records fed in are the run's own declarations, which is what both readings below are
+/// entitled to: `Rig::verify` has already accepted the real ones as equal to them, and a rig
+/// reading from RAM would have nothing else. What the two readings differ in is *how many*,
+/// and which witness they are judged against.
+fn audit_of(rig: &Rig, history: u16, progress: Progress, banks: usize) -> Result<(), Breach> {
     let workload = rig.workload(0);
     let mut audit = Audit::new(workload, progress);
     let mut scratch = [0_u8; Workload::MAX_PAYLOAD_BYTES];
     let mut declared = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-    // Only what the writer began. A run that began nothing remembers nothing, which is the
-    // state a reset before the first mark leaves.
-    if let Some(attempted) = progress.attempted() {
-        for index in 0..=attempted {
-            let Some(record) = workload.record(index, &mut declared) else {
-                break;
-            };
-            audit.saw(&record, &mut scratch)?;
-        }
+    for index in 0..history {
+        let Some(record) = workload.record(index, &mut declared) else {
+            break;
+        };
+        audit.saw(&record, &mut scratch)?;
     }
     audit.finish(banks)
 }
 
+/// How many records a rig that had skipped the journal scan would claim.
+///
+/// Every record the witness saw begun. A run that began nothing claims nothing.
+const fn remembered_history(progress: Progress) -> u16 {
+    match progress.attempted() {
+        Some(attempted) => attempted.saturating_add(1),
+        None => 0,
+    }
+}
+
 #[test]
-fn a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch() {
+fn a_rig_that_skipped_the_journal_scan_would_notice_no_loss_at_all() {
     // A watchdog reset holds the supply, so RAM survives it. That makes a shortcut available
     // that a brownout forbids: judge the run from the history the rig still holds, instead of
-    // from a fresh scan of media. This measures what the shortcut costs.
+    // from a fresh scan of media. This is what the shortcut costs.
     //
-    // Nothing here is a defect in `Rig::verify`. It is the reason `Rig::verify` reads media,
-    // stated as a number rather than as a comment — and the third of the three differences
-    // `waymaker-fault`'s watchdog model names, the two on media being covered there.
+    // The claim is "no loss at all", not a count, and that is the honest shape of it: a
+    // reading that never touches the journal cannot disagree with the history the writer
+    // believed it wrote, so it passes every run — including every run the media-reading rig
+    // breaches. A count would dress that tautology up as a measurement.
+    //
+    // What carries the content is the contrast, which is asserted: on the same runs the real
+    // rig is *not* a constant. It breaches some and passes others.
     let harness = Harness::new(geometry());
     let Ok(runs) = harness.run(|session| wrong_writer(Flaw::AcknowledgeBeforeCommit, session))
     else {
@@ -345,8 +356,8 @@ fn a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch() {
     };
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let mut caught = 0_usize;
-    let mut excused = 0_usize;
+    let mut breached = 0_usize;
+    let mut passed = 0_usize;
     for run in &runs {
         let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
             continue;
@@ -354,33 +365,45 @@ fn a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch() {
         let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
             continue;
         };
-        if !matches!(
-            verdict.outcome(),
-            Outcome::Breached(Breach::LostAcknowledgedRecord { .. })
-        ) {
-            continue;
+        match verdict.outcome() {
+            Outcome::Passed => passed += 1,
+            Outcome::Breached(_) => breached += 1,
         }
-        caught += 1;
         let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
             continue;
         };
-        if verdict_from_retained_ram(&rig, progress, verdict.banks()).is_ok() {
-            excused += 1;
-        }
+        assert_eq!(
+            audit_of(
+                &rig,
+                remembered_history(progress),
+                progress,
+                verdict.banks()
+            ),
+            Ok(()),
+            "the retained-RAM reading found something at {:?}, which it has no way to see",
+            run.injection()
+        );
     }
-    assert!(caught > 0, "the media-reading rig caught no loss at all");
-    assert_eq!(
-        excused, caught,
-        "a rig judging from retained RAM excused {excused} of the {caught} losses the real \
-         one catches"
+    assert!(
+        breached > 0,
+        "the media-reading rig caught no loss, so the contrast is with nothing"
+    );
+    assert!(
+        passed > 0,
+        "the media-reading rig breached every run, so it is a constant too"
     );
 }
 
 #[test]
-fn the_real_rig_reads_the_history_from_media() {
-    // The other half, so the test above is a measurement rather than an accusation: on the
-    // *correct* writer both readings agree, which is what makes the disagreement above a
-    // property of the loss and not of the two code paths.
+fn a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part() {
+    // The other half of what RAM retention offers, and the direction that can fail. The
+    // witness is durable because a power cut takes RAM; a rig that kept it instead would hold
+    // every mark it *issued*, including the ones a reset took off media before they landed.
+    //
+    // Judged against a real history, those marks over-claim: the audit reports a record lost
+    // that was never committed. That is `Breach::LostAcknowledgedRecord`'s own documented
+    // hazard — "it invents a breach on a healthy device" — and this is the correct writer, so
+    // every one of them is a false positive.
     let harness = Harness::new(geometry());
     let runs = harness
         .run(|session| {
@@ -395,7 +418,24 @@ fn the_real_rig_reads_the_history_from_media() {
         .expect("the fault-free run succeeds");
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let mut compared = 0_usize;
+
+    // The marks a whole iteration issues. On a board this is what RAM would still hold after
+    // a watchdog reset; here it is read off the part the fault-free run finished.
+    let remembered = {
+        let Some(clean) = runs.first() else {
+            unreachable!("the fault-free run is first")
+        };
+        let Some(mut device) = Device::restored(geometry(), clean.image().to_vec()) else {
+            unreachable!("the image came from a device of this geometry")
+        };
+        let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
+            unreachable!("a finished run left a readable witness")
+        };
+        progress
+    };
+
+    let mut invented = 0_usize;
+    let mut judged = 0_usize;
     for run in &runs {
         let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
             continue;
@@ -403,16 +443,24 @@ fn the_real_rig_reads_the_history_from_media() {
         let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
             continue;
         };
-        let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
+        if verdict.outcome() != Outcome::Passed {
             continue;
-        };
-        assert_eq!(
-            verdict_from_retained_ram(&rig, progress, verdict.banks()).is_ok(),
-            verdict.outcome() == Outcome::Passed,
-            "the two readings disagree on the correct writer at {:?}",
-            run.injection()
-        );
-        compared += 1;
+        }
+        judged += 1;
+        // The history is the real one — how many records the media-reading audit accepted —
+        // and only the witness is the remembered one.
+        if audit_of(&rig, verdict.recovered(), remembered, verdict.banks()).is_err() {
+            invented += 1;
+        }
     }
-    assert!(compared > 0, "no run was compared");
+    assert!(judged > 0, "no healthy run was judged");
+    assert!(
+        invented > 0,
+        "remembered marks accused no healthy run, so the witness could have been kept in RAM"
+    );
+    assert!(
+        invented < judged,
+        "remembered marks accused every healthy run, so this measures the fixture rather \
+         than the marks"
+    );
 }

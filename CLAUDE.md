@@ -210,7 +210,7 @@ All 2 hardware targets, with the id to cite when a change touches one:
 
 | Id | Target | Where it stands | What would discharge it |
 | --- | --- | --- | --- |
-| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one — and the census cannot complete without one, because its sixth cell is a watchdog reset inside the dispatch window, which no model can produce. |
+| `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one — and the census cannot complete without one, because its sixth cell is a watchdog reset inside the dispatch window, which this injector — whose every crash point is a storage operation — cannot produce. |
 | `cortex-m4` | power-cut and watchdog-reset loops on a Cortex-M4 board | Not run | the same log from a second core, because a rig that only ever ran on one part has measured that part rather than the protocol. |
 
 Moving a row to `Passed` needs an accepted ADR carrying the attestation marker and the id, in
@@ -221,9 +221,9 @@ guards against for §16's open questions.
 What *is* discharged is everything a host can discharge, and it is worth being exact about
 which. `waymaker-rig` is driven at every crash point `waymaker-fault` enumerates — every byte
 of every program, every block of every erase, before and after every barrier, and now a
-watchdog reset after every operation that changes media — and its own oracle accepts every
-one; **five of the census's six cells are filled and the sixth is named**; and two writers
-wrong in one way each are required to be caught by the guarantee they break and by no other.
+watchdog reset after every operation, barriers included — and its own oracle accepts every
+one; **five of the census's six cells are filled and the sixth is named**; and writers wrong
+in one way each are required to be caught by the guarantee they break and by no other.
 The dispatch cell is filled on evidence that execution entered the dispatcher rather than on
 the mark that precedes it — a mark is not evidence of the thing it marks, and `Dispatched` is
 deliberately written *before* the effect, so a power cut taking that mark's own commit barrier
@@ -241,12 +241,22 @@ A board's watchdog fires on a timer rather than at a call boundary. So the cell 
 two rows above, and `the_sweep_covers_five_of_the_six_census_cells_and_names_the_sixth`
 requires the census to keep refusing the run.
 
+Read forwards, the same sentence says what the two filled watchdog cells are worth, and it is
+less than a reader would assume. The causes can only diverge where something other than
+another storage call follows a completed operation, so at a schedule or a completion write
+they do not diverge at all: the media, the ledger and the dispatch are the power-cut twin's,
+and only the cause the injector armed differs. Those cells record that the cause was performed
+and that recovery survived it. That is the strongest objection to this, so it is a test rather
+than a paragraph — `the_two_causes_part_company_only_where_an_effect_follows_a_completed_call`
+measures the coincidence at every operation and requires a divergence to exist somewhere.
+
 What a host cannot supply beyond that is media that behaves like a part: the model starts
 erased and only clears bits, its barrier is a no-op, a bit that programmed weakly is not a
 state it has, and a real part may abort the unit in flight where this one finishes it. Nor
 retained RAM — a watchdog reset really leaves it, and nothing here models it; what the rig
 measures instead is the *cost* of trusting it, in
-`a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch`. §12's
+`a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part`, which is the half
+of it that can fail. §12's
 `barrier-is-durable` and `barrier-orders-what-follows` are still `waymaker-conformance`'s
 across-reset witness's, and still owed against a real driver.
 
@@ -1030,12 +1040,13 @@ mark is allowed to be wrong. The run and the cut point are pure functions of a s
 iteration, so a log line carries the whole run; the witness travels in the line too, along with
 the evidence a verdict rests on — how many records recovery accepted and how many banks claimed
 authority — because two of the six breaches are caused by bytes a line cannot carry, and a
-rebuilt part reaches a pass. A watchdog reset is a
-*cause the rig carries* rather than one it can perform on a host: the plan arms it, the cutter
-is handed it and the log records it, but `waymaker-fault`'s every injection is a power loss —
-"the world stops here" — and nothing models a core-only reset or retained RAM. So the host
-sweep fills the three power-cut cells and the census refuses the run, naming a watchdog cell as
-the gap; the other three are inside the board rows below. Two more corrections came out of
+rebuilt part reaches a pass. A watchdog reset was, at the time, a
+*cause the rig carried* rather than one it could perform: the plan armed it, the cutter was
+handed it and the log recorded it, but every injection the harness made was a power loss, so
+the host sweep filled the three power-cut cells and the census refused the run. That is no
+longer where this stands — issue #27's own paragraph below, and
+[ADR 0023](docs/adr/0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md), are
+what the rig does now. Two more corrections came out of
 review, and both are the same shape — an instrument reading its own bookkeeping as a finding
 about the firmware. A mark is not evidence of the thing it marks, so the dispatch cell is
 earned by the dispatcher having been entered; and a part this run was never *installed* on is
@@ -1131,9 +1142,11 @@ to reject. Five of the six cells are now filled on a host; the sixth is a watchd
 inside the dispatch window, it is unreachable for a stated reason, and the census still
 refuses the run and names it. The third difference a watchdog reset has — RAM survives it — is
 modelled nowhere and measured as a cost:
-`a_rig_that_judged_from_retained_ram_would_pass_a_loss_it_must_catch` shows a rig that judged
-from the history it still held excusing *every* loss the media-reading rig catches, which is
-why the witness is durable.
+`a_rig_that_skipped_the_journal_scan_would_notice_no_loss_at_all` shows a rig that judged from
+the history it still held excusing *every* loss the media-reading rig catches — a tautology,
+written as one — and
+`a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part` is the half that can
+fail: remembered marks over-claim, and the audit then reports a loss that never happened.
 
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async

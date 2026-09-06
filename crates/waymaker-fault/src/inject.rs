@@ -217,14 +217,14 @@ pub struct Injection {
 ///
 /// * `(0, None, PowerLoss)` — the world stopping before the sequence began;
 /// * `(i, Bytes(n), PowerLoss)` for every interior tear point of every operation;
-/// * `(i, Whole, PowerLoss)` for every operation that can change media — the operation
-///   completes and returns, the power then goes, and the writer meets it at its next
-///   storage call. That is also "power loss *before* operation `i + 1`", so the two are one
-///   entry rather than two;
-/// * `(i, Whole, Watchdog)` for every operation that can change media — the operation
-///   completes on media and the core stops before the call returns. That is the *only*
-///   watchdog world this crate can tell from a brownout, and the doc comment on
-///   [`Interruption::Watchdog`] says why the others are not enumerated;
+/// * `(i, Whole, PowerLoss)` for every operation that is not a no-op, a barrier included —
+///   the operation completes and returns, the power then goes, and the writer meets it at
+///   its next storage call. That is also "power loss *before* operation `i + 1`", so the two
+///   are one entry rather than two;
+/// * `(i, Whole, Watchdog)` for the same operations — each completes on media and the core
+///   stops before the call returns. That is the *only* watchdog world this crate can tell
+///   from a brownout, and the doc comment on [`Interruption::Watchdog`] says why the others
+///   are not enumerated;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
 ///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
 ///   or for an operation that moves no bytes.
