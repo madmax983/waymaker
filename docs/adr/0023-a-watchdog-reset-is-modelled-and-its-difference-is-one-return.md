@@ -66,6 +66,14 @@ in both". The writer is not dead: this crate's writer is any `FnMut` over a `Ses
 causes hand it different errors, and nothing obliges it to propagate one. A writer that reacts
 takes a different path, and a sweep that listed only the brownout would never run it.
 
+`Progress::None` is offered before *every* operation rather than only the first, which is the
+same mistake caught a second time — Codex's fourth round. In the power-cut half "reset before
+operation `i`" is the previous operation's `Whole` point, because that call returns `Ok(())`
+and the writer carries on identically. Under a watchdog reset it does not: `Whole` returns an
+error, so the writer never reaches whatever it does between the two operations. For
+`program_a()?; effect(); program_b()?` the effect happens under `(b, None, Watchdog)` and under
+no other watchdog point.
+
 On media a watchdog reset is nevertheless *weaker* than a brownout, and that is stated as a
 theorem rather than left as a silence:
 `every_watchdog_image_is_one_a_power_cut_also_produces` proves the inclusion over the real
@@ -83,15 +91,21 @@ rather than the progress. That is the rule the rejected first attempt broke.
 
 **All six census cells are now filled on a host**, and
 `the_sweep_covers_every_cell_of_the_census` requires `Coverage::verdict` to pass rather than
-name a gap. The dispatch cell is the one worth explaining. It does *not* fill at the dispatch
-mark's own commit barrier — that barrier does not return under this cause, so the effect never
-goes out. It fills one operation later, when the reset lands inside the next witness mark with
-the schedule record committed, the dispatch mark whole and the dispatcher already entered.
-`phase_of` earns the cell from the dispatcher having run rather than from the mark, exactly as
-it does for a power cut.
+name a gap. The dispatch cell is the one worth explaining, and finding the crash point that
+really fills it took two review rounds.
 
-That cell was unreachable under the whole-operations-only enumeration, and the correction
-Codex forced closed it. Two things that were owed to hardware are therefore not.
+It does *not* fill at the dispatch mark's own commit barrier — that barrier does not return
+under this cause, so the effect never goes out. Nor inside the *next* witness program, which an
+earlier revision credited and Codex rejected: a write is in flight there, so the run was cut
+during that write and not in the window; it read like the window only because a torn mark
+leaves `attempted` on the schedule while `effects` has moved. `phase_of` now requires nothing
+to be in flight, and `a_write_in_flight_is_not_the_dispatch_window` requires the misreadable
+runs to exist so the qualification cannot quietly stop qualifying.
+
+It fills at `(next operation, Progress::None, Watchdog)`: the barrier returned, the dispatcher
+ran, and the core reset before the next program began. Nothing half done, the effect out — the
+mirror of the power-cut cell's `(barrier, Whole, PowerLoss)`. That point exists only because
+of the `None`-per-operation rule below.
 
 **At a write point, though, the filled watchdog cells buy less than a reader would assume.**
 At a *completed* operation the causes can only diverge where something other than another

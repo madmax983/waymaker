@@ -169,14 +169,14 @@ fn the_enumeration_is_a_pure_function_and_has_no_duplicates() {
 #[test]
 fn the_count_is_the_arithmetic_the_sequence_implies() {
     // Power loss: one before anything, plus one per tear point, plus one after each op.
-    // Watchdog: the same shape at unit boundaries — one before anything, one per interior
-    // boundary, one after each op. Eight bytes of four-byte units has one interior boundary.
+    // Watchdog: one before *each* op, one per interior unit boundary, one after each op.
+    // Eight bytes of four-byte units has one interior boundary.
     // Failure: one per tear point plus `None` and `Whole` for each mutating op, and a
     // single point for each barrier.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let points = injections(&ops, geometry());
     let power = 1 + 7 + 1 + 1;
-    let watchdog = 1 + 1 + 1 + 1;
+    let watchdog = 2 + 1 + 2;
     let failure = (7 + 2) + 1;
     assert_eq!(points.len(), power + watchdog + failure);
 }
@@ -223,8 +223,16 @@ fn an_operation_that_mutates_nothing_contributes_no_duplicate_worlds() {
                 progress: Progress::None,
                 interruption: Interruption::PowerLoss,
             },
+            // One before each operation. Even for a call that moves no bytes the two are
+            // different worlds: under `(1, None, Watchdog)` operation zero returned `Ok`, and
+            // under `(0, None, Watchdog)` it did not.
             Injection {
                 op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+            Injection {
+                op: 1,
                 progress: Progress::None,
                 interruption: Interruption::Watchdog,
             },

@@ -242,11 +242,14 @@ pub struct Injection {
 ///   the operation completes and returns, the power then goes, and the writer meets it at
 ///   its next storage call. That is also "power loss *before* operation `i + 1`", so the two
 ///   are one entry rather than two;
-/// * the same shape again for [`Interruption::Watchdog`] — `(0, None, Watchdog)`, an
-///   interior point per operation, and `(i, Whole, Watchdog)` — with one difference: a core
-///   reset is offered at *unit* boundaries rather than at every byte, because the unit in
-///   flight completes and a point inside one leaves what the boundary above it leaves and
-///   answers the caller the same way;
+/// * for [`Interruption::Watchdog`], `(i, None, Watchdog)` before *every* operation, an
+///   interior point per unit boundary, and `(i, Whole, Watchdog)`. Two differences from the
+///   power-cut half. A core reset is offered at *unit* boundaries rather than at every byte,
+///   because the unit in flight completes and a point inside one leaves what the boundary
+///   above it leaves and answers the caller the same way. And `None` is offered before every
+///   operation rather than only before the first, because "reset before operation `i`" is
+///   not the previous operation's `Whole` point here: a watchdog reset at `Whole` returns an
+///   error, so the writer never reaches whatever it does between the two;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
 ///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
 ///   or for an operation that moves no bytes.
@@ -279,12 +282,26 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
         }
     }
 
-    points.push(Injection {
-        op: 0,
-        progress: Progress::None,
-        interruption: Interruption::Watchdog,
-    });
+    if ops.is_empty() {
+        points.push(Injection {
+            op: 0,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        });
+    }
     for (index, op) in ops.iter().enumerate() {
+        // Before this operation started. Unlike the power-cut half, this is *not* the
+        // previous operation's `Whole` point read a second way: a power cut there returns
+        // `Ok(())` and the writer carries on to whatever it does next, while a watchdog
+        // reset there returns an error and it does not. So `program_a()?; effect();
+        // program_b()?` reaches the effect under `(b, None, Watchdog)` and under no other
+        // watchdog point, and a list without this one would omit an execution the writer
+        // really has. Codex found it on the fourth review round.
+        points.push(Injection {
+            op: index,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        });
         for bytes in op.reset_points(geometry) {
             points.push(Injection {
                 op: index,

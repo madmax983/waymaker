@@ -353,10 +353,14 @@ fn a_barrier_that_did_not_return_orders_a_record_without_acknowledging_it() {
 
 #[test]
 fn a_watchdog_reset_is_enumerated_at_unit_boundaries_and_nowhere_else() {
-    // The same shape as the power-cut half, at a coarser granularity: a reset before anything,
-    // an interior point per unit, and a whole operation. A point *inside* a unit would be the
-    // boundary above it, and an enumeration that counts one crash point twice is no longer a
-    // count of anything.
+    // A reset before *each* operation, an interior point per unit, and a whole operation. A
+    // point inside a unit would be the boundary above it, and an enumeration that counts one
+    // crash point twice is no longer a count of anything.
+    //
+    // `None` is per operation rather than once, unlike the power-cut half, and that is Codex's
+    // fourth-round finding: a power cut at `Whole` returns `Ok(())` so "before the next
+    // operation" is the same world, while a watchdog reset at `Whole` returns an error and the
+    // writer never reaches whatever lies between the two.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let watchdog: Vec<_> = injections(&ops, geometry())
         .into_iter()
@@ -384,8 +388,14 @@ fn a_watchdog_reset_is_enumerated_at_unit_boundaries_and_nowhere_else() {
                 progress: Progress::Whole,
                 interruption: Interruption::Watchdog,
             },
-            // A barrier has no interior and still has the last point: it completed, and the
-            // core stopped before it returned. §02 decision 3 is about that state.
+            // A barrier has no interior and still has both: the core stopped before it ran,
+            // and the core stopped after it changed media and before it returned. §02
+            // decision 3 is about the second.
+            Injection {
+                op: 1,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
             Injection {
                 op: 1,
                 progress: Progress::Whole,

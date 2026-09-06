@@ -47,18 +47,25 @@
 //!
 //! # How the dispatch cell fills under a watchdog reset
 //!
-//! Not at the dispatch mark's own commit barrier — that barrier does not return under this
-//! cause, so the effect never goes out. It fills one operation later: the reset lands inside
-//! the *next* witness mark, with the schedule record committed, the dispatch mark whole and
-//! the dispatcher already entered. That is the window design document §02 decision 3 opens,
-//! and [`phase_of`] earns the cell from `effects` rather than from the mark, exactly as it
-//! does for a power cut.
+//! At exactly one crash point, and it took two review rounds to find the right one.
 //!
-//! It is reachable only because a watchdog reset is enumerated at interior unit boundaries as
-//! well as at whole operations. An earlier version of this change enumerated whole operations
-//! only, arguing the interior points were power-cut points already listed; Codex found the
-//! hole in that argument — the two causes hand the writer different errors, and this crate's
-//! writer is under no obligation to propagate — and closing it closed this cell too.
+//! Not at the dispatch mark's own commit barrier: that barrier does not return under this
+//! cause, so the effect never goes out. And not inside the *next* witness program either,
+//! which is what an earlier revision credited — there a write is in flight, so the run was cut
+//! during that write and not in the window. It read like the window because the torn mark is
+//! not whole, leaving `attempted` on the schedule while `effects` had moved.
+//!
+//! It fills at `(next operation, Progress::None, Watchdog)`: the dispatch mark's barrier
+//! returned, the dispatcher ran, and the core reset before the next program began. Nothing on
+//! media is half done and the effect is out, which is the window design document §02 decision
+//! 3 opens. The power-cut cell fills at the mirror of it — `(barrier, Whole, PowerLoss)`,
+//! where the call returns and the world stops before the next one.
+//!
+//! Both halves of that are Codex's, from the third and fourth rounds:
+//! [`in_flight`] is the qualification that stops the wrong runs counting, and the `None`
+//! watchdog point before every operation is what makes the right one exist.
+//! [`a_write_in_flight_is_not_the_dispatch_window`] requires the wrong runs to exist, so the
+//! qualification cannot quietly stop qualifying.
 //!
 //! # What the boards still owe
 //!
@@ -142,6 +149,21 @@ const fn cause_of(injection: Injection) -> Option<ResetCause> {
     }
 }
 
+/// Whether a storage operation was half done when the run stopped.
+///
+/// [`Progress::Bytes`] is the only crash point with an operation open: `None` is before it
+/// started and `Whole` is after it finished. A run with a write in flight is a run cut during
+/// that write, whatever its witness happens to say.
+const fn in_flight(run: &Run) -> bool {
+    matches!(
+        run.injection(),
+        Some(Injection {
+            progress: Progress::Bytes(_),
+            ..
+        })
+    )
+}
+
 /// Whether the interrupted operation was a write to the *engine*, rather than to the rig's
 /// own instrument.
 ///
@@ -178,18 +200,25 @@ fn interrupted_the_engine(run: &Run, rig: &Rig) -> bool {
 /// Crediting the dispatch cell from the mark alone would report a cut in the instrument's
 /// write as a cut in the dispatch window, which is the same relabelling [`cause_of`] refuses.
 ///
-/// What makes the cell reachable at all is [`Interruption::PowerLoss`] at `Progress::Whole`:
-/// the operation returns `Ok(())` and the writer meets the power at its *next* storage call.
-/// So a run cut after the mark's commit barrier really does run `dispatcher.dispatch()` and
-/// really does stop in the window §02 decision 3 opens — the one phase with no storage
-/// operation in flight — which is why that window can be measured here rather than owed to
-/// hardware.
+/// The second qualification is that **nothing was in flight**, and it was Codex's, on the
+/// fourth review round. [`Phase::Dispatch`] is the interval in which the effect is under way
+/// and no storage operation is: a reset that landed *inside* a later witness program is a
+/// reset during that write, not during the dispatch. It reads like one because the torn mark
+/// is not whole, so `attempted` still names the schedule while `effects` has already moved —
+/// which is the same shape as reading a mark as the event it marks.
+///
+/// [`in_flight`] is that qualification. A crash point at [`Progress::Bytes`] has an operation
+/// half done; `None` and `Whole` do not, and those are the two that can be in the window: a
+/// power cut at `Whole` returns `Ok(())` and takes the world at the *next* call, and a
+/// watchdog reset at the next operation's `None` returns nothing at all. Both leave the run
+/// stopped with the effect out and no write open, which is the window §02 decision 3 opens.
 fn phase_of(marks: Marks, run: &Run, rig: &Rig, effects: usize) -> Option<Phase> {
     let workload = rig.workload(0);
     let index = marks.attempted()?;
     match workload.role(index)? {
         Role::Schedule(effect) => {
-            if marks.dispatched() == Some(index) && effects > usize::from(effect) {
+            if marks.dispatched() == Some(index) && effects > usize::from(effect) && !in_flight(run)
+            {
                 Some(Phase::Dispatch)
             } else if interrupted_the_engine(run, rig) {
                 Some(Phase::Schedule)
@@ -1472,4 +1501,69 @@ fn passing_verdict() -> waymaker_rig::run::Verdict {
         unreachable!("a clean run has a verdict")
     };
     verdict
+}
+
+#[test]
+fn a_write_in_flight_is_not_the_dispatch_window() {
+    // The tooth for [`in_flight`], and Codex's fourth-round finding kept as a test.
+    //
+    // A reset inside a later witness program leaves that mark torn, so `attempted` still names
+    // the schedule and `effects` has already moved: the run reads like a dispatch-window reset
+    // and is a reset during a write. Without the qualification the census credited those, and
+    // the cell it credited wrongly is a cell that also fills rightly — so nothing failed.
+    //
+    // This asserts that such runs exist. If they stop existing, the qualification is guarding
+    // nothing and this says so rather than passing quietly.
+    let harness = Harness::new(geometry());
+    let dispatched = RefCell::new(Vec::new());
+    let runs = harness
+        .run(|session| {
+            let (outcome, effects) = drive_counting(session);
+            dispatched.borrow_mut().push(effects);
+            outcome.map(|_| ()).map_err(|_| ())
+        })
+        .expect("the fault-free run succeeds");
+    let dispatched = dispatched.into_inner();
+    let rig = rig();
+    let workload = rig.workload(0);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let (mut looked_like, mut credited) = (0_usize, 0_usize);
+
+    for (run, effects) in runs.iter().zip(dispatched) {
+        if run.injection().is_none() {
+            continue;
+        }
+        let mut device = device_after(run);
+        let marks = {
+            let mut instrument = waymaker_rig::window::Window::new(
+                &mut device,
+                rig.instrument_base(),
+                geometry().erase_size(),
+            )
+            .expect("the instrument window");
+            match Witness::new(rig.witness_region()).scan(&mut instrument, &mut page) {
+                Ok(marks) => marks,
+                Err(_) => continue,
+            }
+        };
+        let Some(index) = marks.attempted() else {
+            continue;
+        };
+        let Some(Role::Schedule(effect)) = workload.role(index) else {
+            continue;
+        };
+        if marks.dispatched() != Some(index) || effects <= usize::from(effect) {
+            continue;
+        }
+        looked_like += 1;
+        if phase_of(marks, run, &rig, effects) == Some(Phase::Dispatch) {
+            credited += 1;
+        }
+    }
+    assert!(credited > 0, "no run reached the dispatch window at all");
+    assert!(
+        looked_like > credited,
+        "every run whose witness and dispatcher agreed was really in the window, so the \
+         in-flight qualification is measuring nothing"
+    );
 }

@@ -221,7 +221,8 @@ guards against for §16's open questions.
 What *is* discharged is everything a host can discharge, and it is worth being exact about
 which. `waymaker-rig` is driven at every crash point `waymaker-fault` enumerates — every byte
 of every program, every block of every erase, before and after every barrier, and now a
-watchdog reset at every unit boundary and after every operation — and its own oracle accepts every
+watchdog reset before every operation, at every unit boundary and after every operation — and
+its own oracle accepts every
 one; **every cell of the census is filled**; and writers wrong
 in one way each are required to be caught by the guarantee they break and by no other.
 The dispatch cell is filled on evidence that execution entered the dispatcher rather than on
@@ -233,10 +234,14 @@ qualification cannot quietly stop qualifying.
 
 The dispatch cell is the one worth explaining, because it does not fill where a reader would
 look for it. A watchdog reset at the dispatch mark's own commit barrier never dispatches — that
-barrier does not return under this cause — so the cell fills one operation later, when the
-reset lands inside the next witness mark with the schedule committed, the dispatch mark whole
-and the dispatcher already entered. `phase_of` earns it from the dispatcher having run rather
-than from the mark, exactly as it does for a power cut.
+barrier does not return under this cause — and a reset *inside* the next witness program is a
+reset during that write rather than in the window, however much a torn mark makes it look like
+one. The cell fills at the next operation's `Progress::None`: the barrier returned, the
+dispatcher ran, and the core reset before the next program began, so nothing is half done and
+the effect is out. That is the mirror of the power-cut cell, which fills at the barrier's own
+`Whole`. `phase_of` earns both from the dispatcher having run *and* from nothing being in
+flight, and `a_write_in_flight_is_not_the_dispatch_window` requires the misreadable runs to
+exist so the second qualification cannot quietly stop qualifying.
 
 At a *write* point, though, the watchdog cells are worth less than a reader would assume. At a
 completed operation the causes can only diverge where something other than another storage call
@@ -1139,9 +1144,9 @@ media a watchdog reset is *weaker* than a brownout, and
 journal writer and requires it to be proper, so the two causes cannot become one model wearing
 two names. The rig's census credits a cell from the injector's own cause and never from a
 reading of `Progress`, which is the rule the first attempt at this broke and Codex was right
-to reject. Every cell of the census is now filled on a host — the dispatch cell one operation
-after the dispatch, since the barrier that would have carried it does not return under this
-cause — and the census is a complete census *of the model*, with the boards owing the physical
+to reject. Every cell of the census is now filled on a host — the dispatch cell at the next
+operation's `Progress::None`, since the barrier that would have carried it does not return
+under this cause — and the census is a complete census *of the model*, with the boards owing the physical
 half of both causes exactly as before. The third difference a watchdog reset has — RAM survives it — is
 modelled nowhere and measured as a cost:
 `a_rig_that_skipped_the_journal_scan_would_notice_no_loss_at_all` shows a rig that judged from

@@ -435,24 +435,24 @@ const COMMIT_OP: usize = FIRST_OP + 5;
 ///
 /// Every interior byte is a tear point and each tear is enumerated twice — once as a power
 /// loss and once as a failure the writer sees — and every interior *unit* boundary once more,
-/// as a watchdog reset. Then four: the whole operation followed by a power loss, the whole
-/// operation followed by a watchdog reset, a failure before it, and a failure after it.
-/// Derived rather than measured, so the census below fails when the sweep *shrinks* rather
-/// than when a fixture's input length changes.
+/// as a watchdog reset. Then five: a watchdog reset before the operation, the whole operation
+/// followed by a power loss, the whole operation followed by a watchdog reset, a failure
+/// before it, and a failure after it. Derived rather than measured, so the census below fails
+/// when the sweep *shrinks* rather than when a fixture's input length changes.
 fn points_in_a_program(len: u32) -> usize {
     let units = (len / geometry().program_size()) as usize;
-    2 * (len as usize - 1) + 4 + units - 1
+    2 * (len as usize - 1) + 5 + units - 1
 }
 
 /// The same, for an erase: interrupted at erase blocks and nowhere else, so its tear points
 /// and its reset points are the same boundaries.
 const fn points_in_an_erase(blocks: u32) -> usize {
-    3 * (blocks as usize - 1) + 4
+    3 * (blocks as usize - 1) + 5
 }
 
-/// The same, for a barrier: it has no interior, so a power loss after it, a watchdog reset
-/// after it, and a failure.
-const POINTS_IN_A_BARRIER: usize = 3;
+/// The same, for a barrier: it has no interior, so a watchdog reset before it, a power loss
+/// after it, a watchdog reset after it, and a failure.
+const POINTS_IN_A_BARRIER: usize = 4;
 
 /// How many erase blocks a bank of this geometry is.
 fn blocks_per_bank() -> u32 {
@@ -722,11 +722,12 @@ fn the_recovery_rules_hold_at_every_crash_point_of_the_swap() {
             Op::Barrier => POINTS_IN_A_BARRIER,
         })
         .sum();
-    // Plus the fault-free run and the two crash points that precede the whole sequence, one
-    // per reset cause.
+    // Plus the fault-free run and the one crash point that precedes the whole sequence and
+    // belongs to no operation: `(0, None, PowerLoss)`. The watchdog reset before operation
+    // zero belongs to operation zero and is inside the sum above.
     assert_eq!(
         runs.len(),
-        enumerated + 3,
+        enumerated + 2,
         "the sweep is not the enumeration"
     );
 
