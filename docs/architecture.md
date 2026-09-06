@@ -54,7 +54,7 @@ graph TD
   waymaker-core["waymaker-core<br/>records · replay cursor · effect identity · transition rules"]
   waymaker-size-probe["waymaker-size-probe<br/>linked to be measured, never shipped"]
   waymaker-fault["waymaker-fault<br/>storage model · crash injector · never flashed"]
-  waymaker-rig["waymaker-rig<br/>power-cut rig · durable witness · wear meter · no_std, never flashed here"]
+  waymaker-rig["waymaker-rig<br/>power-cut and watchdog rig · durable witness · wear meter · no_std, never flashed here"]
   xtask["xtask<br/>the gate · the size and wear reports"]
 
   waymaker-embassy --> waymaker-core
