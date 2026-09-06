@@ -8,6 +8,7 @@ members = [
     "crates/waymaker-spec",
     "crates/waymaker-conformance",
     "crates/waymaker-rig",
+    "crates/waymaker-drive",
     "crates/waymaker-size-probe",
     "xtask",
 ]
@@ -24,6 +25,11 @@ members = [
 # `#![no_std]` so that a board can link it, but the board it is written for is not this
 # workspace's firmware, and selecting it by default would build the rig into the image the
 # code-flash budget is measured against.
+# `waymaker-drive` is excluded for `waymaker-rig`'s reason: it is `#![no_std]` so that the
+# claim "no `Future`, no Embassy, no allocation" is a build failure rather than an
+# inspection, but it is a synchronous driver written to prove the kernel boundary rather
+# than firmware this workspace ships, and selecting it by default would build it into the
+# image the code-flash budget is measured against.
 # `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
 # selecting it by default would add a member the firmware build has nothing to build.
 default-members = [
@@ -48,6 +54,7 @@ waymaker-fault = { path = "crates/waymaker-fault", version = "0.0.0", default-fe
 waymaker-spec = { path = "crates/waymaker-spec", version = "0.0.0", default-features = false }
 waymaker-conformance = { path = "crates/waymaker-conformance", version = "0.0.0", default-features = false }
 waymaker-rig = { path = "crates/waymaker-rig", version = "0.0.0", default-features = false }
+waymaker-drive = { path = "crates/waymaker-drive", version = "0.0.0", default-features = false }
 
 [workspace.lints.rust]
 # Denied rather than forbidden at the workspace level on purpose. Each firmware crate

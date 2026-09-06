@@ -103,6 +103,16 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// knew in RAM, because RAM is the thing a power cut takes. See
 /// [ADR 0021](https://github.com/madmax983/waymaker/blob/main/docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md).
 ///
+/// `waymaker-drive` is issue [#28](https://github.com/madmax983/waymaker/issues/28)'s
+/// synchronous driver for design document §06's explicit kernel boundary. It is the third
+/// member of this category that is `#![no_std]` and allocation-free, and the reason is the
+/// claim it exists to make: a workflow runs to completion with "no `Future`, no Embassy and
+/// no allocation", and a driver that could only be built for the host would leave the last
+/// third of that unchecked. It is not the Embassy façade either — `Ctx`, the async
+/// dispatcher and wakeups are rung 0.4's — and driving the protocol here is what makes
+/// "`waymaker-embassy` is a façade and nothing more" falsifiable rather than intended. See
+/// [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
+///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
@@ -113,7 +123,26 @@ pub const TEST_SUPPORT_CRATES: &[&str] = &[
     "waymaker-spec",
     "waymaker-conformance",
     "waymaker-rig",
+    "waymaker-drive",
 ];
+
+/// Test-support crates that claim to be `#![no_std]` and allocation-free.
+///
+/// A subset of [`TEST_SUPPORT_CRATES`], because most of that category is host code:
+/// `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state space, and
+/// asking either for `#![no_std]` would be asking it to stop doing its job. These three make
+/// the claim, each for a reason of its own — `waymaker-conformance` because the adapter
+/// author it exists for may only be able to run it on the target the driver is for,
+/// `waymaker-rig` because a rig that could only run on a host would be a simulation wearing a
+/// rig's name, and `waymaker-drive` because issue #28's "done when" is a workflow driven to
+/// completion with "no `Future`, no Embassy, and **no allocation**".
+///
+/// The firmware-target build stages are what hold the `std` half; they cannot hold the
+/// allocation half, because `cargo build --lib` produces an rlib and never links, so no
+/// global allocator is required and an `extern crate alloc` under any of these three would
+/// compile clean. [`crate::source::check_crate_attributes`] is what fails a build over it.
+pub const NO_STD_TEST_SUPPORT_CRATES: &[&str] =
+    &["waymaker-conformance", "waymaker-rig", "waymaker-drive"];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";

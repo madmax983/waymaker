@@ -145,6 +145,21 @@ pub const STAGES: &[Stage] = &[
         why: "ADR 0021: a rig that could only run on a host would be a simulation wearing a rig's name",
     },
     Stage {
+        name: "drive-firmware",
+        job: "firmware",
+        // `waymaker-drive` is outside `default-members` too, and issue #28's "done when" is
+        // that a workflow runs to completion with no `Future`, no Embassy and *no
+        // allocation*. The first two are visible in the source; the third is not, and a
+        // host build would never notice an `extern crate alloc` appearing under it.
+        //
+        // `--lib`, not `--all-targets`: the tests drive `waymaker-fault`, which models media
+        // in a `Vec`, and it is the library — the driver and its reference workflow — that a
+        // board would link.
+        command: "cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi",
+        in_hook: false,
+        why: "issue #28: \"no `Future`, no Embassy, no allocation\" is a build failure rather than an inspection",
+    },
+    Stage {
         name: "probe-lint",
         job: "firmware",
         // The size probe's binary is behind `required-features`, so the `lint` stage above
