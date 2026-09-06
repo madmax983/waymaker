@@ -73,10 +73,13 @@
 //! # What this module must not own
 //!
 //! The swap. §10's seven steps — stop scheduling, erase the inactive bank, write the header,
-//! barrier, seal, barrier, lazily erase the old bank — are issue
-//! [#26](https://github.com/madmax983/waymaker/issues/26)'s. What is here is the *price* of
+//! barrier, seal, barrier, lazily erase the old bank — are [`crate::swap`]'s, landed for issue
+//! [#26](https://github.com/madmax983/waymaker/issues/26). What is here is the *price* of
 //! the header that swap writes, because the price is what the reserve is computed from and
-//! a reserve that learned it at the swap would learn it too late.
+//! a reserve that learned it at the swap would learn it too late. Nothing obliges a caller to
+//! consult this reserve before calling [`crate::swap::Swap::beginning`], which refuses an
+//! input that does not fit and so arrives at the same answer one step later; the dispatcher
+//! that would join the two is rung 0.4's.
 
 use core::fmt;
 

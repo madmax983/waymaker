@@ -106,7 +106,7 @@ argued from 42 B would have been the worst version of the thing that ADR objecte
 changes closed it and both were real defects rather than gaming: the plan carried a
 `Geometry` that the `JournalRegion` beside it already held, and each step took the whole
 eighty-odd-byte plan *by value* to compare one field of it. Passing it by reference and
-dropping the duplicate field took the figure to **17978 B**, 454 B under the gate. The probe
+dropping the duplicate field took the figure to **17966 B**, 466 B under the gate. The probe
 row was trimmed too — a three-armed `match` over `Authority` and four `black_box` calls that
 charged the engine's row for this file's arithmetic — which is issue
 [#72](https://github.com/madmax983/waymaker/issues/72) in miniature and is why that issue

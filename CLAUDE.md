@@ -349,7 +349,7 @@ last raise that should happen before issue
 a figure a third of which is the probe is a raise argued from the wrong number. Issue
 [#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap is to be measured against
 a corrected figure rather than against a third raise, and it was: §10's seven-step swap
-lands at **17978 B** against the same 18 KiB gate, with no raise asked for.
+lands at **17966 B** against the same 18 KiB gate, with no raise asked for.
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md)
 records what it took, because the first measurement was 42 B *over* — a plan carrying a
 geometry the region beside it already held, and five steps taking that plan by value to
@@ -637,7 +637,7 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
 - **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
   the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 5 KiB of 17978 B at rung 0.2. ADR 0002 says so, ADR
+  calls "core + flash adapter" — roughly 5 KiB of 17966 B at rung 0.2. ADR 0002 says so, ADR
   0017 attributes rung 0.2's first figure by symbol, ADR 0019 splits the writer out and
   ADR 0020 the reserve, but nothing *checks* the split: doing so needs a call graph, and all
   three attributions are readings of measurements rather than gates.

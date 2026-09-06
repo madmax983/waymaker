@@ -597,8 +597,15 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
 ///
 /// §10 step 7's other half: what a caller does *after* a successful swap. It is not generic
 /// over the integrity check, because nothing left to do reads or writes a seal.
+///
+/// # Why it is not `Copy`
+///
+/// [`reclaim`](Self::reclaim) takes `self` so that §10's lazy erase happens once, and a
+/// `Copy` type would make that consumption a fiction: a caller holding two would erase the
+/// retired bank twice, which is a second erase cycle on a part that has a countable number
+/// of them. `Journal` is not `Copy` for the same shape of reason, one layer down.
 #[must_use = "a completed swap reports the journal the new run writes into"]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Installed {
     plan: Plan,
 }
@@ -611,7 +618,7 @@ impl Installed {
     /// §12's contract and `waymaker-conformance`'s across-reset witness rather than
     /// something a return value can establish.
     #[must_use]
-    pub const fn authority(self) -> Authority {
+    pub const fn authority(&self) -> Authority {
         Authority::Bank {
             id: self.plan.installed,
             generation: self.plan.generation,
@@ -630,7 +637,7 @@ impl Installed {
     /// and a second constructor for the writer — even one this module could prove correct —
     /// is a second way to reach an append offset that no scan vouched for.
     #[must_use]
-    pub const fn region(self) -> JournalRegion {
+    pub const fn region(&self) -> JournalRegion {
         self.plan.region
     }
 
@@ -650,7 +657,7 @@ impl Installed {
     ///
     /// [`EffectSeq::FIRST`]: waymaker_core::EffectSeq::FIRST
     #[must_use]
-    pub const fn allocator(self) -> EffectIdAllocator {
+    pub const fn allocator(&self) -> EffectIdAllocator {
         EffectIdAllocator::for_run(self.plan.run)
     }
 

@@ -191,9 +191,11 @@ impl Rig {
 
     /// The bank the rig installs and writes into.
     ///
-    /// One bank, at generation one, for the length of a run. §10's swap is issue
-    /// [#26](https://github.com/madmax983/waymaker/issues/26)'s, and a rig that swapped banks
-    /// before the swap exists would be testing a protocol nobody wrote.
+    /// One bank, at generation one, for the length of a run. §10's swap landed for issue
+    /// [#26](https://github.com/madmax983/waymaker/issues/26) as `waymaker_flash::swap`, and
+    /// this rig does not drive it: a run here installs one bank and stays in it. Extending the
+    /// workload to roll over is owed, and it is the change that makes [`Rig::judge`] have to
+    /// walk the bank `select` names rather than this one.
     pub const BANK: BankId = BankId::A;
 
     /// The generation that bank is installed at.
@@ -863,9 +865,11 @@ impl Rig {
     ///
     /// [`Rig::BANK`], always. The authority count above is computed the way a boot computes
     /// it — both banks' headers and seals, through [`bank::select`] — and then only bank A's
-    /// journal is read, because bank A is the only one this rig installs. §10's swap is issue
-    /// [#26](https://github.com/madmax983/waymaker/issues/26)'s, and when it lands this is
-    /// where the selected bank has to start being the one that is walked.
+    /// journal is read, because bank A is the only one this rig installs. §10's swap has since
+    /// landed as `waymaker_flash::swap` (issue
+    /// [#26](https://github.com/madmax983/waymaker/issues/26)) and this rig still does not
+    /// drive it, so the two agree today; a workload that rolled over would have to make this
+    /// walk the bank [`bank::select`] names, and that is what is owed before it can.
     ///
     /// # Errors
     ///
