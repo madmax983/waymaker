@@ -381,6 +381,43 @@ where
     Ok(Next::EndOfHistory)
 }
 
+/// Refuses a committed record that follows a terminal one.
+///
+/// §08 row 5 is "return the recorded outcome and poll no further", and a driver that stopped
+/// at the terminal record without asking would accept history no execution could have
+/// produced: `ReplayCursor` refuses a record after a terminal one, and this is the only place
+/// the driver can put that question to it — the machine is never handed the record, because
+/// the boot is over.
+///
+/// # What it costs, and what it does not refuse
+///
+/// One read, and on a scan that reaches erased media the walk ADR 0018 names: a bank of 64
+/// KiB with a 512-byte page is 128 reads. It is paid only when a *replayed* run turns out to
+/// be finished — a run that ends in this boot has a writer open, and a writer knows the scan
+/// is behind it.
+///
+/// A frame that fails to decode is **not** refused. §14 is explicit that a damaged frame is
+/// ignored and the previous history prefix wins, and for a finished run that prefix is the
+/// whole run. Only a *valid sealed* record after the end is impossible.
+fn nothing_follows<S, C>(
+    source: &mut Source<C>,
+    storage: &mut S,
+    page: &mut [u8],
+) -> Result<(), DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    match source {
+        // The scan ran to erased media before either of these existed, so nothing follows.
+        Source::Writing(_) | Source::Spent => Ok(()),
+        Source::Scanning(recovery) => match recovery.next(storage, page) {
+            Some(Ok(_)) => Err(DriveError::HistoryContinues),
+            Some(Err(_)) | None => Ok(()),
+        },
+    }
+}
+
 /// Design document §07's three steps, for one record.
 fn write<S, C>(
     source: &mut Source<C>,
@@ -502,6 +539,9 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                 conclusion,
                 result_len,
             }) => {
+                // §08 row 5 was reached at an effect boundary, so the terminal record is
+                // already consumed and nothing may follow it.
+                nothing_follows(&mut source, storage, page)?;
                 return Ok(Progress::Finished {
                     conclusion,
                     result_len,
@@ -552,6 +592,10 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             write(&mut source, storage, &record, page)?;
             recorded
         };
+        // Both branches above, in one place: the run that ended in this boot and the run
+        // whose terminal record history already held. Free on the first — a writer is open,
+        // so the scan is behind it — and one read on the second.
+        nothing_follows(&mut source, storage, page)?;
         Ok(Progress::Finished {
             conclusion,
             result_len,

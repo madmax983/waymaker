@@ -415,3 +415,128 @@ fn an_activity_answer_that_does_not_fit_is_refused_rather_than_recorded_short() 
         "the intent is committed and the short answer is not"
     );
 }
+
+/// Appends `record` to the journal as it stands, whatever follows it.
+fn append_past_the_end(device: &mut Device, record: &RecordRef<'_>) {
+    let mut page = [0_u8; 256];
+    let mut scan = Recovery::new(region());
+    while scan.next(device, &mut page).is_some() {}
+    let Some(mut journal) = Journal::after(scan) else {
+        unreachable!("the fixtures here end in erased media")
+    };
+    let Ok(staged) = journal.stage(device, record, &mut page) else {
+        unreachable!("the record fits the region")
+    };
+    let Ok(sealable) = staged.payload_barrier(device) else {
+        unreachable!("the model's barrier cannot fail")
+    };
+    let Ok(_) = sealable.commit(device) else {
+        unreachable!("the model's program cannot fail here")
+    };
+}
+
+/// A committed record after a terminal one, which no execution could have written.
+fn a_run_with_a_record_past_its_end() -> Device {
+    let mut device = a_completed_run();
+    append_past_the_end(
+        &mut device,
+        &RecordRef::EffectScheduled {
+            seq: EffectSeq(2),
+            kind: DOWNLOAD,
+            input_len: 3,
+            input_crc: frame::input_digest(b"url"),
+        },
+    );
+    device
+}
+
+#[test]
+fn a_record_committed_after_the_run_ended_is_refused_when_the_workflow_ends_too() {
+    let mut device = a_run_with_a_record_past_its_end();
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    // The workflow makes its two calls, both replayed, and returns; `conclude` consumes the
+    // terminal record and then finds one after it. `ReplayCursor` refuses a record after a
+    // terminal one, and a driver that stopped without asking would report a clean finish.
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("history that could not have been written is refused")
+    };
+    assert_eq!(error, DriveError::HistoryContinues);
+    assert!(world.dispatched().is_empty());
+}
+
+#[test]
+fn a_record_committed_after_the_run_ended_is_refused_at_an_effect_boundary_too() {
+    let mut device = a_run_with_a_record_past_its_end();
+    let mut workflow = Persistent { calls: 0 };
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    // The other route to §08 row 5: the workflow asks for a third effect and the machine
+    // answers with the terminal record. The check belongs on both paths, so it is on both.
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("history that could not have been written is refused")
+    };
+    assert_eq!(error, DriveError::HistoryContinues);
+    assert_eq!(workflow.calls, 2);
+}
+
+#[test]
+fn a_damaged_frame_after_the_run_ended_is_ignored_rather_than_refused() {
+    // §14: a frame that fails to decode is ignored and the previous history prefix wins. For
+    // a finished run that prefix is the whole run, so this is a completed boot rather than a
+    // refusal — which is the line between the two cases above and this one.
+    let device = a_run_with_a_record_past_its_end();
+    let mut image = device.into_image();
+    let last = image
+        .iter()
+        .rposition(|byte| *byte != 0xFF)
+        .unwrap_or_default();
+    image[last] &= 0xF0;
+    let Some(mut device) = Device::restored(geometry(), image) else {
+        unreachable!("the image is device-sized")
+    };
+
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a damaged tail after a terminal record is not a refusal")
+    };
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Completed,
+            result_len: HASHED.len()
+        }
+    );
+}

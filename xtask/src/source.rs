@@ -2239,6 +2239,9 @@ pub const DRIVER_PATH: &str = "waymaker-drive/src/drive.rs";
 
 /// Every kernel answer the synchronous driver is required to decide from.
 ///
+/// Matched at a path boundary by [`names_identifier`'s rule](DRIVER_FORBIDDEN_VOCABULARY),
+/// because a substring test is satisfied by any longer path ending in the same segments.
+///
 /// Issue #28's first work item is to "drive the whole protocol through this boundary so
 /// `waymaker-embassy` is provably a façade and nothing more", and the claim only holds while
 /// the driver's *decisions* come from [`BOUNDARY_TYPES`]. A driver that read a record and
@@ -3970,7 +3973,11 @@ pub fn check_kernel_boundary(
     // `#[cfg(test)]` discharges nothing about the code that ships.
     let code = without_test_modules(&code_only(&source.contents));
     for decision in BOUNDARY_DECISIONS {
-        if !code.contains(decision) {
+        // At a path boundary, like the forbidden half below. A `contains` is satisfied by a
+        // longer path that ends in the same segments — a `SomeIntent::Finished` would vouch
+        // for an `Intent::Finished` arm that is not there, and a pin that cannot fail is
+        // worse than no pin because the report says it checked.
+        if !names_identifier(&code, decision) {
             violations.push(Violation::new(
                 RULE,
                 DRIVER,
@@ -7126,6 +7133,20 @@ mod deferred_answer_pins {
     #[test]
     fn a_driver_that_stops_deciding_from_a_row_of_the_table_is_rejected() {
         let mutant = real_driver_module().replace("Intent::Finished", "Something::Else");
+        let violations = boundary_violations(&real_transition_module(), &mutant);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("names no `Intent::Finished`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_longer_path_ending_in_a_decision_does_not_vouch_for_it() {
+        // What a `contains` would have accepted: the arm is gone and a longer path that ends
+        // in the same two segments is all that is left.
+        let mutant = real_driver_module().replace("Intent::Finished", "SomeIntent::Finished");
         let violations = boundary_violations(&real_transition_module(), &mutant);
         assert!(
             violations
