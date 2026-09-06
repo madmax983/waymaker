@@ -94,7 +94,7 @@ which:
 | Claim | Held by |
 | --- | --- |
 | the seven steps are in §10's order, and no step is reachable without the one before it | the typestate, the `compile_fail` doctest, and `swap-discipline` |
-| the crash windows behave — old run before step 5, new run after step 6, never combined | `crates/waymaker-fault/tests/swap.rs`, at every crash point of every step, with three mutant swaps as teeth |
+| the crash windows behave — old run before step 5, new run after step 6, never combined | `crates/waymaker-fault/tests/swap.rs`, at every crash point of every step, with five wrong swaps as teeth |
 | the barriers are real barriers | §12's contract and `waymaker-conformance`'s across-reset witness. Not this module's, and not a scanner's |
 
 ## Consequences

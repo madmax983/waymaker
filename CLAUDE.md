@@ -1063,9 +1063,10 @@ the second. Three
 different mechanisms hold three different claims, and the ADR is explicit about which:
 `swap-discipline` and a `compile_fail` doctest hold the step order; the crash windows are
 `crates/waymaker-fault/tests/swap.rs`, which drives the real writer at every crash point of
-every step, censuses the steps so a thinning sweep fails the build, and keeps three mutant
-swaps as teeth — one that clears the bank it booted, one that repeats a generation, and one
-that takes step 7 before step 6; and that the barriers are *real* is still §12's contract and
+every step, censuses the steps so a thinning sweep fails the build, and keeps five wrong
+swaps as teeth — one that clears the bank it booted, one that repeats a generation, one that
+takes step 7 before step 6, one whose seal is not a seal, and one that installs a run the
+header does not name; and that the barriers are *real* is still §12's contract and
 `waymaker-conformance`'s across-reset witness. Effect identity is the third "done when":
 `Installed::allocator` is the run the swap installed, starting at `EffectSeq::FIRST`, and
 `SwapError::RunReused` refuses the one input under which the two runs' `(RunId, EffectSeq)`
