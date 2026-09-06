@@ -86,6 +86,7 @@ pub const RULES: &[&str] = &[
     "size-probe-reach",
     "storage-conformance",
     "storage-contract",
+    "swap-discipline",
     "toolchain-targets",
     "transition-surface",
     "workspace-lints",
@@ -260,6 +261,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_recovery_surface(&inputs.layer_sources));
     violations.extend(source::check_commit_discipline(&inputs.layer_sources));
     violations.extend(source::check_capacity_reserve(&inputs.layer_sources));
+    violations.extend(source::check_swap_discipline(&inputs.layer_sources));
     violations.extend(source::check_recovery_routing(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
@@ -267,6 +269,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
     violations.extend(source::check_append_routing(&inputs.layer_sources));
     violations.extend(source::check_bank_integrity_routing(&inputs.layer_sources));
+    violations.extend(source::check_swap_routing(&inputs.layer_sources));
     violations.extend(source::check_rig_oracle(&inputs.rig_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
@@ -842,6 +845,7 @@ mod tests {
             "size-probe-reach",
             "storage-conformance",
             "storage-contract",
+            "swap-discipline",
             "toolchain-targets",
             "transition-surface",
             "workspace-lints",
@@ -959,6 +963,14 @@ mod tests {
                 crate_name: "waymaker-flash".to_owned(),
                 path: format!("crates/{}", source::CAPACITY_SURFACE_PATH),
                 contents: source::tests_support::clean_capacity_reserve(),
+            },
+            // And §10's bank swap of issue #26: `swap-discipline` pins its surface and the
+            // order §10's seven steps happen in, and `integrity-check` pins its one route to
+            // the bank codec. Both fail closed when the module is absent.
+            size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{}", source::SWAP_SURFACE_PATH),
+                contents: source::tests_support::clean_swap_module(),
             },
             size::LayerSource {
                 crate_name: "waymaker-flash".to_owned(),

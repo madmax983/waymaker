@@ -73,10 +73,17 @@
 //! # What this module must not own
 //!
 //! The swap. §10's seven steps — stop scheduling, erase the inactive bank, write the header,
-//! barrier, seal, barrier, lazily erase the old bank — are issue
-//! [#26](https://github.com/madmax983/waymaker/issues/26)'s. What is here is the *price* of
+//! barrier, seal, barrier, lazily erase the old bank — are [`crate::swap`]'s, landed for issue
+//! [#26](https://github.com/madmax983/waymaker/issues/26). What is here is the *price* of
 //! the header that swap writes, because the price is what the reserve is computed from and
-//! a reserve that learned it at the swap would learn it too late.
+//! a reserve that learned it at the swap would learn it too late. Nothing obliges a caller to
+//! consult this reserve before calling [`crate::swap::Swap::beginning`]; the dispatcher that
+//! would join the two is rung 0.4's. The two gates are not the same gate — this one prices a
+//! *bound* a run declares once, and the swap refuses the *input* it is actually handed —
+//! but they refuse at the same ceiling, [`BankRegion::max_run_input_bytes`], so a run whose
+//! bounds this reserve accepted cannot be refused by the swap for its size.
+//!
+//! [`BankRegion::max_run_input_bytes`]: crate::bank::BankRegion::max_run_input_bytes
 
 use core::fmt;
 
