@@ -9,7 +9,7 @@
 //! tooth that could only be produced by a deliberate act of sabotage says nothing about the
 //! code a tired contributor writes at the end of a long day.
 
-use waymaker_fault::{Device, Harness, Session};
+use waymaker_fault::{Device, Harness, Injection, Interruption, Op, Progress as Landed, Session};
 use waymaker_flash::append::Journal;
 use waymaker_flash::recovery::Recovery;
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -394,73 +394,134 @@ fn a_rig_that_skipped_the_journal_scan_would_notice_no_loss_at_all() {
     );
 }
 
-#[test]
-fn a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part() {
-    // The other half of what RAM retention offers, and the direction that can fail. The
-    // witness is durable because a power cut takes RAM; a rig that kept it instead would hold
-    // every mark it *issued*, including the ones a reset took off media before they landed.
-    //
-    // Judged against a real history, those marks over-claim: the audit reports a record lost
-    // that was never committed. That is `Breach::LostAcknowledgedRecord`'s own documented
-    // hazard — "it invents a breach on a healthy device" — and this is the correct writer, so
-    // every one of them is a false positive.
-    let harness = Harness::new(geometry());
-    let runs = harness
-        .run(|session| {
-            let rig = rig();
-            let mut page = [0_u8; Rig::PAGE_BYTES];
-            let mut part = Metered::new(session);
-            rig.prepare(&mut part, 0, &mut page).map_err(|_| ())?;
-            rig.iterate(0, &mut part, &mut Silent, &mut NeverCut, &mut page)
-                .map(|_| ())
-                .map_err(|_| ())
-        })
-        .expect("the fault-free run succeeds");
+/// The correct writer, as a function the harness can drive twice.
+fn correct_writer(session: &mut Session) -> Result<(), ()> {
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut part = Metered::new(session);
+    rig.prepare(&mut part, 0, &mut page).map_err(|_| ())?;
+    rig.iterate(0, &mut part, &mut Silent, &mut NeverCut, &mut page)
+        .map(|_| ())
+        .map_err(|_| ())
+}
 
-    // The marks a whole iteration issues. On a board this is what RAM would still hold after
-    // a watchdog reset; here it is read off the part the fault-free run finished.
-    let remembered = {
-        let Some(clean) = runs.first() else {
-            unreachable!("the fault-free run is first")
-        };
-        let Some(mut device) = Device::restored(geometry(), clean.image().to_vec()) else {
-            unreachable!("the image came from a device of this geometry")
-        };
-        let Some(progress) = marks_on(&rig, &mut device, &mut page) else {
-            unreachable!("a finished run left a readable witness")
-        };
-        progress
+/// `run`'s media, as a device the rig can be pointed at.
+fn device_after(run: &waymaker_fault::Run) -> Option<Device> {
+    Device::restored(geometry(), run.image().to_vec())
+}
+
+/// How often a witness kept in RAM accuses a run the media-reading rig passed.
+///
+/// Returns `(runs compared, runs accused)`.
+///
+/// # How the retained witness is derived
+///
+/// Per run, and that is the whole of the method. RAM after a reset holds the marks the writer
+/// *issued*, which for a run cut inside a mark's own program is the marks that landed plus
+/// that one. So the same crash point is run twice: once torn one byte in, which is the media a
+/// reset left, and once at `Progress::Whole`, which lands exactly that mark and stops — the
+/// marks RAM held, and no others.
+///
+/// Codex found the first version of this reusing the *fault-free* run's final marks for every
+/// crash point, which hands an early run acknowledgements the writer had not issued yet. A
+/// tooth fed future state measures the fixture.
+fn a_retained_witness_against_media(writer: fn(&mut Session) -> Result<(), ()>) -> (usize, usize) {
+    let harness = Harness::new(geometry());
+    let Ok(runs) = harness.run(writer) else {
+        unreachable!("the fault-free run succeeds")
     };
+    let Some(clean) = runs.first() else {
+        unreachable!("the fault-free run is first")
+    };
+    let sequence = clean.ops().to_vec();
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let (mut compared, mut accused) = (0_usize, 0_usize);
 
-    let mut invented = 0_usize;
-    let mut judged = 0_usize;
-    for run in &runs {
-        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+    for (index, op) in sequence.iter().enumerate() {
+        // Only a mark's own program: everywhere else RAM and media hold the same marks, so
+        // there is nothing for a retained witness to over-claim.
+        let Op::Program { offset, len } = *op else {
             continue;
         };
-        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+        if offset < rig.instrument_base() || len < 2 {
+            continue;
+        }
+        let torn = Injection {
+            op: index,
+            progress: Landed::Bytes(1),
+            interruption: Interruption::Watchdog,
+        };
+        let issued = Injection {
+            op: index,
+            progress: Landed::Whole,
+            interruption: Interruption::Watchdog,
+        };
+        let (Ok(torn), Ok(issued)) = (
+            harness.run_one(torn, writer),
+            harness.run_one(issued, writer),
+        ) else {
             continue;
         };
+        let (Some(mut torn_media), Some(mut retained_media)) =
+            (device_after(&torn), device_after(&issued))
+        else {
+            continue;
+        };
+        let Ok(verdict) = rig.verify(0, &mut torn_media, &mut page) else {
+            continue;
+        };
+        // Only runs the real rig passes: an accusation is only false if there is nothing to
+        // accuse.
         if verdict.outcome() != Outcome::Passed {
             continue;
         }
-        judged += 1;
-        // The history is the real one — how many records the media-reading audit accepted —
-        // and only the witness is the remembered one.
-        if audit_of(&rig, verdict.recovered(), remembered, verdict.banks()).is_err() {
-            invented += 1;
+        let Some(retained) = marks_on(&rig, &mut retained_media, &mut page) else {
+            continue;
+        };
+        compared += 1;
+        if audit_of(&rig, verdict.recovered(), retained, verdict.banks()).is_err() {
+            accused += 1;
         }
     }
-    assert!(judged > 0, "no healthy run was judged");
+    (compared, accused)
+}
+
+#[test]
+fn a_witness_kept_in_ram_over_claims_by_one_mark_and_still_accuses_nobody() {
+    // The other half of what RAM retention offers a board: keep the witness in RAM instead of
+    // on media. A reset then leaves RAM holding one mark more than media does — the one whose
+    // program it interrupted — so the retained witness over-claims.
+    //
+    // On the correct writer that costs nothing, and the reason is the mark *order*: every mark
+    // goes down after the thing it attests, so a mark that was issued and did not land claims
+    // something media already supports. The tooth below is what makes that a property of the
+    // order rather than of this fixture.
+    let (compared, accused) = a_retained_witness_against_media(correct_writer);
+    assert!(compared > 0, "no run was cut inside a mark's own program");
+    assert_eq!(
+        accused, 0,
+        "a retained witness accused {accused} of {compared} healthy runs"
+    );
+}
+
+#[test]
+fn a_mark_written_before_the_thing_it_attests_makes_a_retained_witness_accuse_a_healthy_run() {
+    // The tooth. `Flaw::AcknowledgeBeforeCommit` puts the acknowledgment down before the
+    // commit seal, so a mark that was issued and did not land claims a record media does not
+    // have — and a rig judging from RAM reports a §14 violation on a run the media-reading rig
+    // passes. That is `Breach::LostAcknowledgedRecord`'s own documented hazard: "it invents a
+    // breach on a healthy device".
+    let (compared, accused) = a_retained_witness_against_media(|session| {
+        wrong_writer(Flaw::AcknowledgeBeforeCommit, session)
+    });
+    assert!(compared > 0, "no run was cut inside a mark's own program");
     assert!(
-        invented > 0,
-        "remembered marks accused no healthy run, so the witness could have been kept in RAM"
+        accused > 0,
+        "the wrong mark order accused nobody, so the test above measures the fixture"
     );
     assert!(
-        invented < judged,
-        "remembered marks accused every healthy run, so this measures the fixture rather \
-         than the marks"
+        accused < compared,
+        "it accused every run, which measures the fixture too"
     );
 }

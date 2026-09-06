@@ -116,14 +116,24 @@ tautology and is written as one — a reading that never touches the journal can
 with the history the writer believed it wrote — so what carries the content is the contrast
 beside it, which is asserted: on the same runs the real rig is not a constant either way.
 
-Keep the *witness* in RAM instead of on media, and it holds every mark the writer issued,
-including the ones a reset took off media before they landed. Those marks over-claim, so the
-audit reports a loss that never happened:
-`a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part` requires that to
-happen on the correct writer, and requires it not to happen everywhere — a tooth that accused
-every run would measure the fixture. That is the direction that can fail, and it is
-`Breach::LostAcknowledgedRecord`'s own documented hazard: "it invents a breach on a healthy
-device".
+Keep the *witness* in RAM instead of on media, and a reset leaves RAM holding one mark more
+than media does — the one whose program it interrupted. That over-claim turns out to cost
+nothing on the correct writer, and the reason is a property of the rig worth having written
+down: **every mark goes down after the thing it attests**, so a mark that was issued and did
+not land claims something media already supports.
+`a_witness_kept_in_ram_over_claims_by_one_mark_and_still_accuses_nobody` asserts it, and
+`a_mark_written_before_the_thing_it_attests_makes_a_retained_witness_accuse_a_healthy_run`
+makes it a property of the order rather than of the fixture: under
+`Flaw::AcknowledgeBeforeCommit` the retained witness reports a §14 violation on a run the
+media-reading rig passes, which is `Breach::LostAcknowledgedRecord`'s own documented hazard —
+"it invents a breach on a healthy device".
+
+Codex's third round is why that reads the way it does. The first version derived the retained
+witness from the *fault-free* run's final marks and used it at every crash point, which hands
+an early run acknowledgements the writer had not issued yet; its `accused > 0` was the fixture
+supplying future state. The marks are now derived per run — the same crash point is run twice,
+once torn one byte in for the media a reset left, and once at `Progress::Whole`, which lands
+exactly the mark in flight and stops — and the honest answer changed sign.
 
 **Every sweep in the workspace grew by one point per mutating operation and per barrier.**
 That is cheap by construction — the interior points are the expensive ones and none are added

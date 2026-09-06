@@ -253,8 +253,8 @@ real part may abort the unit in flight where this one finishes it. Nor a reset-c
 nor a watchdog that fires on a timer rather than at a call boundary. Nor retained RAM — a
 watchdog reset really leaves it, and nothing here models it; what the rig measures instead is
 the *cost* of trusting it, in
-`a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part`, which is the half
-of it that can fail. §12's
+`a_witness_kept_in_ram_over_claims_by_one_mark_and_still_accuses_nobody` and the tooth beside
+it, which is the half of it that can fail. §12's
 `barrier-is-durable` and `barrier-orders-what-follows` are still `waymaker-conformance`'s
 across-reset witness's, and still owed against a real driver.
 
@@ -1146,9 +1146,11 @@ half of both causes exactly as before. The third difference a watchdog reset has
 modelled nowhere and measured as a cost:
 `a_rig_that_skipped_the_journal_scan_would_notice_no_loss_at_all` shows a rig that judged from
 the history it still held excusing *every* loss the media-reading rig catches — a tautology,
-written as one — and
-`a_rig_that_kept_its_marks_in_ram_would_invent_a_breach_on_a_healthy_part` is the half that can
-fail: remembered marks over-claim, and the audit then reports a loss that never happened.
+written as one. The witness half is the one that can fail and does not:
+`a_witness_kept_in_ram_over_claims_by_one_mark_and_still_accuses_nobody` measures that a
+retained witness, derived per run rather than from a finished one, accuses no healthy run,
+because every mark goes down after the thing it attests — and the tooth beside it shows a
+writer with that order reversed accusing one.
 
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async
