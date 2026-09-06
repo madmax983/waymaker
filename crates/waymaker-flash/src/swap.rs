@@ -205,6 +205,15 @@ pub enum SwapError {
     /// a swap, so two runs sharing a run id share every effect identity they ever mint.
     /// Refused here because there is no later point at which it could be: once the header is
     /// on media the collision is durable.
+    ///
+    /// This catches the adjacent case and **is not a uniqueness check**. A run id belonging
+    /// to any *earlier* run of the device passes it, and the collision is the same one — a
+    /// dispatcher or an external service holding deduplication state would read the new run's
+    /// first effects as redeliveries of that older run's. `RunId` is documented as unique on
+    /// a device and nothing on the device remembers the ids it has retired, so global
+    /// freshness is the caller's obligation; this is the cheap refusal of the mistake most
+    /// likely to be made, not the guarantee. Codex found the overclaim on the second review
+    /// round.
     RunReused,
     /// The retired reader or writer is not over the bank being retired.
     ///
@@ -319,6 +328,25 @@ pub enum SwapStepError<E> {
     /// new bank would be sealed without its payload ever having been made durable, and an
     /// erase aimed at an offset another device does not have is a write outside every bank
     /// it does.
+    ///
+    /// # What "device" means here, exactly
+    ///
+    /// A [`Geometry`](crate::storage::Geometry), and therefore not an *instance*. Two parts
+    /// of the same model have the same geometry, so a caller holding two of them can
+    /// [`prepare`](Swap::prepare) on one and [`commit`](Sealable::commit) on the other and
+    /// this refusal will not fire — sealing a bank whose erase happened on the other chip, or
+    /// erasing an unrelated device's active bank. Codex found that on the second review
+    /// round.
+    ///
+    /// It is stated rather than closed because it is not this module's contract to change:
+    /// [`AppendError::WrongDevice`](crate::append::AppendError::WrongDevice),
+    /// [`RecoveryError::WrongDevice`](crate::recovery::RecoveryError::WrongDevice) and
+    /// [`CapacityError::WrongDevice`](crate::capacity::CapacityError::WrongDevice) are the
+    /// same comparison, and a swap that bound an instance while the writer beside it did not
+    /// would be the one module in this crate whose `WrongDevice` meant something different.
+    /// Binding storage identity across all four — by holding the `&mut S` through a
+    /// protocol rather than accepting one per step — is issue
+    /// [#84](https://github.com/madmax983/waymaker/issues/84).
     WrongDevice,
 }
 
@@ -393,6 +421,10 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     /// `booted` is [`bank::select`]'s answer for this device **now**, and `run` is the run id
     /// the header of the bank it named carries. Neither is checked here — this call reads no
     /// media — and both are what the caller already decoded to get this far.
+    ///
+    /// `next.run` must also be fresh for the *device*, not merely different from `run`:
+    /// [`SwapError::RunReused`] compares the two it is given and cannot see the run ids this
+    /// device has already retired.
     ///
     /// Each is load-bearing in a different way, and neither failure has a symptom. A wrong
     /// `run` weakens exactly one thing, the [`SwapError::RunReused`] refusal, and the result

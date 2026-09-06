@@ -709,6 +709,24 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
+- **That a device is an *instance* rather than a geometry.** Four modules refuse storage that
+  is "not the device this was validated against" — `append` at three steps, `recovery`,
+  `capacity` and `swap` at all five — and all four decide it by comparing a `Geometry`. Two
+  parts of the same model have the same one, so none of them can tell two instances apart: a
+  caller holding two chips can prepare a swap on one and commit it on the other, sealing a
+  bank whose erase happened elsewhere or erasing an unrelated device's active bank. Codex
+  found it on issue #26's second review round. It is stated rather than closed because it is
+  one contract in four places and a `swap` that bound an instance while the writer beside it
+  did not would be the one module whose `WrongDevice` meant something else; binding the
+  storage with a borrow instead of a comparison is issue
+  [#84](https://github.com/madmax983/waymaker/issues/84).
+- **That a run id a swap installs is one the device has never used.** `SwapError::RunReused`
+  compares the next run against the one being retired, which is the adjacent mistake and not
+  a uniqueness check: a run id from any *earlier* run passes it, and the `(RunId, EffectSeq)`
+  collision is the same one — an external service holding deduplication state would read the
+  new run's first effects as redeliveries of that older run's. Nothing on the device
+  remembers the ids it has retired, so global freshness is a precondition on
+  `Swap::beginning` rather than something the swap can check.
 - **That the authority a swap was planned from is the device's.** `Swap::beginning` takes
   `bank::select`'s answer and the retiring run's id as arguments and reads no media, so
   neither is verified. A wrong `run` disables the `SwapError::RunReused` refusal; a *stale*

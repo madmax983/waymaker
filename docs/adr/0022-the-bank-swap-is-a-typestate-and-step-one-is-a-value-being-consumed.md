@@ -168,6 +168,18 @@ stops there: an effect scheduled, its outcome and a terminal record are `Reserve
 floor, which is a policy about what a run may do rather than a fact about whether the run the
 swap installs can start.
 
+**Two limits the second review round drew, both stated rather than closed.** A "device" here
+is a `Geometry`, so two parts of the same model are one device and a caller with two chips
+can prepare on one and commit on the other — that is the contract `append`, `recovery` and
+`capacity` all keep, and closing it in this module alone would leave four identical names
+meaning two different things, so it is issue
+[#84](https://github.com/madmax983/waymaker/issues/84) rather than a line here. And
+`SwapError::RunReused` compares the next run against the retiring one, which catches the
+adjacent mistake and is not a uniqueness check: a run id from any earlier run passes it and
+collides just as durably. Nothing on the device remembers the ids it has retired, so global
+freshness is the caller's, and the documentation now says so where it used to imply
+otherwise.
+
 ## Alternatives considered
 
 **One `continue_as_new()` function.** Smaller, and the reason it was rejected is in the
