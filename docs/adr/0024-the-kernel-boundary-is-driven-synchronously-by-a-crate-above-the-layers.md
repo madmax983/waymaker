@@ -49,8 +49,15 @@ under the driver.
 `waymaker-drive` is a crate above the layers, in `policy::TEST_SUPPORT_CRATES` with
 `waymaker-fault`, `waymaker-spec`, `waymaker-conformance` and `waymaker-rig`. It is
 `#![no_std]`, allocation-free, and outside `default-members`, and the `drive-firmware`
-pipeline stage builds its library for `thumbv6m-none-eabi` — so "no `Future`, no Embassy, no
-allocation" is a build failure rather than an inspection.
+pipeline stage builds its library for `thumbv6m-none-eabi`.
+
+That stage holds the `std` half and not the allocation half, and the difference is worth
+being exact about: `cargo build --lib` produces an rlib and never links, so no global
+allocator is required and an `extern crate alloc` would compile clean. `crate-attributes` is
+what fails a build over it — `policy::NO_STD_TEST_SUPPORT_CRATES` names the three
+test-support crates that make the `#![no_std]` claim, and the rule holds all three to it.
+`waymaker-conformance` and `waymaker-rig` made the same claim before this change with nothing
+checking it either.
 
 It owns four things and no more.
 
@@ -63,8 +70,18 @@ one could stop a run nothing asked to stop.
 may answer `Pending`. That is how a driver with no executor still has a way to wait.
 
 **The loop** is `Driver::boot`: the recovery scan feeds the machine, the machine's answer says
-what to do, and the two-barrier writer records it. `Progress` has two shapes, `Finished` and
+what to do, and §10's gated writer records it. `Progress` has two shapes, `Finished` and
 `Waiting`, and the errors are refusals rather than repairs.
+
+Every append goes through `waymaker_flash::capacity::Reserved` rather than through `Journal`
+directly, and that is not tidiness. An ungated driver commits a schedule record, tells the
+world to perform the effect, and *then* finds the outcome record does not fit — and §08 has
+no edge from an unresolved effect to a terminal record, so the run can never end, and every
+boot after it performs the effect again. The reserve refuses before the schedule record, so
+the run declines to start the effect instead of having already asked for it. A driver
+carrying no reserve is strictly weaker than the wrong reserve
+[ADR 0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) already has a
+test for, so the reserve is a constructor argument rather than an option.
 
 **A reference workflow and world**, in the library rather than in `tests/`, so the firmware
 target builds them too.
@@ -75,8 +92,16 @@ the *shape* half pins the member set of every boundary type in both directions, 
 issue #28's second "done when" — §09 reserves six record kinds nobody has written a body for,
 and a `Resolve::TimerFired` added when the first lands would turn one boundary into a boundary
 per record. The *routing* half pins that `waymaker-drive` decides from `Intent` and `Resolve`
-and names neither `RecordKind` nor `Step`, because a driver that read history for itself would
-be a second transition table.
+and names neither `RecordKind` nor `Step` — as *identifiers*, so `Step ::Record` and
+`use …::Step as S;` are caught too — because a driver that read history for itself would be a
+second transition table.
+
+What the routing half does not say is that the driver reads no record at all. It reads two:
+`recorded` classifies a terminal record when the workflow ends outside an effect boundary, and
+`begin` refuses a journal whose first record is not a `RunStarted`. Both are `RecordRef`, both
+are exhaustive matches the compiler breaks when a variant is added, and both are named in
+[what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
+rather than left for a reader to find.
 
 The lifetime discipline §06 asks to be documented is enforced instead. Every borrowed result
 points into a buffer the caller owns and the driver reuses, and `Boundary::call` derives its
@@ -116,6 +141,18 @@ they become new boundary variants instead.
 And it takes a `JournalRegion` and a `RunId` from its caller rather than selecting a bank. Bank
 selection is `waymaker-flash`'s `bank::select`, and a driver that did it too would be the
 second place authority is decided.
+
+Three defects came out of review rather than out of writing this, and the sharpest is the
+reserve above: the first version of this driver appended through `Journal` directly, and a
+journal too small for a run's outcome record left it dispatching a real effect on every boot
+for ever. The other two were the same shape as each other — a length measured against the
+wrong thing. `conclude` committed the terminal record and
+*then* copied the run's outcome into the caller's buffer, so a payload the buffer could not
+hold left a run that really completed reporting `ResultTooLong` on that boot and on every boot
+after it. And the reference world reported how many bytes *fit* rather than how many it
+produced, so a small buffer had the driver record a truncated result as history instead of
+refusing it. Both are now the other way round, and both are held by a test that was watched
+failing against the old code.
 
 ## Alternatives considered
 

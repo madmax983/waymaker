@@ -37,10 +37,11 @@ pub trait Boundary {
     ///
     /// # The lifetime discipline
     ///
-    /// The returned bytes borrow the driver's scratch page, and the *next* call overwrites
-    /// it. A workflow that needs a result after its next boundary copies it into its own
-    /// storage first. That is not a convention: the borrow is derived from `&mut self`, so
-    /// holding one across the next call does not compile.
+    /// The returned bytes borrow the caller's **result** buffer — not the scratch page,
+    /// which never reaches a workflow — and the *next* call overwrites it. A workflow that
+    /// needs a result after its next boundary copies it into its own storage first. That is
+    /// not a convention: the borrow is derived from `&mut self`, so holding one across the
+    /// next call does not compile.
     ///
     /// ```compile_fail,E0499
     /// use waymaker_core::{ActivityKind, Outcome};

@@ -85,9 +85,11 @@ harness, `waymaker-spec` is the formal specification of the recovery invariants,
 `waymaker-conformance` is the storage-contract suite and the `embedded-storage` port,
 `waymaker-rig` is the power-cut and watchdog-reset rig, and `waymaker-drive` is the
 synchronous driver that runs a workflow to completion through the kernel boundary. No layer
-may depend on any of them. The last three are `#![no_std]` and *are* built for a firmware
-target — by CI, on `thumbv6m-none-eabi` — because each exists to be run on the part rather
-than only about it; none is in the image the code-flash budget is measured against.
+may depend on any of them. The last three are `#![no_std]` and allocation-free, because each
+exists to be run on the part rather than only about it; CI builds `waymaker-rig` and
+`waymaker-drive` for `thumbv6m-none-eabi`, and `waymaker-conformance` is meant to be built by
+an adapter author for the target their driver is for. None is in the image the code-flash
+budget is measured against.
 
 ## Budgets
 

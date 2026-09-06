@@ -5,10 +5,12 @@
 //! media is `waymaker-fault`'s model of NOR — so the bytes below are bytes this workspace
 //! really writes rather than a fixture that agrees with it.
 
-use waymaker_core::{EffectSeq, RecordRef, RunId};
-use waymaker_drive::demo::{DOWNLOAD, DOWNLOADED, HASH, HASHED, Pipeline, World};
-use waymaker_drive::{Conclusion, DriveError, Driver, Progress};
+use waymaker_core::{EffectId, EffectSeq, RecordRef, RunId};
+use waymaker_drive::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASH, HASHED, Pipeline, World};
+use waymaker_drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 use waymaker_fault::Device;
+use waymaker_flash::bank::BankLayout;
+use waymaker_flash::capacity::Reserve;
 use waymaker_flash::frame::ProgramAlign;
 use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
@@ -33,6 +35,17 @@ fn region() -> JournalRegion {
         unreachable!("a 1024-byte region at offset 0 fits this geometry")
     };
     region
+}
+
+/// §10's reserve the driver gates every append with.
+fn reserve() -> Reserve {
+    let Ok(layout) = BankLayout::new(geometry()) else {
+        unreachable!("this geometry holds two erase blocks")
+    };
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+        unreachable!("the reference workflow's bounds fit this layout")
+    };
+    reserve
 }
 
 /// Every record the journal holds, decoded.
@@ -87,13 +100,15 @@ fn a_workflow_runs_to_completion_on_an_erased_journal() {
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
 
-    let progress = Driver::new(region(), RUN)
+    let progress = Driver::new(region(), RUN, reserve())
         .boot(
             &mut device,
             &mut world,
             &mut workflow,
-            &mut page,
-            &mut result,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
         )
         .expect("the run completes");
 
@@ -140,13 +155,15 @@ fn a_completed_run_replays_from_history_and_dispatches_nothing() {
     {
         let mut workflow = Pipeline::new();
         let mut world = World::new();
-        Driver::new(region(), RUN)
+        Driver::new(region(), RUN, reserve())
             .boot(
                 &mut device,
                 &mut world,
                 &mut workflow,
-                &mut page,
-                &mut result,
+                Scratch {
+                    page: &mut page,
+                    result: &mut result,
+                },
             )
             .expect("the run completes");
     }
@@ -154,13 +171,15 @@ fn a_completed_run_replays_from_history_and_dispatches_nothing() {
     // A cold start over the same media, with a workflow that has never run.
     let mut workflow = Pipeline::new();
     let mut world = World::new();
-    let progress = Driver::new(region(), RUN)
+    let progress = Driver::new(region(), RUN, reserve())
         .boot(
             &mut device,
             &mut world,
             &mut workflow,
-            &mut page,
-            &mut result,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
         )
         .expect("the recovered run replays");
 
@@ -192,13 +211,15 @@ fn an_activity_that_is_not_ready_suspends_the_run_under_a_committed_identity() {
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
 
-    let progress = Driver::new(region(), RUN)
+    let progress = Driver::new(region(), RUN, reserve())
         .boot(
             &mut device,
             &mut world,
             &mut workflow,
-            &mut page,
-            &mut result,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
         )
         .expect("a pending activity is not a failure");
 
@@ -226,44 +247,74 @@ fn a_reboot_redelivers_the_effect_under_the_identity_it_was_scheduled_with() {
     let mut result = [0_u8; 64];
 
     {
+        // The *second* effect is the one left outstanding, on purpose. A driver that minted
+        // a fresh identity on redelivery would answer `EffectSeq(0)` below, because that is
+        // where `EffectIdAllocator` starts — so a run whose outstanding effect is the first
+        // one cannot tell redelivery from re-minting at all.
         let mut workflow = Pipeline::new();
-        let mut world = World::pending_at(0);
-        Driver::new(region(), RUN)
-            .boot(
-                &mut device,
-                &mut world,
-                &mut workflow,
-                &mut page,
-                &mut result,
-            )
-            .expect("a pending activity is not a failure");
+        let mut world = World::pending_at(1);
+        let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        ) else {
+            unreachable!("a pending activity is not a failure")
+        };
+        assert_eq!(
+            progress,
+            Progress::Waiting {
+                id: EffectId {
+                    run: RUN,
+                    seq: EffectSeq(1)
+                }
+            }
+        );
     }
 
     let mut workflow = Pipeline::new();
     let mut world = World::new();
-    let progress = Driver::new(region(), RUN)
-        .boot(
-            &mut device,
-            &mut world,
-            &mut workflow,
-            &mut page,
-            &mut result,
-        )
-        .expect("the run resumes");
-
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("the resumed run completes")
+    };
     let Progress::Finished { conclusion, .. } = progress else {
         panic!("the resumed run completes: {progress:?}");
     };
     assert_eq!(conclusion, Conclusion::Completed);
 
-    // §14's redelivery contract: the redelivered effect wears the sequence the schedule
-    // record recorded, not a fresh one.
-    let first = world
+    // §14's redelivery contract: the resumed run dispatches the outstanding effect and
+    // nothing else, under the sequence its schedule record already committed.
+    let dispatched: Vec<_> = world
         .dispatched()
-        .first()
-        .expect("something was dispatched");
-    assert_eq!(first.id.seq, EffectSeq(0));
-    assert_eq!(first.kind, DOWNLOAD);
+        .iter()
+        .map(|call| (call.id.seq, call.kind))
+        .collect();
+    assert_eq!(dispatched, [(EffectSeq(1), HASH)]);
+
+    // And the journal holds one schedule per effect. A driver that minted a fresh identity
+    // would have written a second `EffectScheduled(0)` here.
+    assert_eq!(
+        history(&mut device),
+        [
+            RecordKindAndBytes::RunStarted(7, 1, b"seed".to_vec()),
+            RecordKindAndBytes::EffectScheduled(0),
+            RecordKindAndBytes::EffectCompleted(0, DOWNLOADED.to_vec()),
+            RecordKindAndBytes::EffectScheduled(1),
+            RecordKindAndBytes::EffectCompleted(1, HASHED.to_vec()),
+            RecordKindAndBytes::RunCompleted(HASHED.to_vec()),
+        ]
+    );
 }
 
 #[test]
@@ -275,13 +326,15 @@ fn a_journal_that_cannot_be_extended_is_refused_rather_than_appended_to() {
     {
         let mut workflow = Pipeline::new();
         let mut world = World::pending_at(0);
-        Driver::new(region(), RUN)
+        Driver::new(region(), RUN, reserve())
             .boot(
                 &mut device,
                 &mut world,
                 &mut workflow,
-                &mut page,
-                &mut result,
+                Scratch {
+                    page: &mut page,
+                    result: &mut result,
+                },
             )
             .expect("a pending activity is not a failure");
     }
@@ -298,13 +351,15 @@ fn a_journal_that_cannot_be_extended_is_refused_rather_than_appended_to() {
 
     let mut workflow = Pipeline::new();
     let mut world = World::new();
-    let error = Driver::new(region(), RUN)
+    let error = Driver::new(region(), RUN, reserve())
         .boot(
             &mut device,
             &mut world,
             &mut workflow,
-            &mut page,
-            &mut result,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
         )
         .expect_err("a damaged tail has no append point");
     assert!(

@@ -46,23 +46,28 @@
 //!
 //! ```
 //! use waymaker_core::RunId;
-//! use waymaker_drive::demo::{HASHED, Pipeline, World};
-//! use waymaker_drive::{Conclusion, Driver, Progress};
+//! use waymaker_drive::demo::{BOUNDS, HASHED, Pipeline, World};
+//! use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
+//! use waymaker_flash::capacity::Reserve;
 //! # use waymaker_fault::Device;
+//! # use waymaker_flash::bank::BankLayout;
 //! # use waymaker_flash::frame::ProgramAlign;
 //! # use waymaker_flash::recovery::JournalRegion;
 //! # use waymaker_flash::storage::Geometry;
 //! # let geometry = Geometry::new(4096, 1024, 4, 1).expect("a legal geometry");
 //! # let align = ProgramAlign::new(4).expect("a legal granularity");
 //! # let region = JournalRegion::spanning(geometry, 0, 1024, align).expect("a legal region");
+//! # let layout = BankLayout::new(geometry).expect("a legal two-bank layout");
+//! // §10 prices the run's two exits before it starts, from what the workflow declares.
+//! let reserve = Reserve::for_layout(BOUNDS, layout).expect("the bounds fit the layout");
 //! let mut device = Device::new(geometry);
 //! let mut workflow = Pipeline::new();
 //! let mut world = World::new();
 //! let mut page = [0_u8; 256];
 //! let mut result = [0_u8; 64];
 //!
-//! let progress = Driver::new(region, RunId(1))
-//!     .boot(&mut device, &mut world, &mut workflow, &mut page, &mut result)
+//! let progress = Driver::new(region, RunId(1), reserve)
+//!     .boot(&mut device, &mut world, &mut workflow, Scratch { page: &mut page, result: &mut result })
 //!     .expect("the run completes");
 //!
 //! assert_eq!(
@@ -83,5 +88,5 @@ mod workflow;
 
 pub use activity::{Activities, Performed};
 pub use boundary::{Boundary, Suspended};
-pub use drive::{Conclusion, DriveError, Driver, Progress};
+pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 pub use workflow::{Identity, Workflow};

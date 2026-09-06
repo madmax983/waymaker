@@ -27,22 +27,25 @@ use core::cell::RefCell;
 
 use waymaker_core::{EffectSeq, RecordRef, RunId};
 use waymaker_drive::demo::{
-    DOWNLOAD, DOWNLOADED, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
+    BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
-use waymaker_drive::{DriveError, Driver};
+use waymaker_drive::{DriveError, Driver, Scratch};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::append::Journal;
+use waymaker_flash::bank::BankLayout;
+use waymaker_flash::capacity::Reserve;
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
 
 const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
 
-/// One erase block, which is the whole journal region. Small on purpose: the enumeration is
-/// a function of the write sequence, and a bigger region only makes the same sweep slower.
+/// Two erase blocks, which is §10's minimum and what §04's reserve is priced against. The
+/// journal below is one of them; the other is the bank a `continue_as_new` would install
+/// into, which this driver does not perform but the reserve still prices.
 fn geometry() -> Geometry {
-    let Ok(geometry) = Geometry::new(512, 512, 4, 1) else {
-        unreachable!("512 is one whole 512-byte block of 4-byte units")
+    let Ok(geometry) = Geometry::new(1024, 512, 4, 1) else {
+        unreachable!("1024 is two whole 512-byte blocks of 4-byte units")
     };
     geometry
 }
@@ -52,9 +55,20 @@ fn region() -> JournalRegion {
         unreachable!("4 is a power of two within the program-size range")
     };
     let Ok(region) = JournalRegion::spanning(geometry(), 0, 512, align) else {
-        unreachable!("the region is the whole device")
+        unreachable!("the region is the device's first erase block")
     };
     region
+}
+
+/// §10's reserve the driver gates every append with.
+fn reserve() -> Reserve {
+    let Ok(layout) = BankLayout::new(geometry()) else {
+        unreachable!("this geometry holds two erase blocks")
+    };
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+        unreachable!("the reference workflow's bounds fit this layout")
+    };
+    reserve
 }
 
 /// Every record the image recovers to, as a summary a prefix comparison can use.
@@ -105,6 +119,14 @@ impl Summary {
     }
 }
 
+/// The sequence of the schedule record no outcome follows, if history left one open.
+const fn unresolved(history: &[Summary]) -> Option<u32> {
+    match history.last() {
+        Some(Summary::EffectScheduled(seq)) => Some(*seq),
+        Some(Summary::RunStarted | Summary::EffectResolved(_) | Summary::Terminal) | None => None,
+    }
+}
+
 /// One boot of the reference workflow over `session`, and the sequences it dispatched.
 fn drive(
     session: &mut Session,
@@ -114,8 +136,15 @@ fn drive(
     let mut world = World::new();
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
-    let ended =
-        Driver::new(region(), RUN).boot(session, &mut world, &mut workflow, &mut page, &mut result);
+    let ended = Driver::new(region(), RUN, reserve()).boot(
+        session,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
     dispatched
         .borrow_mut()
         .extend(world.dispatched().iter().map(|call| call.id.seq.0));
@@ -207,6 +236,8 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
 
     let mut resumed = 0_usize;
     let mut unextendable = 0_usize;
+    let mut redelivered = 0_usize;
+    let mut redelivered_late = 0_usize;
     for run in &runs {
         let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
             unreachable!("the image is device-sized")
@@ -215,12 +246,14 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
         let mut world = World::new();
         let mut page = [0_u8; 256];
         let mut result = [0_u8; 64];
-        let ended = Driver::new(region(), RUN).boot(
+        let ended = Driver::new(region(), RUN, reserve()).boot(
             &mut device,
             &mut world,
             &mut workflow,
-            &mut page,
-            &mut result,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
         );
 
         match ended {
@@ -232,16 +265,26 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
                     "the resumed run reaches the same answer, at {:?}",
                     run.injection()
                 );
-                // §14's redelivery contract: a redelivered effect wears the sequence its
-                // schedule record already committed, so nothing after the crash uses an
-                // identity the run had not already spent.
-                for call in world.dispatched() {
-                    assert!(
-                        call.id.seq.0 <= 1,
-                        "a resumed run minted {:?} beyond the run's two effects, at {:?}",
-                        call.id.seq,
+                // §14's redelivery contract, stated so a fresh mint fails it. When the
+                // crash left a schedule with no outcome, the resumed run's *first* dispatch
+                // must wear that sequence — a driver that re-minted would answer
+                // `EffectSeq(0)`, which is where the allocator starts, and would be caught
+                // wherever the outstanding effect is the second one.
+                if let Some(outstanding) = unresolved(&recovered(run.image())) {
+                    let first = world.dispatched().first().unwrap_or_else(|| {
+                        panic!("the resumed run redelivers, at {:?}", run.injection())
+                    });
+                    assert_eq!(
+                        first.id.seq.0,
+                        outstanding,
+                        "the resumed run redelivered {:?} for an outstanding {outstanding}, at {:?}",
+                        first.id.seq,
                         run.injection()
                     );
+                    redelivered += 1;
+                    if outstanding > 0 {
+                        redelivered_late += 1;
+                    }
                 }
             }
             Err(error) => {
@@ -267,6 +310,15 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
     }
     assert!(resumed > 0, "some crash images carry the run on");
     assert!(
+        redelivered > 0,
+        "some crash images leave an effect outstanding, which is what redelivery is for"
+    );
+    assert!(
+        redelivered_late > 0,
+        "and some of those are the run's *second* effect, which is the only case that tells \
+         redelivery apart from a fresh identity"
+    );
+    assert!(
         unextendable > 0,
         "and some do not, which is the case a bank swap exists for"
     );
@@ -275,7 +327,6 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
 #[test]
 fn a_driver_that_dispatches_before_it_commits_loses_the_intent() {
     let harness = Harness::new(geometry());
-    let dispatched: RefCell<Vec<u32>> = RefCell::new(Vec::new());
     let logs: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
 
     // The mutant: §07's steps, with the effect performed before its schedule record is
@@ -283,10 +334,8 @@ fn a_driver_that_dispatches_before_it_commits_loses_the_intent() {
     let runs = harness
         .run(|session| {
             logs.borrow_mut().push(Vec::new());
-            dispatched.borrow_mut().clear();
             let mut page = [0_u8; 256];
-            let recovery = Recovery::new(region());
-            let mut scan = recovery;
+            let mut scan = Recovery::new(region());
             let mut probe = [0_u8; 256];
             while scan.next(session, &mut probe).is_some() {}
             let Some(mut journal) = Journal::after(scan) else {
@@ -300,7 +349,6 @@ fn a_driver_that_dispatches_before_it_commits_loses_the_intent() {
             append(&mut journal, session, &started, &mut page)?;
 
             // Dispatched first. This is the whole mutation.
-            dispatched.borrow_mut().push(0);
             if let Some(last) = logs.borrow_mut().last_mut() {
                 last.push(0);
             }

@@ -8,9 +8,11 @@ use waymaker_core::{ActivityKind, EffectId};
 
 /// What an activity did.
 ///
-/// The length is how many bytes of the caller's buffer the activity filled. A length past
-/// the end of that buffer is a refusal rather than a truncation: a result silently cut
-/// short would be recorded as history and replayed for ever.
+/// The length is how many bytes the activity **produced**, not how many of them fit. An
+/// activity whose answer is larger than the buffer still reports the answer's own length,
+/// and the driver refuses with [`DriveError::ResultTooLong`](crate::DriveError). Reporting
+/// the truncated length instead would record the short answer as history and replay it for
+/// ever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Performed {
     /// Success. The first `len` bytes of the buffer are the result.

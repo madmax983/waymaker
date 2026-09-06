@@ -11,6 +11,7 @@
 //! borrow it arrived in ends there.
 
 use waymaker_core::{ActivityKind, EffectId, Outcome};
+use waymaker_flash::capacity::Bounds;
 
 use crate::activity::{Activities, Performed};
 use crate::boundary::{Boundary, Suspended};
@@ -29,7 +30,23 @@ pub const DOWNLOADED: &[u8] = b"contents-of-the-thing";
 /// What [`World`] answers a [`HASH`] with.
 pub const HASHED: &[u8] = b"\x01\x02\x03\x04";
 
+/// What [`Pipeline`]'s records may be worth, for §10's reserve.
+///
+/// A workflow declares this, because §10 prices a run's two exits before the run starts and
+/// only the workflow knows how big its records get. The numbers are this workflow's own:
+/// four bytes of run input, a `DOWNLOAD` result of [`DOWNLOADED`]'s length, and a terminal
+/// payload no longer than that.
+pub const BOUNDS: Bounds = Bounds {
+    run_input_bytes: 4,
+    effect_result_bytes: 32,
+    terminal_bytes: 32,
+};
+
 /// Copies as much of `src` into `dst` as fits, and says how much that was.
+///
+/// The answer is what *fit*, which is what a workflow keeping a result needs. A world
+/// reporting what it *produced* is a different question, and [`World::perform`] answers that
+/// one instead — see [`Performed`].
 fn copy(src: &[u8], dst: &mut [u8]) -> usize {
     let taken = src.len().min(dst.len());
     let (Some(from), Some(into)) = (src.get(..taken), dst.get_mut(..taken)) else {
@@ -185,10 +202,23 @@ impl World {
         }
     }
 
-    /// Every effect this world was asked to perform, in order.
+    /// Every effect this world **performed**, in order, up to [`DISPATCH_LOG`].
+    ///
+    /// An effect answered [`Performed::Pending`] is not one of them: the world was asked and
+    /// declined, and nothing reached the outside. `crates/waymaker-drive/tests/crash.rs`
+    /// reads this as the list of effects that really happened, so counting a declined one
+    /// would make its durable-intent sweep assert about an effect nobody performed.
     #[must_use]
     pub fn dispatched(&self) -> &[Dispatch] {
-        self.log.get(..self.count).unwrap_or_default()
+        self.log
+            .get(..self.count.min(DISPATCH_LOG))
+            .unwrap_or_default()
+    }
+
+    /// How many effects this world was asked to perform, log or no log.
+    #[must_use]
+    pub const fn performed(&self) -> usize {
+        self.count
     }
 }
 
@@ -212,14 +242,20 @@ impl Activities for World {
         }
         if let Some(slot) = self.log.get_mut(nth) {
             *slot = Dispatch { id, kind };
-            self.count = nth.saturating_add(1);
         }
+        // Counted whether or not the log had room, so a run longer than [`DISPATCH_LOG`]
+        // stops *recording* dispatches rather than stops counting them. A `pending_at` that
+        // silently stopped advancing would be an instrument that lies.
+        self.count = nth.saturating_add(1);
         let answer = if kind == DOWNLOAD { DOWNLOADED } else { HASHED };
-        let taken = copy(answer, out);
+        // The bytes are bounded by the caller's buffer; the *length* is the answer's own.
+        // See [`Performed`]: a world that reported what fit would have the driver record a
+        // truncated result as history rather than refuse it.
+        copy(answer, out);
         if self.failing_at == Some(nth) {
-            Performed::Failed(taken)
+            Performed::Failed(answer.len())
         } else {
-            Performed::Completed(taken)
+            Performed::Completed(answer.len())
         }
     }
 }

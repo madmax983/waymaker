@@ -9,13 +9,15 @@
 use waymaker_core::{ActivityKind, Outcome, RunId};
 use waymaker_core::{EffectSeq, KernelError, RecordRef};
 use waymaker_drive::demo::{
-    DOWNLOAD, HASH, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
+    BOUNDS, DOWNLOAD, HASH, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Boundary, Conclusion, DriveError, Driver, Identity, Progress, Suspended, Workflow,
+    Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::append::Journal;
+use waymaker_flash::bank::BankLayout;
+use waymaker_flash::capacity::Reserve;
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
@@ -41,6 +43,17 @@ fn region() -> JournalRegion {
     region
 }
 
+/// §10's reserve the driver gates every append with.
+fn reserve() -> Reserve {
+    let Ok(layout) = BankLayout::new(geometry()) else {
+        unreachable!("this geometry holds two erase blocks")
+    };
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+        unreachable!("the reference workflow's bounds fit this layout")
+    };
+    reserve
+}
+
 /// A device holding the reference workflow's completed run.
 fn a_completed_run() -> Device {
     let mut device = Device::new(geometry());
@@ -48,12 +61,14 @@ fn a_completed_run() -> Device {
     let mut world = World::new();
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
-    let Ok(progress) = Driver::new(region(), RUN).boot(
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
         &mut device,
         &mut world,
         &mut workflow,
-        &mut page,
-        &mut result,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
     ) else {
         unreachable!("the reference run completes on erased media")
     };
@@ -98,12 +113,14 @@ fn a_workflow_that_outlives_its_history_is_told_the_run_already_ended() {
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
 
-    let Ok(progress) = Driver::new(region(), RUN).boot(
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
         &mut device,
         &mut world,
         &mut workflow,
-        &mut page,
-        &mut result,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
     ) else {
         unreachable!("a terminal record is an answer, not a failure")
     };
@@ -135,12 +152,14 @@ fn a_recorded_outcome_longer_than_the_callers_buffer_is_refused() {
     // `DOWNLOAD` recorded twenty-one bytes, and this holds two.
     let mut result = [0_u8; 2];
 
-    let Err(error) = Driver::new(region(), RUN).boot(
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
         &mut device,
         &mut world,
         &mut workflow,
-        &mut page,
-        &mut result,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
     ) else {
         unreachable!("a replayed result that does not fit cannot be handed back")
     };
@@ -183,12 +202,14 @@ fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
     let mut workflow = Pipeline::new();
     let mut world = World::new();
     let mut result = [0_u8; 64];
-    let Err(error) = Driver::new(region(), RUN).boot(
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
         &mut device,
         &mut world,
         &mut workflow,
-        &mut page,
-        &mut result,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
     ) else {
         unreachable!("a run that never started cannot be replayed")
     };
@@ -198,7 +219,7 @@ fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
 
 #[test]
 fn a_driver_reports_the_region_and_the_run_it_was_built_for() {
-    let driver: Driver = Driver::new(region(), RUN);
+    let driver: Driver = Driver::new(region(), RUN, reserve());
     assert_eq!(driver.region(), region());
     assert_eq!(driver.run(), RUN);
 }
@@ -224,12 +245,7 @@ impl Workflow for Unknown {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        match boundary.call(ActivityKind(99), b"")? {
-            Outcome::Completed(bytes) | Outcome::Failed(bytes) => {
-                let taken = bytes.len().min(4);
-                let _ = taken;
-            }
-        }
+        boundary.call(ActivityKind(99), b"")?;
         Ok(Outcome::Failed(b"no"))
     }
 }
@@ -241,13 +257,16 @@ fn a_run_that_ends_in_failure_records_a_terminal_failure() {
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
 
-    let progress: Result<Progress, DriveError<FaultError>> = Driver::new(region(), RUN).boot(
-        &mut device,
-        &mut world,
-        &mut Unknown,
-        &mut page,
-        &mut result,
-    );
+    let progress: Result<Progress, DriveError<FaultError>> = Driver::new(region(), RUN, reserve())
+        .boot(
+            &mut device,
+            &mut world,
+            &mut Unknown,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        );
     let Ok(progress) = progress else {
         unreachable!("a failing workflow is a recorded outcome, not a driver error")
     };
@@ -259,4 +278,140 @@ fn a_run_that_ends_in_failure_records_a_terminal_failure() {
         }
     );
     assert_eq!(&result[..2], b"no");
+    // Read back, because `Conclusion` came from the workflow rather than from media: a
+    // `terminal()` that wrote `RunCompleted` while reporting `Failed` would pass without it.
+    assert_eq!(
+        kinds(&mut device),
+        ["started", "scheduled", "completed", "run-failed"]
+    );
+}
+
+/// A workflow with no effects and a terminal payload larger than a small result buffer.
+struct Verbose {
+    payload: [u8; 32],
+}
+
+impl Workflow for Verbose {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            version: WORKFLOW_VERSION,
+            input: b"seed",
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&self.payload))
+    }
+}
+
+/// Every record the journal holds, by kind.
+fn kinds(device: &mut Device) -> Vec<&'static str> {
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut out = Vec::new();
+    while let Some(step) = recovery.next(device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        out.push(match record {
+            RecordRef::RunStarted { .. } => "started",
+            RecordRef::EffectScheduled { .. } => "scheduled",
+            RecordRef::EffectCompleted { .. } => "completed",
+            RecordRef::EffectFailed { .. } => "failed",
+            RecordRef::RunCompleted { .. } => "run-completed",
+            RecordRef::RunFailed { .. } => "run-failed",
+        });
+    }
+    out
+}
+
+#[test]
+fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written() {
+    let mut device = Device::new(geometry());
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut workflow = Verbose { payload: [7; 32] };
+
+    {
+        let mut small = [0_u8; 8];
+        let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut small,
+            },
+        ) else {
+            unreachable!("a terminal payload that does not fit cannot be handed back")
+        };
+        assert_eq!(
+            error,
+            DriveError::ResultTooLong {
+                produced: 32,
+                available: 8
+            }
+        );
+    }
+
+    // The refusal came before the record. Committing it first would leave a run that
+    // completed on media and reported `ResultTooLong` on this boot and on every boot after
+    // it, whatever buffer the caller brought.
+    assert_eq!(kinds(&mut device), ["started"]);
+
+    let mut roomy = [0_u8; 64];
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut roomy,
+        },
+    ) else {
+        unreachable!("a caller with room finishes the run")
+    };
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Completed,
+            result_len: 32
+        }
+    );
+    assert_eq!(kinds(&mut device), ["started", "run-completed"]);
+}
+
+#[test]
+fn an_activity_answer_that_does_not_fit_is_refused_rather_than_recorded_short() {
+    let mut device = Device::new(geometry());
+    let mut world = World::new();
+    let mut workflow = Pipeline::new();
+    let mut page = [0_u8; 256];
+    // `DOWNLOAD` answers with twenty-one bytes, and this holds two.
+    let mut result = [0_u8; 2];
+
+    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a truncated result would be recorded as history and replayed for ever")
+    };
+    assert_eq!(
+        error,
+        DriveError::ResultTooLong {
+            produced: 21,
+            available: 2
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started", "scheduled"],
+        "the intent is committed and the short answer is not"
+    );
 }

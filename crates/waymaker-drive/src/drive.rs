@@ -14,6 +14,7 @@ use waymaker_core::{
     ReplayMachine, Resolve, RunId,
 };
 use waymaker_flash::append::{AppendError, Journal};
+use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame;
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
@@ -94,6 +95,41 @@ pub enum DriveError<E> {
         /// How many bytes the workflow passed.
         bytes: usize,
     },
+    /// §10's reserve does not fit the journal this driver was pointed at.
+    ///
+    /// Decided when the writer is opened, before a record is staged: a journal that cannot
+    /// hold the reserve is a journal in which the run's exits were never affordable.
+    Reserve(CapacityError),
+    /// §10 refused the record, before the device was asked for anything.
+    ///
+    /// The refusal that keeps this driver honest. Without it a schedule record is committed,
+    /// the effect is dispatched, and the outcome record then does not fit — which strands
+    /// the run for ever, because §08 has no edge from an unresolved effect to a terminal
+    /// record, and re-performs the effect on every boot after it.
+    Capacity(Refusal),
+}
+
+/// The two buffers a boot borrows.
+///
+/// Named rather than two adjacent `&mut [u8]` parameters, because two adjacent slice
+/// parameters of different meanings are swappable in silence: a caller that passed them the
+/// other way round would get a run that succeeded, or a `PageTooSmall` that points at
+/// neither buffer. They cannot alias — two `&mut [u8]` in safe Rust are disjoint by
+/// construction — so the only mistake left is which is which, and this is what removes it.
+#[derive(Debug)]
+pub struct Scratch<'a> {
+    /// Where one record at a time is staged. Never retained across a call.
+    ///
+    /// Design document §04 states the runtime RAM budget with a 512-byte page. It must hold
+    /// the largest record this run writes or replays; a smaller one is refused with
+    /// [`DriveError::Recovery`] carrying `PageTooSmall`, or with [`DriveError::Append`].
+    pub page: &'a mut [u8],
+    /// Where an activity writes its outcome, and where a terminal payload is left.
+    ///
+    /// Every borrowed byte a workflow sees points in here, and the next boundary overwrites
+    /// it. A result longer than this buffer is [`DriveError::ResultTooLong`] rather than a
+    /// truncation.
+    pub result: &'a mut [u8],
 }
 
 /// A synchronous driver for one run's journal.
@@ -105,14 +141,15 @@ pub enum DriveError<E> {
 pub struct Driver<C: IntegrityCheck = Catalogued> {
     region: JournalRegion,
     run: RunId,
+    reserve: Reserve,
     check: PhantomData<C>,
 }
 
 impl Driver<Catalogued> {
     /// A driver over `region`, for `run`, sealing with the shipped integrity check.
     #[must_use]
-    pub const fn new(region: JournalRegion, run: RunId) -> Self {
-        Self::with_integrity(region, run)
+    pub const fn new(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
+        Self::with_integrity(region, run, reserve)
     }
 }
 
@@ -122,12 +159,19 @@ impl<C: IntegrityCheck> Driver<C> {
     /// The run is taken separately from the region because §07 keeps the run id in the bank
     /// header rather than in every record: the journal cannot say which run it is.
     #[must_use]
-    pub const fn with_integrity(region: JournalRegion, run: RunId) -> Self {
+    pub const fn with_integrity(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
         Self {
             region,
             run,
+            reserve,
             check: PhantomData,
         }
+    }
+
+    /// §10's reserve every append is gated by.
+    #[must_use]
+    pub const fn reserve(&self) -> Reserve {
+        self.reserve
     }
 
     /// The journal this driver replays and extends.
@@ -166,18 +210,25 @@ impl<C: IntegrityCheck> Driver<C> {
         storage: &mut S,
         activities: &mut A,
         workflow: &mut W,
-        page: &mut [u8],
-        result: &mut [u8],
+        scratch: Scratch<'_>,
     ) -> Result<Progress, DriveError<S::Error>>
     where
         S: StableStorage,
         A: Activities,
         W: Workflow,
     {
+        let Scratch { page, result } = scratch;
         let mut machine = ReplayMachine::new(self.run);
         let mut source = Source::Scanning(Recovery::<C>::with_integrity(self.region));
 
-        begin(&mut source, &mut machine, storage, workflow, page)?;
+        begin(
+            &mut source,
+            &mut machine,
+            storage,
+            workflow,
+            page,
+            self.reserve,
+        )?;
 
         let mut context = Context {
             storage,
@@ -186,6 +237,7 @@ impl<C: IntegrityCheck> Driver<C> {
             page,
             result,
             source,
+            reserve: self.reserve,
             stop: None,
         };
         let ended = workflow.run(&mut context);
@@ -200,6 +252,7 @@ fn begin<S, C, W>(
     storage: &mut S,
     workflow: &W,
     page: &mut [u8],
+    reserve: Reserve,
 ) -> Result<(), DriveError<S::Error>>
 where
     S: StableStorage,
@@ -247,7 +300,7 @@ where
         workflow_version: identity.version,
         input: identity.input,
     };
-    open(source)?;
+    open(source, reserve)?;
     write(source, storage, &record, page)?;
     machine
         .advance(record)
@@ -263,25 +316,32 @@ where
 enum Source<C: IntegrityCheck> {
     /// Replaying committed history.
     Scanning(Recovery<C>),
-    /// History is exhausted; the journal is being extended.
-    Writing(Journal<C>),
+    /// History is exhausted; the journal is being extended, through §10's gate.
+    Writing(Reserved<C>),
     /// The scan ended somewhere a writer cannot be opened at.
     Spent,
 }
 
-/// Turns a finished scan into a writer, or refuses.
-fn open<E, C: IntegrityCheck>(source: &mut Source<C>) -> Result<(), DriveError<E>> {
+/// Turns a finished scan into a gated writer, or refuses.
+fn open<E, C: IntegrityCheck>(
+    source: &mut Source<C>,
+    reserve: Reserve,
+) -> Result<(), DriveError<E>> {
     match mem::replace(source, Source::Spent) {
         // `None` is the scan that stopped at damage, at an unsealed frame, or was
         // abandoned. §14: the recovered prefix stands, and nothing may be appended after it.
         Source::Scanning(recovery) => {
-            Journal::after(recovery).map_or(Err(DriveError::NoAppendPoint), |journal| {
-                *source = Source::Writing(journal);
-                Ok(())
-            })
+            let Some(journal) = Journal::after(recovery) else {
+                return Err(DriveError::NoAppendPoint);
+            };
+            // §10's gate, taken here so that every append below goes through it. A journal
+            // whose region cannot hold the reserve is refused before a record is staged.
+            let reserved = Reserved::over(journal, reserve).map_err(DriveError::Reserve)?;
+            *source = Source::Writing(reserved);
+            Ok(())
         }
-        Source::Writing(journal) => {
-            *source = Source::Writing(journal);
+        Source::Writing(reserved) => {
+            *source = Source::Writing(reserved);
             Ok(())
         }
         Source::Spent => Err(DriveError::NoAppendPoint),
@@ -296,21 +356,28 @@ fn peek<'page, S, C>(
     source: &mut Source<C>,
     storage: &mut S,
     page: &'page mut [u8],
+    reserve: Reserve,
 ) -> Result<Next<'page>, DriveError<S::Error>>
 where
     S: StableStorage,
     C: IntegrityCheck,
 {
-    if let Source::Scanning(recovery) = &mut *source {
-        match recovery.next(storage, page) {
+    match &mut *source {
+        // A writer is open, so history really has run out.
+        Source::Writing(_) => return Ok(Next::EndOfHistory),
+        // A scan that ended somewhere no writer could be opened at. `EndOfHistory` is the
+        // input that produces `Intent::Schedule` and `Resolve::Redeliver` — the two rows
+        // that lead to dispatch — so answering it here would offer the world an effect this
+        // bank can never record. Unreachable today because every `open` failure sets `stop`
+        // first; spelled as the refusal it has to be rather than left to the call graph.
+        Source::Spent => return Err(DriveError::NoAppendPoint),
+        Source::Scanning(recovery) => match recovery.next(storage, page) {
             Some(Ok(record)) => return Ok(Next::Record(record)),
             Some(Err(error)) => return Err(DriveError::Recovery(error)),
             None => {}
-        }
-    } else {
-        return Ok(Next::EndOfHistory);
+        },
     }
-    open(source)?;
+    open(source, reserve)?;
     Ok(Next::EndOfHistory)
 }
 
@@ -325,12 +392,15 @@ where
     S: StableStorage,
     C: IntegrityCheck,
 {
-    let Source::Writing(journal) = source else {
+    let Source::Writing(reserved) = source else {
         return Err(DriveError::NoAppendPoint);
     };
-    journal
+    reserved
         .stage(storage, record, page)
-        .map_err(DriveError::Append)?
+        .map_err(|error| match error {
+            ReservedError::Capacity(refusal) => DriveError::Capacity(refusal),
+            ReservedError::Append(error) => DriveError::Append(error),
+        })?
         .payload_barrier(storage)
         .map_err(DriveError::Append)?
         .commit(storage)
@@ -401,6 +471,7 @@ struct Context<'a, S: StableStorage, A: Activities, C: IntegrityCheck> {
     page: &'a mut [u8],
     result: &'a mut [u8],
     source: Source<C>,
+    reserve: Reserve,
     stop: Option<Stop<S::Error>>,
 }
 
@@ -420,6 +491,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             page,
             result,
             mut source,
+            reserve,
             stop,
             ..
         } = self;
@@ -446,7 +518,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
 
         // Bound and collapsed in one statement: a `Next` that stayed alive across the
         // match would hold the page borrow into the arm that has to write through it.
-        let terminated = match peek(&mut source, storage, &mut *page)? {
+        let terminated = match peek(&mut source, storage, &mut *page, reserve)? {
             // §08 row 5 reached outside an effect boundary: the workflow and history agree
             // that the run is over, and history is what the caller is told.
             Next::Record(record) => {
@@ -465,10 +537,20 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
         let (conclusion, result_len) = if let Some(recorded) = terminated {
             recorded
         } else {
+            // Copied first, and the record written only if it fit. The other order commits a
+            // terminal record and then refuses the boot that wrote it, so a run that really
+            // completed reports `ResultTooLong` on this boot and on every boot after it.
+            // Nothing else in this crate is ordered that way: `dispatch` measures an
+            // activity's answer before it records one, for the same reason.
+            let recorded = store(outcome, result)?;
             let record = terminal(outcome);
-            write(&mut source, storage, &record, page)?;
+            // Advanced before it is written, which is the order every other record here is
+            // in: the kernel says a record may follow, and only then does it reach media.
+            // §08 has no edge from an unresolved effect to a terminal record, so this is
+            // where a run that ended with one outstanding is refused rather than recorded.
             machine.advance(record).map_err(DriveError::Kernel)?;
-            store(outcome, result)?
+            write(&mut source, storage, &record, page)?;
+            recorded
         };
         Ok(Progress::Finished {
             conclusion,
@@ -525,6 +607,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             page,
             result,
             source,
+            reserve,
             stop,
             ..
         } = self;
@@ -540,14 +623,18 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             }));
             return Decision::Stop;
         };
-        let input_crc = frame::input_digest(input);
+        // The check this driver seals with, not the shipped one. `waymaker-flash`'s own
+        // documentation says why: a build that sealed frames with one check and digested
+        // activity inputs with another records a digest no replay of it can reproduce, and
+        // §08's divergence comparison then fails on every effect.
+        let input_crc = frame::input_digest_with::<C>(input);
         let request = EffectRequest {
             kind,
             input_len,
             input_crc,
         };
 
-        let half = match peek(source, *storage, page) {
+        let half = match peek(source, *storage, page, *reserve) {
             Err(error) => Half::Failed(error),
             Ok(next) => match machine.intent(request, next) {
                 Ok(Intent::Schedule { id }) => Half::Schedule(id),
@@ -592,7 +679,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                 Decision::Dispatch(id)
             }
             Half::Recorded => {
-                let resolved = match peek(source, *storage, page) {
+                let resolved = match peek(source, *storage, page, *reserve) {
                     Err(error) => Resolved::Failed(error),
                     Ok(next) => match machine.outcome(next) {
                         Ok(Resolve::Replayed { outcome, .. }) => match store(outcome, result) {
@@ -630,11 +717,15 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             result,
             source,
             stop,
+            ..
         } = self;
 
-        let performed = activities.perform(id, kind, input, result);
-        let produced = match performed {
-            Performed::Completed(produced) | Performed::Failed(produced) => produced,
+        // Matched once. A second match would need an arm for `Pending`, which cannot be
+        // reached here — and an unreachable arm that picks a record kind is a wrong default
+        // waiting for the day it is reachable.
+        let (produced, failed) = match activities.perform(id, kind, input, result) {
+            Performed::Completed(produced) => (produced, false),
+            Performed::Failed(produced) => (produced, true),
             Performed::Pending => {
                 *stop = Some(Stop::Waiting(id));
                 return Err(Suspended::NEW);
@@ -649,21 +740,22 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             return Err(Suspended::NEW);
         };
 
-        let (outcome, record) = match performed {
-            Performed::Failed(_) => (
+        let (outcome, record) = if failed {
+            (
                 Outcome::Failed(bytes),
                 RecordRef::EffectFailed {
                     seq: id.seq,
                     error: bytes,
                 },
-            ),
-            Performed::Completed(_) | Performed::Pending => (
+            )
+        } else {
+            (
                 Outcome::Completed(bytes),
                 RecordRef::EffectCompleted {
                     seq: id.seq,
                     result: bytes,
                 },
-            ),
+            )
         };
         if let Err(error) = write(source, *storage, &record, page) {
             *stop = Some(Stop::Failed(error));
