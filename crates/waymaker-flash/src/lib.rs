@@ -30,7 +30,9 @@
 //! ways out of a full journal cost on this layout, and the one gate that refuses an ordinary
 //! record while both are still affordable — before the device is called at all.
 //!
-//! What is still owed at 0.2 is the bank swap and `continue_as_new`.
+//! [`swap`] is §10's `continue_as_new`: the seven-step bank swap as a typestate, in which
+//! the run being retired gives up its writer at step 1 and a generation seal cannot be
+//! programmed without the payload barrier of step 4 in front of it.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -44,6 +46,7 @@ pub mod frame;
 pub mod integrity;
 pub mod recovery;
 pub mod storage;
+pub mod swap;
 
 pub use append::{AppendError, Journal, Sealable, Staged, WriteAmplification};
 pub use bank::{
@@ -54,3 +57,4 @@ pub use frame::{Decoded, Frame, ProgramAlign, Scan};
 pub use integrity::{Catalogued, IntegrityCheck};
 pub use recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 pub use storage::{Geometry, GeometryError, StableStorage};
+pub use swap::{Installed, Prepared, Retired, Swap, SwapError, SwapFailure};

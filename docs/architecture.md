@@ -371,6 +371,14 @@ Recovery never combines the two runs' footprints. The generation seal written at
 what makes the new bank authoritative, and it is written only once the payload it seals is
 already durable.
 
+Each step above is a type in `waymaker_flash::swap`, and the arrows are which type the step
+before it returns: step 1 is `Swap::beginning` consuming the retiring run's writer, step 2 is
+`Swap::prepare`, step 3 is `Prepared::stage`, step 4 is `Staged::payload_barrier`, steps 5
+and 6 are `Sealable::commit`, and step 7 is `Installed::reclaim`. So "a crash before step 5
+recovers the old run" is a statement about a value that does not exist yet rather than about
+a line nobody has reordered — see
+[ADR 0022](adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md).
+
 The banks themselves, before and after:
 
 <!-- diagram: two-bank-generations -->

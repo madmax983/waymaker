@@ -1185,12 +1185,13 @@ fn journal_append() -> usize {
     });
     kept = kept.wrapping_add(amplification_cost(WriteAmplification::NONE));
 
-    // §10's reserve is measured with the writer this function already built rather than with
-    // one of its own. A second geometry, region, recovery and `Journal::after` in the probe
-    // would be charged to the engine's row, and issue #72 is about how much of this figure
-    // is already the probe's own arithmetic.
+    // §10's reserve and §10's swap are measured with the geometry and the writer this
+    // function already built rather than with ones of their own. A second geometry, region,
+    // recovery and `Journal::after` in the probe would be charged to the engine's row, and
+    // issue #72 is about how much of this figure is already the probe's own arithmetic.
     kept = kept.wrapping_add(match waymaker_flash::bank::BankLayout::new(geometry) {
-        Ok(layout) => capacity_reserve(&mut media, layout, journal),
+        Ok(layout) => capacity_reserve(&mut media, layout, journal)
+            .wrapping_add(bank_swap(&mut media, layout)),
         Err(error) => error.message().len(),
     });
 
@@ -1289,6 +1290,124 @@ fn capacity_reserve(
     core::hint::black_box(show);
 
     core::hint::black_box(kept)
+}
+
+/// §10's `continue_as_new`: the seven-step bank swap, and the bank it retires.
+///
+/// Issue [#26](https://github.com/madmax983/waymaker/issues/26), and a row of the delta a
+/// device pays once per run rather than on every append. Every public function of
+/// `waymaker_flash::swap` is called from here, which is `size-probe-reach`'s requirement,
+/// and both halves are linked: the refusal a swap can be planned with and the seven steps
+/// that follow one it accepts.
+///
+/// The layout and the media are arguments for [`capacity_reserve`]'s reason — a second boot
+/// sequence in the probe would charge the engine for the probe's own scaffolding — and the
+/// retired reader is an unscanned [`Recovery`], because what this row is meant to charge for
+/// is the swap and not a second walk of a journal [`journal_append`] has already walked.
+///
+/// [`Recovery`]: waymaker_flash::recovery::Recovery
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -> usize {
+    use waymaker_core::RunId;
+    use waymaker_flash::bank::{Authority, BankHeader, BankId, Generation};
+    use waymaker_flash::recovery::{JournalRegion, Recovery};
+    use waymaker_flash::swap::{Retired, Swap, SwapError};
+
+    let align = layout.align();
+    let Ok(region) = JournalRegion::spanning(
+        layout.geometry(),
+        core::hint::black_box(0),
+        core::hint::black_box(64),
+        align,
+    ) else {
+        return 0;
+    };
+    // One `black_box`, on the field the refusals turn on. Five would keep five stores alive
+    // and charge the engine's row for them.
+    let next = BankHeader {
+        run: RunId(core::hint::black_box(2)),
+        align,
+        workflow_kind: 1,
+        workflow_version: 2,
+        input_schema: 1,
+        input: b"next",
+    };
+    let swap = match Swap::beginning(
+        layout,
+        Authority::Bank {
+            id: BankId::A,
+            generation: Generation(core::hint::black_box(1)),
+        },
+        RunId(core::hint::black_box(1)),
+        Retired::Recovery(Recovery::new(region)),
+        next,
+    ) {
+        Ok(swap) => swap,
+        Err(error) => return swap_error_cost(error),
+    };
+
+    let mut page = [0_u8; 64];
+    let installed = match swap
+        .prepare(media)
+        .and_then(|prepared| prepared.stage(media, &mut page))
+        .and_then(|staged| staged.payload_barrier(media))
+        .and_then(|sealable| sealable.commit(media))
+    {
+        Ok(installed) => installed,
+        Err(error) => return swap_failure_cost(error),
+    };
+
+    // Everything a caller does with a completed swap: where the new run writes, what the
+    // next swap begins from, and the identity space it starts in.
+    let mut kept = (installed.region().bytes() as usize)
+        .wrapping_add(generation_cost(installed.authority()))
+        .wrapping_add(usize::from(installed.allocator().peek().is_some()));
+    kept = kept.wrapping_add(match installed.reclaim(media) {
+        Ok(()) => 1,
+        Err(error) => swap_failure_cost(error),
+    });
+
+    // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a
+    // function pointer for the reason [`capacity_reserve`] retains its: formatting something
+    // would link `core::fmt::write` and charge this row for machinery the impl avoids.
+    let show: fn(&SwapError, &mut core::fmt::Formatter<'_>) -> core::fmt::Result =
+        <SwapError as core::fmt::Display>::fmt;
+    core::hint::black_box(show);
+
+    core::hint::black_box(kept)
+}
+
+/// Whether a swap's own accessor named a bank, folded so the call cannot be discarded.
+///
+/// Deliberately not a three-armed `match` over [`waymaker_flash::bank::Authority`]. That
+/// enum's arms are already linked by `bank_seal_and_selection`, and a second `match` here
+/// would charge the engine's row for arithmetic that belongs to this file — which is issue
+/// [#72](https://github.com/madmax983/waymaker/issues/72).
+#[cfg(feature = "engine")]
+const fn generation_cost(authority: waymaker_flash::bank::Authority) -> usize {
+    matches!(authority, waymaker_flash::bank::Authority::Bank { .. }) as usize
+}
+
+/// Every arm of a swap's planning refusal.
+#[cfg(feature = "engine")]
+const fn swap_error_cost(error: waymaker_flash::swap::SwapError) -> usize {
+    error.message().len()
+}
+
+/// Every arm of a swap step's refusal.
+///
+/// `SwapFailure` carries no `message` of its own — see its documentation for why — so this
+/// is what a driver's own reporting looks like, and linking it is what makes the row honest.
+#[cfg(feature = "engine")]
+const fn swap_failure_cost(
+    error: waymaker_flash::swap::SwapFailure<waymaker_flash::storage::GeometryError>,
+) -> usize {
+    match error {
+        waymaker_flash::swap::SwapFailure::Storage(inner) => inner.message().len(),
+        waymaker_flash::swap::SwapFailure::Encode(inner) => inner.message().len(),
+        waymaker_flash::swap::SwapFailure::WrongDevice => 1,
+    }
 }
 
 /// Every arm of a reserve's construction refusal.
