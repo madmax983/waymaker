@@ -15,12 +15,16 @@
 //! that: only one injection is armed per run, and everything before it is identical by
 //! construction.
 //!
-//! # The two effects are different questions
+//! # The three effects are different questions
 //!
 //! [`Interruption::PowerLoss`] asks "what is on media if the world stops here" — nothing after it
-//! runs, ever. [`Interruption::Failure`] asks "what does the writer do when this call returns an
-//! error" — the media may already have changed, and the writer carries on. Design document
-//! §12 requires both: `program` and `erase` "may fail **or** be interrupted".
+//! runs, ever. [`Interruption::Watchdog`] asks the same of a reset the supply survives, which
+//! leaves a whole number of units on media and tells the writer nothing. [`Interruption::Failure`]
+//! asks "what does the writer do when this call returns an error" — the media may already have
+//! changed, and the writer carries on. Design document §12 requires the last of the three:
+//! `program` and `erase` "may fail **or** be interrupted"; issue
+//! [#27](https://github.com/madmax983/waymaker/issues/27) requires the first two, and requires
+//! them to be different.
 //!
 //! # None of these enums is `#[non_exhaustive]`
 //!
@@ -73,6 +77,27 @@ impl Op {
                 .collect(),
             Self::Barrier => Vec::new(),
         }
+    }
+
+    /// The points strictly inside this operation at which a *core reset* can interrupt it.
+    ///
+    /// The unit boundaries, and nothing between them. A watchdog reset holds the supply, so
+    /// the flash controller finishes the unit the core stopped believing in: a reset inside a
+    /// unit leaves what a reset at the boundary above it leaves, and answers the caller the
+    /// same way, so enumerating both would count one crash point twice.
+    ///
+    /// A program's unit is the program size and an erase's is the erase block, so this is a
+    /// subset of [`tear_points`](Self::tear_points) for both.
+    fn reset_points(self, geometry: Geometry) -> Vec<u32> {
+        let (len, unit) = match self {
+            Self::Program { len, .. } => (len, geometry.program_size()),
+            Self::Erase { len, .. } => (len, geometry.erase_size()),
+            Self::Barrier => return Vec::new(),
+        };
+        (1..)
+            .map_while(|units: u32| units.checked_mul(unit))
+            .take_while(|boundary| *boundary < len)
+            .collect()
     }
 
     /// Whether this operation has a state between "did nothing" and "did everything" that a
@@ -140,6 +165,50 @@ pub enum Interruption {
     ///
     /// [`FaultError::PowerLoss`]: crate::FaultError::PowerLoss
     PowerLoss,
+    /// The core was reset while the supply held.
+    ///
+    /// Issue [#27](https://github.com/madmax983/waymaker/issues/27): "a watchdog reset is not
+    /// identical to a brownout and both must be covered". It differs in three ways, and the
+    /// first two are here.
+    ///
+    /// **The unit in flight completes.** The supply holds, so the flash controller finishes
+    /// the program unit or the erase block the core stopped believing in. Media after a
+    /// watchdog reset always holds a whole number of units; a brownout can stop inside one.
+    /// A [`Progress::Bytes`] armed here is therefore rounded *up* to the unit.
+    ///
+    /// **The writer is never told.** The call returns [`FaultError::WatchdogReset`] at every
+    /// [`Progress`], including [`Whole`](Progress::Whole) — where a power cut returns
+    /// `Ok(())` first. Design document §02 decision 3 is about that state: a writer that does
+    /// `barrier()?` and then dispatches dispatches after a power cut and does not after a
+    /// watchdog reset.
+    ///
+    /// The third difference is retained RAM, which this crate does not model. `waymaker-rig`
+    /// owns it, because a durable witness is what RAM retention would let a reader skip.
+    ///
+    /// # Why the interior points are unit boundaries
+    ///
+    /// Because a point inside a unit is the boundary above it. The unit completes, so the
+    /// media are the same, and the call answers `FaultError::WatchdogReset` either way — one
+    /// crash point, listed once.
+    ///
+    /// A *power-cut* point at the same offset is not the same world, and the difference is
+    /// not only the media. The two causes hand the writer different errors, and this crate's
+    /// writer is any `FnMut` over a [`Session`](crate::Session): it may catch the error and do
+    /// something that is not a storage call. So a watchdog reset is enumerated at every
+    /// boundary of its own rather than folded into the brownout that left the same bytes.
+    ///
+    /// On media it is nevertheless *weaker* than a brownout — every image it leaves is one
+    /// some power cut also leaves, which `tests/watchdog.rs`'s
+    /// `every_watchdog_image_is_one_a_power_cut_also_produces` proves over the real journal
+    /// writer. What is not weaker is the answer.
+    ///
+    /// One cost of this falls on the rig rather than here, and it is stated where it lands: a
+    /// watchdog reset can never be *in* the dispatch window, because reaching that window
+    /// needs the mark's barrier to have returned and a watchdog reset is the reset that does
+    /// not return. That cell is a board's.
+    ///
+    /// [`FaultError::WatchdogReset`]: crate::FaultError::WatchdogReset
+    Watchdog,
     /// The call returns an error and the writer carries on. Design document §12's "program
     /// and erase may fail".
     Failure,
@@ -169,10 +238,18 @@ pub struct Injection {
 ///
 /// * `(0, None, PowerLoss)` — the world stopping before the sequence began;
 /// * `(i, Bytes(n), PowerLoss)` for every interior tear point of every operation;
-/// * `(i, Whole, PowerLoss)` for every operation that can change media — the operation
-///   completes and returns, the power then goes, and the writer meets it at its next
-///   storage call. That is also "power loss *before* operation `i + 1`", so the two are one
-///   entry rather than two;
+/// * `(i, Whole, PowerLoss)` for every operation that is not a no-op, a barrier included —
+///   the operation completes and returns, the power then goes, and the writer meets it at
+///   its next storage call. That is also "power loss *before* operation `i + 1`", so the two
+///   are one entry rather than two;
+/// * for [`Interruption::Watchdog`], `(i, None, Watchdog)` before *every* operation, an
+///   interior point per unit boundary, and `(i, Whole, Watchdog)`. Two differences from the
+///   power-cut half. A core reset is offered at *unit* boundaries rather than at every byte,
+///   because the unit in flight completes and a point inside one leaves what the boundary
+///   above it leaves and answers the caller the same way. And `None` is offered before every
+///   operation rather than only before the first, because "reset before operation `i`" is
+///   not the previous operation's `Whole` point here: a watchdog reset at `Whole` returns an
+///   error, so the writer never reaches whatever it does between the two;
 /// * `(i, None, Failure)`, `(i, Bytes(n), Failure)` and `(i, Whole, Failure)` for every
 ///   operation that can fail after the fact, and `(i, None, Failure)` alone for a barrier
 ///   or for an operation that moves no bytes.
@@ -201,6 +278,42 @@ pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
                 op: index,
                 progress: Progress::Whole,
                 interruption: Interruption::PowerLoss,
+            });
+        }
+    }
+
+    if ops.is_empty() {
+        points.push(Injection {
+            op: 0,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        });
+    }
+    for (index, op) in ops.iter().enumerate() {
+        // Before this operation started. Unlike the power-cut half, this is *not* the
+        // previous operation's `Whole` point read a second way: a power cut there returns
+        // `Ok(())` and the writer carries on to whatever it does next, while a watchdog
+        // reset there returns an error and it does not. So `program_a()?; effect();
+        // program_b()?` reaches the effect under `(b, None, Watchdog)` and under no other
+        // watchdog point, and a list without this one would omit an execution the writer
+        // really has. Codex found it on the fourth review round.
+        points.push(Injection {
+            op: index,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        });
+        for bytes in op.reset_points(geometry) {
+            points.push(Injection {
+                op: index,
+                progress: Progress::Bytes(bytes),
+                interruption: Interruption::Watchdog,
+            });
+        }
+        if !op.mutates_nothing() {
+            points.push(Injection {
+                op: index,
+                progress: Progress::Whole,
+                interruption: Interruption::Watchdog,
             });
         }
     }

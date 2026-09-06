@@ -26,7 +26,12 @@ pub enum Durability {
     /// Some or all of it reached media, and no barrier has ordered it since. Recovery may
     /// produce it or not; both are legal.
     PossiblyDurable,
-    /// A barrier completed after every one of its writes. Recovery **must** produce it.
+    /// A barrier *returned* after every one of its writes. Recovery **must** produce it.
+    ///
+    /// Returned, not merely completed. Design document §15's guarantee is about a promise,
+    /// and a barrier that changed media without handing control back promised nothing — so a
+    /// record ordered by one is [`PossiblyDurable`](Self::PossiblyDurable) here even though
+    /// it is durable in fact. That understates in the direction a check must understate in.
     Acknowledged,
 }
 

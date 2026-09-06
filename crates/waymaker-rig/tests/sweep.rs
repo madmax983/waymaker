@@ -14,29 +14,67 @@
 //!   model has. That is precisely why the boards are still owed, and
 //!   `xtask::docs::HARDWARE_TARGETS` says so.
 //!
-//! # Why every cell this file fills is a power cut
+//! # Which cell a run fills, and what a cell is worth
 //!
-//! An earlier version of this file partitioned the injector's enumeration into the two reset
-//! causes — a torn program for a brownout, a whole or unstarted one for a watchdog — and
-//! reported a complete census. Codex was right to reject it, and the reason is worth keeping
-//! here rather than in a commit message.
+//! A cell is credited from the injector's own cause, never from a reading of `Progress`. An
+//! earlier version of this file partitioned power cuts by how much of an operation completed
+//! and called half of them watchdog resets. Codex was right to reject it: that groups power
+//! cuts, it does not perform a reset the supply survives.
 //!
-//! Every injection the harness performs is an [`Interruption::PowerLoss`], whose documented
-//! contract is "the world stops here": nothing runs afterwards, the session is dead, and the
-//! image is what media held at that instant. What separates a watchdog reset from a brownout
-//! is that the supply *holds* — the flash controller may finish a unit the core has stopped
-//! believing in, RAM is not cleared, and the reset-cause register says which happened. The
-//! model has none of those. Splitting `Progress` two ways groups power cuts by how much of an
-//! operation completed; it does not perform a watchdog reset, and calling the result watchdog
-//! coverage is the relabelling this crate exists to avoid.
+//! The harness now performs one. [`Interruption::Watchdog`] holds the supply, so the flash
+//! controller finishes the unit the core stopped believing in and the writer is never told the
+//! operation completed. [`cause_of`] reads the cause off the injection, and
+//! [`a_watchdog_cell_is_credited_only_by_a_watchdog_reset`] is what keeps it reading the cause
+//! rather than the progress.
 //!
-//! So this file fills the three [`ResetCause::PowerCut`] cells and says so. The three
-//! [`ResetCause::Watchdog`] cells are a **hardware** obligation, and they are inside the rows
-//! `xtask::docs::HARDWARE_TARGETS` already carries — both of which name "power-cut *and
-//! watchdog-reset* loops". What this crate does supply for them is everything but the
-//! evidence: the plan arms the cause, [`PlannedCut`] hands it to the cutter, the log line
-//! records it, and the census refuses a run that never reached them. That refusal is a tested
-//! property below rather than a claim.
+//! # What the filled watchdog cells buy, stated exactly
+//!
+//! Less at a write point than a reader would assume, and the amount is measured rather than
+//! described.
+//!
+//! On media a watchdog reset is *weaker* than a brownout: `waymaker-fault`'s
+//! `every_watchdog_image_is_one_a_power_cut_also_produces` proves it. The two causes part
+//! company over what the *call* answered, so at a *completed* operation they can only diverge
+//! where something other than another storage call follows — which in this rig is the
+//! dispatch, and nowhere else.
+//!
+//! [`the_two_causes_part_company_only_where_an_effect_follows_a_completed_call`] is that,
+//! measured over whole operations: identical media at every one, identical dispatch wherever
+//! the *engine* was interrupted, and a divergence somewhere. So at a schedule or a completion
+//! write the watchdog cell records that the cause was performed and that recovery survived it;
+//! it does not record a run its power-cut twin did not also produce. Saying so is the
+//! difference between a census and a tally.
+//!
+//! # How the dispatch cell fills under a watchdog reset
+//!
+//! At exactly one crash point, and it took two review rounds to find the right one.
+//!
+//! Not at the dispatch mark's own commit barrier: that barrier does not return under this
+//! cause, so the effect never goes out. And not inside the *next* witness program either,
+//! which is what an earlier revision credited — there a write is in flight, so the run was cut
+//! during that write and not in the window. It read like the window because the torn mark is
+//! not whole, leaving `attempted` on the schedule while `effects` had moved.
+//!
+//! It fills at `(next operation, Progress::None, Watchdog)`: the dispatch mark's barrier
+//! returned, the dispatcher ran, and the core reset before the next program began. Nothing on
+//! media is half done and the effect is out, which is the window design document §02 decision
+//! 3 opens. The power-cut cell fills at the mirror of it — `(barrier, Whole, PowerLoss)`,
+//! where the call returns and the world stops before the next one.
+//!
+//! Both halves of that are Codex's, from the third and fourth rounds:
+//! [`in_flight`] is the qualification that stops the wrong runs counting, and the `None`
+//! watchdog point before every operation is what makes the right one exist.
+//! [`a_write_in_flight_is_not_the_dispatch_window`] requires the wrong runs to exist, so the
+//! qualification cannot quietly stop qualifying.
+//!
+//! # What the boards still owe
+//!
+//! Everything physical, for both causes. A real part may abort the unit in flight rather than
+//! finish it, may leave a bit at neither level, has a reset-cause register no model has, and
+//! runs a watchdog off a timer rather than at a call boundary; RAM retention is real there and
+//! is modelled here only in `tests/teeth.rs`, as the shortcut it makes available.
+//! `xtask::docs::HARDWARE_TARGETS` carries both rows and both stay `Not run`. A complete
+//! census here is a complete census *of the model*.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -100,14 +138,30 @@ fn records() -> u16 {
 
 /// The reset cause an injection models.
 ///
-/// One answer, because the harness has one: `Interruption::PowerLoss` is a power cut whatever
-/// `Progress` it stopped at. See the module documentation for why this used to have two.
+/// Read off the injection's own cause. `Progress` says how much of an operation landed, which
+/// is not a reset cause — see the module documentation for the version of this that read one.
 const fn cause_of(injection: Injection) -> Option<ResetCause> {
     match injection.interruption {
         // A failed call the writer reacts to is not a reset at all.
         Interruption::Failure => None,
         Interruption::PowerLoss => Some(ResetCause::PowerCut),
+        Interruption::Watchdog => Some(ResetCause::Watchdog),
     }
+}
+
+/// Whether a storage operation was half done when the run stopped.
+///
+/// [`Progress::Bytes`] is the only crash point with an operation open: `None` is before it
+/// started and `Whole` is after it finished. A run with a write in flight is a run cut during
+/// that write, whatever its witness happens to say.
+const fn in_flight(run: &Run) -> bool {
+    matches!(
+        run.injection(),
+        Some(Injection {
+            progress: Progress::Bytes(_),
+            ..
+        })
+    )
 }
 
 /// Whether the interrupted operation was a write to the *engine*, rather than to the rig's
@@ -144,21 +198,27 @@ fn interrupted_the_engine(run: &Run, rig: &Rig) -> bool {
 /// out — deliberately, so it over-claims rather than under-claims — so a power loss that takes
 /// the mark's own commit barrier leaves the mark whole on media with `dispatch` never called.
 /// Crediting the dispatch cell from the mark alone would report a cut in the instrument's
-/// write as a cut in the dispatch window, which is the same relabelling the watchdog cells are
-/// left empty to avoid.
+/// write as a cut in the dispatch window, which is the same relabelling [`cause_of`] refuses.
 ///
-/// What makes the cell reachable at all is [`Interruption::PowerLoss`] at `Progress::Whole`:
-/// the operation returns `Ok(())` and the writer meets the power at its *next* storage call.
-/// So a run cut after the mark's commit barrier really does run `dispatcher.dispatch()` and
-/// really does stop in the window §02 decision 3 opens — the one phase with no storage
-/// operation in flight — which is why that window can be measured here rather than owed to
-/// hardware.
+/// The second qualification is that **nothing was in flight**, and it was Codex's, on the
+/// fourth review round. [`Phase::Dispatch`] is the interval in which the effect is under way
+/// and no storage operation is: a reset that landed *inside* a later witness program is a
+/// reset during that write, not during the dispatch. It reads like one because the torn mark
+/// is not whole, so `attempted` still names the schedule while `effects` has already moved —
+/// which is the same shape as reading a mark as the event it marks.
+///
+/// [`in_flight`] is that qualification. A crash point at [`Progress::Bytes`] has an operation
+/// half done; `None` and `Whole` do not, and those are the two that can be in the window: a
+/// power cut at `Whole` returns `Ok(())` and takes the world at the *next* call, and a
+/// watchdog reset at the next operation's `None` returns nothing at all. Both leave the run
+/// stopped with the effect out and no write open, which is the window §02 decision 3 opens.
 fn phase_of(marks: Marks, run: &Run, rig: &Rig, effects: usize) -> Option<Phase> {
     let workload = rig.workload(0);
     let index = marks.attempted()?;
     match workload.role(index)? {
         Role::Schedule(effect) => {
-            if marks.dispatched() == Some(index) && effects > usize::from(effect) {
+            if marks.dispatched() == Some(index) && effects > usize::from(effect) && !in_flight(run)
+            {
                 Some(Phase::Dispatch)
             } else if interrupted_the_engine(run, rig) {
                 Some(Phase::Schedule)
@@ -349,10 +409,9 @@ fn every_crash_point_leaves_media_the_oracle_accepts() {
 }
 
 #[test]
-fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
-    // Issue #27's census, over the half a host can supply. A sweep that never reached a
-    // dispatch-phase cut has said nothing about that cell, and this is what makes the silence
-    // a failure.
+fn the_sweep_covers_every_cell_of_the_census() {
+    // Issue #27's census, all six cells. A sweep that never reached a dispatch-phase reset has
+    // said nothing about that cell, and this is what makes the silence a failure.
     let harness = Harness::new(geometry());
     // What the dispatcher was entered for, one entry per run. `Harness::run` calls the writer
     // once for the fault-free run and then once per crash point, in the order it returns them,
@@ -405,24 +464,47 @@ fn the_sweep_covers_all_three_write_points_under_a_power_cut() {
         }
     }
     for phase in Phase::ALL {
-        assert!(
-            coverage.iterations(phase, ResetCause::PowerCut) > 0,
-            "the sweep never cut the {} write",
-            phase.name()
-        );
+        for cause in ResetCause::ALL {
+            assert!(
+                coverage.iterations(phase, cause) > 0,
+                "the sweep never reset the {} write with a {}",
+                phase.name(),
+                cause.name()
+            );
+        }
     }
-
-    // And the half it cannot: the census must still refuse this run, because a watchdog reset
-    // has not happened. A host sweep that reported a complete census would be reporting
-    // coverage nothing produced — which is what this file used to do.
-    let gap = coverage
+    coverage
         .verdict()
-        .expect_err("a host sweep performs no watchdog reset, so the census is not complete");
-    assert_eq!(
-        gap.cause(),
-        ResetCause::Watchdog,
-        "the only cells a host cannot fill are the watchdog ones"
-    );
+        .expect("every cell of the census was reached");
+}
+
+#[test]
+fn a_watchdog_cell_is_credited_only_by_a_watchdog_reset() {
+    // The rule that keeps the census from being a relabelling. A cell is credited from the
+    // injector's cause, so a sweep that performed no watchdog reset cannot fill a watchdog
+    // cell however its power cuts are grouped.
+    //
+    // Stated over `cause_of` itself, which is the one function the census reads.
+    for progress in [Progress::None, Progress::Bytes(1), Progress::Whole] {
+        let power = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::PowerLoss,
+        };
+        assert_eq!(cause_of(power), Some(ResetCause::PowerCut));
+        let watchdog = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::Watchdog,
+        };
+        assert_eq!(cause_of(watchdog), Some(ResetCause::Watchdog));
+        let failure = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::Failure,
+        };
+        assert_eq!(cause_of(failure), None, "a failed call is not a reset");
+    }
 }
 
 #[test]
@@ -493,28 +575,106 @@ fn a_dispatch_mark_is_not_evidence_that_the_dispatcher_ran() {
 }
 
 #[test]
-fn the_watchdog_cells_are_owed_by_hardware_and_the_census_says_so() {
-    // The rig supplies everything for a watchdog reset but the reset. This is that stated as a
-    // test rather than as a comment: a census with every power-cut cell filled is still
-    // incomplete, and the gap it names is a watchdog cell every time.
+fn a_power_cut_only_census_is_still_incomplete() {
+    // The census's own rule, independent of what any sweep reached: three filled cells are not
+    // six. A `Coverage::verdict` that stopped saying so would let a sweep whose watchdog half
+    // silently stopped running report a pass.
     let mut coverage = Coverage::EMPTY;
     for phase in Phase::ALL {
         coverage = coverage.record(phase, ResetCause::PowerCut);
     }
     let gap = coverage
         .verdict()
-        .expect_err("three of the six cells are hardware's");
+        .expect_err("half a census is not a census");
     assert_eq!(gap.cause(), ResetCause::Watchdog);
     assert_eq!(gap.phase(), Phase::Schedule);
 
-    // And the cause is carried end to end, so a board that *can* perform one is armed for it:
-    // the plan draws it, and the cutter is handed it.
+    // And the cause is carried end to end, so a board is armed for it: the plan draws it, and
+    // the cutter is handed it.
     let rig = rig();
     let armed = (0..64_u32)
         .map(|iteration| rig.cut_at(iteration))
         .filter(|cut| cut.cause() == ResetCause::Watchdog)
         .count();
     assert!(armed > 0, "no iteration in 64 armed a watchdog reset");
+}
+
+#[test]
+fn the_two_causes_part_company_only_where_an_effect_follows_a_completed_call() {
+    // What the two filled watchdog cells buy, measured rather than asserted — and the
+    // adversarial reading of this change answered rather than left open.
+    //
+    // Three claims, over every operation of the run at `Progress::Whole`:
+    //
+    // 1. the media are identical, whichever cause was armed;
+    // 2. wherever the *engine* was the thing interrupted — which is every run the schedule and
+    //    completion cells are credited from — the dispatch is identical too, so those cells
+    //    record no run their power-cut twins did not also produce;
+    // 3. somewhere the dispatch is *not* identical, so the two causes are two.
+    //
+    // The third is the dispatch mark's commit barrier, and the second is why it is the only
+    // one: everywhere else a completed call is followed by another storage call, which fails
+    // under either cause.
+    let harness = Harness::new(geometry());
+    let baseline = harness
+        .run(|session| drive(session).map(|_| ()).map_err(|_| ()))
+        .expect("the fault-free run succeeds");
+    let Some(clean) = baseline.first() else {
+        unreachable!("the fault-free run is first")
+    };
+    let operations = clean.ops().len();
+    let rig = rig();
+
+    let at = |op: usize, interruption: Interruption| {
+        let dispatched = RefCell::new(0_usize);
+        let outcome = harness.run_one(
+            Injection {
+                op,
+                progress: Progress::Whole,
+                interruption,
+            },
+            |session: &mut waymaker_fault::Session| {
+                let (result, effects) = drive_counting(session);
+                *dispatched.borrow_mut() = effects;
+                result.map(|_| ()).map_err(|_| ())
+            },
+        );
+        outcome.ok().map(|run| (dispatched.into_inner(), run))
+    };
+
+    let mut divergent = 0_usize;
+    let mut engine_points = 0_usize;
+    for op in 0..operations {
+        let (Some((power_effects, power)), Some((watchdog_effects, watchdog))) = (
+            at(op, Interruption::PowerLoss),
+            at(op, Interruption::Watchdog),
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            power.image(),
+            watchdog.image(),
+            "operation {op} left different media under the two causes"
+        );
+        if interrupted_the_engine(&power, &rig) {
+            engine_points += 1;
+            assert_eq!(
+                power_effects, watchdog_effects,
+                "operation {op} is an engine write and the two causes dispatched differently"
+            );
+        }
+        if power_effects != watchdog_effects {
+            divergent += 1;
+        }
+    }
+    assert!(
+        engine_points > 0,
+        "no operation interrupted the engine, so claim 2 is about nothing"
+    );
+    assert!(
+        divergent > 0,
+        "no operation dispatched differently, so the two causes are one run"
+    );
 }
 
 #[test]
@@ -1341,4 +1501,69 @@ fn passing_verdict() -> waymaker_rig::run::Verdict {
         unreachable!("a clean run has a verdict")
     };
     verdict
+}
+
+#[test]
+fn a_write_in_flight_is_not_the_dispatch_window() {
+    // The tooth for [`in_flight`], and Codex's fourth-round finding kept as a test.
+    //
+    // A reset inside a later witness program leaves that mark torn, so `attempted` still names
+    // the schedule and `effects` has already moved: the run reads like a dispatch-window reset
+    // and is a reset during a write. Without the qualification the census credited those, and
+    // the cell it credited wrongly is a cell that also fills rightly — so nothing failed.
+    //
+    // This asserts that such runs exist. If they stop existing, the qualification is guarding
+    // nothing and this says so rather than passing quietly.
+    let harness = Harness::new(geometry());
+    let dispatched = RefCell::new(Vec::new());
+    let runs = harness
+        .run(|session| {
+            let (outcome, effects) = drive_counting(session);
+            dispatched.borrow_mut().push(effects);
+            outcome.map(|_| ()).map_err(|_| ())
+        })
+        .expect("the fault-free run succeeds");
+    let dispatched = dispatched.into_inner();
+    let rig = rig();
+    let workload = rig.workload(0);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let (mut looked_like, mut credited) = (0_usize, 0_usize);
+
+    for (run, effects) in runs.iter().zip(dispatched) {
+        if run.injection().is_none() {
+            continue;
+        }
+        let mut device = device_after(run);
+        let marks = {
+            let mut instrument = waymaker_rig::window::Window::new(
+                &mut device,
+                rig.instrument_base(),
+                geometry().erase_size(),
+            )
+            .expect("the instrument window");
+            match Witness::new(rig.witness_region()).scan(&mut instrument, &mut page) {
+                Ok(marks) => marks,
+                Err(_) => continue,
+            }
+        };
+        let Some(index) = marks.attempted() else {
+            continue;
+        };
+        let Some(Role::Schedule(effect)) = workload.role(index) else {
+            continue;
+        };
+        if marks.dispatched() != Some(index) || effects <= usize::from(effect) {
+            continue;
+        }
+        looked_like += 1;
+        if phase_of(marks, run, &rig, effects) == Some(Phase::Dispatch) {
+            credited += 1;
+        }
+    }
+    assert!(credited > 0, "no run reached the dispatch window at all");
+    assert!(
+        looked_like > credited,
+        "every run whose witness and dispatcher agreed was really in the window, so the \
+         in-flight qualification is measuring nothing"
+    );
 }

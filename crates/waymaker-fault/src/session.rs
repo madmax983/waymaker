@@ -67,7 +67,12 @@ pub struct Session {
     /// `(record, index of the first operation that could belong to it)`. A `None` record
     /// is a *close*: it ends the span before it and starts one that belongs to nothing.
     marks: Vec<(Option<RecordId>, usize)>,
-    powered: bool,
+    /// The reset that ended this session, once one has happened.
+    ///
+    /// A cause rather than a flag, because the two resets are different worlds and a caller
+    /// that meets one at its next call should be told which. Every call after it returns this
+    /// error, records no operation, and touches no media.
+    stopped: Option<FaultError>,
 }
 
 impl Session {
@@ -81,7 +86,7 @@ impl Session {
             payloads: Vec::new(),
             barriers: Vec::new(),
             marks: Vec::new(),
-            powered: true,
+            stopped: None,
         }
     }
 
@@ -296,23 +301,70 @@ impl Session {
     const fn completed(&mut self, injection: Injection) -> Result<(), FaultError> {
         match injection.interruption {
             Interruption::PowerLoss => {
-                self.powered = false;
+                self.stopped = Some(FaultError::PowerLoss);
                 Ok(())
             }
+            // A watchdog reset stops the core, so there is no return for it to reach. The
+            // operation is on media and the writer is told nothing — which is the one
+            // difference between the two resets that media cannot show.
+            Interruption::Watchdog => Err(self.interrupt(Interruption::Watchdog)),
             Interruption::Failure => Err(FaultError::InjectedFailure),
         }
     }
 
-    /// The error an `interruption` reports, and the power state it leaves behind.
+    /// The error an `interruption` reports, and the state it leaves the session in.
     const fn interrupt(&mut self, interruption: Interruption) -> FaultError {
         match interruption {
             Interruption::PowerLoss => {
-                self.powered = false;
+                self.stopped = Some(FaultError::PowerLoss);
                 FaultError::PowerLoss
+            }
+            Interruption::Watchdog => {
+                self.stopped = Some(FaultError::WatchdogReset);
+                FaultError::WatchdogReset
             }
             Interruption::Failure => FaultError::InjectedFailure,
         }
     }
+
+    /// How much of an operation of `len` bytes reached media at `injection`.
+    ///
+    /// A watchdog reset holds the supply, so the unit in flight completes and the answer is
+    /// rounded *up* to `unit`. A power cut or a failure stops where it stopped — for an
+    /// erase, at the block boundary below, because no device erases byte by byte.
+    const fn landed_at(injection: Injection, len: u32, unit: u32) -> u32 {
+        let landed = Self::landed(injection.progress, len);
+        match injection.interruption {
+            Interruption::Watchdog => unit_completed(landed, len, unit),
+            Interruption::PowerLoss | Interruption::Failure => landed,
+        }
+    }
+
+    /// The same, for an erase, whose unit is the erase block.
+    fn erase_landed_at(&self, injection: Injection, len: u32) -> u32 {
+        let block = self.device.geometry().erase_size();
+        let landed = Self::landed(injection.progress, len);
+        match injection.interruption {
+            Interruption::Watchdog => unit_completed(landed, len, block),
+            Interruption::PowerLoss | Interruption::Failure => self.erase_blocks_of(landed),
+        }
+    }
+}
+
+/// `landed` raised to the next whole `unit`, and never past `len`.
+///
+/// The supply holds through a watchdog reset, so the unit the core stopped believing in is
+/// finished by the controller. `unit` is a geometry unit, which [`Geometry`] refuses to be
+/// zero, so the first guard is unreachable through a real device.
+const fn unit_completed(landed: u32, len: u32, unit: u32) -> u32 {
+    if unit == 0 {
+        return landed;
+    }
+    let raised = match landed.div_ceil(unit).checked_mul(unit) {
+        Some(raised) => raised,
+        None => u32::MAX,
+    };
+    if raised < len { raised } else { len }
 }
 
 impl StableStorage for Session {
@@ -323,15 +375,15 @@ impl StableStorage for Session {
     }
 
     fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
-        if !self.powered {
-            return Err(FaultError::PowerLoss);
+        if let Some(stopped) = self.stopped {
+            return Err(stopped);
         }
         self.device.read(offset, dst)
     }
 
     fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
-        if !self.powered {
-            return Err(FaultError::PowerLoss);
+        if let Some(stopped) = self.stopped {
+            return Err(stopped);
         }
         let len = u32::try_from(src.len()).map_err(|_| GeometryError::OutOfBounds)?;
         // Refused before anything is recorded, exactly as an unfaulted device refuses it: a
@@ -345,9 +397,10 @@ impl StableStorage for Session {
 
         let index = self.ops.len();
         self.ops.push(Op::Program { offset, len });
+        let unit = self.device.geometry().program_size();
         let landed = self
             .armed_for(index)
-            .map_or(len, |injection| Self::landed(injection.progress, len));
+            .map_or(len, |injection| Self::landed_at(injection, len, unit));
         let written = src.get(..landed as usize).unwrap_or(src);
         // Torn is "some of what this write meant to change is on media and the rest is
         // not", measured against the *media* rather than against the byte count. Both
@@ -380,16 +433,16 @@ impl StableStorage for Session {
     }
 
     fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
-        if !self.powered {
-            return Err(FaultError::PowerLoss);
+        if let Some(stopped) = self.stopped {
+            return Err(stopped);
         }
         self.device.geometry().validate_erase(offset, len)?;
 
         let index = self.ops.len();
         self.ops.push(Op::Erase { offset, len });
-        let landed = self.armed_for(index).map_or(len, |injection| {
-            self.erase_blocks_of(Self::landed(injection.progress, len))
-        });
+        let landed = self
+            .armed_for(index)
+            .map_or(len, |injection| self.erase_landed_at(injection, len));
         self.touched.push(self.device.apply_erase(offset, landed));
         self.payloads.push(0);
         self.missing.push(if landed == len {
@@ -411,8 +464,8 @@ impl StableStorage for Session {
     }
 
     fn barrier(&mut self) -> Result<(), Self::Error> {
-        if !self.powered {
-            return Err(FaultError::PowerLoss);
+        if let Some(stopped) = self.stopped {
+            return Err(stopped);
         }
 
         let index = self.ops.len();
@@ -423,16 +476,40 @@ impl StableStorage for Session {
 
         match self.armed_for(index) {
             // A barrier that returned an error establishes nothing a caller may rely on,
-            // whatever really happened on the wire. It has no interior, so any progress
-            // other than `None` says it ran — there is no half of a barrier to land.
-            Some(injection) if injection.progress == Progress::None => {
+            // whatever really happened on the wire. It has no interior, so any progress that
+            // is not zero says it ran — there is no half of a barrier to land.
+            //
+            // Zero is read rather than matched on the variant. [`Progress::Bytes`] documents
+            // that a hand-built zero *is* [`Progress::None`], and a guard that compared the
+            // variant let `Bytes(0)` through as a completed barrier — acknowledging a record
+            // from a barrier the caller had said did nothing.
+            Some(injection)
+                if matches!(injection.progress, Progress::None | Progress::Bytes(0)) =>
+            {
                 Err(self.interrupt(injection.interruption))
             }
-            // The barrier completed. Whether the power then went away or the call merely
-            // reported a failure, the ordering it established is on media.
+            // The barrier completed, so the ordering it established is on media. Whether it
+            // *acknowledged* anything is a different question, and the answer is what the
+            // call returned.
+            //
+            // Only a barrier that returned `Ok` acknowledges. Design document §15's
+            // guarantee is about a promise — "any record acknowledged after its barrier is
+            // recovered after reset" — and a call that handed back an error promised
+            // nothing. A power cut at `Progress::Whole` returns first and so still
+            // acknowledges; a watchdog reset never returns, and an injected failure returns
+            // an error, so neither does.
+            //
+            // The cost is that such a record is [`Durability::PossiblyDurable`] when it is
+            // in fact durable, which understates. That is the safe direction: recovery may
+            // produce it or not, and both are legal. Raising the obligation instead would
+            // make the oracle reject a reader that stopped one record short of a record
+            // nobody was ever told about.
             Some(injection) => {
-                self.barriers.push(index);
-                self.completed(injection)
+                let outcome = self.completed(injection);
+                if outcome.is_ok() {
+                    self.barriers.push(index);
+                }
+                outcome
             }
             None => {
                 self.barriers.push(index);

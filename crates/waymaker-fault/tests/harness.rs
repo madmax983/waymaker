@@ -986,3 +986,38 @@ fn one_run(injection: Injection) -> Run {
     };
     run
 }
+
+#[test]
+fn a_barrier_stopped_at_zero_bytes_is_a_barrier_that_did_nothing() {
+    // `Progress::Bytes` documents that a hand-built zero *is* `Progress::None`. A barrier has
+    // no interior, so the two have to answer the same: the ordering was not established, and
+    // the record before it is not acknowledged.
+    //
+    // The guard used to compare the variant rather than the value, so `Bytes(0)` was read as
+    // a barrier that ran. That obliged recovery to produce a record from a barrier the caller
+    // had said did nothing — a check failing in the direction a check must not.
+    for progress in [Progress::None, Progress::Bytes(0)] {
+        for interruption in [
+            Interruption::PowerLoss,
+            Interruption::Watchdog,
+            Interruption::Failure,
+        ] {
+            let injection = Injection {
+                // Operation 1 is the first record's barrier.
+                op: 1,
+                progress,
+                interruption,
+            };
+            let run = match Harness::new(geometry()).run_one(injection, two_records) {
+                Ok(run) => run,
+                Err(error) => unreachable!("{error}"),
+            };
+            assert_eq!(
+                run.ledger().state(RecordId(0)),
+                Some(Durability::PossiblyDurable),
+                "{injection:?} acknowledged a record from a barrier that did nothing"
+            );
+            assert_eq!(verify_recovery(run.ledger(), &[]), Ok(()));
+        }
+    }
+}

@@ -9,6 +9,19 @@
 //! Issue [#27](https://github.com/madmax983/waymaker/issues/27) asks for cuts at three write
 //! points and, separately, for "watchdog-reset tests at the same three points". Six cells,
 //! and a run that missed one is not a run that passed.
+//!
+//! # Where the six stand
+//!
+//! A host sweep fills all six: `waymaker_fault::Interruption::Watchdog` performs a real core
+//! reset, at every unit boundary and after every operation.
+//!
+//! The dispatch cell fills a little later under that cause than under a power cut. A watchdog
+//! reset at the dispatch mark's commit barrier never dispatches, because that barrier does not
+//! return; the cell is earned one operation on, when the reset lands inside the next mark with
+//! the effect already out.
+//!
+//! A complete census here is a complete census *of the model*. The physical half of both
+//! causes is owed by `xtask::docs::HARDWARE_TARGETS`, whose two rows stay `Not run`.
 
 use crate::phase::{Phase, ResetCause};
 

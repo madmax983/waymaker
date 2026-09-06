@@ -47,6 +47,20 @@ fn a_four_byte_program_tears_at_every_byte_inside_it() {
             power(Progress::Bytes(2)),
             power(Progress::Bytes(3)),
             power(Progress::Whole),
+            // Watchdog: the reset before anything, then the whole operation with the core
+            // stopping before the call returned. No interior point, because a four-byte
+            // program on a four-byte unit has no unit boundary inside it — see
+            // `Interruption::Watchdog`.
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+            Injection {
+                op: 0,
+                progress: Progress::Whole,
+                interruption: Interruption::Watchdog,
+            },
             // Failure: the call returns an error having done nothing, part of it, or all
             // of it. The last is not a contradiction — an operation whose status read
             // fails after the media changed is a real device.
@@ -155,25 +169,37 @@ fn the_enumeration_is_a_pure_function_and_has_no_duplicates() {
 #[test]
 fn the_count_is_the_arithmetic_the_sequence_implies() {
     // Power loss: one before anything, plus one per tear point, plus one after each op.
+    // Watchdog: one before *each* op, one per interior unit boundary, one after each op.
+    // Eight bytes of four-byte units has one interior boundary.
     // Failure: one per tear point plus `None` and `Whole` for each mutating op, and a
     // single point for each barrier.
     let ops = [Op::Program { offset: 0, len: 8 }, Op::Barrier];
     let points = injections(&ops, geometry());
     let power = 1 + 7 + 1 + 1;
+    let watchdog = 2 + 1 + 2;
     let failure = (7 + 2) + 1;
-    assert_eq!(points.len(), power + failure);
+    assert_eq!(points.len(), power + watchdog + failure);
 }
 
 #[test]
-fn an_empty_sequence_still_has_the_crash_point_before_it_started() {
+fn an_empty_sequence_still_has_the_crash_points_before_it_started() {
+    // One per reset cause. Both leave media untouched; they differ in what the writer's first
+    // call is told, which is the whole of the difference between the two causes.
     let points = injections(&[], geometry());
     assert_eq!(
         points,
-        vec![Injection {
-            op: 0,
-            progress: Progress::None,
-            interruption: Interruption::PowerLoss,
-        }]
+        vec![
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::PowerLoss,
+            },
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+        ]
     );
 }
 
@@ -196,6 +222,19 @@ fn an_operation_that_mutates_nothing_contributes_no_duplicate_worlds() {
                 op: 0,
                 progress: Progress::None,
                 interruption: Interruption::PowerLoss,
+            },
+            // One before each operation. Even for a call that moves no bytes the two are
+            // different worlds: under `(1, None, Watchdog)` operation zero returned `Ok`, and
+            // under `(0, None, Watchdog)` it did not.
+            Injection {
+                op: 0,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
+            },
+            Injection {
+                op: 1,
+                progress: Progress::None,
+                interruption: Interruption::Watchdog,
             },
             // The call still fails, and the writer still reacts to it: that is a crash
             // point, and it is the only one either operation has.

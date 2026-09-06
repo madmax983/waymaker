@@ -83,7 +83,15 @@ impl StableStorage for Blind {
 ///
 /// Pinned, for the reason `waymaker-spec`'s census is: a sweep that silently shrank is the
 /// direction that turns a proof into a formality.
-const SWEEP: usize = 48;
+///
+/// It moved from 48 to 70 when `waymaker-fault` grew a third cause, `Interruption::Watchdog`.
+/// A watchdog reset is enumerated at unit boundaries rather than at every byte, and it adds a
+/// `Progress::None` point before *every* operation as well as a `Whole` point after each — the
+/// two are different worlds under this cause, because a reset at `Whole` returns an error and
+/// the writer never reaches what follows. `arm` issues eleven operations with no interior unit
+/// boundary in any of them — three single-unit programs, three single-block erases and five
+/// barriers — so the third cause contributes two points each.
+const SWEEP: usize = 70;
 
 fn nested() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 64, 4, 2) else {
