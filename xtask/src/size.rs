@@ -2710,6 +2710,9 @@ mod tests {
     fn symbol(name: &str, size: u64, section_index: u16) -> crate::elf::Symbol {
         crate::elf::Symbol {
             name: name.to_owned(),
+            // Attribution is a sum over sizes and never reads an address; the fixtures
+            // say so by leaving every symbol at one.
+            address: 0,
             size,
             section_index,
         }

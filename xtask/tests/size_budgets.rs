@@ -330,13 +330,12 @@ fn the_probes_own_code_is_a_real_share_of_the_image_it_is_subtracted_from() {
 
 #[test]
 fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
-    // The second opinion for the symbol *reader*, as `the_parser_agrees_with_llvm_size_
-    // about_the_probe` is for the sections: a symbol table read at the wrong offsets
-    // answers with well-formed nonsense, and the gate would then subtract it. It says
-    // nothing about the attribution, because `defining_crate` decides both sides of the
-    // comparison — that is `no_symbol_the_gate_credits_to_the_probe_is_a_layers_body`,
-    // below, and the per-symbol section index is
-    // `elf::tests::both_classes_read_the_symbols_llvm_readobj_reads`.
+    // The second opinion for the symbol *reader*, as the `llvm-size` test above is for the
+    // sections: a symbol table read at the wrong offsets answers with well-formed nonsense,
+    // and the gate would then subtract it. It says nothing about the *attribution*, because
+    // `defining_crate` decides both sides of the comparison — the test below this one holds
+    // that, and the per-symbol section index is held in `xtask::elf`'s own tests, against
+    // `llvm-readobj`.
     let Some(llvm_nm) = llvm_tool("llvm-nm") else {
         panic!(
             "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
@@ -442,13 +441,19 @@ fn stripping_the_symbol_table_moves_no_byte_the_gate_measures() {
 }
 
 #[test]
-fn no_symbol_the_gate_credits_to_the_probe_is_a_layers_body() {
+fn no_symbol_the_gate_credits_to_the_probe_is_a_traits_own_provided_body() {
     // `defining_crate` reads the first crate root of a mangled path, and one v0 production
-    // puts them the other way round: `<Self as Trait>::method` for a method the *trait*
-    // provides names the self type first. A layer trait with a default body, implemented
-    // for a probe type, would then be a layer's bytes under the probe's name — and this
-    // gate subtracts what it reads as the probe's. The unit tests hold the parser; this
-    // holds the real image, through a demangler that is not ours.
+    // puts them the other way round: `Y` is `<Self as Trait>::method` for a method the
+    // *trait* provides, and it names the self type first. A layer trait with a default
+    // body, implemented for a probe type, would then be a layer's bytes under the probe's
+    // name — and this gate subtracts what it reads as the probe's.
+    //
+    // `X`, the impl's own method, demangles to the same `<A as B>::m` shape and is
+    // genuinely the probe's, so a demangler cannot tell the two apart. The mangled form
+    // can, and this scans for it the other way round from `defining_crate`: find the
+    // length-prefixed crate name as a substring and look at what came before it, rather
+    // than parse crate roots left to right. `llvm-nm --demangle` supplies the name a
+    // failure has to be readable as.
     let Some(llvm_nm) = llvm_tool("llvm-nm") else {
         panic!(
             "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
@@ -477,31 +482,81 @@ fn no_symbol_the_gate_credits_to_the_probe_is_a_layers_body() {
         "no symbol is credited to the probe, so this test checks nothing"
     );
 
-    // `llvm-nm --demangle` prints the same table with names spelled out. Line order and
-    // address are the same, so a symbol is found by its address and size.
+    // Falsifiable on this image rather than only on one a future layer produces: it
+    // already carries `<waymaker_flash::storage::Geometry as core::cmp::PartialEq>::ne`,
+    // whose body is `core`'s. A `defining_crate` that read the first crate root of a `Y`
+    // name would answer `waymaker_flash` for it.
+    let qualified: Vec<&xtask::elf::Symbol> = symbols
+        .iter()
+        .filter(|symbol| head_of(&symbol.name).is_some_and(|head| head.contains('Y')))
+        .collect();
+    assert!(
+        !qualified.is_empty(),
+        "the image carries no `Y` symbol, so the half of this test that can fail checks nothing"
+    );
+    for symbol in qualified {
+        assert_eq!(
+            size::defining_crate(&symbol.name),
+            None,
+            "`{}` is a trait's own provided body, whose crate the mangled path names second",
+            symbol.name
+        );
+    }
+
     for symbol in credited {
+        // `llvm-nm --print-size` prints `<address> <size> <type> <name>`, and the address
+        // is what identifies a defined symbol: any number of functions share a size, so
+        // pairing on one picks whichever came first. Bit 0 of `st_value` is the ARM
+        // interworking flag — a Thumb function is odd — and `llvm-nm` clears it while the
+        // ELF field carries it, so it is masked here; the size is matched as well, which
+        // is what tells a Thumb function from the zero-sized `$t` symbol at the same place.
         let spelled = demangled
             .lines()
             .find_map(|line| {
                 let fields: Vec<&str> = line.split_whitespace().collect();
+                let address = u64::from_str_radix(fields.first()?, 16).ok()?;
                 let size = u64::from_str_radix(fields.get(1)?, 16).ok()?;
-                if size != symbol.size {
+                if address != symbol.address & !1 || size != symbol.size {
                     return None;
                 }
                 Some(fields.get(3..)?.join(" "))
             })
-            .unwrap_or_default();
-        // `<A as B>::m`: `B` is where the body is written when `m` is the trait's own.
-        if let Some((_, trait_half)) = spelled.split_once(" as ") {
-            for layer in ["waymaker_core", "waymaker_flash", "waymaker_embassy"] {
-                assert!(
-                    !trait_half.starts_with(layer),
-                    "the gate credits {} B to `{probe}` for `{spelled}`, whose trait half is a layer's, so a provided method body would be subtracted from the budget",
+            .unwrap_or_else(|| {
+                panic!(
+                    "llvm-nm lists no {} B symbol at {:#x}, which our reader credits to `{probe}`",
                     symbol.size,
-                );
-            }
-        }
+                    symbol.address & !1
+                )
+            });
+
+        let head = head_of(&symbol.name).unwrap_or_else(|| {
+            panic!("`{spelled}` is credited to `{probe}` and names no crate of this workspace")
+        });
+        assert!(
+            !head.contains('Y'),
+            "the gate credits {} B to `{probe}` for `{spelled}`, whose mangled path opens with the `Y` production — the body of a provided method belongs to the trait, so this would subtract a layer's bytes from the budget",
+            symbol.size,
+        );
     }
+}
+
+/// The part of a `v0` mangled name before the first crate of this workspace it names.
+///
+/// Found by searching for the length-prefixed crate name as a substring, which is the
+/// opposite way round from `size::defining_crate` — that parses crate roots left to right.
+/// Two readings of one name agreeing is worth more than one reading checked against itself.
+fn head_of(mangled: &str) -> Option<&str> {
+    [
+        "waymaker-core",
+        "waymaker-flash",
+        "waymaker-embassy",
+        size::PROBE_PACKAGE,
+    ]
+    .iter()
+    .map(|package| package.replace('-', "_"))
+    .filter_map(|crate_name| mangled.find(&format!("{}{crate_name}", crate_name.len())))
+    .min()
+    .and_then(|at| mangled.get(..at))
 }
 
 /// The `default` row's linked image, once [`measured`] has linked it.

@@ -143,12 +143,13 @@ struct Layout {
     sh_entsize: usize,
     /// Offsets within one symbol table entry.
     st_name: usize,
+    st_value: usize,
     st_shndx: usize,
     st_size: usize,
     /// The size of one symbol table entry.
     symbol_entry_size: usize,
     /// Whether the class's address-width fields are 64 bits wide: `sh_flags`,
-    /// `sh_offset`, `sh_size`, `sh_entsize` and a symbol's `st_size`.
+    /// `sh_offset`, `sh_size`, `sh_entsize`, and a symbol's `st_value` and `st_size`.
     wide: bool,
 }
 
@@ -167,6 +168,7 @@ const ELF32: Layout = Layout {
     sh_link: 0x18,
     sh_entsize: 0x24,
     st_name: 0x00,
+    st_value: 0x04,
     st_shndx: 0x0e,
     st_size: 0x08,
     symbol_entry_size: 0x10,
@@ -188,6 +190,7 @@ const ELF64: Layout = Layout {
     sh_link: 0x28,
     sh_entsize: 0x38,
     st_name: 0x00,
+    st_value: 0x08,
     st_shndx: 0x06,
     st_size: 0x10,
     symbol_entry_size: 0x18,
@@ -259,6 +262,12 @@ pub fn sections(bytes: &[u8]) -> Result<Vec<Section>, ElfError> {
 pub struct Symbol {
     /// The symbol name, still mangled.
     pub name: String,
+    /// `st_value`: where the symbol sits, which is what identifies it.
+    ///
+    /// Two symbols can share a name after mangling collides, and any number share a size.
+    /// A caller pairing this table against another reader's output has to pair on
+    /// something, and for a defined symbol this is the thing that is unique.
+    pub address: u64,
     /// `st_size`: how many bytes the symbol occupies.
     pub size: u64,
     /// `st_shndx`: which section the bytes are in, indexed as [`sections`] returns them.
@@ -340,6 +349,7 @@ pub fn symbols(bytes: &[u8]) -> Result<Vec<Symbol>, ElfError> {
                     read_u32(entry, layout.st_name, endian)?,
                     "symbol name",
                 )?,
+                address: read_address(entry, layout.st_value, endian, layout.wide)?,
                 size: read_address(entry, layout.st_size, endian, layout.wide)?,
                 section_index: read_u16(entry, layout.st_shndx, endian)?,
             });
@@ -797,17 +807,19 @@ pub mod tests_support {
     #[derive(Debug, Clone)]
     pub struct SymbolSpec {
         name: String,
+        address: u64,
         size: u64,
         section_index: u16,
         name_offset: Option<u32>,
     }
 
     impl SymbolSpec {
-        /// A symbol of `size` bytes in the section at `section_index`.
+        /// A symbol of `size` bytes at `address`, in the section at `section_index`.
         #[must_use]
-        pub fn new(name: &str, size: u64, section_index: u16) -> Self {
+        pub fn new(name: &str, address: u64, size: u64, section_index: u16) -> Self {
             Self {
                 name: name.to_owned(),
+                address,
                 size,
                 section_index,
                 name_offset: None,
@@ -958,6 +970,13 @@ pub mod tests_support {
 
                 let mut entry = vec![0_u8; layout.symbol_entry_size];
                 write_u32(&mut entry, layout.st_name, name_offset, self.endian);
+                write_address(
+                    &mut entry,
+                    layout.st_value,
+                    symbol.address,
+                    self.endian,
+                    self.class == Class::Elf64,
+                );
                 write_address(
                     &mut entry,
                     layout.st_size,
@@ -1203,8 +1222,12 @@ mod tests {
             ))
             .with(SectionSpec::nobits(".bss", 0x20, SHF_ALLOC | SHF_WRITE))
             .with_symbols(vec![
-                SymbolSpec::new("_RNvCs1_4mine4work", 0x30, 1),
-                SymbolSpec::new("_RNvCs1_4mine5state", 0x10, 2),
+                SymbolSpec::new("_RNvCs1_4mine4work", 0x1000, 0x30, 1),
+                // Deliberately the same size as `work` and at another address: a reader
+                // pairing this table against another one by size alone cannot tell them
+                // apart, and every symbol here has to be identifiable.
+                SymbolSpec::new("_RNvCs1_4mine4more", 0x1030, 0x30, 1),
+                SymbolSpec::new("_RNvCs1_4mine5state", 0x2000, 0x10, 2),
             ])
             .build()
     }
@@ -1236,7 +1259,7 @@ mod tests {
                 0x40,
                 SHF_ALLOC | SHF_EXECINSTR,
             ))
-            .with_symbols(vec![SymbolSpec::new("_RNvCs1_4mine4work", 0x30, 1)])
+            .with_symbols(vec![SymbolSpec::new("_RNvCs1_4mine4work", 0x1000, 0x30, 1)])
             .build();
         let symbols = symbols(&image).expect("a synthetic ELF is readable");
         // The table opens with the all-zero symbol every real one does, and the parser
@@ -1320,24 +1343,33 @@ mod tests {
             );
 
             // `Num: Value Size Type Bind Vis Ndx Name`
-            let second_opinion: Vec<(String, u64, u16)> = listing
+            let second_opinion: Vec<(String, u64, u64, u16)> = listing
                 .lines()
                 .filter_map(|line| {
                     let fields: Vec<&str> = line.split_whitespace().collect();
-                    let (size, section, symbol) = (fields.get(2)?, fields.get(6)?, fields.get(7)?);
+                    let (address, size) = (fields.get(1)?, fields.get(2)?);
+                    let (section, symbol) = (fields.get(6)?, fields.get(7)?);
                     Some((
                         (*symbol).to_owned(),
+                        u64::from_str_radix(address, 16).ok()?,
                         size.parse().ok()?,
                         section.parse().ok()?,
                     ))
                 })
                 .collect();
 
-            let ours: Vec<(String, u64, u16)> = symbols(&image)
+            let ours: Vec<(String, u64, u64, u16)> = symbols(&image)
                 .expect("a synthetic ELF is readable")
                 .into_iter()
                 .filter(|symbol| !symbol.name.is_empty())
-                .map(|symbol| (symbol.name, symbol.size, symbol.section_index))
+                .map(|symbol| {
+                    (
+                        symbol.name,
+                        symbol.address,
+                        symbol.size,
+                        symbol.section_index,
+                    )
+                })
                 .collect();
 
             assert!(!ours.is_empty(), "the builder wrote no named symbols");
@@ -1364,7 +1396,9 @@ mod tests {
     fn a_symbol_name_outside_the_string_table_is_an_error_rather_than_a_nameless_symbol() {
         let image = ElfBuilder::new(Class::Elf32)
             .with(SectionSpec::progbits(".text", 8, SHF_ALLOC))
-            .with_symbols(vec![SymbolSpec::new("work", 4, 1).with_name_offset(0xffff)])
+            .with_symbols(vec![
+                SymbolSpec::new("work", 0x1000, 4, 1).with_name_offset(0xffff),
+            ])
             .build();
         assert!(
             symbols(&image).is_err(),
