@@ -29,7 +29,7 @@
 
 use core::cell::RefCell;
 
-use waymaker_core::{EffectSeq, RecordRef, RunId};
+use waymaker_core::{EffectId, EffectSeq, RecordRef, RunId};
 use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
@@ -600,4 +600,109 @@ fn a_reboot_after_an_exhausted_effect_carries_the_run_on_or_refuses_before_dispa
         "no crash image was one the run could carry on from"
     );
     assert!(refused > 0, "no crash image was one the run had to refuse");
+}
+
+#[test]
+fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identical_id() {
+    // Issue [#30](https://github.com/madmax983/waymaker/issues/30)'s first "done when". The
+    // window is the one §14 makes no exactly-once promise about: the world has changed, and
+    // the record saying so has not reached media. Every crash point inside it must leave the
+    // *same* `(RunId, EffectSeq)` for the next boot to redeliver.
+    //
+    // What makes this more than `a_reboot_after_a_crash_…` is the first filter below. That
+    // test asks what happens when history left a schedule unresolved, whatever caused it —
+    // including a crash that landed while the schedule record itself was being written, in
+    // which case nothing was ever performed. This one keeps only the runs where the crashed
+    // boot had already performed the effect, which is the window and nothing else.
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
+
+    let runs = harness
+        .run(|session| {
+            logs.borrow_mut().push(Vec::new());
+            let mine = RefCell::new(Vec::new());
+            let ended = drive(session, &mine);
+            if let Some(last) = logs.borrow_mut().last_mut() {
+                last.clone_from(&mine.borrow());
+            }
+            ended
+        })
+        .expect("the fault-free run completes");
+
+    let logs = logs.into_inner();
+    assert_eq!(
+        logs.len(),
+        runs.len(),
+        "one dispatch log per run, in the order the harness ran them"
+    );
+
+    let mut duplicated = 0_usize;
+    let mut duplicated_late = 0_usize;
+    for (run, performed) in runs.iter().zip(&logs) {
+        let history = recovered(run.image());
+        // The effect whose schedule survived and whose outcome did not.
+        let Some(outstanding) = unresolved(&history) else {
+            continue;
+        };
+        // And the crashed boot had already performed it. Those two together are the window:
+        // the activity ran, and step 7's barrier never returned.
+        if !performed.contains(&outstanding) {
+            continue;
+        }
+
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            unreachable!("the image is device-sized")
+        };
+        let mut workflow = Pipeline::new();
+        let mut world = World::new();
+        let mut page = [0_u8; 256];
+        let mut result = [0_u8; 64];
+        let ended = Driver::new(region(), RUN, reserve()).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        );
+        let Ok(_) = ended else {
+            // A sealed schedule record is an append point, so this cannot be the unextendable
+            // case — but a scan that stopped at damage *after* it can be, and that reboot has
+            // nothing to redeliver. `a_reboot_after_a_crash_…` holds the refusal's own
+            // properties; here it is simply not this window.
+            continue;
+        };
+
+        let first = world.dispatched().first().unwrap_or_else(|| {
+            panic!(
+                "the reboot performed nothing for an outstanding {outstanding}, at {:?}",
+                run.injection()
+            )
+        });
+        assert_eq!(
+            first.id,
+            EffectId {
+                run: RUN,
+                seq: EffectSeq(outstanding),
+            },
+            "the second attempt of effect {outstanding} carried another identity, at {:?}",
+            run.injection()
+        );
+        duplicated = duplicated.saturating_add(1);
+        if outstanding > 0 {
+            duplicated_late = duplicated_late.saturating_add(1);
+        }
+    }
+
+    assert!(
+        duplicated > 0,
+        "no crash landed between an activity and its completion barrier, so this measured \
+         nothing"
+    );
+    assert!(
+        duplicated_late > 0,
+        "and none of them was the run's *second* effect, which is the only case that tells \
+         redelivery apart from a fresh identity"
+    );
 }

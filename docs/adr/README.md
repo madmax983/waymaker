@@ -34,6 +34,7 @@ be superseded.
 | [0023](0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md) | A watchdog reset is modelled, and its difference is one return | accepted |
 | [0024](0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md) | The kernel boundary is driven synchronously, by a crate above the layers | accepted |
 | [0025](0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md) | The effect protocol is a typestate, and an exhausted answer is a record | accepted |
+| [0026](0026-redelivery-is-the-kernels-answer-and-at-least-once-is-the-contract.md) | Redelivery is the kernel's answer, and at-least-once is the contract | accepted |
 
 ## Reading the numbers
 
@@ -51,7 +52,7 @@ of these are older than their numbers suggest:
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
-0022 → 0023 → 0024 → 0025.
+0022 → 0023 → 0024 → 0025 → 0026.
 
 ## Writing one
 

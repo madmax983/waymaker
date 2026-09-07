@@ -30,21 +30,45 @@ pub enum Performed {
     /// activity. The driver records it the same way, because on media the two are the same
     /// statement, and because a refusal there strands the run.
     Exhausted,
-    /// Not now. The run suspends under the identity it was dispatched with, and the next
-    /// boot redelivers it — design document §14's redelivery contract.
+    /// Not now. The run suspends under the identity it was dispatched with. The next boot
+    /// redelivers it, whether a reset came between the two or not — design document §14's
+    /// redelivery contract.
     Pending,
 }
 
 /// The activities a workflow can call.
+///
+/// # At-least-once, and no more than that
+///
+/// Waymaker can perform one effect more than once. There are two causes:
+///
+/// * a **retry** — the activity answered [`Performed::Pending`], and the caller drove the
+///   run again;
+/// * a **reset** — power failed after the activity changed the world and before the outcome
+///   record was durable. Design document §07 writes that record at step 5 and commits it at
+///   step 7. Power can go at any point between step 4 and step 7.
+///
+/// Every attempt carries one identity: the `(RunId, EffectSeq)` the schedule record
+/// committed, which [`DurableIntent::id`] gives. That pair is the only value a downstream
+/// system can deduplicate on.
+///
+/// Waymaker does **not** promise exactly-once physical side effects. No setting changes
+/// this, and the engine cannot: the world changed before the record of it did. There are two
+/// ways to get exactly-once, and both are outside this engine — make the activity
+/// idempotent, or deduplicate the identity downstream. An activity that does neither
+/// performs its effect twice after a reset in that window.
 pub trait Activities {
     /// Perform `intent`'s effect and write its outcome into `out`.
     ///
     /// `intent` is design document §07 step 4's argument. Some boot committed the schedule
-    /// record for it before this call — this one, or an earlier one that the reset
-    /// redelivered. So an activity that deduplicates downstream sees a repeat rather than a
-    /// second effect.
+    /// record for it before this call — this one, or an earlier one that a reset or a retry
+    /// redelivered.
     ///
     /// # Postconditions
+    ///
+    /// An implementor must tolerate a duplicate attempt. The same `intent` can arrive more
+    /// than once, and it carries the same identity every time. The trait's own docs say what
+    /// this engine does not promise.
     ///
     /// An implementor must not truncate. Write no more than `out.len()` bytes, and report
     /// [`Performed::Exhausted`] when the answer is wider. An implementor that writes what
