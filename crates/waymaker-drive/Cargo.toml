@@ -23,8 +23,8 @@ waymaker-flash.workspace = true
 # injector lists, which is what makes "across a power cut" a loop rather than a claim.
 waymaker-fault.workspace = true
 # Design document §14's failure-semantics table as a vocabulary: `tests/matrix.rs` classifies
-# every crash point into a row the rig also names, so the model half and the rig half of
-# issue #31's matrix disagree about nothing.
+# every crash point into a row the rig also names, so both halves of issue #31's matrix use
+# one vocabulary.
 waymaker-rig.workspace = true
 
 [features]

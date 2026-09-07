@@ -2170,8 +2170,9 @@ pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
         id: "cortex-m0plus",
         headline: "power-cut and watchdog-reset loops on a Cortex-M0+ board",
         attestation: Attestation::NotRun,
-        evidence: "a rig log from a board, with the census complete and no breach; \
-                   `waymaker-rig` is written to link on the target and has never been on one",
+        evidence: "a rig log from a board, with the census and the failure matrix complete \
+                   and no breach; `waymaker-rig` is written to link on the target and has \
+                   never been on one",
     },
     HardwareTarget {
         id: "cortex-m4",
@@ -2382,7 +2383,7 @@ pub const FAILURE_RIG_TESTS_PATH: &str = "crates/waymaker-rig/tests/matrix.rs";
 pub enum RigStanding {
     /// `crates/waymaker-rig/tests/matrix.rs` classifies crash points into it and resumes them.
     Swept,
-    /// The rig has no workload that reaches it. Owed, and said so.
+    /// The rig has no workload that reaches it. Owed, and said so: issue #96.
     Owed,
 }
 
@@ -2414,6 +2415,8 @@ pub struct FailureRow {
     pub model_test: &'static str,
     /// Whether the rig sweep reaches it.
     pub rig: RigStanding,
+    /// The test in [`FAILURE_RIG_TESTS_PATH`] that discharges it on the rig, for a swept row.
+    pub rig_test: Option<&'static str>,
 }
 
 /// The ten rows of §14's failure-semantics table.
@@ -2428,6 +2431,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "During schedule frame write",
         model_test: "during_schedule_frame_write_the_frame_is_ignored_and_the_activity_was_not_yet_dispatchable",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_schedule_frame_write_the_frame_is_ignored_and_the_activity_was_not_yet_dispatchable_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-schedule-barrier-before-dispatch",
@@ -2435,6 +2441,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "After schedule barrier, before dispatch",
         model_test: "after_schedule_barrier_before_dispatch_the_stable_effect_id_is_redelivered",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_schedule_barrier_before_dispatch_the_stable_effect_id_is_redelivered_on_the_rig",
+        ),
     },
     FailureRow {
         id: "during-physical-activity",
@@ -2442,6 +2451,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "During physical activity",
         model_test: "during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-activity-before-completion-barrier",
@@ -2449,6 +2461,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "After physical activity, before completion barrier",
         model_test: "after_physical_activity_before_completion_barrier_the_same_id_is_redelivered",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_physical_activity_before_completion_barrier_the_same_id_is_redelivered_on_the_rig",
+        ),
     },
     FailureRow {
         id: "during-completion-write",
@@ -2456,6 +2471,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "During completion write",
         model_test: "during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-completion-barrier",
@@ -2463,6 +2481,9 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "After completion barrier",
         model_test: "after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again",
         rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again_on_the_rig",
+        ),
     },
     FailureRow {
         id: "during-inactive-bank-erase-or-write",
@@ -2470,6 +2491,7 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "During inactive-bank erase/write",
         model_test: "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues",
         rig: RigStanding::Owed,
+        rig_test: None,
     },
     FailureRow {
         id: "after-new-bank-seal-barrier",
@@ -2477,6 +2499,7 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "After new bank seal barrier",
         model_test: "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current",
         rig: RigStanding::Owed,
+        rig_test: None,
     },
     FailureRow {
         id: "history-capacity-reached",
@@ -2484,6 +2507,7 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "History capacity reached",
         model_test: "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
         rig: RigStanding::Owed,
+        rig_test: None,
     },
     FailureRow {
         id: "replay-divergence",
@@ -2491,16 +2515,19 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         failure_point: "Replay divergence",
         model_test: "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
         rig: RigStanding::Owed,
+        rig_test: None,
     },
 ];
 
-/// Every kebab-case string literal in `source`: the ids `Row::id` answers with.
+/// Every kebab-case string literal in `source`'s `fn id` body: the ids `Row::id` answers
+/// with.
 ///
-/// The shape rather than the function, because a scanner cannot find a `match` arm by
-/// meaning. A row's id has at least one hyphen and nothing but lowercase letters, and no
-/// other literal in the vocabulary file has that shape.
+/// Scoped to the body the way `integrity-check` pins parameters inside the function that
+/// owns them, so a literal elsewhere in the file vouches for nothing. A row's id has at least
+/// one hyphen and nothing but lowercase letters.
 fn kebab_literals(source: &str) -> BTreeSet<&str> {
-    source
+    crate::source::braced_body(source, "fn id")
+        .unwrap_or_default()
         .split('"')
         .skip(1)
         .step_by(2)
@@ -2513,29 +2540,45 @@ fn kebab_literals(source: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Whether `source` declares `#[test] fn name(`, comments and fences aside.
+/// Whether `source` declares a `fn name(` whose attribute block carries `#[test]` and
+/// neither `#[ignore` nor `#[cfg(`.
+///
+/// The whole contiguous block of attributes above the `fn`, not the one line: `#[ignore]`
+/// above `#[test]` is a test nothing runs, and `#[cfg(any())]` above it is one nothing
+/// compiles.
 fn declares_test(source: &str, name: &str) -> bool {
     let lines: Vec<&str> = source.lines().map(str::trim).collect();
-    lines.windows(2).any(|pair| {
-        pair.first() == Some(&"#[test]")
-            && pair
-                .get(1)
-                .is_some_and(|line| line.starts_with(&format!("fn {name}(")))
+    lines.iter().enumerate().any(|(index, line)| {
+        if !line.starts_with(&format!("fn {name}(")) {
+            return false;
+        }
+        let attributes: Vec<&str> = lines
+            .get(..index)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .take_while(|above| above.starts_with("#["))
+            .copied()
+            .collect();
+        attributes.contains(&"#[test]")
+            && !attributes
+                .iter()
+                .any(|above| above.starts_with("#[ignore") || above.starts_with("#[cfg("))
     })
 }
 
 /// Rule: design document §14's failure-semantics table and the five places it lives agree.
 ///
-/// The same shape as [`check_recovery_spec`]. A row of [`FAILURE_ROWS`] has to be named by
-/// the rig's vocabulary at [`FAILURE_ROWS_PATH`] and by nothing else there, discharged by a
-/// `#[test]` of its own name at [`FAILURE_MODEL_TESTS_PATH`] that names its variant, reached
-/// by the rig sweep at [`FAILURE_RIG_TESTS_PATH`] when the table says it is swept, written
-/// down in `CLAUDE.md` with its failure point, its test and its rig standing, and decided in
-/// [`FAILURE_MATRIX_ADR`].
+/// The same shape as [`check_recovery_spec`]. A row of [`FAILURE_ROWS`] has to be answered
+/// by `Row::id` at [`FAILURE_ROWS_PATH`] and nothing else there, discharged by a `#[test]` of
+/// its own name at [`FAILURE_MODEL_TESTS_PATH`] in a file that names its variant, discharged
+/// by a `#[test]` of its rig name at [`FAILURE_RIG_TESTS_PATH`] when the table says it is
+/// swept, written down in `CLAUDE.md` with its failure point, its test and its rig standing,
+/// and decided in [`FAILURE_MATRIX_ADR`].
 ///
-/// What it cannot see is whether a named test asserts the row's *behaviour*. That is the
-/// test's own census — the model half requires every row to be reached and the rig half
-/// requires the census to refuse at the first owed row.
+/// What it cannot see is whether a named test asserts the row's *behaviour*. That is each
+/// file's own census: the model half requires every row to be reached and pins the count
+/// per row, and the rig half requires its census to refuse at the first owed row.
 #[must_use]
 fn check_failure_matrix(
     claude_md: Option<&str>,
@@ -2553,7 +2596,7 @@ fn check_failure_matrix(
              matrix to the table it is named after",
         )),
         Some(contents) => {
-            let source = strip_rust_comments(contents);
+            let source = crate::source::without_test_modules(&strip_rust_comments(contents));
             let declared = kebab_literals(&source);
             for row in FAILURE_ROWS {
                 if !declared.contains(row.id) {
@@ -2615,8 +2658,7 @@ fn check_failure_rows_are_tested(
                         "failure-matrix",
                         row.id,
                         format!(
-                            "{FAILURE_MODEL_TESTS_PATH} never names `Row::{}`, so its census \
-                             cannot be counting this row",
+                            "{FAILURE_MODEL_TESTS_PATH} never names `Row::{}`",
                             row.variant
                         ),
                     ));
@@ -2633,16 +2675,16 @@ fn check_failure_rows_are_tested(
         Some(contents) => {
             let source = strip_rust_comments(contents);
             for row in FAILURE_ROWS {
-                if row.rig == RigStanding::Swept
-                    && !source.contains(&format!("Row::{}", row.variant))
-                {
+                let Some(rig_test) = row.rig_test else {
+                    continue;
+                };
+                if !declares_test(&source, rig_test) {
                     violations.push(Violation::new(
                         "failure-matrix",
                         row.id,
                         format!(
                             "docs::FAILURE_ROWS says the rig sweeps this row and \
-                             {FAILURE_RIG_TESTS_PATH} never names `Row::{}`",
-                            row.variant
+                             {FAILURE_RIG_TESTS_PATH} declares no `#[test] fn {rig_test}`"
                         ),
                     ));
                 }
@@ -3249,7 +3291,7 @@ pub mod tests_support {
     use super::{
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, FAILURE_MATRIX_ADR, FAILURE_ROWS, HARDWARE_TARGETS, QuestionStatus,
-        RECOVERY_SPEC_ADR, RigStanding, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, SPEC_CLAUSES,
+        RECOVERY_SPEC_ADR, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, SPEC_CLAUSES,
         STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES, adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
@@ -3436,14 +3478,16 @@ pub mod tests_support {
     /// A row vocabulary answering exactly the ids the gate expects.
     #[must_use]
     pub fn clean_failure_rows() -> String {
-        let mut body = String::from("//! The rows.\npub const fn id(self) -> &'static str {\n");
+        let mut body = String::from(
+            "//! The rows.\npub const fn id(self) -> &'static str {\n    match self {\n",
+        );
         for row in FAILURE_ROWS {
             line(
                 &mut body,
-                format_args!("    Self::{} => \"{}\",", row.variant, row.id),
+                format_args!("        Self::{} => \"{}\",", row.variant, row.id),
             );
         }
-        body.push_str("}\n");
+        body.push_str("    }\n}\n");
         body
     }
 
@@ -3463,17 +3507,22 @@ pub mod tests_support {
         body
     }
 
-    /// A rig test file naming every row the table says the rig sweeps.
+    /// A rig test file declaring one named test per row the table says the rig sweeps.
     #[must_use]
     pub fn clean_failure_rig_tests() -> String {
-        let mut body = String::from("//! The rig half.\nfn rows() {\n");
-        for row in FAILURE_ROWS
-            .iter()
-            .filter(|row| row.rig == RigStanding::Swept)
-        {
-            line(&mut body, format_args!("    let _ = Row::{};", row.variant));
+        let mut body = String::from("//! The rig half.\n");
+        for row in FAILURE_ROWS {
+            let Some(rig_test) = row.rig_test else {
+                continue;
+            };
+            line(
+                &mut body,
+                format_args!(
+                    "#[test]\nfn {rig_test}() {{\n    let _ = Row::{};\n}}\n",
+                    row.variant
+                ),
+            );
         }
-        body.push_str("}\n");
         body
     }
 
@@ -5986,29 +6035,175 @@ mod tests {
 
     #[test]
     fn a_test_that_is_not_a_test_does_not_vouch_for_its_row() {
+        let Some(row) = FAILURE_ROWS.first() else {
+            unreachable!("the table has ten rows")
+        };
         let mut inputs = matrix_inputs();
         inputs.failure_model_tests = inputs
             .failure_model_tests
             .map(|tests| tests.replacen("#[test]\n", "", 1));
-        assert!(!matrix_violations(&inputs).is_empty());
+        assert!(
+            matrix_violations(&inputs)
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains(row.model_test))
+        );
     }
 
     #[test]
-    fn a_swept_row_the_rig_never_names_is_a_violation() {
-        let Some(swept) = FAILURE_ROWS
+    fn a_swept_row_with_no_rig_test_named_after_it_is_a_violation() {
+        let Some((swept, rig_test)) = FAILURE_ROWS
             .iter()
-            .find(|row| row.rig == RigStanding::Swept)
+            .find_map(|row| row.rig_test.map(|test| (row, test)))
         else {
             unreachable!("the rig sweeps six rows")
         };
         let mut inputs = matrix_inputs();
         inputs.failure_rig_tests = inputs
             .failure_rig_tests
-            .map(|tests| tests.replace(&format!("Row::{}", swept.variant), "Row::Other"));
+            .map(|tests| tests.replace(&format!("fn {rig_test}("), "fn renamed("));
         let violations = matrix_violations(&inputs);
         assert!(
-            violations.iter().any(|v| v.subject == swept.id),
+            violations
+                .iter()
+                .any(|v| v.subject == swept.id && v.detail.contains(rig_test)),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn every_swept_row_names_a_rig_test_and_no_owed_row_does() {
+        for row in FAILURE_ROWS {
+            assert_eq!(
+                row.rig == RigStanding::Swept,
+                row.rig_test.is_some(),
+                "{}",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn an_ignored_or_compiled_out_test_does_not_vouch_for_its_row() {
+        let Some(row) = FAILURE_ROWS.first() else {
+            unreachable!("the table has ten rows")
+        };
+        for attribute in ["#[ignore]", "#[cfg(any())]"] {
+            let mut inputs = matrix_inputs();
+            inputs.failure_model_tests = inputs
+                .failure_model_tests
+                .map(|tests| tests.replacen("#[test]\n", &format!("{attribute}\n#[test]\n"), 1));
+            let violations = matrix_violations(&inputs);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.subject == row.id && v.detail.contains(row.model_test)),
+                "{attribute}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_file_that_never_names_a_rows_variant_is_a_violation() {
+        let Some(row) = FAILURE_ROWS.first() else {
+            unreachable!("the table has ten rows")
+        };
+        let mut inputs = matrix_inputs();
+        inputs.failure_model_tests = inputs
+            .failure_model_tests
+            .map(|tests| tests.replace(&format!("Row::{}", row.variant), "Row::Other"));
+        let violations = matrix_violations(&inputs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains(row.variant)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_answered_only_in_a_test_module_or_outside_fn_id_does_not_vouch_for_it() {
+        let Some(row) = FAILURE_ROWS.last() else {
+            unreachable!("the table has ten rows")
+        };
+        let quoted = format!("\"{}\"", row.id);
+        // Moved out of `fn id` into a test module.
+        let mut inputs = matrix_inputs();
+        inputs.failure_rows = inputs.failure_rows.map(|rows| {
+            format!(
+                "{}\n#[cfg(test)]\nmod tests {{\n    const ID: &str = {quoted};\n}}\n",
+                rows.replace(&quoted, "\"moved\"")
+            )
+        });
+        let violations = matrix_violations(&inputs);
+        assert!(
+            violations.iter().any(|v| v.subject == row.id),
+            "{violations:?}"
+        );
+        // Moved out of `fn id` into a constant beside it.
+        let mut inputs = matrix_inputs();
+        inputs.failure_rows = inputs.failure_rows.map(|rows| {
+            format!(
+                "const ID: &str = {quoted};\n{}",
+                rows.replace(&quoted, "\"moved\"")
+            )
+        });
+        assert!(
+            matrix_violations(&inputs)
+                .iter()
+                .any(|v| v.subject == row.id)
+        );
+    }
+
+    #[test]
+    fn a_claude_md_row_that_is_doubled_or_missing_a_field_is_a_violation() {
+        let Some(row) = FAILURE_ROWS.first() else {
+            unreachable!("the table has ten rows")
+        };
+        let mut doubled = matrix_inputs();
+        doubled.claude_md = doubled.claude_md.map(|md| {
+            let line = md
+                .lines()
+                .find(|line| line.contains(&format!("`{}`", row.id)))
+                .unwrap_or_default()
+                .to_owned();
+            format!("{md}\n{line}\n")
+        });
+        assert!(
+            matrix_violations(&doubled)
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains("2 table rows"))
+        );
+
+        let mut without_point = matrix_inputs();
+        without_point.claude_md = without_point
+            .claude_md
+            .map(|md| md.replace(row.failure_point, "Somewhere"));
+        assert!(
+            matrix_violations(&without_point)
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains("its failure point"))
+        );
+
+        let mut without_test = matrix_inputs();
+        without_test.claude_md = without_test
+            .claude_md
+            .map(|md| md.replace(&format!("`{}`", row.model_test), "`renamed`"));
+        assert!(
+            matrix_violations(&without_test)
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains("the test that discharges it"))
+        );
+
+        let mut adr_short = matrix_inputs();
+        for adr in &mut adr_short.adrs {
+            if adr.name == FAILURE_MATRIX_ADR {
+                adr.contents = adr.contents.replace(&format!("`{}`", row.id), "`gone`");
+            }
+        }
+        assert!(
+            matrix_violations(&adr_short)
+                .iter()
+                .any(|v| v.subject == row.id && v.detail.contains(FAILURE_MATRIX_ADR))
         );
     }
 

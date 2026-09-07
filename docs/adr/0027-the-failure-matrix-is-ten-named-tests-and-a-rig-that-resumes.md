@@ -38,21 +38,29 @@ ten rows in the table's order, each with a stable id: `during-schedule-frame-wri
 `after-activity-before-completion-barrier`, `during-completion-write`,
 `after-completion-barrier`, `during-inactive-bank-erase-or-write`,
 `after-new-bank-seal-barrier`, `history-capacity-reached` and `replay-divergence`. It is in
-the rig rather than in the driver because the rig is the crate a board links, and a vocabulary
-the board cannot name is a vocabulary the model and the rig would eventually spell
-differently. `Matrix` is the census over it, and `Matrix::verdict` fails closed at the first
-row nothing reached. Both are pinned by `rig-oracle`, for `Coverage`'s reason.
+the rig rather than in the driver because the rig is the crate a board links, so the model and
+the rig cannot spell a row differently. `Matrix` is the census over it, and `Matrix::verdict`
+fails closed at the first row nothing reached. Both are pinned by `rig-oracle`, for
+`Coverage`'s reason.
 
 **One named test per row, on the model.** `crates/waymaker-drive/tests/matrix.rs` has ten
 tests whose names are the failure point followed by the required behaviour. Seven rows are
-crash sweeps: every crash point `waymaker-fault` lists is put in a row from the operation it
-interrupted, cross-checked against the media it left, and the reboot is held to the row's
-behaviour. Row 3 is not a storage crash point and is modelled as a world that is entered and
-does not return. Rows 7 and 8 drive the real `Swap` at every crash point and then *boot the
-driver* on whichever bank `select` names, so "continue the old run" is a run continuing rather
-than a generation comparing. Row 9 counts mutations during the refused boot and then performs
-the swap from that state. Row 10 reboots every crash image whose history reaches the divergent
+crash-swept on the model: every crash point `waymaker-fault` lists is put in a row from the
+operation it interrupted, cross-checked against the media it left, and the reboot is held to
+the row's behaviour. Row 3 is not a storage crash point and is driven: a world that performs
+the effect and never answers, then a reboot, so the world's log shows two performances under
+one identity. Rows 7 and 8 drive the real `Swap` at every crash point, over a spare bank that
+holds a stale sealed run so the erase has something to take, and then *boot the driver* on
+whichever bank `select` names, so "continue the old run" is a run continuing rather than a
+generation comparing. Row 9 counts mutations during the refused boot and then performs the
+swap from that state. Row 10 reboots every crash image whose history reaches the divergent
 effect with a divergent workflow, twice.
+
+Rows 2 and 6 are decided by what recovery produced, and the operation is the check. A seal
+that landed whole with its commit barrier refused is recovered on this model, which §15 allows,
+so it sits in row 2 or row 6 beside the one point that is strictly after the barrier: a
+watchdog reset at `Progress::Whole`. Row 2 has no power cut after a *returned* barrier,
+because the driver dispatches as soon as the barrier returns and that world is row 4.
 
 The classification is read off the recorded operation sequence: the reference run is six
 records of four operations each, pinned by
@@ -63,10 +71,15 @@ with its operation is a panic, not a row.
 
 **The rig resumes.** `Rig::resume` recovers the installed bank, audits the prefix record by
 record against the workload, redelivers the effect whose schedule has no completion under the
-same index, and writes what the run still owes. It takes no cut and writes no witness mark: it
-is judged by what it returns and by what the dispatcher saw. `crates/waymaker-rig/tests/matrix.rs`
-classifies every crash point from the witness, the recovered count, the journal's ending and
-the dispatcher's own log, resumes it, and holds it to its row.
+same index, and writes what the run still owes. It takes no cut. It erases the instrument and
+marks the witness again as it writes, so `verify` judges a resumed part and a reset during a
+resume is a crash point the witness can speak to; review found the first version wrote no
+marks, and `verify` after it accused a healthy part. A run that was already complete keeps
+the witness it has. `crates/waymaker-rig/tests/matrix.rs` has one test per swept row, named
+after it with `_on_the_rig`: it classifies every crash point from the witness, the recovered
+count, the journal's ending and the dispatcher's own log, resumes it, judges the resumed
+part, and holds it to its row. Row 3 on the rig is a dispatcher that is entered and does not
+return, credited from those runs and not from the injector's cause.
 
 **The rig fills six rows and says so.** Rows 7 to 10 need a swap workload, a capacity refusal
 and a divergent replay, and this rig has none. `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`
@@ -75,27 +88,37 @@ same shape ADR 0021 chose for the watchdog cells: a census that fails naming the
 than a table shortened to what passes.
 
 **A gate holds the five places together.** `xtask::docs::FAILURE_ROWS` is the table, and the
-`failure-matrix` rule fails a build in which a row is missing from the rig's `Row::id`, has
-no `#[test]` of its name in the model file, is marked swept and never named in the rig file,
-has no `CLAUDE.md` row carrying its failure point, its test and its rig standing, or is absent
-from this ADR. The vocabulary check runs both ways, so a row added to the enum and not to the
-table fails too.
+`failure-matrix` rule fails a build in which a row is missing from the `fn id` body of the
+rig's vocabulary, has no `#[test]` of its name in the model file, is marked swept and has no
+`#[test]` of its rig name in the rig file, has no `CLAUDE.md` row carrying its failure point,
+its test and its rig standing, or is absent from this ADR. A test under `#[ignore]` or
+`#[cfg(` is not a test. The vocabulary check runs both ways, so a row added to the enum and
+not to the table fails too. Both halves run as the `matrix` stage of the `verification` job,
+for the reason the recovery specification does: a row that stopped holding is legible in the
+checks list under its own name.
 
 ## Consequences
 
-**The numbers.** On the model, 541 crash points are classified into a row and every one is
+**The numbers.** On the model, 542 crash points are classified into a row and every one is
 held to its row's behaviour: 138 in row 1, 12 in row 2, 6 in row 4, 159 in row 5, 79 in
-row 6, 122 in row 7 and 25 in row 8, with rows 3, 9 and 10 driven directly. Every one of the
-seven swept rows is reached by a power cut and by a watchdog reset. On the rig, 434 crash
-points are classified and resumed, plus two for row 3: 86, 84, 42, 84 and 138 in rows 1, 2, 4,
-5 and 6.
+row 6, 123 in row 7 and 25 in row 8, with rows 3, 9 and 10 driven directly. Every one of the
+seven crash-swept rows on the model is reached by a power cut and by a watchdog reset. On the
+rig, 434 crash points are classified and resumed: 86, 84, 42, 84 and 138 in rows 1, 2, 4, 5
+and 6, plus two driven runs for row 3. All of it is pinned per row, so a sweep that thinned
+fails closed; the skips are counted by reason, and the oracle is required to refuse none.
 
 **Row 5 does not hold as written, and this records it.** §14 says "redeliver". A torn
 completion leaves a journal with no append point — ADR 0018's anti-bricking rule, restated by
 ADR 0026 — so neither the driver nor the rig can redeliver into that bank. Both refuse. The
 test asserts what does hold: the torn completion is ignored, no partial bytes reach the
-workflow, and nothing is dispatched. The run's continuation is §10's `continue_as_new`, which
-is a new run under a new id. A dispatcher that swaps on a torn tail is rung 0.4's.
+workflow, and nothing is dispatched. The refusal is the decode error at the torn frame,
+`IntegrityFailed` or `Unsealed`, and the test pins those two; a 0.4 dispatcher deciding
+`continue_as_new` keys on them. The run's continuation is §10's `continue_as_new`, which is a
+new run under a new id, so an effect the world did perform is performed again under another
+`(RunId, EffectSeq)`. That is the duplicate `stable-redelivery` forbids, and the guarantee is
+forfeited for this row rather than merely deferred. Issue
+[#95](https://github.com/madmax983/waymaker/issues/95) is the repair that would keep the
+identity, and it belongs with rung 0.4's dispatcher.
 
 **Row 2 is reachable on the model after all.** "After schedule barrier, before dispatch" has
 no power-cut instance in a writer that dispatches as soon as the barrier returns. It has a
@@ -106,14 +129,19 @@ that landed whole with its barrier refused. Twelve crash points, six of them wat
 is the standing `waymaker-rig` already has on `waymaker-conformance`. No layer is touched and
 no budget moves.
 
-**`Rig::resume` is a fifth public function the runner pin lists**, and `RigError` gained a
-`Breach` variant: a resume over a prefix that is not this run's refuses before writing.
+**`Rig::resume` is a public function added to the runner pin**, and `RigError` gained two
+variants: `Breach`, for a prefix that is not this run's, and `Authority`, for a part with
+other than one bank. Both refuse before writing.
 
-**What is owed** is the four rig rows, written in the table as `Owed`. A swap workload in the
-rig is what fills 7 and 8, and it is the change that makes `Rig::judge` walk the bank `select`
-names rather than bank A. A capacity refusal and a divergent replay on the rig are cheaper and
-are still absent, because a probe that asks for a record wider than the bound is not "history
-capacity reached". The boards are still owed both causes, exactly as
+**What is owed** is the four rig rows, written in the table as `Owed`, and it is issue
+[#96](https://github.com/madmax983/waymaker/issues/96). A swap workload in the rig is what
+fills 7 and 8, and it is the change that makes `Rig::judge` walk the bank `select` names
+rather than bank A. A capacity refusal and a divergent replay on the rig are cheaper and are
+still absent, because a probe that asks for a record wider than the bound is not "history
+capacity reached". The same issue records what a board cannot do: rows 2, 3 and 4 are told
+apart by whether the dispatcher was entered and returned, which the harness sees and a reset
+takes with the RAM, so on a board they need a durable record of the world. The rig half is a
+matrix of the model, and the boards are still owed both causes, exactly as
 [what the boards still owe](../../CLAUDE.md#what-the-boards-still-owe) says.
 
 ## Alternatives considered

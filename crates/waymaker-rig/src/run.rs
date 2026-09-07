@@ -97,6 +97,11 @@ pub enum RigError<E, D = core::convert::Infallible> {
     Dispatch(D),
     /// The recovered prefix is not this run's history, so nothing can be resumed from it.
     Breach(Breach),
+    /// Other than one bank is authoritative, so there is no run to resume.
+    Authority {
+        /// How many were.
+        banks: usize,
+    },
     /// The four units are not a geometry.
     Geometry(GeometryError),
 }
@@ -167,7 +172,8 @@ pub enum Resumed {
         /// under the same index, before anything was written — §08's redelivery row.
         redelivered: Option<u16>,
     },
-    /// The journal has no append point: a torn or unsealed tail. Nothing was dispatched.
+    /// The journal has no append point: a torn or unsealed tail. Nothing was dispatched
+    /// and nothing on the part changed.
     ///
     /// ADR 0018's anti-bricking rule. The run's continuation is §10's `continue_as_new`,
     /// which this rig does not perform.
@@ -416,18 +422,7 @@ impl Rig {
         // The instrument is erased as the rig's own traffic; the engine as the engine's,
         // because §10's bank lifecycle is what erases a bank and the figure published for it
         // has to include that.
-        part.set_traffic(Traffic::Rig);
-        {
-            let mut instrument = self.instrument(part)?;
-            let bytes = instrument.geometry().capacity();
-            instrument
-                .erase(0, bytes)
-                .map_err(|_| RigError::Witness(WitnessError::Region))?;
-            instrument
-                .barrier()
-                .map_err(|_| RigError::Witness(WitnessError::Region))?;
-        }
-        part.set_traffic(Traffic::Engine);
+        self.erase_instrument(part)?;
 
         // The bank input is the opening record's payload: §10 puts the run input in the bank
         // header and §06 replays `RunStarted` from history, so a rig whose two disagreed
@@ -809,11 +804,60 @@ impl Rig {
             .map_err(RigError::Dispatch)
     }
 
+    /// The run's recovered prefix, audited record by record, and a writer after it if the
+    /// journal has an append point.
+    ///
+    /// The audit is given a witness that claims every record was begun, so it compares
+    /// records and demands nothing else: what a resume owes is decided from the prefix, not
+    /// the marks.
+    fn recover_prefix<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        workload: Workload,
+        page: &mut [u8],
+    ) -> Result<(u16, Option<Journal>), RigError<S::Error>> {
+        let Some(last) = workload
+            .records()
+            .and_then(|records| records.checked_sub(1))
+        else {
+            return Err(RigError::Workload);
+        };
+        let region = {
+            let mut engine = self.engine(part)?;
+            let banks = self.authoritative_banks(&mut engine, page)?;
+            if banks != 1 {
+                return Err(RigError::Authority { banks });
+            }
+            match self.installed_journal(&mut engine, workload, banks, page)? {
+                Some(region) => region,
+                None => return Err(RigError::Bank),
+            }
+        };
+        let mut audit = Audit::new(workload, Progress::EMPTY.raising(Stage::Attempted, last));
+        let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut engine = self.engine(part)?;
+        let mut recovery = Recovery::new(region);
+        while let Some(step) = recovery.next(&mut engine, page) {
+            match step {
+                Ok(record) => audit
+                    .saw(&record, &mut expected)
+                    .map_err(RigError::Breach)?,
+                Err(RecoveryError::Decode(_)) => break,
+                Err(error) => return Err(RigError::Recovery(unwindow_recovery(error))),
+            }
+        }
+        Ok((audit.recovered(), Journal::after(recovery)))
+    }
+
     /// Carries iteration `iteration` on from whatever a reset left on `part`.
     ///
     /// What a boot does after a cut: recover the prefix, redeliver the effect whose schedule
-    /// has no completion, and write the records the run still owes. No witness mark and no
-    /// cut: a resume is judged by what it returns and by what the dispatcher saw.
+    /// has no completion, and write the records the run still owes. No cut is offered.
+    ///
+    /// The instrument is erased and marked again for the resumed boot, in the order
+    /// [`iterate`](Self::iterate) marks it, so [`verify`](Self::verify) judges a resumed
+    /// part and a reset during a resume is a crash point the witness can speak to. The
+    /// erase comes after the decision to write, so a refused resume changes nothing.
     ///
     /// # Postconditions
     ///
@@ -823,8 +867,9 @@ impl Rig {
     ///
     /// # Errors
     ///
-    /// [`RigError::Bank`] when no single bank names this run, [`RigError::Breach`] when the
-    /// prefix is not this run's, and the refusals [`iterate`](Self::iterate) lists.
+    /// [`RigError::Authority`] when other than one bank is authoritative, [`RigError::Bank`]
+    /// when that bank does not name this run, [`RigError::Breach`] when the prefix is not
+    /// this run's, and the refusals [`iterate`](Self::iterate) lists.
     pub fn resume<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -839,57 +884,39 @@ impl Rig {
         let Some(records) = workload.records() else {
             return Err(RigError::Workload);
         };
-        let region = {
-            let mut engine = self.engine(part).map_err(widen)?;
-            let banks = self.authoritative_banks(&mut engine, page).map_err(widen)?;
-            match self
-                .installed_journal(&mut engine, workload, banks, page)
-                .map_err(widen)?
-            {
-                Some(region) => region,
-                None => return Err(RigError::Bank),
-            }
+        let (recovered, journal) = self.recover_prefix(part, workload, page).map_err(widen)?;
+        let Some(mut journal) = journal else {
+            return Ok(Resumed::Unextendable { recovered });
         };
+        // A run that was complete has nothing to write and keeps the witness it has.
+        if recovered >= records {
+            return Ok(Resumed::Completed {
+                recovered,
+                redelivered: None,
+            });
+        }
+        self.erase_instrument(part).map_err(widen)?;
+        let mut witness = Witness::new(self.witness);
 
-        // A witness that claims every record was begun, so the audit compares records and
-        // demands nothing else: what a resume owes is decided from the prefix, not the marks.
-        let Some(last) = records.checked_sub(1) else {
-            return Err(RigError::Workload);
-        };
-        let mut audit = Audit::new(workload, Progress::EMPTY.raising(Stage::Attempted, last));
-        let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-        let mut journal = {
-            let mut engine = self.engine(part).map_err(widen)?;
-            let mut recovery = Recovery::new(region);
-            while let Some(step) = recovery.next(&mut engine, page) {
-                match step {
-                    Ok(record) => audit
-                        .saw(&record, &mut expected)
-                        .map_err(RigError::Breach)?,
-                    Err(RecoveryError::Decode(_)) => break,
-                    Err(error) => return Err(RigError::Recovery(unwindow_recovery(error))),
-                }
-            }
-            match Journal::after(recovery) {
-                Some(journal) => journal,
-                None => {
-                    return Ok(Resumed::Unextendable {
-                        recovered: audit.recovered(),
-                    });
-                }
-            }
-        };
-        let recovered = audit.recovered();
-
-        let redelivered = match recovered
+        let outstanding = recovered
             .checked_sub(1)
-            .and_then(|index| workload.role(index))
-        {
-            Some(Role::Schedule(effect)) => {
+            .and_then(|index| match workload.role(index) {
+                Some(Role::Schedule(effect)) => Some((index, effect)),
+                Some(Role::Start | Role::Completion(_) | Role::Finish) | None => None,
+            });
+        let redelivered = match outstanding {
+            Some((index, effect)) => {
+                self.mark(
+                    part,
+                    &mut witness,
+                    Mark::new(iteration, index, Stage::Dispatched),
+                    page,
+                )
+                .map_err(widen)?;
                 self.perform(iteration, effect, dispatcher)?;
                 Some(effect)
             }
-            Some(Role::Start | Role::Completion(_) | Role::Finish) | None => None,
+            None => None,
         };
 
         let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
@@ -897,12 +924,33 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Attempted),
+                page,
+            )
+            .map_err(widen)?;
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
             self.append(part, &mut journal, &record, page)
                 .map_err(widen)?;
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Acknowledged),
+                page,
+            )
+            .map_err(widen)?;
             if let Role::Schedule(effect) = role {
+                self.mark(
+                    part,
+                    &mut witness,
+                    Mark::new(iteration, index, Stage::Dispatched),
+                    page,
+                )
+                .map_err(widen)?;
                 self.perform(iteration, effect, dispatcher)?;
             }
             if matches!(role, Role::Completion(_)) {
@@ -913,6 +961,23 @@ impl Rig {
             recovered,
             redelivered,
         })
+    }
+
+    /// Erases the instrument area, as the rig's own traffic, and waits for it.
+    fn erase_instrument<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+    ) -> Result<(), RigError<S::Error>> {
+        part.set_traffic(Traffic::Rig);
+        let outcome = {
+            let mut instrument = self.instrument(part)?;
+            let bytes = instrument.geometry().capacity();
+            instrument
+                .erase(0, bytes)
+                .and_then(|()| instrument.barrier())
+        };
+        part.set_traffic(Traffic::Engine);
+        outcome.map_err(|_| RigError::Witness(WitnessError::Region))
     }
 
     /// Programs one witness mark, as the rig's own traffic.
@@ -1248,6 +1313,7 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::Storage(inner) => RigError::Storage(inner),
         RigError::Geometry(inner) => RigError::Geometry(inner),
         RigError::Breach(inner) => RigError::Breach(inner),
+        RigError::Authority { banks } => RigError::Authority { banks },
         RigError::Dispatch(never) => match never {},
     }
 }

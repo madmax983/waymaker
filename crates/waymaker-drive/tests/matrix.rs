@@ -19,7 +19,19 @@
 //! One row is not a storage crash point. "During physical activity" is the world being
 //! entered and not returning, which the injector cannot produce and
 //! [`during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt`]
-//! models with a world that declines once.
+//! models with a world that performs the effect and then never answers.
+//!
+//! Rows 2 and 6 are decided by what recovery produced, and the operation is the check. A
+//! seal that landed whole with its commit barrier refused is recovered on this model — §15
+//! lets recovery include an unacknowledged complete record — so it sits in row 2 or row 6
+//! beside the one point that is strictly after the barrier, a watchdog reset at
+//! `Progress::Whole`. Row 2 has no power cut after a *returned* barrier: the driver
+//! dispatches as soon as the barrier returns, so that world is row 4. Whether a seal with no
+//! barrier is durable on a part is §12's contract and `waymaker-conformance`'s.
+//!
+//! A failed call (`Interruption::Failure`) is not a reset. The driver stops on it, the media
+//! are in one of the states above, and the point is classified like any other; the census
+//! requires the two reset causes separately.
 //!
 //! # Where this deviates from §14
 //!
@@ -31,7 +43,9 @@
 
 use core::cell::RefCell;
 
-use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, Outcome, RecordRef, RunId};
+use waymaker_core::{
+    ActivityKind, DecodeError, EffectId, EffectSeq, KernelError, Outcome, RecordRef, RunId,
+};
 use waymaker_drive::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, World};
 use waymaker_drive::{
     Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
@@ -42,7 +56,7 @@ use waymaker_fault::{
 use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Refusal, Reserve};
 use waymaker_flash::frame::ProgramAlign;
-use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
+use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_flash::swap::{Retired, Swap};
 use waymaker_rig::matrix::{Matrix, Row};
@@ -290,6 +304,15 @@ fn classify(run: &Run, performed: &[u32]) -> Option<(Row, u32)> {
                 "dispatched during its own schedule, at {at}"
             );
             if history.contains(&Record::Schedule(k)) {
+                // Recovered, so the seal landed whole: this is the seal's `Whole` or the
+                // commit barrier, and never the frame or the payload barrier.
+                assert!(
+                    matches!(
+                        (step, landed),
+                        (Step::Seal, true) | (Step::CommitBarrier, _)
+                    ),
+                    "a recovered schedule from an unsealed write, at {at}"
+                );
                 Some((Row::AfterScheduleBarrierBeforeDispatch, k))
             } else {
                 Some((Row::DuringScheduleFrameWrite, k))
@@ -301,6 +324,13 @@ fn classify(run: &Run, performed: &[u32]) -> Option<(Row, u32)> {
                 "an outcome written for an effect never performed, at {at}"
             );
             if history.contains(&Record::Outcome(k)) {
+                assert!(
+                    matches!(
+                        (step, landed),
+                        (Step::Seal, true) | (Step::CommitBarrier, _)
+                    ),
+                    "a recovered outcome from an unsealed write, at {at}"
+                );
                 Some((Row::AfterCompletionBarrier, k))
             } else if step == Step::Frame && !landed {
                 assert!(
@@ -378,10 +408,13 @@ fn refused_without_dispatch(
     world: &World,
     at: &str,
 ) {
+    // A torn frame fails its check; a whole frame with no seal is unsealed. Nothing else.
     assert!(
         matches!(
             ended,
-            Err(DriveError::Recovery(_) | DriveError::NoAppendPoint)
+            Err(DriveError::Recovery(RecoveryError::Decode(
+                DecodeError::IntegrityFailed | DecodeError::Unsealed
+            )))
         ),
         "the only legal refusals here, at {at}: {ended:?}"
     );
@@ -436,7 +469,9 @@ fn during_schedule_frame_write_the_frame_is_ignored_and_the_activity_was_not_yet
         let (ended, world, workflow) = reboot(&point.image);
         if ended.is_ok() {
             // Nothing of the frame landed, so the reboot schedules it afresh — once.
-            assert_eq!(dispatched(&world, RUN).first(), Some(&k), "at {at}");
+            let again = dispatched(&world, RUN);
+            assert_eq!(again.first(), Some(&k), "at {at}");
+            assert_eq!(again.iter().filter(|s| **s == k).count(), 1, "at {at}");
             assert_eq!(workflow.hashed(), HASHED, "at {at}");
             carried_on += 1;
         } else {
@@ -480,15 +515,15 @@ fn after_schedule_barrier_before_dispatch_the_stable_effect_id_is_redelivered() 
     }
 }
 
-#[test]
-fn during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt()
- {
-    // The world is entered and does not return, which is what the supply going during the
-    // activity looks like from the media: the schedule is the last durable record and
-    // nothing was written after it. RAM goes with the reboot; the world persists.
+/// Row 3, driven: the world performs the effect and never answers, then the run reboots.
+///
+/// The supply going during the activity, after the world changed. From the media it is a
+/// schedule with nothing after it; from the world it is one performance with no answer. RAM
+/// goes with the reboot; the world persists. Returns the row it credits.
+fn row_three() -> Row {
     for k in 0..2_u32 {
         let mut device = Device::new(geometry());
-        let mut world = World::pending_once_at_seq(k);
+        let mut world = World::interrupted_once_at_seq(k);
         let mut workflow = Pipeline::new();
         let first = boot(
             &mut device,
@@ -525,18 +560,32 @@ fn during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates
             "{second:?}"
         );
         assert_eq!(again.hashed(), HASHED);
-        // Two attempts, one identity, and the world performed it once.
-        let offers: Vec<EffectId> = world.offered().iter().map(|d| d.id).collect();
+        // Performed twice, under one identity: the duplicate attempt the row requires the
+        // activity to tolerate, and it did — the run ended with the right answer.
         let id = EffectId {
             run: RUN,
             seq: EffectSeq(k),
         };
-        assert_eq!(offers.iter().filter(|o| **o == id).count(), 2, "effect {k}");
+        let attempts: Vec<EffectId> = world
+            .dispatched()
+            .iter()
+            .map(|d| d.id)
+            .filter(|got| *got == id)
+            .collect();
+        assert_eq!(attempts, [id, id], "effect {k}");
         assert_eq!(
-            dispatched(&world, RUN).iter().filter(|s| **s == k).count(),
-            1
+            world.offered().iter().filter(|d| d.id == id).count(),
+            2,
+            "effect {k}"
         );
     }
+    Row::DuringPhysicalActivity
+}
+
+#[test]
+fn during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt()
+ {
+    assert_eq!(row_three(), Row::DuringPhysicalActivity);
 }
 
 #[test]
@@ -583,12 +632,13 @@ fn during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_
             Some(&Record::Schedule(k)),
             "torn completion ignored, at {at}"
         );
-        for payload in payloads(&point.image) {
-            assert!(
-                payload == DOWNLOADED || payload == HASHED,
-                "a partial answer was recovered, at {at}"
-            );
-        }
+        // Every recovered outcome belongs to an effect before `k`, and is whole.
+        let recovered = payloads(&point.image);
+        assert_eq!(recovered.len(), usize::try_from(k).unwrap_or(0), "at {at}");
+        assert!(
+            recovered.iter().all(|p| p == DOWNLOADED || p == HASHED),
+            "a partial answer was recovered, at {at}"
+        );
         // See the module documentation: no append point, so the bank is refused rather than
         // redelivered into, and nothing of the answer reaches the workflow.
         let (ended, world, workflow) = reboot(&point.image);
@@ -727,8 +777,21 @@ fn authority(device: &mut Device, layout: BankLayout) -> Authority {
 const SWAP_OPS: usize = 8;
 
 /// The old run installed and waiting at its second effect, then the whole swap.
+/// The run two generations back, left sealed in bank B so §10's step 2 erases something.
+const STALE_RUN: RunId = RunId(0x0BAD_F00D_0000_0011);
+
 fn swap_writer(session: &mut Session) -> Result<(), String> {
     let layout = layout_of(swap_geometry());
+    // Bank B holds a stale sealed run, so a partial erase leaves a real candidate for
+    // `select` to reject rather than cells that were erased already.
+    install(
+        session,
+        layout,
+        BankId::B,
+        Generation(0),
+        &header_of(STALE_RUN, layout),
+    )
+    .map_err(|e| format!("{e:?}"))?;
     let old = header_of(RUN, layout);
     let region =
         install(session, layout, BankId::A, Generation(1), &old).map_err(|e| format!("{e:?}"))?;
@@ -763,6 +826,18 @@ fn swap_writer(session: &mut Session) -> Result<(), String> {
         .and_then(|sealable| sealable.commit(session))
         .map_err(|e| format!("{e:?}"))?;
     installed.reclaim(session).map_err(|e| format!("{e:?}"))
+}
+
+/// Requires `row` to have been reached by a power cut and by a watchdog reset.
+fn both_causes<'a>(injections: impl Iterator<Item = &'a Injection>, row: Row) {
+    let seen: Vec<Interruption> = injections.map(|i| i.interruption).collect();
+    for cause in [Interruption::PowerLoss, Interruption::Watchdog] {
+        assert!(
+            seen.contains(&cause),
+            "{} was never reached by a {cause:?}",
+            row.id()
+        );
+    }
 }
 
 /// One crash point of the swap, classified by what the device then boots.
@@ -803,7 +878,12 @@ fn swap_sweep() -> Vec<SwapPoint> {
         let Some(injection) = run.injection() else {
             continue;
         };
-        if injection.op < first_swap_op {
+        // From the swap's first operation on, and the power cut after the old run's last
+        // barrier returned, which the writer meets at that first operation.
+        let before_the_swap = injection.op + 1 == first_swap_op
+            && injection.progress == Landed::Whole
+            && injection.interruption == Interruption::PowerLoss;
+        if injection.op < first_swap_op && !before_the_swap {
             continue;
         }
         let Some(mut device) = Device::restored(geometry, run.image().to_vec()) else {
@@ -853,12 +933,17 @@ fn during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_th
     let Ok(region) = JournalRegion::of(layout, BankId::A, &header_of(RUN, layout)) else {
         unreachable!("bank A holds a journal")
     };
-    let mut seen = 0_usize;
-    let mut mid_erase = 0_usize;
-    for mut point in swap_sweep()
+    let points: Vec<SwapPoint> = swap_sweep()
         .into_iter()
         .filter(|p| p.row == Row::DuringInactiveBankEraseOrWrite)
-    {
+        .collect();
+    both_causes(
+        points.iter().map(|p| &p.injection),
+        Row::DuringInactiveBankEraseOrWrite,
+    );
+    let mut seen = 0_usize;
+    let mut mid_erase = 0_usize;
+    for mut point in points {
         let at = format!("{:?}", point.injection);
         seen += 1;
         if matches!(point.injection.progress, Landed::Bytes(_)) {
@@ -896,12 +981,17 @@ fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_
     let Ok(region) = JournalRegion::of(layout, BankId::B, &next) else {
         unreachable!("bank B holds a journal")
     };
-    let mut seen = 0_usize;
-    let mut old_journal_intact = 0_usize;
-    for mut point in swap_sweep()
+    let points: Vec<SwapPoint> = swap_sweep()
         .into_iter()
         .filter(|p| p.row == Row::AfterNewBankSealBarrier)
-    {
+        .collect();
+    both_causes(
+        points.iter().map(|p| &p.injection),
+        Row::AfterNewBankSealBarrier,
+    );
+    let mut seen = 0_usize;
+    let mut old_journal_intact = 0_usize;
+    for mut point in points {
         let at = format!("{:?}", point.injection);
         seen += 1;
         // The authoritative header names the new run, not the old one.
@@ -1023,8 +1113,8 @@ fn near_capacity() -> (Geometry, BankLayout, Reserve, JournalRegion, Device) {
     unreachable!("no bank in the search fills after exactly one effect")
 }
 
-#[test]
-fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new() {
+/// Row 9, driven. Returns the row it credits.
+fn row_nine() -> Row {
     let (_, layout, reserve, region, mut device) = near_capacity();
     assert_eq!(
         history_of(&mut device, region).0,
@@ -1078,12 +1168,14 @@ fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_
     ) else {
         unreachable!("a swap can be planned from the near-capacity state")
     };
-    let installed = swap
+    let Ok(installed) = swap
         .prepare(&mut device)
         .and_then(|prepared| prepared.stage(&mut device, &mut page))
         .and_then(|staged| staged.payload_barrier(&mut device))
         .and_then(|sealable| sealable.commit(&mut device))
-        .expect("the seven steps complete on a fault-free device");
+    else {
+        unreachable!("the seven steps complete on a fault-free device")
+    };
     assert_eq!(authority(&mut device, layout), installed.authority());
     let mut new_world = World::new();
     let mut new_workflow = Pipeline::new();
@@ -1108,6 +1200,12 @@ fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_
         matches!(ended, Err(DriveError::Capacity(Refusal::NearCapacity))),
         "{ended:?}"
     );
+    Row::HistoryCapacityReached
+}
+
+#[test]
+fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new() {
+    assert_eq!(row_nine(), Row::HistoryCapacityReached);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1133,8 +1231,9 @@ impl Workflow for Divergent {
     }
 }
 
-#[test]
-fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched() {
+/// Row 10, driven over every crash image whose history reaches the divergent effect.
+/// Returns the row it credits.
+fn row_ten() -> Row {
     let harness = Harness::new(geometry());
     let Ok(runs) = harness.run(|session| reference(session).0) else {
         unreachable!("the fault-free run completes")
@@ -1185,6 +1284,12 @@ fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_hist
         diverged_with_the_effect_outstanding > 0,
         "the sharpest case — a changed request for an outstanding effect — was never met"
     );
+    Row::ReplayDivergence
+}
+
+#[test]
+fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched() {
+    assert_eq!(row_ten(), Row::ReplayDivergence);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1192,7 +1297,7 @@ fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_hist
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn every_row_of_the_table_is_reached_and_every_crash_point_is_in_a_row() {
+fn every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned() {
     let mut matrix = Matrix::EMPTY;
     for point in sweep() {
         matrix = matrix.record(point.row);
@@ -1200,17 +1305,33 @@ fn every_row_of_the_table_is_reached_and_every_crash_point_is_in_a_row() {
     for point in swap_sweep() {
         matrix = matrix.record(point.row);
     }
-    // The two rows that are not crash points, each held by its own test above.
-    matrix = matrix
-        .record(Row::DuringPhysicalActivity)
-        .record(Row::HistoryCapacityReached)
-        .record(Row::ReplayDivergence);
+    // The three rows that are driven rather than swept, credited by what each returns after
+    // its own assertions and not by fiat.
+    for row in [row_three(), row_nine(), row_ten()] {
+        matrix = matrix.record(row);
+    }
     matrix
         .verdict()
         .expect("every row of §14's table is reached on the model");
-    assert!(
-        matrix.total() > 300,
-        "the sweep shrank to {} classified points",
-        matrix.total()
+    // Pinned exactly, for `waymaker-spec`'s census reason: the numbers move when the run or
+    // the geometry does, and the dangerous direction is a sweep that quietly shrank.
+    let counts: Vec<(Row, u32)> = Row::ALL
+        .into_iter()
+        .map(|row| (row, matrix.iterations(row)))
+        .collect();
+    assert_eq!(
+        counts,
+        [
+            (Row::DuringScheduleFrameWrite, 138),
+            (Row::AfterScheduleBarrierBeforeDispatch, 12),
+            (Row::DuringPhysicalActivity, 1),
+            (Row::AfterActivityBeforeCompletionBarrier, 6),
+            (Row::DuringCompletionWrite, 159),
+            (Row::AfterCompletionBarrier, 79),
+            (Row::DuringInactiveBankEraseOrWrite, 123),
+            (Row::AfterNewBankSealBarrier, 25),
+            (Row::HistoryCapacityReached, 1),
+            (Row::ReplayDivergence, 1),
+        ]
     );
 }

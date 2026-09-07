@@ -211,6 +211,16 @@ pub const STAGES: &[Stage] = &[
         why: "issue #20: design document \u{a7}14's guarantees verify in CI as a check of their own, not as a line in another job's log",
     },
     Stage {
+        name: "matrix",
+        job: "verification",
+        // Issue #31's exit criterion, beside issue #20's for the same reason: a red
+        // `verification` job says a row of design document §14's table no longer holds,
+        // under the name of the row. The `test` stage runs both files too.
+        command: "cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix",
+        in_hook: false,
+        why: "issue #31: design document \u{a7}14's failure-semantics table runs in CI as a check of its own, on the model and on the rig",
+    },
+    Stage {
         name: "layering",
         job: "layering",
         command: "cargo --locked xtask check-layering",

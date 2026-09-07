@@ -1211,9 +1211,8 @@ pub fn check_rig_oracle(sources: &[crate::size::LayerSource]) -> Vec<Violation> 
         RIG_MATRIX_PATH,
         RIG_MATRIX_SURFACE,
         sources,
-        "the failure matrix is what makes a row nothing reached a refusal rather than a \
-         silence, so a way to call a row reached that was not cannot be added without a \
-         reviewer writing it down",
+        "an unreached row is a refusal, not a silence; a way to mark a row reached needs a \
+         reviewer to write it down",
     ));
     violations
 }
@@ -4985,7 +4984,7 @@ fn find_source<'a>(
 /// before the end of the input, so a caller that cannot find what it pins reports that
 /// rather than pinning nothing.
 #[must_use]
-fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
+pub(crate) fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
 
     let after = code.match_indices(header).find_map(|(index, _)| {
@@ -5285,7 +5284,7 @@ fn is_array_type(declared_type: &str) -> bool {
 /// Lines are replaced rather than removed so that anything reported against this text still
 /// lines up with the file.
 #[must_use]
-fn without_test_modules(code: &str) -> String {
+pub(crate) fn without_test_modules(code: &str) -> String {
     let mut kept = String::with_capacity(code.len());
     let mut depth: i32 = 0;
     let mut test_block: Option<i32> = None;
