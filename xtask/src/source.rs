@@ -2200,16 +2200,61 @@ fn declares_braced_struct(code: &str, header: &str) -> bool {
         })
 }
 
-/// The brace depth at `index`, counted from the start of `code`.
+/// Whether `code` has a hand-written `impl Trait for type_name` block.
 ///
-/// `code` has already been through [`code_only`], so a brace in a comment or a string
-/// literal is not in it. Depth zero is a statement of the body itself; anything deeper is
-/// inside a block, a closure or a match arm, and a step taken there is a step a branch can
-/// skip.
-fn brace_depth_at(code: &str, index: usize) -> usize {
+/// A `#[derive(..)]` is not one: it produces no `impl` line for this scan to find, which is
+/// what keeps `Clone`, `Copy` and `Debug` out of the way.
+///
+/// Codex round 2 asked for this, on a premise that does not hold: `public_functions` counts a
+/// method of a trait `impl` as callable whatever its visibility, so the surface pin already
+/// rejected `impl From<EffectId> for DurableIntent` — as a name it does not list, and, when
+/// the method reuses a pinned name, as one declared twice. Both were measured before this was
+/// written.
+///
+/// It is here anyway, because the two pins that are *about* construction — the method set and
+/// the `Self` scan — do both go blind on a trait `impl`, and a guarantee that holds only
+/// through a third pin's side effect is one nobody can check by reading this file.
+fn implements_trait_for(code: &str, type_name: &str) -> bool {
+    let mut cursor = 0_usize;
+    while let Some(at) = code.get(cursor..).and_then(|rest| rest.find("\nimpl")) {
+        let start = cursor.saturating_add(at).saturating_add(1);
+        let Some(rest) = code.get(start..) else {
+            break;
+        };
+        cursor = start.saturating_add(5);
+        let header = rest.get(..rest.find('{').unwrap_or(0)).unwrap_or_default();
+        let Some((_, implemented)) = header.rsplit_once(" for ") else {
+            continue;
+        };
+        // The bare name, with any generic arguments cut off: `DurableIntent` and
+        // `Dispatchable<C>` are the same type here.
+        let named = implemented
+            .trim()
+            .split(['<', ' ', '\n'])
+            .next()
+            .unwrap_or_default();
+        if named == type_name {
+            return true;
+        }
+    }
+    false
+}
+
+/// The nesting depth at `index`, counted from the start of `code`.
+///
+/// Braces, parentheses and brackets together. `code` has already been through [`code_only`],
+/// so a bracket in a comment or a string literal is not in it. Depth zero is a statement of
+/// the body itself; anything deeper is inside a block, an argument list, a match arm or a
+/// closure, and a step taken there is a step a branch can skip.
+///
+/// The parentheses are Codex's, from round 2. Brace depth alone equated nesting with
+/// execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has
+/// no braces at all: three pinned calls, in order, at brace depth zero, in a closure nothing
+/// runs.
+fn nesting_depth_at(code: &str, index: usize) -> usize {
     let before = code.get(..index).unwrap_or_default();
-    let opened = before.matches('{').count();
-    let closed = before.matches('}').count();
+    let opened = before.matches(['{', '(', '[']).count();
+    let closed = before.matches(['}', ')', ']']).count();
     opened.saturating_sub(closed)
 }
 
@@ -4245,6 +4290,20 @@ fn check_effect_methods(code: &str, type_name: &str, methods: &[&str]) -> Vec<Vi
             ),
         ));
     }
+    if EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{type_name}` implements a trait: a trait body is not an inherent `impl` and \
+                 writes `Self` rather than the type's name, so the method pin and the \
+                 construction pin are both blind to it. What catches a \
+                 `From<EffectId> for {type_name}` today is the surface pin, incidentally — \
+                 either as a name it does not list or as one listed twice — and a proof of \
+                 durable intent should not rest on an incidental"
+            ),
+        ));
+    }
     if EFFECT_NO_SELF_LITERAL.contains(&type_name) && struct_literals(&joined, "Self") != 0 {
         violations.push(Violation::new(
             RULE,
@@ -4324,6 +4383,20 @@ fn check_effect_steps(code: &str) -> Vec<Violation> {
         // Counted and located on one whitespace-free copy, so a count and a position cannot
         // disagree about which occurrence they mean.
         let tight = tightened(body);
+        // A closure bound to a name puts the three calls at the body's own nesting, and
+        // nothing but the `|` says they are not what the body does. Neither of these two
+        // bodies has any use for one.
+        if tight.contains('|') {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "`{owner}::{body_name}` declares a closure: \u{a7}07's steps have to be \
+                     what this body does, and a closure is a body of its own that may never \
+                     be called"
+                ),
+            ));
+        }
         let mut previous = 0_usize;
         for step in EFFECT_STEPS {
             if tight.matches(step).count() != 1 {
@@ -4356,13 +4429,14 @@ fn check_effect_steps(code: &str) -> Vec<Violation> {
             // right order on a path nothing takes is not §07's protocol. The position pin
             // below cannot see this, because a construction after a skipped `.commit(` is
             // still textually after it.
-            if brace_depth_at(&tight, at) != 0 {
+            if nesting_depth_at(&tight, at) != 0 {
                 violations.push(Violation::new(
                     RULE,
                     DRIVER,
                     format!(
-                        "`{owner}::{body_name}` takes `{step}` inside a block: \u{a7}07's steps \
-                         are what this body does, not what one of its branches does"
+                        "`{owner}::{body_name}` takes `{step}` inside a block, an argument \
+                         list or a closure: \u{a7}07's steps are what this body does, not what \
+                         one of its branches does"
                     ),
                 ));
             }
@@ -6877,6 +6951,69 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("declares no `fn redelivering`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_trait_impl_on_a_proof_type_is_reported() {
+        // Codex round 2. The surface pin already caught this — `public_functions` counts a
+        // trait method as callable — so this asserts the *direct* refusal, which is what
+        // stops the guarantee resting on another pin's side effect.
+        for proof in EFFECT_NO_SELF_LITERAL {
+            let source = tests_support::clean_effect_module()
+                + &format!(
+                    "impl From<EffectId> for {proof} {{\n\
+                     \x20   fn from(id: EffectId) -> Self {{\n        Self {{ id }}\n    }}\n}}\n"
+                );
+            let details = effect_details(&source);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("implements a trait")),
+                "{proof}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_step_body_whose_barriers_are_inside_a_closure_is_reported() {
+        // Codex round 2, the other half. Codex's own example: no braces anywhere in the
+        // closure, so brace depth is zero at every one of the three calls.
+        let source = tests_support::clean_effect_module().replacen(
+            "        self.writer\n            .stage(storage, &record, page)\n\
+             \x20           .payload_barrier(storage)\n            .commit(storage);",
+            "        let _ = false.then(|| self.writer\n\
+             \x20           .stage(storage, &record, page)\n\
+             \x20           .payload_barrier(storage)\n            .commit(storage));",
+            1,
+        );
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("inside a block")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_body_that_declares_a_closure_is_reported() {
+        // And a closure bound to a name sidesteps every depth: the calls are at the body's
+        // own nesting, and nothing but the `|` says they are not what the body does.
+        let source = tests_support::clean_effect_module().replacen(
+            "        self.writer\n            .stage(storage, &record, page)\n\
+             \x20           .payload_barrier(storage)\n            .commit(storage);",
+            "        let seal = || self.writer\n            .stage(storage, &record, page)\n\
+             \x20           .payload_barrier(storage)\n            .commit(storage);\n\
+             \x20       let _ = seal;",
+            1,
+        );
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares a closure")),
             "{details:?}"
         );
     }
