@@ -1560,15 +1560,21 @@ fn facade() -> usize {
     use waymaker_core::timer::Deadline;
     use waymaker_embassy::clock::{ClockError, PersistentClock, PersistentTimer};
 
-    /// A stand-in RTC. The probe is never run, so the reading is an opaque constant and
-    /// what the row charges for is the capability, not the driver.
+    /// A stand-in RTC. The probe is never run, so what the row charges for is the
+    /// capability rather than the driver.
+    ///
+    /// The whole `Result` goes through `black_box`, not the reading inside it. Codex found
+    /// the version that boxed only the reading: the discriminant was then a compile-time
+    /// `Ok`, so every `ClockError::Unavailable` arm folded away and the row omitted a path
+    /// a real fallible clock takes. It is the same mistake the engine row made with a spec's
+    /// discriminant, one type over.
     struct Rtc(u64);
 
     impl PersistentClock for Rtc {
         type Error = ();
 
         fn now(&mut self) -> Result<u64, ()> {
-            Ok(core::hint::black_box(self.0))
+            core::hint::black_box(Ok(self.0))
         }
     }
 

@@ -1565,7 +1565,7 @@ two identifiers outright: a persistent-clock module that names `AfterBoot` or `B
 either substituting one policy for the other or fabricating a permission.
 Two things came out of this rather than out of reading the code. The `facade` row of
 `cargo xtask size` measured 0 B and carried a standing notice asking for something to call,
-because `waymaker-embassy` declared no code at all; it now reads 292 B and the notice is gone.
+because `waymaker-embassy` declared no code at all; it now reads 320 B and the notice is gone.
 And the budget is the number worth recording: §11's vocabulary cost 284 B, 18102 B to
 18386 B against the same 18 KiB gate and no third raise, which leaves 46 B — not enough for
 issue #33's two record bodies, so issue #72 is now this rung's binding constraint rather than

@@ -95,6 +95,13 @@ measured the boot half of §11 and reported it as §11. The correction is 40 B �
 and the reason the finding was a P1 rather than a tidy-up: 40 B of unmeasured code against
 what was then 94 B of headroom.
 
+The façade row makes the same mistake one type over, and Codex found that too: the stand-in
+RTC returned `Ok(black_box(reading))`, so the `Result`'s discriminant was a compile-time fact
+and every `ClockError::Unavailable` arm folded away. Boxing the whole `Result` is 28 B — 292 B
+to 320 B — which is the cost of the path a real fallible clock takes. Neither row is gated
+against a budget, so nothing would have failed; what would have been wrong is the published
+number, and §04 asks every optional feature to show its own cost.
+
 `ClockKind` spends two numbers now — 1 for the boot clock, 2 for the persistent one, and zero
 for neither, so an erased or zeroed field does not decode as a policy. That is the same move
 `RecordKind` made for the five records it cannot decode: issue #33 writes a record body rather
@@ -142,7 +149,7 @@ does the same across a power loss and requires the first look to say `Elapsed`.
 
 The `facade` row of `cargo xtask size` measures something for the first time. It read 0 B and
 carried a standing notice — "either it costs nothing, or `waymaker-size-probe` does not reach
-any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 292 B,
+any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 320 B,
 and the notice is gone.
 
 The code-flash figure is the number worth recording. §11's vocabulary cost **284 B**: 18102 B
