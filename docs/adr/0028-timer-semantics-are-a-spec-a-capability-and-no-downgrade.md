@@ -50,10 +50,15 @@ has no persistent clock". Issue [#34](https://github.com/madmax983/waymaker/issu
 for exactly that, and `IncompatibleWorkflow` — which issue #33 correctly uses for a *recorded*
 clock kind this firmware cannot service — says only that the workflow cannot be replayed.
 
-**A persistent deadline needs a clock in hand.** `PersistentTimer::arm` takes
-`&mut C where C: PersistentClock` and is the only constructor. Firmware with no such type
-cannot write the call at all, which is issue #32's compile-time half; `ClockCapability` is the
-runtime half, for a firmware that declares what it has.
+**A persistent deadline needs a clock in hand, and the clock that armed it.**
+`PersistentTimer::<C>::arm` takes `&mut C where C: PersistentClock` and is the only
+constructor. Firmware with no such type cannot write the call at all, which is issue #32's
+compile-time half; `ClockCapability` is the runtime half, for a firmware that declares what it
+has. The clock type stays in the timer, so `poll` accepts no other driver — a `compile_fail`
+doctest beside a compiling twin is what states that. Codex found the version without it on the
+first review round, and the finding was right: an RTC counting milliseconds since an epoch and
+a network clock counting seconds since boot are both `u64`, so a timer armed by one and polled
+by the other fires early or late with nothing to say so.
 
 `evaluate` adds nothing. An `AfterBoot` deadline compares the interval against
 `reading - armed_at`, and an `AtPersistentTime` one compares the reading against the instant.
@@ -61,6 +66,21 @@ Both subtractions happen after the reading has been checked against the arming r
 input wraps a deadline into the past or into a future that never arrives. A reading below the
 arming reading is `KernelError::ClockWentBackwards` rather than a credited or a discarded
 interval.
+
+`ClockCapability::admits` names every pair and uses no `_`. That is the finding this change's
+own review turned up, and it inverts the reasoning: with a wildcard, a third spec added later
+would have been *admitted* by a firmware with no persistent clock — the silent downgrade this
+module exists to forbid, arriving in the one place that decides policy, while `clock_kind` and
+`evaluate` failed to compile and named the two places that do not. The kernel's error
+vocabulary refuses `#[non_exhaustive]` for the same reason, and this is that rule applied to a
+policy table. It is also what makes the gate's residual limits tolerable: a third policy is now
+a compile error at the arm that would have permitted it, whatever a scanner can or cannot see.
+
+`PersistentTimer` keeps a high-water mark rather than trusting `Timer::armed_at` alone. Review
+found that a clock which moved back *after* a poll, but stayed above the arming reading, was
+believed: a deadline reported `Elapsed` and then `Remaining` on the next look. A timer that
+un-fires is worse than one that never fired, and `PersistentClock`'s contract — "poll catches
+it" — was not true without this.
 
 `ClockKind` spends two numbers now — 1 for the boot clock, 2 for the persistent one, and zero
 for neither, so an erased or zeroed field does not decode as a policy. That is the same move
@@ -72,28 +92,42 @@ semantics module's public surface, the members of `TimerSpec`, `ClockCapability`
 `Deadline`, and the capability module's surface — each in both directions, so a module renamed
 or deleted is a pin that has stopped checking. It also refuses two identifiers in
 `waymaker-embassy/src/clock.rs`: `AfterBoot` and `BootOnly`. A module that exists because a
-boot clock is not good enough has no honest use for either, and a `TimerSpec::best_effort`, a
-`Timer::arm_or_downgrade` or a `PersistentClock::now_or_zero` would each break no layering
-rule, need no dependency, and pass every other gate.
+boot clock is not good enough has no honest use for either.
+
+Three of its halves are there because review defeated the version without them, and each was
+watched passing on a mutation before it was closed. A `pub(crate) const fn arm_or_downgrade`
+on `impl Timer` — the same mutation ADR 0025's review used on `DurableIntent` — because a
+surface pin counts `pub ` and not `pub(`, and `pub(crate)` is reach enough for rung 0.4's
+`Ctx`; the method sets are read at every visibility now. A `pub spec` field on `Timer`, which
+adds no function and changes no member and makes the invariant the whole design rests on a
+value any caller can set. And the sharpest: `pub const BEST_EFFORT: Self = Self::AfterBoot
+{ ticks: 0 }` on `impl TimerSpec`, reached from `arm` as `TimerSpec::BEST_EFFORT` behind a
+plausible "epoch not restored yet" guard — neither file named a banned identifier, no surface
+changed, and the whole pipeline was green on a persistent deadline served by a clock that
+restarts on every reset. An identifier blacklist closes one spelling at a time, so the pin is
+positive instead: `clock.rs` must name a spec, and every spec it names must be
+`TimerSpec::AtPersistentTime`.
 
 ## Consequences
 
 Rung 0.5's first item is done, and the two "done when" tests are what state it:
 `an_after_boot_timer_restarts_its_interval_after_a_reset` arms an interval, reads it part-way,
-takes the reset that clears both the boot clock and the RAM the timer lived in, re-arms from
-the same spec, and requires the whole interval to be owed again after 1 040 ticks of total
-powered time. `an_at_persistent_time_timer_is_elapsed_when_the_restored_epoch_is_past_its_instant`
+then re-arms from the same spec against a boot clock that has returned to zero — which is what
+a reset leaves — and requires the whole interval to start again after 1 040 ticks of total
+powered time. Nothing here performs a reset, because no record yet carries a timer across one;
+`a_timer_armed_before_a_reset_refuses_a_reading_from_after_it` covers the timer that somehow
+survived one. `an_at_persistent_time_timer_is_elapsed_when_the_restored_epoch_is_past_its_instant`
 does the same across a power loss and requires the first look to say `Elapsed`.
 
 The `facade` row of `cargo xtask size` measures something for the first time. It read 0 B and
 carried a standing notice — "either it costs nothing, or `waymaker-size-probe` does not reach
-any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 256 B,
+any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 280 B,
 and the notice is gone.
 
-The code-flash figure is the number worth recording. §11's vocabulary cost **268 B**: 18102 B
-to 18370 B against the same 18 KiB gate,
+The code-flash figure is the number worth recording. §11's vocabulary cost **236 B**: 18102 B
+to 18338 B against the same 18 KiB gate,
 [ADR 0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) asked for no
-third raise and there is none. What that leaves is 62 B of headroom, which is not enough for
+third raise and there is none. What that leaves is 94 B of headroom, which is not enough for
 rung 0.5's remaining work: issue #33's two record bodies and their codec will not fit under
 it. A third of the measured figure is still the size probe's own arithmetic rather than the
 engine's, which is issue [#72](https://github.com/madmax983/waymaker/issues/72), and that
@@ -112,6 +146,11 @@ What is owed, stated so that a green build does not imply it:
   the new reading against. Issue #33's `TimerScheduled` record is what carries the floor
   across a reboot, and it is one of the reasons that record has to hold the arming reading as
   well as the deadline.
+- **Two instances of one driver are one clock to the compiler.** The type parameter closes
+  the two-drivers case and not the two-RTCs-on-one-board case, nor one driver re-created with
+  a different epoch. It is the same limit `waymaker-flash` records for a `Geometry`, and the
+  same fix would close it — bind the clock by a borrow rather than by a type — except that a
+  deadline holding a borrow of its clock could not be held across the wait it describes.
 - **Nothing obliges a caller to go through the capability.** `Timer::arm` with
   `ClockCapability::Persistent` is available to a firmware that declares it and does not have
   it. The declaration is the firmware's word, exactly as `Swap::beginning`'s two arguments
@@ -122,6 +161,23 @@ What is owed, stated so that a green build does not imply it:
   ordinary in-boot sleep" arrives with the dispatcher at 0.4; there is no sleep here to
   document as not power-loss-durable, and the `AfterBoot` variant carries that sentence
   instead.
+- **The member pin reads a header string.** A rename that carries the crate root with it —
+  the shipped `TimerSpec` becomes `TimerSpecV2`, a decoy `mod compat` keeps the pinned name
+  and the pinned members — leaves `TIMER_TYPES` comparing a type nobody ships. Review ran it.
+  The crate-root check closes the careless version (the rename loses its re-export, or does
+  not compile), and what closes the *dangerous* version is not the gate at all: a third policy
+  has to be handled in `admits`, which no longer has a wildcard, so it is a line a reviewer
+  reads. `kernel-boundary` shares the reader and the limit.
+- **`ClockKind`'s numbers are not pinned.** The surface pin counts functions and the member
+  pin names three enums, so `pub const AFTER_BOOT: Self = Self(1)` — the one thing here that
+  reaches media — can be renumbered with the gate green. `each_spec_reports_the_clock_kind_its_record_will_carry`
+  is what holds them, and issue #33 is where they become a wire format worth a pin.
+- **A `Timer` handed out can be evaluated with any reading.** `PersistentTimer::timer` returns
+  the kernel type, and `Timer::evaluate` is public and takes a bare `u64`, so a caller that
+  goes around `poll` can measure a persistent deadline with a boot reading. The accessor
+  exists because issue #33 has to record what was armed; `poll` is the path that carries the
+  clock, and nothing obliges a caller to take it — the same standing as the reserve and the
+  witness above.
 - **The gate compares names.** An `admits` that stopped consulting its argument, or an
   `evaluate` that credited an interval it could not measure, are invisible to
   `timer-capability` and are `crates/waymaker-core/tests/timer.rs`'s. Each half pins one file,

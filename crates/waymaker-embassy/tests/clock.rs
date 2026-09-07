@@ -57,7 +57,7 @@ fn a_persistent_timer_can_only_be_armed_with_a_clock_in_hand() {
     // reaching `TimerSpec::AtPersistentTime` through `PersistentTimer` requires a
     // `&mut C: PersistentClock`, and a firmware with no such type cannot write the call.
     let mut rtc = Rtc::reading(&[1_000, 1_500]);
-    let armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
+    let mut armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
 
     assert_eq!(
         armed.timer().spec(),
@@ -72,7 +72,7 @@ fn a_restored_epoch_past_the_instant_is_elapsed_on_the_first_poll() {
     // The across-power-loss case, driven through the capability rather than through the
     // arithmetic: the run re-arms on the new boot and the RTC has kept counting.
     let mut rtc = Rtc::reading(&[5_000, 5_000]);
-    let armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
+    let mut armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
 
     assert_eq!(armed.poll(&mut rtc), Ok(Deadline::Elapsed));
 }
@@ -82,13 +82,13 @@ fn a_clock_that_fails_is_a_failure_rather_than_a_reading() {
     // Issue #32's third work item, first half. There is no default reading: a zero here
     // would fire every persistent timer at once, and a `u64::MAX` would fire none of them.
     let mut arming = Rtc::failing();
-    assert_eq!(
+    assert!(matches!(
         PersistentTimer::arm(&mut arming, 2_000),
         Err(ClockError::Unavailable(Fault))
-    );
+    ));
 
     let mut polling = Rtc::reading(&[1_000]);
-    let armed = PersistentTimer::arm(&mut polling, 2_000).expect("the clock answered once");
+    let mut armed = PersistentTimer::arm(&mut polling, 2_000).expect("the clock answered once");
     let mut broken = Rtc::failing();
     assert_eq!(armed.poll(&mut broken), Err(ClockError::Unavailable(Fault)));
 }
@@ -98,12 +98,63 @@ fn a_clock_that_goes_backwards_is_refused_rather_than_believed() {
     // Issue #32's third work item, second half. A battery swap or an epoch re-sync can
     // move an RTC back; believing it would un-fire a timer that had already elapsed.
     let mut rtc = Rtc::reading(&[1_000, 999]);
-    let armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
+    let mut armed = PersistentTimer::arm(&mut rtc, 2_000).expect("the clock answered");
 
     assert_eq!(
         armed.poll(&mut rtc),
         Err(ClockError::Refused(KernelError::ClockWentBackwards))
     );
+}
+
+/// A second driver, with its own epoch. Its readings are `u64` and mean something else.
+struct NetworkEpoch {
+    seconds: u64,
+}
+
+impl PersistentClock for NetworkEpoch {
+    type Error = Fault;
+
+    fn now(&mut self) -> Result<u64, Fault> {
+        Ok(self.seconds)
+    }
+}
+
+#[test]
+fn a_timer_armed_by_one_clock_is_polled_by_that_clock() {
+    // Codex found this on the first review round, and it is the failure this module exists
+    // to prevent wearing a different hat: two drivers, two epochs, both `u64`. An RTC
+    // counting milliseconds since 1970 and a network epoch counting seconds since boot
+    // produce readings that are meaningless against each other, and a deadline measured
+    // across them fires early or late with nothing to say so.
+    //
+    // The clock type is now part of the timer, so the mix-up is a compile error rather
+    // than a wrong verdict. What this test can state at runtime is the other half: the two
+    // timers are different types, and each is polled by the clock that armed it.
+    let mut rtc = Rtc::reading(&[1_000_000, 1_000_500]);
+    let mut armed_by_rtc: PersistentTimer<Rtc> =
+        PersistentTimer::arm(&mut rtc, 1_002_000).expect("the RTC answered");
+
+    let mut epoch = NetworkEpoch { seconds: 1_000 };
+    let mut armed_by_epoch: PersistentTimer<NetworkEpoch> =
+        PersistentTimer::arm(&mut epoch, 1_500).expect("the network epoch answered");
+
+    // Each against its own clock. The RTC is 1 500 of its units short of its deadline; the
+    // epoch is 500 of its units short of its own.
+    assert_eq!(
+        armed_by_rtc.poll(&mut rtc),
+        Ok(Deadline::Remaining { ticks: 1_500 })
+    );
+    assert_eq!(
+        armed_by_epoch.poll(&mut epoch),
+        Ok(Deadline::Remaining { ticks: 500 })
+    );
+
+    // Had the clock type not been part of the timer, `armed_by_epoch.poll(&mut rtc)` would
+    // have compiled and answered `Elapsed`: 1 000 000 is past the instant 1 500, so a
+    // deadline 500 seconds away would have fired at once. That call is now rejected by the
+    // compiler, and `the_wrong_clock_does_not_compile` is the doctest that proves it.
+    let would_have_been_elapsed = armed_by_epoch.timer().evaluate(1_000_000);
+    assert_eq!(would_have_been_elapsed, Ok(Deadline::Elapsed));
 }
 
 #[test]

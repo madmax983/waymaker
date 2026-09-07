@@ -14,9 +14,11 @@
 //!
 //! # Status
 //!
-//! Rung 0.5's first item is here: [`clock`] holds design document §11's `PersistentClock`
-//! capability and the only route to a deadline that needs one. The async `Ctx`, the
-//! dispatcher and in-boot sleep arrive with rung 0.4.
+//! Rung 0.5's first item is here, ahead of rung 0.4: [`clock`] holds design document §11's
+//! `PersistentClock` capability. It is here rather than later because the layering leaves
+//! nowhere else — the kernel's must-not-own cell names a clock and `waymaker-flash`'s names
+//! timers — and it needs no dispatcher to be correct. The async `Ctx`, the dispatcher and
+//! in-boot sleep still arrive with rung 0.4.
 
 #![no_std]
 #![forbid(unsafe_code)]

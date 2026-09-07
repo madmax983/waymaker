@@ -19,6 +19,37 @@ const EVERY_SPEC: [TimerSpec; 2] = [
     TimerSpec::AtPersistentTime { instant: 2_000 },
 ];
 
+/// The position of each spec in [`EVERY_SPEC`], by exhaustive `match`.
+///
+/// Without this the no-downgrade property below is stated over a hand-written array: a
+/// third spec would be added, the array would stay at two, and the test that exists to
+/// cover *every* spec would quietly cover two of three while still passing.
+const fn position_of(spec: TimerSpec) -> usize {
+    match spec {
+        TimerSpec::AfterBoot { .. } => 0,
+        TimerSpec::AtPersistentTime { .. } => 1,
+    }
+}
+
+/// The same, for the capabilities.
+const fn capability_position_of(capability: ClockCapability) -> usize {
+    match capability {
+        ClockCapability::BootOnly => 0,
+        ClockCapability::Persistent => 1,
+    }
+}
+
+#[test]
+fn the_property_below_is_stated_over_every_spec_and_every_capability() {
+    assert!(EVERY_SPEC.iter().map(|spec| position_of(*spec)).eq(0..2));
+    assert!(
+        EVERY_CAPABILITY
+            .iter()
+            .map(|capability| capability_position_of(*capability))
+            .eq(0..2)
+    );
+}
+
 /// Both capabilities, for the same reason.
 const EVERY_CAPABILITY: [ClockCapability; 2] =
     [ClockCapability::BootOnly, ClockCapability::Persistent];
@@ -48,13 +79,13 @@ fn an_after_boot_timer_restarts_its_interval_after_a_reset() {
     )
     .expect("the same spec arms again on the next boot");
 
-    // The whole interval is owed again. The device has now been powered for 1_040 ticks
+    // The whole interval starts again. The device has now been powered for 1_040 ticks
     // in total across the two boots, which is more than twice the interval, and the timer
     // is still not elapsed: that is the honest answer §11 asks for.
     assert_eq!(
         after.evaluate(40),
         Ok(Deadline::Remaining { ticks: 10 }),
-        "the interval restarts from the new boot rather than crediting the old one"
+        "the interval starts again from the new boot rather than crediting the old one"
     );
     assert_eq!(after.evaluate(49), Ok(Deadline::Remaining { ticks: 1 }));
     assert_eq!(after.evaluate(50), Ok(Deadline::Elapsed));
@@ -128,6 +159,11 @@ fn a_persistent_timer_is_refused_rather_than_downgraded_without_a_clock() {
         KernelError::NoPersistentClock.message(),
         "this firmware has no persistent clock",
         "issue #34 asks the refusal to name the missing capability"
+    );
+    assert_eq!(
+        KernelError::ClockWentBackwards.message(),
+        "a clock read below its arming reading",
+        "the other refusal a timer can produce, pinned so the two cannot be swapped"
     );
 }
 

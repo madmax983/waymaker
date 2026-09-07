@@ -212,11 +212,14 @@ fn engine() -> usize {
 
 /// Design document §11's timer semantics: both specs, both capabilities, both verdicts.
 ///
-/// Split out of [`engine`] for readability alone, like the four rows above it. Every arm is
+/// `#[inline(never)]` on both arms, like every sibling: without it the engine arm can be
+/// folded into [`engine`] while the baseline arm cannot, and the delta stops being measured
+/// the way every row it is compared against is. Every arm is
 /// reached, so the row charges for the refusal as well as for the arithmetic: a firmware
 /// that only linked the happy path would understate the cost of the thing that makes §02
 /// decision 8 hold.
 #[cfg(feature = "engine")]
+#[inline(never)]
 fn timers() -> usize {
     use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
 
@@ -1569,7 +1572,7 @@ fn facade() -> usize {
 
     let mut rtc = Rtc(core::hint::black_box(1_000));
     let kept = match PersistentTimer::arm(&mut rtc, core::hint::black_box(2_000)) {
-        Ok(armed) => {
+        Ok(mut armed) => {
             let spec = usize::from(armed.timer().spec().clock_kind().0);
             let verdict = match armed.poll(&mut rtc) {
                 Ok(Deadline::Elapsed) => 1,

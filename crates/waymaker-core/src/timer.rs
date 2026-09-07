@@ -1,8 +1,8 @@
-//! Timer semantics: what a deadline means, and which clock can honour it.
+//! Timer semantics: what a deadline means, and which clock can measure it.
 //!
 //! Design document §11. A monotonic MCU timer returns to zero after a reset. It cannot
 //! say how long the device had no power. §02 decision 8 makes that a rule: timer semantics
-//! match the hardware's clock. They never pretend.
+//! match the hardware's clock.
 //!
 //! # What this module owns
 //!
@@ -20,12 +20,11 @@
 //!
 //! # The absence this module defends
 //!
-//! A persistent deadline is never downgraded to a boot deadline. §11 asks for semantics
-//! that match the hardware; a downgrade is the opposite. So a [`Timer`] holds the
-//! [`TimerSpec`] it was armed from. [`Timer::arm`] can refuse, and it can return a timer
-//! for that spec. It cannot return a timer for another spec, because it has no other spec
-//! to return. The `timer-capability` gate rule pins the surface so a downgrade stays a
-//! line a reviewer has to write on purpose.
+//! A persistent deadline is never downgraded to a boot deadline. A [`Timer`] holds the
+//! [`TimerSpec`] it was armed from and no other, so [`Timer::arm`] gives a refusal or a
+//! timer for that spec. [`ClockCapability::admits`] names every pair and uses no wildcard,
+//! so a spec added later must be decided there rather than admitted by default. The
+//! `timer-capability` rule pins the rest.
 
 use crate::error::KernelError;
 
@@ -55,15 +54,14 @@ impl ClockKind {
 
 /// What a workflow asks a timer to wait for.
 ///
-/// Design document §11, verbatim in both variants. The difference between them is a
-/// hardware fact, not a preference, which is why they are two variants rather than one
-/// with a flag.
+/// The two variants are §11's, field for field. The difference between them is a hardware
+/// fact, not a preference, which is why they are two variants and not one with a flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TimerSpec {
     /// Wait `ticks` of this boot's monotonic clock.
     ///
     /// **This is not a power-loss-durable delay.** The boot clock restarts at zero after
-    /// a reset, and the armed timer lives in RAM, so a reboot owes the whole interval
+    /// a reset, and the armed timer lives in RAM, so a reboot starts the whole interval
     /// again. A device that resets every `ticks / 2` never reaches this deadline. Use
     /// [`AtPersistentTime`](Self::AtPersistentTime) when the delay must survive power
     /// loss.
@@ -122,12 +120,21 @@ impl ClockCapability {
     ///
     /// Total and `const`. It never rewrites `spec`: the only two answers are "yes" and a
     /// named refusal.
+    ///
+    /// Every pair is named. The `Ok` cases share one body and so share one arm, but by
+    /// or-pattern and never by `_`, which is the whole point: a wildcard would *admit* a
+    /// spec added later. That is the silent downgrade this module exists to forbid, and it
+    /// would arrive in the one place that decides policy while
+    /// [`clock_kind`](TimerSpec::clock_kind) and [`Timer::evaluate`] failed to compile and
+    /// named the two places that do not. The kernel's error vocabulary refuses
+    /// `#[non_exhaustive]` for the same reason.
     pub const fn admits(self, spec: TimerSpec) -> Result<(), KernelError> {
         match (self, spec) {
             (Self::BootOnly, TimerSpec::AtPersistentTime { .. }) => {
                 Err(KernelError::NoPersistentClock)
             }
-            (Self::BootOnly | Self::Persistent, _) => Ok(()),
+            (Self::BootOnly | Self::Persistent, TimerSpec::AfterBoot { .. })
+            | (Self::Persistent, TimerSpec::AtPersistentTime { .. }) => Ok(()),
         }
     }
 }
@@ -167,8 +174,7 @@ impl Timer {
     /// # Postconditions
     ///
     /// Either a refusal, or a timer whose [`spec`](Self::spec) is `spec` and whose
-    /// [`armed_at`](Self::armed_at) is `now`. There is no third answer, which is how §11's
-    /// "never a silent downgrade" is held.
+    /// [`armed_at`](Self::armed_at) is `now`. There is no third answer.
     pub const fn arm(
         spec: TimerSpec,
         capability: ClockCapability,
@@ -209,9 +215,8 @@ impl Timer {
     ///
     /// # Postconditions
     ///
-    /// Total and `const`. It adds nothing: an interval is compared against a difference,
-    /// and a difference is only taken after the guard above. So no reading wraps a
-    /// deadline into the past or into a future that never arrives.
+    /// Total and `const`. It adds nothing: it compares an interval against a difference,
+    /// and takes the difference only after the guard above. No reading can wrap.
     pub const fn evaluate(&self, reading: u64) -> Result<Deadline, KernelError> {
         if reading < self.armed_at {
             return Err(KernelError::ClockWentBackwards);

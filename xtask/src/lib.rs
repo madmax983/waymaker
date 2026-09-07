@@ -1045,6 +1045,14 @@ mod tests {
                 path: format!("crates/{}", source::CLOCK_CAPABILITY_PATH),
                 contents: source::tests_support::clean_clock_module(),
             },
+            // And the kernel's crate root, which `timer-capability` reads to check that the
+            // types its member pin found are the ones the crate re-exports. A pin that only
+            // reads a header string is defeated by a rename that leaves a decoy behind.
+            size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: source::tests_support::clean_kernel_root(),
+            },
             size::LayerSource {
                 crate_name: "waymaker-flash".to_owned(),
                 path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
