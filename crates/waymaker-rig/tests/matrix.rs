@@ -44,7 +44,7 @@ use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::matrix::{Matrix, Row};
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Resumed, Rig, RigError};
+use waymaker_rig::run::{Resumed, Rig, RigError, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Progress as Marks, Witness};
@@ -609,6 +609,116 @@ fn the_sweep_skips_only_for_a_named_reason_and_never_because_the_oracle_refused(
     );
     // Every injected run; the fault-free run has no injection and is neither.
     assert_eq!(points.len() + skips.len(), 1096, "the sweep changed size");
+}
+
+/// A part whose power goes at the `k`th mutation. `tests/sweep.rs` has the same fuse.
+struct Fuse<'a> {
+    device: &'a mut Device,
+    left: usize,
+}
+
+impl Fuse<'_> {
+    const fn blown(&mut self) -> bool {
+        match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+impl StableStorage for Fuse<'_> {
+    type Error = FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        if self.blown() {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_reset_at_any_mutation_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
+    // Codex found the first version of `resume` erasing the instrument: a reset after that
+    // erase left a journal with records and a witness that claimed none, and `verify`
+    // accused a healthy part. The resume now continues the witness, and this cuts every
+    // resume of the sweep at every mutation and judges what is left.
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut cuts = 0_usize;
+    for run in runs.iter().skip(1) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        {
+            let mut probe = device_after(run);
+            if rig.verify(0, &mut probe, &mut page).map(Verdict::outcome) != Ok(Outcome::Passed) {
+                continue;
+            }
+        }
+        for cut in 0..80_usize {
+            let mut device = device_after(run);
+            let stopped = {
+                let mut fuse = Fuse {
+                    device: &mut device,
+                    left: cut,
+                };
+                let mut metered = Metered::new(&mut fuse);
+                rig.resume(0, &mut metered, &mut Log::default(), &mut page)
+                    .is_err()
+            };
+            let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+                unreachable!("a cut resume leaves a judgeable part, at {injection:?}")
+            };
+            assert_eq!(
+                verdict.outcome(),
+                Outcome::Passed,
+                "a resume cut after {cut} mutations, at {injection:?}"
+            );
+            cuts += 1;
+            if !stopped {
+                break;
+            }
+        }
+    }
+    assert!(cuts > 1000, "only {cuts} resume cuts were judged");
 }
 
 #[test]

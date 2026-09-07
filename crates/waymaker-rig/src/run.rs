@@ -854,10 +854,13 @@ impl Rig {
     /// What a boot does after a cut: recover the prefix, redeliver the effect whose schedule
     /// has no completion, and write the records the run still owes. No cut is offered.
     ///
-    /// The instrument is erased and marked again for the resumed boot, in the order
-    /// [`iterate`](Self::iterate) marks it, so [`verify`](Self::verify) judges a resumed
-    /// part and a reset during a resume is a crash point the witness can speak to. The
-    /// erase comes after the decision to write, so a refused resume changes nothing.
+    /// The witness is continued, not erased: the marks the reset left stay, and the resume
+    /// appends the marks [`iterate`](Self::iterate) would write, skipping any the witness
+    /// already claims. So at every point a reset can land during a resume the witness
+    /// claims no more than the media hold, [`verify`](Self::verify) judges the part, and a
+    /// refused resume changes nothing. An erase here was the first version, and review found
+    /// the window it opened: a reset after the erase left a journal with records and a
+    /// witness that claimed none.
     ///
     /// # Postconditions
     ///
@@ -888,15 +891,13 @@ impl Rig {
         let Some(mut journal) = journal else {
             return Ok(Resumed::Unextendable { recovered });
         };
-        // A run that was complete has nothing to write and keeps the witness it has.
         if recovered >= records {
             return Ok(Resumed::Completed {
                 recovered,
                 redelivered: None,
             });
         }
-        self.erase_instrument(part).map_err(widen)?;
-        let mut witness = Witness::new(self.witness);
+        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
 
         let outstanding = recovered
             .checked_sub(1)
@@ -906,13 +907,9 @@ impl Rig {
             });
         let redelivered = match outstanding {
             Some((index, effect)) => {
-                self.mark(
-                    part,
-                    &mut witness,
-                    Mark::new(iteration, index, Stage::Dispatched),
-                    page,
-                )
-                .map_err(widen)?;
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
                 self.perform(iteration, effect, dispatcher)?;
                 Some(effect)
             }
@@ -924,33 +921,21 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
-            self.mark(
-                part,
-                &mut witness,
-                Mark::new(iteration, index, Stage::Attempted),
-                page,
-            )
-            .map_err(widen)?;
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
             self.append(part, &mut journal, &record, page)
                 .map_err(widen)?;
-            self.mark(
-                part,
-                &mut witness,
-                Mark::new(iteration, index, Stage::Acknowledged),
-                page,
-            )
-            .map_err(widen)?;
-            if let Role::Schedule(effect) = role {
-                self.mark(
-                    part,
-                    &mut witness,
-                    Mark::new(iteration, index, Stage::Dispatched),
-                    page,
-                )
+            let mark = Mark::new(iteration, index, Stage::Acknowledged);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
                 .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
                 self.perform(iteration, effect, dispatcher)?;
             }
             if matches!(role, Role::Completion(_)) {
@@ -978,6 +963,48 @@ impl Rig {
         };
         part.set_traffic(Traffic::Engine);
         outcome.map_err(|_| RigError::Witness(WitnessError::Region))
+    }
+
+    /// The witness as the reset left it, positioned to append, and what it claims.
+    fn continued_witness<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        page: &mut [u8],
+    ) -> Result<(Witness, Progress), RigError<S::Error>> {
+        part.set_traffic(Traffic::Rig);
+        let outcome = {
+            let mut instrument = self.instrument(part)?;
+            Witness::continued(self.witness, &mut instrument, page)
+        };
+        part.set_traffic(Traffic::Engine);
+        outcome.map_err(|error| RigError::Witness(unwindow_witness(error)))
+    }
+
+    /// Programs `mark` unless `known` already claims its index for its stage, and raises
+    /// `known` to match.
+    ///
+    /// A mark's high water is the largest index it named, so a mark at or below it says
+    /// nothing new and the witness refuses it as out of order. Skipping it is what lets a
+    /// resume continue a witness rather than start one.
+    fn mark_above<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        witness: &mut Witness,
+        known: &mut Progress,
+        mark: Mark,
+        page: &mut [u8],
+    ) -> Result<(), RigError<S::Error>> {
+        let high = match mark.stage() {
+            Stage::Attempted => known.attempted(),
+            Stage::Acknowledged => known.acknowledged(),
+            Stage::Dispatched => known.dispatched(),
+        };
+        if high.is_some_and(|high| high >= mark.index()) {
+            return Ok(());
+        }
+        self.mark(part, witness, mark, page)?;
+        *known = known.raising(mark.stage(), mark.index());
+        Ok(())
     }
 
     /// Programs one witness mark, as the rig's own traffic.

@@ -1462,8 +1462,8 @@ vocabulary a board can link. `crates/waymaker-drive/tests/matrix.rs` is one test
 named after it: 542 crash points classified from the operation the crash interrupted and
 cross-checked against the media, with the two bank rows driving the real swap and then
 *booting the driver* on the bank `select` names, and the counts per row pinned.
-`Rig::resume` carries a cut iteration on, erasing and re-marking the witness as it goes, so
-the rig observes the behaviour column and a resumed part is still judgeable.
+`Rig::resume` carries a cut iteration on, continuing the witness the reset left, so the rig
+observes the behaviour column and a part is judgeable at every point a reset can land.
 `crates/waymaker-rig/tests/matrix.rs` classifies and resumes 434 crash points into five rows,
 drives two runs for the sixth, and requires the rig's census to refuse at the seventh, which
 is the honest shape of a rig with no swap workload. The `failure-matrix` rule holds the five

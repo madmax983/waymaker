@@ -158,8 +158,9 @@ pub enum WitnessError<E = core::convert::Infallible> {
     ShortBuffer,
     /// These bytes are not a mark: erased, torn, or never written.
     NotAMark,
-    /// A valid mark sits past a slot that is not one. Marks are appended, so this is media
-    /// the rig did not produce.
+    /// A valid mark sits past an erased slot. Marks are appended, so this is media the rig
+    /// did not produce. A torn slot is not a hole: a boot that resumed a run appends after
+    /// the mark the reset tore.
     Hole,
     /// Two marks name different iterations. A witness holds one iteration's marks.
     MixedIterations,
@@ -182,7 +183,7 @@ impl<E> WitnessError<E> {
         match self {
             Self::ShortBuffer => "the buffer is shorter than the operation needs",
             Self::NotAMark => "these bytes are not a mark",
-            Self::Hole => "a mark sits past a slot that is not one",
+            Self::Hole => "a mark sits past an erased slot",
             Self::MixedIterations => "the witness holds marks from more than one iteration",
             Self::OutOfOrder => "a stage's mark indices did not increase",
             Self::Full => "the witness region has no slot left",
@@ -723,18 +724,49 @@ impl Witness {
 
     /// Reads every slot and reports what the rig durably knew.
     ///
+    /// A torn slot is read past: the mark after it is the next boot's, appended by
+    /// [`continued`](Self::continued). The marks stay in order across it, or the scan refuses.
+    ///
     /// # Errors
     ///
-    /// [`WitnessError::Hole`] for a mark past a slot that is not one, and the refusals
+    /// [`WitnessError::Hole`] for a mark past an erased slot, and the refusals
     /// [`mark`](Self::mark) lists.
     pub fn scan<S: StableStorage>(
         self,
         storage: &mut S,
         page: &mut [u8],
     ) -> Result<Progress, WitnessError<S::Error>> {
+        self.read(storage, page).map(|(progress, _)| progress)
+    }
+
+    /// A witness positioned after every mark and every torn slot `region` holds, with what
+    /// those marks say.
+    ///
+    /// What a boot that resumes a run appends with: the marks before the reset stay, and the
+    /// marks it writes follow them.
+    ///
+    /// # Errors
+    ///
+    /// As [`scan`](Self::scan).
+    pub fn continued<S: StableStorage>(
+        region: WitnessRegion,
+        storage: &mut S,
+        page: &mut [u8],
+    ) -> Result<(Self, Progress), WitnessError<S::Error>> {
+        let (progress, next) = Self::new(region).read(storage, page)?;
+        Ok((Self { region, next }, progress))
+    }
+
+    /// Every slot, and the index of the first erased one after the last used one.
+    fn read<S: StableStorage>(
+        self,
+        storage: &mut S,
+        page: &mut [u8],
+    ) -> Result<(Progress, u32), WitnessError<S::Error>> {
         let slot_bytes = self.check(storage, page)?;
         let mut progress = Progress::default();
         let mut ended = false;
+        let mut next = 0_u32;
 
         for index in 0..self.region.capacity() {
             let Some(offset) = self.region.slot_offset(index) else {
@@ -745,25 +777,29 @@ impl Witness {
             };
             storage.read(offset, slot).map_err(WitnessError::Driver)?;
 
+            let erased = slot.iter().all(|byte| *byte == 0xFF);
             match Mark::decode(slot) {
                 Ok(mark) if !ended => {
                     progress = progress.accept(mark).map_err(promote)?;
+                    next = index.saturating_add(1);
                 }
                 Ok(_) => return Err(WitnessError::Hole),
+                // Everything past the end must be erased. Anything else is a second region
+                // of writing, which marks are never appended as.
                 Err(_) if ended => {
-                    // Everything past the end must be erased. Anything else is a second
-                    // region of writing, which marks are never appended as.
-                    if slot.iter().any(|byte| *byte != 0xFF) {
+                    if !erased {
                         return Err(WitnessError::Hole);
                     }
                 }
+                Err(_) if erased => ended = true,
+                // A mark the reset tore. The next boot appends after it.
                 Err(_) => {
-                    ended = true;
-                    progress.torn = slot.iter().any(|byte| *byte != 0xFF);
+                    progress.torn = true;
+                    next = index.saturating_add(1);
                 }
             }
         }
-        Ok(progress)
+        Ok((progress, next))
     }
 }
 

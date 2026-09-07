@@ -71,11 +71,15 @@ with its operation is a panic, not a row.
 
 **The rig resumes.** `Rig::resume` recovers the installed bank, audits the prefix record by
 record against the workload, redelivers the effect whose schedule has no completion under the
-same index, and writes what the run still owes. It takes no cut. It erases the instrument and
-marks the witness again as it writes, so `verify` judges a resumed part and a reset during a
-resume is a crash point the witness can speak to; review found the first version wrote no
-marks, and `verify` after it accused a healthy part. A run that was already complete keeps
-the witness it has. `crates/waymaker-rig/tests/matrix.rs` has one test per swept row, named
+same index, and writes what the run still owes. It takes no cut. It continues the witness the
+reset left: the marks stay, a torn slot is read past, and the resume appends the marks
+`iterate` would write, skipping any the witness already claims. So `verify` judges a resumed
+part, and `a_reset_at_any_mutation_of_a_resume_leaves_a_part_the_rig_judges_healthy` cuts
+every resume of the sweep at every mutation and requires the part to pass. Two review rounds
+shaped this. The first version wrote no marks, and `verify` after it accused a healthy part.
+The second erased the instrument and re-marked it, and Codex found the window: a reset after
+the erase left a journal with records and a witness that claimed none. A run that was already
+complete writes nothing. `crates/waymaker-rig/tests/matrix.rs` has one test per swept row, named
 after it with `_on_the_rig`: it classifies every crash point from the witness, the recovered
 count, the journal's ending and the dispatcher's own log, resumes it, judges the resumed
 part, and holds it to its row. Row 3 on the rig is a dispatcher that is entered and does not
