@@ -27,6 +27,15 @@ pub const SHF_EXECINSTR: u64 = 0x4;
 /// `SHT_NOBITS`: the section occupies no space in the file, only in memory.
 pub const SHT_NOBITS: u32 = 8;
 
+/// `SHN_UNDEF`: the symbol is defined in no section of this image.
+pub const SHN_UNDEF: u16 = 0;
+
+/// `SHT_SYMTAB`: the section is a symbol table.
+pub const SHT_SYMTAB: u32 = 2;
+
+/// `SHT_STRTAB`: the section is a string table.
+pub const SHT_STRTAB: u32 = 3;
+
 /// The first section index that is reserved rather than a real section.
 ///
 /// A file with this many sections or more stores the real count and the real string-table
@@ -125,6 +134,13 @@ struct Layout {
     sh_offset: usize,
     sh_size: usize,
     sh_link: usize,
+    sh_entsize: usize,
+    /// Offsets within one symbol table entry.
+    st_name: usize,
+    st_shndx: usize,
+    st_size: usize,
+    /// The size of one symbol table entry.
+    symbol_entry_size: usize,
     /// Whether `sh_flags`, `sh_offset` and `sh_size` are 64 bits wide.
     wide: bool,
 }
@@ -142,6 +158,11 @@ const ELF32: Layout = Layout {
     sh_offset: 0x10,
     sh_size: 0x14,
     sh_link: 0x18,
+    sh_entsize: 0x24,
+    st_name: 0x00,
+    st_shndx: 0x0e,
+    st_size: 0x08,
+    symbol_entry_size: 0x10,
     wide: false,
 };
 
@@ -158,6 +179,11 @@ const ELF64: Layout = Layout {
     sh_offset: 0x18,
     sh_size: 0x20,
     sh_link: 0x28,
+    sh_entsize: 0x38,
+    st_name: 0x00,
+    st_shndx: 0x06,
+    st_size: 0x10,
+    symbol_entry_size: 0x18,
     wide: true,
 };
 
@@ -173,10 +199,14 @@ struct RawSection {
     name_offset: u32,
     kind: u32,
     flags: u64,
+    /// `sh_offset`: where the section's bytes start in the file.
+    offset: u64,
     size: u64,
-    /// `sh_link`, read only from the first header, where it carries the extended
-    /// string-table index.
+    /// `sh_link`. On the first header it carries the extended string-table index; on a
+    /// symbol table it names the string table its names live in.
     link: u32,
+    /// `sh_entsize`: the width of one entry, for a section that holds a table.
+    entry_size: u64,
 }
 
 /// Every section of the image at `bytes`, in section header order.
@@ -208,13 +238,108 @@ pub fn sections(bytes: &[u8]) -> Result<Vec<Section>, ElfError> {
     raw.into_iter()
         .map(|section| {
             Ok(Section {
-                name: read_name(strings, section.name_offset)?,
+                name: read_name(strings, section.name_offset, "section name")?,
                 size: section.size,
                 kind: section.kind,
                 flags: section.flags,
             })
         })
         .collect()
+}
+
+/// One symbol of a linked image, as its symbol table records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    /// The symbol name, still mangled.
+    pub name: String,
+    /// `st_size`: how many bytes the symbol occupies.
+    pub size: u64,
+    /// `st_shndx`: which section the bytes are in, indexed as [`sections`] returns them.
+    pub section_index: u16,
+}
+
+/// Every symbol of every symbol table in the image at `bytes`, in table order.
+///
+/// An image with no symbol table has no symbols, which is not an error here: whether a
+/// missing table is fatal is a question for the gate that asked, and this reads the format.
+///
+/// # Errors
+///
+/// Returns [`ElfError`] if the bytes are not an ELF image this can read, if a symbol table
+/// is truncated, if its entries are not the width this class declares, or if a symbol name
+/// points outside its string table. Every one fails closed, for [`sections`]' reason: a
+/// table that cannot be read is a table whose sizes are unknown, and reading the entries
+/// that happen to fit would under-report every total taken from it.
+pub fn symbols(bytes: &[u8]) -> Result<Vec<Symbol>, ElfError> {
+    let (layout, endian) = identify(bytes)?;
+    let table = locate_table(bytes, layout, endian)?;
+
+    let mut raw = Vec::with_capacity(table.count);
+    for index in 0..table.count {
+        raw.push(read_section(
+            bytes,
+            table.offset,
+            table.entry_size,
+            index,
+            layout,
+            endian,
+        )?);
+    }
+
+    let mut found = Vec::new();
+    for section in raw.iter().filter(|section| section.kind == SHT_SYMTAB) {
+        // A declared width other than this class's is a table whose fields sit somewhere
+        // else, so reading it at these offsets would answer with well-formed nonsense.
+        // Zero means "not a table of fixed-width entries", which a symbol table is.
+        if section.entry_size != layout.symbol_entry_size as u64 {
+            return Err(ElfError::new(format!(
+                "a symbol table declares {} byte entries, but this ELF class writes {} byte ones",
+                section.entry_size, layout.symbol_entry_size
+            )));
+        }
+        let strings = table_bytes(
+            bytes,
+            raw.get(section.link as usize)
+                .ok_or_else(|| ElfError::new("a symbol table names no string table"))?,
+            "the symbol name string table",
+        )?;
+        let entries = table_bytes(bytes, section, "a symbol table")?;
+        if entries.len() % layout.symbol_entry_size != 0 {
+            return Err(ElfError::new(format!(
+                "a symbol table is {} bytes, which is not a whole number of {} byte entries",
+                entries.len(),
+                layout.symbol_entry_size
+            )));
+        }
+        for entry in entries.chunks_exact(layout.symbol_entry_size) {
+            found.push(Symbol {
+                name: read_name(
+                    strings,
+                    read_u32(entry, layout.st_name, endian)?,
+                    "a symbol name",
+                )?,
+                size: read_address(entry, layout.st_size, endian, layout.wide)?,
+                section_index: read_u16(entry, layout.st_shndx, endian)?,
+            });
+        }
+    }
+
+    Ok(found)
+}
+
+/// The bytes one section holds, or an error naming it.
+fn table_bytes<'a>(
+    bytes: &'a [u8],
+    section: &RawSection,
+    what: &str,
+) -> Result<&'a [u8], ElfError> {
+    let offset = usize::try_from(section.offset)
+        .map_err(|_| ElfError::new(format!("{what} starts beyond addressable memory")))?;
+    let len = usize::try_from(section.size)
+        .map_err(|_| ElfError::new(format!("{what} is larger than memory")))?;
+    bytes
+        .get(offset..offset.saturating_add(len))
+        .ok_or_else(|| ElfError::new(format!("{what} is truncated")))
 }
 
 /// The machine the image is for, from `e_machine`.
@@ -423,6 +548,12 @@ fn read_section(
             endian,
             layout.wide,
         )?,
+        offset: read_address(
+            bytes,
+            section_field(table_offset, entry_size, index, layout.sh_offset)?,
+            endian,
+            layout.wide,
+        )?,
         size: read_address(
             bytes,
             section_field(table_offset, entry_size, index, layout.sh_size)?,
@@ -434,25 +565,35 @@ fn read_section(
             section_field(table_offset, entry_size, index, layout.sh_link)?,
             endian,
         )?,
+        entry_size: read_address(
+            bytes,
+            section_field(table_offset, entry_size, index, layout.sh_entsize)?,
+            endian,
+            layout.wide,
+        )?,
     })
 }
 
-/// The NUL-terminated name at `offset` in the section name string table.
-fn read_name(strings: &[u8], offset: u32) -> Result<String, ElfError> {
+/// The NUL-terminated name at `offset` in the string table `strings`.
+///
+/// `what` names the thing being read, because the same table walk answers for a section
+/// name and for a symbol name and a message that guessed wrong sends a reader to the wrong
+/// half of the image.
+fn read_name(strings: &[u8], offset: u32, what: &str) -> Result<String, ElfError> {
     let offset = usize::try_from(offset)
-        .map_err(|_| ElfError::new("a section name offset does not fit in memory"))?;
+        .map_err(|_| ElfError::new(format!("a {what} offset does not fit in memory")))?;
     // `>=`, not `>`: `strings.get(len..)` is an empty slice rather than `None`, so an
     // offset one past the end would come back as a nameless section instead of an error,
     // and the per-section breakdown would silently under-report while `flash` stayed right.
     if offset >= strings.len() {
         return Err(ElfError::new(format!(
-            "a section name offset ({offset}) points outside the {} byte string table",
+            "a {what} offset ({offset}) points outside the {} byte string table",
             strings.len()
         )));
     }
     let rest = strings
         .get(offset..)
-        .ok_or_else(|| ElfError::new("a section name offset is out of range"))?;
+        .ok_or_else(|| ElfError::new(format!("a {what} offset is out of range")))?;
     let end = rest
         .iter()
         .position(|byte| *byte == 0)
@@ -564,6 +705,12 @@ pub mod tests_support {
         flags: u64,
         kind: u32,
         name_offset: Option<u32>,
+        /// Bytes to lay down in the file, for a section a reader actually reads.
+        contents: Option<Vec<u8>>,
+        /// `sh_link`.
+        link: u32,
+        /// `sh_entsize`.
+        entry_size: u64,
     }
 
     impl SectionSpec {
@@ -576,6 +723,19 @@ pub mod tests_support {
                 flags,
                 kind: 1,
                 name_offset: None,
+                contents: None,
+                link: 0,
+                entry_size: 0,
+            }
+        }
+
+        /// A section carrying real bytes, whose size is those bytes.
+        fn holding(name: &str, kind: u32, contents: Vec<u8>) -> Self {
+            Self {
+                size: contents.len() as u64,
+                kind,
+                contents: Some(contents),
+                ..Self::progbits(name, 0, 0)
             }
         }
 
@@ -596,12 +756,42 @@ pub mod tests_support {
         }
     }
 
+    /// One symbol to write into a synthetic image's symbol table.
+    #[derive(Debug, Clone)]
+    pub struct SymbolSpec {
+        name: String,
+        size: u64,
+        section_index: u16,
+        name_offset: Option<u32>,
+    }
+
+    impl SymbolSpec {
+        /// A symbol of `size` bytes in the section at `section_index`.
+        #[must_use]
+        pub fn new(name: &str, size: u64, section_index: u16) -> Self {
+            Self {
+                name: name.to_owned(),
+                size,
+                section_index,
+                name_offset: None,
+            }
+        }
+
+        /// Writes a name offset that does not point at this symbol's name.
+        #[must_use]
+        pub const fn with_name_offset(mut self, offset: u32) -> Self {
+            self.name_offset = Some(offset);
+            self
+        }
+    }
+
     /// Assembles a minimal but well-formed ELF image around a list of sections.
     #[derive(Debug, Clone)]
     pub struct ElfBuilder {
         class: Class,
         endian: Endian,
         sections: Vec<SectionSpec>,
+        symbols: Vec<SymbolSpec>,
         section_headers: bool,
         extended_counts: bool,
     }
@@ -614,6 +804,7 @@ pub mod tests_support {
                 class,
                 endian: Endian::Little,
                 sections: Vec::new(),
+                symbols: Vec::new(),
                 section_headers: true,
                 extended_counts: false,
             }
@@ -648,18 +839,43 @@ pub mod tests_support {
             self
         }
 
+        /// Adds a `.symtab` and the `.strtab` its names live in.
+        #[must_use]
+        pub fn with_symbols(mut self, symbols: Vec<SymbolSpec>) -> Self {
+            self.symbols = symbols;
+            self
+        }
+
         /// Renders the image.
         #[must_use]
         pub fn build(&self) -> Vec<u8> {
-            let (strings, offsets) = self.string_table();
-            let string_table_index = self.sections.len() + 1;
+            let sections = self.all_sections();
+            let (strings, offsets) = Self::string_table(&sections);
+            let string_table_index = sections.len() + 1;
             let strings_offset = self.class.header_size();
-            let table_offset = strings_offset + strings.len();
 
-            let mut image = self.file_header(table_offset, strings.len(), string_table_index);
+            // Every section that carries bytes is laid down after the section names, and
+            // the header table goes last, so a reader that follows `sh_offset` finds them.
+            let contents_offset = strings_offset + strings.len();
+            let mut contents = Vec::new();
+            let mut content_offsets = Vec::new();
+            for section in &sections {
+                content_offsets.push(section.contents.as_ref().map_or(0, |bytes| {
+                    let at = contents_offset + contents.len();
+                    contents.extend_from_slice(bytes);
+                    u64::try_from(at).unwrap_or(0)
+                }));
+            }
+            let table_offset = contents_offset + contents.len();
+
+            let mut image =
+                self.file_header(table_offset, strings.len(), string_table_index, &sections);
             image.extend_from_slice(&strings);
+            image.extend_from_slice(&contents);
             image.extend_from_slice(&self.section_headers(
+                &sections,
                 &offsets,
+                &content_offsets,
                 string_table_index,
                 strings_offset,
                 strings.len(),
@@ -667,12 +883,65 @@ pub mod tests_support {
             image
         }
 
+        /// The sections written into the image: the declared ones, plus the symbol table
+        /// and its string table when there are symbols.
+        fn all_sections(&self) -> Vec<SectionSpec> {
+            let mut sections = self.sections.clone();
+            if self.symbols.is_empty() {
+                return sections;
+            }
+            // Header indices: 0 is the null section, so the declared sections are 1..=n,
+            // the symbol table is n+1 and its string table n+2.
+            let strtab_index = u32::try_from(sections.len() + 2).unwrap_or(0);
+            let (symtab, strtab) = self.symbol_table();
+            sections.push(SectionSpec {
+                link: strtab_index,
+                entry_size: self.class.layout().symbol_entry_size as u64,
+                ..SectionSpec::holding(".symtab", super::SHT_SYMTAB, symtab)
+            });
+            sections.push(SectionSpec::holding(".strtab", super::SHT_STRTAB, strtab));
+            sections
+        }
+
+        /// The symbol table and the string table its names live in.
+        fn symbol_table(&self) -> (Vec<u8>, Vec<u8>) {
+            let layout = self.class.layout();
+            let mut strings = vec![0_u8];
+            // A real table opens with an all-zero symbol at index 0.
+            let mut entries = vec![0_u8; layout.symbol_entry_size];
+            for symbol in &self.symbols {
+                let name_offset = symbol
+                    .name_offset
+                    .unwrap_or_else(|| u32::try_from(strings.len()).unwrap_or(0));
+                strings.extend_from_slice(symbol.name.as_bytes());
+                strings.push(0);
+
+                let mut entry = vec![0_u8; layout.symbol_entry_size];
+                write_u32(&mut entry, layout.st_name, name_offset, self.endian);
+                write_address(
+                    &mut entry,
+                    layout.st_size,
+                    symbol.size,
+                    self.endian,
+                    self.class == Class::Elf64,
+                );
+                write_u16(
+                    &mut entry,
+                    layout.st_shndx,
+                    symbol.section_index,
+                    self.endian,
+                );
+                entries.extend_from_slice(&entry);
+            }
+            (entries, strings)
+        }
+
         /// The section name string table, and each section's offset into it.
-        fn string_table(&self) -> (Vec<u8>, Vec<u32>) {
+        fn string_table(sections: &[SectionSpec]) -> (Vec<u8>, Vec<u32>) {
             let mut strings = vec![0_u8];
             let mut offsets = Vec::new();
             let shstrtab = SectionSpec::progbits(".shstrtab", 0, 0);
-            for section in self.sections.iter().chain(core::iter::once(&shstrtab)) {
+            for section in sections.iter().chain(core::iter::once(&shstrtab)) {
                 offsets.push(u32::try_from(strings.len()).unwrap_or(0));
                 strings.extend_from_slice(section.name.as_bytes());
                 strings.push(0);
@@ -686,10 +955,11 @@ pub mod tests_support {
             table_offset: usize,
             _strings_len: usize,
             string_table_index: usize,
+            sections: &[SectionSpec],
         ) -> Vec<u8> {
             let header_size = self.class.header_size();
             let wide = self.class == Class::Elf64;
-            let count = self.sections.len() + 2;
+            let count = sections.len() + 2;
 
             let mut image = vec![0_u8; header_size];
             write_bytes(&mut image, 0, b"\x7fELF");
@@ -744,12 +1014,14 @@ pub mod tests_support {
         /// The section header table.
         fn section_headers(
             &self,
+            sections: &[SectionSpec],
             offsets: &[u32],
+            content_offsets: &[u64],
             string_table_index: usize,
             strings_offset: usize,
             strings_len: usize,
         ) -> Vec<u8> {
-            let count = self.sections.len() + 2;
+            let count = sections.len() + 2;
             let mut headers = vec![0_u8; self.class.entry_size() * count];
 
             if self.extended_counts {
@@ -758,15 +1030,16 @@ pub mod tests_support {
                 self.write_header(
                     &mut headers,
                     0,
+                    &SectionSpec {
+                        size: u64::try_from(count).unwrap_or(0),
+                        link: u32::try_from(string_table_index).unwrap_or(0),
+                        ..SectionSpec::progbits("", 0, 0)
+                    },
                     0,
                     0,
-                    0,
-                    u64::try_from(count).unwrap_or(0),
-                    0,
-                    u32::try_from(string_table_index).unwrap_or(0),
                 );
             }
-            for (index, section) in self.sections.iter().enumerate() {
+            for (index, section) in sections.iter().enumerate() {
                 let name_offset = section
                     .name_offset
                     .or_else(|| offsets.get(index).copied())
@@ -774,58 +1047,60 @@ pub mod tests_support {
                 self.write_header(
                     &mut headers,
                     index + 1,
+                    section,
                     name_offset,
-                    section.kind,
-                    section.flags,
-                    section.size,
-                    0,
-                    0,
+                    content_offsets.get(index).copied().unwrap_or(0),
                 );
             }
             self.write_header(
                 &mut headers,
                 string_table_index,
+                &SectionSpec {
+                    size: u64::try_from(strings_len).unwrap_or(0),
+                    ..SectionSpec::progbits(".shstrtab", 0, 0)
+                },
                 offsets.last().copied().unwrap_or(0),
-                3,
-                0,
-                u64::try_from(strings_len).unwrap_or(0),
                 u64::try_from(strings_offset).unwrap_or(0),
-                0,
             );
             headers
         }
 
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "a section header has this many fields; naming them in a struct here \
-                      would move the same list one line up"
-        )]
         fn write_header(
             &self,
             headers: &mut [u8],
             index: usize,
+            section: &SectionSpec,
             name_offset: u32,
-            kind: u32,
-            flags: u64,
-            size: u64,
             offset: u64,
-            link: u32,
         ) {
             let wide = self.class == Class::Elf64;
             let at = index * self.class.entry_size();
             let layout = self.class.layout();
-            let (flags_at, offset_at, size_at, link_at) = (
-                layout.sh_flags,
-                layout.sh_offset,
-                layout.sh_size,
-                layout.sh_link,
-            );
             write_u32(headers, at, name_offset, self.endian);
-            write_u32(headers, at + 0x04, kind, self.endian);
-            write_address(headers, at + flags_at, flags, self.endian, wide);
-            write_address(headers, at + offset_at, offset, self.endian, wide);
-            write_address(headers, at + size_at, size, self.endian, wide);
-            write_u32(headers, at + link_at, link, self.endian);
+            write_u32(headers, at + 0x04, section.kind, self.endian);
+            write_address(
+                headers,
+                at + layout.sh_flags,
+                section.flags,
+                self.endian,
+                wide,
+            );
+            write_address(headers, at + layout.sh_offset, offset, self.endian, wide);
+            write_address(
+                headers,
+                at + layout.sh_size,
+                section.size,
+                self.endian,
+                wide,
+            );
+            write_u32(headers, at + layout.sh_link, section.link, self.endian);
+            write_address(
+                headers,
+                at + layout.sh_entsize,
+                section.entry_size,
+                self.endian,
+                wide,
+            );
         }
     }
 
@@ -867,7 +1142,131 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::tests_support::{Class, ElfBuilder, SectionSpec};
+    use crate::elf::tests_support::{Class, ElfBuilder, SectionSpec, SymbolSpec};
+
+    /// An image with one function symbol in `.text` and one in `.bss`.
+    fn image_with_symbols(class: Class) -> Vec<u8> {
+        ElfBuilder::new(class)
+            .with(SectionSpec::progbits(
+                ".text",
+                0x40,
+                SHF_ALLOC | SHF_EXECINSTR,
+            ))
+            .with(SectionSpec::nobits(".bss", 0x20, SHF_ALLOC | SHF_WRITE))
+            .with_symbols(vec![
+                SymbolSpec::new("_RNvCs1_4mine4work", 0x30, 1),
+                SymbolSpec::new("_RNvCs1_4mine5state", 0x10, 2),
+            ])
+            .build()
+    }
+
+    #[test]
+    fn a_symbol_table_reports_each_symbols_name_size_and_section() {
+        let image = image_with_symbols(Class::Elf32);
+        let symbols = symbols(&image).expect("a synthetic ELF is readable");
+        let named: Vec<(&str, u64, u16)> = symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.size, symbol.section_index))
+            .collect();
+        assert!(
+            named.contains(&("_RNvCs1_4mine4work", 0x30, 1)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("_RNvCs1_4mine5state", 0x10, 2)),
+            "{named:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_symbols_read_the_same_in_a_wide_big_endian_image() {
+        let image = ElfBuilder::new(Class::Elf64)
+            .big_endian()
+            .with(SectionSpec::progbits(
+                ".text",
+                0x40,
+                SHF_ALLOC | SHF_EXECINSTR,
+            ))
+            .with_symbols(vec![SymbolSpec::new("_RNvCs1_4mine4work", 0x30, 1)])
+            .build();
+        let symbols = symbols(&image).expect("a synthetic ELF is readable");
+        // The table opens with the all-zero symbol every real one does, and the parser
+        // reports the table as written rather than editing it.
+        let named: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|symbol| !symbol.name.is_empty())
+            .collect();
+        assert_eq!(named.len(), 1, "{symbols:?}");
+        assert_eq!(named[0].name, "_RNvCs1_4mine4work");
+        assert_eq!(named[0].size, 0x30);
+        assert_eq!(named[0].section_index, 1);
+    }
+
+    #[test]
+    fn an_image_with_no_symbol_table_reports_no_symbols() {
+        // Not an error here: whether a missing table is fatal is the gate's decision, and
+        // the parser's job is to read the format.
+        let image = ElfBuilder::new(Class::Elf32)
+            .with(SectionSpec::progbits(".text", 8, SHF_ALLOC))
+            .build();
+        assert_eq!(symbols(&image), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_symbol_name_outside_the_string_table_is_an_error_rather_than_a_nameless_symbol() {
+        let image = ElfBuilder::new(Class::Elf32)
+            .with(SectionSpec::progbits(".text", 8, SHF_ALLOC))
+            .with_symbols(vec![SymbolSpec::new("work", 4, 1).with_name_offset(0xffff)])
+            .build();
+        assert!(
+            symbols(&image).is_err(),
+            "a name outside the table is not a nameless symbol"
+        );
+    }
+
+    #[test]
+    fn a_truncated_symbol_table_is_an_error_rather_than_the_symbols_that_fit() {
+        let mut image = image_with_symbols(Class::Elf32);
+        // Declare a table longer than the file, which is what a truncated artifact looks
+        // like. Reading the entries that fit would under-report every attribution.
+        let sections = sections(&image).expect("readable");
+        let index = sections
+            .iter()
+            .position(|section| section.kind == SHT_SYMTAB)
+            .expect("the builder wrote a symbol table");
+        let table = locate_table(&image, ELF32, Endian::Little).expect("readable");
+        let at =
+            section_field(table.offset, table.entry_size, index, ELF32.sh_size).expect("in range");
+        image
+            .get_mut(at..at + 4)
+            .expect("in range")
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            symbols(&image).is_err(),
+            "a truncated table is not a short one"
+        );
+    }
+
+    #[test]
+    fn a_symbol_table_whose_entries_are_the_wrong_width_is_an_error() {
+        let mut image = image_with_symbols(Class::Elf32);
+        let sections = sections(&image).expect("readable");
+        let index = sections
+            .iter()
+            .position(|section| section.kind == SHT_SYMTAB)
+            .expect("the builder wrote a symbol table");
+        let table = locate_table(&image, ELF32, Endian::Little).expect("readable");
+        let at = section_field(table.offset, table.entry_size, index, ELF32.sh_entsize)
+            .expect("in range");
+        image
+            .get_mut(at..at + 4)
+            .expect("in range")
+            .copy_from_slice(&20_u32.to_le_bytes());
+        assert!(
+            symbols(&image).is_err(),
+            "entries of an unexpected width are read at the wrong offsets, not read anyway"
+        );
+    }
 
     #[test]
     fn an_elf32_little_endian_image_reports_its_sections() {

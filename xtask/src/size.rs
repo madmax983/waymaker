@@ -115,8 +115,17 @@ fn variant_build_dir(build_dir: &Path, variant: &str) -> PathBuf {
     build_dir.join(slug)
 }
 
+/// The `--config` override that keeps the symbol table in the linked image.
+///
+/// Design document §04's budgets are measured against `[profile.release]` as the workspace
+/// declares it, and this changes one setting of it: `strip`. That setting removes
+/// unallocated sections and nothing else, so every number the gate reads is the same on
+/// either side of it — and [`check_symbols_are_not_measured`] holds each image to that
+/// rather than taking it on trust.
+const STRIP_NOTHING: &str = "profile.release.strip=\"none\"";
+
 /// The version stamped into the JSON report.
-const REPORT_SCHEMA: u64 = 1;
+const REPORT_SCHEMA: u64 = 2;
 
 /// The row every other row is an increment on: an image with no Waymaker in it.
 pub const BASELINE_ROW: &str = "baseline";
@@ -323,6 +332,148 @@ fn in_section(name: &str, section: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
+/// The crate name the probe's own symbols carry.
+///
+/// Cargo package names use `-` and Rust paths use `_`, and a mangled symbol carries the
+/// path spelling. Derived rather than written down, so a renamed probe cannot leave the
+/// attribution matching nothing and reading every image as all layers.
+#[must_use]
+pub fn probe_crate_name() -> String {
+    PROBE_PACKAGE.replace('-', "_")
+}
+
+/// The crate that *declares* `mangled`, as Rust's name mangling records it.
+///
+/// The first crate-root component of the path, which is where the body was written. A
+/// monomorphised generic names two crates — `waymaker_flash::frame::encode_with` linked
+/// for the probe carries `waymaker_flash` in its path and `waymaker_size_probe` as the
+/// instantiating crate — and crediting the byte count to the instantiation would hand
+/// every generic in the engine back to the row this attribution exists to correct.
+///
+/// `None` for a symbol no Rust compiler mangled: `__aeabi_memcpy` and the rest belong to
+/// nobody here, and everything that belongs to nobody stays charged to the layers.
+#[must_use]
+pub fn defining_crate(mangled: &str) -> Option<&str> {
+    v0_crate(mangled).or_else(|| legacy_crate(mangled))
+}
+
+/// The crate root of a `v0` mangled name (`_RNvCs<hash>_14waymaker_flash5frame…`).
+fn v0_crate(mangled: &str) -> Option<&str> {
+    let path = mangled.strip_prefix("_R")?;
+    // The first `C` that begins a well-formed crate root. Scanned rather than parsed: the
+    // components before it are namespace and backreference codes, and a scan that only
+    // has to recognise one component does not need to know the rest of the grammar.
+    path.match_indices('C')
+        .filter_map(|(at, _)| path.get(at.saturating_add(1)..))
+        .find_map(crate_root)
+}
+
+/// The identifier of a crate root, given the bytes after its `C`.
+fn crate_root(rest: &str) -> Option<&str> {
+    // An optional disambiguator: `s`, base-62 digits, `_`.
+    let rest = match rest.strip_prefix('s') {
+        Some(after) => {
+            let (disambiguator, tail) = after.split_once('_')?;
+            disambiguator
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+                .then_some(tail)?
+        }
+        None => rest,
+    };
+    // `u` marks a punycode identifier, whose decoded spelling is not what a symbol from
+    // this workspace carries; the encoded one is still a name, and reading it is better
+    // than reading the crate root after it.
+    identifier(rest.strip_prefix('u').unwrap_or(rest))
+}
+
+/// The crate root of a `legacy` mangled name (`_ZN14waymaker_flash5frame…`).
+fn legacy_crate(mangled: &str) -> Option<&str> {
+    identifier(mangled.strip_prefix("_ZN")?)
+}
+
+/// A length-prefixed identifier, if `rest` opens with one.
+///
+/// A length longer than what follows it answers `None` rather than the characters that
+/// happen to be there: a truncation of a crate name is a crate name, and attributing bytes
+/// to it is worse than attributing them to nobody.
+fn identifier(rest: &str) -> Option<&str> {
+    let digits = rest.len().saturating_sub(
+        rest.trim_start_matches(|character: char| character.is_ascii_digit())
+            .len(),
+    );
+    let (length, tail) = rest.split_at_checked(digits)?;
+    let length: usize = length.parse().ok()?;
+    // v0 separates the length from an identifier that would otherwise start with a digit.
+    let name = tail.strip_prefix('_').unwrap_or(tail).get(..length)?;
+    let mut characters = name.chars();
+    let starts = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_');
+    let continues =
+        characters.all(|character| character.is_ascii_alphanumeric() || character == '_');
+    (starts && continues).then_some(name)
+}
+
+/// How many of the image's stored bytes the symbol table attributes to `crate_name`.
+///
+/// Only symbols in a section that costs flash, because that is the budget being read: a
+/// `.bss` symbol is RAM, and a symbol in a section that was discarded is nothing.
+/// `SHN_UNDEF` and the reserved indices name no section and are attributed to nobody.
+#[must_use]
+pub fn attributed_flash(sections: &[Section], symbols: &[elf::Symbol], crate_name: &str) -> u64 {
+    symbols
+        .iter()
+        .filter(|symbol| defining_crate(&symbol.name) == Some(crate_name))
+        .filter(|symbol| symbol.section_index != elf::SHN_UNDEF)
+        .filter(|symbol| {
+            sections
+                .get(usize::from(symbol.section_index))
+                .is_some_and(Section::occupies_storage)
+        })
+        .fold(0, |total, symbol| total.saturating_add(symbol.size))
+}
+
+/// Rule: the symbol table this attribution is read from costs no byte the gate measures.
+///
+/// The matrix links its images with `strip` off so that there are symbols to attribute,
+/// and gates the section sizes of that same image. The two are the same measurement only
+/// while the symbol table is unallocated — which every linker makes it, and which is
+/// therefore worth asking rather than assuming, because the failure is a budget quietly
+/// read against a bigger image than the one that ships.
+///
+/// An image with no symbol table at all fails here too: a zero attribution is
+/// indistinguishable from a probe that cost nothing, and reading it as the latter restores
+/// the figure this module exists to correct.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the image carries no symbol table, or if a symbol, string or
+/// debug section is allocated.
+pub fn check_symbols_are_not_measured(sections: &[Section]) -> Result<(), SizeError> {
+    if !sections
+        .iter()
+        .any(|section| section.kind == elf::SHT_SYMTAB)
+    {
+        return Err(SizeError::new(
+            "the linked image carries no symbol table, so no byte of it can be attributed; the matrix links with `strip` off precisely so that there is one",
+        ));
+    }
+
+    for section in sections {
+        let stripped = matches!(section.kind, elf::SHT_SYMTAB | elf::SHT_STRTAB)
+            || section.name.starts_with(".debug");
+        if stripped && section.allocated() {
+            return Err(SizeError::new(format!(
+                "`{}` is allocated, so stripping it would change a section the budget is measured on; the attribution and the gated sizes would then be readings of two different images",
+                section.name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// One measured row of the report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -334,6 +485,14 @@ pub struct Row {
     pub measured_against: String,
     /// The measured sections.
     pub sizes: SectionSizes,
+    /// Stored bytes this image's symbol table attributes to the probe crate itself.
+    ///
+    /// Design document §04's code-flash budget is stated for "core + flash adapter", and
+    /// the probe is neither: its `match` arms, folds and calls exist only to keep the
+    /// layers' code alive past `--gc-sections`. Recorded per row rather than subtracted on
+    /// the spot so that the report can state the split as well as gate the corrected
+    /// figure.
+    pub probe_flash: u64,
     /// Whether exceeding a budget on this row fails the gate.
     pub gated: bool,
 }
@@ -346,6 +505,7 @@ impl Row {
         features: &[&str],
         measured_against: &str,
         sizes: SectionSizes,
+        probe_flash: u64,
         gated: bool,
     ) -> Self {
         Self {
@@ -353,6 +513,7 @@ impl Row {
             features: features.iter().map(|f| (*f).to_owned()).collect(),
             measured_against: measured_against.to_owned(),
             sizes,
+            probe_flash,
             gated,
         }
     }
@@ -534,6 +695,33 @@ impl SizeReport {
         Some(row.sizes.saturating_delta(&baseline.sizes))
     }
 
+    /// How much more of `name`'s image the symbol table attributes to the probe than it
+    /// does of the baseline's.
+    #[must_use]
+    pub fn probe_delta_of(&self, name: &str) -> Option<u64> {
+        let baseline = self.baseline()?;
+        let row = self.row(name)?;
+        Some(row.probe_flash.saturating_sub(baseline.probe_flash))
+    }
+
+    /// The layers' share of `name`'s flash delta: the image delta less what the probe's
+    /// own code grew by.
+    ///
+    /// This is the number design document §04's code-flash budget is stated over, and the
+    /// number [`Self::shortfalls`] gates. Everything the symbol table does not name as the
+    /// probe's stays here — `.rodata` strings, `compiler_builtins`, the alignment padding
+    /// between functions — because a byte nobody can attribute is a byte the layers
+    /// brought, and a budget should err toward failing.
+    ///
+    /// Saturating for [`SectionSizes::saturating_delta`]'s reason: a probe share larger
+    /// than the image it was read from is a measurement fault, and
+    /// [`Self::shortfalls`] refuses it rather than letting it credit the layers.
+    #[must_use]
+    pub fn layers_flash_of(&self, name: &str) -> Option<u64> {
+        let delta = self.delta_of(name)?.flash;
+        Some(delta.saturating_sub(self.probe_delta_of(name)?))
+    }
+
     /// How much bigger `name` is than the row it is an increment on.
     ///
     /// For a feature row that is the feature's own cost, which is the number design
@@ -639,13 +827,45 @@ impl SizeReport {
             });
         }
 
+        // Every image the matrix links *is* the probe, so a row that attributes nothing to
+        // it is a row whose symbol table was not read — a stripped image, a parser that
+        // came back empty, a report written by an older build. Reading that as "the probe
+        // cost nothing" restores the figure this correction exists to remove, silently and
+        // in the direction that passes.
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| row.gated || row.name == BASELINE_ROW)
+        {
+            if row.probe_flash == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` attributes no byte at all to `{PROBE_PACKAGE}`, but every image the matrix links is the probe; its symbol table was not read",
+                        row.name
+                    ),
+                });
+            }
+            if row.probe_flash > row.sizes.flash {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` attributes {} B to `{PROBE_PACKAGE}` out of an image holding {} B, which is not a reading of that image",
+                        row.name, row.probe_flash, row.sizes.flash
+                    ),
+                });
+            }
+        }
+
         for row in self.rows.iter().filter(|row| row.gated) {
             let delta = row.sizes.saturating_delta(&baseline.sizes);
-            if delta.flash > INCREMENTAL_CODE_FLASH_BUDGET_BYTES {
+            // The layers' share rather than the image delta. Design document §04 states
+            // the budget for "core + flash adapter", and issue #72 is that the probe's own
+            // arithmetic had grown to more than a third of what was being gated.
+            let layers = self.layers_flash_of(&row.name).unwrap_or(delta.flash);
+            if layers > INCREMENTAL_CODE_FLASH_BUDGET_BYTES {
                 shortfalls.push(BudgetShortfall::Exceeded {
                     budget: Budget::IncrementalCodeFlash,
                     subject: row.name.clone(),
-                    measured: delta.flash,
+                    measured: layers,
                 });
             }
             if delta.ram > ENGINE_RAM_BUDGET_BYTES {
@@ -695,13 +915,15 @@ impl SizeReport {
         let mut table = vec![
             format!("section sizes on {FIRMWARE_TARGET}, release-size profile\n"),
             format!(
-                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9}  {:>12}\n",
+                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9} {:>9} {:>9}  {:>12}\n",
                 "variant",
                 "\u{394}.text",
                 "\u{394}.rodata",
                 "\u{394}.data",
                 "\u{394}.bss",
                 "\u{394}flash",
+                "probe",
+                "layers",
                 "\u{394}ram",
                 "over base",
             ),
@@ -711,18 +933,24 @@ impl SizeReport {
             // The baseline's own row shows what a firmware with no Waymaker in it costs,
             // so its columns are absolute and everything else is a delta against it.
             let delta = self.delta_of(&row.name).unwrap_or(row.sizes);
+            let probe = self.probe_delta_of(&row.name).unwrap_or(row.probe_flash);
+            let layers = self
+                .layers_flash_of(&row.name)
+                .unwrap_or_else(|| row.sizes.flash.saturating_sub(row.probe_flash));
             let increment = self.increment_of(&row.name).map_or_else(
                 || "-".to_owned(),
                 |increment| format!("+{} flash", increment.flash),
             );
             table.push(format!(
-                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9}  {increment:>12}{}\n",
+                "  {:<width$}  {:>9} {:>9} {:>9} {:>9}  {:>9} {:>9} {:>9} {:>9}  {increment:>12}{}\n",
                 row.name,
                 delta.text,
                 delta.rodata,
                 delta.data,
                 delta.bss,
                 delta.flash,
+                probe,
+                layers,
                 delta.ram,
                 if row.gated { "  gated" } else { "" },
             ));
@@ -732,6 +960,9 @@ impl SizeReport {
             "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B, engine statics {ENGINE_RAM_BUDGET_BYTES} B (of {} B runtime RAM, less a {} B caller-owned scratch page)\n",
             waymaker_core::budget::RUNTIME_RAM_BYTES,
             waymaker_core::budget::SCRATCH_PAGE_BYTES,
+        ));
+        table.push(format!(
+            "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Every byte no symbol attributes to the probe stays in `layers`.\n"
         ));
         table.push(
             "runtime RAM: statics only. A cursor, context or record header on the caller's stack moves no writable section, so \u{394}ram is a floor on design document \u{a7}04's runtime RAM and not the rule itself; stack accounting needs a call graph and arrives with the code that has one.\n"
@@ -772,6 +1003,13 @@ impl SizeReport {
                 entry.insert("bss".to_owned(), Value::from(row.sizes.bss));
                 entry.insert("flash".to_owned(), Value::from(row.sizes.flash));
                 entry.insert("ram".to_owned(), Value::from(row.sizes.ram));
+                entry.insert("probe_flash".to_owned(), Value::from(row.probe_flash));
+                // Derived, like `delta` below, and for the same reason: this is the number
+                // the gate holds to the budget, and a consumer that has to re-derive it is
+                // a consumer that can derive it differently.
+                if let Some(layers) = self.layers_flash_of(&row.name) {
+                    entry.insert("layers_flash".to_owned(), Value::from(layers));
+                }
                 // The deltas are what the issue asks the job to record and what a reader
                 // wants; they are derivable from the baseline row, but a consumer that has
                 // to re-derive them is a consumer that can derive them differently.
@@ -895,6 +1133,7 @@ impl SizeReport {
                         .get("gated")
                         .and_then(Value::as_bool)
                         .ok_or_else(|| SizeError::new("a size report row has no `gated` flag"))?,
+                    probe_flash: number(row, "probe_flash")?,
                     sizes: SectionSizes {
                         text: number(row, "text")?,
                         rodata: number(row, "rodata")?,
@@ -976,6 +1215,16 @@ pub struct RowDiff {
     pub before: Option<SectionSizes>,
     /// This branch's sizes, absent when the row was removed.
     pub after: Option<SectionSizes>,
+    /// The base branch's layers' share, for a row the budget is held against.
+    ///
+    /// Only for a gated row. The layers' share is defined against the baseline image,
+    /// which is what the budget is stated over; a feature row's own cost is measured
+    /// against the engine underneath it, and reporting a baseline-relative figure beside it
+    /// would report the engine's growth again as every feature's — the thing
+    /// [`diff`] exists to avoid.
+    pub before_layers: Option<u64>,
+    /// This branch's layers' share, on the same terms.
+    pub after_layers: Option<u64>,
 }
 
 impl RowDiff {
@@ -1027,19 +1276,30 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
     let cost = |report: &SizeReport, name: &str| {
         report.increment_of(name).or_else(|| report.delta_of(name))
     };
+    let layers = |report: &SizeReport, name: &str| {
+        report
+            .row(name)
+            .filter(|row| row.gated)
+            .and_then(|_| report.layers_flash_of(name))
+    };
 
     let mut diffs = Vec::new();
 
     for row in head.rows() {
         let after = cost(head, &row.name);
-        let before = base.row(&row.name).and_then(|_| cost(base, &row.name));
-        if before == after && before.is_some() {
+        let after_layers = layers(head, &row.name);
+        let known = base.row(&row.name).is_some();
+        let before = known.then(|| cost(base, &row.name)).flatten();
+        let before_layers = known.then(|| layers(base, &row.name)).flatten();
+        if known && before == after && before_layers == after_layers {
             continue;
         }
         diffs.push(RowDiff {
             name: row.name.clone(),
             before,
             after,
+            before_layers,
+            after_layers,
         });
     }
 
@@ -1049,6 +1309,8 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
                 name: row.name.clone(),
                 before: cost(base, &row.name),
                 after: None,
+                before_layers: layers(base, &row.name),
+                after_layers: None,
             });
         }
     }
@@ -1117,7 +1379,17 @@ pub fn render_diff(diffs: &[RowDiff]) -> String {
             }
             (None, None) => "no measurement on either side".to_owned(),
         };
-        table.push(format!("  {:<width$}  {detail}\n", entry.name));
+        // The gated figure, where there is one. `flash` above is the whole image; this is
+        // the part of it design document §04's budget is stated over.
+        let layers = match (entry.before_layers, entry.after_layers) {
+            (Some(before), Some(after)) => format!(
+                ", layers {before} -> {after} ({}{})",
+                if after >= before { "+" } else { "-" },
+                after.abs_diff(before)
+            ),
+            _ => String::new(),
+        };
+        table.push(format!("  {:<width$}  {detail}{layers}\n", entry.name));
     }
     table.concat()
 }
@@ -1271,11 +1543,21 @@ pub fn measure_into(
         }
         let sections = elf::sections(&bytes)
             .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+        check_symbols_are_not_measured(&sections).map_err(|err| {
+            SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
+        })?;
+        let symbols = elf::symbols(&bytes).map_err(|err| {
+            SizeError::new(format!(
+                "could not read the symbols of {}: {err}",
+                image.display()
+            ))
+        })?;
         rows.push(Row {
             name: variant.name,
             features: variant.features,
             measured_against: variant.measured_against,
             sizes: SectionSizes::of(&sections),
+            probe_flash: attributed_flash(&sections, &symbols, &probe_crate_name()),
             gated: variant.gated,
         });
     }
@@ -1295,6 +1577,14 @@ fn build_variant(root: &Path, build_dir: &Path, variant: &Variant) -> Result<Pat
             "build",
             "--locked",
             "--release",
+            // The gated profile strips symbols, and the gate needs them: the code-flash
+            // figure is the image delta less what the symbol table attributes to the
+            // probe. Stripping removes only unallocated sections, so it moves no byte this
+            // gate measures — which `check_symbols_are_not_measured` asks of every image
+            // rather than assuming, because the whole point is that the sizes and the
+            // attribution are readings of one image.
+            "--config",
+            STRIP_NOTHING,
             "--message-format",
             "json-render-diagnostics",
             "--target",
@@ -2212,17 +2502,34 @@ mod tests {
         }
     }
 
+    /// What the symbol table attributes to the probe in the baseline image.
+    ///
+    /// Non-zero because a baseline image always holds the probe's own entry point, and a
+    /// row where nothing is attributed to the probe is a row whose symbol table was not
+    /// read — which the gate refuses rather than reads as "the probe cost nothing".
+    const BASELINE_PROBE_FLASH: u64 = 10;
+
     fn baseline_row() -> Row {
         Row::new(
             BASELINE_ROW,
             &[PROBE_FEATURE],
             BASELINE_ROW,
             baseline_sizes(),
+            BASELINE_PROBE_FLASH,
             false,
         )
     }
 
     fn default_row(flash_over_baseline: u64, ram_over_baseline: u64) -> Row {
+        default_row_with_probe(flash_over_baseline, ram_over_baseline, BASELINE_PROBE_FLASH)
+    }
+
+    /// A `default` row whose symbol table attributes `probe_flash` bytes to the probe.
+    fn default_row_with_probe(
+        flash_over_baseline: u64,
+        ram_over_baseline: u64,
+        probe_flash: u64,
+    ) -> Row {
         let base = baseline_sizes();
         Row::new(
             DEFAULT_ROW,
@@ -2235,6 +2542,7 @@ mod tests {
                 ram: ram_over_baseline,
                 ..base
             },
+            probe_flash,
             true,
         )
     }
@@ -2252,6 +2560,279 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A stored section, for the attribution tests.
+    fn stored(name: &str) -> crate::elf::Section {
+        crate::elf::Section {
+            name: name.to_owned(),
+            size: 0,
+            kind: 1,
+            flags: crate::elf::SHF_ALLOC,
+        }
+    }
+
+    /// A section that is reserved in RAM and stored nowhere.
+    fn reserved(name: &str) -> crate::elf::Section {
+        crate::elf::Section {
+            name: name.to_owned(),
+            size: 0,
+            kind: crate::elf::SHT_NOBITS,
+            flags: crate::elf::SHF_ALLOC | crate::elf::SHF_WRITE,
+        }
+    }
+
+    fn symbol(name: &str, size: u64, section_index: u16) -> crate::elf::Symbol {
+        crate::elf::Symbol {
+            name: name.to_owned(),
+            size,
+            section_index,
+        }
+    }
+
+    #[test]
+    fn the_defining_crate_of_a_generic_is_the_crate_that_declares_it() {
+        // `waymaker_flash::frame::encode_with::<Catalogued>`, instantiated by the probe.
+        // The probe's name is in the symbol too, at the end, and charging the byte count
+        // to it would hand every generic in the engine back to the row being corrected.
+        let mangled = "_RINvNtCscrinc51sKky_14waymaker_flash5frame11encode_with                       NtNtB4_9integrity10CataloguedECs2RP2q5hjpwT_19waymaker_size_probe";
+        assert_eq!(defining_crate(mangled), Some("waymaker_flash"));
+    }
+
+    #[test]
+    fn the_defining_crate_of_a_probe_function_is_the_probe() {
+        assert_eq!(
+            defining_crate("_RNvCs2RP2q5hjpwT_19waymaker_size_probe6engine"),
+            Some("waymaker_size_probe")
+        );
+    }
+
+    #[test]
+    fn a_legacy_mangled_symbol_names_its_crate_too() {
+        assert_eq!(
+            defining_crate("_ZN14waymaker_flash5frame6encode17h0123456789abcdefE"),
+            Some("waymaker_flash")
+        );
+    }
+
+    #[test]
+    fn a_symbol_no_rust_compiler_mangled_belongs_to_no_crate() {
+        assert_eq!(defining_crate("__aeabi_memcpy"), None);
+        assert_eq!(defining_crate("memcpy"), None);
+    }
+
+    #[test]
+    fn a_crate_component_that_runs_off_the_end_of_the_symbol_names_nothing() {
+        // A length longer than the characters that follow it. Reading it anyway would
+        // attribute bytes to a crate name that is a truncation of a real one.
+        assert_eq!(defining_crate("_RNvCs1_99waymaker"), None);
+    }
+
+    #[test]
+    fn attribution_counts_only_symbols_in_sections_that_cost_flash() {
+        let sections = vec![stored(".null"), stored(".text"), reserved(".bss")];
+        let symbols = vec![
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 100, 1),
+            // In `.bss`: RAM, not flash, so it is not part of the figure being corrected.
+            symbol("_RNvCs1_19waymaker_size_probe5state", 40, 2),
+            symbol("_RNvCs1_14waymaker_flash5frame", 7, 1),
+        ];
+        assert_eq!(
+            attributed_flash(&sections, &symbols, "waymaker_size_probe"),
+            100
+        );
+    }
+
+    #[test]
+    fn a_symbol_pointing_at_no_section_is_attributed_to_nothing() {
+        let sections = vec![stored(".null"), stored(".text")];
+        // `SHN_UNDEF` and an index past the table: an undefined symbol and a corrupt one.
+        let symbols = vec![
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 100, 0),
+            symbol("_RNvCs1_19waymaker_size_probe6second", 100, 9),
+        ];
+        assert_eq!(
+            attributed_flash(&sections, &symbols, "waymaker_size_probe"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_gated_figure_is_the_delta_less_the_probes_own_growth() {
+        // 1 000 B more image than the baseline, 400 B of which the symbol table names as
+        // the probe's own arithmetic. Design document \u{a7}04's budget is for the layers.
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        assert_eq!(
+            report.delta_of(DEFAULT_ROW).map(|sizes| sizes.flash),
+            Some(1_000)
+        );
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(600));
+    }
+
+    #[test]
+    fn the_budget_is_held_against_the_layers_rather_than_against_the_image() {
+        // Over budget as an image, inside it as the layers: the probe's own growth is what
+        // the difference is, and charging it to the kernel is the whole of issue #72.
+        let over_as_an_image = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(
+                    INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 100,
+                    0,
+                    BASELINE_PROBE_FLASH + 200,
+                ),
+            ],
+            KernelState::measured(),
+        );
+        assert!(
+            over_as_an_image.shortfalls().is_empty(),
+            "{:?}",
+            over_as_an_image.shortfalls()
+        );
+
+        let over_as_the_layers = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(
+                    INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 100,
+                    0,
+                    BASELINE_PROBE_FLASH + 50,
+                ),
+            ],
+            KernelState::measured(),
+        );
+        assert!(
+            rendered(&over_as_the_layers.shortfalls()).contains("incremental code flash"),
+            "{:?}",
+            over_as_the_layers.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_row_with_nothing_attributed_to_the_probe_is_not_a_measurement() {
+        // Every image the matrix links is the probe, so a zero here is a symbol table that
+        // was stripped, not a probe that cost nothing — and reading it as zero silently
+        // restores the number issue #72 exists to correct.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row_with_probe(1_000, 0, 0)],
+            KernelState::measured(),
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("nothing was measured"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_probe_share_larger_than_the_image_is_not_a_measurement() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row_with_probe(10, 0, 1_000_000)],
+            KernelState::measured(),
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("nothing was measured"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn the_report_states_the_split_on_every_run() {
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        let rendered = report.render();
+        assert!(rendered.contains("probe"), "{rendered}");
+        assert!(rendered.contains("layers"), "{rendered}");
+        // The corrected figure and the image delta both, so a reader can see the split
+        // rather than take the gate's word for it.
+        assert!(rendered.contains("600"), "{rendered}");
+        assert!(rendered.contains("1000"), "{rendered}");
+    }
+
+    #[test]
+    fn the_json_report_carries_the_probe_share_and_the_layers_figure() {
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("the report is JSON");
+        let row = json["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["name"] == DEFAULT_ROW)
+            .expect("a default row")
+            .clone();
+        assert_eq!(row["probe_flash"], serde_json::json!(410));
+        assert_eq!(row["layers_flash"], serde_json::json!(600));
+        assert_eq!(
+            SizeReport::from_json(&report.to_json()).expect("readable"),
+            report
+        );
+    }
+
+    #[test]
+    fn a_row_missing_its_probe_share_is_rejected_rather_than_read_as_zero() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_000, 0)],
+            KernelState::measured(),
+        );
+        let json = report
+            .to_json()
+            .replace("\"probe_flash\"", "\"probe_flesh\"");
+        assert!(SizeReport::from_json(&json).is_err());
+    }
+
+    #[test]
+    fn a_symbol_table_that_costs_flash_is_not_one_stripping_can_remove() {
+        // The gate reads symbols out of an image built without `strip`, and gates the
+        // section sizes of that same image. That is only the same measurement while the
+        // symbol table is unallocated, so the image is asked rather than assumed.
+        let allocated_symbols = vec![
+            crate::elf::Section {
+                name: ".symtab".to_owned(),
+                size: 400,
+                kind: crate::elf::SHT_SYMTAB,
+                flags: crate::elf::SHF_ALLOC,
+            },
+            stored(".text"),
+        ];
+        assert!(check_symbols_are_not_measured(&allocated_symbols).is_err());
+    }
+
+    #[test]
+    fn an_image_with_no_symbol_table_cannot_be_attributed() {
+        assert!(check_symbols_are_not_measured(&[stored(".text")]).is_err());
+    }
+
+    #[test]
+    fn an_image_whose_symbol_table_costs_nothing_is_measurable() {
+        let sections = vec![
+            crate::elf::Section {
+                name: ".symtab".to_owned(),
+                size: 400,
+                kind: crate::elf::SHT_SYMTAB,
+                flags: 0,
+            },
+            stored(".text"),
+        ];
+        assert_eq!(check_symbols_are_not_measured(&sections), Ok(()));
     }
 
     #[test]
@@ -2307,6 +2888,7 @@ mod tests {
                 &[PROBE_FEATURE],
                 BASELINE_ROW,
                 SectionSizes::default(),
+                BASELINE_PROBE_FLASH,
                 false,
             )],
             KernelState::measured(),
@@ -2348,6 +2930,7 @@ mod tests {
                 flash: 4_096,
                 ..SectionSizes::default()
             },
+            BASELINE_PROBE_FLASH,
             false,
         );
         let report = SizeReport::new(
@@ -2370,6 +2953,7 @@ mod tests {
                 text: default.sizes.text + flash_over_default,
                 ..default.sizes
             },
+            default.probe_flash,
             false,
         )
     }
@@ -2477,6 +3061,7 @@ mod tests {
                 flash: baseline_sizes().flash + INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1,
                 ..baseline_sizes()
             },
+            BASELINE_PROBE_FLASH,
             false,
         );
         let message = rendered(
@@ -2758,6 +3343,7 @@ mod tests {
                 text: baseline_sizes().text + 1_000,
                 ..baseline_sizes()
             },
+            BASELINE_PROBE_FLASH,
             false,
         );
         let shifted_default = Row::new(
@@ -2771,6 +3357,7 @@ mod tests {
                 ram: 16,
                 ..bigger_baseline.sizes
             },
+            BASELINE_PROBE_FLASH,
             true,
         );
         let head = SizeReport::new(
@@ -2778,6 +3365,97 @@ mod tests {
             KernelState::measured(),
         );
         assert!(diff(&base, &head).is_empty(), "{:?}", diff(&base, &head));
+    }
+
+    #[test]
+    fn a_diff_reports_the_gated_figure_beside_the_image_it_was_read_from() {
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        // 200 B more image, all of it the probe's own arithmetic. The image grew and the
+        // layers did not, which is the distinction issue #72 is about.
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_200, 0, BASELINE_PROBE_FLASH + 600),
+            ],
+            KernelState::measured(),
+        );
+        let diffs = diff(&base, &head);
+        let default = diffs
+            .iter()
+            .find(|entry| entry.name == DEFAULT_ROW)
+            .expect("the default row moved");
+        assert_eq!(default.before_layers, Some(600));
+        assert_eq!(default.after_layers, Some(600));
+        let rendered = render_diff(&diffs);
+        assert!(rendered.contains("layers 600 -> 600"), "{rendered}");
+        assert!(rendered.contains("flash 1000 -> 1200"), "{rendered}");
+    }
+
+    #[test]
+    fn a_row_whose_layers_moved_is_a_diff_even_when_its_image_did_not() {
+        // The probe shrank by exactly what the kernel grew. The image is byte for byte the
+        // same size, and the number the budget is held against went up.
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 300),
+            ],
+            KernelState::measured(),
+        );
+        let diffs = diff(&base, &head);
+        assert!(
+            diffs.iter().any(|entry| entry.name == DEFAULT_ROW),
+            "{diffs:?}"
+        );
+        assert!(render_diff(&diffs).contains("layers 600 -> 700"));
+    }
+
+    #[test]
+    fn an_ungated_row_carries_no_layers_figure() {
+        // A feature row's own cost is measured against the engine underneath it, and the
+        // layers' share is defined against the baseline. Printing the second beside the
+        // first reports the engine's growth again as every feature's.
+        let default = default_row(20, 0);
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 8),
+            ],
+            KernelState::measured(),
+        );
+        let diffs = diff(&report, &report);
+        assert!(
+            diffs.is_empty(),
+            "a report against itself changed nothing: {diffs:?}"
+        );
+        let grown = SizeReport::new(
+            vec![
+                baseline_row(),
+                default.clone(),
+                feature_row("waymaker-core/serde", &default, 40),
+            ],
+            KernelState::measured(),
+        );
+        let feature = diff(&report, &grown)
+            .into_iter()
+            .find(|entry| entry.name == "waymaker-core/serde")
+            .expect("the feature row moved");
+        assert_eq!(feature.before_layers, None);
+        assert_eq!(feature.after_layers, None);
     }
 
     #[test]

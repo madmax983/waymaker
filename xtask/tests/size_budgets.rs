@@ -281,6 +281,106 @@ fn the_parser_agrees_with_llvm_size_about_the_probe() {
     }
 }
 
+#[test]
+fn the_gated_figure_is_the_layers_share_rather_than_the_whole_image() {
+    // Issue #72: the probe's own `match` arms, folds and calls exist only to keep the
+    // layers' code alive past `--gc-sections`, and design document §04's budget is stated
+    // for "core + flash adapter". This is the correction, measured on the real image.
+    let report = measured();
+    let delta = report.delta_of("default").expect("a default row");
+    let probe = report
+        .probe_delta_of("default")
+        .expect("the symbol table names the probe's own code");
+    let layers = report
+        .layers_flash_of("default")
+        .expect("the layers' share is measurable");
+
+    assert!(
+        probe > 0,
+        "no byte of the engine image is attributed to the probe, but the probe is what was linked"
+    );
+    assert!(
+        layers < delta.flash,
+        "the layers' share ({layers} B) is the image delta ({} B) less the probe's own \
+         growth, so it cannot be the whole delta",
+        delta.flash
+    );
+    assert_eq!(
+        layers,
+        delta.flash - probe,
+        "the layers' share is the delta less the probe's own growth and nothing else"
+    );
+}
+
+#[test]
+fn the_probes_own_code_is_a_real_share_of_the_image_it_is_subtracted_from() {
+    // A sanity bound in both directions. Zero would mean the symbol table was not read;
+    // everything would mean the layers were dead-stripped and the gate measures nothing.
+    let report = measured();
+    for name in ["default", "facade"] {
+        let row = report.row(name).expect("a measured row");
+        assert!(
+            row.probe_flash > 0 && row.probe_flash < row.sizes.flash,
+            "`{name}` attributes {} B to the probe out of an image of {} B",
+            row.probe_flash,
+            row.sizes.flash
+        );
+    }
+}
+
+#[test]
+fn the_parser_agrees_with_llvm_nm_about_what_the_probe_costs() {
+    // The second opinion for the attribution, as `the_parser_agrees_with_llvm_size_about_
+    // the_probe` is for the sections. A symbol table read at the wrong offsets answers
+    // with well-formed nonsense, and the gate would then subtract it from the budget.
+    let Some(llvm_nm) = llvm_tool("llvm-nm") else {
+        panic!(
+            "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+    };
+
+    let report = measured();
+    let row = report.row("default").expect("a default row");
+    let image = workspace_root()
+        .join("target/waymaker-size-build/default")
+        .join(xtask::pipeline::FIRMWARE_TARGET)
+        .join("release")
+        .join(size::PROBE_PACKAGE);
+
+    let output = std::process::Command::new(&llvm_nm)
+        .args(["--print-size", "--defined-only"])
+        .arg(&image)
+        .output()
+        .expect("llvm-nm should run");
+    assert!(output.status.success(), "llvm-nm failed on {image:?}");
+
+    let probe = size::probe_crate_name();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let second_opinion: u64 = listing
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // `<address> <size> <type> <name>`; a symbol with no size prints three fields.
+            let (Some(bytes), Some(name)) = (fields.get(1), fields.get(3)) else {
+                return None;
+            };
+            // `n`/`N` is debug information, which costs no flash. Everything else
+            // `--defined-only` prints is in an allocated section of this image.
+            if matches!(fields.get(2), Some(&"n" | &"N")) {
+                return None;
+            }
+            (size::defining_crate(name) == Some(probe.as_str()))
+                .then(|| u64::from_str_radix(bytes, 16).ok())
+                .flatten()
+        })
+        .sum();
+
+    assert_eq!(
+        row.probe_flash, second_opinion,
+        "our symbol reader and llvm-nm disagree about what {probe} costs in {image:?}"
+    );
+}
+
 /// The size `llvm-size -A` reports for one section.
 fn section_size(listing: &str, section: &str) -> Option<u64> {
     listing.lines().find_map(|line| {
@@ -293,6 +393,11 @@ fn section_size(listing: &str, section: &str) -> Option<u64> {
 
 /// `llvm-size` from the pinned toolchain's sysroot, where `llvm-tools-preview` puts it.
 fn llvm_size() -> Option<PathBuf> {
+    llvm_tool("llvm-size")
+}
+
+/// One tool from the pinned toolchain's sysroot, where `llvm-tools-preview` puts it.
+fn llvm_tool(tool: &str) -> Option<PathBuf> {
     let sysroot = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
@@ -308,7 +413,11 @@ fn llvm_size() -> Option<PathBuf> {
         .find_map(|line| line.strip_prefix("host: "))?
         .trim()
         .to_owned();
-    let path = sysroot.join("lib/rustlib").join(host).join("bin/llvm-size");
+    let path = sysroot
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(tool);
     path.is_file().then_some(path)
 }
 
