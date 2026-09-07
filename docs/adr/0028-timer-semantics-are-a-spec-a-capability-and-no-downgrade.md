@@ -119,7 +119,15 @@ plausible "epoch not restored yet" guard — neither file named a banned identif
 changed, and the whole pipeline was green on a persistent deadline served by a clock that
 restarts on every reset. An identifier blacklist closes one spelling at a time, so the pin is
 positive instead: `clock.rs` must name a spec, and every spec it names must be
-`TimerSpec::AtPersistentTime`.
+`TimerSpec::AtPersistentTime` — as a *name* and not a prefix, because Codex's third round
+found `TimerSpec::AtPersistentTimeFallback` walking past a `starts_with`, with an associated
+constant of that name supplying the boot spec from the kernel side.
+
+The crate-root check compares the *source* name of the re-export rather than asking whether
+the root mentions the identifier. That was round 3's other finding, and it is the same shape:
+`pub use timer::TimerPolicy as TimerSpec;` mentions it, and so does
+`pub use timer::compat::TimerSpec;`, and each leaves the decoy in place. Both are tests now,
+and each was watched failing against the version that permitted it.
 
 ## Consequences
 

@@ -1152,7 +1152,16 @@ fn check_clock_spec_construction(code: &str) -> Vec<Violation> {
         }
         named = named.saturating_add(1);
         let rest = code.get(index..).unwrap_or_default();
-        if !rest.starts_with(CLOCK_SPEC_CONSTRUCTION) {
+        // A prefix is not a match. Codex found `TimerSpec::AtPersistentTimeFallback`, which
+        // `starts_with` accepts and which an associated constant in the kernel — invisible to
+        // a method pin that reads `fn` — can define as the boot spec. The boundary is what
+        // makes the pin a name rather than a prefix, exactly as `names_identifier` does.
+        let is_the_pinned_spec = rest.starts_with(CLOCK_SPEC_CONSTRUCTION)
+            && rest
+                .get(CLOCK_SPEC_CONSTRUCTION.len()..)
+                .and_then(|tail| tail.chars().next())
+                .is_none_or(|character| !continues(character));
+        if !is_the_pinned_spec {
             let quoted: String = rest.chars().take(48).collect();
             violations.push(Violation::new(
                 RULE,
@@ -1290,25 +1299,64 @@ fn check_timer_root_reexport(sources: &[crate::size::LayerSource]) -> Vec<Violat
     };
 
     let code = without_test_modules(&code_only(&source.contents));
+    let exported = reexported_from_timer(&code);
 
     TIMER_TYPES
         .iter()
         .map(|pinned| pinned.header)
         .chain(TIMER_BRACED_STRUCTS.iter().copied())
         .filter_map(|header| header.rsplit(' ').next())
-        .filter(|name| !names_identifier(&code, name))
+        .filter(|name| !exported.contains(*name))
         .map(|name| {
             Violation::new(
                 RULE,
                 KERNEL,
                 format!(
-                    "{ROOT} does not name `{name}`, so the pinned type is not the one the \
-                     crate ships; a rename that leaves a decoy behind defeats a pin that only \
-                     reads a header string"
+                    "{ROOT} does not re-export `timer::{name}`, so the pinned type is not the \
+                     one the crate ships; a rename that leaves a decoy behind defeats a pin \
+                     that only reads a header string"
                 ),
             )
         })
         .collect()
+}
+
+/// The names `pub use timer::…` re-exports, as they are spelled *in the module*.
+///
+/// The source name and not the alias. Codex found the version that only asked whether the
+/// crate root mentioned the identifier: `pub use timer::TimerPolicy as TimerSpec;` mentions
+/// it, so the decoy survived and the rename scenario this function exists to close stayed
+/// open. What is compared now is the left-hand side, which is the name the member pin read.
+///
+/// Both spellings are read — `pub use timer::Timer;` and a braced list — and a list may span
+/// lines, so the scan runs to the `;` rather than to the end of a line. An entry that still
+/// holds a `::` is not one of these: `pub use timer::compat::TimerSpec` re-exports whatever
+/// is in `compat`, which is the decoy the rename left behind.
+fn reexported_from_timer(code: &str) -> BTreeSet<&str> {
+    const PREFIX: &str = "pub use timer::";
+
+    let mut exported = BTreeSet::new();
+    for (index, _) in code.match_indices(PREFIX) {
+        let rest = code.get(index.saturating_add(PREFIX.len())..).unwrap_or("");
+        let Some(end) = rest.find(';') else { continue };
+        let list = rest.get(..end).unwrap_or("");
+        for entry in list
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+        {
+            // The source name, before any `as`. A remaining `::` disqualifies it: the pin is
+            // that `timer::<Name>` is the type the crate ships, and a
+            // `pub use timer::compat::TimerSpec` re-exports the decoy rather than the type
+            // the member pin read.
+            let source = entry.split(" as ").next().unwrap_or("").trim();
+            if !source.is_empty() && !source.contains("::") {
+                exported.insert(source);
+            }
+        }
+    }
+    exported
 }
 
 /// The file whose public surface [`STORAGE_CONTRACT_SURFACE`] pins.
@@ -7105,6 +7153,155 @@ mod deferred_answer_pins {
 
     fn effect_sources(contents: &str) -> Vec<crate::size::LayerSource> {
         vec![layer(EFFECT_PROTOCOL_PATH, contents)]
+    }
+
+    /// The three files `timer-capability` reads, with one of them replaced.
+    fn timer_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        let clean: [(&str, String); 3] = [
+            (TIMER_SEMANTICS_PATH, tests_support::clean_timer_module()),
+            (CLOCK_CAPABILITY_PATH, tests_support::clean_clock_module()),
+            (
+                "waymaker-core/src/lib.rs",
+                tests_support::clean_kernel_root(),
+            ),
+        ];
+        clean
+            .into_iter()
+            .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+            .collect()
+    }
+
+    /// Every violation the rule emits when `path` holds `contents`.
+    fn timer_details(path: &str, contents: &str) -> Vec<String> {
+        check_timer_capability(&timer_sources(path, contents))
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect()
+    }
+
+    #[test]
+    fn the_clean_timer_capability_passes() {
+        assert!(
+            timer_details(TIMER_SEMANTICS_PATH, &tests_support::clean_timer_module()).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_spec_whose_name_merely_starts_with_the_pinned_one_is_reported() {
+        // Codex round 3: `starts_with` accepted `TimerSpec::AtPersistentTimeFallback`, and an
+        // associated constant of that name — invisible to a method pin that reads `fn` — can
+        // be the boot spec. A prefix is not a name.
+        let module = tests_support::clean_clock_module().replace(
+            CLOCK_SPEC_CONSTRUCTION,
+            "TimerSpec::AtPersistentTimeFallback",
+        );
+        let details = timer_details(CLOCK_CAPABILITY_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("names a `TimerSpec` other than")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_clock_module_naming_no_spec_is_reported() {
+        // A pin that matches nothing checks nothing.
+        let module = tests_support::clean_clock_module()
+            .lines()
+            .filter(|line| !line.contains("TimerSpec"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let details = timer_details(CLOCK_CAPABILITY_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("names no `TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_re_export_that_renames_another_type_to_a_pinned_name_is_reported() {
+        // Codex round 3: `pub use timer::TimerPolicy as TimerSpec;` mentions the identifier,
+        // so a check that only asked whether the root named it left the decoy in place. What
+        // is compared is the source name.
+        let root = "//! A kernel crate root.\npub mod timer;\n\
+                    pub use timer::TimerPolicy as TimerSpec;\n\
+                    pub use timer::{ClockCapability, Deadline, Timer};\n";
+        let details = timer_details("waymaker-core/src/lib.rs", root);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("does not re-export `timer::TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_re_export_reaching_through_a_module_is_not_the_pinned_type() {
+        // `pub use timer::compat::TimerSpec` re-exports whatever the rename left in `compat`,
+        // which is the decoy rather than the type the member pin read.
+        let root = "//! A kernel crate root.\npub mod timer;\n\
+                    pub use timer::compat::TimerSpec;\n\
+                    pub use timer::{ClockCapability, Deadline, Timer};\n";
+        let details = timer_details("waymaker-core/src/lib.rs", root);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("does not re-export `timer::TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_pub_crate_downgrade_on_the_timer_is_reported() {
+        // A surface pin counts `pub ` and not `pub(`, and `pub(crate)` is reach enough for
+        // rung 0.4's `Ctx`, which lands in this crate.
+        let module = tests_support::clean_timer_module().replace(
+            "impl Timer {",
+            "impl Timer {\n    pub(crate) fn arm_or_downgrade() {}",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("arm_or_downgrade")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_public_field_on_the_timer_is_reported() {
+        let module = tests_support::clean_timer_module()
+            .replace("    spec: TimerSpec,", "    pub spec: TimerSpec,");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares a public field")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_timer_module_fails_closed() {
+        let details: Vec<String> = check_timer_capability(&[])
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect();
+        assert!(
+            details.iter().any(|detail| detail.contains("timer.rs")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| detail.contains("clock.rs")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| detail.contains("lib.rs")),
+            "{details:?}"
+        );
     }
 
     /// Every violation the rule emits for `source`, so a test cannot pass on another half's
