@@ -69,9 +69,14 @@ barrier returned is normalised to the next record's frame program with nothing l
 is where the writer meets it. Every class is then cross-checked: a row whose media disagrees
 with its operation is a panic, not a row.
 
-**The rig resumes.** `Rig::resume` recovers the installed bank, audits the prefix record by
-record against the workload, redelivers the effect whose schedule has no completion under the
-same index, and writes what the run still owes. It takes no cut. It continues the witness the
+**The rig resumes.** `Rig::resume` recovers the installed bank, runs the audit `verify` runs
+against the witness the reset left, redelivers the effect whose schedule has no completion
+under the same index, and writes what the run still owes. A part `verify` would not pass is
+refused before any mutation or dispatch, with the same breach. The fourth review round found
+the audit running against a synthetic witness: a part that had lost an acknowledged record was
+resumed, the record rewritten, and `verify` then passed, so
+`a_resume_refuses_a_part_that_lost_an_acknowledged_record_rather_than_rewriting_it` blanks a
+committed record under a whole witness and requires the refusal. It takes no cut. It continues the witness the
 reset left: the marks stay, a torn slot is read past, and the resume appends the marks
 `iterate` would write, skipping any the witness already claims. So `verify` judges a resumed
 part, and `a_reset_at_any_mutation_of_a_resume_leaves_a_part_the_rig_judges_healthy` cuts
@@ -147,7 +152,7 @@ is the standing `waymaker-rig` already has on `waymaker-conformance`. No layer i
 no budget moves.
 
 **`Rig::resume` and `Rig::reset_budget` are public functions added to the runner pin**, and
-`RigError` gained two variants: `Breach`, for a prefix that is not this run's, and
+`RigError` gained two variants: `Breach`, for a part `verify` would not pass, and
 `Authority`, for a part with other than one bank. Both refuse before writing.
 `RigError::WitnessTooSmall` now counts the reserved torn slot, so a witness with exactly a
 clean run's marks is refused at construction rather than at the first reset inside a mark.

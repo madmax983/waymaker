@@ -840,14 +840,9 @@ impl Rig {
         &self,
         part: &mut Metered<'_, S>,
         workload: Workload,
+        known: Progress,
         page: &mut [u8],
     ) -> Result<(u16, Option<Journal>), RigError<S::Error>> {
-        let Some(last) = workload
-            .records()
-            .and_then(|records| records.checked_sub(1))
-        else {
-            return Err(RigError::Workload);
-        };
         let region = {
             let mut engine = self.engine(part)?;
             let banks = self.authoritative_banks(&mut engine, page)?;
@@ -859,7 +854,11 @@ impl Rig {
                 None => return Err(RigError::Bank),
             }
         };
-        let mut audit = Audit::new(workload, Progress::EMPTY.raising(Stage::Attempted, last));
+        // The audit `verify` runs, against the witness the reset left. Review found the first
+        // version auditing against a synthetic witness that claimed only that every record
+        // was attempted: a part that had lost an acknowledged record was resumed, the record
+        // rewritten, and `verify` then passed — the one loss the rig exists to catch, masked.
+        let mut audit = Audit::new(workload, known);
         let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
         let mut engine = self.engine(part)?;
         let mut recovery = Recovery::new(region);
@@ -872,6 +871,7 @@ impl Rig {
                 Err(error) => return Err(RigError::Recovery(unwindow_recovery(error))),
             }
         }
+        audit.finish(1).map_err(RigError::Breach)?;
         Ok((audit.recovered(), Journal::after(recovery)))
     }
 
@@ -890,15 +890,16 @@ impl Rig {
     ///
     /// # Postconditions
     ///
-    /// Every recovered record is the one the workload declared at that position, or the
-    /// resume refuses before writing. An effect is dispatched at most once here, and a
-    /// recovered completion is never dispatched again.
+    /// The part passes the audit [`verify`](Self::verify) runs, against the witness the reset
+    /// left, or the resume refuses before writing or dispatching. An effect is dispatched at
+    /// most once here, and a recovered completion is never dispatched again.
     ///
     /// # Errors
     ///
     /// [`RigError::Authority`] when other than one bank is authoritative, [`RigError::Bank`]
-    /// when that bank does not name this run, [`RigError::Breach`] when the prefix is not
-    /// this run's, and the refusals [`iterate`](Self::iterate) lists.
+    /// when that bank does not name this run, [`RigError::Breach`] with the breach
+    /// [`verify`](Self::verify) would report, and the refusals [`iterate`](Self::iterate)
+    /// lists.
     pub fn resume<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -913,7 +914,10 @@ impl Rig {
         let Some(records) = workload.records() else {
             return Err(RigError::Workload);
         };
-        let (recovered, journal) = self.recover_prefix(part, workload, page).map_err(widen)?;
+        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
+        let (recovered, journal) = self
+            .recover_prefix(part, workload, known, page)
+            .map_err(widen)?;
         let Some(mut journal) = journal else {
             return Ok(Resumed::Unextendable { recovered });
         };
@@ -923,7 +927,6 @@ impl Rig {
                 redelivered: None,
             });
         }
-        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
 
         let outstanding = recovered
             .checked_sub(1)

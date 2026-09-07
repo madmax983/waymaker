@@ -892,6 +892,123 @@ fn a_resume_survives_its_reset_budget_and_reports_the_reset_past_it() {
     assert_eq!(verdict.outcome(), Outcome::Passed);
 }
 
+/// Reads the last committed record of the rig's bank back to erased media, as a part that
+/// lost a committed suffix would present it.
+fn blank_last_record(rig: &Rig, device: &mut Device, page: &mut [u8]) {
+    let layout = rig.layout();
+    let region = layout.bank(Rig::BANK);
+    let (start, end) = {
+        let Ok(mut engine) = Window::new(&mut *device, 0, layout.geometry().capacity()) else {
+            unreachable!("the engine window")
+        };
+        let Some(want) = usize::try_from(region.payload_bytes())
+            .ok()
+            .map(|want| want.min(page.len()))
+        else {
+            unreachable!("a header fits a page")
+        };
+        let Some(head) = page.get_mut(..want) else {
+            unreachable!("a header fits a page")
+        };
+        let Ok(()) = engine.read(region.base(), head) else {
+            unreachable!("a readable bank")
+        };
+        let Ok(header) = bank::decode_header(head) else {
+            unreachable!("an installed bank")
+        };
+        let Ok(journal) = JournalRegion::of(layout, Rig::BANK, &header) else {
+            unreachable!("a journal region")
+        };
+        let mut recovery = Recovery::new(journal);
+        let mut start = None;
+        loop {
+            let at = recovery.offset();
+            match recovery.next(&mut engine, page) {
+                Some(Ok(_)) => start = Some(at),
+                Some(Err(_)) | None => break,
+            }
+        }
+        let Some(start) = start else {
+            unreachable!("a journal with a record in it")
+        };
+        (start, recovery.offset())
+    };
+    let mut image = device.image().to_vec();
+    let (Ok(from), Ok(to)) = (usize::try_from(start), usize::try_from(end)) else {
+        unreachable!("offsets index the image")
+    };
+    let Some(record) = image.get_mut(from..to) else {
+        unreachable!("the record is inside the image")
+    };
+    record.fill(0xFF);
+    let Some(blanked) = Device::restored(geometry(), image) else {
+        unreachable!("the image is this geometry's")
+    };
+    *device = blanked;
+}
+
+#[test]
+fn a_resume_refuses_a_part_that_lost_an_acknowledged_record_rather_than_rewriting_it() {
+    // Codex, round 4: the prefix audit ran against a synthetic witness that claimed only that
+    // every record was attempted, so a part that lost a committed, acknowledged record read
+    // as resumable. The resume rewrote the record and `verify` then passed, masking the one
+    // loss the rig exists to catch. The audit runs against the real witness now, and the
+    // resume refuses before any mutation or dispatch.
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut device = Device::new(geometry());
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        rig.iterate(
+            0,
+            &mut metered,
+            &mut Log::default(),
+            &mut NeverCut,
+            &mut page,
+        )
+        .expect("a completed run");
+    }
+    blank_last_record(&rig, &mut device, &mut page);
+    let last = 2 * EFFECTS + 1;
+    let breached = Outcome::Breached(Breach::LostAcknowledgedRecord { index: last });
+    assert_eq!(
+        rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
+        Ok(breached),
+        "the loss is what verify reports before the resume"
+    );
+
+    let mut dispatcher = Log::default();
+    let refused = {
+        let mut metered = Metered::new(&mut device);
+        let before = (metered.wear(), metered.rig_wear());
+        let refused = rig.resume(0, &mut metered, &mut dispatcher, &mut page);
+        assert_eq!(
+            (metered.wear(), metered.rig_wear()),
+            before,
+            "a refused resume writes nothing"
+        );
+        refused
+    };
+    assert!(
+        matches!(
+            refused,
+            Err(RigError::Breach(Breach::LostAcknowledgedRecord { index })) if index == last
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a refused resume dispatches nothing"
+    );
+    assert_eq!(
+        rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
+        Ok(breached),
+        "the loss is still there to be reported"
+    );
+}
+
 #[test]
 fn the_rows_are_ten_and_each_is_its_own_index_and_id() {
     assert_eq!(Row::ALL.len(), 10);
@@ -1050,8 +1167,9 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(matches!(refused, Err(RigError::Bank)), "{refused:?}");
 
-    // A bank installed for iteration 0 and written by iteration 1: the prefix is not this
-    // run's, and the resume refuses before writing.
+    // A bank installed for iteration 0 and written by iteration 1: the witness and the
+    // prefix are another run's, and the resume refuses before writing, with the breach
+    // `verify` reports.
     let mut device = Device::new(geometry());
     let mut metered = Metered::new(&mut device);
     rig.prepare(&mut metered, 0, &mut page)
@@ -1067,15 +1185,16 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     let before = (metered.wear(), metered.rig_wear());
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(
-        matches!(
-            refused,
-            Err(RigError::Breach(Breach::RecordDiffers { index: 0 }))
-        ),
+        matches!(refused, Err(RigError::Breach(Breach::WitnessUnreadable))),
         "{refused:?}"
     );
     assert_eq!(
         (metered.wear(), metered.rig_wear()),
         before,
         "a refused resume writes nothing"
+    );
+    assert_eq!(
+        rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
+        Ok(Outcome::Breached(Breach::WitnessUnreadable))
     );
 }
