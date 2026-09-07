@@ -345,11 +345,7 @@ fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
 
     let report = measured();
     let row = report.row("default").expect("a default row");
-    let image = workspace_root()
-        .join("target/waymaker-size-build/default")
-        .join(xtask::pipeline::FIRMWARE_TARGET)
-        .join("release")
-        .join(size::PROBE_PACKAGE);
+    let image = default_image();
 
     let output = std::process::Command::new(&llvm_nm)
         .args(["--print-size", "--defined-only"])
@@ -459,11 +455,7 @@ fn no_symbol_the_gate_credits_to_the_probe_is_a_layers_body() {
         );
     };
 
-    let image = workspace_root()
-        .join("target/waymaker-size-build/default")
-        .join(xtask::pipeline::FIRMWARE_TARGET)
-        .join("release")
-        .join(size::PROBE_PACKAGE);
+    let image = default_image();
     let output = std::process::Command::new(&llvm_nm)
         .args(["--print-size", "--defined-only", "--demangle"])
         .arg(&image)
@@ -510,6 +502,24 @@ fn no_symbol_the_gate_credits_to_the_probe_is_a_layers_body() {
             }
         }
     }
+}
+
+/// The `default` row's linked image, once [`measured`] has linked it.
+///
+/// Through `measured` rather than by joining the path, because the matrix is what links
+/// these images: a test that only names the file passes on a developer's machine, where a
+/// previous run left one behind, and fails on a clean checkout — or, worse, measures the
+/// image a previous run left.
+fn default_image() -> PathBuf {
+    assert!(
+        measured().row("default").is_some(),
+        "the matrix linked no `default` image"
+    );
+    workspace_root()
+        .join("target/waymaker-size-build/default")
+        .join(xtask::pipeline::FIRMWARE_TARGET)
+        .join("release")
+        .join(size::PROBE_PACKAGE)
 }
 
 /// The size `llvm-size -A` reports for one section.
