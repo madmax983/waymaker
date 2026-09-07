@@ -6,10 +6,14 @@
 //!
 //! # What makes step 4 unreachable
 //!
-//! [`DurableIntent`] is the only value a dispatch accepts, its field is private, and this
-//! module builds one in two bodies only — [`Effect::schedule`], after step 3's commit
-//! barrier returned, and [`Effect::redelivering`], for a schedule record that committed
-//! before this boot. A driver cannot name the identity of an effect it has not committed.
+//! [`DurableIntent`] is the only value a dispatch accepts, and its field is private. This
+//! module builds one in two bodies only. [`Effect::schedule`] builds one after step 3's
+//! commit barrier returned. `Effect::redelivering` builds one for a schedule record that an
+//! earlier boot committed; it is `pub(crate)`, because its evidence is the kernel's
+//! `Resolve::Redeliver` rather than anything this module can see.
+//!
+//! So no caller outside this crate can name the identity of an effect it has not committed,
+//! and inside it the one exception is one function with one caller.
 //!
 //! # Why this crate
 //!
@@ -26,7 +30,7 @@ use crate::drive::DriveError;
 
 /// Proof that §07 step 3 completed for one effect.
 ///
-/// Step 4 takes this and nothing else.
+/// Step 4 accepts no other proof.
 ///
 /// # Why the field is private
 ///
@@ -68,10 +72,12 @@ pub enum Resolution<'a> {
     Failed(&'a [u8]),
     /// The answer is longer than the bound.
     ///
-    /// Recorded as a failure with no payload. The run continues and the workflow sees no
-    /// part of the answer. The two alternatives are both worse: a truncation records a
-    /// short result and replays it for ever, and a refusal strands the run, because §08 has
-    /// no edge from an unresolved effect to a terminal record.
+    /// Recorded as a failure with no payload. The run continues, and the workflow sees no
+    /// part of the answer.
+    ///
+    /// The two alternatives are worse. A truncation records a short result and replays it
+    /// for ever. A refusal strands the run: §08 has no edge from an unresolved effect to a
+    /// terminal record, so the run can never end.
     ///
     /// An empty payload is the only payload that fits every bound, `0` included. So an
     /// exhausted effect and an effect that failed with no detail are the same record, which
@@ -203,14 +209,20 @@ impl<C: IntegrityCheck> Effect<C> {
         })
     }
 
-    /// An intent that committed before this boot.
+    /// An effect whose schedule record was committed in an earlier boot.
     ///
-    /// §08's redelivery row: committed history holds the schedule record and no outcome, so
-    /// steps 1 to 3 are already behind us and this writes nothing. The kernel is what says
-    /// so — it answers `Resolve::Redeliver` — and this takes its word. See
+    /// §08's redelivery row. Committed history holds the schedule record and no outcome, so
+    /// steps 1 to 3 already happened and this writes nothing.
+    ///
+    /// # Why it is not public
+    ///
+    /// It mints a proof from a sequence number. The evidence is the kernel's
+    /// `Resolve::Redeliver`, which the driver reads and this function cannot see, so in any
+    /// hand but that one it is a forge. `pub(crate)` confines the trust to the one caller.
+    /// See
     /// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked).
     #[must_use]
-    pub const fn redelivering(self, seq: EffectSeq) -> Dispatchable<C> {
+    pub(crate) const fn redelivering(self, seq: EffectSeq) -> Dispatchable<C> {
         Dispatchable {
             intent: DurableIntent {
                 id: EffectId { run: self.run, seq },
@@ -276,5 +288,90 @@ fn refusal<E>(error: ReservedError<E>) -> DriveError<E> {
     match error {
         ReservedError::Capacity(refused) => DriveError::Capacity(refused),
         ReservedError::Append(error) => DriveError::Append(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use waymaker_core::{ActivityKind, EffectSeq, RunId};
+    use waymaker_fault::Device;
+    use waymaker_flash::append::Journal;
+    use waymaker_flash::bank::BankLayout;
+    use waymaker_flash::capacity::{Bounds, Reserve, Reserved};
+    use waymaker_flash::frame::ProgramAlign;
+    use waymaker_flash::recovery::{JournalRegion, Recovery};
+    use waymaker_flash::storage::Geometry;
+
+    use super::{Effect, Resolution};
+
+    const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
+
+    const BOUNDS: Bounds = Bounds {
+        run_input_bytes: 4,
+        effect_result_bytes: 8,
+        terminal_bytes: 8,
+    };
+
+    fn geometry() -> Geometry {
+        let Ok(geometry) = Geometry::new(1024, 512, 4, 1) else {
+            unreachable!("1024 is two whole 512-byte blocks of 4-byte units")
+        };
+        geometry
+    }
+
+    fn region() -> JournalRegion {
+        let Some(align) = ProgramAlign::new(4) else {
+            unreachable!("4 is a power of two within the program-size range")
+        };
+        let Ok(region) = JournalRegion::spanning(geometry(), 0, 512, align) else {
+            unreachable!("the region is the device's first erase block")
+        };
+        region
+    }
+
+    fn writer(storage: &mut Device) -> Reserved {
+        let Ok(layout) = BankLayout::new(geometry()) else {
+            unreachable!("this geometry holds two erase blocks")
+        };
+        let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+            unreachable!("these bounds fit this layout")
+        };
+        let mut recovery = Recovery::new(region());
+        let mut page = [0_u8; 128];
+        while recovery.next(storage, &mut page).is_some() {}
+        let Some(journal) = Journal::after(recovery) else {
+            unreachable!("an erased journal has an append point")
+        };
+        let Ok(reserved) = Reserved::over(journal, reserve) else {
+            unreachable!("the reserve fits this journal")
+        };
+        reserved
+    }
+
+    /// `redelivering` is `pub(crate)`, so this is the only place it can be driven directly.
+    /// The end-to-end path is `crates/waymaker-drive/tests/drive.rs`.
+    #[test]
+    fn a_redelivered_intent_writes_nothing_and_keeps_the_committed_identity() {
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; 128];
+        let request = waymaker_core::EffectRequest {
+            kind: ActivityKind(1),
+            input_len: 3,
+            input_crc: 0x0BAD_F00D,
+        };
+        let scheduled = Effect::over(RUN, writer(&mut device))
+            .schedule(&mut device, EffectSeq(0), request, &mut page)
+            .expect("the schedule fits the journal");
+        let resolved = scheduled
+            .dispatch
+            .resolve(&mut device, Resolution::Completed(b"ok"), &mut page)
+            .expect("the outcome fits");
+        let before = device.image().to_vec();
+
+        let redelivered = resolved.next.redelivering(EffectSeq(0));
+
+        assert_eq!(redelivered.intent().id().run, RUN);
+        assert_eq!(redelivered.intent().id().seq, EffectSeq(0));
+        assert_eq!(device.image(), before.as_slice());
     }
 }

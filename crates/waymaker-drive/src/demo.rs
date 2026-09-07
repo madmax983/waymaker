@@ -163,6 +163,7 @@ pub struct World {
     pending_at: Option<usize>,
     failing_at: Option<usize>,
     exhausting_at: Option<usize>,
+    exhausting_seq: Option<u32>,
 }
 
 impl World {
@@ -184,6 +185,7 @@ impl World {
             pending_at: None,
             failing_at: None,
             exhausting_at: None,
+            exhausting_seq: None,
         }
     }
 
@@ -214,6 +216,19 @@ impl World {
     pub const fn exhausting_at(nth: usize) -> Self {
         Self {
             exhausting_at: Some(nth),
+            ..Self::new()
+        }
+    }
+
+    /// A world that exhausts the effect whose sequence is `seq`, on every boot.
+    ///
+    /// [`exhausting_at`](Self::exhausting_at) counts dispatches within one boot, so after a
+    /// crash that already resolved an effect it exhausts a different one. This keys off the
+    /// identity the schedule record committed, which is the same on every boot.
+    #[must_use]
+    pub const fn exhausting_seq(seq: u32) -> Self {
+        Self {
+            exhausting_seq: Some(seq),
             ..Self::new()
         }
     }
@@ -270,7 +285,10 @@ impl Activities for World {
         let taken = copy(answer, out);
         // §07 step 5 takes bounded result bytes. An answer wider than the bound is reported
         // as exhausted rather than truncated, so no part of it reaches the workflow.
-        if self.exhausting_at == Some(nth) || taken < answer.len() {
+        if self.exhausting_at == Some(nth)
+            || self.exhausting_seq == Some(intent.id().seq.0)
+            || taken < answer.len()
+        {
             return Performed::Exhausted;
         }
         if self.failing_at == Some(nth) {

@@ -438,6 +438,10 @@ fn no_recovered_outcome_holds_part_of_an_answer_at_any_crash_point() {
         .run(|session| drive(session, &RefCell::new(Vec::new())))
         .expect("the fault-free run completes");
 
+    assert!(
+        runs.len() > 1,
+        "the enumeration found crash points to sweep"
+    );
     let mut seen = 0_usize;
     for run in &runs {
         for payload in recovered_outcomes(run.image()) {
@@ -475,6 +479,15 @@ fn an_exhausted_answer_stays_empty_and_keeps_its_intent_at_every_crash_point() {
         .expect("the fault-free run completes");
 
     let logs = logs.into_inner();
+    assert_eq!(
+        logs.len(),
+        runs.len(),
+        "one dispatch log per run, in the order the harness ran them"
+    );
+    assert!(
+        runs.len() > 1,
+        "the enumeration found crash points to sweep"
+    );
     let whole = recovered(runs.first().expect("the fault-free run is first").image());
     assert_eq!(
         whole,
@@ -487,6 +500,7 @@ fn an_exhausted_answer_stays_empty_and_keeps_its_intent_at_every_crash_point() {
         "an exhausted effect resolves, and the workflow's failure branch ends the run"
     );
 
+    let mut truncated = 0_usize;
     for (run, dispatched) in runs.iter().zip(&logs) {
         let history = recovered(run.image());
         assert!(
@@ -494,6 +508,9 @@ fn an_exhausted_answer_stays_empty_and_keeps_its_intent_at_every_crash_point() {
             "{:?} is not a prefix of the fault-free history: {history:?}",
             run.injection()
         );
+        if history.len() < whole.len() {
+            truncated = truncated.saturating_add(1);
+        }
         for payload in recovered_outcomes(run.image()) {
             assert!(
                 payload.is_empty(),
@@ -513,4 +530,74 @@ fn an_exhausted_answer_stays_empty_and_keeps_its_intent_at_every_crash_point() {
             );
         }
     }
+    assert!(
+        truncated > 0,
+        "a sweep in which no crash ever shortened history is a sweep that measured nothing"
+    );
+}
+
+#[test]
+fn a_reboot_after_an_exhausted_effect_carries_the_run_on_or_refuses_before_dispatching() {
+    // The window `an_exhausted_answer_…` leaves: what the *next* boot does with a crash
+    // image an exhausted effect left behind. The world is keyed on the effect sequence
+    // rather than on a per-boot dispatch counter, so the same effect exhausts on every boot.
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(|session| drive_world(session, &RefCell::new(Vec::new()), World::exhausting_seq(0)))
+        .expect("the fault-free run completes");
+
+    let mut resumed = 0_usize;
+    let mut refused = 0_usize;
+    for run in &runs {
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            unreachable!("the image is device-sized")
+        };
+        let mut workflow = Pipeline::new();
+        let mut world = World::exhausting_seq(0);
+        let mut page = [0_u8; 256];
+        let mut result = [0_u8; 64];
+        let ended = Driver::new(region(), RUN, reserve()).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        );
+        if ended.is_ok() {
+            {
+                resumed = resumed.saturating_add(1);
+                assert_eq!(
+                    recovered(device.image()),
+                    [
+                        Summary::RunStarted,
+                        Summary::EffectScheduled(0),
+                        Summary::EffectResolved(0),
+                        Summary::Terminal,
+                    ],
+                    "a resumed run reaches the same history, at {:?}",
+                    run.injection()
+                );
+                for payload in recovered_outcomes(device.image()) {
+                    assert!(
+                        payload.is_empty(),
+                        "a resumed run committed {} bytes for an exhausted effect, at {:?}",
+                        payload.len(),
+                        run.injection()
+                    );
+                }
+            }
+        } else {
+            // §14: a torn or unsealed tail has no append point, and this driver does not
+            // swap banks — so it refuses rather than repairing. Nothing was dispatched.
+            refused = refused.saturating_add(1);
+            assert_eq!(world.performed(), 0, "at {:?}", run.injection());
+        }
+    }
+    assert!(
+        resumed > 0,
+        "no crash image was one the run could carry on from"
+    );
+    assert!(refused > 0, "no crash image was one the run had to refuse");
 }

@@ -38,15 +38,17 @@ was priced against `Bounds::effect_result_bytes`. An answer could fit one and no
 **§07 is three types, in `waymaker-drive`.** `Effect` holds §10's gated writer between
 effects. `Effect::schedule` takes steps 1, 2 and 3 and returns a `Dispatchable`.
 `Dispatchable::intent` is the only source of a `DurableIntent`, and `Activities::perform` —
-step 4 — takes nothing else. `Dispatchable::resolve` takes steps 5, 6 and 7 and returns a
+step 4 — accepts no other proof. `Dispatchable::resolve` takes steps 5, 6 and 7 and returns a
 `Resolved`, which carries the only `Outcome` a caller can reach. So the workflow observes the
 result after step 7's barrier and at no earlier point, because there is no earlier value to
 observe.
 
-`DurableIntent`'s field is private. This crate builds one in two bodies: `schedule`, after
-step 3's commit barrier returned, and `redelivering`, for a schedule record that committed
-before this boot. Both are durability proofs. A `compile_fail` doctest shows that a third is
-not available to a caller.
+`DurableIntent`'s field is private. This crate builds one in two bodies. `schedule` builds one
+after step 3's commit barrier returned, which is a proof. `redelivering` builds one for a
+schedule record an earlier boot committed, and that is *not* a proof: the evidence is the
+kernel's `Resolve::Redeliver`, which the driver reads and this module cannot see. So
+`redelivering` is `pub(crate)`, and the trust is confined to the one caller beside it. A
+`compile_fail` doctest shows that a third route is not available to a caller.
 
 **The protocol is above the layers, not in `waymaker-flash`.** Steps 1 to 3 and 5 to 7 are
 `waymaker-flash`'s two-barrier writer, but step 4 is an activity, and `waymaker-flash`'s
@@ -65,14 +67,15 @@ in an earlier boot.
 **An answer that overruns the bound is a record, not a refusal.** `Resolution::Exhausted` is
 written as an `EffectFailed` with no payload. The run continues, the workflow takes its
 failure branch, and no part of the answer reaches it. `Performed::Exhausted` is how an
-activity says so.
+activity says so, and an activity that instead *reports* a length wider than the buffer it
+was handed is recorded the same way: on media the two are the same statement, and a refusal
+there strands the run exactly as the old behaviour did.
 
 **There is one bound.** The driver hands an activity a buffer of exactly
 `Bounds::effect_result_bytes`, taken from the reserve that priced the bank —
 `Reserve::bounds()` is new for this. A result buffer narrower than that bound is
 `DriveError::ResultBufferTooSmall`, refused at the start of a boot before the run's own record
-is written. An activity that reports a length wider than the buffer it was handed is a broken
-activity rather than an exhausted one, and stays `DriveError::ResultTooLong`.
+is written. A payload wider than the bound is refused by §10's reserve before any media call.
 
 ## Consequences
 
@@ -89,9 +92,20 @@ others, which is worse than a stated ambiguity.
 that can never end, and §08 leaves no third option.
 
 The result-buffer rule is stricter than it was. A caller that brought a small buffer and a
-large declared bound is now refused at boot rather than at the first effect. Three tests in
+large declared bound is now refused at boot rather than at the first effect. Two tests in
 `crates/waymaker-drive/tests/boundary.rs` moved to reserves of their own to keep testing what
 they were about.
+
+The bound applies on the reading side too, which review found it did not: `store` copies a
+replayed outcome under the narrower of the caller's buffer and the declared bound, so a
+firmware whose bounds shrank refuses a journal written under the old ones rather than handing
+back a payload it would decline to write.
+
+`Decision` grew from an `EffectId` to a `Dispatchable`, and the writer is now moved through
+`schedule` and `resolve` rather than staying inside `Source`. Code flash moved 4 B; the stack
+did not move measurably, because nothing measures it — §04's runtime RAM figure is statics
+only, and CLAUDE.md says so. It is recorded here because this change is what made the value
+large enough to be worth recording.
 
 `Reserve::bounds()` is a new public function in a layer, so the size probe reaches it and
 §04's code-flash budget charges for it: 18098 B to 18102 B, against the same 18432 B gate. No
@@ -113,11 +127,14 @@ checked](../../CLAUDE.md#what-is-not-checked) says so.
 without going through a test-support crate. It was not taken because step 4 is an activity and
 `waymaker-flash` must not own activities; a `DurableIntent` minted in the storage layer and
 consumed above it would be a protocol split across a boundary it is meant to define. The
-code-flash budget agrees — §04's incremental gate has 334 B of headroom — but that is
-corroboration rather than the reason.
+code-flash budget agrees — §04's incremental gate has 330 B of headroom after this change —
+but that is corroboration rather than the reason.
 
-**A closure: `schedule_then_dispatch(|intent| ...)`.** It hides the order rather than
-enforcing it, and the closure can still be called from a body that has not scheduled.
+**A closure: `schedule_then_dispatch(|intent| ...)`.** The order would then be a fact about
+one function's body rather than about a type, which is the thing issue #29 asks to be
+replaced. It also fixes the shape of the caller: a driver that wants to record something
+between steps 4 and 5, or to suspend at `Performed::Pending` without resolving, has to
+express it as a return value from the closure instead of as ordinary control flow.
 
 **A truncated result.** Forbidden by issue #29's second "done when": no partial result bytes
 are ever exposed to the workflow. A truncation also becomes history and replays for ever.

@@ -511,7 +511,7 @@ this table is how you find out what a red build is telling you.
 | `rig-oracle` | `waymaker-rig`'s oracle or its census gains a public function `source::RIG_AUDIT_SURFACE` or `source::RIG_CENSUS_SURFACE` does not list, in either direction — or either file is gone, so the pin checks nothing. A rig is the one piece of code here whose bugs are *invisible*: a firmware bug shows up as a failing test, a rig bug as a passing one. Every way of giving the instrument back is an addition — an `Audit::assume_passed`, an `Audit::ignore`, a `Breach::suppress`, a second `finish` taking the authority count as advisory, a `Coverage::force_complete`, a `Gap::ignore` — and each would break no other rule, need no dependency and pass every test that exists. The census is a file of its own rather than part of `phase.rs` for this rule's sake: `Phase` and `ResetCause` each declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell two such declarations apart. What it cannot see is whether the oracle's arithmetic is right — `crates/waymaker-rig/tests/teeth.rs` is what holds that, with two writers wrong in one way each and a control writer required to pass. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
 | `kernel-boundary` | Design document §06's kernel boundary stops being the one that was reviewed, in either half. The *shape* half: a type in `source::BOUNDARY_TYPES` — `EffectRequest`, `Intent`, `Resolve`, `Outcome`, `Next` — declares a member the pin does not have, or stops declaring one it does, or is gone so the pin checks nothing. Issue [#28](https://github.com/madmax983/waymaker/issues/28) asks that "adding a new record kind does not change this signature", and §09 numbers eleven record kinds of which five — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`, `SIGNAL_RECEIVED`, `CHILD_STARTED` — have no body yet. A `Resolve::TimerFired` arriving with the first of them would break no other rule, need no dependency, and turn one boundary into a boundary per record. The *routing* half: `waymaker-drive`'s driver stops naming a row of `source::BOUNDARY_DECISIONS`, or grows one of `source::DRIVER_FORBIDDEN_VOCABULARY` — `RecordKind` or `Step`, matched as *identifiers*, because a `Step::` spelling ban is evaded by `Step ::Record` and by `use …::Step as S;` and fires on an unrelated `BootStep::`. A driver that decided from a record rather than from `Intent` and `Resolve` would be a second transition table, and the one below it would no longer be where §08 is enforced. `RecordRef` is not on the list because the driver constructs them — the kernel names the record it wants written and something has to write it — and it reads two, which [what is not checked](#what-is-not-checked) names rather than leaves implied. Both halves read the file with its `#[cfg(test)]` modules removed, for `integrity-check`'s reason: a decision named only under `cfg(test)` discharges nothing about the code that ships. A type declared *twice* fails too — `braced_body` reads the first declaration, so a decoy above the real one is what a first-match scan reads. One rule id because it is one decision. What it cannot see is a *widened* member behind a name already on the list, and a driver that names every decision and then ignores one; `crates/waymaker-drive/tests/` is what holds the behaviour. [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md). |
-| `effect-protocol` | Design document §07's seven-step effect protocol stops being the one that was reviewed. `waymaker-drive/src/effect.rs` gains or loses a public function `source::EFFECT_PROTOCOL_SURFACE` lists; the state in `source::EFFECT_DISPATCH_STATE` declares anything but the two methods its row names; a type in `source::EFFECT_OPAQUE` declares a public field; a value in `source::EFFECT_CONSTRUCTIONS` is built outside the two bodies its row names, or is not built inside each of them; a body in `source::EFFECT_STEP_BODIES` stops naming each of `source::EFFECT_STEPS` exactly once and in that order; or `redelivering` names one of `source::EFFECT_REDELIVERY_FORBIDDEN`. Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be unreachable without step 3, "structurally, not by review", and every way of giving that back is an *addition*: a `DurableIntent::new`, a public `id` field on it, an `Effect::dispatchable_now`, a `Dispatchable::into_writer`, or a `Resolution::outcome` a caller can call before step 7. Each would break no other rule, need no dependency, and turn §02 decision 3 back into a convention. The step rows are the other half: §07 states the frame, the payload barrier and the seal twice, and a body that takes them in another order is not that protocol. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is a step added from another file — it pins one file, exactly as `capacity-reserve` and `recovery-surface` do — nor whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness; the crash windows are `crates/waymaker-drive/tests/crash.rs`. [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md). |
+| `effect-protocol` | Design document §07's seven-step effect protocol stops being the one that was reviewed. `waymaker-drive/src/effect.rs` gains or loses a public function `source::EFFECT_PROTOCOL_SURFACE` lists; the state in `source::EFFECT_DISPATCH_STATE` declares anything but the two methods its row names; a type in `source::EFFECT_TYPE_METHODS` is declared twice, stops being a braced struct, declares a public field, or declares a method set other than its row's — read at *every* visibility, because a surface pin counts `pub ` and not `pub(`; a type in `source::EFFECT_NO_SELF_LITERAL` builds a `Self`; the file declares a module; a value in `source::EFFECT_CONSTRUCTIONS` is built outside the two bodies its row names, or is not built inside each of them; a body in `source::EFFECT_STEP_BODIES` — located in its owning type's own `impl` blocks — stops taking each of `source::EFFECT_STEPS` exactly once, in that order, and at the body's own brace depth; `source::EFFECT_PROOF_AFTER`'s body builds a proof before the step its row names; or `redelivering` names one of `source::EFFECT_REDELIVERY_FORBIDDEN`. Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be unreachable without step 3, "structurally, not by review", and every way of giving that back is an *addition*: a `DurableIntent::new`, a public `id` field on it, an `Effect::dispatchable_now`, a `Dispatchable::into_writer`, or a `Resolution::outcome` a caller can call before step 7. Each would break no other rule, need no dependency, and turn §02 decision 3 back into a convention. The step rows are the other half: §07 states the frame, the payload barrier and the seal twice, and a body that takes them in another order is not that protocol. Six of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a `pub(crate) const fn new(id) -> Self` on `DurableIntent`, wired into the driver, with the gate green; a `Self { .. }` the name-based construction pin cannot see; a private free `fn resolve` above the real one, taking all three steps while `Dispatchable::resolve` stopped at the payload barrier; a decoy `pub struct` above the real one; a `pub` tuple field, where `braced_body` reads the first `{` after a declaration and so reported on the `impl` block below; and an `impl` inside a nested module, which `inherent_impl_bodies` cannot see because it reads `impl` at column zero. Codex round 1 found the seventh: the construction pin and the order pin were independent, so an early `return` carrying a freshly built `Dispatchable` satisfied both. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is a step added from another file — it pins one file, exactly as `capacity-reserve` and `recovery-surface` do — nor whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness; the crash windows are `crates/waymaker-drive/tests/crash.rs`. [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md). |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
@@ -862,13 +862,33 @@ Stated so that nobody mistakes silence for coverage:
   are an `EffectFailed` with an empty payload, because an empty payload is the only payload
   that fits every declared bound, `effect_result_bytes == 0` included. ADR 0025 states the
   loss rather than hiding it.
-- **A §07 step added from another file, or an activity that lies about a length.**
-  `effect-protocol` pins one file, exactly as `capacity-reserve`, `recovery-surface` and
-  `storage-contract` each say of the one they pin: an `impl Dispatchable { pub fn ... }` in
-  a sibling module of `waymaker-drive` adds a step with the rule silent. And an activity that
-  reports a length wider than the buffer it was handed is refused with
-  `DriveError::ResultTooLong` rather than recorded — a broken activity, caught at run time by
-  `crates/waymaker-drive/tests/teeth.rs` rather than by a rule.
+- **A §07 step reachable only on one branch, or written by a macro.** `effect-protocol`
+  requires each of §07's storage steps to be a statement of its body rather than of a block
+  inside it, and every proof of durable intent to be built after the commit barrier. What a
+  scanner still cannot say is whether the *path* that reaches the construction is the path
+  that took the steps — a `?` on a call above them short-circuits without a `return` — nor
+  what a macro expands to, since a macro-generated `fn` is in no `impl` body it reads.
+  `capacity-reserve` records the first limit for the same reason, and
+  `crates/waymaker-drive/tests/crash.rs` is what holds the behaviour.
+- **A §07 step added from another file.** `effect-protocol` pins one file, exactly as
+  `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin:
+  an `impl Dispatchable { fn ... }` in a sibling module of `waymaker-drive` adds a step with
+  the rule silent. Inside the file it is closed — the method sets are compared at every
+  visibility and a submodule is refused — but a sibling file is a sibling file.
+- **That an activity did not truncate its own answer.** `Performed::Exhausted` is how an
+  answer wider than `out` is reported, and an activity that instead writes what fits and
+  returns `Completed(out.len())` produces a valid short record the driver cannot tell from a
+  complete one. It replays for ever. That is a contract on the implementor, stated on
+  `Activities::perform`, and nothing can check it: the driver never sees the answer the
+  activity had.
+- **That the whole-answer crash sweep could fail for a reason this crate owns.**
+  `crates/waymaker-drive/tests/crash.rs`'s
+  `no_recovered_outcome_holds_part_of_an_answer_at_any_crash_point` is a statement about
+  media, and what makes it true is §09's commit seal rather than anything in
+  `waymaker-drive`: no change to `effect.rs` or `drive.rs` turns it red. Its falsifier is
+  `crates/waymaker-fault/tests/commit_discipline.rs`, whose seal-before-frame writer reaches
+  the state it asserts is unreachable. The *exposure* half — that a workflow sees no part of
+  an answer — is `crates/waymaker-drive/tests/effect.rs`, and that one is falsifiable here.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -1239,8 +1259,9 @@ which is the place `.await` will go. The claim that it allocates nothing is a *b
 crate is `#![no_std]` and the `drive-firmware` stage links its library for
 `thumbv6m-none-eabi`, so the reference workflow a board would run is a workflow a board can
 link. §02 decision 3 stops being a comment and becomes the order of two calls — the schedule
-record is committed in one and the world is not heard from until the other, which cannot be
-reached without it — and that is swept at every crash point `waymaker-fault` enumerates, with
+record is committed in one and the world is not heard from until the other. Two calls in one
+function is an order a later change can swap, which is what issue #29 fixes; at 0.3's first
+half it was an order rather than a type. It is swept at every crash point `waymaker-fault` enumerates, with
 a hand-written driver that dispatches first as the tooth. Every append goes through §10's
 `Reserved` rather than through `Journal`, and that is the sharpest thing review found: an
 ungated driver commits a schedule record, tells the world to perform the effect, and *then*
@@ -1266,8 +1287,11 @@ order after issue #28; nothing stopped a later change from reordering them, beca
 was two statements in one function. `waymaker-drive`'s `effect` module is the protocol as
 three types. `Effect::schedule` takes steps 1, 2 and 3 and hands back a `Dispatchable`;
 `Dispatchable::intent` is the only source of a `DurableIntent`; and `Activities::perform` —
-step 4 — takes nothing else. A driver cannot name the identity of an effect it has not
-committed, and a `compile_fail` doctest shows a caller cannot forge one. §07's last sentence
+step 4 — accepts no other proof. A `compile_fail` doctest shows a caller cannot forge one.
+The one exception is `Effect::redelivering`, which mints a proof from a sequence number
+because §08's redelivery row is the kernel's word rather than anything this module can read;
+it is `pub(crate)`, so the trust is confined to the one caller beside it, and review found
+that it had been public. §07's last sentence
 is a type too: `Dispatchable::resolve` takes steps 5, 6 and 7 and returns the only `Outcome` a
 caller can reach, so the workflow observes the result after step 7's barrier and at no earlier
 point. `effect-protocol` pins the surface, the two methods the dispatch state may declare, the
@@ -1278,7 +1302,10 @@ whose answer was longer than the bound failed the boot — and the schedule reco
 committed, so the next boot redelivered it, met the same answer, and failed again, for ever.
 §08 has no edge from an unresolved effect to a terminal record, so that run could never end.
 It is now `Resolution::Exhausted`, recorded as an `EffectFailed` with no payload: the run
-makes progress, and no part of the answer reaches the workflow. Two bounds became one at the
+makes progress, and no part of the answer reaches the workflow. Review found the fix
+half-applied — an activity that *reported* more than the buffer it was handed still met a
+refusal three lines below, with the same stranding behind it — and both routes are the
+exhaustion now, because on media they are the same statement. Two bounds became one at the
 same time — the activity is handed a buffer of exactly `Bounds::effect_result_bytes`, from the
 reserve that priced the bank, and a narrower result buffer is refused before the run's own
 record is written. Both "done when"s are swept rather than argued:

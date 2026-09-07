@@ -187,6 +187,78 @@ fn a_recorded_outcome_longer_than_the_callers_buffer_is_refused() {
 }
 
 #[test]
+fn a_recorded_outcome_longer_than_the_declared_bound_is_refused() {
+    let mut device = a_completed_run();
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    // The bound this boot declares is four bytes. The buffer is not the bound: a roomy
+    // buffer must not let a record the run never priced reach the workflow.
+    let narrow = Bounds {
+        effect_result_bytes: 4,
+        ..BOUNDS
+    };
+    let mut result = [0_u8; 64];
+
+    let Err(error) = Driver::new(region(), RUN, reserve_for(narrow)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a recorded outcome over the declared bound cannot be handed back")
+    };
+    assert_eq!(
+        error,
+        DriveError::ResultTooLong {
+            produced: 21,
+            available: 4
+        }
+    );
+}
+
+#[test]
+fn a_terminal_payload_over_the_declared_bound_is_refused_before_the_record() {
+    let mut device = Device::new(geometry());
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut workflow = Verbose { payload: [7; 32] };
+    // Thirty-two bytes of payload against a sixteen-byte terminal bound, in a roomy buffer.
+    let bounds = Bounds {
+        terminal_bytes: 16,
+        ..BOUNDS
+    };
+    let mut result = [0_u8; 64];
+
+    let Err(error) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a terminal payload over the declared bound cannot be recorded")
+    };
+    assert_eq!(
+        error,
+        DriveError::ResultTooLong {
+            produced: 32,
+            available: 16
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started"],
+        "the refusal comes before the terminal record"
+    );
+}
+
+#[test]
 fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
     let mut device = Device::new(geometry());
     let mut page = [0_u8; 256];
@@ -403,9 +475,52 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
 }
 
 #[test]
-fn an_activity_answer_that_does_not_fit_is_recorded_as_a_failure_with_no_payload() {
+fn an_answer_wider_than_the_declared_bound_is_recorded_as_a_failure_with_no_payload() {
     let mut device = Device::new(geometry());
-    // The world's answer to the first effect is wider than the bound it is handed.
+    // Nothing synthetic here: the reference world answers `DOWNLOAD` with twenty-one bytes
+    // and the run declares eight, so the world meets the bound it was handed and says so.
+    let bounds = Bounds {
+        effect_result_bytes: 8,
+        ..BOUNDS
+    };
+    let mut world = World::new();
+    let mut workflow = Pipeline::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let Ok(progress) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("an exhausted effect is a recorded failure, not a stuck run")
+    };
+
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: b"download".len()
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started", "scheduled", "failed", "run-failed"],
+        "the run makes progress rather than refusing the same effect on every boot"
+    );
+    assert_eq!(payloads(&mut device).get(2), Some(&0));
+    assert_eq!(world.performed(), 1, "and the effect was performed once");
+}
+
+#[test]
+fn a_world_that_declares_itself_exhausted_is_recorded_the_same_way() {
+    let mut device = Device::new(geometry());
+    // The other route to the same record: a world whose answer fits the buffer but which
+    // reports `Performed::Exhausted` anyway.
     let mut world = World::exhausting_at(0);
     let mut workflow = Pipeline::new();
     let mut page = [0_u8; 256];

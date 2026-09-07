@@ -95,11 +95,16 @@ pub enum DriveError<E> {
         /// How many bytes the caller supplied.
         available: usize,
     },
-    /// An activity, or a workflow, produced more bytes than the caller's buffer holds.
+    /// More bytes were offered than may be handed back.
+    ///
+    /// The limit is the narrower of the caller's result buffer and the bound the run
+    /// declared for that payload — §10's `effect_result_bytes` for an effect outcome,
+    /// `terminal_bytes` for a terminal record. A record already on media that exceeds the
+    /// bound is history written under other bounds, and it is refused rather than truncated.
     ResultTooLong {
         /// How many bytes were offered.
         produced: usize,
-        /// How many the buffer holds.
+        /// How many may be handed back.
         available: usize,
     },
     /// An activity input longer than a schedule record can describe.
@@ -139,8 +144,8 @@ pub struct Scratch<'a> {
     /// Where an activity writes its outcome, and where a terminal payload is left.
     ///
     /// Every borrowed byte a workflow sees points in here, and the next boundary overwrites
-    /// it. A result longer than this buffer is [`DriveError::ResultTooLong`] rather than a
-    /// truncation.
+    /// it. It must be at least `Bounds::effect_result_bytes` wide, which
+    /// [`boot`](Driver::boot) refuses before it writes anything.
     pub result: &'a mut [u8],
 }
 
@@ -488,18 +493,35 @@ where
 }
 
 /// Copies `outcome`'s bytes into `into`, and says which outcome it was.
-fn store<E>(outcome: Outcome<'_>, into: &mut [u8]) -> Result<(Conclusion, usize), DriveError<E>> {
+///
+/// `bound` is what the run declared this kind of payload may be worth — §10's
+/// `effect_result_bytes` for an effect outcome, `terminal_bytes` for a terminal record. The
+/// limit is the narrower of that and the caller's buffer, and it is the whole of the
+/// one-bound rule on the *reading* side: a roomy buffer must not let a record the run never
+/// priced reach the workflow. Without it a firmware that lowered its bounds would replay a
+/// journal written under the old ones and hand back a payload it would refuse to write.
+fn store<E>(
+    outcome: Outcome<'_>,
+    into: &mut [u8],
+    bound: u16,
+) -> Result<(Conclusion, usize), DriveError<E>> {
     let (conclusion, bytes) = match outcome {
         Outcome::Completed(bytes) => (Conclusion::Completed, bytes),
         Outcome::Failed(bytes) => (Conclusion::Failed, bytes),
     };
-    let available = into.len();
+    let available = into.len().min(usize::from(bound));
     let Some(target) = into.get_mut(..bytes.len()) else {
         return Err(DriveError::ResultTooLong {
             produced: bytes.len(),
             available,
         });
     };
+    if bytes.len() > available {
+        return Err(DriveError::ResultTooLong {
+            produced: bytes.len(),
+            available,
+        });
+    }
     target.copy_from_slice(bytes);
     Ok((conclusion, bytes.len()))
 }
@@ -611,7 +633,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                     return Err(DriveError::HistoryContinues);
                 };
                 machine.advance(record).map_err(DriveError::Kernel)?;
-                Some(store(recorded, result)?)
+                Some(store(recorded, result, reserve.bounds().terminal_bytes)?)
             }
             Next::EndOfHistory => None,
         };
@@ -624,10 +646,11 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             // completed reports `ResultTooLong` on this boot and on every boot after it.
             // Nothing else in this crate is ordered that way: `dispatch` measures an
             // activity's answer before it records one, for the same reason.
-            let recorded = store(outcome, result)?;
+            let recorded = store(outcome, result, reserve.bounds().terminal_bytes)?;
             let record = terminal(outcome);
-            // Advanced before it is written, which is the order every other record here is
-            // in: the kernel says a record may follow, and only then does it reach media.
+            // Advanced before it is written. The schedule and outcome records were already
+            // authorised — `intent()` and `outcome()` answered for them — and this one has
+            // nothing that authorised it, so the kernel is asked before media is touched.
             // §08 has no edge from an unresolved effect to a terminal record, so this is
             // where a run that ended with one outstanding is refused rather than recorded.
             machine.advance(record).map_err(DriveError::Kernel)?;
@@ -768,10 +791,13 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             Ok(next) => match machine.intent(request, next) {
                 Ok(Intent::Schedule { id }) => Half::Schedule(id),
                 Ok(Intent::Recorded { .. }) => Half::Recorded,
-                Ok(Intent::Finished { outcome }) => match store(outcome, result) {
-                    Ok((conclusion, len)) => Half::Finished(conclusion, len),
-                    Err(error) => Half::Failed(error),
-                },
+                // A terminal record, so the bound is the terminal one.
+                Ok(Intent::Finished { outcome }) => {
+                    match store(outcome, result, reserve.bounds().terminal_bytes) {
+                        Ok((conclusion, len)) => Half::Finished(conclusion, len),
+                        Err(error) => Half::Failed(error),
+                    }
+                }
                 Err(error) => Half::Failed(DriveError::Kernel(error)),
             },
         };
@@ -795,10 +821,12 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                 let answer = match peek(source, *storage, page, *reserve) {
                     Err(error) => Answer::Failed(error),
                     Ok(next) => match machine.outcome(next) {
-                        Ok(Resolve::Replayed { outcome, .. }) => match store(outcome, result) {
-                            Ok((conclusion, len)) => Answer::Replayed(conclusion, len),
-                            Err(error) => Answer::Failed(error),
-                        },
+                        Ok(Resolve::Replayed { outcome, .. }) => {
+                            match store(outcome, result, reserve.bounds().effect_result_bytes) {
+                                Ok((conclusion, len)) => Answer::Replayed(conclusion, len),
+                                Err(error) => Answer::Failed(error),
+                            }
+                        }
                         Ok(Resolve::Redeliver { id }) => Answer::Redeliver(id),
                         Err(error) => Answer::Failed(DriveError::Kernel(error)),
                     },
@@ -876,11 +904,18 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
 
         let resolution = match answered {
             None => Resolution::Exhausted,
+            // An activity that reported more than the buffer it was handed said the same
+            // thing `Performed::Exhausted` says, in the wrong words: the answer does not fit.
+            // Recorded as exhausted rather than refused, because a refusal here strands the
+            // run for ever — the schedule record is already committed, §08 has no edge from
+            // an unresolved effect to a terminal record, and every later boot meets the same
+            // answer. That is the defect this whole change exists to remove, and it was
+            // still reachable three lines from the fix.
+            Some((produced, _)) if produced > bound => Resolution::Exhausted,
             Some((produced, failed)) => {
                 let Some(bytes) = out.get(..produced) else {
-                    // An activity that reported more than the buffer it was handed. That is a
-                    // broken activity rather than an exhausted one: `Performed::Exhausted` is
-                    // how an answer that does not fit is reported.
+                    // Unreachable: the arm above caught it. Spelled as the refusal it has to
+                    // be, because the workspace denies a panic.
                     *stop = Some(Stop::Failed(DriveError::ResultTooLong {
                         produced,
                         available: bound,

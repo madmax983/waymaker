@@ -253,8 +253,12 @@ fn a_workflow_that_ends_while_history_continues_is_refused() {
 
 /// A world that claims to have written more than the buffer holds.
 ///
-/// A broken activity rather than an exhausted one: an answer that does not fit is
-/// [`Performed::Exhausted`], and the driver records it. This one lies about a length.
+/// A broken activity: an answer that does not fit is [`Performed::Exhausted`], and this one
+/// says `Completed` with a length it cannot have written. On media the two are the same
+/// statement — the answer does not fit — so the driver records the exhaustion rather than
+/// refusing. Refusing would strand the run: the schedule record is committed, §08 has no
+/// edge from an unresolved effect to a terminal record, and every later boot meets the same
+/// answer.
 struct Greedy;
 
 impl Activities for Greedy {
@@ -270,16 +274,29 @@ impl Activities for Greedy {
 }
 
 #[test]
-fn a_result_longer_than_the_callers_buffer_is_refused_rather_than_truncated() {
+fn a_result_longer_than_the_bound_is_recorded_as_exhausted_rather_than_stranding_the_run() {
     let mut device = Device::new(geometry());
     let mut workflow = Pipeline::new();
-    let error = boot(&mut device, &mut Greedy, &mut workflow)
-        .expect_err("a truncated result would be replayed for ever");
+    let progress = boot(&mut device, &mut Greedy, &mut workflow)
+        .expect("an answer that does not fit is a recorded failure, not a stuck run");
     assert_eq!(
-        error,
-        DriveError::ResultTooLong {
-            produced: 33,
-            available: 32
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: b"download".len()
+        }
+    );
+
+    // And the run is over, so a second boot replays it rather than performing the effect
+    // again. That is the whole difference: a refusal here repeats for ever.
+    let mut again = Pipeline::new();
+    let progress =
+        boot(&mut device, &mut Greedy, &mut again).expect("the terminal record is replayed");
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: b"download".len()
         }
     );
 }
