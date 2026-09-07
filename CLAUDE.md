@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 45 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 46 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -37,6 +37,7 @@ cargo build --locked -p waymaker-drive --no-default-features --lib --target thum
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
+cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo --locked xtask check-layering
 ```
 
@@ -264,6 +265,58 @@ it, which is the half of it that can fail. §12's
 `barrier-is-durable` and `barrier-orders-what-follows` are still `waymaker-conformance`'s
 across-reset witness's, and still owed against a real driver.
 
+## The failure matrix, row by row
+
+Design document §14 states failure semantics as a table of ten rows, and issue
+[#31](https://github.com/madmax983/waymaker/issues/31) is rung 0.3's exit criterion: each row
+is a named test, and the matrix runs on the in-memory model and on the rig. The rows are
+`waymaker_rig::matrix::Row`, `xtask::docs::FAILURE_ROWS` holds the table, and the
+`failure-matrix` rule fails a build in which this section, that table, the rig's vocabulary,
+the model's test file and
+[ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
+stop naming the same set.
+
+The model half is `crates/waymaker-drive/tests/matrix.rs`: one test per row, named after it,
+and the rule reads the names out of the file. The rig half is
+`crates/waymaker-rig/tests/matrix.rs`: one test per swept row, named after it with
+`_on_the_rig`, which classifies every crash point the injector lists, resumes the run with
+`Rig::resume`, and holds it to the row. Both run in the `verification` job as the `matrix`
+stage. The rig half runs on the host through `waymaker-fault`; no board has run it, and
+[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches six rows; the "On the
+rig" column says which, and `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap` requires
+the rig's census to refuse rather than to stop at six.
+
+All 10 failure rows, with the id to cite when a change touches one:
+
+| Id | Failure point | Discharged on the model by | On the rig |
+| --- | --- | --- | --- |
+| `during-schedule-frame-write` | During schedule frame write | `during_schedule_frame_write_the_frame_is_ignored_and_the_activity_was_not_yet_dispatchable` | Swept |
+| `after-schedule-barrier-before-dispatch` | After schedule barrier, before dispatch | `after_schedule_barrier_before_dispatch_the_stable_effect_id_is_redelivered` | Swept |
+| `during-physical-activity` | During physical activity | `during_physical_activity_the_effect_is_redelivered_and_the_activity_tolerates_the_duplicate_attempt` | Swept |
+| `after-activity-before-completion-barrier` | After physical activity, before completion barrier | `after_physical_activity_before_completion_barrier_the_same_id_is_redelivered` | Swept |
+| `during-completion-write` | During completion write | `during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed` | Swept |
+| `after-completion-barrier` | After completion barrier | `after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again` | Swept |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Owed |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Owed |
+| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Owed |
+| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Owed |
+
+Row 5 does not hold as §14 writes it. It says "redeliver": a torn completion leaves no append
+point ([ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)),
+so the driver and the rig both refuse the bank. The test asserts the refusal beside the two
+halves that do hold: the torn completion is ignored and no partial bytes reach the workflow.
+The run's continuation is §10's `continue_as_new`, a new run under a new id, so an effect
+performed before the crash is performed again under another `(RunId, EffectSeq)`. That is the
+duplicate `stable-redelivery` forbids, and it is issue
+[#95](https://github.com/madmax983/waymaker/issues/95).
+
+The four `Owed` rows are the rig's, not the model's: a swap workload, a capacity refusal and a
+divergent replay are things this rig does not do — issue
+[#96](https://github.com/madmax983/waymaker/issues/96). To move a row to `Swept`: name its
+rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned gap test. The
+same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
+dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
+
 ## The layering
 
 `waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way. The table
@@ -324,9 +377,10 @@ Seven crates are in the workspace and are *not* layers:
   [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md).
 - `waymaker-rig` — design document §15's power-cut and watchdog-reset rig, also
   `policy::TEST_SUPPORT_CRATES`. The deterministic workload and cut plan, the durable witness
-  of what the writer had done when the supply went, the wear meter, the oracle and the log
-  line a violation is reproducible from. Outside `default-members`, and nothing depends on it
-  except `xtask`, which runs it to measure the write amplification it publishes. It is
+  of what the writer had done when the supply went, the wear meter, the oracle, the log
+  line a violation is reproducible from, and issue #31's row vocabulary and census. Outside
+  `default-members`, and nothing depends on it except `xtask`, which runs it to measure the
+  write amplification it publishes. It is
   `#![no_std]` and allocation-free for a sharper reason than `waymaker-conformance`'s: a rig
   that could only run on a host would be a simulation wearing a rig's name, so the code that
   cuts the supply has to be code a board can link — which also means it may not keep what it
@@ -489,7 +543,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 45 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 46 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -549,6 +603,7 @@ this table is how you find out what a red build is telling you.
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
+| `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]` or `#[cfg(` is not a test. What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
@@ -810,6 +865,19 @@ Stated so that nobody mistakes silence for coverage:
   rule silent, exactly as `recovery-surface`, `storage-contract` and `capacity-reserve` each
   say of the one file they pin. The rig is the sharpest case of the three, because its bugs
   show up as *passing* tests.
+- **That a row-named test asserts its row.** `failure-matrix` reads names: a `#[test]` per
+  row in the model file and per swept row in the rig file. A test that kept its name and lost
+  its assertions passes it, and so does a `Row::` variant mentioned in a string. What holds
+  the behaviour is each file's census —
+  `every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned` pins the count per row
+  on the model, and the rig's requires its census to refuse at the first owed row — and the
+  assertions are reviewed by people.
+- **That a crash point is in the row it was put in.** The model classifies from the recorded
+  operation index, through a six-by-four map the sweep pins, and cross-checks each class
+  against the media: a torn outcome with a clean tail, or a schedule row whose effect was
+  performed, is a panic. The rig classifies from the witness, the recovered count, the ending
+  and the dispatcher's log. Both are test-side functions, and a wrong map that agreed with the
+  media in every case would agree with a bug of the same shape.
 - **That the published write-amplification figure is any particular size.** `cargo xtask size`
   fails when the measurement cannot be *taken* — a part that cannot be laid out, a run its own
   oracle rejects — but there is no budget the figure is compared against, so it can regress
@@ -1387,6 +1455,25 @@ promises is now stated where an implementer reads it, on `Activities` itself: on
 be performed more than once, every attempt carries one identity, and exactly-once physical
 side effects are not on offer under any setting. See
 [ADR 0026](docs/adr/0026-redelivery-is-the-kernels-answer-and-at-least-once-is-the-contract.md).
+
+Issue #31 is rung 0.3's exit criterion, and it asks for §14's failure-semantics table to
+become executable row by row. It now is. `waymaker_rig::matrix::Row` is the ten rows as a
+vocabulary a board can link. `crates/waymaker-drive/tests/matrix.rs` is one test per row,
+named after it: 542 crash points classified from the operation the crash interrupted and
+cross-checked against the media, with the two bank rows driving the real swap and then
+*booting the driver* on the bank `select` names, and the counts per row pinned.
+`Rig::resume` carries a cut iteration on, continuing the witness the reset left, so the rig
+observes the behaviour column and a part is judgeable at every point a reset can land.
+`crates/waymaker-rig/tests/matrix.rs` classifies and resumes 434 crash points into five rows,
+drives two runs for the sixth, and requires the rig's census to refuse at the seventh, which
+is the honest shape of a rig with no swap workload. The `failure-matrix` rule holds the five
+places a row lives to one table, and the `matrix` stage runs both halves as a check of their
+own. One finding came out of writing the rows down rather than out of reading the code: §14
+row 5 says a torn completion is redelivered, and under ADR 0018 it cannot be, in this bank or
+by this rig; the table above says `continue_as_new` instead, which forfeits the effect's
+identity, and issue #95 and
+[ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
+record it.
 
 The kernel-state registry has two entries, so the 128 B budget is a number about something.
 Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async

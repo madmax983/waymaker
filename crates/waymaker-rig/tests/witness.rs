@@ -451,3 +451,87 @@ fn a_progress_shorter_than_its_length_is_refused() {
     assert_eq!(progress.encode(&mut bytes), None);
     assert_eq!(Progress::decode(&bytes), None);
 }
+
+#[test]
+fn a_witness_is_continued_past_a_torn_slot_and_a_scan_reads_both_boots() {
+    // A resumed boot appends after the mark the reset tore. The scan reads the first boot's
+    // marks, notes the tear, and reads the second boot's marks in order after it.
+    let mut storage = device(4);
+    let mut page = [0_u8; 64];
+    let mut witness = Witness::new(region(4));
+    witness
+        .mark(
+            &mut storage,
+            Mark::new(ITERATION, 0, Stage::Attempted),
+            &mut page,
+        )
+        .expect("a mark fits");
+    let mut whole = [0_u8; MARK_BYTES];
+    Mark::new(ITERATION, 0, Stage::Acknowledged)
+        .encode(&mut whole)
+        .expect("a mark fits");
+    let Some(head) = whole.get(..4) else {
+        unreachable!("a mark is longer than four bytes")
+    };
+    storage.program(12, head).expect("a torn mark");
+
+    let (mut continued, before) =
+        Witness::continued(region(4), &mut storage, &mut page).expect("a torn witness continues");
+    assert_eq!(before.attempted(), Some(0));
+    assert_eq!(before.acknowledged(), None);
+    assert!(before.torn());
+    assert_eq!(continued.next_slot(), 2, "positioned after the torn slot");
+    continued
+        .mark(
+            &mut storage,
+            Mark::new(ITERATION, 0, Stage::Acknowledged),
+            &mut page,
+        )
+        .expect("the second boot appends");
+    continued
+        .mark(
+            &mut storage,
+            Mark::new(ITERATION, 1, Stage::Attempted),
+            &mut page,
+        )
+        .expect("and goes on");
+
+    let after = Witness::new(region(4))
+        .scan(&mut storage, &mut page)
+        .expect("both boots read as one witness");
+    assert_eq!(after.attempted(), Some(1));
+    assert_eq!(after.acknowledged(), Some(0));
+    assert_eq!(after.marks(), 3);
+    assert!(after.torn());
+}
+
+#[test]
+fn a_mark_out_of_order_after_a_torn_slot_is_still_refused() {
+    // The tear excuses nothing about order: the continued boot's marks must still rise.
+    let mut storage = device(4);
+    let mut page = [0_u8; 64];
+    let mut witness = Witness::new(region(4));
+    witness
+        .mark(
+            &mut storage,
+            Mark::new(ITERATION, 2, Stage::Attempted),
+            &mut page,
+        )
+        .expect("a mark fits");
+    storage
+        .program(12, &[0x00, 0x00, 0x00, 0x00])
+        .expect("a torn mark");
+    let (mut continued, _) =
+        Witness::continued(region(4), &mut storage, &mut page).expect("a torn witness continues");
+    continued
+        .mark(
+            &mut storage,
+            Mark::new(ITERATION, 1, Stage::Attempted),
+            &mut page,
+        )
+        .expect("the witness does not judge at write time");
+    assert_eq!(
+        Witness::new(region(4)).scan(&mut storage, &mut page),
+        Err(WitnessError::OutOfOrder)
+    );
+}

@@ -65,6 +65,7 @@ pub const RULES: &[&str] = &[
     "effect-scheduled-fields",
     "embassy-below-facade",
     "empty-default-features",
+    "failure-matrix",
     "gate-broken",
     "hardware-attestation",
     "inputs-incomplete",
@@ -614,6 +615,9 @@ fn collect_docs_inputs(
         adrs,
         spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
+        failure_rows: read_optional(&root.join(docs::FAILURE_ROWS_PATH))?,
+        failure_model_tests: read_optional(&root.join(docs::FAILURE_MODEL_TESTS_PATH))?,
+        failure_rig_tests: read_optional(&root.join(docs::FAILURE_RIG_TESTS_PATH))?,
         crate_roots,
     })
 }
@@ -841,6 +845,10 @@ mod tests {
                 // two of its three halves for the same reason: the suite's own table is
                 // unreadable, and the record has no ADR for the conformance suite.
                 storage_clauses: None,
+                // Nor the failure matrix's three files, so `failure-matrix` fires.
+                failure_rows: None,
+                failure_model_tests: None,
+                failure_rig_tests: None,
                 crate_roots: vec![docs::CrateRoot {
                     package: "waymaker-core".to_owned(),
                     path: "crates/waymaker-core/src/lib.rs".to_owned(),
@@ -881,6 +889,7 @@ mod tests {
             "effect-scheduled-fields",
             "embassy-below-facade",
             "empty-default-features",
+            "failure-matrix",
             "hardware-attestation",
             "inputs-incomplete",
             "integrity-check",
@@ -983,6 +992,11 @@ mod tests {
                 crate_name: RIG_PACKAGE.to_owned(),
                 path: format!("crates/{}", source::RIG_RUN_PATH),
                 contents: source::tests_support::clean_rig_run(),
+            },
+            size::LayerSource {
+                crate_name: RIG_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::RIG_MATRIX_PATH),
+                contents: source::tests_support::clean_rig_matrix(),
             },
         ]
     }

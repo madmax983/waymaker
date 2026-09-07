@@ -164,6 +164,7 @@ pub struct World {
     offered: usize,
     pending_at: Option<usize>,
     pending_once_seq: Option<u32>,
+    interrupted_once_seq: Option<u32>,
     failing_at: Option<usize>,
     exhausting_at: Option<usize>,
     exhausting_seq: Option<u32>,
@@ -189,6 +190,7 @@ impl World {
             offered: 0,
             pending_at: None,
             pending_once_seq: None,
+            interrupted_once_seq: None,
             failing_at: None,
             exhausting_at: None,
             exhausting_seq: None,
@@ -216,6 +218,21 @@ impl World {
     pub const fn pending_once_at_seq(seq: u32) -> Self {
         Self {
             pending_once_seq: Some(seq),
+            ..Self::new()
+        }
+    }
+
+    /// A world that performs the effect whose sequence is `seq` and then never answers,
+    /// once.
+    ///
+    /// The supply went during the activity, after the world changed. The performance is
+    /// logged and counted; the answer is [`Performed::Pending`]. Every later attempt at the
+    /// effect is performed and answered, so a log of two performances under one identity is
+    /// design document §14's "activity tolerates duplicate attempt", observed.
+    #[must_use]
+    pub const fn interrupted_once_at_seq(seq: u32) -> Self {
+        Self {
+            interrupted_once_seq: Some(seq),
             ..Self::new()
         }
     }
@@ -342,6 +359,11 @@ impl Activities for World {
         // stops *recording* dispatches rather than stops counting them. A `pending_at` that
         // silently stopped advancing would be an instrument that lies.
         self.count = nth.saturating_add(1);
+        // Performed and counted, and then the answer never arrives. Cleared as it fires.
+        if self.interrupted_once_seq == Some(intent.id().seq.0) {
+            self.interrupted_once_seq = None;
+            return Performed::Pending;
+        }
         let answer = if kind == DOWNLOAD { DOWNLOADED } else { HASHED };
         let taken = copy(answer, out);
         // §07 step 5 takes bounded result bytes. An answer wider than the bound is reported

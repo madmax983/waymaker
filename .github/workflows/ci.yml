@@ -215,6 +215,12 @@ jobs:
       - name: Verify the recovery invariants
         run: cargo test --locked -p waymaker-spec --no-default-features
 
+      # Issue #31: design document §14's failure-semantics table, one named test per row,
+      # on the in-memory model and on the rig. Here rather than only in the `check` job's
+      # test stage so that a row that stopped holding is legible in the checks list.
+      - name: Run the failure matrix
+        run: cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash

@@ -82,9 +82,10 @@ pub enum RigError<E, D = core::convert::Infallible> {
         /// The most effects a run can have.
         limit: u16,
     },
-    /// The instrument area cannot hold every mark a clean run writes.
+    /// The instrument area cannot hold every mark a clean run writes, plus
+    /// [`Rig::TORN_SLOTS`].
     WitnessTooSmall {
-        /// How many marks the run needs.
+        /// How many slots the run needs: its marks and the reserved torn ones.
         needed: u32,
         /// How many the region holds.
         capacity: u32,
@@ -95,6 +96,13 @@ pub enum RigError<E, D = core::convert::Infallible> {
     Storage(E),
     /// The physical effect refused.
     Dispatch(D),
+    /// The recovered prefix is not this run's history, so nothing can be resumed from it.
+    Breach(Breach),
+    /// Other than one bank is authoritative, so there is no run to resume.
+    Authority {
+        /// How many were.
+        banks: usize,
+    },
     /// The four units are not a geometry.
     Geometry(GeometryError),
 }
@@ -154,6 +162,28 @@ pub enum Stop {
     },
 }
 
+/// What [`Rig::resume`] did with the media a reset left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Resumed {
+    /// The run carried on from the recovered prefix and wrote every record it still owed.
+    Completed {
+        /// How many records recovery handed back.
+        recovered: u16,
+        /// The effect whose schedule was recovered without its completion. Dispatched again
+        /// under the same index, before anything was written — §08's redelivery row.
+        redelivered: Option<u16>,
+    },
+    /// The journal has no append point: a torn or unsealed tail. Nothing was dispatched
+    /// and nothing on the part changed.
+    ///
+    /// ADR 0018's anti-bricking rule. The run's continuation is §10's `continue_as_new`,
+    /// which this rig does not perform.
+    Unextendable {
+        /// How many records recovery handed back.
+        recovered: u16,
+    },
+}
+
 /// A part laid out for the rig, and the run it performs on it.
 ///
 /// # Invariants
@@ -188,6 +218,16 @@ impl Rig {
         };
         per_effect.checked_add(4)
     }
+
+    /// How many torn slots the instrument reserves past a clean run's marks.
+    ///
+    /// A reset inside a mark's program leaves a slot that is neither erased nor a mark. A
+    /// resume reads past it and never reclaims it, because the only reclaim is an erase and
+    /// an erase of the instrument beside a journal with records in it is the window Codex
+    /// found in issue #31's second review round. One is reserved, so a run survives one such
+    /// reset by construction; [`reset_budget`](Self::reset_budget) says how many the part
+    /// really holds, and [`WitnessError::Full`] reports the reset past it.
+    pub const TORN_SLOTS: u32 = 1;
 
     /// The bank the rig installs and writes into.
     ///
@@ -271,17 +311,20 @@ impl Rig {
         let witness = WitnessRegion::of(instrument, 0, witness_bytes)
             .map_err(|error| RigError::Witness(promote(error)))?;
         // `WitnessRegion::of` checks that *one* mark fits. A clean run writes rather more, and
-        // a rig whose instrument runs out near the end of an iteration reports
-        // `WitnessError::Full` — an instrument failure dressed up as a run. Refused here,
-        // where a caller can make the region bigger or the run shorter.
-        let Some(marks) = Self::marks_per_run(effects) else {
+        // a reset inside a mark costs a slot on top; a rig whose instrument runs out near
+        // the end of an iteration reports `WitnessError::Full` — an instrument failure
+        // dressed up as a run. Refused here, where a caller can make the region bigger or
+        // the run shorter.
+        let Some(needed) =
+            Self::marks_per_run(effects).and_then(|marks| marks.checked_add(Self::TORN_SLOTS))
+        else {
             return Err(RigError::TooManyEffects {
                 limit: Workload::MAX_EFFECTS,
             });
         };
-        if marks > witness.capacity() {
+        if needed > witness.capacity() {
             return Err(RigError::WitnessTooSmall {
-                needed: marks,
+                needed,
                 capacity: witness.capacity(),
             });
         }
@@ -312,6 +355,18 @@ impl Rig {
     #[must_use]
     pub const fn witness_region(&self) -> WitnessRegion {
         self.witness
+    }
+
+    /// How many marks a run's resets may tear before the instrument is full.
+    ///
+    /// Each reset that lands inside a mark's program costs one slot, and no resume reclaims
+    /// it. At least [`TORN_SLOTS`](Self::TORN_SLOTS), by [`new`](Self::new).
+    #[must_use]
+    pub const fn reset_budget(&self) -> u32 {
+        match Self::marks_per_run(self.effects) {
+            Some(marks) => self.witness.capacity().saturating_sub(marks),
+            None => 0,
+        }
     }
 
     /// The seeded plan of cut points.
@@ -393,18 +448,7 @@ impl Rig {
         // The instrument is erased as the rig's own traffic; the engine as the engine's,
         // because §10's bank lifecycle is what erases a bank and the figure published for it
         // has to include that.
-        part.set_traffic(Traffic::Rig);
-        {
-            let mut instrument = self.instrument(part)?;
-            let bytes = instrument.geometry().capacity();
-            instrument
-                .erase(0, bytes)
-                .map_err(|_| RigError::Witness(WitnessError::Region))?;
-            instrument
-                .barrier()
-                .map_err(|_| RigError::Witness(WitnessError::Region))?;
-        }
-        part.set_traffic(Traffic::Engine);
+        self.erase_instrument(part)?;
 
         // The bank input is the opening record's payload: §10 puts the run input in the bank
         // header and §06 replays `RunStarted` from history, so a rig whose two disagreed
@@ -664,22 +708,11 @@ impl Rig {
                 return Ok(Stop::Cut { phase, effect });
             }
 
-            {
-                let mut engine = self.engine(part).map_err(widen)?;
-                let Some(record) = workload.record(index, &mut record_page) else {
-                    return Err(RigError::Workload);
-                };
-                let staged = journal
-                    .stage(&mut engine, &record, page)
-                    .map_err(|error| RigError::Append(unwindow_append(error)))?;
-                let sealable = staged
-                    .payload_barrier(&mut engine)
-                    .map_err(|error| RigError::Append(unwindow_append(error)))?;
-                sealable
-                    .commit(&mut engine)
-                    .map_err(|error| RigError::Append(unwindow_append(error)))?;
-            }
-            part.set_amplification(journal.amplification());
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append(part, &mut journal, &record, page)
+                .map_err(widen)?;
 
             self.mark(
                 part,
@@ -753,14 +786,254 @@ impl Rig {
             }));
         }
 
+        self.perform(iteration, effect, dispatcher)?;
+        Ok(None)
+    }
+
+    /// §07 steps 1 to 3 for `record`, and the journal's figure credited to the meter.
+    fn append<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        journal: &mut Journal,
+        record: &RecordRef<'_>,
+        page: &mut [u8],
+    ) -> Result<(), RigError<S::Error>> {
+        {
+            let mut engine = self.engine(part)?;
+            let staged = journal
+                .stage(&mut engine, record, page)
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+            let sealable = staged
+                .payload_barrier(&mut engine)
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+            sealable
+                .commit(&mut engine)
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+        }
+        part.set_amplification(journal.amplification());
+        Ok(())
+    }
+
+    /// §07 step 4: the physical effect, with the input its schedule record described.
+    fn perform<D: Dispatcher, E>(
+        &self,
+        iteration: u32,
+        effect: u16,
+        dispatcher: &mut D,
+    ) -> Result<(), RigError<E, D::Error>> {
         let mut input = [0_u8; Workload::MAX_PAYLOAD_BYTES];
         let Some(bytes) = self.workload(iteration).effect_input(effect, &mut input) else {
             return Err(RigError::Workload);
         };
         dispatcher
             .dispatch(effect, bytes)
-            .map_err(RigError::Dispatch)?;
-        Ok(None)
+            .map_err(RigError::Dispatch)
+    }
+
+    /// The run's recovered prefix, audited record by record, and a writer after it if the
+    /// journal has an append point.
+    ///
+    /// The audit is given a witness that claims every record was begun, so it compares
+    /// records and demands nothing else: what a resume owes is decided from the prefix, not
+    /// the marks.
+    fn recover_prefix<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        workload: Workload,
+        known: Progress,
+        page: &mut [u8],
+    ) -> Result<(u16, Option<Journal>), RigError<S::Error>> {
+        let region = {
+            let mut engine = self.engine(part)?;
+            let banks = self.authoritative_banks(&mut engine, page)?;
+            if banks != 1 {
+                return Err(RigError::Authority { banks });
+            }
+            match self.installed_journal(&mut engine, workload, banks, page)? {
+                Some(region) => region,
+                None => return Err(RigError::Bank),
+            }
+        };
+        // The audit `verify` runs, against the witness the reset left. Review found the first
+        // version auditing against a synthetic witness that claimed only that every record
+        // was attempted: a part that had lost an acknowledged record was resumed, the record
+        // rewritten, and `verify` then passed — the one loss the rig exists to catch, masked.
+        let mut audit = Audit::new(workload, known);
+        let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut engine = self.engine(part)?;
+        let mut recovery = Recovery::new(region);
+        while let Some(step) = recovery.next(&mut engine, page) {
+            match step {
+                Ok(record) => audit
+                    .saw(&record, &mut expected)
+                    .map_err(RigError::Breach)?,
+                Err(RecoveryError::Decode(_)) => break,
+                Err(error) => return Err(RigError::Recovery(unwindow_recovery(error))),
+            }
+        }
+        audit.finish(1).map_err(RigError::Breach)?;
+        Ok((audit.recovered(), Journal::after(recovery)))
+    }
+
+    /// Carries iteration `iteration` on from whatever a reset left on `part`.
+    ///
+    /// What a boot does after a cut: recover the prefix, redeliver the effect whose schedule
+    /// has no completion, and write the records the run still owes. No cut is offered.
+    ///
+    /// The witness is continued, not erased: the marks the reset left stay, and the resume
+    /// appends the marks [`iterate`](Self::iterate) would write, skipping any the witness
+    /// already claims. So at every point a reset can land during a resume the witness
+    /// claims no more than the media hold, [`verify`](Self::verify) judges the part, and a
+    /// refused resume changes nothing. An erase here was the first version, and review found
+    /// the window it opened: a reset after the erase left a journal with records and a
+    /// witness that claimed none.
+    ///
+    /// # Postconditions
+    ///
+    /// The part passes the audit [`verify`](Self::verify) runs, against the witness the reset
+    /// left, or the resume refuses before writing or dispatching. An effect is dispatched at
+    /// most once here, and a recovered completion is never dispatched again.
+    ///
+    /// # Errors
+    ///
+    /// [`RigError::Authority`] when other than one bank is authoritative, [`RigError::Bank`]
+    /// when that bank does not name this run, [`RigError::Breach`] with the breach
+    /// [`verify`](Self::verify) would report, and the refusals [`iterate`](Self::iterate)
+    /// lists.
+    pub fn resume<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        let workload = self.workload(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
+        let (recovered, journal) = self
+            .recover_prefix(part, workload, known, page)
+            .map_err(widen)?;
+        let Some(mut journal) = journal else {
+            return Ok(Resumed::Unextendable { recovered });
+        };
+        if recovered >= records {
+            return Ok(Resumed::Completed {
+                recovered,
+                redelivered: None,
+            });
+        }
+
+        let outstanding = recovered
+            .checked_sub(1)
+            .and_then(|index| match workload.role(index) {
+                Some(Role::Schedule(effect)) => Some((index, effect)),
+                Some(Role::Start | Role::Completion(_) | Role::Finish) | None => None,
+            });
+        let redelivered = match outstanding {
+            Some((index, effect)) => {
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+                Some(effect)
+            }
+            None => None,
+        };
+
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        for index in recovered..records {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append(part, &mut journal, &record, page)
+                .map_err(widen)?;
+            let mark = Mark::new(iteration, index, Stage::Acknowledged);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(Resumed::Completed {
+            recovered,
+            redelivered,
+        })
+    }
+
+    /// Erases the instrument area, as the rig's own traffic, and waits for it.
+    fn erase_instrument<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+    ) -> Result<(), RigError<S::Error>> {
+        part.set_traffic(Traffic::Rig);
+        let outcome = {
+            let mut instrument = self.instrument(part)?;
+            let bytes = instrument.geometry().capacity();
+            instrument
+                .erase(0, bytes)
+                .and_then(|()| instrument.barrier())
+        };
+        part.set_traffic(Traffic::Engine);
+        outcome.map_err(|_| RigError::Witness(WitnessError::Region))
+    }
+
+    /// The witness as the reset left it, positioned to append, and what it claims.
+    fn continued_witness<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        page: &mut [u8],
+    ) -> Result<(Witness, Progress), RigError<S::Error>> {
+        part.set_traffic(Traffic::Rig);
+        let outcome = {
+            let mut instrument = self.instrument(part)?;
+            Witness::continued(self.witness, &mut instrument, page)
+        };
+        part.set_traffic(Traffic::Engine);
+        outcome.map_err(|error| RigError::Witness(unwindow_witness(error)))
+    }
+
+    /// Programs `mark` unless `known` already claims its index for its stage, and raises
+    /// `known` to match.
+    ///
+    /// A mark's high water is the largest index it named, so a mark at or below it says
+    /// nothing new and the witness refuses it as out of order. Skipping it is what lets a
+    /// resume continue a witness rather than start one.
+    fn mark_above<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        witness: &mut Witness,
+        known: &mut Progress,
+        mark: Mark,
+        page: &mut [u8],
+    ) -> Result<(), RigError<S::Error>> {
+        let high = match mark.stage() {
+            Stage::Attempted => known.attempted(),
+            Stage::Acknowledged => known.acknowledged(),
+            Stage::Dispatched => known.dispatched(),
+        };
+        if high.is_some_and(|high| high >= mark.index()) {
+            return Ok(());
+        }
+        self.mark(part, witness, mark, page)?;
+        *known = known.raising(mark.stage(), mark.index());
+        Ok(())
     }
 
     /// Programs one witness mark, as the rig's own traffic.
@@ -1095,6 +1368,8 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::Workload => RigError::Workload,
         RigError::Storage(inner) => RigError::Storage(inner),
         RigError::Geometry(inner) => RigError::Geometry(inner),
+        RigError::Breach(inner) => RigError::Breach(inner),
+        RigError::Authority { banks } => RigError::Authority { banks },
         RigError::Dispatch(never) => match never {},
     }
 }

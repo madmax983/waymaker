@@ -1137,9 +1137,36 @@ pub const RIG_RUN_SURFACE: &[&str] = &[
     "plan",
     "prepare",
     "recovered",
+    "reset_budget",
+    "resume",
     "verify",
     "witness_region",
     "workload",
+];
+
+/// The file whose public surface [`check_rig_oracle`] also pins: the failure matrix.
+///
+/// Issue [#31](https://github.com/madmax983/waymaker/issues/31)'s ten rows and the census over
+/// them. A `Matrix::force_complete` or a `Gap::ignore` would let a sweep that reached six rows
+/// report ten, which is the relabelling the census exists to refuse.
+pub const RIG_MATRIX_PATH: &str = "waymaker-rig/src/matrix.rs";
+
+/// Every public function the failure matrix is allowed to have.
+///
+/// `saturated` is on the list for [`RIG_CENSUS_SURFACE`]'s reason.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_MATRIX_SURFACE: &[&str] = &[
+    "fmt",
+    "from_index",
+    "id",
+    "index",
+    "iterations",
+    "record",
+    "row",
+    "saturated",
+    "total",
+    "verdict",
 ];
 
 /// Rule: the rig's oracle and its census are exactly the surfaces that were reviewed.
@@ -1178,6 +1205,15 @@ pub fn check_rig_oracle(sources: &[crate::size::LayerSource]) -> Vec<Violation> 
         sources,
         "the runner is where the oracle's verdict is produced, so a lenient verify or a \
          judge that swallowed a breach cannot be added without a reviewer writing it down",
+    ));
+    violations.extend(check_pinned_surface(
+        "rig-oracle",
+        "waymaker-rig",
+        RIG_MATRIX_PATH,
+        RIG_MATRIX_SURFACE,
+        sources,
+        "an unreached row is a refusal, not a silence; a way to mark a row reached needs a \
+         reviewer to write it down",
     ));
     violations
 }
@@ -4949,7 +4985,7 @@ fn find_source<'a>(
 /// before the end of the input, so a caller that cannot find what it pins reports that
 /// rather than pinning nothing.
 #[must_use]
-fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
+pub(crate) fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
 
     let after = code.match_indices(header).find_map(|(index, _)| {
@@ -5249,7 +5285,7 @@ fn is_array_type(declared_type: &str) -> bool {
 /// Lines are replaced rather than removed so that anything reported against this text still
 /// lines up with the file.
 #[must_use]
-fn without_test_modules(code: &str) -> String {
+pub(crate) fn without_test_modules(code: &str) -> String {
     let mut kept = String::with_capacity(code.len());
     let mut depth: i32 = 0;
     let mut test_block: Option<i32> = None;
@@ -9486,6 +9522,12 @@ mod tests {
     #[must_use]
     pub fn clean_rig_run() -> String {
         surface("A rig runner.", super::RIG_RUN_SURFACE)
+    }
+
+    /// A `waymaker-rig` failure matrix whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_rig_matrix() -> String {
+        surface("A failure matrix.", super::RIG_MATRIX_SURFACE)
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.
