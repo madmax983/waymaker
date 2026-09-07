@@ -3,9 +3,11 @@
 - Status: accepted
 - Date: 2026-09-07
 - Issue: [#72](https://github.com/madmax983/waymaker/issues/72)
-- Supersedes: nothing
-- Amends: [ADR 0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md), which
-  decided that sections are read and symbols are not
+- Supersedes: [0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md)'s
+  decision that "only section headers are read, never symbols, which is what makes this work
+  against the `strip = "symbols"` release profile the budgets are measured with". Nothing
+  else in 0002 is changed: its reason for parsing rather than shelling out still holds, and
+  this decision keeps it.
 - Related: [ADR 0017](0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md),
   [ADR 0019](0019-the-commit-seal-is-a-masked-repeat-and-the-writer-is-a-typestate.md),
   [ADR 0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
@@ -61,6 +63,17 @@ The defining crate, not the instantiating one. Fat LTO monomorphises
 Crediting the byte count to the instantiation would hand every generic in the engine back to
 the row this change corrects.
 
+One `v0` production puts the crate roots the other way round, and it is refused rather than
+read. `Y <type> <path>` is `<Self as Trait>::method` for a method the **trait** provides: the
+self type comes first and the trait second, and the body of a provided method is declared
+with the trait. A layer trait with a default body, implemented for one of the probe's types,
+would therefore be a layer's bytes under the probe's name — and this gate *subtracts* what it
+reads as the probe's, so that is a budget loosened silently. No trait in the layers has a
+provided method today, and `size-probe-reach` pushes the probe toward implementing every one
+they add. `defining_crate` answers `None` for such a name, which charges it to the layers.
+`X`, the other trait-impl production, reads the right way round and is not refused; refusing
+it would charge every `impl StableStorage for ProbeMedia` method to the layers.
+
 ### Everything unattributable stays with the layers
 
 The subtraction removes only bytes a symbol names as the probe's. `.rodata` string data,
@@ -98,9 +111,15 @@ ADR 0002's rule extends to the new number:
 - a row that attributes **nothing** to the probe is `Unmeasurable`, not a probe that cost
   nothing. Every image the matrix links is the probe;
 - a probe share **larger than the image** it was read from is `Unmeasurable`;
+- a gated row whose **layers' share is zero** is `Unmeasurable`. That row links the kernel
+  and the flash adapter, so a delta of nothing is a linker that discarded them or a probe
+  share that swallowed the whole image, not a free engine;
 - a report row with no `probe_flash` field is rejected, so a truncated artifact cannot gate
-  clean. The report schema goes from 1 to 2, and a schema-1 base branch reads as "not
-  compared".
+  clean, and the schema goes from 1 to 2 so an older document is refused outright rather than
+  read with the field defaulted;
+- a report with **two rows of one name** is rejected. Every figure is looked up by name and
+  answers with the first row carrying it, so a second `default` row would be gated on the
+  first one's numbers whatever it held.
 
 ### The budget comes down to 12 KiB
 
@@ -117,7 +136,7 @@ capacity reserve, and 10852 B is over it.
 
 - The number the gate prints is the number §04 states. `Δflash` is still printed, so nothing
   is hidden — the report says which of the two is gated.
-- The budget is 6 KiB tighter than it was this morning, and the engine has 1436 B of room.
+- The budget is 6 KiB tighter than ADR 0020 left it, and the engine has 1436 B of room.
 - The matrix links with symbols in the image, so the linked artifacts are larger on disk.
   The measured sections are unchanged, and `check_symbols_are_not_measured` is what says so.
 - **Fat LTO can inline a layer body into a probe symbol**, and the subtraction then charges
@@ -132,6 +151,15 @@ capacity reserve, and 10852 B is over it.
 - Attribution reads Rust's mangling, which is not a stable ABI. A third mangling scheme
   would attribute nothing, every row would read `probe = 0`, and the gate would fail closed
   rather than pass.
+- **The corrected figure is sensitive to the optimiser.** Rebuilt with `lto = false` the same
+  two images attribute 12414 B to the layers rather than 10852 B — a 14% swing, larger than
+  the 1436 B of headroom. It is not a drift risk, because `release-profile` fails a build in
+  which `[profile.release]` moves at all, but it is the reason the ceiling is 12 KiB rather
+  than the tightest number the measurement would allow.
+- The base-branch diff prints `probe` beside `layers` for the gated row. Without it a pull
+  request that added 2 KiB to the probe and 2 KiB to the layers would read as
+  `flash +4000, layers +0`, and the term the gate subtracts is the one a contributor moves
+  most easily — `size-probe-reach` obliges the probe to grow whenever a layer does.
 
 ## Alternatives considered
 

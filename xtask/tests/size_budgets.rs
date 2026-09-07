@@ -329,10 +329,14 @@ fn the_probes_own_code_is_a_real_share_of_the_image_it_is_subtracted_from() {
 }
 
 #[test]
-fn the_parser_agrees_with_llvm_nm_about_what_the_probe_costs() {
-    // The second opinion for the attribution, as `the_parser_agrees_with_llvm_size_about_
-    // the_probe` is for the sections. A symbol table read at the wrong offsets answers
-    // with well-formed nonsense, and the gate would then subtract it from the budget.
+fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
+    // The second opinion for the symbol *reader*, as `the_parser_agrees_with_llvm_size_
+    // about_the_probe` is for the sections: a symbol table read at the wrong offsets
+    // answers with well-formed nonsense, and the gate would then subtract it. It says
+    // nothing about the attribution, because `defining_crate` decides both sides of the
+    // comparison — that is `no_symbol_the_gate_credits_to_the_probe_is_a_layers_body`,
+    // below, and the per-symbol section index is
+    // `elf::tests::both_classes_read_the_symbols_llvm_readobj_reads`.
     let Some(llvm_nm) = llvm_tool("llvm-nm") else {
         panic!(
             "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
@@ -439,6 +443,73 @@ fn stripping_the_symbol_table_moves_no_byte_the_gate_measures() {
         "stripping changed a section the budget is measured on, so the attribution and the \
          gated sizes are readings of two different images"
     );
+}
+
+#[test]
+fn no_symbol_the_gate_credits_to_the_probe_is_a_layers_body() {
+    // `defining_crate` reads the first crate root of a mangled path, and one v0 production
+    // puts them the other way round: `<Self as Trait>::method` for a method the *trait*
+    // provides names the self type first. A layer trait with a default body, implemented
+    // for a probe type, would then be a layer's bytes under the probe's name — and this
+    // gate subtracts what it reads as the probe's. The unit tests hold the parser; this
+    // holds the real image, through a demangler that is not ours.
+    let Some(llvm_nm) = llvm_tool("llvm-nm") else {
+        panic!(
+            "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+    };
+
+    let image = workspace_root()
+        .join("target/waymaker-size-build/default")
+        .join(xtask::pipeline::FIRMWARE_TARGET)
+        .join("release")
+        .join(size::PROBE_PACKAGE);
+    let output = std::process::Command::new(&llvm_nm)
+        .args(["--print-size", "--defined-only", "--demangle"])
+        .arg(&image)
+        .output()
+        .expect("llvm-nm should run");
+    assert!(output.status.success(), "llvm-nm failed on {image:?}");
+    let demangled = String::from_utf8_lossy(&output.stdout);
+
+    let bytes = std::fs::read(&image).expect("the image should be readable");
+    let symbols = xtask::elf::symbols(&bytes).expect("the image should parse");
+    let probe = size::probe_crate_name();
+
+    let credited: Vec<&xtask::elf::Symbol> = symbols
+        .iter()
+        .filter(|symbol| size::defining_crate(&symbol.name) == Some(probe.as_str()))
+        .collect();
+    assert!(
+        !credited.is_empty(),
+        "no symbol is credited to the probe, so this test checks nothing"
+    );
+
+    // `llvm-nm --demangle` prints the same table with names spelled out. Line order and
+    // address are the same, so a symbol is found by its address and size.
+    for symbol in credited {
+        let spelled = demangled
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let size = u64::from_str_radix(fields.get(1)?, 16).ok()?;
+                if size != symbol.size {
+                    return None;
+                }
+                Some(fields.get(3..)?.join(" "))
+            })
+            .unwrap_or_default();
+        // `<A as B>::m`: `B` is where the body is written when `m` is the trait's own.
+        if let Some((_, trait_half)) = spelled.split_once(" as ") {
+            for layer in ["waymaker_core", "waymaker_flash", "waymaker_embassy"] {
+                assert!(
+                    !trait_half.starts_with(layer),
+                    "the gate credits {} B to `{probe}` for `{spelled}`, whose trait half is a layer's, so a provided method body would be subtracted from the budget",
+                    symbol.size,
+                );
+            }
+        }
+    }
 }
 
 /// The size `llvm-size -A` reports for one section.

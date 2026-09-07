@@ -357,15 +357,49 @@ pub fn defining_crate(mangled: &str) -> Option<&str> {
     v0_crate(mangled).or_else(|| legacy_crate(mangled))
 }
 
+/// The `v0` production for a trait's own provided method, `<Self as Trait>::method`.
+///
+/// It is the one production that puts the crate roots the other way round: `Y <type>
+/// <path>` names the *self* type first and the trait second, and the body of a provided
+/// method is declared with the trait. So the first crate root of such a name is the crate
+/// that wrote the `impl`, not the crate that wrote the code.
+///
+/// A layer trait with a default body, implemented for one of the probe's types, is
+/// therefore a layer's bytes under the probe's name — and this gate *subtracts* what it
+/// reads as the probe's, so that is a budget loosened silently. No trait in the layers has
+/// a provided method today, and `size-probe-reach` pushes the probe toward implementing
+/// every one they add.
+const QUALIFIED: char = 'Y';
+
 /// The crate root of a `v0` mangled name (`_RNvCs<hash>_14waymaker_flash5frame…`).
+///
+/// Two ways this scanner declines to answer, and both charge the bytes to the layers,
+/// which is the bias the rest of the attribution already has:
+///
+/// * a [`QUALIFIED`] path anywhere before the crate root, because the first crate root of
+///   one is not the crate that wrote the body and skipping the self type would need most
+///   of the grammar rather than one production of it;
+/// * any name whose first parseable crate root is not one, which a `C` inside a long
+///   base-62 disambiguator can produce. It cannot spell this workspace's probe: a
+///   disambiguator holds no `_`, and every crate name here does.
 fn v0_crate(mangled: &str) -> Option<&str> {
     let path = mangled.strip_prefix("_R")?;
     // The first `C` that begins a well-formed crate root. Scanned rather than parsed: the
-    // components before it are namespace and backreference codes, and a scan that only
-    // has to recognise one component does not need to know the rest of the grammar.
-    path.match_indices('C')
-        .filter_map(|(at, _)| path.get(at.saturating_add(1)..))
-        .find_map(crate_root)
+    // components before it are namespace and backreference codes, and one production is
+    // all a scan has to recognise — as long as it refuses the one production that would
+    // make recognising it the wrong answer.
+    let at = path
+        .match_indices('C')
+        .find(|(at, _)| {
+            path.get(at.saturating_add(1)..)
+                .and_then(crate_root)
+                .is_some()
+        })
+        .map(|(at, _)| at)?;
+    if path.get(..at)?.contains(QUALIFIED) {
+        return None;
+    }
+    crate_root(path.get(at.saturating_add(1)..)?)
 }
 
 /// The identifier of a crate root, given the bytes after its `C`.
@@ -451,13 +485,17 @@ pub fn attributed_flash(sections: &[Section], symbols: &[elf::Symbol], crate_nam
 /// Returns [`SizeError`] if the image carries no symbol table, or if a symbol, string or
 /// debug section is allocated.
 pub fn check_symbols_are_not_measured(sections: &[Section]) -> Result<(), SizeError> {
-    if !sections
+    // Exactly one, not at least one. `elf::symbols` reads every `SHT_SYMTAB` section
+    // there is, so a second one would attribute the same bytes twice — which subtracts
+    // them twice, in the direction that passes.
+    let tables = sections
         .iter()
-        .any(|section| section.kind == elf::SHT_SYMTAB)
-    {
-        return Err(SizeError::new(
-            "the linked image carries no symbol table, so no byte of it can be attributed; the matrix links with `strip` off precisely so that there is one",
-        ));
+        .filter(|section| section.kind == elf::SHT_SYMTAB)
+        .count();
+    if tables != 1 {
+        return Err(SizeError::new(format!(
+            "the linked image carries {tables} symbol tables; the matrix links with `strip` off precisely so that there is one, and every one of them is read"
+        )));
     }
 
     for section in sections {
@@ -704,6 +742,20 @@ impl SizeReport {
         Some(row.probe_flash.saturating_sub(baseline.probe_flash))
     }
 
+    /// The layers' share of one row's flash delta, given the baseline it is measured
+    /// against.
+    ///
+    /// Takes the rows rather than their names. [`Self::row`] answers with the *first* row
+    /// carrying a name, and the gate is applied to the rows it iterates — so a report with
+    /// two rows called `default` would have had every one of them gated on the figure of
+    /// the first. `--report` gates a document this process did not produce, which is the
+    /// same reason the `gated` flag is not taken at its word.
+    #[must_use]
+    const fn layers_of(row: &Row, baseline: &Row) -> u64 {
+        let delta = row.sizes.flash.saturating_sub(baseline.sizes.flash);
+        delta.saturating_sub(row.probe_flash.saturating_sub(baseline.probe_flash))
+    }
+
     /// The layers' share of `name`'s flash delta: the image delta less what the probe's
     /// own code grew by.
     ///
@@ -718,8 +770,7 @@ impl SizeReport {
     /// [`Self::shortfalls`] refuses it rather than letting it credit the layers.
     #[must_use]
     pub fn layers_flash_of(&self, name: &str) -> Option<u64> {
-        let delta = self.delta_of(name)?.flash;
-        Some(delta.saturating_sub(self.probe_delta_of(name)?))
+        Some(Self::layers_of(self.row(name)?, self.baseline()?))
     }
 
     /// How much bigger `name` is than the row it is an increment on.
@@ -858,7 +909,24 @@ impl SizeReport {
             // The layers' share rather than the image delta. Design document §04 states
             // the budget for "core + flash adapter", and issue #72 is that the probe's own
             // arithmetic had grown to more than a third of what was being gated.
-            let layers = self.layers_flash_of(&row.name).unwrap_or(delta.flash);
+            let layers = Self::layers_of(row, baseline);
+            // A gated row links the kernel and the flash adapter, which cannot cost
+            // nothing — the baseline's own zero is refused above for that reason. Two
+            // routes reach this one, and both are faults rather than results: the linker
+            // discarded the layers, so the image did not grow; or the probe's attributed
+            // growth swallowed the whole delta, which `layers_of` saturates rather than
+            // reporting as a negative cost. The per-image bound on `probe_flash` above
+            // cannot see either, because it compares against the whole image.
+            if layers == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` leaves the layers 0 B of a {} B image delta, {} B of which is attributed to `{PROBE_PACKAGE}`; a row that links the engine cannot cost nothing",
+                        row.name,
+                        delta.flash,
+                        row.probe_flash.saturating_sub(baseline.probe_flash),
+                    ),
+                });
+            }
             if layers > INCREMENTAL_CODE_FLASH_BUDGET_BYTES {
                 shortfalls.push(BudgetShortfall::Exceeded {
                     budget: Budget::IncrementalCodeFlash,
@@ -960,7 +1028,8 @@ impl SizeReport {
             waymaker_core::budget::SCRATCH_PAGE_BYTES,
         ));
         table.push(format!(
-            "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Every byte no symbol attributes to the probe stays in `layers`.\n"
+            "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Both are deltas against the baseline image, whose own probe symbols are {} B. Every byte no symbol attributes to the probe stays in `layers`.\n",
+            self.baseline().map_or(0, |row| row.probe_flash),
         ));
         table.push(
             "runtime RAM: statics only. A cursor, context or record header on the caller's stack moves no writable section, so \u{394}ram is a floor on design document \u{a7}04's runtime RAM and not the rule itself; stack accounting needs a call graph and arrives with the code that has one.\n"
@@ -1144,6 +1213,8 @@ impl SizeReport {
             })
             .collect::<Result<Vec<Row>, SizeError>>()?;
 
+        check_row_names_are_unique(&rows)?;
+
         let kernel_state = document
             .get("kernel_state")
             .ok_or_else(|| SizeError::new("the size report has no `kernel_state`"))?;
@@ -1175,6 +1246,24 @@ impl SizeReport {
             kernel_state: Some(kernel_state),
         })
     }
+}
+
+/// Rule: no two rows of a report carry one name.
+///
+/// Every lookup in a report is by name and answers with the first row carrying one, so a
+/// document with two `default` rows would have every one of them gated on the figure of the
+/// first, whatever the second held. `--report` reads a document this process did not
+/// produce, which is the same reason the `gated` flag is not taken at its word.
+fn check_row_names_are_unique(rows: &[Row]) -> Result<(), SizeError> {
+    for (at, row) in rows.iter().enumerate() {
+        if rows.iter().take(at).any(|earlier| earlier.name == row.name) {
+            return Err(SizeError::new(format!(
+                "the size report has two rows called `{}`, and every figure in it is looked up by name",
+                row.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A required byte count.
@@ -1213,6 +1302,16 @@ pub struct RowDiff {
     pub before: Option<SectionSizes>,
     /// This branch's sizes, absent when the row was removed.
     pub after: Option<SectionSizes>,
+    /// The base branch's probe share, for a row the budget is held against.
+    ///
+    /// Reported beside the layers' figure because it is the term the gate *subtracts*, and
+    /// the one a contributor moves most easily: `size-probe-reach` obliges the probe to
+    /// call every public function a layer declares, so probe code grows whenever library
+    /// code does. Without it a pull request that adds 2 KiB to each reads as `flash +4000,
+    /// layers +0`, with the subtraction recoverable only by arithmetic.
+    pub before_probe: Option<u64>,
+    /// This branch's probe share, on the same terms.
+    pub after_probe: Option<u64>,
     /// The base branch's layers' share, for a row the budget is held against.
     ///
     /// Only for a gated row. The layers' share is defined against the baseline image,
@@ -1274,11 +1373,16 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
     let cost = |report: &SizeReport, name: &str| {
         report.increment_of(name).or_else(|| report.delta_of(name))
     };
+    let gated = |report: &SizeReport, name: &str| report.row(name).is_some_and(|row| row.gated);
     let layers = |report: &SizeReport, name: &str| {
-        report
-            .row(name)
-            .filter(|row| row.gated)
-            .and_then(|_| report.layers_flash_of(name))
+        gated(report, name)
+            .then(|| report.layers_flash_of(name))
+            .flatten()
+    };
+    let probe = |report: &SizeReport, name: &str| {
+        gated(report, name)
+            .then(|| report.probe_delta_of(name))
+            .flatten()
     };
 
     let mut diffs = Vec::new();
@@ -1286,16 +1390,21 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
     for row in head.rows() {
         let after = cost(head, &row.name);
         let after_layers = layers(head, &row.name);
+        let after_probe = probe(head, &row.name);
         let known = base.row(&row.name).is_some();
         let before = known.then(|| cost(base, &row.name)).flatten();
         let before_layers = known.then(|| layers(base, &row.name)).flatten();
-        if known && before == after && before_layers == after_layers {
+        let before_probe = known.then(|| probe(base, &row.name)).flatten();
+        if known && before == after && before_layers == after_layers && before_probe == after_probe
+        {
             continue;
         }
         diffs.push(RowDiff {
             name: row.name.clone(),
             before,
             after,
+            before_probe,
+            after_probe,
             before_layers,
             after_layers,
         });
@@ -1307,6 +1416,8 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
                 name: row.name.clone(),
                 before: cost(base, &row.name),
                 after: None,
+                before_probe: probe(base, &row.name),
+                after_probe: None,
                 before_layers: layers(base, &row.name),
                 after_layers: None,
             });
@@ -1377,19 +1488,35 @@ pub fn render_diff(diffs: &[RowDiff]) -> String {
             }
             (None, None) => "no measurement on either side".to_owned(),
         };
-        // The gated figure, where there is one. `flash` above is the whole image; this is
-        // the part of it design document §04's budget is stated over.
-        let layers = match (entry.before_layers, entry.after_layers) {
-            (Some(before), Some(after)) => format!(
-                ", layers {before} -> {after} ({}{})",
-                if after >= before { "+" } else { "-" },
-                after.abs_diff(before)
+        // The split, where there is a gated figure. `flash` above is the whole image;
+        // `probe` is what the gate subtracts and `layers` is what design document §04's
+        // budget is stated over. Both are printed, because a row where the two moved by
+        // the same amount reads as no change in the gated number and is not one.
+        let split = match (
+            entry.before_probe,
+            entry.after_probe,
+            entry.before_layers,
+            entry.after_layers,
+        ) {
+            (Some(probe_before), Some(probe_after), Some(before), Some(after)) => format!(
+                ", probe {probe_before} -> {probe_after} ({}), layers {before} -> {after} ({})",
+                signed(probe_before, probe_after),
+                signed(before, after),
             ),
             _ => String::new(),
         };
-        table.push(format!("  {:<width$}  {detail}{layers}\n", entry.name));
+        table.push(format!("  {:<width$}  {detail}{split}\n", entry.name));
     }
     table.concat()
+}
+
+/// How a figure moved, as `+40` or `-8`.
+fn signed(before: u64, after: u64) -> String {
+    format!(
+        "{}{}",
+        if after >= before { "+" } else { "-" },
+        after.abs_diff(before)
+    )
 }
 
 /// The size gate could not run, so it does not know whether it passed.
@@ -2590,11 +2717,51 @@ mod tests {
 
     #[test]
     fn the_defining_crate_of_a_generic_is_the_crate_that_declares_it() {
-        // `waymaker_flash::frame::encode_with::<Catalogued>`, instantiated by the probe.
-        // The probe's name is in the symbol too, at the end, and charging the byte count
-        // to it would hand every generic in the engine back to the row being corrected.
-        let mangled = "_RINvNtCscrinc51sKky_14waymaker_flash5frame11encode_with                       NtNtB4_9integrity10CataloguedECs2RP2q5hjpwT_19waymaker_size_probe";
+        // `waymaker_flash::frame::encode_with::<Catalogued>`, instantiated by the probe,
+        // as `llvm-nm` prints it from the linked image. The probe's name is in the symbol
+        // too, at the end, and charging the byte count to it would hand every generic in
+        // the engine back to the row being corrected.
+        let mangled = concat!(
+            "_RINvNtCscrinc51sKky_14waymaker_flash5frame11encode_with",
+            "NtNtB4_9integrity10CataloguedECs2RP2q5hjpwT_19waymaker_size_probe",
+        );
         assert_eq!(defining_crate(mangled), Some("waymaker_flash"));
+    }
+
+    #[test]
+    fn a_traits_own_provided_method_is_charged_to_nobody_rather_than_to_the_impl() {
+        // `<waymaker_size_probe::ProbeCheck as waymaker_flash::IntegrityCheck>::frame_check`
+        // for a method the trait provides: the body is `waymaker-flash`'s, and `Y` names
+        // the self type first. Reading the first crate root would subtract a layer's bytes
+        // from the budget under the probe's name, which is the one direction that loosens
+        // it. Refused instead, so the bytes stay with the layers.
+        let mangled = concat!(
+            "_RNvYNtCsebY0CHkT2OO_19waymaker_size_probe10ProbeCheck",
+            "NtCsfjwSggzmCUk_14waymaker_flash14IntegrityCheck11frame_checkB4_",
+        );
+        assert_eq!(defining_crate(mangled), None);
+
+        // The mirror, which the linked image really carries:
+        // `<waymaker_flash::storage::Geometry as core::cmp::PartialEq>::ne`. `core` wrote
+        // the body, and refusing charges it to the layers, which is where it already was.
+        let borrowed = concat!(
+            "_RNvYNtNtCscrinc51sKky_14waymaker_flash7storage8Geometry",
+            "NtNtCsaKixe4yIu8C_4core3cmp9PartialEq2neCs2RP2q5hjpwT_19waymaker_size_probe",
+        );
+        assert_eq!(defining_crate(borrowed), None);
+    }
+
+    #[test]
+    fn an_impl_of_a_layer_trait_for_a_probe_type_is_still_the_probes() {
+        // `X` is the other trait-impl production and it reads the right way round: the
+        // impl path comes first, so a method body written in the probe is the probe's.
+        // Refusing this one too would charge the probe's own code to the layers on every
+        // `impl StableStorage for ProbeMedia` method there is.
+        let mangled = concat!(
+            "_RNvXs0_Cs2RP2q5hjpwT_19waymaker_size_probeNtB5_10ProbeMedia",
+            "NtNtCscrinc51sKky_14waymaker_flash7storage13StableStorage4read",
+        );
+        assert_eq!(defining_crate(mangled), Some("waymaker_size_probe"));
     }
 
     #[test]
@@ -2838,6 +3005,65 @@ mod tests {
     }
 
     #[test]
+    fn an_image_with_two_symbol_tables_cannot_be_attributed() {
+        // Every one is read, so a second table attributes the same bytes twice — and the
+        // gate subtracts what it attributes.
+        let twice = vec![
+            crate::elf::Section {
+                name: ".symtab".to_owned(),
+                size: 400,
+                kind: crate::elf::SHT_SYMTAB,
+                flags: 0,
+            },
+            crate::elf::Section {
+                name: ".symtab.other".to_owned(),
+                size: 400,
+                kind: crate::elf::SHT_SYMTAB,
+                flags: 0,
+            },
+            stored(".text"),
+        ];
+        assert!(check_symbols_are_not_measured(&twice).is_err());
+    }
+
+    #[test]
+    fn a_diff_shows_a_probe_that_grew_beside_the_layers_that_did_not() {
+        // The term the gate subtracts is the one a contributor moves most easily, so a
+        // pull request that grows both by the same amount must not read as no change.
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            KernelState::measured(),
+        );
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_200, 0, BASELINE_PROBE_FLASH + 600),
+            ],
+            KernelState::measured(),
+        );
+        let rendered = render_diff(&diff(&base, &head));
+        assert!(rendered.contains("probe 400 -> 600 (+200)"), "{rendered}");
+        assert!(rendered.contains("layers 600 -> 600 (+0)"), "{rendered}");
+    }
+
+    #[test]
+    fn the_report_names_the_probe_bytes_both_terms_are_measured_against() {
+        // Both columns are deltas against the baseline, and the baseline's own probe
+        // symbols appear in no column. A reader checking the subtraction needs the number.
+        let report = report(1_000, 0);
+        assert!(
+            report
+                .render()
+                .contains(&format!("own probe symbols are {BASELINE_PROBE_FLASH} B")),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
     fn an_image_whose_symbol_table_costs_nothing_is_measurable() {
         let sections = vec![
             crate::elf::Section {
@@ -2955,7 +3181,47 @@ mod tests {
         );
         let delta = report.delta_of(DEFAULT_ROW).expect("a default row");
         assert_eq!(delta.flash, 0, "a smaller image is not a negative cost");
-        assert!(report.shortfalls().is_empty());
+        // And a saturated zero on a gated row is reported rather than passed: that row
+        // links the kernel and the flash adapter, so a delta of nothing is a measurement
+        // fault, not a free engine.
+        assert!(
+            rendered(&report.shortfalls()).contains("cannot cost nothing"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_gated_row_whose_probe_share_swallows_the_whole_delta_is_not_a_measurement() {
+        // The per-image bound cannot see this: the probe share is well under the image it
+        // was read from, and still leaves the layers nothing.
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 1_000),
+            ],
+            KernelState::measured(),
+        );
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(0));
+        assert!(
+            rendered(&report.shortfalls()).contains("cannot cost nothing"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_report_with_two_rows_of_one_name_is_rejected_rather_than_gated_on_the_first() {
+        // Every figure in a report is looked up by name, so a second `default` row would
+        // be gated on the first one's numbers whatever it held. `--report` reads a
+        // document this process did not produce.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(20, 0), default_row(20, 0)],
+            KernelState::measured(),
+        );
+        let error = SizeReport::from_json(&report.to_json())
+            .expect_err("two rows of one name is not a report");
+        assert!(error.to_string().contains("two rows called"), "{error}");
     }
 
     /// A feature row costing `flash_over_default` more than the `default` row it sits on.

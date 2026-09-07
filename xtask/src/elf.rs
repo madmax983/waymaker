@@ -36,11 +36,17 @@ pub const SHT_SYMTAB: u32 = 2;
 /// `SHT_STRTAB`: the section is a string table.
 pub const SHT_STRTAB: u32 = 3;
 
-/// The first section index that is reserved rather than a real section.
+/// The first section index that is reserved rather than naming a section.
+///
+/// `SHN_ABS`, `SHN_COMMON` and `SHN_XINDEX` live at or above it, and a symbol carrying one
+/// of them is in no section of this image. Public because a caller bucketing symbols by
+/// section has to be able to say so: `sections.get(index)` happens to answer `None` for
+/// every one of them today, and stops doing so in an image with 0xff00 sections or more,
+/// which [`sections`] can read.
 ///
 /// A file with this many sections or more stores the real count and the real string-table
 /// index in the otherwise unused first section header.
-const SHN_LORESERVE: u16 = 0xff00;
+pub const SHN_LORESERVE: u16 = 0xff00;
 
 /// One section of a linked image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +147,8 @@ struct Layout {
     st_size: usize,
     /// The size of one symbol table entry.
     symbol_entry_size: usize,
-    /// Whether `sh_flags`, `sh_offset` and `sh_size` are 64 bits wide.
+    /// Whether the class's address-width fields are 64 bits wide: `sh_flags`,
+    /// `sh_offset`, `sh_size`, `sh_entsize` and a symbol's `st_size`.
     wide: bool,
 }
 
@@ -263,6 +270,14 @@ pub struct Symbol {
 /// An image with no symbol table has no symbols, which is not an error here: whether a
 /// missing table is fatal is a question for the gate that asked, and this reads the format.
 ///
+/// `st_shndx` is reported as written. A reserved index — [`SHN_UNDEF`], `SHN_ABS`,
+/// `SHN_COMMON`, or `SHN_XINDEX`, which defers to a `SHT_SYMTAB_SHNDX` section this does
+/// not read — names no section of this image, and a caller bucketing symbols by section is
+/// expected to say so with [`SHN_LORESERVE`]. Not resolved rather than refused, because a
+/// symbol in no section occupies no bytes of one: the size gate's use of this
+/// under-attributes such a symbol, which charges its bytes to the layers and errs toward
+/// failing the budget.
+///
 /// # Errors
 ///
 /// Returns [`ElfError`] if the bytes are not an ELF image this can read, if a symbol table
@@ -297,12 +312,19 @@ pub fn symbols(bytes: &[u8]) -> Result<Vec<Symbol>, ElfError> {
                 section.entry_size, layout.symbol_entry_size
             )));
         }
-        let strings = table_bytes(
-            bytes,
-            raw.get(section.link as usize)
-                .ok_or_else(|| ElfError::new("a symbol table names no string table"))?,
-            "the symbol name string table",
-        )?;
+        let names = raw
+            .get(section.link as usize)
+            .ok_or_else(|| ElfError::new("a symbol table names no string table"))?;
+        // A `sh_link` that names any other section reads as a string table of whatever
+        // bytes are there, and every symbol comes back with a garbage name — which the
+        // attribution above this then reports as zero rather than as an error.
+        if names.kind != SHT_STRTAB {
+            return Err(ElfError::new(format!(
+                "a symbol table's `sh_link` names section type {} rather than a string table",
+                names.kind
+            )));
+        }
+        let strings = table_bytes(bytes, names, "the symbol name string table")?;
         let entries = table_bytes(bytes, section, "a symbol table")?;
         if entries.len() % layout.symbol_entry_size != 0 {
             return Err(ElfError::new(format!(
@@ -316,7 +338,7 @@ pub fn symbols(bytes: &[u8]) -> Result<Vec<Symbol>, ElfError> {
                 name: read_name(
                     strings,
                     read_u32(entry, layout.st_name, endian)?,
-                    "a symbol name",
+                    "symbol name",
                 )?,
                 size: read_address(entry, layout.st_size, endian, layout.wide)?,
                 section_index: read_u16(entry, layout.st_shndx, endian)?,
@@ -594,15 +616,19 @@ fn read_name(strings: &[u8], offset: u32, what: &str) -> Result<String, ElfError
     let rest = strings
         .get(offset..)
         .ok_or_else(|| ElfError::new(format!("a {what} offset is out of range")))?;
-    let end = rest
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(rest.len());
+    // A name with no terminator is a truncated table, not a name that runs to the end of
+    // it. Accepting the tail would answer with one enormous name and no error, which is the
+    // same failure the `>=` above refuses one line at a time.
+    let end = rest.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        ElfError::new(format!(
+            "a {what} at offset {offset} has no terminator before the end of the string table"
+        ))
+    })?;
     let name = rest
         .get(..end)
-        .ok_or_else(|| ElfError::new("a section name is truncated"))?;
+        .ok_or_else(|| ElfError::new(format!("a {what} is truncated")))?;
     String::from_utf8(name.to_vec())
-        .map_err(|err| ElfError::new(format!("a section name is not valid UTF-8: {err}")))
+        .map_err(|err| ElfError::new(format!("a {what} is not valid UTF-8: {err}")))
 }
 
 fn read_u16(bytes: &[u8], at: usize, endian: Endian) -> Result<u16, ElfError> {
@@ -709,6 +735,8 @@ pub mod tests_support {
         contents: Option<Vec<u8>>,
         /// `sh_link`.
         link: u32,
+        /// `sh_info`. For a symbol table, one past the index of the last local symbol.
+        info: u32,
         /// `sh_entsize`.
         entry_size: u64,
     }
@@ -725,7 +753,16 @@ pub mod tests_support {
                 name_offset: None,
                 contents: None,
                 link: 0,
+                info: 0,
                 entry_size: 0,
+            }
+        }
+
+        /// A string table, which is what a section holding names has to be.
+        fn strings(name: &str) -> Self {
+            Self {
+                kind: super::SHT_STRTAB,
+                ..Self::progbits(name, 0, 0)
             }
         }
 
@@ -896,6 +933,9 @@ pub mod tests_support {
             let (symtab, strtab) = self.symbol_table();
             sections.push(SectionSpec {
                 link: strtab_index,
+                // Every symbol this builder writes is local, so `sh_info` is the whole
+                // table. A zero here makes a real reader warn once per symbol.
+                info: u32::try_from(self.symbols.len() + 1).unwrap_or(0),
                 entry_size: self.class.layout().symbol_entry_size as u64,
                 ..SectionSpec::holding(".symtab", super::SHT_SYMTAB, symtab)
             });
@@ -940,7 +980,7 @@ pub mod tests_support {
         fn string_table(sections: &[SectionSpec]) -> (Vec<u8>, Vec<u32>) {
             let mut strings = vec![0_u8];
             let mut offsets = Vec::new();
-            let shstrtab = SectionSpec::progbits(".shstrtab", 0, 0);
+            let shstrtab = SectionSpec::strings(".shstrtab");
             for section in sections.iter().chain(core::iter::once(&shstrtab)) {
                 offsets.push(u32::try_from(strings.len()).unwrap_or(0));
                 strings.extend_from_slice(section.name.as_bytes());
@@ -1057,7 +1097,7 @@ pub mod tests_support {
                 string_table_index,
                 &SectionSpec {
                     size: u64::try_from(strings_len).unwrap_or(0),
-                    ..SectionSpec::progbits(".shstrtab", 0, 0)
+                    ..SectionSpec::strings(".shstrtab")
                 },
                 offsets.last().copied().unwrap_or(0),
                 u64::try_from(strings_offset).unwrap_or(0),
@@ -1094,6 +1134,15 @@ pub mod tests_support {
                 wide,
             );
             write_u32(headers, at + layout.sh_link, section.link, self.endian);
+            // `sh_info` sits one word after `sh_link` in both classes. Kept here rather
+            // than in `Layout`, which is shared with the parser so that the two cannot
+            // disagree about a field they both read — and the parser never reads this one.
+            write_u32(
+                headers,
+                at + layout.sh_link + 0x04,
+                section.info,
+                self.endian,
+            );
             write_address(
                 headers,
                 at + layout.sh_entsize,
@@ -1200,6 +1249,105 @@ mod tests {
         assert_eq!(named[0].name, "_RNvCs1_4mine4work");
         assert_eq!(named[0].size, 0x30);
         assert_eq!(named[0].section_index, 1);
+    }
+
+    /// `llvm-readobj` from the pinned toolchain's sysroot.
+    ///
+    /// `llvm-readelf` is the same binary under another name and is not installed by
+    /// `llvm-tools-preview`; `--elf-output-style=GNU` is what the other name selects.
+    fn llvm_readobj() -> std::path::PathBuf {
+        let sysroot = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("rustc should run");
+        let sysroot =
+            std::path::PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned());
+        let host = std::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("rustc should run");
+        let host = String::from_utf8_lossy(&host.stdout).into_owned();
+        let host = host
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .expect("rustc reports its host triple")
+            .trim()
+            .to_owned();
+        let path = sysroot
+            .join("lib/rustlib")
+            .join(host)
+            .join("bin/llvm-readobj");
+        assert!(
+            path.is_file(),
+            "llvm-readobj is missing from the toolchain sysroot; rust-toolchain.toml pins \
+             llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+        path
+    }
+
+    #[test]
+    fn both_classes_read_the_symbols_llvm_readobj_reads() {
+        // The synthetic tests share `Layout` between the builder and the parser, on
+        // purpose — two copies of the offsets can be wrong in the same direction. That
+        // leaves one hole, and it is not hypothetical: reading `st_shndx` four bytes early
+        // reads `st_info`, which for a table of functions is the constant 2, and every
+        // symbol then resolves to section 2 with the same total size. A sum cannot see it.
+        // So the second opinion is per symbol and includes the section index.
+        //
+        // It is here rather than beside the `llvm-nm` check in `tests/size_budgets.rs`
+        // because the only image that gate ever links is ELF32: the whole 64-bit half of
+        // the layout table would otherwise have no external reader at all, and a
+        // copy-pasted offset in it would leave every test in the workspace green.
+        let readobj = llvm_readobj();
+        let directory = std::env::temp_dir().join(format!("waymaker-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+
+        for (class, name) in [(Class::Elf32, "elf32.o"), (Class::Elf64, "elf64.o")] {
+            let image = image_with_symbols(class);
+            let path = directory.join(name);
+            std::fs::write(&path, &image).expect("the image should be writable");
+
+            let output = std::process::Command::new(&readobj)
+                .args(["--elf-output-style=GNU", "--symbols", "--wide"])
+                .arg(&path)
+                .output()
+                .expect("llvm-readobj should run");
+            let listing = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && output.stderr.is_empty(),
+                "llvm-readobj rejected the synthetic {name}: {}\n{listing}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // `Num: Value Size Type Bind Vis Ndx Name`
+            let second_opinion: Vec<(String, u64, u16)> = listing
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    let (size, section, symbol) = (fields.get(2)?, fields.get(6)?, fields.get(7)?);
+                    Some((
+                        (*symbol).to_owned(),
+                        size.parse().ok()?,
+                        section.parse().ok()?,
+                    ))
+                })
+                .collect();
+
+            let ours: Vec<(String, u64, u16)> = symbols(&image)
+                .expect("a synthetic ELF is readable")
+                .into_iter()
+                .filter(|symbol| !symbol.name.is_empty())
+                .map(|symbol| (symbol.name, symbol.size, symbol.section_index))
+                .collect();
+
+            assert!(!ours.is_empty(), "the builder wrote no named symbols");
+            assert_eq!(
+                ours, second_opinion,
+                "our reader and llvm-readobj disagree about {name}:\n{listing}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
