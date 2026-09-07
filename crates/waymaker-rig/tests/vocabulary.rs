@@ -12,7 +12,7 @@ use waymaker_rig::cutter::{Cutter, NeverCut, PlannedCut};
 use waymaker_rig::log::{Entry, LogError, Outcome};
 use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Rig, Stop};
+use waymaker_rig::run::{Rig, RigError, Stop};
 use waymaker_rig::wear::{Metered, Traffic, Wear};
 use waymaker_rig::window::{Window, WindowError, WindowFault};
 use waymaker_rig::witness::{Mark, Progress, Stage, Witness, WitnessError, WitnessRegion};
@@ -410,9 +410,9 @@ fn a_witness_too_small_for_the_whole_run_is_refused_at_construction() {
         rig.witness_region().capacity()
     };
     // Whatever the region holds, a run needing more marks than that must be refused here
-    // rather than part-way through.
+    // rather than part-way through. One slot past the marks is reserved for a torn one.
     for effects in 0..12_u16 {
-        let needed = 5 * u32::from(effects) + 4;
+        let needed = 5 * u32::from(effects) + 4 + Rig::TORN_SLOTS;
         let built = Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), effects);
         if needed > capacity {
             assert!(
@@ -438,6 +438,59 @@ fn a_witness_too_small_for_the_whole_run_is_refused_at_construction() {
             panic!("{effects} effects needed {needed} marks and failed mid-run: {error:?}")
         });
     }
+}
+
+#[test]
+fn a_witness_with_no_slot_to_spare_for_a_torn_mark_is_refused() {
+    // Codex, round 3 of issue #31: a reset inside a mark's program leaves a torn slot, and a
+    // resume reads past it and never reclaims it. A witness that holds exactly a clean run's
+    // marks is full at the first such reset, so `new` reserves `Rig::TORN_SLOTS` past them
+    // and reports the budget. Searched rather than written down, because the exact fit is
+    // an arithmetic coincidence of slot width and mark count.
+    let mut exact = 0_u32;
+    let mut spare = 0_u32;
+    for erase in [64_u32, 128, 256, 512] {
+        for program in [4_u32, 8, 16, 32] {
+            let Ok(part) = Geometry::new(8 * erase, erase, program, 1) else {
+                continue;
+            };
+            for effects in 0..8_u16 {
+                let Some(marks) = Rig::marks_per_run(effects) else {
+                    unreachable!("a short run")
+                };
+                let built = Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), effects);
+                let Some(capacity) = witness_capacity(part) else {
+                    continue;
+                };
+                if capacity == marks {
+                    exact += 1;
+                    assert!(
+                        matches!(
+                            built,
+                            Err(RigError::WitnessTooSmall { needed, capacity: found })
+                                if needed == marks + Rig::TORN_SLOTS && found == capacity
+                        ),
+                        "{effects} effects against {capacity} slots: {built:?}"
+                    );
+                } else if capacity == marks + Rig::TORN_SLOTS {
+                    spare += 1;
+                    let rig = built.expect("one torn slot fits");
+                    assert_eq!(rig.reset_budget(), Rig::TORN_SLOTS);
+                }
+            }
+        }
+    }
+    assert!(exact >= 2, "only {exact} exact fits were found");
+    assert!(spare >= 1, "no one-slot-spare fit was found");
+}
+
+/// How many marks `part`'s instrument block holds, or `None` when none fits.
+fn witness_capacity(part: Geometry) -> Option<u32> {
+    let slot = u32::try_from(waymaker_rig::witness::MARK_BYTES)
+        .ok()?
+        .div_ceil(part.program_size())
+        .checked_mul(part.program_size())?;
+    Some(part.erase_size() / slot)
 }
 
 /// A dispatcher that does nothing, for the cases that are about media rather than effects.

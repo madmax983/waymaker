@@ -16,7 +16,7 @@
 //! decision's id, a protocol step, an ADR number — so that the words around them stay
 //! free to be rewritten.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::Violation;
 use crate::policy::LAYERS;
@@ -2519,23 +2519,27 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
     },
 ];
 
-/// Every kebab-case string literal in `source`'s `fn id` body: the ids `Row::id` answers
-/// with.
+/// Every `Self::Variant => "id"` arm of `source`'s `fn id` body, in order.
 ///
 /// Scoped to the body the way `integrity-check` pins parameters inside the function that
-/// owns them, so a literal elsewhere in the file vouches for nothing. A row's id has at least
-/// one hyphen and nothing but lowercase letters.
-fn kebab_literals(source: &str) -> BTreeSet<&str> {
+/// owns them, so a literal elsewhere in the file vouches for nothing. Pairs rather than a
+/// set of ids: two ids swapped between arms leave the set whole and attach each to the
+/// wrong row, which Codex found on issue #31's third review round.
+fn id_arms(source: &str) -> Vec<(&str, &str)> {
+    let continues = |character: char| character.is_ascii_alphanumeric() || character == '_';
     crate::source::braced_body(source, "fn id")
         .unwrap_or_default()
-        .split('"')
+        .split("Self::")
         .skip(1)
-        .step_by(2)
-        .filter(|literal| {
-            literal.contains('-')
-                && literal
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        .filter_map(|arm| {
+            let end = arm
+                .find(|character| !continues(character))
+                .unwrap_or(arm.len());
+            let variant = arm.get(..end)?;
+            let (_, rest) = arm.split_once("=>")?;
+            let (_, quoted) = rest.split_once('"')?;
+            let (id, _) = quoted.split_once('"')?;
+            Some((variant, id))
         })
         .collect()
 }
@@ -2570,7 +2574,8 @@ fn declares_test(source: &str, name: &str) -> bool {
 /// Rule: design document §14's failure-semantics table and the five places it lives agree.
 ///
 /// The same shape as [`check_recovery_spec`]. A row of [`FAILURE_ROWS`] has to be answered
-/// by `Row::id` at [`FAILURE_ROWS_PATH`] and nothing else there, discharged by a `#[test]` of
+/// with its id, for its variant, by `Row::id` at [`FAILURE_ROWS_PATH`] and nothing else
+/// there, discharged by a `#[test]` of
 /// its own name at [`FAILURE_MODEL_TESTS_PATH`] in a file that names its variant, discharged
 /// by a `#[test]` of its rig name at [`FAILURE_RIG_TESTS_PATH`] when the table says it is
 /// swept, written down in `CLAUDE.md` with its failure point, its test and its rig standing,
@@ -2597,24 +2602,38 @@ fn check_failure_matrix(
         )),
         Some(contents) => {
             let source = crate::source::without_test_modules(&strip_rust_comments(contents));
-            let declared = kebab_literals(&source);
+            let arms = id_arms(&source);
             for row in FAILURE_ROWS {
-                if !declared.contains(row.id) {
-                    violations.push(Violation::new(
+                let answered = arms.iter().find(|(variant, _)| *variant == row.variant);
+                match answered {
+                    None => violations.push(Violation::new(
                         "failure-matrix",
                         row.id,
-                        format!("{FAILURE_ROWS_PATH} answers no `Row::id` with this id"),
-                    ));
+                        format!(
+                            "{FAILURE_ROWS_PATH} has no `Row::id` arm for `{}`",
+                            row.variant
+                        ),
+                    )),
+                    Some((_, id)) if *id != row.id => violations.push(Violation::new(
+                        "failure-matrix",
+                        row.id,
+                        format!(
+                            "{FAILURE_ROWS_PATH} answers `{id}` for `{}`, and \
+                             docs::FAILURE_ROWS says this id",
+                            row.variant
+                        ),
+                    )),
+                    Some(_) => {}
                 }
             }
-            for id in declared {
-                if !FAILURE_ROWS.iter().any(|row| row.id == id) {
+            for (variant, id) in arms {
+                if !FAILURE_ROWS.iter().any(|row| row.variant == variant) {
                     violations.push(Violation::new(
                         "failure-matrix",
                         id.to_owned(),
                         format!(
-                            "{FAILURE_ROWS_PATH} declares this row and docs::FAILURE_ROWS does \
-                             not, so a row is swept and undocumented"
+                            "{FAILURE_ROWS_PATH} declares `{variant}` and docs::FAILURE_ROWS \
+                             does not, so a row is swept and undocumented"
                         ),
                     ));
                 }
@@ -5990,13 +6009,49 @@ mod tests {
             .map(|rows| rows.replace("\"replay-divergence\"", "\"replay-drift\""));
         let violations = matrix_violations(&inputs);
         assert!(
-            violations.iter().any(|v| v.subject == "replay-divergence"),
+            violations
+                .iter()
+                .any(|v| v.subject == "replay-divergence" && v.detail.contains("replay-drift")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn a_row_the_vocabulary_answers_and_the_table_never_declared_is_a_violation() {
+        let mut inputs = matrix_inputs();
+        inputs.failure_rows = inputs.failure_rows.map(|rows| {
+            rows.replace(
+                "        Self::ReplayDivergence =>",
+                "        Self::Meltdown => \"reactor-meltdown\",\n        Self::ReplayDivergence =>",
+            )
+        });
+        let violations = matrix_violations(&inputs);
         assert!(
-            violations.iter().any(|v| v.subject == "replay-drift"),
+            violations.iter().any(|v| v.subject == "reactor-meltdown"),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn two_ids_swapped_between_arms_is_a_violation() {
+        // Codex, round 3 of issue #31: the ids read as a set, so two of them swapped between
+        // arms passed with every id still declared, attached to the wrong rows.
+        let mut inputs = matrix_inputs();
+        inputs.failure_rows = inputs.failure_rows.map(|rows| {
+            rows.replace("\"during-completion-write\"", "\"placeholder\"")
+                .replace(
+                    "\"after-completion-barrier\"",
+                    "\"during-completion-write\"",
+                )
+                .replace("\"placeholder\"", "\"after-completion-barrier\"")
+        });
+        let violations = matrix_violations(&inputs);
+        for id in ["during-completion-write", "after-completion-barrier"] {
+            assert!(
+                violations.iter().any(|v| v.subject == id),
+                "{id}: {violations:?}"
+            );
+        }
     }
 
     #[test]

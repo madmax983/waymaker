@@ -35,7 +35,7 @@
 
 use std::cell::RefCell;
 
-use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Run};
+use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
 use waymaker_flash::bank;
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
@@ -47,7 +47,7 @@ use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Resumed, Rig, RigError, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
-use waymaker_rig::witness::{Progress as Marks, Witness};
+use waymaker_rig::witness::{Progress as Marks, Witness, WitnessError};
 use waymaker_rig::workload::Role;
 
 const SEED: u64 = 0x0031_0031_0031_0031;
@@ -611,80 +611,61 @@ fn the_sweep_skips_only_for_a_named_reason_and_never_because_the_oracle_refused(
     assert_eq!(points.len() + skips.len(), 1096, "the sweep changed size");
 }
 
-/// A part whose power goes at the `k`th mutation. `tests/sweep.rs` has the same fuse.
-struct Fuse<'a> {
-    device: &'a mut Device,
-    left: usize,
+/// The resume of a crashed part, as a writer the injector can cut.
+///
+/// The crashed image is put back with one program, op 0, and the rig resumes over it. The
+/// resume's own operations are the ops after it, so every crash point the injector lists for
+/// them is a reset the resume itself takes: every byte of every mark and every record, and
+/// every barrier. A resume that fails with nothing armed is a fault of the test.
+fn restore_and_resume(
+    rig: &Rig,
+    image: &[u8],
+    session: &mut waymaker_fault::Session,
+) -> Result<(), String> {
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    session
+        .program(0, image)
+        .map_err(|error| format!("restore: {error:?}"))?;
+    let mut metered = Metered::new(session);
+    rig.resume(0, &mut metered, &mut Log::default(), &mut page)
+        .map(|_| ())
+        .map_err(|error| format!("resume: {error:?}"))
 }
 
-impl Fuse<'_> {
-    const fn blown(&mut self) -> bool {
-        match self.left.checked_sub(1) {
-            Some(left) => {
-                self.left = left;
-                false
-            }
-            None => true,
-        }
-    }
-}
-
-impl StableStorage for Fuse<'_> {
-    type Error = FaultError;
-
-    fn geometry(&self) -> Geometry {
-        self.device.geometry()
-    }
-
-    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
-        self.device.read(offset, dst)
-    }
-
-    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
-        if self.blown() {
-            return Err(FaultError::PowerLoss);
-        }
-        self.device.program(offset, src)
-    }
-
-    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
-        if self.blown() {
-            return Err(FaultError::PowerLoss);
-        }
-        self.device.erase(offset, len)
-    }
-
-    fn barrier(&mut self) -> Result<(), Self::Error> {
-        if self.blown() {
-            return Err(FaultError::PowerLoss);
-        }
-        self.device.barrier()
-    }
+/// Whether `op` is a program of a witness slot.
+const fn programs_the_instrument(rig: &Rig, op: Op) -> bool {
+    matches!(op, Op::Program { offset, .. } if offset >= rig.instrument_base())
 }
 
 #[test]
-fn a_reset_at_any_mutation_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
+fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
     // Codex found the first version of `resume` erasing the instrument: a reset after that
     // erase left a journal with records and a witness that claimed none, and `verify`
-    // accused a healthy part. The resume now continues the witness, and this cuts every
-    // resume of the sweep at every mutation and judges what is left.
+    // accused a healthy part. The resume now continues the witness. Round 3 found the test
+    // for that cutting only between calls, so no mark was ever torn by a resume. This runs
+    // every resume of the sweep through the injector, so a reset lands inside every byte
+    // of every mark and record the resume writes, and judges what is left. Each distinct
+    // image once: two crash points that left the same media are one resume.
     let harness = Harness::new(geometry());
-    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
-    let Ok(runs) = harness.run(|session| {
-        let (outcome, entered) = drive(session);
-        logs.borrow_mut().push(entered);
-        outcome.map_err(|_| ())
-    }) else {
+    let Ok(runs) = harness.run(|session| drive(session).0.map_err(|_| ())) else {
         unreachable!("the fault-free run succeeds")
     };
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
+    let never = Injection {
+        op: usize::MAX,
+        progress: Progress::None,
+        interruption: Interruption::PowerLoss,
+    };
+    let mut images = std::collections::HashSet::new();
     let mut cuts = 0_usize;
+    let mut torn_marks = 0_usize;
+    let mut uninstalled = 0_usize;
     for run in runs.iter().skip(1) {
-        let Some(injection) = run.injection() else {
+        let Some(landed) = run.injection() else {
             continue;
         };
-        if injection.interruption == Interruption::Failure {
+        if landed.interruption == Interruption::Failure || !images.insert(run.image().to_vec()) {
             continue;
         }
         {
@@ -692,33 +673,223 @@ fn a_reset_at_any_mutation_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
             if rig.verify(0, &mut probe, &mut page).map(Verdict::outcome) != Ok(Outcome::Passed) {
                 continue;
             }
+            match rig.resume(
+                0,
+                &mut Metered::new(&mut probe),
+                &mut Log::default(),
+                &mut page,
+            ) {
+                Ok(_) => {}
+                // A cut before the bank seal landed: no run to resume, and nothing to cut.
+                Err(RigError::Authority { banks: 0 }) => {
+                    uninstalled += 1;
+                    continue;
+                }
+                Err(error) => unreachable!("a healthy part resumes, after {landed:?}: {error:?}"),
+            }
         }
-        for cut in 0..80_usize {
-            let mut device = device_after(run);
-            let stopped = {
-                let mut fuse = Fuse {
-                    device: &mut device,
-                    left: cut,
-                };
-                let mut metered = Metered::new(&mut fuse);
-                rig.resume(0, &mut metered, &mut Log::default(), &mut page)
-                    .is_err()
+        let image = run.image();
+        let Ok(clean) = harness.run_one(never, |session| restore_and_resume(&rig, image, session))
+        else {
+            unreachable!("a resume nothing cuts completes, after {landed:?}")
+        };
+        let resume_ops = clean.ops().get(1..).unwrap_or_default();
+        for point in waymaker_fault::injections(resume_ops, geometry()) {
+            if point.interruption == Interruption::Failure {
+                continue;
+            }
+            let injection = Injection {
+                op: point.op + 1,
+                ..point
             };
+            let Ok(cut) = harness.run_one(injection, |session| {
+                restore_and_resume(&rig, image, session)
+            }) else {
+                unreachable!("a deterministic resume, at {injection:?} after {landed:?}")
+            };
+            let mut device = device_after(&cut);
             let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
-                unreachable!("a cut resume leaves a judgeable part, at {injection:?}")
+                unreachable!(
+                    "a cut resume leaves a judgeable part, at {injection:?} after {landed:?}"
+                )
             };
             assert_eq!(
                 verdict.outcome(),
                 Outcome::Passed,
-                "a resume cut after {cut} mutations, at {injection:?}"
+                "a resume cut at {injection:?}, after {landed:?}"
             );
             cuts += 1;
-            if !stopped {
-                break;
+            if matches!(point.progress, Progress::Bytes(_))
+                && resume_ops
+                    .get(point.op)
+                    .is_some_and(|op| programs_the_instrument(&rig, *op))
+            {
+                torn_marks += 1;
             }
         }
     }
-    assert!(cuts > 1000, "only {cuts} resume cuts were judged");
+    // Pinned, so a sweep that thinned fails closed: the parts cut before the bank was
+    // sealed, the distinct images resumed, the resets taken, and those inside a mark.
+    assert_eq!(
+        (uninstalled, images.len(), cuts, torn_marks),
+        (47, 389, 47_157, 15_990),
+        "the resume sweep changed size"
+    );
+}
+
+/// A part whose supply goes inside the first witness mark programmed after `base`.
+///
+/// One program unit of the mark lands, so the slot is neither erased nor a mark: the torn
+/// slot a resume reads past. Every call after it is refused, as after a power cut.
+struct TornMark<'a> {
+    device: &'a mut Device,
+    base: u32,
+    torn: bool,
+}
+
+impl StableStorage for TornMark<'_> {
+    type Error = FaultError;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        if self.torn {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        if self.torn {
+            return Err(FaultError::PowerLoss);
+        }
+        if offset < self.base {
+            return self.device.program(offset, src);
+        }
+        self.torn = true;
+        let unit =
+            usize::try_from(self.geometry().program_size()).map_err(|_| FaultError::PowerLoss)?;
+        let head = src.get(..unit).ok_or(FaultError::PowerLoss)?;
+        self.device.program(offset, head)?;
+        Err(FaultError::PowerLoss)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        if self.torn {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        if self.torn {
+            return Err(FaultError::PowerLoss);
+        }
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_resume_survives_its_reset_budget_and_reports_the_reset_past_it() {
+    // Codex, round 3: a torn slot is never reclaimed, so a witness sized for a clean run
+    // alone is full at the first reset inside a mark. `Rig::new` reserves `TORN_SLOTS` past
+    // the marks and `reset_budget` says how many the part holds. This spends the budget one
+    // torn mark at a time and requires the run to finish, then spends one more and requires
+    // the refusal to be `Full` with the part still judged healthy.
+    let harness = Harness::new(geometry());
+    let Ok(runs) = harness.run(|session| drive(session).0.map_err(|_| ())) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let rig = rig();
+    let budget = rig.reset_budget();
+    assert!(budget >= Rig::TORN_SLOTS);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let records = 2 * EFFECTS + 2;
+    // A power cut that left a whole witness and a run with records still to write.
+    let Some(run) = runs.iter().skip(1).find(|run| {
+        let mut device = device_after(run);
+        run.injection()
+            .is_some_and(|i| i.interruption == Interruption::PowerLoss)
+            && marks_on(&rig, &mut device, &mut page).is_some_and(|marks| !marks.torn())
+            && rig.verify(0, &mut device, &mut page).map(Verdict::outcome) == Ok(Outcome::Passed)
+            && matches!(
+                rig.resume(0, &mut Metered::new(&mut device), &mut Log::default(), &mut page),
+                Ok(Resumed::Completed { recovered, .. }) if recovered + 2 < records
+            )
+    }) else {
+        unreachable!("the sweep has a resumable crash point")
+    };
+    for tears in 0..=budget {
+        let mut device = device_after(run);
+        for _ in 0..tears {
+            let stopped = {
+                let mut torn = TornMark {
+                    device: &mut device,
+                    base: rig.instrument_base(),
+                    torn: false,
+                };
+                rig.resume(
+                    0,
+                    &mut Metered::new(&mut torn),
+                    &mut Log::default(),
+                    &mut page,
+                )
+            };
+            assert!(stopped.is_err(), "the tear was not taken");
+            assert!(
+                marks_on(&rig, &mut device, &mut page).is_some_and(Marks::torn),
+                "the witness does not read as torn"
+            );
+        }
+        let resumed = rig.resume(
+            0,
+            &mut Metered::new(&mut device),
+            &mut Log::default(),
+            &mut page,
+        );
+        assert!(
+            matches!(resumed, Ok(Resumed::Completed { .. })),
+            "{tears} torn marks against a budget of {budget}: {resumed:?}"
+        );
+        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+            unreachable!("a resumed part is judgeable")
+        };
+        assert_eq!(
+            verdict.outcome(),
+            Outcome::Passed,
+            "after {tears} torn marks"
+        );
+    }
+    let mut device = device_after(run);
+    for _ in 0..=budget {
+        let mut torn = TornMark {
+            device: &mut device,
+            base: rig.instrument_base(),
+            torn: false,
+        };
+        let _ = rig.resume(
+            0,
+            &mut Metered::new(&mut torn),
+            &mut Log::default(),
+            &mut page,
+        );
+    }
+    let resumed = rig.resume(
+        0,
+        &mut Metered::new(&mut device),
+        &mut Log::default(),
+        &mut page,
+    );
+    assert!(
+        matches!(resumed, Err(RigError::Witness(WitnessError::Full))),
+        "one reset past the budget: {resumed:?}"
+    );
+    let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+        unreachable!("a part whose instrument is full is still judgeable")
+    };
+    assert_eq!(verdict.outcome(), Outcome::Passed);
 }
 
 #[test]
@@ -741,11 +912,22 @@ fn the_rows_are_ten_and_each_is_its_own_index_and_id() {
     ids.dedup();
     assert_eq!(ids.len(), 10, "ids are distinct");
     assert_eq!(Row::from_index(10), None);
+    // Every id, in the table's order: a swapped pair is a row wearing another's name.
     assert_eq!(
-        Row::ALL.first().map(|r| r.id()),
-        Some("during-schedule-frame-write")
+        Row::ALL.map(Row::id),
+        [
+            "during-schedule-frame-write",
+            "after-schedule-barrier-before-dispatch",
+            "during-physical-activity",
+            "after-activity-before-completion-barrier",
+            "during-completion-write",
+            "after-completion-barrier",
+            "during-inactive-bank-erase-or-write",
+            "after-new-bank-seal-barrier",
+            "history-capacity-reached",
+            "replay-divergence",
+        ]
     );
-    assert_eq!(Row::ALL.last().map(|r| r.id()), Some("replay-divergence"));
 }
 
 #[test]

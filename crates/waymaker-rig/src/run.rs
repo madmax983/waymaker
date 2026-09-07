@@ -82,9 +82,10 @@ pub enum RigError<E, D = core::convert::Infallible> {
         /// The most effects a run can have.
         limit: u16,
     },
-    /// The instrument area cannot hold every mark a clean run writes.
+    /// The instrument area cannot hold every mark a clean run writes, plus
+    /// [`Rig::TORN_SLOTS`].
     WitnessTooSmall {
-        /// How many marks the run needs.
+        /// How many slots the run needs: its marks and the reserved torn ones.
         needed: u32,
         /// How many the region holds.
         capacity: u32,
@@ -218,6 +219,16 @@ impl Rig {
         per_effect.checked_add(4)
     }
 
+    /// How many torn slots the instrument reserves past a clean run's marks.
+    ///
+    /// A reset inside a mark's program leaves a slot that is neither erased nor a mark. A
+    /// resume reads past it and never reclaims it, because the only reclaim is an erase and
+    /// an erase of the instrument beside a journal with records in it is the window Codex
+    /// found in issue #31's second review round. One is reserved, so a run survives one such
+    /// reset by construction; [`reset_budget`](Self::reset_budget) says how many the part
+    /// really holds, and [`WitnessError::Full`] reports the reset past it.
+    pub const TORN_SLOTS: u32 = 1;
+
     /// The bank the rig installs and writes into.
     ///
     /// One bank, at generation one, for the length of a run. §10's swap landed for issue
@@ -300,17 +311,20 @@ impl Rig {
         let witness = WitnessRegion::of(instrument, 0, witness_bytes)
             .map_err(|error| RigError::Witness(promote(error)))?;
         // `WitnessRegion::of` checks that *one* mark fits. A clean run writes rather more, and
-        // a rig whose instrument runs out near the end of an iteration reports
-        // `WitnessError::Full` — an instrument failure dressed up as a run. Refused here,
-        // where a caller can make the region bigger or the run shorter.
-        let Some(marks) = Self::marks_per_run(effects) else {
+        // a reset inside a mark costs a slot on top; a rig whose instrument runs out near
+        // the end of an iteration reports `WitnessError::Full` — an instrument failure
+        // dressed up as a run. Refused here, where a caller can make the region bigger or
+        // the run shorter.
+        let Some(needed) =
+            Self::marks_per_run(effects).and_then(|marks| marks.checked_add(Self::TORN_SLOTS))
+        else {
             return Err(RigError::TooManyEffects {
                 limit: Workload::MAX_EFFECTS,
             });
         };
-        if marks > witness.capacity() {
+        if needed > witness.capacity() {
             return Err(RigError::WitnessTooSmall {
-                needed: marks,
+                needed,
                 capacity: witness.capacity(),
             });
         }
@@ -341,6 +355,18 @@ impl Rig {
     #[must_use]
     pub const fn witness_region(&self) -> WitnessRegion {
         self.witness
+    }
+
+    /// How many marks a run's resets may tear before the instrument is full.
+    ///
+    /// Each reset that lands inside a mark's program costs one slot, and no resume reclaims
+    /// it. At least [`TORN_SLOTS`](Self::TORN_SLOTS), by [`new`](Self::new).
+    #[must_use]
+    pub const fn reset_budget(&self) -> u32 {
+        match Self::marks_per_run(self.effects) {
+            Some(marks) => self.witness.capacity().saturating_sub(marks),
+            None => 0,
+        }
     }
 
     /// The seeded plan of cut points.

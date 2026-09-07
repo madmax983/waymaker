@@ -1137,6 +1137,7 @@ pub const RIG_RUN_SURFACE: &[&str] = &[
     "plan",
     "prepare",
     "recovered",
+    "reset_budget",
     "resume",
     "verify",
     "witness_region",

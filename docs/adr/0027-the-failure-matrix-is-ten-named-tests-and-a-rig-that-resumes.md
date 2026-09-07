@@ -85,6 +85,17 @@ count, the journal's ending and the dispatcher's own log, resumes it, judges the
 part, and holds it to its row. Row 3 on the rig is a dispatcher that is entered and does not
 return, credited from those runs and not from the injector's cause.
 
+The third round found two more things about the resume, and both are in the numbers below.
+A torn slot is never reclaimed, so a witness that held exactly a clean run's marks was full at
+the first reset inside a mark: `Rig::new` now reserves `Rig::TORN_SLOTS` past the marks,
+`Rig::reset_budget` says how many the part holds, and
+`a_resume_survives_its_reset_budget_and_reports_the_reset_past_it` spends the budget one torn
+mark at a time, requires the run to finish, and requires the reset past it to be
+`WitnessError::Full` with the part still judged healthy. And the test that cut a resume did so
+between calls, so no resume ever tore a mark of its own; it now runs every resume of the sweep
+through the injector, at every byte of every mark and record and at every barrier, with the
+count of resets taken inside a mark pinned.
+
 **The rig fills six rows and says so.** Rows 7 to 10 need a swap workload, a capacity refusal
 and a divergent replay, and this rig has none. `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`
 requires `Matrix::verdict` to refuse at `during-inactive-bank-erase-or-write`. That is the
@@ -92,8 +103,8 @@ same shape ADR 0021 chose for the watchdog cells: a census that fails naming the
 than a table shortened to what passes.
 
 **A gate holds the five places together.** `xtask::docs::FAILURE_ROWS` is the table, and the
-`failure-matrix` rule fails a build in which a row is missing from the `fn id` body of the
-rig's vocabulary, has no `#[test]` of its name in the model file, is marked swept and has no
+`failure-matrix` rule fails a build in which a row's variant is answered with another id, or
+none, by the `fn id` body of the rig's vocabulary, has no `#[test]` of its name in the model file, is marked swept and has no
 `#[test]` of its rig name in the rig file, has no `CLAUDE.md` row carrying its failure point,
 its test and its rig standing, or is absent from this ADR. A test under `#[ignore]` or
 `#[cfg(` is not a test. The vocabulary check runs both ways, so a row added to the enum and
@@ -109,7 +120,9 @@ row 6, 123 in row 7 and 25 in row 8, with rows 3, 9 and 10 driven directly. Ever
 seven crash-swept rows on the model is reached by a power cut and by a watchdog reset. On the
 rig, 434 crash points are classified and resumed: 86, 84, 42, 84 and 138 in rows 1, 2, 4, 5
 and 6, plus two driven runs for row 3. All of it is pinned per row, so a sweep that thinned
-fails closed; the skips are counted by reason, and the oracle is required to refuse none.
+fails closed; the skips are counted by reason, and the oracle is required to refuse none. Every
+resume of the rig's sweep is itself cut at every crash point the injector lists: 389 distinct
+crash images, 47,157 resets, 15,990 of them inside a mark, and the part passes after each.
 
 **Row 5 does not hold as written, and this records it.** §14 says "redeliver". A torn
 completion leaves a journal with no append point — ADR 0018's anti-bricking rule, restated by
@@ -133,9 +146,11 @@ that landed whole with its barrier refused. Twelve crash points, six of them wat
 is the standing `waymaker-rig` already has on `waymaker-conformance`. No layer is touched and
 no budget moves.
 
-**`Rig::resume` is a public function added to the runner pin**, and `RigError` gained two
-variants: `Breach`, for a prefix that is not this run's, and `Authority`, for a part with
-other than one bank. Both refuse before writing.
+**`Rig::resume` and `Rig::reset_budget` are public functions added to the runner pin**, and
+`RigError` gained two variants: `Breach`, for a prefix that is not this run's, and
+`Authority`, for a part with other than one bank. Both refuse before writing.
+`RigError::WitnessTooSmall` now counts the reserved torn slot, so a witness with exactly a
+clean run's marks is refused at construction rather than at the first reset inside a mark.
 
 **What is owed** is the four rig rows, written in the table as `Owed`, and it is issue
 [#96](https://github.com/madmax983/waymaker/issues/96). A swap workload in the rig is what
