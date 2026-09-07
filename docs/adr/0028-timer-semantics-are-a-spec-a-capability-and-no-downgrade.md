@@ -182,6 +182,15 @@ What is owed, stated so that a green build does not imply it:
   ordinary in-boot sleep" arrives with the dispatcher at 0.4; there is no sleep here to
   document as not power-loss-durable, and the `AfterBoot` variant carries that sentence
   instead.
+- **An associated `const` is invisible to every pin here.** The method pin reads `fn`
+  declarations, and the façade's spec pin drops `use` declarations before it scans, so a
+  `pub const BEST_EFFORT: Self = Self::AfterBoot { .. }` imported under an alias reaches
+  `arm` with no `TimerSpec` token in sight. `admits` does not backstop this one, because the
+  constant resolves to a variant that already exists. Codex found it on the fourth round,
+  after the two spellings closed above; it is issue
+  [#99](https://github.com/madmax983/waymaker/issues/99), which also carries the argument
+  that pinning associated items at the kernel end would close `ClockKind`'s numbers at the
+  same time.
 - **The member pin reads a header string.** A rename that carries the crate root with it —
   the shipped `TimerSpec` becomes `TimerSpecV2`, a decoy `mod compat` keeps the pinned name
   and the pinned members — leaves `TIMER_TYPES` comparing a type nobody ships. Review ran it.

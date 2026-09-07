@@ -997,6 +997,17 @@ Stated so that nobody mistakes silence for coverage:
   against: an RTC that moved backwards while the power was off is invisible here. Issue #33's
   `TimerScheduled` record is what carries the floor across a reboot, which is why that record
   has to hold the arming reading as well as the deadline.
+- **An associated `const` on a timer type, and an aliased import of one.**
+  `timer-capability`'s method pin reads `fn` declarations, so a
+  `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec` is
+  invisible to it; and the façade's spec pin drops `use` declarations before it scans, so
+  `use waymaker_core::timer::TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;` removes the one
+  occurrence that ties the alias to the type. Together they are a downgrade the gate passes,
+  and `admits` does not backstop it either, because the constant resolves to a variant that
+  already exists. Codex found it on the fourth review round of issue #32, and it is issue
+  [#99](https://github.com/madmax983/waymaker/issues/99). `effect-protocol` and
+  `kernel-boundary` read `fn` declarations too, so the blind spot is theirs as well. The same
+  gap is why `ClockKind`'s numbers are unpinned, below.
 - **That a pinned timer type is the type the crate ships.** `timer-capability`'s member pin
   reads a header string, so a rename that carries the crate root with it — `TimerSpec` becomes
   `TimerSpecV2`, a decoy `mod compat` keeps the pinned name and the pinned members — leaves it
