@@ -2382,10 +2382,29 @@ pub const BOUNDARY_DECISIONS: &[&str] = &[
     "Resolve::Replayed",
 ];
 
-/// Vocabulary the driver may not name, because naming it is deciding.
+/// Why [`DRIVER_FORBIDDEN_VOCABULARY`] refuses the two record names.
+///
+/// One string rather than two identical ones, so the pair cannot drift into two reasons for
+/// one ban.
+const RECORD_VOCABULARY: &str = "is the record vocabulary the kernel decides from; a driver \
+                                 that reads it is a second transition table, and the one \
+                                 below it is no longer where \u{a7}08 is enforced";
+
+/// Vocabulary the driver may not name, with the reason each is banned.
 ///
 /// `RecordKind` is §09's numbering and `Step` is what the cursor answers an `advance` with:
 /// a driver that matched on either would be reading history rather than being told about it.
+///
+/// `EffectIdAllocator` is issue [#30](https://github.com/madmax983/waymaker/issues/30)'s.
+/// §14's fourth guarantee is that a retry and a reboot redeliver the *original* identity, and
+/// the driver keeps that guarantee by never having an identity of its own: every
+/// `(RunId, EffectSeq)` it dispatches under comes from `Intent::Schedule` or
+/// `Resolve::Redeliver`. A driver that reached for the allocator would be minting, and a
+/// fresh mint for an outstanding effect is a second effect as far as every downstream
+/// system is concerned. It is a floor rather than a proof — `EffectId`'s fields are public,
+/// so a literal evades it, and
+/// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
+/// says so.
 ///
 /// Matched as *identifiers* rather than as substrings, which is what makes the ban a ban.
 /// A spelling ban on `Step::` is evaded by `Step ::Record`, by `use …::Step as S;`, and by
@@ -2397,7 +2416,15 @@ pub const BOUNDARY_DECISIONS: &[&str] = &[
 /// written and something has to write it. It also reads two, and
 /// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
 /// names both rather than leaving them implied.
-pub const DRIVER_FORBIDDEN_VOCABULARY: &[&str] = &["RecordKind", "Step"];
+pub const DRIVER_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
+    ("RecordKind", RECORD_VOCABULARY),
+    ("Step", RECORD_VOCABULARY),
+    (
+        "EffectIdAllocator",
+        "is the one thing permitted to mint an effect identity; a driver that names it can \
+         hand a redelivered effect a fresh sequence, which \u{a7}14 says is a second effect",
+    ),
+];
 
 /// The file whose surface and step order [`check_effect_protocol`] pins.
 pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
@@ -4626,16 +4653,12 @@ pub fn check_kernel_boundary(
             ));
         }
     }
-    for forbidden in DRIVER_FORBIDDEN_VOCABULARY {
+    for (forbidden, why) in DRIVER_FORBIDDEN_VOCABULARY {
         if names_identifier(&code, forbidden) {
             violations.push(Violation::new(
                 RULE,
                 DRIVER,
-                format!(
-                    "{DRIVER_PATH} names `{forbidden}`, which is the record vocabulary the \
-                     kernel decides from; a driver that reads it is a second transition \
-                     table, and the one below it is no longer where \u{a7}08 is enforced"
-                ),
+                format!("{DRIVER_PATH} names `{forbidden}`, which {why}"),
             ));
         }
     }
@@ -8246,6 +8269,24 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|one| one.detail.contains("names no `Intent::Finished`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_that_could_mint_an_identity_is_rejected() {
+        // Issue #30: a redelivered effect keeps the identity its schedule record committed.
+        // A driver holding an allocator can hand it a fresh one, which every downstream
+        // system reads as a second effect.
+        let mutant = format!(
+            "{}\nuse waymaker_core::EffectIdAllocator;\n",
+            real_driver_module()
+        );
+        let violations = boundary_violations(&real_transition_module(), &mutant);
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("mint an effect identity")),
             "{violations:?}"
         );
     }

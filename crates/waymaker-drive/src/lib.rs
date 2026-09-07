@@ -40,6 +40,14 @@
 //! falsifiable. See
 //! [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
 //!
+//! # At-least-once
+//!
+//! Waymaker can perform one effect more than once: after a retry, and after a reset between
+//! the activity and its committed outcome. Every attempt carries the identity the schedule
+//! record committed. Waymaker promises that identity and nothing more. It does not give
+//! exactly-once physical side effects. Read [`Activities`]. An implementer writes against
+//! that trait.
+//!
 //! # The lifetime discipline
 //!
 //! Every borrowed result — a replayed outcome, a redelivered activity's answer, a

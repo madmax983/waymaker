@@ -160,7 +160,10 @@ pub const DISPATCH_LOG: usize = 8;
 pub struct World {
     log: [Dispatch; DISPATCH_LOG],
     count: usize,
+    offers: [Dispatch; DISPATCH_LOG],
+    offered: usize,
     pending_at: Option<usize>,
+    pending_once_seq: Option<u32>,
     failing_at: Option<usize>,
     exhausting_at: Option<usize>,
     exhausting_seq: Option<u32>,
@@ -182,7 +185,10 @@ impl World {
         Self {
             log: [Self::UNUSED; DISPATCH_LOG],
             count: 0,
+            offers: [Self::UNUSED; DISPATCH_LOG],
+            offered: 0,
             pending_at: None,
+            pending_once_seq: None,
             failing_at: None,
             exhausting_at: None,
             exhausting_seq: None,
@@ -195,6 +201,21 @@ impl World {
     pub const fn pending_at(nth: usize) -> Self {
         Self {
             pending_at: Some(nth),
+            ..Self::new()
+        }
+    }
+
+    /// A world that declines the effect whose sequence is `seq` once, and performs every
+    /// later attempt at it.
+    ///
+    /// An activity that was not ready and then was. Keyed on the identity the schedule record
+    /// committed rather than on a dispatch count, so the decline and the retry are the same
+    /// effect however many boots separate them — the trick
+    /// [`exhausting_seq`](Self::exhausting_seq) uses, for the same reason.
+    #[must_use]
+    pub const fn pending_once_at_seq(seq: u32) -> Self {
+        Self {
+            pending_once_seq: Some(seq),
             ..Self::new()
         }
     }
@@ -246,6 +267,31 @@ impl World {
             .unwrap_or_default()
     }
 
+    /// Every intent this world was **offered**, in order, up to [`DISPATCH_LOG`].
+    ///
+    /// [`dispatched`](Self::dispatched)'s counterpart, and the difference is the whole reason
+    /// both exist: an effect answered [`Performed::Pending`] is offered and not dispatched.
+    /// Design document §14's redelivery contract is a statement about what the world is
+    /// *asked* — a declined attempt and the retry that follows it must carry one identity —
+    /// and a log that only recorded what happened could not see that pair.
+    #[must_use]
+    pub fn offered(&self) -> &[Dispatch] {
+        self.offers
+            .get(..self.offered.min(DISPATCH_LOG))
+            .unwrap_or_default()
+    }
+
+    /// How many intents this world was offered, log or no log.
+    ///
+    /// [`offered`](Self::offered)'s cross-check, the way [`performed`](Self::performed) is
+    /// [`dispatched`](Self::dispatched)'s. A log capped at [`DISPATCH_LOG`] cannot say
+    /// whether it holds all it was given, and an instrument that cannot say so is one that
+    /// lies as soon as a run outgrows it.
+    #[must_use]
+    pub const fn offers(&self) -> usize {
+        self.offered
+    }
+
     /// How many effects this world was asked to perform, log or no log.
     #[must_use]
     pub const fn performed(&self) -> usize {
@@ -267,8 +313,23 @@ impl Activities for World {
         _input: &[u8],
         out: &mut [u8],
     ) -> Performed {
+        // Recorded before anything is decided, so a declined attempt is an offer like any
+        // other. Counted whether or not the log had room, for the reason `count` is.
+        if let Some(slot) = self.offers.get_mut(self.offered) {
+            *slot = Dispatch {
+                id: intent.id(),
+                kind,
+            };
+        }
+        self.offered = self.offered.saturating_add(1);
+
         let nth = self.count;
         if self.pending_at == Some(nth) {
+            return Performed::Pending;
+        }
+        // Cleared as it fires, so the next attempt at this effect is performed.
+        if self.pending_once_seq == Some(intent.id().seq.0) {
+            self.pending_once_seq = None;
             return Performed::Pending;
         }
         if let Some(slot) = self.log.get_mut(nth) {
