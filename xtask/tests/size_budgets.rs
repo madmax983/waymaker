@@ -381,6 +381,66 @@ fn the_parser_agrees_with_llvm_nm_about_what_the_probe_costs() {
     );
 }
 
+#[test]
+fn stripping_the_symbol_table_moves_no_byte_the_gate_measures() {
+    // ADR 0029's central claim, driven rather than argued. The matrix links with
+    // `--config profile.release.strip="none"` so that there are symbols to attribute, and
+    // gates the section sizes of that same image. That is one measurement only while
+    // stripping touches nothing allocated. `size::check_symbols_are_not_measured` asks each
+    // image whether that holds; this links the workspace's own release profile beside it
+    // and compares the answer.
+    let stripped = scratch("stripped");
+    let output = xtask::coverage::uninstrumented_cargo()
+        .current_dir(workspace_root())
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--message-format",
+            "json-render-diagnostics",
+            "--target",
+            xtask::pipeline::FIRMWARE_TARGET,
+            "--target-dir",
+        ])
+        .arg(&stripped)
+        .args([
+            "--package",
+            size::PROBE_PACKAGE,
+            "--no-default-features",
+            "--features",
+            "probe,engine",
+        ])
+        .output()
+        .expect("cargo build should run");
+    assert!(
+        output.status.success(),
+        "linking the stripped image failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image = size::executable_path(
+        &String::from_utf8_lossy(&output.stdout),
+        size::PROBE_PACKAGE,
+    )
+    .expect("the build produced an image");
+    let bytes = std::fs::read(&image).expect("the image should be readable");
+    let sections = xtask::elf::sections(&bytes).expect("the image should parse");
+    let stripped_sizes = size::SectionSizes::of(&sections);
+
+    // The stripped image has no symbol table, which is exactly why the gate does not use it.
+    assert!(
+        size::check_symbols_are_not_measured(&sections).is_err(),
+        "the release profile strips symbols, so the gated image cannot be the attributed one"
+    );
+
+    let measured = measured().row("default").expect("a default row").sizes;
+    assert_eq!(
+        stripped_sizes, measured,
+        "stripping changed a section the budget is measured on, so the attribution and the \
+         gated sizes are readings of two different images"
+    );
+}
+
 /// The size `llvm-size -A` reports for one section.
 fn section_size(listing: &str, section: &str) -> Option<u64> {
     listing.lines().find_map(|line| {

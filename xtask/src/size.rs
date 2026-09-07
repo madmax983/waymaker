@@ -831,12 +831,10 @@ impl SizeReport {
         // it is a row whose symbol table was not read — a stripped image, a parser that
         // came back empty, a report written by an older build. Reading that as "the probe
         // cost nothing" restores the figure this correction exists to remove, silently and
-        // in the direction that passes.
-        for row in self
-            .rows
-            .iter()
-            .filter(|row| row.gated || row.name == BASELINE_ROW)
-        {
+        // in the direction that passes. Every row, not only the gated ones: the report
+        // states the split for all of them, and a misstatement is worth as much as a wrong
+        // gate to whoever reads it.
+        for row in &self.rows {
             if row.probe_flash == 0 {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
@@ -2725,6 +2723,24 @@ mod tests {
         );
         assert!(
             rendered(&report.shortfalls()).contains("nothing was measured"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn an_ungated_row_with_nothing_attributed_to_the_probe_is_not_a_measurement_either() {
+        // The report states the split for every row, so a row whose symbol table was not
+        // read misstates one — which is worth as much as a wrong gate to whoever reads it.
+        let default = default_row(20, 0);
+        let mut feature = feature_row("waymaker-core/serde", &default, 8);
+        feature.probe_flash = 0;
+        let report = SizeReport::new(
+            vec![baseline_row(), default, feature],
+            KernelState::measured(),
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("waymaker-core/serde"),
             "{:?}",
             report.shortfalls()
         );
