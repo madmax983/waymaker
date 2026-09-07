@@ -22,6 +22,10 @@ waymaker-flash.workspace = true
 # The in-memory NOR model and the crash injector. The driver is run at every crash point the
 # injector lists, which is what makes "across a power cut" a loop rather than a claim.
 waymaker-fault.workspace = true
+# Design document §14's failure-semantics table as a vocabulary: `tests/matrix.rs` classifies
+# every crash point into a row the rig also names, so the model half and the rig half of
+# issue #31's matrix disagree about nothing.
+waymaker-rig.workspace = true
 
 [features]
 default = []

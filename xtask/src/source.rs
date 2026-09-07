@@ -1137,9 +1137,35 @@ pub const RIG_RUN_SURFACE: &[&str] = &[
     "plan",
     "prepare",
     "recovered",
+    "resume",
     "verify",
     "witness_region",
     "workload",
+];
+
+/// The file whose public surface [`check_rig_oracle`] also pins: the failure matrix.
+///
+/// Issue [#31](https://github.com/madmax983/waymaker/issues/31)'s ten rows and the census over
+/// them. A `Matrix::force_complete` or a `Gap::ignore` would let a sweep that reached six rows
+/// report ten, which is the relabelling the census exists to refuse.
+pub const RIG_MATRIX_PATH: &str = "waymaker-rig/src/matrix.rs";
+
+/// Every public function the failure matrix is allowed to have.
+///
+/// `saturated` is on the list for [`RIG_CENSUS_SURFACE`]'s reason.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_MATRIX_SURFACE: &[&str] = &[
+    "fmt",
+    "from_index",
+    "id",
+    "index",
+    "iterations",
+    "record",
+    "row",
+    "saturated",
+    "total",
+    "verdict",
 ];
 
 /// Rule: the rig's oracle and its census are exactly the surfaces that were reviewed.
@@ -1178,6 +1204,16 @@ pub fn check_rig_oracle(sources: &[crate::size::LayerSource]) -> Vec<Violation> 
         sources,
         "the runner is where the oracle's verdict is produced, so a lenient verify or a \
          judge that swallowed a breach cannot be added without a reviewer writing it down",
+    ));
+    violations.extend(check_pinned_surface(
+        "rig-oracle",
+        "waymaker-rig",
+        RIG_MATRIX_PATH,
+        RIG_MATRIX_SURFACE,
+        sources,
+        "the failure matrix is what makes a row nothing reached a refusal rather than a \
+         silence, so a way to call a row reached that was not cannot be added without a \
+         reviewer writing it down",
     ));
     violations
 }
@@ -9486,6 +9522,12 @@ mod tests {
     #[must_use]
     pub fn clean_rig_run() -> String {
         surface("A rig runner.", super::RIG_RUN_SURFACE)
+    }
+
+    /// A `waymaker-rig` failure matrix whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_rig_matrix() -> String {
+        surface("A failure matrix.", super::RIG_MATRIX_SURFACE)
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.
