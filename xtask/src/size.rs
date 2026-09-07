@@ -454,18 +454,82 @@ fn identifier(rest: &str) -> Option<&str> {
 /// Only symbols in a section that costs flash, because that is the budget being read: a
 /// `.bss` symbol is RAM, and a symbol in a section that was discarded is nothing.
 /// `SHN_UNDEF` and the reserved indices name no section and are attributed to nobody.
+///
+/// # Bytes, not entries
+///
+/// The measure of the *address ranges* the crate's symbols cover, not the sum of their
+/// sizes. Under `lto = "fat"` and `opt-level = "z"` the linker folds identical function
+/// bodies and can leave several mangled names on one body, so a sum counts the same stored
+/// bytes once per name — and this figure is *subtracted* from the budget, so an overstated
+/// one is a budget quietly loosened.
+///
+/// A range another crate's symbol also covers is credited to nobody, for the same reason
+/// in the other direction: a body folded together with a layer's is not the probe's to
+/// take off the layers' bill. Unattributable symbols count as another crate's here, since
+/// `__aeabi_memcpy` folded onto a probe body is no more the probe's than a layer's is.
+///
+/// `st_value` is used as the symbol table holds it, with the ARM interworking bit still on
+/// a Thumb function. Two ranges are comparable only where both carry it, so the bit can
+/// only ever manufacture an overlap — which removes credit from the crate being measured,
+/// and so errs toward charging the layers.
 #[must_use]
 pub fn attributed_flash(sections: &[Section], symbols: &[elf::Symbol], crate_name: &str) -> u64 {
-    symbols
-        .iter()
-        .filter(|symbol| defining_crate(&symbol.name) == Some(crate_name))
-        .filter(|symbol| symbol.section_index != elf::SHN_UNDEF)
-        .filter(|symbol| {
-            sections
+    let stored = |symbol: &elf::Symbol| {
+        symbol.size > 0
+            && symbol.section_index != elf::SHN_UNDEF
+            && sections
                 .get(usize::from(symbol.section_index))
                 .is_some_and(Section::occupies_storage)
-        })
-        .fold(0, |total, symbol| total.saturating_add(symbol.size))
+    };
+
+    let mut sections_seen: Vec<u16> = symbols
+        .iter()
+        .filter(|symbol| stored(symbol))
+        .map(|symbol| symbol.section_index)
+        .collect();
+    sections_seen.sort_unstable();
+    sections_seen.dedup();
+
+    let ranges = |index: u16, mine: bool| {
+        merged(
+            symbols
+                .iter()
+                .filter(|symbol| stored(symbol) && symbol.section_index == index)
+                .filter(|symbol| (defining_crate(&symbol.name) == Some(crate_name)) == mine)
+                .map(|symbol| (symbol.address, symbol.address.saturating_add(symbol.size)))
+                .collect(),
+        )
+    };
+
+    sections_seen.into_iter().fold(0_u64, |total, index| {
+        total.saturating_add(length_outside(&ranges(index, true), &ranges(index, false)))
+    })
+}
+
+/// `ranges`, sorted, with everything that touches or overlaps joined into one.
+fn merged(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// How many bytes of `mine` no range of `theirs` covers. Both are [`merged`].
+fn length_outside(mine: &[(u64, u64)], theirs: &[(u64, u64)]) -> u64 {
+    mine.iter().fold(0_u64, |total, &(start, end)| {
+        let covered = theirs
+            .iter()
+            .fold(0_u64, |covered, &(other_start, other_end)| {
+                let overlap = end.min(other_end).saturating_sub(start.max(other_start));
+                covered.saturating_add(overlap)
+            });
+        total.saturating_add(end.saturating_sub(start).saturating_sub(covered))
+    })
 }
 
 /// Rule: the symbol table this attribution is read from costs no byte the gate measures.
@@ -2725,12 +2789,10 @@ mod tests {
         }
     }
 
-    fn symbol(name: &str, size: u64, section_index: u16) -> crate::elf::Symbol {
+    fn symbol(name: &str, address: u64, size: u64, section_index: u16) -> crate::elf::Symbol {
         crate::elf::Symbol {
             name: name.to_owned(),
-            // Attribution is a sum over sizes and never reads an address; the fixtures
-            // say so by leaving every symbol at one.
-            address: 0,
+            address,
             size,
             section_index,
         }
@@ -2818,10 +2880,10 @@ mod tests {
     fn attribution_counts_only_symbols_in_sections_that_cost_flash() {
         let sections = vec![stored(".null"), stored(".text"), reserved(".bss")];
         let symbols = vec![
-            symbol("_RNvCs1_19waymaker_size_probe6engine", 100, 1),
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 0x1000, 100, 1),
             // In `.bss`: RAM, not flash, so it is not part of the figure being corrected.
-            symbol("_RNvCs1_19waymaker_size_probe5state", 40, 2),
-            symbol("_RNvCs1_14waymaker_flash5frame", 7, 1),
+            symbol("_RNvCs1_19waymaker_size_probe5state", 0x9000, 40, 2),
+            symbol("_RNvCs1_14waymaker_flash5frame", 0x2000, 7, 1),
         ];
         assert_eq!(
             attributed_flash(&sections, &symbols, "waymaker_size_probe"),
@@ -2834,12 +2896,64 @@ mod tests {
         let sections = vec![stored(".null"), stored(".text")];
         // `SHN_UNDEF` and an index past the table: an undefined symbol and a corrupt one.
         let symbols = vec![
-            symbol("_RNvCs1_19waymaker_size_probe6engine", 100, 0),
-            symbol("_RNvCs1_19waymaker_size_probe6second", 100, 9),
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 0x1000, 100, 0),
+            symbol("_RNvCs1_19waymaker_size_probe6second", 0x2000, 100, 9),
         ];
         assert_eq!(
             attributed_flash(&sections, &symbols, "waymaker_size_probe"),
             0
+        );
+    }
+
+    #[test]
+    fn two_names_on_one_body_are_the_bytes_of_one_body() {
+        // `lto = "fat"` and `opt-level = "z"` fold identical function bodies and can leave
+        // several mangled names on the survivor. This figure is *subtracted* from the
+        // budget, so counting the bytes once per name loosens it.
+        let sections = vec![stored(".null"), stored(".text")];
+        let symbols = vec![
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 0x1000, 100, 1),
+            symbol("_RNvCs1_19waymaker_size_probe4twin", 0x1000, 100, 1),
+            // Partly overlapping rather than identical, which is the same question asked
+            // of a linker that folded a body into the tail of another.
+            symbol("_RNvCs1_19waymaker_size_probe5third", 0x1040, 100, 1),
+        ];
+        assert_eq!(
+            attributed_flash(&sections, &symbols, "waymaker_size_probe"),
+            0x1040 + 100 - 0x1000
+        );
+    }
+
+    #[test]
+    fn a_body_two_crates_both_name_is_credited_to_neither() {
+        // The mirror of the fold above: a body the linker shared between the probe and a
+        // layer is not the probe's to take off the layers' bill. An unattributable name
+        // counts as another crate's for the same reason.
+        let sections = vec![stored(".null"), stored(".text")];
+        let symbols = vec![
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 0x1000, 100, 1),
+            symbol("_RNvCs1_14waymaker_flash5frame4body", 0x1000, 100, 1),
+            symbol("_RNvCs1_19waymaker_size_probe4mine", 0x2000, 40, 1),
+            symbol("__aeabi_memcpy", 0x2000, 40, 1),
+        ];
+        assert_eq!(
+            attributed_flash(&sections, &symbols, "waymaker_size_probe"),
+            0
+        );
+    }
+
+    #[test]
+    fn one_crates_bodies_in_two_sections_are_both_counted() {
+        // Ranges are compared within a section: two sections address independently, so an
+        // address in `.text` says nothing about the same address in `.rodata`.
+        let sections = vec![stored(".null"), stored(".text"), stored(".rodata")];
+        let symbols = vec![
+            symbol("_RNvCs1_19waymaker_size_probe6engine", 0x1000, 100, 1),
+            symbol("_RNvCs1_19waymaker_size_probe5table", 0x1000, 40, 2),
+        ];
+        assert_eq!(
+            attributed_flash(&sections, &symbols, "waymaker_size_probe"),
+            140
         );
     }
 

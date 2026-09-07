@@ -355,12 +355,14 @@ fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
 
     let probe = size::probe_crate_name();
     let listing = String::from_utf8_lossy(&output.stdout);
-    let second_opinion: u64 = listing
+    let mut second_opinion: Vec<(u64, u64)> = listing
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             // `<address> <size> <type> <name>`; a symbol with no size prints three fields.
-            let (Some(bytes), Some(name)) = (fields.get(1), fields.get(3)) else {
+            let (Some(address), Some(bytes), Some(name)) =
+                (fields.first(), fields.get(1), fields.get(3))
+            else {
                 return None;
             };
             // `n`/`N` is debug information, which costs no flash. Everything else
@@ -368,15 +370,40 @@ fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
             if matches!(fields.get(2), Some(&"n" | &"N")) {
                 return None;
             }
-            (size::defining_crate(name) == Some(probe.as_str()))
-                .then(|| u64::from_str_radix(bytes, 16).ok())
-                .flatten()
+            if size::defining_crate(name) != Some(probe.as_str()) {
+                return None;
+            }
+            Some((
+                u64::from_str_radix(address, 16).ok()?,
+                u64::from_str_radix(bytes, 16).ok()?,
+            ))
         })
-        .sum();
+        .collect();
+    second_opinion.sort_unstable();
 
+    // Each symbol's placement and width, not their total. A total would be a reading of
+    // `attributed_flash`'s rule as well as of this reader — that rule measures the union of
+    // address ranges, so the two agree only while nothing is folded — and this test is
+    // about the offsets the table is read at. `llvm-nm` clears the ARM interworking bit
+    // that `st_value` carries on a Thumb function, so it is masked here.
+    let mut ours: Vec<(u64, u64)> = xtask::elf::symbols(&std::fs::read(&image).expect("readable"))
+        .expect("the image should parse")
+        .into_iter()
+        .filter(|symbol| symbol.size > 0)
+        .filter(|symbol| size::defining_crate(&symbol.name) == Some(probe.as_str()))
+        .map(|symbol| (symbol.address & !1, symbol.size))
+        .collect();
+    ours.sort_unstable();
+
+    assert!(!ours.is_empty(), "no symbol is credited to `{probe}`");
     assert_eq!(
-        row.probe_flash, second_opinion,
-        "our symbol reader and llvm-nm disagree about what {probe} costs in {image:?}"
+        ours, second_opinion,
+        "our symbol reader and llvm-nm disagree about `{probe}`'s symbols in {image:?}"
+    );
+    assert!(
+        row.probe_flash > 0 && row.probe_flash <= ours.iter().map(|(_, size)| size).sum::<u64>(),
+        "the attributed figure ({} B) is not within the bytes those symbols name",
+        row.probe_flash
     );
 }
 

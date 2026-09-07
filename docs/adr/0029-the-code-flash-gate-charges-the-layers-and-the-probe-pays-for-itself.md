@@ -74,6 +74,19 @@ they add. `defining_crate` answers `None` for such a name, which charges it to t
 `X`, the other trait-impl production, reads the right way round and is not refused; refusing
 it would charge every `impl StableStorage for ProbeMedia` method to the layers.
 
+### The probe's share is bytes, not symbol table entries
+
+`attributed_flash` measures the **union of the address ranges** the crate's symbols cover,
+per section. Under `lto = "fat"` and `opt-level = "z"` the linker folds identical function
+bodies and can leave several mangled names on the survivor, and a sum of `st_size` then
+counts the same stored bytes once per name. This figure is subtracted from the budget, so an
+overstated one is a budget loosened.
+
+A range another crate's symbol also covers is credited to nobody, which is the same rule in
+the other direction: a body folded together with a layer's is not the probe's to take off the
+layers' bill. An unattributable name counts as another crate's, since `__aeabi_memcpy` folded
+onto a probe body is no more the probe's than a layer's is.
+
 ### Everything unattributable stays with the layers
 
 The subtraction removes only bytes a symbol names as the probe's. `.rodata` string data,
@@ -148,6 +161,9 @@ capacity reserve, and 10852 B is over it.
 - `.rodata` holds one sized symbol in the current image, so the attribution is a `.text`
   fact and the other 1804 B are charged to the layers. That is the conservative direction,
   and it means the layers' figure is not a per-crate accounting.
+- Both the fold rule and the sign rule below it were found by review rather than by
+  measurement: this image has no folded symbol and no shrinking probe. They are in the code
+  because the direction they were wrong in is the one that passes.
 - Attribution reads Rust's mangling, which is not a stable ABI. A third mangling scheme
   would attribute nothing, every row would read `probe = 0`, and the gate would fail closed
   rather than pass.
