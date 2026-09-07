@@ -46,7 +46,7 @@ const DECODE_ERRORS: [(DecodeError, &str); 7] = [
 
 /// Every `KernelError` beside its exact text, with one wrapped decode failure standing for
 /// the `Decode` arm — whose text is the decoder's own, passed through unchanged.
-const KERNEL_ERRORS: [(KernelError, &str); 6] = [
+const KERNEL_ERRORS: [(KernelError, &str); 8] = [
     (
         KernelError::IdExhausted,
         "the run's effect sequence space is spent",
@@ -68,10 +68,50 @@ const KERNEL_ERRORS: [(KernelError, &str); 6] = [
         "this firmware cannot replay this workflow",
     ),
     (
+        KernelError::NoPersistentClock,
+        "this firmware has no persistent clock",
+    ),
+    (
+        KernelError::ClockWentBackwards,
+        "a clock read below a reading already accepted",
+    ),
+    (
         KernelError::Decode(DecodeError::IntegrityFailed),
         "a seal did not match the bytes it covers",
     ),
 ];
+
+/// The position of each `KernelError` in [`KERNEL_ERRORS`], by exhaustive `match`.
+///
+/// The array is a fixed-length list, so a variant added to the enum without a row here
+/// would leave the new message pinned by nothing and every test still green. This match is
+/// what stops that: a new variant is a compile error, and the only index it can be given is
+/// one the array does not have. `crates/waymaker-core/src/error.rs`'s own test module keeps
+/// its copy of the list complete the same way.
+const fn position_of(error: KernelError) -> usize {
+    match error {
+        KernelError::IdExhausted => 0,
+        KernelError::HistoryNearCapacity => 1,
+        KernelError::NondeterministicWorkflow => 2,
+        KernelError::MalformedHistory => 3,
+        KernelError::IncompatibleWorkflow => 4,
+        KernelError::NoPersistentClock => 5,
+        KernelError::ClockWentBackwards => 6,
+        KernelError::Decode(_) => 7,
+    }
+}
+
+#[test]
+fn the_pinned_list_holds_every_kernel_error_once() {
+    // Every index in `0..len`, produced once and in order, which is only possible when the
+    // array lists each variant the match knows exactly once.
+    assert!(
+        KERNEL_ERRORS
+            .iter()
+            .map(|(error, _)| position_of(*error))
+            .eq(0..KERNEL_ERRORS.len())
+    );
+}
 
 #[test]
 fn errors_display_their_message() {

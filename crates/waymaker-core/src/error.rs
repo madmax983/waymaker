@@ -154,6 +154,26 @@ pub enum KernelError {
     /// changed code. A firmware log line that could not tell them apart would send an
     /// engineer to the wrong place.
     MalformedHistory,
+    /// This firmware has no persistent clock, and the timer asked for one.
+    ///
+    /// Design document §11: a monotonic clock returns to zero after a reset and cannot say
+    /// how long the power was absent. A `TimerSpec::AtPersistentTime` therefore needs a
+    /// clock that survives power loss. Where there is none the answer is this refusal, and
+    /// never a downgrade to `AfterBoot` — a downgrade is a delay the device silently
+    /// restarts on every reset, which is the failure §02 decision 8 exists to prevent.
+    NoPersistentClock,
+    /// A clock read below a reading this timer has already been given.
+    ///
+    /// An RTC moves back when its battery is changed or its epoch is re-synchronised. A
+    /// boot clock moves back when the device resets. Either way the elapsed time is
+    /// unknowable, so the kernel refuses rather than crediting or discarding an interval
+    /// it cannot measure.
+    ///
+    /// *Which* accepted reading depends on who asks. `Timer::evaluate` compares against the
+    /// arming reading, which is all a `Copy` value can remember. `PersistentTimer::poll`
+    /// compares against the highest reading it has been shown, so an elapsed deadline
+    /// cannot un-fire. The message names neither, because both are true.
+    ClockWentBackwards,
     /// A record could not be decoded within its bounds.
     Decode(DecodeError),
 }
@@ -176,6 +196,8 @@ impl KernelError {
             Self::NondeterministicWorkflow => "replay diverged from recorded history",
             Self::IncompatibleWorkflow => "this firmware cannot replay this workflow",
             Self::MalformedHistory => "committed history is not a legal record sequence",
+            Self::NoPersistentClock => "this firmware has no persistent clock",
+            Self::ClockWentBackwards => "a clock read below a reading already accepted",
             Self::Decode(error) => error.message(),
         }
     }
@@ -252,12 +274,14 @@ mod tests {
 
     /// Every `KernelError`, with one wrapped decode failure standing for the `Decode` arm,
     /// kept complete the same way as [`DECODE_ERRORS`].
-    const KERNEL_ERRORS: [KernelError; 6] = [
+    const KERNEL_ERRORS: [KernelError; 8] = [
         KernelError::IdExhausted,
         KernelError::HistoryNearCapacity,
         KernelError::NondeterministicWorkflow,
         KernelError::IncompatibleWorkflow,
         KernelError::MalformedHistory,
+        KernelError::NoPersistentClock,
+        KernelError::ClockWentBackwards,
         KernelError::Decode(DecodeError::IntegrityFailed),
     ];
 
@@ -288,7 +312,9 @@ mod tests {
             KernelError::NondeterministicWorkflow => 2,
             KernelError::IncompatibleWorkflow => 3,
             KernelError::MalformedHistory => 4,
-            KernelError::Decode(_) => 5,
+            KernelError::NoPersistentClock => 5,
+            KernelError::ClockWentBackwards => 6,
+            KernelError::Decode(_) => 7,
         }
     }
 

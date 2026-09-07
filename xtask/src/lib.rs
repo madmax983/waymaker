@@ -90,6 +90,7 @@ pub const RULES: &[&str] = &[
     "storage-conformance",
     "storage-contract",
     "swap-discipline",
+    "timer-capability",
     "toolchain-targets",
     "transition-surface",
     "workspace-lints",
@@ -285,6 +286,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_kernel_owns_no_encoding(&inputs.layer_sources));
     violations.extend(source::check_replay_cursor_surface(&inputs.layer_sources));
     violations.extend(source::check_transition_surface(&inputs.layer_sources));
+    violations.extend(source::check_timer_capability(&inputs.layer_sources));
     violations.extend(source::check_storage_contract(&inputs.layer_sources));
     violations.extend(source::check_recovery_surface(&inputs.layer_sources));
     violations.extend(source::check_commit_discipline(&inputs.layer_sources));
@@ -913,6 +915,7 @@ mod tests {
             "storage-conformance",
             "storage-contract",
             "swap-discipline",
+            "timer-capability",
             "toolchain-targets",
             "transition-surface",
             "workspace-lints",
@@ -1029,6 +1032,27 @@ mod tests {
             // above.
             // And the storage contract of §12, which `storage-contract` pins for the
             // same reason: renamed or deleted, the pin checks nothing.
+            // And design document §11's timer semantics and the capability above them,
+            // which `timer-capability` pins in both crates and which fail closed when either
+            // module is absent.
+            size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: format!("crates/{}", source::TIMER_SEMANTICS_PATH),
+                contents: source::tests_support::clean_timer_module(),
+            },
+            size::LayerSource {
+                crate_name: "waymaker-embassy".to_owned(),
+                path: format!("crates/{}", source::CLOCK_CAPABILITY_PATH),
+                contents: source::tests_support::clean_clock_module(),
+            },
+            // And the kernel's crate root, which `timer-capability` reads to check that the
+            // types its member pin found are the ones the crate re-exports. A pin that only
+            // reads a header string is defeated by a rename that leaves a decoy behind.
+            size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: source::tests_support::clean_kernel_root(),
+            },
             size::LayerSource {
                 crate_name: "waymaker-flash".to_owned(),
                 path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),

@@ -1,8 +1,8 @@
 //! Embassy façade for Waymaker.
 //!
-//! This crate owns `Ctx`, activity futures, the dispatcher, wakeups, and optional typed
-//! codec helpers. It is the only crate in the workspace permitted to know that Embassy
-//! exists.
+//! This crate owns `Ctx`, activity futures, the dispatcher, wakeups, the persistent-clock
+//! capability, and optional typed codec helpers. It is the only crate in the workspace
+//! permitted to know that Embassy exists.
 //!
 //! # What this crate must not own
 //!
@@ -14,9 +14,16 @@
 //!
 //! # Status
 //!
-//! Rung 0.0: the crate exists so that the layering is enforceable. The async `Ctx`,
-//! dispatcher, and in-boot timer arrive with rung 0.4.
+//! Rung 0.5's first item is here, ahead of rung 0.4: [`clock`] holds design document §11's
+//! `PersistentClock` capability. It is here rather than later because the layering leaves
+//! nowhere else — the kernel's must-not-own cell names a clock and `waymaker-flash`'s names
+//! timers — and it needs no dispatcher to be correct. The async `Ctx`, the dispatcher and
+//! in-boot sleep still arrive with rung 0.4.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod clock;
+
+pub use clock::{ClockError, PersistentClock, PersistentTimer};

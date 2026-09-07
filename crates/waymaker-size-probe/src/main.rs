@@ -205,8 +205,66 @@ fn engine() -> usize {
     kept = kept.wrapping_add(journal_append());
     kept = kept.wrapping_add(replay_cursor());
     kept = kept.wrapping_add(transition_table());
+    kept = kept.wrapping_add(timers());
 
     core::hint::black_box(kept)
+}
+
+/// Design document §11's timer semantics: both specs, both capabilities, both verdicts.
+///
+/// `#[inline(never)]` on both arms, like every sibling: without it the engine arm can be
+/// folded into [`engine`] while the baseline arm cannot, and the delta stops being measured
+/// the way every row it is compared against is. Every arm is
+/// reached, so the row charges for the refusal as well as for the arithmetic: a firmware
+/// that only linked the happy path would understate the cost of the thing that makes §02
+/// decision 8 hold.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn timers() -> usize {
+    use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
+
+    // The whole spec and the whole capability go through `black_box`, not just the numbers
+    // inside them. Codex found the version that boxed only the `ticks`: the discriminant was
+    // then a compile-time fact, so `admits` folded to `Ok(())`, the `NoPersistentClock`
+    // refusal was unreachable, and the `AtPersistentTime` arms of `clock_kind` and
+    // `evaluate` were dead. The row measured the boot half of §11 and reported it as §11.
+    // With the discriminant opaque, one chain keeps both arms of all three alive.
+    let spec = core::hint::black_box(TimerSpec::AtPersistentTime { instant: 2_000 });
+    let capability = core::hint::black_box(ClockCapability::BootOnly);
+
+    let mut kept = usize::from(spec.clock_kind().0);
+
+    // The refusal, which is the branch a downgrade would have skipped.
+    kept = kept.wrapping_add(match capability.admits(spec) {
+        Ok(()) => 0,
+        Err(error) => error.message().len(),
+    });
+
+    // And an armed timer, read at both verdicts.
+    kept = kept.wrapping_add(
+        match Timer::arm(spec, core::hint::black_box(ClockCapability::Persistent), 10) {
+            Ok(timer) => {
+                let armed = usize::try_from(timer.armed_at()).unwrap_or(0);
+                let kind = usize::from(timer.spec().clock_kind().0);
+                let verdict = match timer.evaluate(core::hint::black_box(20)) {
+                    Ok(Deadline::Elapsed) => 1,
+                    Ok(Deadline::Remaining { ticks }) => usize::try_from(ticks).unwrap_or(0),
+                    Err(error) => error.message().len(),
+                };
+                armed.wrapping_add(kind).wrapping_add(verdict)
+            }
+            Err(error) => error.message().len(),
+        },
+    );
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn timers() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The streaming replay cursor: one run's history walked forwards, record by record.
@@ -1499,10 +1557,45 @@ fn engine() -> usize {
 #[cfg(feature = "facade")]
 #[inline(never)]
 fn facade() -> usize {
-    use waymaker_embassy as _;
+    use waymaker_core::timer::Deadline;
+    use waymaker_embassy::clock::{ClockError, PersistentClock, PersistentTimer};
 
-    // Rung 0.4: drive one dispatcher step here.
-    core::hint::black_box(0)
+    /// A stand-in RTC. The probe is never run, so what the row charges for is the
+    /// capability rather than the driver.
+    ///
+    /// The whole `Result` goes through `black_box`, not the reading inside it. Codex found
+    /// the version that boxed only the reading: the discriminant was then a compile-time
+    /// `Ok`, so every `ClockError::Unavailable` arm folded away and the row omitted a path
+    /// a real fallible clock takes. It is the same mistake the engine row made with a spec's
+    /// discriminant, one type over.
+    struct Rtc(u64);
+
+    impl PersistentClock for Rtc {
+        type Error = ();
+
+        fn now(&mut self) -> Result<u64, ()> {
+            core::hint::black_box(Ok(self.0))
+        }
+    }
+
+    let mut rtc = Rtc(core::hint::black_box(1_000));
+    let kept = match PersistentTimer::arm(&mut rtc, core::hint::black_box(2_000)) {
+        Ok(mut armed) => {
+            let spec = usize::from(armed.timer().spec().clock_kind().0);
+            let verdict = match armed.poll(&mut rtc) {
+                Ok(Deadline::Elapsed) => 1,
+                Ok(Deadline::Remaining { ticks }) => usize::try_from(ticks).unwrap_or(0),
+                Err(ClockError::Unavailable(())) => 2,
+                Err(ClockError::Refused(error)) => error.message().len(),
+            };
+            spec.wrapping_add(verdict)
+        }
+        Err(ClockError::Unavailable(())) => 3,
+        Err(ClockError::Refused(error)) => error.message().len(),
+    };
+
+    // Rung 0.4: drive one dispatcher step here too.
+    core::hint::black_box(kept)
 }
 
 /// Nothing, in an image built without the façade.

@@ -912,6 +912,453 @@ pub fn check_transition_surface(sources: &[crate::size::LayerSource]) -> Vec<Vio
     )
 }
 
+/// The file whose timer semantics `timer-capability` pins.
+pub const TIMER_SEMANTICS_PATH: &str = "waymaker-core/src/timer.rs";
+
+/// The file whose persistent-clock capability `timer-capability` pins.
+pub const CLOCK_CAPABILITY_PATH: &str = "waymaker-embassy/src/clock.rs";
+
+/// Every public function design document §11's timer semantics are allowed to have.
+///
+/// §02 decision 8 is that timer semantics match the hardware's clock and never pretend. The
+/// way that is given back is an *addition*: a `TimerSpec::best_effort(capability)`, a
+/// `Timer::arm_or_downgrade`, a `Timer::force_elapsed`, or a `Deadline::assume_elapsed`
+/// would each break no layering rule, need no dependency, pass every other gate, and turn
+/// §11 into a preference. A test cannot call a function that is not there, so the surface is
+/// pinned and a way to pretend is a line a reviewer writes on purpose.
+///
+/// The pin fails in the other direction too: a name this file no longer declares means the
+/// module was renamed or deleted and the pin has stopped checking anything.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const TIMER_SURFACE: &[&str] = &[
+    "admits",
+    "arm",
+    "armed_at",
+    "clock_kind",
+    "evaluate",
+    "spec",
+];
+
+/// Every public function the persistent-clock capability is allowed to have.
+///
+/// The façade half of the same decision. `PersistentTimer::arm` takes a `&mut C:
+/// PersistentClock`, and it is the only constructor, so a firmware with no clock cannot
+/// write the call — that is issue #32's compile-time half. A `PersistentTimer::assume`, a
+/// `PersistentClock::now_or_zero`, or a second constructor taking a reading the caller chose
+/// would each give it back, and each would pass every other gate.
+///
+/// `now` is on the list because a trait method is callable without `pub` on it.
+///
+/// Sorted, for [`TIMER_SURFACE`]'s reason.
+pub const CLOCK_SURFACE: &[&str] = &["arm", "now", "poll", "timer"];
+
+/// The two timer vocabularies, and the members each may declare.
+///
+/// §11 offers two deadlines and this workspace services two clocks. Both are wire-format
+/// commitments as much as API ones: issue
+/// [#33](https://github.com/madmax983/waymaker/issues/33)'s `TimerScheduled` record carries
+/// the clock kind so that "recovery cannot silently reinterpret one policy as another", and
+/// a third policy is a number spent on media for the life of the format. `Deadline` is here
+/// because a third answer — a "probably elapsed", a "cannot tell" — is exactly the pretence
+/// §02 decision 8 forbids.
+pub const TIMER_TYPES: &[BoundaryType] = &[
+    BoundaryType {
+        header: "pub enum TimerSpec",
+        members: &["AfterBoot", "AtPersistentTime"],
+    },
+    BoundaryType {
+        header: "pub enum ClockCapability",
+        members: &["BootOnly", "Persistent"],
+    },
+    BoundaryType {
+        header: "pub enum Deadline",
+        members: &["Elapsed", "Remaining"],
+    },
+];
+
+/// What the persistent-clock module may not name, and why.
+///
+/// Matched as *identifiers*, over code with its comments and string literals stripped, for
+/// `kernel-boundary`'s reason: a spelling ban is evaded by a longer path that ends in the
+/// same segments, and a doc comment explaining the ban would otherwise trip it.
+///
+/// Both are the boot clock. A module whose whole purpose is the clock that survives power
+/// loss has no honest use for either: reaching for the boot spec is substituting one policy
+/// for the other, and reaching for the boot-only capability is fabricating a refusal or a
+/// permission the caller did not give. Neither breaks a layering rule and neither needs a
+/// dependency, which is why the ban is mechanical.
+pub const CLOCK_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
+    (
+        "AfterBoot",
+        "is the boot deadline; a persistent-clock module that names it is substituting one \
+         clock policy for another, which is the downgrade design document §11 forbids",
+    ),
+    (
+        "BootOnly",
+        "is the capability of a firmware with no persistent clock; a module reached only \
+         through a clock cannot honestly claim it",
+    ),
+];
+
+/// Each timer type and the methods it may declare, at every visibility.
+///
+/// [`TIMER_SURFACE`] counts `pub ` and not `pub(`, which is not enough here. Review of this
+/// change added `pub(crate) const fn arm_or_downgrade(spec, capability, now) -> Self` to
+/// `impl Timer` and watched the gate stay green — the same mutation ADR 0025's review used
+/// on `DurableIntent`, and `pub(crate)` is reach enough for a downgrade, because rung 0.4's
+/// `Ctx` lands in this crate. `effect-protocol` closed it by pinning method *sets* at every
+/// visibility; this is that guard, for the module where the policy lives.
+pub const TIMER_TYPE_METHODS: &[(&str, &[&str])] = &[
+    ("Timer", &["arm", "armed_at", "evaluate", "spec"]),
+    ("TimerSpec", &["clock_kind"]),
+    ("ClockCapability", &["admits"]),
+];
+
+/// The timer types that must stay braced structs with no public field.
+///
+/// `pub struct Timer { pub spec: TimerSpec, pub armed_at: u64 }` adds no function, changes no
+/// enum member, and makes the invariant the whole design rests on — a timer holds the spec it
+/// was armed from — a field any caller can set. `effect-protocol` pins exactly this for
+/// `DurableIntent`, and for the same reason: a public field is a constructor.
+pub const TIMER_BRACED_STRUCTS: &[&str] = &["Timer"];
+
+/// The one way `waymaker-embassy`'s clock module may name a `TimerSpec`.
+///
+/// An identifier blacklist closes one spelling at a time, and review of this change walked
+/// straight past it: `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 };` on
+/// `impl TimerSpec`, reached from `arm` as `TimerSpec::BEST_EFFORT` behind a plausible
+/// "epoch not restored yet" guard. Neither file named `AfterBoot` or `BootOnly`, no surface
+/// changed, and the whole pipeline was green on a persistent deadline served by a clock that
+/// restarts on every reset.
+///
+/// So the pin is positive rather than negative, which is `effect-protocol`'s move: the
+/// module must name a spec — a pin that matches nothing checks nothing — and every name it
+/// gives one must be this one. That closes the associated-const route and every spelling
+/// nobody has thought of, where a blacklist closes the two that were.
+pub const CLOCK_SPEC_CONSTRUCTION: &str = "TimerSpec::AtPersistentTime";
+
+/// Rule: design document §11's timer semantics are the ones that were reviewed, and a
+/// persistent deadline still needs a persistent clock.
+///
+/// Two halves, one id, because it is one decision. The kernel half pins the semantics
+/// module's surface and the three vocabularies §11 and issue #33 rest on. The façade half
+/// pins the capability's surface and refuses the boot clock's vocabulary in the one module
+/// that exists because a boot clock is not good enough.
+///
+/// Both halves fail closed: a module the pin cannot find is a pin that has stopped checking,
+/// which is the failure mode every rule here is written to avoid. Both read the file with
+/// its `#[cfg(test)]` modules removed, for `integrity-check`'s reason — a downgrade written
+/// under `cfg(test)` discharges nothing about the code that ships.
+///
+/// What it cannot see, so that nobody reads more into a green build than is there. It
+/// compares *names*: an `admits` that stopped consulting its argument, or an `evaluate` that
+/// credited an interval it could not measure, are invisible to it and are
+/// `crates/waymaker-core/tests/timer.rs`'s. And it pins one file per half, exactly as
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
+/// pin: an `impl Timer { pub fn force(..) }` in a sibling module of `waymaker-core`, or a
+/// `trait PersistentTimerExt` with a blanket impl beside the façade, adds the door with the
+/// rule silent.
+#[must_use]
+pub fn check_timer_capability(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const KERNEL: &str = "waymaker-core";
+    const FACADE: &str = "waymaker-embassy";
+
+    let mut violations = check_pinned_surface(
+        RULE,
+        KERNEL,
+        TIMER_SEMANTICS_PATH,
+        TIMER_SURFACE,
+        sources,
+        "design document \u{a7}11's semantics are where \u{a7}02 decision 8 is enforced, so a \
+         way to pretend that time passed cannot be added without a reviewer writing it down",
+    );
+
+    if let Some(source) = find_source(sources, TIMER_SEMANTICS_PATH) {
+        let code = without_test_modules(&code_only(&source.contents));
+        let pin = MemberPin {
+            rule: RULE,
+            subject: KERNEL,
+            path: TIMER_SEMANTICS_PATH,
+            table: "TIMER_TYPES",
+            why: "\u{a7}11 offers two deadlines and this workspace services two clocks, and \
+                  issue #33 puts the clock kind on media for the life of the format",
+        };
+        for pinned in TIMER_TYPES {
+            violations.extend(check_boundary_type(&pin, &code, pinned));
+        }
+        violations.extend(check_timer_types(&code));
+    }
+    violations.extend(check_timer_root_reexport(sources));
+
+    violations.extend(check_pinned_surface(
+        RULE,
+        FACADE,
+        CLOCK_CAPABILITY_PATH,
+        CLOCK_SURFACE,
+        sources,
+        "the capability is issue #32's compile-time half \u{2014} a persistent deadline needs \
+         a clock in hand \u{2014} so a second route to one cannot be added without a reviewer \
+         writing it down",
+    ));
+
+    if let Some(source) = find_source(sources, CLOCK_CAPABILITY_PATH) {
+        let code = without_test_modules(&code_only(&source.contents));
+        for (forbidden, why) in CLOCK_FORBIDDEN_VOCABULARY {
+            if names_identifier(&code, forbidden) {
+                violations.push(Violation::new(
+                    RULE,
+                    FACADE,
+                    format!("{CLOCK_CAPABILITY_PATH} names `{forbidden}`, which {why}"),
+                ));
+            }
+        }
+        violations.extend(check_clock_spec_construction(&code));
+    }
+
+    violations
+}
+
+/// Every `TimerSpec` the clock module names is the persistent one, and it names at least one.
+///
+/// Both halves matter. A module that names none has a pin checking nothing; a module that
+/// names another has a downgrade in the file whose whole purpose is that there is not one.
+fn check_clock_spec_construction(code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const FACADE: &str = "waymaker-embassy";
+    const SPEC: &str = "TimerSpec";
+
+    // Without the `use` declarations. An import names the type and constructs nothing, and a
+    // module that may name exactly one spec still has to import it.
+    let code: String = code
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("use "))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let code = code.as_str();
+
+    let mut violations = Vec::new();
+    let mut named = 0_usize;
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+
+    for (index, _) in code.match_indices(SPEC) {
+        let is_identifier = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        if !is_identifier {
+            continue;
+        }
+        named = named.saturating_add(1);
+        let rest = code.get(index..).unwrap_or_default();
+        // A prefix is not a match. Codex found `TimerSpec::AtPersistentTimeFallback`, which
+        // `starts_with` accepts and which an associated constant in the kernel — invisible to
+        // a method pin that reads `fn` — can define as the boot spec. The boundary is what
+        // makes the pin a name rather than a prefix, exactly as `names_identifier` does.
+        let is_the_pinned_spec = rest.starts_with(CLOCK_SPEC_CONSTRUCTION)
+            && rest
+                .get(CLOCK_SPEC_CONSTRUCTION.len()..)
+                .and_then(|tail| tail.chars().next())
+                .is_none_or(|character| !continues(character));
+        if !is_the_pinned_spec {
+            let quoted: String = rest.chars().take(48).collect();
+            violations.push(Violation::new(
+                RULE,
+                FACADE,
+                format!(
+                    "{CLOCK_CAPABILITY_PATH} names a `{SPEC}` other than \
+                     `{CLOCK_SPEC_CONSTRUCTION}`, at `{quoted}`; the persistent-clock module \
+                     may reach exactly one spec, so an associated constant or any other \
+                     spelling cannot stand in for a boot deadline"
+                ),
+            ));
+        }
+    }
+
+    if named == 0 {
+        violations.push(Violation::new(
+            RULE,
+            FACADE,
+            format!(
+                "{CLOCK_CAPABILITY_PATH} names no `{SPEC}`, so the construction pin is \
+                 checking nothing; the module exists to build `{CLOCK_SPEC_CONSTRUCTION}` and \
+                 nothing else"
+            ),
+        ));
+    }
+
+    violations
+}
+
+/// The timer types are declared once, keep their methods, and expose no field.
+fn check_timer_types(code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const KERNEL: &str = "waymaker-core";
+
+    let mut violations = Vec::new();
+
+    for name in TIMER_BRACED_STRUCTS {
+        let header = format!("pub struct {name}");
+        let declarations = declaration_count(code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "{TIMER_SEMANTICS_PATH} declares `{header}` {declarations} times, not \
+                     once; the scans below read the first, so a decoy above the real one is \
+                     what they would check"
+                ),
+            ));
+            continue;
+        }
+        if !declares_braced_struct(code, &header) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{name}` is not a braced struct: the field scan reads the first `{{` \
+                     after the declaration, so a tuple struct would have it reporting on \
+                     whatever follows — and a `pub` tuple field is a spec anybody can rewrite"
+                ),
+            ));
+            continue;
+        }
+        if braced_body(code, &header).is_some_and(|body| count_tokens(body, "pub") != 0) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{name}` declares a public field: the invariant this design rests on is \
+                     that a timer holds the spec it was armed from, and a public field makes \
+                     that a value any caller can set"
+                ),
+            ));
+        }
+    }
+
+    for (name, methods) in TIMER_TYPE_METHODS {
+        let blocks = inherent_impl_bodies(code, name);
+        if blocks.is_empty() {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "{TIMER_SEMANTICS_PATH} declares no inherent `impl` for `{name}`, so its \
+                     methods are pinned against nothing"
+                ),
+            ));
+            continue;
+        }
+        let declared = declared_function_names(&blocks.join("\n"));
+        let mut expected: Vec<String> = methods.iter().map(|method| (*method).to_owned()).collect();
+        expected.sort();
+        if declared != expected {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{name}` declares {declared:?} rather than {expected:?}: read at every \
+                     visibility, because a surface pin counts `pub ` and not `pub(`, and a \
+                     `pub(crate) fn arm_or_downgrade` is reach enough for rung 0.4's `Ctx`, \
+                     which lands in this crate"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// The pinned types are the ones the crate root re-exports.
+///
+/// `check_boundary_type` reads a header string, so it is defeated by a rename that leaves a
+/// decoy behind: rename the shipped `pub enum TimerSpec` to `TimerSpecV2`, keep a
+/// `mod compat { pub enum TimerSpec { AfterBoot, AtPersistentTime } }`, and the member pin
+/// finds the decoy, declared once, with exactly the pinned members. Review of this change ran
+/// that and shipped a third policy with the gate green.
+///
+/// The crate root is what closes it. `waymaker-core` re-exports its vocabulary, so a renamed
+/// type either loses its re-export — reported here — or keeps it, and then the decoy and the
+/// real type collide on one name in one `pub use`, which does not compile.
+fn check_timer_root_reexport(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const KERNEL: &str = "waymaker-core";
+    const ROOT: &str = "waymaker-core/src/lib.rs";
+
+    let Some(source) = find_source(sources, ROOT) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {ROOT} in the workspace, so nothing shows that the pinned timer types are \
+                 the ones this crate ships"
+            ),
+        )];
+    };
+
+    let code = without_test_modules(&code_only(&source.contents));
+    let exported = reexported_from_timer(&code);
+
+    TIMER_TYPES
+        .iter()
+        .map(|pinned| pinned.header)
+        .chain(TIMER_BRACED_STRUCTS.iter().copied())
+        .filter_map(|header| header.rsplit(' ').next())
+        .filter(|name| !exported.contains(*name))
+        .map(|name| {
+            Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "{ROOT} does not re-export `timer::{name}`, so the pinned type is not the \
+                     one the crate ships; a rename that leaves a decoy behind defeats a pin \
+                     that only reads a header string"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The names `pub use timer::…` re-exports, as they are spelled *in the module*.
+///
+/// The source name and not the alias. Codex found the version that only asked whether the
+/// crate root mentioned the identifier: `pub use timer::TimerPolicy as TimerSpec;` mentions
+/// it, so the decoy survived and the rename scenario this function exists to close stayed
+/// open. What is compared now is the left-hand side, which is the name the member pin read.
+///
+/// Both spellings are read — `pub use timer::Timer;` and a braced list — and a list may span
+/// lines, so the scan runs to the `;` rather than to the end of a line. An entry that still
+/// holds a `::` is not one of these: `pub use timer::compat::TimerSpec` re-exports whatever
+/// is in `compat`, which is the decoy the rename left behind.
+fn reexported_from_timer(code: &str) -> BTreeSet<&str> {
+    const PREFIX: &str = "pub use timer::";
+
+    let mut exported = BTreeSet::new();
+    for (index, _) in code.match_indices(PREFIX) {
+        let rest = code.get(index.saturating_add(PREFIX.len())..).unwrap_or("");
+        let Some(end) = rest.find(';') else { continue };
+        let list = rest.get(..end).unwrap_or("");
+        for entry in list
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+        {
+            // The source name, before any `as`. A remaining `::` disqualifies it: the pin is
+            // that `timer::<Name>` is the type the crate ships, and a
+            // `pub use timer::compat::TimerSpec` re-exports the decoy rather than the type
+            // the member pin read.
+            let source = entry.split(" as ").next().unwrap_or("").trim();
+            if !source.is_empty() && !source.contains("::") {
+                exported.insert(source);
+            }
+        }
+    }
+    exported
+}
+
 /// The file whose public surface [`STORAGE_CONTRACT_SURFACE`] pins.
 pub const STORAGE_CONTRACT_PATH: &str = "waymaker-flash/src/storage.rs";
 
@@ -4651,8 +5098,16 @@ pub fn check_kernel_boundary(
         )),
         Some(source) => {
             let code = without_test_modules(&code_only(&source.contents));
+            let pin = MemberPin {
+                rule: RULE,
+                subject: KERNEL,
+                path: KERNEL_BOUNDARY_PATH,
+                table: "BOUNDARY_TYPES",
+                why: "issue #28 asks that adding a record kind not change this signature, \
+                      and \u{a7}09 reserves five kinds nobody has written a body for yet",
+            };
             for pinned in BOUNDARY_TYPES {
-                violations.extend(check_boundary_type(RULE, KERNEL, &code, pinned));
+                violations.extend(check_boundary_type(&pin, &code, pinned));
             }
         }
     }
@@ -4702,13 +5157,34 @@ pub fn check_kernel_boundary(
     violations
 }
 
-/// One pinned boundary type, compared against what the kernel declares.
-fn check_boundary_type(
+/// Where a member pin lives, and why the members it lists are the members it lists.
+///
+/// Shared by `kernel-boundary` and `timer-capability`: both pin a *vocabulary* — the members
+/// a type may declare — and both fail in either direction, so the reader is one function and
+/// everything that differs between them is a field here.
+struct MemberPin<'a> {
+    /// The rule that reports.
     rule: &'static str,
-    subject: &str,
-    code: &str,
-    pinned: &BoundaryType,
-) -> Vec<Violation> {
+    /// The crate the file belongs to.
+    subject: &'a str,
+    /// The file, for the message.
+    path: &'a str,
+    /// The constant holding the pin, so a failure names what to go and read.
+    table: &'static str,
+    /// Why a member added here costs something. One clause, appended to the message.
+    why: &'static str,
+}
+
+/// One pinned type, compared against what the file declares.
+fn check_boundary_type(pin: &MemberPin<'_>, code: &str, pinned: &BoundaryType) -> Vec<Violation> {
+    let MemberPin {
+        rule,
+        subject,
+        path,
+        table,
+        why,
+    } = *pin;
+
     // Before the members, because `braced_body` reads the *first* declaration: a decoy above
     // the real one leaves the pin comparing something nobody ships. `integrity-check` fails
     // over the same shape and this is the same guard.
@@ -4718,9 +5194,8 @@ fn check_boundary_type(
             rule,
             subject,
             format!(
-                "{KERNEL_BOUNDARY_PATH} declares `{}` {declarations} times, not once; the pin \
-                 reads the first declaration, so a second one leaves it comparing a type \
-                 nobody ships",
+                "{path} declares `{}` {declarations} times, not once; the pin reads the \
+                 first declaration, so a second one leaves it comparing a type nobody ships",
                 pinned.header
             ),
         )];
@@ -4730,8 +5205,7 @@ fn check_boundary_type(
             rule,
             subject,
             format!(
-                "{KERNEL_BOUNDARY_PATH} declares no `{}`, so its pinned members are checking \
-                 nothing",
+                "{path} declares no `{}`, so its pinned members are checking nothing",
                 pinned.header
             ),
         )];
@@ -4750,9 +5224,7 @@ fn check_boundary_type(
             rule,
             subject,
             format!(
-                "`{}` declares `{added}`, which BOUNDARY_TYPES does not pin; issue #28 asks \
-                 that adding a record kind not change this signature, and \u{a7}09 reserves \
-                 five kinds nobody has written a body for yet",
+                "`{}` declares `{added}`, which {table} does not pin; {why}",
                 pinned.header
             ),
         ));
@@ -4762,9 +5234,8 @@ fn check_boundary_type(
             rule,
             subject,
             format!(
-                "`{}` no longer declares `{removed}`, which BOUNDARY_TYPES pins; a member \
-                 the pin cannot find means the boundary was renamed and the pin has stopped \
-                 checking it",
+                "`{}` no longer declares `{removed}`, which {table} pins; a member the pin \
+                 cannot find means the type was renamed and the pin has stopped checking it",
                 pinned.header
             ),
         ));
@@ -6682,6 +7153,155 @@ mod deferred_answer_pins {
 
     fn effect_sources(contents: &str) -> Vec<crate::size::LayerSource> {
         vec![layer(EFFECT_PROTOCOL_PATH, contents)]
+    }
+
+    /// The three files `timer-capability` reads, with one of them replaced.
+    fn timer_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        let clean: [(&str, String); 3] = [
+            (TIMER_SEMANTICS_PATH, tests_support::clean_timer_module()),
+            (CLOCK_CAPABILITY_PATH, tests_support::clean_clock_module()),
+            (
+                "waymaker-core/src/lib.rs",
+                tests_support::clean_kernel_root(),
+            ),
+        ];
+        clean
+            .into_iter()
+            .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+            .collect()
+    }
+
+    /// Every violation the rule emits when `path` holds `contents`.
+    fn timer_details(path: &str, contents: &str) -> Vec<String> {
+        check_timer_capability(&timer_sources(path, contents))
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect()
+    }
+
+    #[test]
+    fn the_clean_timer_capability_passes() {
+        assert!(
+            timer_details(TIMER_SEMANTICS_PATH, &tests_support::clean_timer_module()).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_spec_whose_name_merely_starts_with_the_pinned_one_is_reported() {
+        // Codex round 3: `starts_with` accepted `TimerSpec::AtPersistentTimeFallback`, and an
+        // associated constant of that name — invisible to a method pin that reads `fn` — can
+        // be the boot spec. A prefix is not a name.
+        let module = tests_support::clean_clock_module().replace(
+            CLOCK_SPEC_CONSTRUCTION,
+            "TimerSpec::AtPersistentTimeFallback",
+        );
+        let details = timer_details(CLOCK_CAPABILITY_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("names a `TimerSpec` other than")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_clock_module_naming_no_spec_is_reported() {
+        // A pin that matches nothing checks nothing.
+        let module = tests_support::clean_clock_module()
+            .lines()
+            .filter(|line| !line.contains("TimerSpec"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let details = timer_details(CLOCK_CAPABILITY_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("names no `TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_re_export_that_renames_another_type_to_a_pinned_name_is_reported() {
+        // Codex round 3: `pub use timer::TimerPolicy as TimerSpec;` mentions the identifier,
+        // so a check that only asked whether the root named it left the decoy in place. What
+        // is compared is the source name.
+        let root = "//! A kernel crate root.\npub mod timer;\n\
+                    pub use timer::TimerPolicy as TimerSpec;\n\
+                    pub use timer::{ClockCapability, Deadline, Timer};\n";
+        let details = timer_details("waymaker-core/src/lib.rs", root);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("does not re-export `timer::TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_re_export_reaching_through_a_module_is_not_the_pinned_type() {
+        // `pub use timer::compat::TimerSpec` re-exports whatever the rename left in `compat`,
+        // which is the decoy rather than the type the member pin read.
+        let root = "//! A kernel crate root.\npub mod timer;\n\
+                    pub use timer::compat::TimerSpec;\n\
+                    pub use timer::{ClockCapability, Deadline, Timer};\n";
+        let details = timer_details("waymaker-core/src/lib.rs", root);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("does not re-export `timer::TimerSpec`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_pub_crate_downgrade_on_the_timer_is_reported() {
+        // A surface pin counts `pub ` and not `pub(`, and `pub(crate)` is reach enough for
+        // rung 0.4's `Ctx`, which lands in this crate.
+        let module = tests_support::clean_timer_module().replace(
+            "impl Timer {",
+            "impl Timer {\n    pub(crate) fn arm_or_downgrade() {}",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("arm_or_downgrade")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_public_field_on_the_timer_is_reported() {
+        let module = tests_support::clean_timer_module()
+            .replace("    spec: TimerSpec,", "    pub spec: TimerSpec,");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares a public field")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_timer_module_fails_closed() {
+        let details: Vec<String> = check_timer_capability(&[])
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect();
+        assert!(
+            details.iter().any(|detail| detail.contains("timer.rs")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| detail.contains("clock.rs")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| detail.contains("lib.rs")),
+            "{details:?}"
+        );
     }
 
     /// Every violation the rule emits for `source`, so a test cannot pass on another half's
@@ -9310,16 +9930,19 @@ mod deferred_answer_pins {
 #[cfg(test)]
 pub mod tests_support {
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
 
     use super::{
         APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_CALL, APPEND_COMMIT_STEP,
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
         BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
-        CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
-        FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS,
-        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
-        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
-        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TRANSITION_SURFACE,
+        CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE,
+        DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
+        INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
+        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
+        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
+        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES,
+        TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -9363,6 +9986,65 @@ pub mod tests_support {
             }
             source.push_str("}\n");
         }
+        source
+    }
+
+    /// A timer module satisfying every half of `timer-capability`'s kernel side.
+    ///
+    /// Rendered from the pins rather than written out, so a name added to a pin without the
+    /// real module gaining it fails against the real workspace, where it should. The methods
+    /// are rendered inside their `impl` blocks rather than as free functions: the surface pin
+    /// reports a name declared twice, so a fixture that did both would describe a workspace
+    /// the gate rejects for a reason no test here is about.
+    #[must_use]
+    pub fn clean_timer_module() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from("//! A timer module.\n");
+        for pinned in TIMER_TYPES {
+            let _ = writeln!(source, "{} {{", pinned.header);
+            for member in pinned.members {
+                let _ = writeln!(source, "    {member},");
+            }
+            source.push_str("}\n");
+        }
+        for name in TIMER_BRACED_STRUCTS {
+            let _ = writeln!(source, "pub struct {name} {{\n    spec: TimerSpec,\n}}");
+        }
+        for (name, methods) in TIMER_TYPE_METHODS {
+            let _ = writeln!(source, "impl {name} {{");
+            for method in *methods {
+                let _ = writeln!(source, "    pub fn {method}() {{}}");
+            }
+            source.push_str("}\n");
+        }
+        source
+    }
+
+    /// A kernel crate root re-exporting every type `timer-capability` pins.
+    #[must_use]
+    pub fn clean_kernel_root() -> String {
+        let exported: Vec<&str> = TIMER_TYPES
+            .iter()
+            .map(|pinned| pinned.header)
+            .chain(TIMER_BRACED_STRUCTS.iter().copied())
+            .filter_map(|header| header.rsplit(' ').next())
+            .collect();
+        format!(
+            "//! A kernel crate root.\npub mod timer;\npub use timer::{{{}}};\n",
+            exported.join(", ")
+        )
+    }
+
+    /// A clock module declaring exactly [`CLOCK_SURFACE`], naming no boot clock, and
+    /// building the one spec [`CLOCK_SPEC_CONSTRUCTION`] permits.
+    #[must_use]
+    pub fn clean_clock_module() -> String {
+        let mut source = surface("A persistent-clock module.", CLOCK_SURFACE);
+        let _ = writeln!(
+            &mut source,
+            "const SPEC: () = {{ let _ = {CLOCK_SPEC_CONSTRUCTION}; }};"
+        );
         source
     }
 
@@ -9880,6 +10562,8 @@ mod tests {
             .chain(APPEND_SURFACE)
             .chain(CAPACITY_SURFACE)
             .chain(SWAP_SURFACE)
+            .chain(TIMER_SURFACE)
+            .chain(CLOCK_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {
