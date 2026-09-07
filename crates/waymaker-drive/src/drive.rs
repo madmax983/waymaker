@@ -22,6 +22,7 @@ use waymaker_flash::storage::StableStorage;
 
 use crate::activity::{Activities, Performed};
 use crate::boundary::{Boundary, Suspended};
+use crate::effect::{Dispatchable, Effect, Resolution, Resolved, Scheduled};
 use crate::workflow::Workflow;
 
 /// How a run ended, without the bytes it ended with.
@@ -83,11 +84,27 @@ pub enum DriveError<E> {
     /// the chance to say so: §08's divergence check runs at an effect boundary, and a
     /// workflow that ends early reaches none. The fault is the same one.
     HistoryContinues,
-    /// An activity, or a workflow, produced more bytes than the caller's buffer holds.
+    /// The result buffer is narrower than the bound the run declared.
+    ///
+    /// Refused at the start of a boot, before a record is written. An activity is handed a
+    /// buffer of exactly `Bounds::effect_result_bytes`, so a narrower one would make the
+    /// buffer a second, smaller bound that §10 never priced.
+    ResultBufferTooSmall {
+        /// What the run declared its effect results may be worth.
+        needed: usize,
+        /// How many bytes the caller supplied.
+        available: usize,
+    },
+    /// More bytes were offered than may be handed back.
+    ///
+    /// The limit is the narrower of the caller's result buffer and the bound the run
+    /// declared for that payload — §10's `effect_result_bytes` for an effect outcome,
+    /// `terminal_bytes` for a terminal record. A record already on media that exceeds the
+    /// bound is history written under other bounds, and it is refused rather than truncated.
     ResultTooLong {
         /// How many bytes were offered.
         produced: usize,
-        /// How many the buffer holds.
+        /// How many may be handed back.
         available: usize,
     },
     /// An activity input longer than a schedule record can describe.
@@ -127,8 +144,8 @@ pub struct Scratch<'a> {
     /// Where an activity writes its outcome, and where a terminal payload is left.
     ///
     /// Every borrowed byte a workflow sees points in here, and the next boundary overwrites
-    /// it. A result longer than this buffer is [`DriveError::ResultTooLong`] rather than a
-    /// truncation.
+    /// it. It must be at least `Bounds::effect_result_bytes` wide, which
+    /// [`boot`](Driver::boot) refuses before it writes anything.
     pub result: &'a mut [u8],
 }
 
@@ -218,6 +235,15 @@ impl<C: IntegrityCheck> Driver<C> {
         W: Workflow,
     {
         let Scratch { page, result } = scratch;
+        // Before anything reaches media. A boot that discovered this at the first effect
+        // would already have committed the run's opening record.
+        let needed = usize::from(self.reserve.bounds().effect_result_bytes);
+        if result.len() < needed {
+            return Err(DriveError::ResultBufferTooSmall {
+                needed,
+                available: result.len(),
+            });
+        }
         let mut machine = ReplayMachine::new(self.run);
         let mut source = Source::Scanning(Recovery::<C>::with_integrity(self.region));
 
@@ -348,6 +374,21 @@ fn open<E, C: IntegrityCheck>(
     }
 }
 
+/// Takes the writer out of `source`, or refuses.
+///
+/// §07's protocol consumes the writer for the length of one effect, which is what makes a
+/// second appender over one journal unrepresentable. `source` is left [`Source::Spent`]
+/// until [`Context::dispatch`] puts the writer back.
+const fn take<E, C: IntegrityCheck>(source: &mut Source<C>) -> Result<Reserved<C>, DriveError<E>> {
+    match mem::replace(source, Source::Spent) {
+        Source::Writing(reserved) => Ok(reserved),
+        other => {
+            *source = other;
+            Err(DriveError::NoAppendPoint)
+        }
+    }
+}
+
 /// The record at the cursor's position, or [`Next::EndOfHistory`].
 ///
 /// The one place the scan and the kernel are kept in step: an exhausted scan becomes a
@@ -452,18 +493,35 @@ where
 }
 
 /// Copies `outcome`'s bytes into `into`, and says which outcome it was.
-fn store<E>(outcome: Outcome<'_>, into: &mut [u8]) -> Result<(Conclusion, usize), DriveError<E>> {
+///
+/// `bound` is what the run declared this kind of payload may be worth — §10's
+/// `effect_result_bytes` for an effect outcome, `terminal_bytes` for a terminal record. The
+/// limit is the narrower of that and the caller's buffer, and it is the whole of the
+/// one-bound rule on the *reading* side: a roomy buffer must not let a record the run never
+/// priced reach the workflow. Without it a firmware that lowered its bounds would replay a
+/// journal written under the old ones and hand back a payload it would refuse to write.
+fn store<E>(
+    outcome: Outcome<'_>,
+    into: &mut [u8],
+    bound: u16,
+) -> Result<(Conclusion, usize), DriveError<E>> {
     let (conclusion, bytes) = match outcome {
         Outcome::Completed(bytes) => (Conclusion::Completed, bytes),
         Outcome::Failed(bytes) => (Conclusion::Failed, bytes),
     };
-    let available = into.len();
+    let available = into.len().min(usize::from(bound));
     let Some(target) = into.get_mut(..bytes.len()) else {
         return Err(DriveError::ResultTooLong {
             produced: bytes.len(),
             available,
         });
     };
+    if bytes.len() > available {
+        return Err(DriveError::ResultTooLong {
+            produced: bytes.len(),
+            available,
+        });
+    }
     target.copy_from_slice(bytes);
     Ok((conclusion, bytes.len()))
 }
@@ -575,7 +633,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                     return Err(DriveError::HistoryContinues);
                 };
                 machine.advance(record).map_err(DriveError::Kernel)?;
-                Some(store(recorded, result)?)
+                Some(store(recorded, result, reserve.bounds().terminal_bytes)?)
             }
             Next::EndOfHistory => None,
         };
@@ -588,10 +646,11 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             // completed reports `ResultTooLong` on this boot and on every boot after it.
             // Nothing else in this crate is ordered that way: `dispatch` measures an
             // activity's answer before it records one, for the same reason.
-            let recorded = store(outcome, result)?;
+            let recorded = store(outcome, result, reserve.bounds().terminal_bytes)?;
             let record = terminal(outcome);
-            // Advanced before it is written, which is the order every other record here is
-            // in: the kernel says a record may follow, and only then does it reach media.
+            // Advanced before it is written. The schedule and outcome records were already
+            // authorised — `intent()` and `outcome()` answered for them — and this one has
+            // nothing that authorised it, so the kernel is asked before media is touched.
             // §08 has no edge from an unresolved effect to a terminal record, so this is
             // where a run that ended with one outstanding is refused rather than recorded.
             machine.advance(record).map_err(DriveError::Kernel)?;
@@ -625,7 +684,10 @@ enum Half<E> {
 }
 
 /// What the outcome half decided.
-enum Resolved<E> {
+///
+/// Named for the answer rather than for the step, because [`Resolved`](crate::Resolved) is
+/// §07 step 7's own value and two `Resolved`s in one file is one too many.
+enum Answer<E> {
     /// Row 1, already copied into the result buffer.
     Replayed(Conclusion, usize),
     /// Row 2. Dispatch again, under the identity history recorded.
@@ -635,13 +697,53 @@ enum Resolved<E> {
 }
 
 /// What one boundary needs next, once every borrow of the page has been collapsed.
-enum Decision {
+enum Decision<C: IntegrityCheck> {
     /// History answered. The bytes are in the result buffer.
     Replayed(Conclusion, usize),
-    /// The world has to answer, under this identity.
-    Dispatch(EffectId),
+    /// The world has to answer. §07 step 4 takes the value this carries and nothing else.
+    Dispatch(Dispatchable<C>),
     /// The run stops here; `Context::stop` says why.
     Stop,
+}
+
+/// §02 decision 3, as §07 steps 1, 2 and 3.
+///
+/// Split out of [`Context::decide`] for clippy's line budget, and because this is the half
+/// §02 decision 3 is about: the writer leaves `source` here and comes back only in
+/// [`Context::dispatch`], so a run with an effect in flight has no appender.
+fn scheduling<S, C>(
+    source: &mut Source<C>,
+    storage: &mut S,
+    machine: &mut ReplayMachine,
+    page: &mut [u8],
+    stop: &mut Option<Stop<S::Error>>,
+    id: EffectId,
+    request: EffectRequest,
+) -> Decision<C>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    let writer = match take(source) {
+        Ok(writer) => writer,
+        Err(error) => {
+            *stop = Some(Stop::Failed(error));
+            return Decision::Stop;
+        }
+    };
+    let scheduled = Effect::over(id.run, writer).schedule(storage, id.seq, request, page);
+    let Scheduled { dispatch, record } = match scheduled {
+        Ok(scheduled) => scheduled,
+        Err(error) => {
+            *stop = Some(Stop::Failed(error));
+            return Decision::Stop;
+        }
+    };
+    if let Err(error) = machine.advance(record) {
+        *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+        return Decision::Stop;
+    }
+    Decision::Dispatch(dispatch)
 }
 
 impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
@@ -650,7 +752,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
     /// Every arm is a row of design document §08's table. A refusal is recorded in `stop`
     /// rather than returned, because the only thing [`Boundary::call`] may hand a workflow
     /// is [`Suspended`].
-    fn decide(&mut self, kind: ActivityKind, input: &[u8]) -> Decision {
+    fn decide(&mut self, kind: ActivityKind, input: &[u8]) -> Decision<C> {
         let Self {
             storage,
             machine,
@@ -689,10 +791,13 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             Ok(next) => match machine.intent(request, next) {
                 Ok(Intent::Schedule { id }) => Half::Schedule(id),
                 Ok(Intent::Recorded { .. }) => Half::Recorded,
-                Ok(Intent::Finished { outcome }) => match store(outcome, result) {
-                    Ok((conclusion, len)) => Half::Finished(conclusion, len),
-                    Err(error) => Half::Failed(error),
-                },
+                // A terminal record, so the bound is the terminal one.
+                Ok(Intent::Finished { outcome }) => {
+                    match store(outcome, result, reserve.bounds().terminal_bytes) {
+                        Ok((conclusion, len)) => Half::Finished(conclusion, len),
+                        Err(error) => Half::Failed(error),
+                    }
+                }
                 Err(error) => Half::Failed(DriveError::Kernel(error)),
             },
         };
@@ -709,41 +814,37 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
                 });
                 Decision::Stop
             }
-            // §02 decision 3: the intent crosses a durability barrier before the effect, so
-            // the schedule record is committed here and the world hears nothing until it is.
-            Half::Schedule(id) => {
-                let record = RecordRef::EffectScheduled {
-                    seq: id.seq,
-                    kind,
-                    input_len,
-                    input_crc,
-                };
-                if let Err(error) = write(source, *storage, &record, page) {
-                    *stop = Some(Stop::Failed(error));
-                    return Decision::Stop;
-                }
-                if let Err(error) = machine.advance(record) {
-                    *stop = Some(Stop::Failed(DriveError::Kernel(error)));
-                    return Decision::Stop;
-                }
-                Decision::Dispatch(id)
-            }
+            // §02 decision 3, as §07 steps 1 to 3: the intent crosses two barriers before
+            // the effect, and the value step 4 needs does not exist until they returned.
+            Half::Schedule(id) => scheduling(source, *storage, machine, page, stop, id, request),
             Half::Recorded => {
-                let resolved = match peek(source, *storage, page, *reserve) {
-                    Err(error) => Resolved::Failed(error),
+                let answer = match peek(source, *storage, page, *reserve) {
+                    Err(error) => Answer::Failed(error),
                     Ok(next) => match machine.outcome(next) {
-                        Ok(Resolve::Replayed { outcome, .. }) => match store(outcome, result) {
-                            Ok((conclusion, len)) => Resolved::Replayed(conclusion, len),
-                            Err(error) => Resolved::Failed(error),
-                        },
-                        Ok(Resolve::Redeliver { id }) => Resolved::Redeliver(id),
-                        Err(error) => Resolved::Failed(DriveError::Kernel(error)),
+                        Ok(Resolve::Replayed { outcome, .. }) => {
+                            match store(outcome, result, reserve.bounds().effect_result_bytes) {
+                                Ok((conclusion, len)) => Answer::Replayed(conclusion, len),
+                                Err(error) => Answer::Failed(error),
+                            }
+                        }
+                        Ok(Resolve::Redeliver { id }) => Answer::Redeliver(id),
+                        Err(error) => Answer::Failed(DriveError::Kernel(error)),
                     },
                 };
-                match resolved {
-                    Resolved::Replayed(conclusion, len) => Decision::Replayed(conclusion, len),
-                    Resolved::Redeliver(id) => Decision::Dispatch(id),
-                    Resolved::Failed(error) => {
+                match answer {
+                    Answer::Replayed(conclusion, len) => Decision::Replayed(conclusion, len),
+                    // §07 steps 1 to 3 completed in an earlier boot: committed history holds
+                    // the schedule record and no outcome, which is what the kernel just said.
+                    Answer::Redeliver(id) => match take(source) {
+                        Ok(writer) => {
+                            Decision::Dispatch(Effect::over(id.run, writer).redelivering(id.seq))
+                        }
+                        Err(error) => {
+                            *stop = Some(Stop::Failed(error));
+                            Decision::Stop
+                        }
+                    },
+                    Answer::Failed(error) => {
                         *stop = Some(Stop::Failed(error));
                         Decision::Stop
                     }
@@ -752,10 +853,15 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
         }
     }
 
-    /// The world performs `id`, and its answer becomes history before the workflow sees it.
+    /// §07 steps 4 to 7: the world performs the effect, and its answer becomes history
+    /// before the workflow sees it.
+    ///
+    /// The [`Dispatchable`] is the whole of §02 decision 3 here. It is a value only a
+    /// completed step 3 produces, so this function cannot be reached with an intent that is
+    /// not durable.
     fn dispatch(
         &mut self,
-        id: EffectId,
+        dispatchable: Dispatchable<C>,
         kind: ActivityKind,
         input: &[u8],
     ) -> Result<Outcome<'_>, Suspended> {
@@ -766,55 +872,84 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
             page,
             result,
             source,
+            reserve,
             stop,
-            ..
         } = self;
 
-        // Matched once. A second match would need an arm for `Pending`, which cannot be
-        // reached here — and an unreachable arm that picks a record kind is a wrong default
-        // waiting for the day it is reachable.
-        let (produced, failed) = match activities.perform(id, kind, input, result) {
-            Performed::Completed(produced) => (produced, false),
-            Performed::Failed(produced) => (produced, true),
-            Performed::Pending => {
-                *stop = Some(Stop::Waiting(id));
-                return Err(Suspended::NEW);
-            }
-        };
+        let intent = dispatchable.intent();
         let available = result.len();
-        let Some(bytes) = result.get(..produced) else {
-            *stop = Some(Stop::Failed(DriveError::ResultTooLong {
-                produced,
+        let bound = usize::from(reserve.bounds().effect_result_bytes);
+        // Unreachable: `boot` refuses a narrower buffer before anything is written. Spelled
+        // as the refusal it has to be, because the workspace denies a panic.
+        let Some(out) = result.get_mut(..bound) else {
+            *stop = Some(Stop::Failed(DriveError::ResultBufferTooSmall {
+                needed: bound,
                 available,
             }));
             return Err(Suspended::NEW);
         };
 
-        let (outcome, record) = if failed {
-            (
-                Outcome::Failed(bytes),
-                RecordRef::EffectFailed {
-                    seq: id.seq,
-                    error: bytes,
-                },
-            )
-        } else {
-            (
-                Outcome::Completed(bytes),
-                RecordRef::EffectCompleted {
-                    seq: id.seq,
-                    result: bytes,
-                },
-            )
+        // §07 step 4. Matched once. A second match would need an arm for `Pending`, which
+        // cannot be reached here — and an unreachable arm that picks a record kind is a wrong
+        // default waiting for the day it is reachable.
+        let answered = match activities.perform(intent, kind, input, out) {
+            Performed::Completed(produced) => Some((produced, false)),
+            Performed::Failed(produced) => Some((produced, true)),
+            Performed::Exhausted => None,
+            Performed::Pending => {
+                *stop = Some(Stop::Waiting(intent.id()));
+                return Err(Suspended::NEW);
+            }
         };
-        if let Err(error) = write(source, *storage, &record, page) {
-            *stop = Some(Stop::Failed(error));
-            return Err(Suspended::NEW);
-        }
+
+        let resolution = match answered {
+            None => Resolution::Exhausted,
+            // An activity that reported more than the buffer it was handed said the same
+            // thing `Performed::Exhausted` says, in the wrong words: the answer does not fit.
+            // Recorded as exhausted rather than refused, because a refusal here strands the
+            // run for ever — the schedule record is already committed, §08 has no edge from
+            // an unresolved effect to a terminal record, and every later boot meets the same
+            // answer. That is the defect this whole change exists to remove, and it was
+            // still reachable three lines from the fix.
+            Some((produced, _)) if produced > bound => Resolution::Exhausted,
+            Some((produced, failed)) => {
+                let Some(bytes) = out.get(..produced) else {
+                    // Unreachable: the arm above caught it. Spelled as the refusal it has to
+                    // be, because the workspace denies a panic.
+                    *stop = Some(Stop::Failed(DriveError::ResultTooLong {
+                        produced,
+                        available: bound,
+                    }));
+                    return Err(Suspended::NEW);
+                };
+                if failed {
+                    Resolution::Failed(bytes)
+                } else {
+                    Resolution::Completed(bytes)
+                }
+            }
+        };
+
+        // §07 steps 5, 6 and 7. The writer comes back only here, so a run with an effect in
+        // flight has no appender.
+        let Resolved {
+            next,
+            record,
+            outcome,
+        } = match dispatchable.resolve(*storage, resolution, page) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                *stop = Some(Stop::Failed(error));
+                return Err(Suspended::NEW);
+            }
+        };
         if let Err(error) = machine.advance(record) {
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
             return Err(Suspended::NEW);
         }
+        *source = Source::Writing(next.into_writer());
+        // The bytes the record holds, and no others. An exhausted answer shows nothing, and
+        // this is the only outcome §07 lets a caller reach.
         Ok(outcome)
     }
 
@@ -832,7 +967,7 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Boundary for Context<'_
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),
-            Decision::Dispatch(id) => self.dispatch(id, kind, input),
+            Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, kind, input),
             Decision::Stop => Err(Suspended::NEW),
         }
     }

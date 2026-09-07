@@ -61,6 +61,7 @@ pub const RULES: &[&str] = &[
     "dependency-direction",
     "dependency-direction-transitive",
     "diagrams",
+    "effect-protocol",
     "effect-scheduled-fields",
     "embassy-below-facade",
     "empty-default-features",
@@ -301,6 +302,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.layer_sources,
         &inputs.driver_sources,
     ));
+    violations.extend(source::check_effect_protocol(&inputs.driver_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -875,6 +877,7 @@ mod tests {
             "dependency-direction",
             "dependency-direction-transitive",
             "diagrams",
+            "effect-protocol",
             "effect-scheduled-fields",
             "embassy-below-facade",
             "empty-default-features",
@@ -944,11 +947,20 @@ mod tests {
     /// The routing half fails closed when the module is absent, so a fixture without this
     /// would describe a workspace the gate rejects for a reason no test here is about.
     fn clean_driver_sources() -> Vec<size::LayerSource> {
-        vec![size::LayerSource {
-            crate_name: DRIVER_PACKAGE.to_owned(),
-            path: format!("crates/{}", source::DRIVER_PATH),
-            contents: source::tests_support::clean_driver_module(),
-        }]
+        vec![
+            size::LayerSource {
+                crate_name: DRIVER_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::DRIVER_PATH),
+                contents: source::tests_support::clean_driver_module(),
+            },
+            // And §07's protocol, which `effect-protocol` pins for the same reason: gone,
+            // the pin checks nothing.
+            size::LayerSource {
+                crate_name: DRIVER_PACKAGE.to_owned(),
+                path: format!("crates/{}", source::EFFECT_PROTOCOL_PATH),
+                contents: source::tests_support::clean_effect_module(),
+            },
+        ]
     }
 
     /// A `waymaker-rig` whose oracle and census are exactly what `rig-oracle` pins.

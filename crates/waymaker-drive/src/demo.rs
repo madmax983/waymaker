@@ -11,6 +11,8 @@
 //! borrow it arrived in ends there.
 
 use waymaker_core::{ActivityKind, EffectId, Outcome};
+
+use crate::effect::DurableIntent;
 use waymaker_flash::capacity::Bounds;
 
 use crate::activity::{Activities, Performed};
@@ -160,6 +162,8 @@ pub struct World {
     count: usize,
     pending_at: Option<usize>,
     failing_at: Option<usize>,
+    exhausting_at: Option<usize>,
+    exhausting_seq: Option<u32>,
 }
 
 impl World {
@@ -180,6 +184,8 @@ impl World {
             count: 0,
             pending_at: None,
             failing_at: None,
+            exhausting_at: None,
+            exhausting_seq: None,
         }
     }
 
@@ -198,6 +204,31 @@ impl World {
     pub const fn failing_at(nth: usize) -> Self {
         Self {
             failing_at: Some(nth),
+            ..Self::new()
+        }
+    }
+
+    /// A world whose answer at the `nth` dispatch is wider than the bound it was handed.
+    ///
+    /// It writes what fits and then reports [`Performed::Exhausted`], which is the one
+    /// answer a world with too much to say may give.
+    #[must_use]
+    pub const fn exhausting_at(nth: usize) -> Self {
+        Self {
+            exhausting_at: Some(nth),
+            ..Self::new()
+        }
+    }
+
+    /// A world that exhausts the effect whose sequence is `seq`, on every boot.
+    ///
+    /// [`exhausting_at`](Self::exhausting_at) counts dispatches within one boot, so after a
+    /// crash that already resolved an effect it exhausts a different one. This keys off the
+    /// identity the schedule record committed, which is the same on every boot.
+    #[must_use]
+    pub const fn exhausting_seq(seq: u32) -> Self {
+        Self {
+            exhausting_seq: Some(seq),
             ..Self::new()
         }
     }
@@ -231,7 +262,7 @@ impl Default for World {
 impl Activities for World {
     fn perform(
         &mut self,
-        id: EffectId,
+        intent: DurableIntent,
         kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
@@ -241,21 +272,29 @@ impl Activities for World {
             return Performed::Pending;
         }
         if let Some(slot) = self.log.get_mut(nth) {
-            *slot = Dispatch { id, kind };
+            *slot = Dispatch {
+                id: intent.id(),
+                kind,
+            };
         }
         // Counted whether or not the log had room, so a run longer than [`DISPATCH_LOG`]
         // stops *recording* dispatches rather than stops counting them. A `pending_at` that
         // silently stopped advancing would be an instrument that lies.
         self.count = nth.saturating_add(1);
         let answer = if kind == DOWNLOAD { DOWNLOADED } else { HASHED };
-        // The bytes are bounded by the caller's buffer; the *length* is the answer's own.
-        // See [`Performed`]: a world that reported what fit would have the driver record a
-        // truncated result as history rather than refuse it.
-        copy(answer, out);
+        let taken = copy(answer, out);
+        // §07 step 5 takes bounded result bytes. An answer wider than the bound is reported
+        // as exhausted rather than truncated, so no part of it reaches the workflow.
+        if self.exhausting_at == Some(nth)
+            || self.exhausting_seq == Some(intent.id().seq.0)
+            || taken < answer.len()
+        {
+            return Performed::Exhausted;
+        }
         if self.failing_at == Some(nth) {
-            Performed::Failed(answer.len())
+            Performed::Failed(taken)
         } else {
-            Performed::Completed(answer.len())
+            Performed::Completed(taken)
         }
     }
 }

@@ -17,7 +17,7 @@ use waymaker_drive::{
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::BankLayout;
-use waymaker_flash::capacity::Reserve;
+use waymaker_flash::capacity::{Bounds, Reserve};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::Geometry;
@@ -45,11 +45,19 @@ fn region() -> JournalRegion {
 
 /// §10's reserve the driver gates every append with.
 fn reserve() -> Reserve {
+    reserve_for(BOUNDS)
+}
+
+/// The same, for a run that declares something other than the reference workflow's bounds.
+///
+/// The result buffer is sized to `effect_result_bytes`, so a test about a buffer that is too
+/// narrow is a test about a run that declared more than the caller brought.
+fn reserve_for(bounds: Bounds) -> Reserve {
     let Ok(layout) = BankLayout::new(geometry()) else {
         unreachable!("this geometry holds two erase blocks")
     };
-    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
-        unreachable!("the reference workflow's bounds fit this layout")
+    let Ok(reserve) = Reserve::for_layout(bounds, layout) else {
+        unreachable!("these bounds fit this layout")
     };
     reserve
 }
@@ -149,10 +157,16 @@ fn a_recorded_outcome_longer_than_the_callers_buffer_is_refused() {
     let mut workflow = Pipeline::new();
     let mut world = World::new();
     let mut page = [0_u8; 256];
+    // History was written under the reference bounds. This boot declares two bytes, which
+    // is the firmware whose bounds shrank under a journal that is already there.
+    let narrow = Bounds {
+        effect_result_bytes: 2,
+        ..BOUNDS
+    };
     // `DOWNLOAD` recorded twenty-one bytes, and this holds two.
     let mut result = [0_u8; 2];
 
-    let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+    let Err(error) = Driver::new(region(), RUN, reserve_for(narrow)).boot(
         &mut device,
         &mut world,
         &mut workflow,
@@ -169,6 +183,78 @@ fn a_recorded_outcome_longer_than_the_callers_buffer_is_refused() {
             produced: 21,
             available: 2
         }
+    );
+}
+
+#[test]
+fn a_recorded_outcome_longer_than_the_declared_bound_is_refused() {
+    let mut device = a_completed_run();
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    // The bound this boot declares is four bytes. The buffer is not the bound: a roomy
+    // buffer must not let a record the run never priced reach the workflow.
+    let narrow = Bounds {
+        effect_result_bytes: 4,
+        ..BOUNDS
+    };
+    let mut result = [0_u8; 64];
+
+    let Err(error) = Driver::new(region(), RUN, reserve_for(narrow)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a recorded outcome over the declared bound cannot be handed back")
+    };
+    assert_eq!(
+        error,
+        DriveError::ResultTooLong {
+            produced: 21,
+            available: 4
+        }
+    );
+}
+
+#[test]
+fn a_terminal_payload_over_the_declared_bound_is_refused_before_the_record() {
+    let mut device = Device::new(geometry());
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut workflow = Verbose { payload: [7; 32] };
+    // Thirty-two bytes of payload against a sixteen-byte terminal bound, in a roomy buffer.
+    let bounds = Bounds {
+        terminal_bytes: 16,
+        ..BOUNDS
+    };
+    let mut result = [0_u8; 64];
+
+    let Err(error) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("a terminal payload over the declared bound cannot be recorded")
+    };
+    assert_eq!(
+        error,
+        DriveError::ResultTooLong {
+            produced: 32,
+            available: 16
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started"],
+        "the refusal comes before the terminal record"
     );
 }
 
@@ -333,9 +419,15 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
     let mut page = [0_u8; 256];
     let mut workflow = Verbose { payload: [7; 32] };
 
+    // Eight bytes of effect result, so that an eight-byte buffer is a legal one and the
+    // refusal below is about the *terminal* payload rather than about the buffer's width.
+    let bounds = Bounds {
+        effect_result_bytes: 8,
+        ..BOUNDS
+    };
     {
         let mut small = [0_u8; 8];
-        let Err(error) = Driver::new(region(), RUN, reserve()).boot(
+        let Err(error) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
             &mut device,
             &mut world,
             &mut workflow,
@@ -361,7 +453,7 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
     assert_eq!(kinds(&mut device), ["started"]);
 
     let mut roomy = [0_u8; 64];
-    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+    let Ok(progress) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
         &mut device,
         &mut world,
         &mut workflow,
@@ -383,12 +475,93 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
 }
 
 #[test]
-fn an_activity_answer_that_does_not_fit_is_refused_rather_than_recorded_short() {
+fn an_answer_wider_than_the_declared_bound_is_recorded_as_a_failure_with_no_payload() {
+    let mut device = Device::new(geometry());
+    // Nothing synthetic here: the reference world answers `DOWNLOAD` with twenty-one bytes
+    // and the run declares eight, so the world meets the bound it was handed and says so.
+    let bounds = Bounds {
+        effect_result_bytes: 8,
+        ..BOUNDS
+    };
+    let mut world = World::new();
+    let mut workflow = Pipeline::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let Ok(progress) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("an exhausted effect is a recorded failure, not a stuck run")
+    };
+
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: b"download".len()
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started", "scheduled", "failed", "run-failed"],
+        "the run makes progress rather than refusing the same effect on every boot"
+    );
+    assert_eq!(payloads(&mut device).get(2), Some(&0));
+    assert_eq!(world.performed(), 1, "and the effect was performed once");
+}
+
+#[test]
+fn a_world_that_declares_itself_exhausted_is_recorded_the_same_way() {
+    let mut device = Device::new(geometry());
+    // The other route to the same record: a world whose answer fits the buffer but which
+    // reports `Performed::Exhausted` anyway.
+    let mut world = World::exhausting_at(0);
+    let mut workflow = Pipeline::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let Ok(progress) = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    ) else {
+        unreachable!("an exhausted effect is a recorded failure, not a stuck run")
+    };
+
+    // The workflow saw a failed download and took its failure branch. It never saw a byte of
+    // the answer: §07 step 5 records bounded result bytes, and an exhausted answer has none.
+    assert_eq!(
+        progress,
+        Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: b"download".len()
+        }
+    );
+    assert_eq!(
+        kinds(&mut device),
+        ["started", "scheduled", "failed", "run-failed"],
+        "the run makes progress rather than refusing the same effect on every boot"
+    );
+    assert_eq!(payloads(&mut device).get(2), Some(&0));
+}
+
+#[test]
+fn a_result_buffer_narrower_than_the_declared_bound_is_refused_before_any_record() {
     let mut device = Device::new(geometry());
     let mut world = World::new();
     let mut workflow = Pipeline::new();
     let mut page = [0_u8; 256];
-    // `DOWNLOAD` answers with twenty-one bytes, and this holds two.
+    // The run declares thirty-two bytes of effect result, and this holds two.
     let mut result = [0_u8; 2];
 
     let Err(error) = Driver::new(region(), RUN, reserve()).boot(
@@ -400,20 +573,41 @@ fn an_activity_answer_that_does_not_fit_is_refused_rather_than_recorded_short() 
             result: &mut result,
         },
     ) else {
-        unreachable!("a truncated result would be recorded as history and replayed for ever")
+        unreachable!("a buffer narrower than the bound is a second, smaller bound")
     };
+
     assert_eq!(
         error,
-        DriveError::ResultTooLong {
-            produced: 21,
+        DriveError::ResultBufferTooSmall {
+            needed: 32,
             available: 2
         }
     );
-    assert_eq!(
-        kinds(&mut device),
-        ["started", "scheduled"],
-        "the intent is committed and the short answer is not"
+    assert!(
+        kinds(&mut device).is_empty(),
+        "the refusal comes before the run's own record"
     );
+}
+
+/// Every record's payload length, in order.
+fn payloads(device: &mut Device) -> Vec<usize> {
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut out = Vec::new();
+    while let Some(step) = recovery.next(device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        out.push(match record {
+            RecordRef::RunStarted { input, .. } => input.len(),
+            RecordRef::EffectScheduled { .. } => 0,
+            RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
+                result.len()
+            }
+            RecordRef::EffectFailed { error, .. } | RecordRef::RunFailed { error } => error.len(),
+        });
+    }
+    out
 }
 
 /// Appends `record` to the journal as it stands, whatever follows it.

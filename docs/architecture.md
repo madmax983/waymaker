@@ -127,6 +127,18 @@ flowchart TD
   class n1,n2,n3,n4,n5,n6,n7 state;
 ```
 
+`waymaker-drive`'s `effect` module is this picture as three types. `Effect::schedule` is
+steps 1, 2 and 3; it returns a `Dispatchable`, whose `intent` is the only source of the
+`DurableIntent` step 4 takes. `Dispatchable::resolve` is steps 5, 6 and 7, and it returns the
+only `Outcome` a caller can reach — which is step 7's tag as a type. The `effect-protocol`
+rule pins the surface, the construction sites and the order. §07 lives above the layers
+because step 4 is an activity and `waymaker-flash` must not own activities; see
+[ADR 0025](adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md).
+
+An activity whose answer is wider than the bound the run declared resolves as
+`Resolution::Exhausted`, which is an `EffectFailed` with no payload. The run makes progress
+and no part of the answer reaches the workflow.
+
 Step 4 is the one that cannot be made atomic. Power can fail after the activity has changed
 the world and before its outcome is committed, so Waymaker redelivers the same stable
 effect id. **There is no exactly-once physical promise**: exactly-once behavior needs an

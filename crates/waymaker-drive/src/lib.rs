@@ -12,7 +12,11 @@
 //!   propagates with `?` where an async façade would `.await`.
 //! * [`Workflow`] and [`Identity`] — a plain value re-run from its beginning after every
 //!   reset.
-//! * [`Activities`] and [`Performed`] — the world's half, bounded by the caller's buffer.
+//! * [`Activities`] and [`Performed`] — the world's half, bounded by the run's declared
+//!   result bound.
+//! * [`Effect`], [`Dispatchable`], [`DurableIntent`], [`Resolution`], [`Scheduled`] and
+//!   [`Resolved`] — design document §07's seven steps, in an order that is the only order
+//!   that compiles.
 //! * [`Driver`], [`Progress`] and [`DriveError`] — the loop: `waymaker-flash`'s recovery
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
@@ -84,9 +88,11 @@ mod activity;
 mod boundary;
 pub mod demo;
 mod drive;
+mod effect;
 mod workflow;
 
 pub use activity::{Activities, Performed};
 pub use boundary::{Boundary, Suspended};
 pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
+pub use effect::{Dispatchable, DurableIntent, Effect, Resolution, Resolved, Scheduled};
 pub use workflow::{Identity, Workflow};
