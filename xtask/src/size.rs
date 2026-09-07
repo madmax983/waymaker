@@ -735,6 +735,11 @@ impl SizeReport {
 
     /// How much more of `name`'s image the symbol table attributes to the probe than it
     /// does of the baseline's.
+    ///
+    /// A reported figure, and it saturates like every other delta here: a probe that got
+    /// *smaller* reads as 0 rather than as a negative cost. [`Self::layers_flash_of`] does
+    /// not go through it for that reason — it subtracts each image's non-probe bytes, so a
+    /// shrinking probe is counted as the layer growth it is.
     #[must_use]
     pub fn probe_delta_of(&self, name: &str) -> Option<u64> {
         let baseline = self.baseline()?;
@@ -750,10 +755,23 @@ impl SizeReport {
     /// two rows called `default` would have had every one of them gated on the figure of
     /// the first. `--report` gates a document this process did not produce, which is the
     /// same reason the `gated` flag is not taken at its word.
+    ///
+    /// Each image's non-probe bytes, subtracted — rather than the image delta with the
+    /// probe delta taken off it. The two agree while the probe grows and part company when
+    /// it *shrinks*, because a saturating subtraction of the probe term discards the sign
+    /// and hands the difference to nobody: an image 12 200 B larger whose probe is 200 B
+    /// smaller is 12 400 B of layer growth, and the other order reports 12 200 B. That is
+    /// the loosening direction, so the sign is kept where it can be.
+    ///
+    /// `probe_flash` is refused above where it exceeds the image it was read from, so
+    /// neither inner subtraction saturates. The outer one does, for
+    /// [`SectionSizes::saturating_delta`]'s reason: a row that links *less* than the
+    /// baseline is a measurement fault rather than a negative cost.
     #[must_use]
     const fn layers_of(row: &Row, baseline: &Row) -> u64 {
-        let delta = row.sizes.flash.saturating_sub(baseline.sizes.flash);
-        delta.saturating_sub(row.probe_flash.saturating_sub(baseline.probe_flash))
+        let row_layers = row.sizes.flash.saturating_sub(row.probe_flash);
+        let baseline_layers = baseline.sizes.flash.saturating_sub(baseline.probe_flash);
+        row_layers.saturating_sub(baseline_layers)
     }
 
     /// The layers' share of `name`'s flash delta: the image delta less what the probe's
@@ -3192,6 +3210,23 @@ mod tests {
             "{:?}",
             report.shortfalls()
         );
+    }
+
+    #[test]
+    fn a_probe_that_shrank_is_layer_growth_rather_than_nothing() {
+        // The layers' share is each image's non-probe bytes, subtracted. Taking the probe
+        // *delta* off the image delta instead loses the sign when the probe shrinks, and
+        // loses it in the direction that passes: this row is 12200 B larger with 200 B less
+        // probe in it, which is 12400 B of layers and over the budget.
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(12_200, 0, BASELINE_PROBE_FLASH - 5),
+            ],
+            KernelState::measured(),
+        );
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(12_205));
+        assert_eq!(report.probe_delta_of(DEFAULT_ROW), Some(0));
     }
 
     #[test]
