@@ -109,13 +109,13 @@ than a table shortened to what passes.
 
 **A gate holds the five places together.** `xtask::docs::FAILURE_ROWS` is the table, and the
 `failure-matrix` rule fails a build in which a row's variant is answered with another id, or
-none, by the `fn id` body of the rig's vocabulary, has no `#[test]` of its name in the model file, is marked swept and has no
-`#[test]` of its rig name in the rig file, has no `CLAUDE.md` row carrying its failure point,
-its test and its rig standing, or is absent from this ADR. A test under `#[ignore]` or
-`#[cfg(` is not a test. The vocabulary check runs both ways, so a row added to the enum and
-not to the table fails too. Both halves run as the `matrix` stage of the `verification` job,
-for the reason the recovery specification does: a row that stopped holding is legible in the
-checks list under its own name.
+none, by the `fn id` body of the rig's vocabulary, has no `#[test]` of its name in the model
+file whose body names its variant, is marked swept and has no such `#[test]` of its rig name in
+the rig file, has no `CLAUDE.md` row carrying its failure point, its test and its rig standing,
+or is absent from this ADR. A test under `#[ignore]` or `#[cfg(` is not a test. The vocabulary
+check runs both ways, so a row added to the enum and not to the table fails too. Both halves
+run as the `matrix` stage of the `verification` job, for the reason the recovery specification
+does: a row that stopped holding is legible in the checks list under its own name.
 
 ## Consequences
 

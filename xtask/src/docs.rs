@@ -2571,14 +2571,29 @@ fn declares_test(source: &str, name: &str) -> bool {
     })
 }
 
+/// Whether the body of `fn name(` in `source` names `Row::variant`, as an identifier.
+///
+/// The test named after a row has to be about that row. Codex found the check reading the
+/// whole file for the variant, which two tests with their names swapped pass.
+fn test_names_variant(source: &str, name: &str, variant: &str) -> bool {
+    let Some(body) = crate::source::braced_body(source, &format!("fn {name}(")) else {
+        return false;
+    };
+    let wanted = format!("Row::{variant}");
+    body.match_indices(&wanted).any(|(index, _)| {
+        body.get(index + wanted.len()..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|next| !(next.is_ascii_alphanumeric() || next == '_'))
+    })
+}
+
 /// Rule: design document §14's failure-semantics table and the five places it lives agree.
 ///
 /// The same shape as [`check_recovery_spec`]. A row of [`FAILURE_ROWS`] has to be answered
 /// with its id, for its variant, by `Row::id` at [`FAILURE_ROWS_PATH`] and nothing else
-/// there, discharged by a `#[test]` of
-/// its own name at [`FAILURE_MODEL_TESTS_PATH`] in a file that names its variant, discharged
-/// by a `#[test]` of its rig name at [`FAILURE_RIG_TESTS_PATH`] when the table says it is
-/// swept, written down in `CLAUDE.md` with its failure point, its test and its rig standing,
+/// there, discharged by a `#[test]` of its own name at [`FAILURE_MODEL_TESTS_PATH`] whose
+/// body names its variant, discharged by such a `#[test]` of its rig name at
+/// [`FAILURE_RIG_TESTS_PATH`] when the table says it is swept, written down in `CLAUDE.md` with its failure point, its test and its rig standing,
 /// and decided in [`FAILURE_MATRIX_ADR`].
 ///
 /// What it cannot see is whether a named test asserts the row's *behaviour*. That is each
@@ -2672,13 +2687,14 @@ fn check_failure_rows_are_tested(
                         ),
                     ));
                 }
-                if !source.contains(&format!("Row::{}", row.variant)) {
+                if !test_names_variant(&source, row.model_test, row.variant) {
                     violations.push(Violation::new(
                         "failure-matrix",
                         row.id,
                         format!(
-                            "{FAILURE_MODEL_TESTS_PATH} never names `Row::{}`",
-                            row.variant
+                            "{FAILURE_MODEL_TESTS_PATH}'s `fn {}` never names `Row::{}`, so \
+                             the test named after this row is not about it",
+                            row.model_test, row.variant
                         ),
                     ));
                 }
@@ -2704,6 +2720,17 @@ fn check_failure_rows_are_tested(
                         format!(
                             "docs::FAILURE_ROWS says the rig sweeps this row and \
                              {FAILURE_RIG_TESTS_PATH} declares no `#[test] fn {rig_test}`"
+                        ),
+                    ));
+                }
+                if !test_names_variant(&source, rig_test, row.variant) {
+                    violations.push(Violation::new(
+                        "failure-matrix",
+                        row.id,
+                        format!(
+                            "{FAILURE_RIG_TESTS_PATH}'s `fn {rig_test}` never names `Row::{}`, \
+                             so the rig test named after this row is not about it",
+                            row.variant
                         ),
                     ));
                 }
@@ -6155,6 +6182,61 @@ mod tests {
                 "{attribute}: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn two_row_tests_with_their_names_swapped_is_a_violation() {
+        // Codex, round 5 of issue #31: the variant was looked for anywhere in the file, so
+        // two tests with their names swapped kept every variant present and every name
+        // declared, and reported each row's semantics under the other's name.
+        let (Some(first), Some(second)) = (FAILURE_ROWS.first(), FAILURE_ROWS.get(1)) else {
+            unreachable!("the table has ten rows")
+        };
+        let mut inputs = matrix_inputs();
+        inputs.failure_model_tests = inputs.failure_model_tests.map(|tests| {
+            tests
+                .replace(&format!("fn {}(", first.model_test), "fn placeholder(")
+                .replace(
+                    &format!("fn {}(", second.model_test),
+                    &format!("fn {}(", first.model_test),
+                )
+                .replace("fn placeholder(", &format!("fn {}(", second.model_test))
+        });
+        let violations = matrix_violations(&inputs);
+        for row in [first, second] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.subject == row.id && v.detail.contains(row.variant)),
+                "{}: {violations:?}",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_rig_test_whose_body_names_another_row_is_a_violation() {
+        let Some((swept, rig_test)) = FAILURE_ROWS
+            .iter()
+            .find_map(|row| row.rig_test.map(|test| (row, test)))
+        else {
+            unreachable!("the rig sweeps six rows")
+        };
+        let mut inputs = matrix_inputs();
+        inputs.failure_rig_tests = inputs.failure_rig_tests.map(|tests| {
+            tests.replacen(
+                &format!("Row::{}", swept.variant),
+                "Row::ReplayDivergence",
+                1,
+            )
+        });
+        let violations = matrix_violations(&inputs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.subject == swept.id && v.detail.contains(rig_test)),
+            "{violations:?}"
+        );
     }
 
     #[test]
