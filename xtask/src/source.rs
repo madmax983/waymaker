@@ -4383,20 +4383,9 @@ fn check_effect_steps(code: &str) -> Vec<Violation> {
         // Counted and located on one whitespace-free copy, so a count and a position cannot
         // disagree about which occurrence they mean.
         let tight = tightened(body);
-        // A closure bound to a name puts the three calls at the body's own nesting, and
-        // nothing but the `|` says they are not what the body does. Neither of these two
-        // bodies has any use for one.
-        if tight.contains('|') {
-            violations.push(Violation::new(
-                RULE,
-                DRIVER,
-                format!(
-                    "`{owner}::{body_name}` declares a closure: \u{a7}07's steps have to be \
-                     what this body does, and a closure is a body of its own that may never \
-                     be called"
-                ),
-            ));
-        }
+        violations.extend(check_effect_step_body_is_unconditional(
+            owner, body_name, &tight,
+        ));
         let mut previous = 0_usize;
         for step in EFFECT_STEPS {
             if tight.matches(step).count() != 1 {
@@ -4468,6 +4457,52 @@ fn check_effect_steps(code: &str) -> Vec<Violation> {
     }
 
     violations.extend(check_effect_proof_position(code));
+    violations
+}
+
+/// A step body runs its steps unconditionally, as far as a scanner can tell.
+///
+/// Two rounds of review reached the same shape from two directions.
+/// `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has no braces, and
+/// `false && self.writer.stage(..)?…` has no nesting either: both put all three pinned calls
+/// once, in order, at depth zero, in code that never runs.
+///
+/// A scanner cannot follow control flow, so it refuses the constructs that create it. `|`
+/// covers a closure and the `||` half of a short-circuit at once. Neither of the two bodies
+/// this runs on has any use for either. That is a syntactic answer to a semantic question and
+/// holds only as far as this list does, which
+/// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
+/// says plainly.
+fn check_effect_step_body_is_unconditional(
+    owner: &str,
+    body_name: &str,
+    tight: &str,
+) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    if tight.contains('|') {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{owner}::{body_name}` declares a closure, or short-circuits with `||`: \
+                 \u{a7}07's steps have to be what this body does, and a closure is a body of \
+                 its own that may never be called"
+            ),
+        ));
+    }
+    if tight.contains("&&") {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{owner}::{body_name}` short-circuits with `&&`: the right-hand side of one \
+                 is code that may never run, and \u{a7}07's steps have to be what this body does"
+            ),
+        ));
+    }
     violations
 }
 
@@ -7014,6 +7049,28 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("declares a closure")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_body_that_short_circuits_its_barriers_is_reported() {
+        // Codex round 3. `false && self.writer.stage(..)?.payload_barrier(..)?.commit(..)?`
+        // puts all three calls once, in order, at nesting depth zero, in a right-hand side
+        // that never runs. `||` was already refused by the closure ban; `&&` was not.
+        let source = tests_support::clean_effect_module().replacen(
+            "        self.writer\n            .stage(storage, &record, page)\n\
+             \x20           .payload_barrier(storage)\n            .commit(storage);",
+            "        let _ = false\n            && self.writer\n\
+             \x20               .stage(storage, &record, page)\n\
+             \x20               .payload_barrier(storage)\n                .commit(storage);",
+            1,
+        );
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("short-circuits")),
             "{details:?}"
         );
     }
