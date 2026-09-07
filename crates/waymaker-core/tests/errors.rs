@@ -73,7 +73,7 @@ const KERNEL_ERRORS: [(KernelError, &str); 8] = [
     ),
     (
         KernelError::ClockWentBackwards,
-        "a clock read below its arming reading",
+        "a clock read below a reading already accepted",
     ),
     (
         KernelError::Decode(DecodeError::IntegrityFailed),

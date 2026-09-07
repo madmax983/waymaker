@@ -65,7 +65,11 @@ by the other fires early or late with nothing to say so.
 Both subtractions happen after the reading has been checked against the arming reading, so no
 input wraps a deadline into the past or into a future that never arrives. A reading below the
 arming reading is `KernelError::ClockWentBackwards` rather than a credited or a discarded
-interval.
+interval. Its message says "a clock read below a reading already accepted" rather than naming
+the arming reading, because the two callers compare against different floors: `Timer::evaluate`
+against the arming reading, which is all a `Copy` value can remember, and
+`PersistentTimer::poll` against the highest reading it has been shown. Codex found the message
+naming only the first, which would have sent a firmware log to the wrong regression.
 
 `ClockCapability::admits` names every pair and uses no `_`. That is the finding this change's
 own review turned up, and it inverts the reasoning: with a wildcard, a third spec added later
@@ -81,6 +85,15 @@ found that a clock which moved back *after* a poll, but stayed above the arming 
 believed: a deadline reported `Elapsed` and then `Remaining` on the next look. A timer that
 un-fires is worse than one that never fired, and `PersistentClock`'s contract — "poll catches
 it" — was not true without this.
+
+The size probe drives a spec whose *discriminant* is opaque, not merely one whose fields are.
+Codex found the version that boxed only the `ticks`: `TimerSpec::AfterBoot` was then a
+compile-time fact, so `admits` folded to `Ok(())`, the `NoPersistentClock` refusal was
+unreachable, and the `AtPersistentTime` arms of `clock_kind` and `evaluate` were dead. The row
+measured the boot half of §11 and reported it as §11. The correction is 40 B — 18338 B to
+18378 B, before the message fix below took it to 18386 B — which is the size of the answer,
+and the reason the finding was a P1 rather than a tidy-up: 40 B of unmeasured code against
+what was then 94 B of headroom.
 
 `ClockKind` spends two numbers now — 1 for the boot clock, 2 for the persistent one, and zero
 for neither, so an erased or zeroed field does not decode as a policy. That is the same move
@@ -121,13 +134,13 @@ does the same across a power loss and requires the first look to say `Elapsed`.
 
 The `facade` row of `cargo xtask size` measures something for the first time. It read 0 B and
 carried a standing notice — "either it costs nothing, or `waymaker-size-probe` does not reach
-any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 280 B,
+any code the feature adds" — because `waymaker-embassy` declared no code. It now reads 292 B,
 and the notice is gone.
 
-The code-flash figure is the number worth recording. §11's vocabulary cost **236 B**: 18102 B
-to 18338 B against the same 18 KiB gate,
+The code-flash figure is the number worth recording. §11's vocabulary cost **284 B**: 18102 B
+to 18386 B against the same 18 KiB gate,
 [ADR 0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) asked for no
-third raise and there is none. What that leaves is 94 B of headroom, which is not enough for
+third raise and there is none. What that leaves is 46 B of headroom, which is not enough for
 rung 0.5's remaining work: issue #33's two record bodies and their codec will not fit under
 it. A third of the measured figure is still the size probe's own arithmetic rather than the
 engine's, which is issue [#72](https://github.com/madmax983/waymaker/issues/72), and that

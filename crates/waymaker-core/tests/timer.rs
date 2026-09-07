@@ -162,7 +162,7 @@ fn a_persistent_timer_is_refused_rather_than_downgraded_without_a_clock() {
     );
     assert_eq!(
         KernelError::ClockWentBackwards.message(),
-        "a clock read below its arming reading",
+        "a clock read below a reading already accepted",
         "the other refusal a timer can produce, pinned so the two cannot be swapped"
     );
 }

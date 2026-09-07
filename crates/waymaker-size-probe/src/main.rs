@@ -223,24 +223,26 @@ fn engine() -> usize {
 fn timers() -> usize {
     use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
 
-    let spec = TimerSpec::AfterBoot {
-        ticks: core::hint::black_box(50),
-    };
+    // The whole spec and the whole capability go through `black_box`, not just the numbers
+    // inside them. Codex found the version that boxed only the `ticks`: the discriminant was
+    // then a compile-time fact, so `admits` folded to `Ok(())`, the `NoPersistentClock`
+    // refusal was unreachable, and the `AtPersistentTime` arms of `clock_kind` and
+    // `evaluate` were dead. The row measured the boot half of §11 and reported it as §11.
+    // With the discriminant opaque, one chain keeps both arms of all three alive.
+    let spec = core::hint::black_box(TimerSpec::AtPersistentTime { instant: 2_000 });
+    let capability = core::hint::black_box(ClockCapability::BootOnly);
 
-    // The refusal, which is the branch a downgrade would have skipped. Reached through the
-    // predicate rather than through a second spec value: a third of the measured figure is
-    // already the probe's own arithmetic, which is issue #72.
     let mut kept = usize::from(spec.clock_kind().0);
-    kept = kept.wrapping_add(
-        match core::hint::black_box(ClockCapability::BootOnly).admits(spec) {
-            Ok(()) => 0,
-            Err(error) => error.message().len(),
-        },
-    );
+
+    // The refusal, which is the branch a downgrade would have skipped.
+    kept = kept.wrapping_add(match capability.admits(spec) {
+        Ok(()) => 0,
+        Err(error) => error.message().len(),
+    });
 
     // And an armed timer, read at both verdicts.
     kept = kept.wrapping_add(
-        match Timer::arm(spec, ClockCapability::Persistent, core::hint::black_box(10)) {
+        match Timer::arm(spec, core::hint::black_box(ClockCapability::Persistent), 10) {
             Ok(timer) => {
                 let armed = usize::try_from(timer.armed_at()).unwrap_or(0);
                 let kind = usize::from(timer.spec().clock_kind().0);

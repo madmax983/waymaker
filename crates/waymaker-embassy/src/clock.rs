@@ -243,8 +243,10 @@ impl<C: PersistentClock> PersistentTimer<C> {
     /// # Errors
     ///
     /// [`ClockError::Unavailable`] when the clock cannot be read, and
-    /// [`ClockError::Refused`] when it read below the highest reading this timer has seen.
-    /// The high-water mark is what makes an elapsed deadline stay elapsed: `armed_at` alone
+    /// [`ClockError::Refused`] when it read below the highest reading this timer has seen —
+    /// which is not the same as below the arming reading, and is why
+    /// [`KernelError::ClockWentBackwards`]'s message says "a reading already accepted". The
+    /// high-water mark is what makes an elapsed deadline stay elapsed: `armed_at` alone
     /// believed any backwards move that stayed above it.
     pub fn poll(&mut self, clock: &mut C) -> Result<Deadline, ClockError<C::Error>> {
         let reading = clock.now().map_err(ClockError::Unavailable)?;

@@ -162,12 +162,17 @@ pub enum KernelError {
     /// never a downgrade to `AfterBoot` — a downgrade is a delay the device silently
     /// restarts on every reset, which is the failure §02 decision 8 exists to prevent.
     NoPersistentClock,
-    /// A clock read below the reading a timer was armed at.
+    /// A clock read below a reading this timer has already been given.
     ///
     /// An RTC moves back when its battery is changed or its epoch is re-synchronised. A
     /// boot clock moves back when the device resets. Either way the elapsed time is
     /// unknowable, so the kernel refuses rather than crediting or discarding an interval
     /// it cannot measure.
+    ///
+    /// *Which* accepted reading depends on who asks. `Timer::evaluate` compares against the
+    /// arming reading, which is all a `Copy` value can remember. `PersistentTimer::poll`
+    /// compares against the highest reading it has been shown, so an elapsed deadline
+    /// cannot un-fire. The message names neither, because both are true.
     ClockWentBackwards,
     /// A record could not be decoded within its bounds.
     Decode(DecodeError),
@@ -192,7 +197,7 @@ impl KernelError {
             Self::IncompatibleWorkflow => "this firmware cannot replay this workflow",
             Self::MalformedHistory => "committed history is not a legal record sequence",
             Self::NoPersistentClock => "this firmware has no persistent clock",
-            Self::ClockWentBackwards => "a clock read below its arming reading",
+            Self::ClockWentBackwards => "a clock read below a reading already accepted",
             Self::Decode(error) => error.message(),
         }
     }

@@ -451,7 +451,7 @@ a figure a third of which is the probe is a raise argued from the wrong number. 
 [#26](https://github.com/madmax983/waymaker/issues/26)'s bank swap is to be measured against
 a corrected figure rather than against a third raise, and it was: §10's seven-step swap
 lands at **18098 B** against the same 18 KiB gate, with no raise asked for. §11's timer
-vocabulary then took it to **18338 B** against that same gate, leaving 94 B —
+vocabulary then took it to **18386 B** against that same gate, leaving 46 B —
 [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md), which
 says plainly that issue #33's record bodies do not fit under it.
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md)
@@ -1554,9 +1554,9 @@ two identifiers outright: a persistent-clock module that names `AfterBoot` or `B
 either substituting one policy for the other or fabricating a permission.
 Two things came out of this rather than out of reading the code. The `facade` row of
 `cargo xtask size` measured 0 B and carried a standing notice asking for something to call,
-because `waymaker-embassy` declared no code at all; it now reads 280 B and the notice is gone.
-And the budget is the number worth recording: §11's vocabulary cost 236 B, 18102 B to
-18338 B against the same 18 KiB gate and no third raise, which leaves 94 B — not enough for
+because `waymaker-embassy` declared no code at all; it now reads 292 B and the notice is gone.
+And the budget is the number worth recording: §11's vocabulary cost 284 B, 18102 B to
+18386 B against the same 18 KiB gate and no third raise, which leaves 46 B — not enough for
 issue #33's two record bodies, so issue #72 is now this rung's binding constraint rather than
 a tidy-up. What is owed is written down: the backwards-clock floor lives in RAM and so is only
 a floor within one arming, which is one reason #33's record carries the arming reading; and
