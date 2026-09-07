@@ -74,9 +74,11 @@ first "done when" names: crash points at which the crashed boot had *already per
 effect and its outcome record did not commit. Those are counted, and a sweep in which none
 occurred fails.
 
-The digest cases are two, on purpose: an input of the recorded length with a different byte,
-and an input of a different length. §09 records both and the pair is compared whole, so a
-single case would leave one half tested by nothing.
+The digest cases are two: an input of the recorded length with a different byte, and a
+shorter one. A driver cannot vary one half of §09's digest alone, because a shorter input has
+a different checksum too — that isolation is the kernel's, in
+`crates/waymaker-core/tests/transition.rs`. What these two hold is the driver's half: the
+digest it computes is a digest of the bytes the workflow passed.
 
 ## Consequences
 

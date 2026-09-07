@@ -1360,7 +1360,8 @@ finding none fails the build. Both were watched failing against a driver that re
 digest half is §08's fourth row at the driver rather than at the kernel: a changed input on a
 resolved effect stops the run, and — the sharper case — a changed input on an *outstanding*
 one stops it rather than redelivering, which is issue #30's "not a silent re-dispatch". Two
-inputs, because §09 records a length and a checksum and compares the pair whole. No retry
+inputs, of the recorded length and of another; a driver cannot vary one half of §09's digest
+alone, so isolating the length from the checksum stays `waymaker-core`'s. No retry
 *policy* is introduced: §16 leaves `retry-policy-placement` open at rung 0.4, and a driver
 that decided when to try again would settle a deferred question by accident. What Waymaker
 promises is now stated where an implementer reads it, on `Activities` itself: one effect can

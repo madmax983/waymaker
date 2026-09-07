@@ -283,17 +283,21 @@ impl Workflow for Tampered {
     }
 }
 
-/// The two ways §09's recorded digest can disagree, as static inputs `Tampered` can hold.
+/// Two inputs the recorded run never passed: one of the recorded length, one shorter.
 ///
-/// The pair is compared whole, so both halves need a case: a length change with a colliding
-/// checksum is exactly what a checksum alone waves through.
+/// §09 records a length and a checksum, and the kernel compares the pair whole. A driver
+/// cannot vary one half alone, because a shorter input has a different checksum too. That
+/// isolation is the kernel's: `waymaker-core/tests/transition.rs` holds the checksum still in
+/// `a_different_input_length_is_divergence` and the length still in its neighbour. What these
+/// two hold is the driver's half — the digest it computes is a digest of the bytes the
+/// workflow passed, at the recorded length and at another one.
 const OTHER_BYTES: &[u8] = b"Xontents-of-the-thing";
 const OTHER_LENGTH: &[u8] = b"contents-of-the-thin";
 
 #[test]
-fn the_tampered_inputs_differ_from_the_recorded_one_in_one_way_each() {
-    // Without this the two cases below could both be length changes, and the checksum half
-    // of §09's digest would be tested by nothing.
+fn one_tampered_input_keeps_the_recorded_length_and_one_does_not() {
+    // Without this both cases could be length changes, and a driver that digested a length
+    // instead of the bytes would pass them both.
     assert_eq!(OTHER_BYTES.len(), DOWNLOADED.len());
     assert_ne!(OTHER_BYTES, DOWNLOADED);
     assert_ne!(OTHER_LENGTH.len(), DOWNLOADED.len());
