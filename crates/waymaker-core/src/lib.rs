@@ -2,8 +2,8 @@
 //!
 //! A workflow is re-created from its beginning after reboot and deterministically replayed
 //! through an ordered journal. This crate owns that semantics and nothing else:
-//! borrowed record views, effect identity, the replay cursor, transition rules, and
-//! capacity errors.
+//! borrowed record views, effect identity, the replay cursor, transition rules, timer
+//! semantics, and capacity errors.
 //!
 //! # What this crate must not own
 //!
@@ -24,10 +24,11 @@
 //!
 //! # Status
 //!
-//! Rung 0.1 in progress: effect identity, the activity kind vocabulary, the allocator, the
-//! error vocabulary, the borrowed record views and the streaming replay cursor are here;
-//! §08's transition rules and divergence detection follow. The bytes those views are
-//! decoded from belong to `waymaker-flash`.
+//! Effect identity, the activity kind vocabulary, the allocator, the error vocabulary, the
+//! borrowed record views, the streaming replay cursor and §08's transition rules are here,
+//! and so is [`timer`] — design document §11's deadlines, with no clock behind them,
+//! because the kernel reads none. The bytes those views are decoded from belong to
+//! `waymaker-flash`; the persistent-clock capability belongs to `waymaker-embassy`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -39,6 +40,7 @@ pub mod error;
 pub mod id;
 pub mod record;
 pub mod replay;
+pub mod timer;
 pub mod transition;
 
 pub use activity::{ActivityKind, ActivityName};
@@ -46,4 +48,5 @@ pub use error::{DecodeError, KernelError};
 pub use id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
 pub use record::{RecordKind, RecordRef};
 pub use replay::{PendingEffect, Position, ReplayCursor, Step};
+pub use timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 pub use transition::{Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve};

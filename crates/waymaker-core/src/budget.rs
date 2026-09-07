@@ -167,9 +167,13 @@ macro_rules! kernel_state_types {
 // rather than the bytes themselves, which is why its size is target-dependent and is
 // budgeted through this registry rather than pinned to a literal beside its declaration.
 // The context joins them at rung 0.4.
+// An armed timer is live for as long as the run waits on it, so it is charged here too.
+// It holds the spec it was armed from and the reading it was armed at; §11 needs both, and
+// the size is target-independent because neither is a pointer.
 kernel_state_types! {
     crate::transition::ReplayMachine,
     crate::record::RecordRef<'static>,
+    crate::timer::Timer,
 }
 
 /// The assertion macro, documented beside the constants it is stated against.

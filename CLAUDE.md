@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 46 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 47 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -329,9 +329,9 @@ gate renders it; the `claude-md` rule compares the two.
 
 | Crate | Owns | May depend on |
 | --- | --- | --- |
-| `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, capacity errors | nothing |
+| `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, timer semantics and the clock-kind vocabulary, capacity errors | nothing |
 | `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, the capacity reserve, the seven-step bank swap and `continue_as_new`, compaction transition | waymaker-core |
-| `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, optional typed codec helpers | waymaker-core, waymaker-flash |
+| `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, the persistent-clock capability, optional typed codec helpers | waymaker-core, waymaker-flash |
 
 ### The must-not-own table
 
@@ -543,7 +543,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 46 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 47 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -564,6 +564,7 @@ this table is how you find out what a red build is telling you.
 | `swap-discipline` | §10's bank swap gains a public function `source::SWAP_SURFACE` does not list, in either direction — or its step order comes apart: a state in `source::SWAP_TYPESTATE` declares anything but the one method its row names, `Staged` names `program`, a value in `source::SWAP_CONSTRUCTIONS` is built anywhere but inside the body its row names, `payload_barrier` stops taking `source::SWAP_BARRIER_CALL`, or a row of `source::SWAP_ERASE_CALLS` stops erasing exactly the bank it names, before a barrier, without naming the other one. Issue [#26](https://github.com/madmax983/waymaker/issues/26) states §10 as seven steps and two recovery rules — "a crash before step 5 recovers the old run, a crash after step 6 recovers the new run" — and every one of those is a statement about *where the barriers are*. A `Prepared::commit` skipping the header, a `Staged::seal_now` skipping the payload barrier, an `Installed` built anywhere but in `commit`, or a `Swap::install(bank)` taking the bank to erase from its caller would each break no other rule and turn a protocol into a convention. The erase rows are the sharpest: which bank a swap clears is derived from the authority the device booted, and a `prepare` that erased the *retiring* bank is a device clearing the run it is executing. What it cannot see is whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness, nor whether the crash windows behave — that is `crates/waymaker-fault/tests/swap.rs`, at every crash point of all seven steps. |
 | `rig-oracle` | `waymaker-rig`'s oracle or its census gains a public function `source::RIG_AUDIT_SURFACE` or `source::RIG_CENSUS_SURFACE` does not list, in either direction — or either file is gone, so the pin checks nothing. A rig is the one piece of code here whose bugs are *invisible*: a firmware bug shows up as a failing test, a rig bug as a passing one. Every way of giving the instrument back is an addition — an `Audit::assume_passed`, an `Audit::ignore`, a `Breach::suppress`, a second `finish` taking the authority count as advisory, a `Coverage::force_complete`, a `Gap::ignore` — and each would break no other rule, need no dependency and pass every test that exists. The census is a file of its own rather than part of `phase.rs` for this rule's sake: `Phase` and `ResetCause` each declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell two such declarations apart. What it cannot see is whether the oracle's arithmetic is right — `crates/waymaker-rig/tests/teeth.rs` is what holds that, with two writers wrong in one way each and a control writer required to pass. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
+| `timer-capability` | Design document §11's timer semantics stop being the ones that were reviewed, in either half. The *kernel* half: `waymaker-core/src/timer.rs` gains or loses a public function `source::TIMER_SURFACE` lists, or a type in `source::TIMER_TYPES` — `TimerSpec`, `ClockCapability`, `Deadline` — is declared twice, is gone, or declares a member set other than its row's. The *façade* half: `waymaker-embassy/src/clock.rs` gains or loses a public function `source::CLOCK_SURFACE` lists, or names one of `source::CLOCK_FORBIDDEN_VOCABULARY` — `AfterBoot`, `BootOnly`, matched as *identifiers* over code with its comments stripped. §02 decision 8 is that timer semantics match the hardware's clock and never pretend, and every way of giving that back is an *addition*: a `TimerSpec::best_effort(capability)`, a `Timer::arm_or_downgrade`, a `Timer::force_elapsed`, a `PersistentClock::now_or_zero`, a third `Deadline` meaning "cannot tell", or a second constructor for a persistent timer that takes a reading rather than a clock. Each would break no layering rule, need no dependency, and pass every other gate. The two banned identifiers are the boot clock: a module that exists because a boot clock is not good enough has no honest use for either. The member sets are a wire-format commitment as much as an API one — issue #33 puts the clock kind on media for the life of the format. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is an `admits` that stopped consulting its argument or an `evaluate` that credited an interval it could not measure, which is `crates/waymaker-core/tests/timer.rs`'s; and each half pins one file, so a door added from a sibling module is a door the rule is silent about. [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md). |
 | `kernel-boundary` | Design document §06's kernel boundary stops being the one that was reviewed, in either half. The *shape* half: a type in `source::BOUNDARY_TYPES` — `EffectRequest`, `Intent`, `Resolve`, `Outcome`, `Next` — declares a member the pin does not have, or stops declaring one it does, or is gone so the pin checks nothing. Issue [#28](https://github.com/madmax983/waymaker/issues/28) asks that "adding a new record kind does not change this signature", and §09 numbers eleven record kinds of which five — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`, `SIGNAL_RECEIVED`, `CHILD_STARTED` — have no body yet. A `Resolve::TimerFired` arriving with the first of them would break no other rule, need no dependency, and turn one boundary into a boundary per record. The *routing* half: `waymaker-drive`'s driver stops naming a row of `source::BOUNDARY_DECISIONS`, or grows one of `source::DRIVER_FORBIDDEN_VOCABULARY` — `RecordKind`, `Step` or `EffectIdAllocator`, matched as *identifiers*, because a `Step::` spelling ban is evaded by `Step ::Record` and by `use …::Step as S;` and fires on an unrelated `BootStep::`. A driver that decided from a record rather than from `Intent` and `Resolve` would be a second transition table, and the one below it would no longer be where §08 is enforced. The allocator is issue [#30](https://github.com/madmax983/waymaker/issues/30)'s: §14's fourth guarantee is that a retry and a reboot redeliver the *original* identity, and the driver keeps it by never having an identity of its own — every `(RunId, EffectSeq)` it dispatches under comes from `Intent::Schedule` or `Resolve::Redeliver`, and a fresh mint for an outstanding effect is a second effect to every downstream system. `RecordRef` is not on the list because the driver constructs them — the kernel names the record it wants written and something has to write it — and it reads two, which [what is not checked](#what-is-not-checked) names rather than leaves implied. Both halves read the file with its `#[cfg(test)]` modules removed, for `integrity-check`'s reason: a decision named only under `cfg(test)` discharges nothing about the code that ships. A type declared *twice* fails too — `braced_body` reads the first declaration, so a decoy above the real one is what a first-match scan reads. One rule id because it is one decision. What it cannot see is a *widened* member behind a name already on the list, and a driver that names every decision and then ignores one; `crates/waymaker-drive/tests/` is what holds the behaviour. [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md). |
 | `effect-protocol` | Design document §07's seven-step effect protocol stops being the one that was reviewed. `waymaker-drive/src/effect.rs` gains or loses a public function `source::EFFECT_PROTOCOL_SURFACE` lists; the state in `source::EFFECT_DISPATCH_STATE` declares anything but the two methods its row names; a type in `source::EFFECT_TYPE_METHODS` is declared twice, stops being a braced struct, declares a public field, or declares a method set other than its row's — read at *every* visibility, because a surface pin counts `pub ` and not `pub(`; a type in `source::EFFECT_NO_SELF_LITERAL` builds a `Self` or implements a trait; the file declares a module; a value in `source::EFFECT_CONSTRUCTIONS` is built outside the two bodies its row names, or is not built inside each of them; a body in `source::EFFECT_STEP_BODIES` — located in its owning type's own `impl` blocks — stops taking each of `source::EFFECT_STEPS` exactly once, in that order, and at the body's own nesting depth — braces, parentheses and brackets together — or declares a closure or a short-circuit (`|`, `&&`); `source::EFFECT_PROOF_AFTER`'s body builds a proof before the step its row names; or `redelivering` names one of `source::EFFECT_REDELIVERY_FORBIDDEN`. Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be unreachable without step 3, "structurally, not by review", and every way of giving that back is an *addition*: a `DurableIntent::new`, a public `id` field on it, an `Effect::dispatchable_now`, a `Dispatchable::into_writer`, or a `Resolution::outcome` a caller can call before step 7. Each would break no other rule, need no dependency, and turn §02 decision 3 back into a convention. The step rows are the other half: §07 states the frame, the payload barrier and the seal twice, and a body that takes them in another order is not that protocol. Six of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a `pub(crate) const fn new(id) -> Self` on `DurableIntent`, wired into the driver, with the gate green; a `Self { .. }` the name-based construction pin cannot see; a private free `fn resolve` above the real one, taking all three steps while `Dispatchable::resolve` stopped at the payload barrier; a decoy `pub struct` above the real one; a `pub` tuple field, where `braced_body` reads the first `{` after a declaration and so reported on the `impl` block below; and an `impl` inside a nested module, which `inherent_impl_bodies` cannot see because it reads `impl` at column zero. Codex round 1 found the seventh: the construction pin and the order pin were independent, so an early `return` carrying a freshly built `Dispatchable` satisfied both. Codex round 2 found the eighth, which is the sharpest of the lot: brace depth is not execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has no braces at all — three pinned calls, in order, at brace depth zero, in a closure nothing runs. The depth counts parentheses and brackets now, and a step body may not declare a closure. Round 3 found the ninth in the same family — `false && self.writer.stage(..)?…` puts every call once, in order, at depth zero, on a right-hand side that never runs — so the two short-circuit operators are refused as well. A scanner cannot follow control flow, so what it does instead is refuse the constructs that create it, and [what is not checked](#what-is-not-checked) says which. Round 2's other finding did not reproduce: `public_functions` counts a trait `impl`'s method as callable, so the surface pin already rejected an `impl From<EffectId> for DurableIntent`; the direct refusal is here anyway, because the two pins that are *about* construction do go blind on a trait `impl` and a guarantee should not rest on another pin's side effect. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is a step added from another file — it pins one file, exactly as `capacity-reserve` and `recovery-surface` do — nor whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness; the crash windows are `crates/waymaker-drive/tests/crash.rs`. [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md). |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
@@ -987,6 +988,24 @@ Stated so that nobody mistakes silence for coverage:
   `crates/waymaker-fault/tests/commit_discipline.rs`, whose seal-before-frame writer reaches
   the state it asserts is unreachable. The *exposure* half — that a workflow sees no part of
   an answer — is `crates/waymaker-drive/tests/effect.rs`, and that one is falsifiable here.
+- **That a persistent clock stayed monotonic across a reboot.** `Timer::evaluate` refuses a
+  reading below the reading the timer was armed at, and that floor lives in RAM. A power cut
+  takes it, so a run that re-arms on the next boot has nothing to compare the new reading
+  against: an RTC that moved backwards while the power was off is invisible here. Issue #33's
+  `TimerScheduled` record is what carries the floor across a reboot, which is why that record
+  has to hold the arming reading as well as the deadline.
+- **That a firmware really has the clock it declares.** `ClockCapability::Persistent` is the
+  firmware's word. `Timer::arm` believes it, exactly as `Swap::beginning` believes the two
+  arguments it is handed. What the façade adds is a *witness* — `PersistentTimer::arm` takes
+  a `&mut C: PersistentClock`, so on that path the declaration cannot be made without the
+  hardware — and nothing obliges a caller to take that path. Joining the two by construction
+  is rung 0.4's dispatcher, the same standing as "nothing obliges a future dispatcher to use
+  the gated writer".
+- **That an `AfterBoot` interval is measured against a clock that is really monotonic.** The
+  kernel reads no clock: every reading is an argument. A boot clock that skipped, stalled or
+  ran at the wrong rate produces deadlines this code cannot fault, because it has no second
+  source to disagree with. That is design document §11's own division of labour — the clock
+  is the driver's — and issue #34's board test is where a real one is measured.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -1475,8 +1494,48 @@ identity, and issue #95 and
 [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
 record it.
 
-The kernel-state registry has two entries, so the 128 B budget is a number about something.
-Timers and the `TimerScheduled`/`TimerFired` records are the rest of rung 0.1, and the async
-`Ctx` and dispatcher arrive with 0.4. The
+Issue #32 opens rung 0.5, and what it asks for is one sentence from §11 made structural: a
+delay that needs a clock which survives power loss is never quietly served by one that does
+not. `waymaker-core`'s `timer` module is §11's vocabulary — `TimerSpec`'s two deadlines,
+`ClockKind`'s two numbers, `ClockCapability`, `Timer` and `Deadline` — and it reads no clock,
+because the kernel's must-not-own cell names one. Every reading is an argument.
+`waymaker-embassy`'s `clock` module is the capability, one layer up for the reason
+`StableStorage` is one layer up: `PersistentClock::now` reads hardware. `waymaker-flash` was
+never a candidate — its own must-not-own cell names timers.
+Three mechanisms hold three claims, and ADR 0028 is explicit about which. A `Timer` carries
+the `TimerSpec` it was armed from and holds no second description of its deadline, so
+`Timer::arm` has two answers and not three: a refusal, or a timer for that spec. The refusal
+names the missing capability — `KernelError::NoPersistentClock`, "this firmware has no
+persistent clock" — which is what issue #34 asks of it, and which `IncompatibleWorkflow` could
+not say. And `PersistentTimer::arm` takes a `&mut C: PersistentClock` and is the only
+constructor, so firmware with no clock cannot write the call at all: that is issue #32's
+compile-time half. `evaluate` adds nothing anywhere — an interval is compared against a
+difference, and the difference is only taken after the reading has been checked against the
+arming reading — so no input wraps a deadline into the past or into a future that never
+arrives, and a clock that went backwards is `ClockWentBackwards` rather than a credited or a
+discarded interval. Both "done when"s are driven rather than argued:
+`an_after_boot_timer_restarts_its_interval_after_a_reset` takes the reset that clears the boot
+clock *and* the RAM the timer lived in, and requires the whole interval to be owed again after
+1 040 ticks of total powered time; the persistent twin removes the power for longer than the
+interval and requires the first look at the restored epoch to say `Elapsed`.
+`timer-capability` is what stops the shape being given back, in both crates, and it refuses
+two identifiers outright: a persistent-clock module that names `AfterBoot` or `BootOnly` is
+either substituting one policy for the other or fabricating a permission.
+Two things came out of this rather than out of reading the code. The `facade` row of
+`cargo xtask size` measured 0 B and carried a standing notice asking for something to call,
+because `waymaker-embassy` declared no code at all; it now reads 256 B and the notice is gone.
+And the budget is the number worth recording: §11's vocabulary cost 268 B, 18102 B to
+18370 B against the same 18 KiB gate and no third raise, which leaves 62 B — not enough for
+issue #33's two record bodies, so issue #72 is now this rung's binding constraint rather than
+a tidy-up. What is owed is written down: the backwards-clock floor lives in RAM and so is only
+a floor within one arming, which is one reason #33's record carries the arming reading; and
+nothing obliges a caller to reach the persistent capability through the façade, which is rung
+0.4's dispatcher. See
+[ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md).
+
+The kernel-state registry has three entries — the replay machine, the record view and an
+armed timer — so the 128 B budget is a number about something, and 88 B of it is spent. The
+`TimerScheduled`/`TimerFired` records are issue #33's, the RTC driver and the board test are
+issue #34's, and the async `Ctx`, the dispatcher and in-boot sleep arrive with 0.4. The
 gates went in before the code they govern, which is the point: a gate retrofitted after
 coverage has slipped is a gate that ratifies the slip.

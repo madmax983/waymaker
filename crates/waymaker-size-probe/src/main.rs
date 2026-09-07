@@ -205,8 +205,61 @@ fn engine() -> usize {
     kept = kept.wrapping_add(journal_append());
     kept = kept.wrapping_add(replay_cursor());
     kept = kept.wrapping_add(transition_table());
+    kept = kept.wrapping_add(timers());
 
     core::hint::black_box(kept)
+}
+
+/// Design document §11's timer semantics: both specs, both capabilities, both verdicts.
+///
+/// Split out of [`engine`] for readability alone, like the four rows above it. Every arm is
+/// reached, so the row charges for the refusal as well as for the arithmetic: a firmware
+/// that only linked the happy path would understate the cost of the thing that makes §02
+/// decision 8 hold.
+#[cfg(feature = "engine")]
+fn timers() -> usize {
+    use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
+
+    let spec = TimerSpec::AfterBoot {
+        ticks: core::hint::black_box(50),
+    };
+
+    // The refusal, which is the branch a downgrade would have skipped. Reached through the
+    // predicate rather than through a second spec value: a third of the measured figure is
+    // already the probe's own arithmetic, which is issue #72.
+    let mut kept = usize::from(spec.clock_kind().0);
+    kept = kept.wrapping_add(
+        match core::hint::black_box(ClockCapability::BootOnly).admits(spec) {
+            Ok(()) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
+    // And an armed timer, read at both verdicts.
+    kept = kept.wrapping_add(
+        match Timer::arm(spec, ClockCapability::Persistent, core::hint::black_box(10)) {
+            Ok(timer) => {
+                let armed = usize::try_from(timer.armed_at()).unwrap_or(0);
+                let kind = usize::from(timer.spec().clock_kind().0);
+                let verdict = match timer.evaluate(core::hint::black_box(20)) {
+                    Ok(Deadline::Elapsed) => 1,
+                    Ok(Deadline::Remaining { ticks }) => usize::try_from(ticks).unwrap_or(0),
+                    Err(error) => error.message().len(),
+                };
+                armed.wrapping_add(kind).wrapping_add(verdict)
+            }
+            Err(error) => error.message().len(),
+        },
+    );
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn timers() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The streaming replay cursor: one run's history walked forwards, record by record.
@@ -1499,10 +1552,39 @@ fn engine() -> usize {
 #[cfg(feature = "facade")]
 #[inline(never)]
 fn facade() -> usize {
-    use waymaker_embassy as _;
+    use waymaker_core::timer::Deadline;
+    use waymaker_embassy::clock::{ClockError, PersistentClock, PersistentTimer};
 
-    // Rung 0.4: drive one dispatcher step here.
-    core::hint::black_box(0)
+    /// A stand-in RTC. The probe is never run, so the reading is an opaque constant and
+    /// what the row charges for is the capability, not the driver.
+    struct Rtc(u64);
+
+    impl PersistentClock for Rtc {
+        type Error = ();
+
+        fn now(&mut self) -> Result<u64, ()> {
+            Ok(core::hint::black_box(self.0))
+        }
+    }
+
+    let mut rtc = Rtc(core::hint::black_box(1_000));
+    let kept = match PersistentTimer::arm(&mut rtc, core::hint::black_box(2_000)) {
+        Ok(armed) => {
+            let spec = usize::from(armed.timer().spec().clock_kind().0);
+            let verdict = match armed.poll(&mut rtc) {
+                Ok(Deadline::Elapsed) => 1,
+                Ok(Deadline::Remaining { ticks }) => usize::try_from(ticks).unwrap_or(0),
+                Err(ClockError::Unavailable(())) => 2,
+                Err(ClockError::Refused(error)) => error.message().len(),
+            };
+            spec.wrapping_add(verdict)
+        }
+        Err(ClockError::Unavailable(())) => 3,
+        Err(ClockError::Refused(error)) => error.message().len(),
+    };
+
+    // Rung 0.4: drive one dispatcher step here too.
+    core::hint::black_box(kept)
 }
 
 /// Nothing, in an image built without the façade.
