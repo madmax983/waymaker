@@ -833,12 +833,15 @@ Stated so that nobody mistakes silence for coverage:
   `waymaker-drive` is a decision the rule cannot see.
 - **That the synchronous driver cannot mint an effect identity.** `kernel-boundary`'s
   routing half forbids `EffectIdAllocator` in `waymaker-drive/src/drive.rs`, which is a floor
-  and not a proof: `EffectId`'s fields are public, so `EffectId { run, seq }` written by hand
-  evades it, and so does a sibling module. What holds the behaviour is
-  `crates/waymaker-drive/tests/redelivery.rs` and `tests/crash.rs`, which measure the
-  identity a retry and a reboot really dispatch under, and are watched failing against a
-  driver that re-mints. The same shape as `kernel-owns-no-encoding`: a rule that makes the
-  wrong thing a line somebody wrote on purpose.
+  and not a proof, in two ways worth naming separately. `EffectId`'s fields are public, so
+  `EffectId { run, seq }` written by hand evades it; and the pinned file is the driver, while
+  the identity is actually *constructed* one file over, in `effect.rs`, which this rule does
+  not read. What holds the behaviour is
+  `crates/waymaker-drive/tests/redelivery.rs::what_redelivery_answers_is_not_what_a_fresh_mint_would`,
+  which drives the real driver and compares what it redelivered against what an allocator
+  would have minted, and `tests/crash.rs`, which does the same at every crash point of the
+  window. The same shape as `kernel-owns-no-encoding`: a rule that makes the wrong thing a
+  line somebody wrote on purpose.
 - **That the synchronous driver never reads a record.** `kernel-boundary`'s routing half
   forbids `RecordKind` and `Step`, and `waymaker-drive` names neither. It does read
   `RecordRef` twice, and both are decisions rather than transcription: `recorded` classifies a
@@ -887,6 +890,15 @@ Stated so that nobody mistakes silence for coverage:
   an `impl Dispatchable { fn ... }` in a sibling module of `waymaker-drive` adds a step with
   the rule silent. Inside the file it is closed — the method sets are compared at every
   visibility and a submodule is refused — but a sibling file is a sibling file.
+- **That the run half of a redelivered identity is the device's.** §14's guarantee is about
+  a `(RunId, EffectSeq)` pair, and only the sequence half is read from media: `ReplayCursor`
+  takes it from the schedule record, and the `RunId` is an argument to `Driver::new` that no
+  boot compares against the bank header. A caller that derived the run differently between
+  two boots — or drove one bank's region with the other bank's run — redelivers the right
+  sequence under the wrong run, and every check in the driver passes, because §07 keeps the
+  run id in the bank header rather than in every record. That is a precondition on the
+  caller, the same standing as `Swap::beginning`'s two unverified arguments, and closing it
+  by construction is the dispatcher's at rung 0.4.
 - **That an effect happens once.** Waymaker promises at-least-once delivery under a stable
   `(RunId, EffectSeq)`, and no more. Power can fail after an activity changed the world and
   before §07 step 7 commits the outcome, so the next boot redelivers the same identity and
@@ -1334,7 +1346,7 @@ injector lists, with the exhaustion path swept beside them. See
 which also says what is owed: the redelivery proof is the kernel's word, and an exhausted
 effect cannot be told from one that failed with no detail.
 
-Issue #30 is the rest of rung 0.3, and what it asks for is one guarantee held at the layer
+Issue #30 is rung 0.3's last item, and what it asks for is one guarantee held at the layer
 that can break it. §14's fourth guarantee — "retries and reboot redelivery reuse the original
 effect identity" — was proved about `EffectIdAllocator` by `waymaker-spec` and about nothing
 else, and a driver that handed a redelivered effect a fresh sequence would have passed every
@@ -1355,8 +1367,15 @@ allocator starts at `EffectSeq(0)` and a run whose outstanding effect is its fir
 tell redelivery from a fresh mint; that is a tooth rather than a comment claiming it.
 `crates/waymaker-drive/tests/crash.rs` adds issue #30's first "done when": the crash points
 at which the crashed boot had *already performed* the effect and its outcome record did not
-commit, which is the window between §07 step 4 and step 7's barrier, censused so that a sweep
-finding none fails the build. Both were watched failing against a driver that re-mints. The
+commit, which is the window between §07 step 4 and step 7's barrier. The assertion is
+**total** over that window and it splits two ways — a crash at an operation boundary leaves a
+whole journal and the next boot redelivers, and a crash inside the outcome frame or its seal
+leaves a torn tail with no append point, which ADR 0018 refuses rather than repairs. Both
+classes are censused, because an earlier version skipped the second with a `continue` and so
+asserted about six of the window's 165 crash points. A third test reads what the driver
+*wrote*: a schedule record carries the length and the digest of the bytes the workflow
+passed, which is the one thing a run cannot catch about itself, since a driver that records a
+constant length agrees with itself on every replay. The
 digest half is §08's fourth row at the driver rather than at the kernel: a changed input on a
 resolved effect stops the run, and — the sharper case — a changed input on an *outstanding*
 one stops it rather than redelivering, which is issue #30's "not a silent re-dispatch". Two

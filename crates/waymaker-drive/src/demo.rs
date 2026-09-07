@@ -281,6 +281,17 @@ impl World {
             .unwrap_or_default()
     }
 
+    /// How many intents this world was offered, log or no log.
+    ///
+    /// [`offered`](Self::offered)'s cross-check, the way [`performed`](Self::performed) is
+    /// [`dispatched`](Self::dispatched)'s. A log capped at [`DISPATCH_LOG`] cannot say
+    /// whether it holds all it was given, and an instrument that cannot say so is one that
+    /// lies as soon as a run outgrows it.
+    #[must_use]
+    pub const fn offers(&self) -> usize {
+        self.offered
+    }
+
     /// How many effects this world was asked to perform, log or no log.
     #[must_use]
     pub const fn performed(&self) -> usize {

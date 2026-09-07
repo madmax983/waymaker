@@ -53,8 +53,8 @@ impl DurableIntent {
     /// The stable `(RunId, EffectSeq)` step 4 dispatches under.
     ///
     /// A retry and a reset both redeliver this pair, so a downstream service that
-    /// deduplicates on it sees a repeat rather than a second effect. It is the whole of what
-    /// Waymaker promises here; [`Activities`](crate::Activities) says what it does not.
+    /// deduplicates on it sees a repeat rather than a second effect. This pair is all that
+    /// Waymaker promises here; [`Activities`](crate::Activities) states what it does not.
     #[must_use]
     pub const fn id(self) -> EffectId {
         self.id

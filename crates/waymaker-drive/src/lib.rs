@@ -42,11 +42,11 @@
 //!
 //! # At-least-once
 //!
-//! One effect can be performed more than once — after a retry, and after a reset that landed
-//! between the activity and its committed outcome. Every attempt carries the identity the
-//! schedule record committed. Waymaker promises that identity and nothing more:
-//! exactly-once physical side effects are not on offer. [`Activities`] is where an
-//! implementer reads this, because that is the trait they write against.
+//! Waymaker can perform one effect more than once: after a retry, and after a reset between
+//! the activity and its committed outcome. Every attempt carries the identity the schedule
+//! record committed. Waymaker promises that identity and nothing more. It does not give
+//! exactly-once physical side effects. Read [`Activities`]. An implementer writes against
+//! that trait.
 //!
 //! # The lifetime discipline
 //!

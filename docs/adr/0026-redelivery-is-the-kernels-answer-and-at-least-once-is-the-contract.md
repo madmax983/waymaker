@@ -48,10 +48,12 @@ promise exactly-once, and issue #30 is explicit: "the documentation must not sof
 `source::DRIVER_FORBIDDEN_VOCABULARY`, so `kernel-boundary` fails a build in which
 `waymaker-drive/src/drive.rs` reaches for the one thing permitted to mint a sequence.
 
-This is a floor and not a proof. `EffectId`'s fields are public, so a hand-written literal
-evades it, and so does a sibling module — the same limit `capacity-reserve` and
-`recovery-surface` each record about the file they pin. It is in
-[what is not checked](../../CLAUDE.md#what-is-not-checked) rather than implied.
+This is a floor and not a proof, in two ways worth naming separately. `EffectId`'s fields
+are public, so a hand-written literal evades it. And the pinned file is the *driver*, while
+the identity is constructed one file over in `effect.rs` — so the floor sits under the file
+that routes an identity rather than the file that builds one. Both are in
+[what is not checked](../../CLAUDE.md#what-is-not-checked) rather than implied, and the
+weight is on the tests below.
 
 **An in-boot retry is another boot with no reset.** No retry policy is introduced. Design
 document §16 leaves `retry-policy-placement` open, owned by rung 0.4, and a driver that
@@ -64,15 +66,32 @@ and a reset between §07 step 4 and step 7 — states that every attempt carries
 and states plainly that exactly-once physical side effects are not on offer and no setting
 changes that. The two ways to get exactly-once are named, and both are outside this engine.
 
-**Both halves are measured, and both have been watched failing.**
+**Both halves are measured, and the tooth is kept rather than remembered.**
 `crates/waymaker-drive/tests/redelivery.rs` drives a retry and five retries; every case uses
 the run's *second* effect, because the allocator starts at `EffectSeq(0)` and a run whose
-outstanding effect is its first cannot tell redelivery from a fresh mint —
-`a_fresh_mint_would_not_answer_what_redelivery_answers` is the tooth that says so rather than
-a comment claiming it. `crates/waymaker-drive/tests/crash.rs` adds the window issue #30's
-first "done when" names: crash points at which the crashed boot had *already performed* the
-effect and its outcome record did not commit. Those are counted, and a sweep in which none
-occurred fails.
+outstanding effect is its first cannot tell redelivery from a fresh mint.
+`what_redelivery_answers_is_not_what_a_fresh_mint_would` is the tooth, and it is *driven*: it
+takes the identity the real driver redelivered under and compares it against the identity an
+allocator would have minted. An earlier version of it compared two constants, which no change
+to the driver could have falsified — review caught that, and this repository's own standard
+is that a guarantee is worth the evidence it could have failed.
+
+`crates/waymaker-drive/tests/crash.rs` adds the window issue #30's first "done when" names:
+crash points at which the crashed boot had *already performed* the effect and its outcome
+record did not commit. The assertion is **total** over that window, which is the second thing
+review corrected. The window splits two ways. A crash at a boundary between two storage
+operations leaves a whole journal and the next boot redelivers under the committed identity.
+A crash *inside* the outcome frame or its seal leaves a torn tail with no append point, so
+ADR 0018's anti-bricking rule refuses the bank and nothing reaches the world — the effect
+happened and no record of it ever will, until §10's `continue_as_new` recycles the bank.
+Both classes are counted and both must occur; an earlier version skipped the second class
+with a `continue`, which discarded 159 of the window's 165 crash points and left two censuses
+that measured the filters rather than the sweep.
+
+`a_schedule_record_carries_the_length_and_digest_of_the_bytes_the_workflow_passed` is the
+third thing review added. Nothing else here reads what the driver *wrote*: a driver that
+recorded a constant `input_len` agrees with itself on every replay, so its own run cannot
+catch it, and the whole suite passed that mutation before this test existed.
 
 The digest cases are two: an input of the recorded length with a different byte, and a
 shorter one. A driver cannot vary one half of §09's digest alone, because a shorter input has
@@ -83,21 +102,32 @@ digest it computes is a digest of the bytes the workflow passed.
 ## Consequences
 
 The guarantee is now falsifiable at the layer that can break it. A driver that re-mints on
-redelivery fails four tests; a driver that digests the wrong bytes fails two. Both mutations
-were run before the tests were kept.
+redelivery fails five tests, one of which is a kept tooth rather than a remembered mutation
+run; a driver that digests the wrong bytes fails two; a driver that records a constant input
+length fails one.
 
-`demo::World` grows an `offered` log beside its `dispatched` one, and a
-`pending_once_at_seq` constructor. The two logs are the difference between what the world was
+`demo::World` grows an `offered` log beside its `dispatched` one, an `offers` count that is
+that log's cross-check the way `performed` is `dispatched`'s, and a `pending_once_at_seq`
+constructor. The two logs are the difference between what the world was
 *asked* and what it *did*, and §14's contract is a statement about the first: a declined
 attempt and the retry after it must carry one identity, and a log of what happened cannot see
 that pair. The constructor is keyed on the sequence rather than on a dispatch count, for the
 reason `exhausting_seq` is: a count means something different on the second boot.
 
-What is still owed is unchanged and is written down. Exactly-once is not on offer, and no
-future work here makes it so; §14 says the same. The gate rule is a floor, so a driver that
-built an `EffectId` by hand would pass it and fail the tests instead. And nothing obliges a
-future dispatcher to use this driver — rung 0.4's, the same standing as the capacity
-reserve's.
+What is still owed is written down rather than implied, and review added one item to it that
+issue #30's own wording asks about. §14's guarantee is a `(RunId, EffectSeq)` pair, and only
+the **sequence** half is read from media: `ReplayCursor` takes it from the schedule record,
+while the `RunId` is an argument to `Driver::new` that no boot compares against the bank
+header — §07 keeps the run id in the header rather than in every record, so there is nothing
+in a record to compare it with. A caller that derived the run differently between two boots
+redelivers the right sequence under the wrong run, and every check in the driver passes. That
+is a precondition on the caller, the same standing as `Swap::beginning`'s two unverified
+arguments, and closing it by construction is rung 0.4's dispatcher.
+
+The rest is unchanged. Exactly-once is not on offer, and no future work here makes it so; §14
+says the same. The gate rule is a floor, so a driver that built an `EffectId` by hand would
+pass it and fail the tests instead. And nothing obliges a future dispatcher to use this
+driver — rung 0.4's, the same standing as the capacity reserve's.
 
 ## Alternatives considered
 

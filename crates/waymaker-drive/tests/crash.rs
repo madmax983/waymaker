@@ -272,25 +272,10 @@ fn a_reboot_after_a_crash_either_carries_the_run_on_or_refuses_before_dispatchin
     let mut redelivered = 0_usize;
     let mut redelivered_late = 0_usize;
     for run in &runs {
-        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
-            unreachable!("the image is device-sized")
-        };
-        let mut workflow = Pipeline::new();
-        let mut world = World::new();
-        let mut page = [0_u8; 256];
-        let mut result = [0_u8; 64];
-        let ended = Driver::new(region(), RUN, reserve()).boot(
-            &mut device,
-            &mut world,
-            &mut workflow,
-            Scratch {
-                page: &mut page,
-                result: &mut result,
-            },
-        );
+        let (ended, world, workflow) = reboot(run.image());
 
         match ended {
-            Ok(_) => {
+            Ok(()) => {
                 resumed += 1;
                 assert_eq!(
                     workflow.hashed(),
@@ -415,6 +400,31 @@ fn a_driver_that_dispatches_before_it_commits_loses_the_intent() {
         lost,
         "a driver that dispatches before it commits must lose an intent at some crash point"
     );
+}
+
+/// One boot of the reference workflow over a crash image, and the world it was given.
+///
+/// Split out for the line budget, and because a reboot of a crash image is the same three
+/// values every time: a restored device, a fresh workflow, and a world that performs
+/// everything. The workflow comes back so a caller can read what the resumed run reached.
+fn reboot(image: &[u8]) -> (Result<(), DriveError<FaultError>>, World, Pipeline) {
+    let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
+        unreachable!("the image is device-sized")
+    };
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let ended = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    (ended.map(|_| ()), world, workflow)
 }
 
 /// Design document §07's three steps for one record, for the mutant above.
@@ -606,14 +616,21 @@ fn a_reboot_after_an_exhausted_effect_carries_the_run_on_or_refuses_before_dispa
 fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identical_id() {
     // Issue [#30](https://github.com/madmax983/waymaker/issues/30)'s first "done when". The
     // window is the one §14 makes no exactly-once promise about: the world has changed, and
-    // the record saying so has not reached media. Every crash point inside it must leave the
-    // *same* `(RunId, EffectSeq)` for the next boot to redeliver.
+    // the record saying so has not reached media.
     //
-    // What makes this more than `a_reboot_after_a_crash_…` is the first filter below. That
+    // What makes this more than `a_reboot_after_a_crash_…` is the second filter below. That
     // test asks what happens when history left a schedule unresolved, whatever caused it —
     // including a crash that landed while the schedule record itself was being written, in
     // which case nothing was ever performed. This one keeps only the runs where the crashed
     // boot had already performed the effect, which is the window and nothing else.
+    //
+    // The window splits two ways, and the assertion is total over it. A crash at an
+    // operation boundary leaves a whole journal, and the next boot redelivers under the
+    // identity the schedule record committed. A crash *inside* the outcome frame or its seal
+    // leaves a torn or unsealed tail, which has no append point — ADR 0018's anti-bricking
+    // rule — so this driver refuses the bank rather than repairing it, and nothing reaches
+    // the world. Both are counted, and a sweep that found only one of them fails: skipping
+    // the second class silently is how 96% of this window went unasserted in review.
     let harness = Harness::new(geometry());
     let logs: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
 
@@ -638,6 +655,8 @@ fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identic
 
     let mut duplicated = 0_usize;
     let mut duplicated_late = 0_usize;
+    let mut unextendable = 0_usize;
+    let mut window = 0_usize;
     for (run, performed) in runs.iter().zip(&logs) {
         let history = recovered(run.image());
         // The effect whose schedule survived and whose outcome did not.
@@ -649,52 +668,57 @@ fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identic
         if !performed.contains(&outstanding) {
             continue;
         }
+        window = window.saturating_add(1);
 
-        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
-            unreachable!("the image is device-sized")
-        };
-        let mut workflow = Pipeline::new();
-        let mut world = World::new();
-        let mut page = [0_u8; 256];
-        let mut result = [0_u8; 64];
-        let ended = Driver::new(region(), RUN, reserve()).boot(
-            &mut device,
-            &mut world,
-            &mut workflow,
-            Scratch {
-                page: &mut page,
-                result: &mut result,
-            },
-        );
-        let Ok(_) = ended else {
-            // A sealed schedule record is an append point, so this cannot be the unextendable
-            // case — but a scan that stopped at damage *after* it can be, and that reboot has
-            // nothing to redeliver. `a_reboot_after_a_crash_…` holds the refusal's own
-            // properties; here it is simply not this window.
-            continue;
-        };
-
-        let first = world.dispatched().first().unwrap_or_else(|| {
-            panic!(
-                "the reboot performed nothing for an outstanding {outstanding}, at {:?}",
-                run.injection()
-            )
-        });
-        assert_eq!(
-            first.id,
-            EffectId {
-                run: RUN,
-                seq: EffectSeq(outstanding),
-            },
-            "the second attempt of effect {outstanding} carried another identity, at {:?}",
-            run.injection()
-        );
-        duplicated = duplicated.saturating_add(1);
-        if outstanding > 0 {
-            duplicated_late = duplicated_late.saturating_add(1);
+        let (ended, world, _) = reboot(run.image());
+        match ended {
+            Ok(()) => {
+                let first = world.dispatched().first().unwrap_or_else(|| {
+                    panic!(
+                        "the reboot performed nothing for an outstanding {outstanding}, at {:?}",
+                        run.injection()
+                    )
+                });
+                assert_eq!(
+                    first.id,
+                    EffectId {
+                        run: RUN,
+                        seq: EffectSeq(outstanding),
+                    },
+                    "the second attempt of effect {outstanding} carried another identity, at \
+                     {:?}",
+                    run.injection()
+                );
+                duplicated = duplicated.saturating_add(1);
+                if outstanding > 0 {
+                    duplicated_late = duplicated_late.saturating_add(1);
+                }
+            }
+            Err(error) => {
+                // The crash tore the outcome frame or left it unsealed, so the scan has no
+                // append point and ADR 0018 refuses the bank rather than repairing it. The
+                // effect happened and no record of it ever will — which is not a redelivery
+                // under a wrong identity, and is what the second half of this window is.
+                assert!(
+                    matches!(error, DriveError::Recovery(_) | DriveError::NoAppendPoint),
+                    "the only legal refusals here, at {:?}: {error:?}",
+                    run.injection()
+                );
+                assert!(
+                    world.dispatched().is_empty(),
+                    "a bank that cannot record an intent dispatches none, at {:?}",
+                    run.injection()
+                );
+                unextendable = unextendable.saturating_add(1);
+            }
         }
     }
 
+    assert_eq!(
+        duplicated.saturating_add(unextendable),
+        window,
+        "every crash in this window is a redelivery or a refusal, and nothing else"
+    );
     assert!(
         duplicated > 0,
         "no crash landed between an activity and its completion barrier, so this measured \
@@ -704,5 +728,10 @@ fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identic
         duplicated_late > 0,
         "and none of them was the run's *second* effect, which is the only case that tells \
          redelivery apart from a fresh identity"
+    );
+    assert!(
+        unextendable > 0,
+        "and no crash in this window tore the outcome frame, so the other half of it was \
+         measured by nothing"
     );
 }

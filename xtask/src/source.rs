@@ -2382,6 +2382,14 @@ pub const BOUNDARY_DECISIONS: &[&str] = &[
     "Resolve::Replayed",
 ];
 
+/// Why [`DRIVER_FORBIDDEN_VOCABULARY`] refuses the two record names.
+///
+/// One string rather than two identical ones, so the pair cannot drift into two reasons for
+/// one ban.
+const RECORD_VOCABULARY: &str = "is the record vocabulary the kernel decides from; a driver \
+                                 that reads it is a second transition table, and the one \
+                                 below it is no longer where \u{a7}08 is enforced";
+
 /// Vocabulary the driver may not name, with the reason each is banned.
 ///
 /// `RecordKind` is §09's numbering and `Step` is what the cursor answers an `advance` with:
@@ -2409,16 +2417,8 @@ pub const BOUNDARY_DECISIONS: &[&str] = &[
 /// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
 /// names both rather than leaving them implied.
 pub const DRIVER_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
-    (
-        "RecordKind",
-        "is the record vocabulary the kernel decides from; a driver that reads it is a \
-         second transition table, and the one below it is no longer where \u{a7}08 is enforced",
-    ),
-    (
-        "Step",
-        "is the record vocabulary the kernel decides from; a driver that reads it is a \
-         second transition table, and the one below it is no longer where \u{a7}08 is enforced",
-    ),
+    ("RecordKind", RECORD_VOCABULARY),
+    ("Step", RECORD_VOCABULARY),
     (
         "EffectIdAllocator",
         "is the one thing permitted to mint an effect identity; a driver that names it can \

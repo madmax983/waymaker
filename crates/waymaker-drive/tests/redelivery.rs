@@ -11,15 +11,18 @@
 //! * **a reboot** — power went, RAM went, and the run is re-created from its journal.
 //!   `tests/drive.rs` and `tests/crash.rs` hold that half.
 //! * **an in-boot retry** — an activity was not ready, and the caller drove the run again
-//!   with no reset at all. That is this file's, and it is the sharper of the two: the
-//!   workflow value, the world and the RAM all survive, so a driver that kept an identity
-//!   counter anywhere would still be believed by a reboot test.
+//!   with no reset at all. That is this file's. The driver holds no state between boots, so
+//!   what the retry adds over the reboot is the *world*: one `World` value spans both
+//!   attempts, which is what lets a test compare the identity the declined attempt carried
+//!   against the identity the retry carried.
 //!
 //! # Why every case here uses the run's *second* effect
 //!
 //! `EffectIdAllocator` starts at `EffectSeq(0)`. A run whose outstanding effect is its first
 //! cannot tell redelivery from a fresh mint, because the two agree.
-//! [`a_fresh_mint_would_not_answer_what_redelivery_answers`] is the tooth that says so.
+//! [`what_redelivery_answers_is_not_what_a_fresh_mint_would`] is the tooth: it drives the
+//! real driver and compares what it redelivered against what an allocator would have
+//! minted, so a re-minting driver fails it.
 //!
 //! # The digest half
 //!
@@ -42,7 +45,7 @@ use waymaker_drive::{
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
-use waymaker_flash::frame::ProgramAlign;
+use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
 
@@ -192,6 +195,11 @@ fn an_in_boot_retry_redelivers_the_identity_the_first_attempt_carried() {
     // The whole of the claim. The declined attempt and the retry carry one identity, and the
     // effect the first boot resolved is replayed rather than offered a second time.
     let offered: Vec<EffectId> = world.offered().iter().map(|call| call.id).collect();
+    assert_eq!(
+        offered.len(),
+        world.offers(),
+        "the log holds every offer it was given"
+    );
     assert_eq!(offered, [FIRST, SECOND, SECOND]);
 
     // And history holds one schedule record per effect. A driver that minted a fresh
@@ -227,6 +235,11 @@ fn any_number_of_retries_carries_one_identity() {
 
     let offered: Vec<EffectId> = world.offered().iter().map(|call| call.id).collect();
     assert_eq!(
+        offered.len(),
+        world.offers(),
+        "the log holds every offer it was given"
+    );
+    assert_eq!(
         offered,
         [FIRST, SECOND, SECOND, SECOND, SECOND, SECOND, SECOND]
     );
@@ -243,19 +256,81 @@ fn any_number_of_retries_carries_one_identity() {
 }
 
 #[test]
-fn a_fresh_mint_would_not_answer_what_redelivery_answers() {
-    // The tooth for the two tests above. Their assertions are worth something only because
-    // the identity a re-minting driver would have produced is a *different* value — which is
-    // true of the run's second effect and false of its first.
+fn what_redelivery_answers_is_not_what_a_fresh_mint_would() {
+    // The tooth for the two tests above, and it is driven rather than declared: the identity
+    // the *real* driver redelivers under is compared against the identity an allocator would
+    // have handed a driver that minted one. A driver that re-mints fails here.
+    let mut world = World::pending_at(1);
+    let mut workflow = Pipeline::new();
+    let mut device = a_run_waiting_on_its_second_effect(&mut world);
+
+    let Ok(progress) = boot(&mut device, &mut world, &mut workflow) else {
+        unreachable!("an activity that is not ready is not a failure")
+    };
+    assert_eq!(progress, Progress::Waiting { id: SECOND });
+    let redelivered = world
+        .offered()
+        .last()
+        .copied()
+        .expect("the retry offered the outstanding effect")
+        .id;
+
     let mut allocator = EffectIdAllocator::for_run(RUN);
     let Ok(minted) = allocator.allocate() else {
         unreachable!("the first allocation of a run is not exhaustion")
     };
-    assert_eq!(minted, FIRST);
-    assert_ne!(
-        minted, SECOND,
-        "a run whose outstanding effect is its first cannot tell redelivery from a fresh mint"
+    assert_eq!(
+        minted, FIRST,
+        "the allocator starts at the run's first effect"
     );
+    assert_ne!(
+        redelivered, minted,
+        "the driver redelivered the identity a fresh mint would have produced, so no case in \
+         this file can tell the two apart"
+    );
+}
+
+#[test]
+fn a_schedule_record_carries_the_length_and_digest_of_the_bytes_the_workflow_passed() {
+    // §09 records a length *and* a checksum, and the kernel compares the pair. Nothing else
+    // here reads what the driver put in the record: a driver that wrote a constant length
+    // would agree with itself on every replay, so its own run could not catch it. The
+    // reference workflow's two inputs have different lengths, which is what makes the
+    // comparison say anything.
+    let mut world = World::new();
+    let mut workflow = Pipeline::new();
+    let mut device = Device::new(geometry());
+    let Ok(_) = boot(&mut device, &mut world, &mut workflow) else {
+        unreachable!("the reference run completes")
+    };
+
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut digests = Vec::new();
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        if let RecordRef::EffectScheduled {
+            input_len,
+            input_crc,
+            ..
+        } = record
+        {
+            digests.push((input_len, input_crc));
+        }
+    }
+
+    let expected: Vec<(u16, u32)> = [b"url".as_slice(), DOWNLOADED]
+        .into_iter()
+        .map(|input| {
+            let Ok(len) = u16::try_from(input.len()) else {
+                unreachable!("both inputs are shorter than a schedule record's bound")
+            };
+            (len, frame::input_digest(input))
+        })
+        .collect();
+    assert_eq!(digests, expected);
 }
 
 /// The reference workflow's second call, with an input the recorded run never passed.
@@ -316,8 +391,6 @@ fn a_changed_input_on_a_resolved_effect_stops_the_run_rather_than_replaying_it()
         let Ok(_) = boot(&mut device, &mut world, &mut workflow) else {
             unreachable!("the reference run completes")
         };
-        let before = history(&mut device);
-
         // The control: the workflow that wrote this history replays it and dispatches
         // nothing. Without it a refusal below could be a device that refuses everything.
         let mut replaying = World::new();
@@ -328,6 +401,8 @@ fn a_changed_input_on_a_resolved_effect_stops_the_run_rather_than_replaying_it()
             replaying.offered().is_empty(),
             "a replay dispatches nothing"
         );
+        // Taken after the control, so it is the media the tampered boot is handed.
+        let before = device.image().to_vec();
 
         let mut world = World::new();
         let error = boot(&mut device, &mut world, &mut Tampered { input: tampered })
@@ -341,9 +416,9 @@ fn a_changed_input_on_a_resolved_effect_stops_the_run_rather_than_replaying_it()
             "a diverging replay dispatches nothing, for input {tampered:?}"
         );
         assert_eq!(
-            history(&mut device),
-            before,
-            "and writes nothing: history stands where the divergence found it"
+            device.image(),
+            before.as_slice(),
+            "and writes nothing: not one byte of media moved, for input {tampered:?}"
         );
     }
 }
@@ -357,7 +432,7 @@ fn a_changed_input_on_an_outstanding_effect_stops_the_run_rather_than_redeliveri
     for tampered in [OTHER_BYTES, OTHER_LENGTH] {
         let mut waiting = World::pending_at(1);
         let mut device = a_run_waiting_on_its_second_effect(&mut waiting);
-        let before = history(&mut device);
+        let before = device.image().to_vec();
 
         let mut world = World::new();
         let error = boot(&mut device, &mut world, &mut Tampered { input: tampered })
@@ -370,7 +445,11 @@ fn a_changed_input_on_an_outstanding_effect_stops_the_run_rather_than_redeliveri
             world.offered().is_empty(),
             "the effect is not redelivered under an input nobody recorded, for {tampered:?}"
         );
-        assert_eq!(history(&mut device), before, "and nothing is written");
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "and not one byte of media moved, for {tampered:?}"
+        );
     }
 }
 
@@ -399,7 +478,7 @@ fn a_changed_activity_kind_on_an_outstanding_effect_stops_the_run_too() {
 
     let mut waiting = World::pending_at(1);
     let mut device = a_run_waiting_on_its_second_effect(&mut waiting);
-    let before = history(&mut device);
+    let before = device.image().to_vec();
 
     let mut world = World::new();
     let error = boot(&mut device, &mut world, &mut OtherKind)
@@ -409,5 +488,5 @@ fn a_changed_activity_kind_on_an_outstanding_effect_stops_the_run_too() {
         DriveError::Kernel(KernelError::NondeterministicWorkflow)
     );
     assert!(world.offered().is_empty());
-    assert_eq!(history(&mut device), before);
+    assert_eq!(device.image(), before.as_slice());
 }

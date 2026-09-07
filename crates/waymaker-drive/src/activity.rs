@@ -30,9 +30,9 @@ pub enum Performed {
     /// activity. The driver records it the same way, because on media the two are the same
     /// statement, and because a refusal there strands the run.
     Exhausted,
-    /// Not now. The run suspends under the identity it was dispatched with. The next boot
-    /// redelivers it, whether a reset came between the two or not — design document §14's
-    /// redelivery contract.
+    /// Not now. The run suspends under the identity it was dispatched with. The driver
+    /// redelivers it on the next pass, with or without a reset in between — design document
+    /// §14's redelivery contract.
     Pending,
 }
 
@@ -40,23 +40,33 @@ pub enum Performed {
 ///
 /// # At-least-once, and no more than that
 ///
-/// Waymaker can perform one effect more than once. There are two causes:
+/// Waymaker can perform one effect more than once. Two causes do this:
 ///
 /// * a **retry** — the activity answered [`Performed::Pending`], and the caller drove the
 ///   run again;
 /// * a **reset** — power failed after the activity changed the world and before the outcome
-///   record was durable. Design document §07 writes that record at step 5 and commits it at
-///   step 7. Power can go at any point between step 4 and step 7.
+///   record was durable. The driver writes that record at design document §07 step 5 and
+///   commits it at step 7, and power can fail at any point between step 4 and step 7.
+///
+/// A reset in that window has two outcomes, and one of them is not a second attempt. A reset
+/// at a boundary between two storage operations leaves a whole journal, and the next boot
+/// redelivers. A reset *inside* the outcome frame or its seal leaves a torn tail with no
+/// append point, and [`Driver`](crate::Driver) refuses that bank rather than repairing it —
+/// so the effect happened, no record of it ever will, and the run stops. Recycling such a
+/// bank is §10's `continue_as_new`, which this driver does not perform.
+///
+/// Neither cause has a limit. Two resets that each redeliver perform the effect three
+/// times.
 ///
 /// Every attempt carries one identity: the `(RunId, EffectSeq)` the schedule record
-/// committed, which [`DurableIntent::id`] gives. That pair is the only value a downstream
+/// committed. [`DurableIntent::id`] returns that pair. It is the only value a downstream
 /// system can deduplicate on.
 ///
 /// Waymaker does **not** promise exactly-once physical side effects. No setting changes
-/// this, and the engine cannot: the world changed before the record of it did. There are two
-/// ways to get exactly-once, and both are outside this engine — make the activity
-/// idempotent, or deduplicate the identity downstream. An activity that does neither
-/// performs its effect twice after a reset in that window.
+/// this. The engine cannot promise it: the world changes before the record of it is durable.
+/// Two ways give exactly-once, and both are outside this engine — make the activity
+/// idempotent, or deduplicate on the identity downstream. An activity that does neither
+/// repeats its effect on each attempt.
 pub trait Activities {
     /// Perform `intent`'s effect and write its outcome into `out`.
     ///
@@ -67,8 +77,8 @@ pub trait Activities {
     /// # Postconditions
     ///
     /// An implementor must tolerate a duplicate attempt. The same `intent` can arrive more
-    /// than once, and it carries the same identity every time. The trait's own docs say what
-    /// this engine does not promise.
+    /// than once, with no limit, and it carries the same identity every time.
+    /// [`Activities`] states what this engine does not promise.
     ///
     /// An implementor must not truncate. Write no more than `out.len()` bytes, and report
     /// [`Performed::Exhausted`] when the answer is wider. An implementor that writes what
