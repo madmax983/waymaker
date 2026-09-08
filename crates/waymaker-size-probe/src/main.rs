@@ -1746,8 +1746,195 @@ fn facade() -> usize {
         Err(ClockError::Refused(error)) => error.message().len(),
     };
 
-    // Rung 0.4: drive one dispatcher step here too.
+    core::hint::black_box(kept.wrapping_add(ctx_facade()))
+}
+
+/// Issue #35's `Ctx` and its four futures, driven once each.
+///
+/// A journal and a dispatcher live here because the façade has neither: it borrows both.
+/// They answer from `black_box`ed values so that no arm folds away — the row would
+/// otherwise charge for a façade whose refusals the linker had proved unreachable.
+#[cfg(feature = "facade")]
+#[inline(never)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one call per public function, which is what `size-probe-reach` asks for"
+)]
+fn ctx_facade() -> usize {
+    use core::future::Future as _;
+    use core::pin::pin;
+    use core::task::{Context as Task, Poll, Waker};
+
+    use waymaker_core::timer::TimerSpec;
+    use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
+    use waymaker_embassy::ctx::{Conclusion, Ctx, Failure, TerminalFuture};
+    use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
+
+    /// A stand-in durable half. It writes nothing; the probe is never run.
+    struct Ledger {
+        kept: [u8; 4],
+        held: usize,
+    }
+
+    impl Journal for Ledger {
+        fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Halted> {
+            if core::hint::black_box(kind.0) == 0 {
+                return Err(Halted);
+            }
+            if core::hint::black_box(input.len()) == 1 {
+                return Ok(Handoff::Replayed(Outcome::Failed(
+                    self.kept.get(..self.held).unwrap_or_default(),
+                )));
+            }
+            Ok(Handoff::Dispatch(EffectId {
+                run: RunId(core::hint::black_box(1)),
+                seq: EffectSeq(core::hint::black_box(0)),
+            }))
+        }
+
+        fn resolve(&mut self, answer: Answer<'_>) -> Result<Outcome<'_>, Halted> {
+            let (bytes, completed): (&[u8], bool) = match answer {
+                Answer::Completed(bytes) => (bytes, true),
+                Answer::Failed(bytes) => (bytes, false),
+                Answer::Exhausted => (&[], false),
+            };
+            let taken = bytes.len().min(self.kept.len());
+            let (Some(from), Some(into)) = (bytes.get(..taken), self.kept.get_mut(..taken)) else {
+                return Err(Halted);
+            };
+            into.copy_from_slice(from);
+            self.held = taken;
+            let held = self.kept.get(..taken).unwrap_or_default();
+            Ok(if completed {
+                Outcome::Completed(held)
+            } else {
+                Outcome::Failed(held)
+            })
+        }
+
+        fn wait(&mut self, spec: TimerSpec) -> Result<(), Halted> {
+            if core::hint::black_box(spec.clock_kind().0) == 0 {
+                return Err(Halted);
+            }
+            Ok(())
+        }
+
+        fn continue_as_new(&mut self, input: &[u8]) -> Halted {
+            self.held = core::hint::black_box(input.len());
+            Halted
+        }
+    }
+
+    /// A stand-in world.
+    struct Fleet(usize);
+
+    impl ActivityDispatcher for Fleet {
+        type Error = usize;
+
+        fn poll_dispatch(
+            &mut self,
+            _task: &mut Task<'_>,
+            id: EffectId,
+            _kind: ActivityKind,
+            _input: &[u8],
+            out: &mut [u8],
+        ) -> Poll<Result<usize, usize>> {
+            if core::hint::black_box(self.0) == 0 {
+                return Poll::Pending;
+            }
+            if core::hint::black_box(id.seq.0) == 9 {
+                return Poll::Ready(Err(self.0));
+            }
+            let Some(first) = out.first_mut() else {
+                return Poll::Ready(Err(self.0));
+            };
+            *first = 7;
+            Poll::Ready(Ok(1))
+        }
+    }
+
+    /// A handle a workflow keeps across a boundary.
+    struct Handle(u8);
+
+    impl Decode for Handle {
+        type Error = ();
+
+        fn decode(bytes: &[u8]) -> Result<Self, ()> {
+            bytes.first().copied().map(Self).ok_or(())
+        }
+    }
+
+    let mut ledger = Ledger {
+        kept: [0; 4],
+        held: 0,
+    };
+    let mut fleet = Fleet(core::hint::black_box(1));
+    let mut out = [0_u8; 4];
+    let mut ctx = Ctx::new(&mut ledger, &mut fleet, &mut out);
+    let mut task = Task::from_waker(Waker::noop());
+    let mut kept: usize = 0;
+
+    {
+        let mut effect = pin!(ctx.activity::<Handle>(
+            ActivityKind(core::hint::black_box(1)),
+            core::hint::black_box(b"in")
+        ));
+        kept = kept.wrapping_add(match effect.as_mut().poll(&mut task) {
+            Poll::Ready(Ok(Handle(byte))) => usize::from(byte),
+            Poll::Ready(Err(Failure::Activity { len })) => len,
+            Poll::Ready(Err(Failure::Decode(()))) => 1,
+            Poll::Pending => 2,
+        });
+    }
+    {
+        let mut deadline = pin!(ctx.timer(TimerSpec::AfterBoot {
+            ticks: core::hint::black_box(5)
+        }));
+        kept = kept.wrapping_add(match deadline.as_mut().poll(&mut task) {
+            Poll::Ready(()) => 3,
+            Poll::Pending => 4,
+        });
+    }
+    {
+        let mut restarted = pin!(ctx.continue_as_new(core::hint::black_box(b"next")));
+        match restarted.as_mut().poll(&mut task) {
+            Poll::Pending => kept = kept.wrapping_add(5),
+            // `Infallible` has no value, so this arm names one that cannot be built.
+            Poll::Ready(never) => match never {},
+        }
+    }
+    {
+        let mut ended: core::pin::Pin<&mut TerminalFuture<'_, ()>> =
+            pin!(ctx.complete(core::hint::black_box(b"done")));
+        kept = kept.wrapping_add(match ended.as_mut().poll(&mut task) {
+            Poll::Ready(Ok(())) => 6,
+            Poll::Ready(Err(())) | Poll::Pending => 7,
+        });
+    }
+    {
+        let mut ended: core::pin::Pin<&mut TerminalFuture<'_, ()>> =
+            pin!(ctx.fail(core::hint::black_box(b"bad")));
+        kept = kept.wrapping_add(match ended.as_mut().poll(&mut task) {
+            Poll::Ready(Ok(())) => 8,
+            Poll::Ready(Err(())) | Poll::Pending => 9,
+        });
+    }
+    kept = kept.wrapping_add(ctx.payload().len());
+    kept = kept.wrapping_add(match ctx.conclusion() {
+        Some(Conclusion::Ended(Outcome::Completed(bytes))) => bytes.len(),
+        Some(Conclusion::Ended(Outcome::Failed(bytes))) => bytes.len().wrapping_add(1),
+        Some(Conclusion::Refused) => 10,
+        None => 11,
+    });
+
     core::hint::black_box(kept)
+}
+
+/// Nothing, in an image built without the façade.
+#[cfg(not(feature = "facade"))]
+#[inline(never)]
+fn ctx_facade() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in an image built without the façade.

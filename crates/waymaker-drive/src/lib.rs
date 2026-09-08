@@ -22,6 +22,10 @@
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
 //!   builds them too.
+//! * `facade` and `ota` — the bridge to `waymaker-embassy`'s `Ctx` and design document
+//!   §06's OTA example. They are the only two modules that name the façade, so removing it
+//!   removes these two files and nothing else. The `without-facade` feature deletes them,
+//!   and the `drive-facadeless` pipeline stage builds that configuration for the part.
 //!
 //! # What this crate must not own
 //!
@@ -35,10 +39,9 @@
 //! For [`waymaker-rig`](https://docs.rs/waymaker-rig)'s reason and one more. A layer's
 //! public functions must all be reached by the size probe, so a driver listed in
 //! `xtask::policy::LAYERS` would be charged against design document §04's code-flash budget
-//! — and this is not firmware Waymaker ships. It is also not the Embassy façade: `Ctx`, the
-//! async dispatcher and wakeups are rung 0.4's, and `waymaker-embassy` is meant to be a
-//! façade over exactly this protocol. Driving the protocol here is what makes that
-//! falsifiable. See
+//! — and this is not firmware Waymaker ships. It is also not the Embassy façade:
+//! `waymaker-embassy` owns `Ctx` and the futures, and this crate is the protocol they are a
+//! façade over. Driving the protocol here is what makes that falsifiable. See
 //! [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
 //!
 //! # At-least-once
@@ -98,10 +101,16 @@ mod boundary;
 pub mod demo;
 mod drive;
 mod effect;
+#[cfg(not(feature = "without-facade"))]
+pub mod facade;
+#[cfg(not(feature = "without-facade"))]
+pub mod ota;
 mod workflow;
 
 pub use activity::{Activities, Clocks, Performed};
-pub use boundary::{Boundary, Suspended};
+pub use boundary::{Answered, Boundary, Handoff, Suspended};
 pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 pub use effect::{Dispatchable, DurableIntent, Effect, Resolution, Resolved, Scheduled};
+#[cfg(not(feature = "without-facade"))]
+pub use facade::Bridge;
 pub use workflow::{Identity, Workflow};

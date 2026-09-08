@@ -6,7 +6,7 @@
 //! [`Suspended`] with `?`, which is what `.await` does in the façade one layer up.
 
 use waymaker_core::timer::TimerSpec;
-use waymaker_core::{ActivityKind, Outcome};
+use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 /// The run cannot continue now. Return it.
 ///
@@ -27,6 +27,39 @@ pub struct Suspended(());
 impl Suspended {
     /// The one value, made by the driver only.
     pub(crate) const NEW: Self = Self(());
+}
+
+/// What the driver says about one activity boundary, after design document §07 step 3.
+///
+/// [`Boundary::call`]'s two halves, for a caller that performs the effect itself. There is
+/// no third shape for "not durable yet": a driver that cannot commit the intent answers
+/// [`Suspended`], so the identity that reaches the world exists only after the schedule
+/// record is durable.
+///
+/// # Why this vocabulary is the driver's own
+///
+/// So that removing the façade removes nothing here. Nothing below `facade` and `ota` names
+/// a `waymaker-embassy` type, and the `without-facade` feature deletes those two modules —
+/// which is what makes "the protocol is fully usable through the synchronous driver" a
+/// build rather than a claim. The `drive-facadeless` pipeline stage is that build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff<'a> {
+    /// History holds the outcome. Nothing may be dispatched.
+    Replayed(Outcome<'a>),
+    /// The intent is durable. Perform the effect under `id`, then call
+    /// [`Boundary::resolve`].
+    Dispatch(EffectId),
+}
+
+/// What the world answered for the effect [`Boundary::schedule`] handed out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered<'a> {
+    /// Success, within the run's declared bound.
+    Completed(&'a [u8]),
+    /// Failure, within the run's declared bound.
+    Failed(&'a [u8]),
+    /// The answer is wider than the bound. It is recorded as a failure with no payload.
+    Exhausted,
 }
 
 /// What a workflow may ask of the world.
@@ -108,4 +141,56 @@ pub trait Boundary {
     /// deadline has not passed yet. Nothing about *why* travels in it;
     /// [`Progress`](crate::Progress) is the driver's answer.
     fn wait(&mut self, spec: TimerSpec) -> Result<(), Suspended>;
+
+    /// [`call`](Self::call)'s first half: §07 steps 1 to 3, and no dispatch.
+    ///
+    /// For a caller that performs the effect itself — an async façade that must `.await`
+    /// the world between the two durable halves. A caller that takes this route calls
+    /// [`resolve`](Self::resolve) next, with what the world answered.
+    ///
+    /// # Postconditions
+    ///
+    /// On [`Handoff::Dispatch`] the schedule record survives a reset. On
+    /// [`Handoff::Replayed`] nothing was written and nothing may be dispatched.
+    ///
+    /// # Errors
+    ///
+    /// [`Suspended`] whenever the run must stop here.
+    fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Suspended>;
+
+    /// [`call`](Self::call)'s second half: §07 steps 5 to 7.
+    ///
+    /// The returned bytes borrow the caller's result buffer, under
+    /// [`call`](Self::call)'s lifetime discipline.
+    ///
+    /// # Postconditions
+    ///
+    /// On [`Ok`] the outcome is replayable, and not before. An answer wider than the run's
+    /// declared bound is recorded as [`Answered::Exhausted`] rather than refused: a refusal
+    /// strands the run, because §08 has no edge from an unresolved effect to a terminal
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// [`Suspended`] whenever the run must stop here, and whenever no effect is
+    /// outstanding — a `resolve` with no `schedule` before it is a caller that never
+    /// committed the intent.
+    fn resolve(&mut self, answered: Answered<'_>) -> Result<Outcome<'_>, Suspended>;
+
+    /// §10's `continue_as_new`: retire this run and install a new one over `input`.
+    ///
+    /// It returns [`Suspended`] and nothing else. The run that asked is over either way.
+    ///
+    /// # What this driver does
+    ///
+    /// It refuses, with
+    /// [`DriveError::ContinueUnsupported`](crate::DriveError::ContinueUnsupported). §10's
+    /// swap is `waymaker-flash`'s `swap` module, and it works on a *bank*: it needs the
+    /// two-bank layout, the authority the device booted, and the generation seal.
+    /// [`Driver`](crate::Driver) is pointed at a
+    /// [`JournalRegion`](waymaker_flash::recovery::JournalRegion) and knows none of them,
+    /// so a swap here would be a swap of a bank this driver cannot name. Issue
+    /// [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatcher is where the two
+    /// are joined.
+    fn continue_as_new(&mut self, input: &[u8]) -> Suspended;
 }

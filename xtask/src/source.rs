@@ -2915,8 +2915,8 @@ fn inherent_impl_bodies(code: &str, type_name: &str) -> Vec<String> {
     // *Every* block, not the first. Review of this change pointed out that a second
     // `impl Staged { .. }` further down the file is invisible to a rule that stops at the
     // first, and a private helper in it could program a seal with the pin green.
-    while let Some(at) = code.get(cursor..).and_then(|rest| rest.find("\nimpl")) {
-        let start = cursor.saturating_add(at).saturating_add(1);
+    while let Some(at) = code.get(cursor..).and_then(next_impl_line) {
+        let start = cursor.saturating_add(at);
         let Some(rest) = code.get(start..) else {
             break;
         };
@@ -2934,6 +2934,29 @@ fn inherent_impl_bodies(code: &str, type_name: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Where the next `impl` keyword at the start of a line begins.
+///
+/// The offset of the keyword, not of the newline, because a leading attribute may sit
+/// between them: `#[rustfmt::skip] impl Bank { pub(crate) fn raw() {} }` is one line that
+/// survives `cargo fmt`, and a scan for `"\nimpl"` does not see it. Codex round 3 found the
+/// same blindness in the reader beside this one.
+fn next_impl_line(code: &str) -> Option<usize> {
+    let mut offset = 0_usize;
+    for line in code.split_inclusive('\n') {
+        // A line at the very start of `code` is mid-line as far as this scan is concerned:
+        // the caller resumes from inside a block it has already read.
+        if offset > 0 {
+            let bare = crate::size::without_leading_attributes(line);
+            if bare.starts_with("impl") {
+                let within = line.len().saturating_sub(bare.len());
+                return Some(offset.saturating_add(within));
+            }
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    None
 }
 
 /// The type an inherent `impl` header names, with its generics stripped.
@@ -4363,7 +4386,15 @@ fn integrity_generic_functions(code: &str) -> Vec<String> {
             continue;
         }
         if joining.is_none() {
-            let is_impl = trimmed.starts_with("impl");
+            // Leading attributes set aside for `future_implementors`'s reason, and this is
+            // the sharper of the two: an `impl` header the scan does not join registers no
+            // depth, so every method inside a generic `impl` block goes unfound and is
+            // pinned by no row of `SEALING_FUNCTIONS`. Codex round 4's class, third
+            // instance. `struct_literal_positions`'s `starts_with("impl")` is the fourth
+            // and is left alone: blinding it reports a declaration as a construction, so
+            // it over-reports rather than going quiet.
+            let bare = crate::size::without_leading_attributes(trimmed);
+            let is_impl = bare.starts_with("impl");
             if is_impl || trimmed.contains("fn ") {
                 joining = Some((String::new(), is_impl));
             }
@@ -5236,6 +5267,537 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
     }
 
     violations
+}
+
+/// The façade's own module, whose public surface `ctx-facade` pins.
+pub const CTX_FACADE_PATH: &str = "waymaker-embassy/src/ctx.rs";
+
+/// The durable half the façade asks, whose public surface `ctx-facade` pins.
+pub const CTX_JOURNAL_PATH: &str = "waymaker-embassy/src/journal.rs";
+
+/// Every public function issue #35's `Ctx` declares.
+///
+/// Four futures, a constructor, and three accessors a caller reads after a boot. A ninth
+/// name is a way for the façade to do something, and the whole of issue #35 is that it may
+/// only ask.
+pub const CTX_SURFACE: &[&str] = &[
+    "activity",
+    "complete",
+    "conclusion",
+    "continue_as_new",
+    "fail",
+    "new",
+    "payload",
+    "timer",
+];
+
+/// The four futures `Ctx` hands out.
+///
+/// Pinned so that a fifth is a reviewer's decision. It is also what makes the `poll`
+/// exemption below safe: the surface pin cannot speak about a name declared four times, so
+/// the count is held here instead.
+pub const CTX_FUTURES: &[&str] = &[
+    "ActivityFuture",
+    "ContinueFuture",
+    "TerminalFuture",
+    "TimerFuture",
+];
+
+/// The type `ctx-facade` pins the methods of, at every visibility.
+pub const CTX_TYPE: &str = "Ctx";
+
+/// The methods `Ctx` declares that are not part of its surface.
+///
+/// One: the shared body behind `complete` and `fail`. Pinned rather than allowed, so a
+/// second private method is a line a reviewer writes.
+pub const CTX_PRIVATE_METHODS: &[&str] = &["ending"];
+
+/// The one name the façade's surface pin does not compare.
+///
+/// `Future::poll` is `core`'s name and every future declares it exactly once, so a pin that
+/// is a list of names cannot say anything about four of them. [`CTX_FUTURES`] holds the
+/// count instead.
+const FUTURE_POLL: &str = "poll";
+
+/// Every method the durable half declares.
+///
+/// Four, one per thing a workflow can ask for. A fifth is a question the façade would be
+/// answering for itself.
+pub const CTX_JOURNAL_SURFACE: &[&str] = &["continue_as_new", "resolve", "schedule", "wait"];
+
+/// What the façade may not name, and why.
+///
+/// Each is a piece of authority the façade must not hold. `waymaker-embassy`'s must-not-own
+/// cell is "on-media authority or hidden global state", and every one of these is the first.
+pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
+    (
+        "StableStorage",
+        "is the device, and a façade that reached one would write records for itself",
+    ),
+    (
+        "Reserved",
+        "is §10's gated writer, and admitting a record is the journal's decision",
+    ),
+    (
+        "RecordRef",
+        "is a record, and a façade that named one would decide what history holds",
+    ),
+    (
+        "Recovery",
+        "is the recovery scan, which decides what committed history is",
+    ),
+    (
+        "ReplayMachine",
+        "is §08's transition table, which decides what may follow what",
+    ),
+    (
+        "BankLayout",
+        "is §10's two-bank layout, which decides which bank is authoritative",
+    ),
+    (
+        "Swap",
+        "is §10's bank swap, which is the journal's to perform",
+    ),
+];
+
+/// The three driver files that may name the façade.
+///
+/// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
+/// fully usable through the synchronous driver. Every *other* module of `waymaker-drive` is
+/// held to naming no façade, and the list is the exemptions rather than the modules held —
+/// so a module added tomorrow is covered without anyone remembering to add a row.
+///
+/// `lib.rs` is here because a crate root declares its modules and re-exports a name from
+/// them. Its own honesty is the `drive-facadeless` build's rather than this scan's.
+pub const FACADE_DRIVER_MODULES: &[&str] = &[
+    "waymaker-drive/src/facade.rs",
+    "waymaker-drive/src/lib.rs",
+    "waymaker-drive/src/ota.rs",
+];
+
+/// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
+///
+/// The crate itself, and the three source-level routes to it that name no crate: the two
+/// modules that hold the edge, and the type they re-export. Review of this change reached
+/// the façade with `use crate::facade::Bridge;` while a ban on the crate name alone stayed
+/// green.
+pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
+    (
+        "waymaker_embassy",
+        "is the façade crate, so a module that names it cannot compile with the façade \
+         removed",
+    ),
+    (
+        "facade",
+        "is the module that holds the façade edge; reaching it is reaching the façade",
+    ),
+    (
+        "ota",
+        "is design document §06's example over the façade; reaching it is reaching the \
+         façade",
+    ),
+    (
+        "Bridge",
+        "is the façade's journal over this boundary, re-exported from the crate root",
+    ),
+];
+
+/// Rule: the façade adds sugar and never authority.
+///
+/// Issue [#35](https://github.com/madmax983/waymaker/issues/35) says it in one line — "it
+/// must add sugar, never authority" — and design document §05 says it as
+/// `waymaker-embassy`'s must-not-own cell: on-media authority or hidden global state. Both
+/// are absences, and an absence is what a test cannot check: a `Ctx::record` that appended
+/// a record for itself would break no layering rule, need no new dependency, and pass every
+/// test in the workspace, because the run would still complete.
+///
+/// So this pins three things.
+///
+/// The **surface**, in both directions. A tenth public function on `Ctx` or a fifth method
+/// on the journal is a reviewer's decision rather than a commit.
+///
+/// The **vocabulary**. `waymaker-embassy` may depend on `waymaker-flash`, so nothing else
+/// stops the façade reaching a `StableStorage` or a `Reserved` and writing through it.
+/// [`CTX_FORBIDDEN_VOCABULARY`] names each piece of authority and why it is not the
+/// façade's.
+///
+/// And **no hidden global state**: a `static` in either module is the other half of the
+/// must-not-own cell, and a façade with one is a façade two runs on a device would share.
+///
+/// The fourth half is the driver's. Every `waymaker-drive` module but the three in
+/// [`FACADE_DRIVER_MODULES`] is held to naming none of [`FACADE_FREE_VOCABULARY`], so a
+/// module added tomorrow is covered without anyone remembering a row. That is the fast half
+/// of "removing the Embassy crate leaves the protocol fully usable"; the `drive-facadeless`
+/// pipeline stage is the half a compiler decides.
+///
+/// # What it cannot see
+///
+/// A function added from a sibling module — it pins two files, exactly as
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
+/// pin. And it compares *names*: a `Ctx::payload` that started returning the journal's
+/// buffer rather than the caller's is `crates/waymaker-embassy/tests/ctx.rs`'s.
+#[must_use]
+pub fn check_ctx_facade(
+    sources: &[crate::size::LayerSource],
+    driver: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    const RULE: &str = "ctx-facade";
+    const FACADE: &str = "waymaker-embassy";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    for (path, pinned) in [
+        (CTX_FACADE_PATH, CTX_SURFACE),
+        (CTX_JOURNAL_PATH, CTX_JOURNAL_SURFACE),
+    ] {
+        violations.extend(check_facade_surface(RULE, FACADE, path, pinned, sources));
+        let Some(source) = find_source(sources, path) else {
+            continue;
+        };
+        if path == CTX_FACADE_PATH {
+            let code = without_test_modules(&code_only(&source.contents));
+            violations.extend(check_facade_futures(RULE, FACADE, path, &code));
+            violations.extend(check_facade_type_members(RULE, FACADE, path, &code));
+        }
+    }
+
+    // The authority ban, the `static` ban and the macro ban are statements about the
+    // *crate*, so they read every one of its files. Review of this change put a
+    // `pub use waymaker_flash::storage::StableStorage as Device;`, a
+    // `pub static ATTEMPTS: AtomicUsize` and a `macro_rules!` expanding a tenth public
+    // method into `impl Ctx` in `dispatch.rs` — one file over from the two the surface pins
+    // read — and watched the gate stay green on all three.
+    for source in sources.iter().filter(|source| source.crate_name == FACADE) {
+        let path = source.path.replace('\\', "/");
+        let code = without_test_modules(&code_only(&source.contents));
+        for (forbidden, why) in CTX_FORBIDDEN_VOCABULARY {
+            if names_identifier(&code, forbidden) {
+                violations.push(Violation::new(
+                    RULE,
+                    FACADE,
+                    format!("{path} names `{forbidden}`, which {why}"),
+                ));
+            }
+        }
+        violations.extend(check_no_hidden_state(RULE, FACADE, &path, &code));
+        // And the future set, for the same reason: a fifth future whose `impl Future` lives
+        // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
+        // cannot see. Review of this change declared one in `dispatch.rs`.
+        for future in future_implementors(&code) {
+            if !CTX_FUTURES.contains(&future.as_str()) {
+                violations.push(Violation::new(
+                    RULE,
+                    FACADE,
+                    format!(
+                        "{path} implements `Future` for `{future}`, which `CTX_FUTURES` does \
+                         not name: a fifth thing a workflow can `.await` is a reviewer's \
+                         decision rather than a commit"
+                    ),
+                ));
+            }
+        }
+        // A scanner cannot expand a macro, so it refuses the construct — the answer
+        // `effect-protocol` gives to a closure and a short-circuit.
+        if names_identifier(&code, "macro_rules") {
+            violations.push(Violation::new(
+                RULE,
+                FACADE,
+                format!(
+                    "{path} declares a `macro_rules!`, which can expand a public method into \
+                     a pinned `impl`, or a future's `poll`, where no pin can read it"
+                ),
+            ));
+        }
+    }
+
+    violations.extend(check_facade_free_driver(RULE, DRIVER, driver));
+    violations
+}
+
+/// Every `waymaker-drive` module but the three that hold the façade edge names no façade.
+///
+/// Discovered from the sources rather than listed, so a module added tomorrow is covered.
+/// A scanner is not the whole of this claim and does not have to be: the `drive-facadeless`
+/// pipeline stage builds the crate with `without-facade`, which a `use crate::facade::Bridge`
+/// and a dependency renamed in a manifest both fail. This is the fast, local half.
+fn check_facade_free_driver(
+    rule: &'static str,
+    subject: &str,
+    driver: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut seen = 0_usize;
+    for source in driver {
+        let path = source.path.replace('\\', "/");
+        if FACADE_DRIVER_MODULES
+            .iter()
+            .any(|exempt| path.ends_with(exempt))
+        {
+            continue;
+        }
+        seen = seen.saturating_add(1);
+        let code = code_only(&source.contents);
+        for (forbidden, why) in FACADE_FREE_VOCABULARY {
+            if names_identifier(&code, forbidden) {
+                violations.push(Violation::new(
+                    rule,
+                    subject.to_owned(),
+                    format!(
+                        "{path} names `{forbidden}`, which {why}; the edge belongs in \
+                         waymaker-drive/src/facade.rs and waymaker-drive/src/ota.rs"
+                    ),
+                ));
+            }
+        }
+    }
+    if seen == 0 {
+        violations.push(Violation::new(
+            rule,
+            subject.to_owned(),
+            "no waymaker-drive module outside the façade edge is in the workspace, so \
+             nothing says the synchronous driver still compiles with the façade removed"
+                .to_owned(),
+        ));
+    }
+    violations
+}
+
+/// `Ctx` declares its methods at every visibility, and no associated constant.
+///
+/// The two defeats CLAUDE.md already records against `timer-capability` and
+/// `effect-protocol`, met here as well: a surface pin counts `pub ` and not `pub(`, and
+/// reads `fn` declarations and so cannot see a `const`. `waymaker-embassy` is one crate, so
+/// a `pub(crate) fn commit_raw` on `Ctx` is reachable from `clock.rs` — which is where the
+/// authority would go.
+fn check_facade_type_members(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    code: &str,
+) -> Vec<Violation> {
+    let blocks = inherent_impl_bodies(code, CTX_TYPE);
+    if blocks.is_empty() {
+        return vec![Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "{path} declares no inherent `impl` for `{CTX_TYPE}`, so its methods are \
+                 pinned against nothing"
+            ),
+        )];
+    }
+    let joined = blocks.join("\n");
+    let mut violations = Vec::new();
+    let declared = declared_function_names(&joined);
+    let mut expected: Vec<String> = CTX_SURFACE
+        .iter()
+        .chain(CTX_PRIVATE_METHODS)
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    if declared != expected {
+        violations.push(Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "`{CTX_TYPE}` declares {declared:?} rather than {expected:?}: read at every \
+                 visibility, because a surface pin counts `pub ` and not `pub(`, and the \
+                 crate that would call a `pub(crate)` escape hatch is this one"
+            ),
+        ));
+    }
+    violations.extend(
+        declared_associated_constants(&joined)
+            .into_iter()
+            .map(|constant| {
+                Violation::new(
+                    rule,
+                    subject.to_owned(),
+                    format!(
+                        "`{CTX_TYPE}` declares the associated constant `{constant}`: a surface \
+                     pin reads `fn` declarations, so a constant is a value every caller \
+                     reaches without changing a surface"
+                    ),
+                )
+            }),
+    );
+    violations
+}
+
+/// The pinned surface, with [`FUTURE_POLL`] set aside.
+///
+/// [`check_pinned_surface`] refuses a name declared twice, and four futures declare `poll`.
+/// Everything else is compared the same way and in both directions.
+fn check_facade_surface(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    pinned: &[&str],
+    sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    let Some(source) = find_source(sources, path) else {
+        return vec![Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "no {path} in the workspace, so the pinned surface is checking nothing; \
+                 issue #35's façade must add sugar and never authority"
+            ),
+        )];
+    };
+
+    let mut declarations: Vec<String> =
+        crate::size::public_functions(core::slice::from_ref(source))
+            .into_iter()
+            .map(|function| function.name)
+            .filter(|name| name != FUTURE_POLL)
+            .collect();
+    declarations.sort_unstable();
+
+    let mut violations = Vec::new();
+    for (index, name) in declarations.iter().enumerate() {
+        if declarations.get(index.wrapping_add(1)) == Some(name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}` more than once, so the pin can no longer speak \
+                     about it; give the second one a name of its own"
+                ),
+            ));
+        }
+    }
+    for name in &declarations {
+        if !pinned.contains(&name.as_str()) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}`, which the pinned surface does not list: the \
+                     façade must add sugar and never authority, so a way for it to do \
+                     something rather than ask cannot be added without a reviewer writing it \
+                     down"
+                ),
+            ));
+        }
+    }
+    for name in pinned {
+        if !declarations.iter().any(|declared| declared == name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{path} no longer declares `{name}`, which the pinned surface lists"),
+            ));
+        }
+    }
+    violations
+}
+
+/// Exactly the futures [`CTX_FUTURES`] names, each with one `poll`.
+///
+/// The count is what the surface pin gave up when it set `poll` aside. A fifth future is a
+/// fifth thing a workflow can `.await`, which is a reviewer's decision rather than a commit.
+fn check_facade_futures(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    code: &str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for future in CTX_FUTURES {
+        let header = format!("pub struct {future}");
+        let declarations = declaration_count(code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{path} declares `{header}` {declarations} times, not once"),
+            ));
+        }
+    }
+    let polls = code
+        .lines()
+        .filter(|line| line.trim_start().starts_with("fn poll("))
+        .count();
+    if polls != CTX_FUTURES.len() {
+        violations.push(Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "{path} declares {polls} `fn poll` bodies and {} futures; the surface pin \
+                 sets `poll` aside, so a future the pin cannot see is one nobody weighed",
+                CTX_FUTURES.len()
+            ),
+        ));
+    }
+    violations
+}
+
+/// Every type the file implements `Future` for.
+///
+/// A line scan, like every other rule here: the header may be spelled `impl Future for X`,
+/// `impl core::future::Future for X` or with generics in between, and what is wanted is the
+/// self type. Generics on the type itself are dropped, so `ActivityFuture<'_, T, D, J>` is
+/// `ActivityFuture`.
+fn future_implementors(code: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in code.lines() {
+        // Leading attributes first, for the reason every other classifier here sets them
+        // aside: `#[rustfmt::skip] impl Future for SignalFuture { .. }` is one line that
+        // `cargo fmt` preserves, and this was the third reader still reading past it. The
+        // `fn poll` count is `ctx.rs`'s alone, so a fifth future declared anywhere else in
+        // the crate rested on this scan. Codex round 4.
+        let trimmed = crate::size::without_leading_attributes(line.trim());
+        if !trimmed.starts_with("impl") {
+            continue;
+        }
+        let Some((before, after)) = trimmed.split_once(" for ") else {
+            continue;
+        };
+        if !names_identifier(before, "Future") {
+            continue;
+        }
+        let name: String = after
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        if !name.is_empty() {
+            found.push(name);
+        }
+    }
+    found
+}
+
+/// A module that declares no `static`.
+///
+/// `waymaker-embassy`'s must-not-own cell names hidden global state, and a `static` is what
+/// that means in a `no_std` crate with no allocator: one device, two runs, one buffer.
+/// `const` is not global state — it has no address a caller can observe — so only `static`
+/// is refused.
+fn check_no_hidden_state(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    code: &str,
+) -> Vec<Violation> {
+    code.lines()
+        // The `static` keyword as a *token*, anywhere on the line. Reading the start of the
+        // line after one `pub` prefix let `#[allow(dead_code)] static SHARED: [u8; 8] = ..`
+        // through, and it survives `cargo fmt`. Review of this change landed exactly that.
+        .filter(|line| names_identifier(line, "static"))
+        .map(|line| {
+            Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{}`, which is hidden global state; the façade's \
+                     must-not-own cell names it, and a buffer two runs share is the failure \
+                     it names",
+                    line.trim()
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Rule: design document §07's seven steps happen in §07's order, and step 4 cannot be
@@ -7806,6 +8368,472 @@ mod deferred_answer_pins {
             .collect()
     }
 
+    /// The two façade files `ctx-facade` reads, with one of them replaced.
+    fn facade_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        [
+            (CTX_FACADE_PATH, tests_support::clean_ctx_facade()),
+            (CTX_JOURNAL_PATH, tests_support::clean_ctx_journal()),
+        ]
+        .into_iter()
+        .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+        .collect()
+    }
+
+    /// Driver modules outside the façade edge, with one of them replaced.
+    fn facade_free_driver_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        [
+            "waymaker-drive/src/drive.rs",
+            "waymaker-drive/src/boundary.rs",
+        ]
+        .into_iter()
+        .map(|at| {
+            let body = tests_support::clean_facade_free_driver_module();
+            layer(at, if at == path { contents } else { &body })
+        })
+        .collect()
+    }
+
+    /// Every violation the rule emits when the façade file `path` holds `contents`.
+    fn facade_details(path: &str, contents: &str) -> Vec<String> {
+        check_ctx_facade(
+            &facade_sources(path, contents),
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect()
+    }
+
+    /// Every violation the rule emits when the driver file `path` holds `contents`.
+    fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
+        check_ctx_facade(
+            &facade_sources("", ""),
+            &facade_free_driver_sources(path, contents),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect()
+    }
+
+    #[test]
+    fn the_clean_facade_passes() {
+        assert!(facade_details("", "").is_empty());
+    }
+
+    #[test]
+    fn a_facade_that_reaches_the_device_is_reported() {
+        // The sharpest mutation the rule exists for. `waymaker-embassy` may depend on
+        // `waymaker-flash`, so nothing else stops the façade programming a record itself.
+        let module = format!(
+            "{}\npub fn record(storage: &mut impl StableStorage) {{ let _ = storage; }}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("StableStorage")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_that_holds_a_static_is_reported() {
+        // The other half of the must-not-own cell. A buffer two runs share is the failure.
+        for declaration in [
+            "static SHARED: [u8; 8] = [0; 8];",
+            "pub static SHARED: [u8; 8] = [0; 8];",
+            "pub(crate) static SHARED: [u8; 8] = [0; 8];",
+        ] {
+            let module = format!("{}\n{declaration}\n", tests_support::clean_ctx_facade());
+            let details = facade_details(CTX_FACADE_PATH, &module);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("hidden global state")),
+                "{declaration}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_const_is_not_hidden_state() {
+        let module = format!(
+            "{}\npub const WIDTH: usize = 8;\n",
+            tests_support::clean_ctx_facade()
+        );
+        assert!(facade_details(CTX_FACADE_PATH, &module).is_empty());
+    }
+
+    #[test]
+    fn a_fifth_future_is_reported() {
+        // The surface pin sets `poll` aside, so this is the only thing that counts them.
+        let module = format!(
+            "{}\npub struct SignalFuture;\nimpl SignalFuture {{\n    fn poll() {{}}\n}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`fn poll`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_function_the_pin_does_not_list_is_reported() {
+        let module = format!(
+            "{}\npub fn record() {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`record`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_function_declared_twice_is_reported() {
+        // A pin that is a list of names cannot speak about a name used twice.
+        let module = format!(
+            "{}\npub fn payload() {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("more than once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_facade_function_is_reported() {
+        let module = tests_support::clean_ctx_facade().replace("pub fn payload()", "fn payload()");
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no longer declares `payload`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_fifth_journal_method_is_reported() {
+        let module = format!(
+            "{}\npub fn append() {{}}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`append`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_future_above_the_real_one_is_reported() {
+        // `braced_body` and every scan below it read the first declaration, so a decoy above
+        // the real one is what they would check. `integrity-check` and `effect-protocol`
+        // each carry a named test for this; without one, the declaration count is a branch
+        // no test reaches.
+        let module = format!(
+            "//! The façade.\npub struct ActivityFuture;\n{}",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("`pub struct ActivityFuture` 2 times")),
+            "{details:?}"
+        );
+    }
+
+    /// The names `public_functions` collects from one file's text.
+    fn counted(contents: &str) -> Vec<String> {
+        crate::size::public_functions(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "waymaker-flash/src/bank.rs".to_owned(),
+            contents: contents.to_owned(),
+        }])
+        .into_iter()
+        .map(|function| function.name)
+        .collect()
+    }
+
+    #[test]
+    fn an_attribute_on_the_same_line_hides_nothing() {
+        // Codex round 3. Round 1's finding was about `#[rustfmt::skip] impl X { pub fn y()
+        // {} }` — one line — and the fix's own fixture put the attribute on a line of its
+        // own, so it never exercised the form the mutation used. Every classifier in the
+        // reader tests the *start* of a line, so an attribute in front of the item hid the
+        // `impl` and the `pub` alike. rustfmt leaves that line exactly as written.
+        for modifier in ["", "const ", "async ", "unsafe "] {
+            let inline = format!("#[rustfmt::skip] impl Bank {{ pub {modifier}fn raw() {{}} }}\n");
+            assert!(
+                counted(&inline).contains(&"raw".to_owned()),
+                "same-line attribute hid `pub {modifier}fn`"
+            );
+        }
+        // And an attribute in front of an ordinary declaration, which is the same shape one
+        // nesting level down.
+        assert!(counted("#[inline] pub fn raw() {}\n").contains(&"raw".to_owned()));
+        // Two of them, and one carrying a bracket of its own.
+        let stacked = "#[cfg(all(a, b))] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(stacked).contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_bracket_inside_an_attributes_string_is_not_the_end_of_the_attribute() {
+        // Codex round 4, and the finding is against round 3's own fix rather than against
+        // the reader it replaced: matching brackets counted every `]` as syntax, so
+        // `reason = "]"` ended the attribute early and left the classifier standing on
+        // `")]` rather than on the item. `#[expect(..)]` needs a reason under this
+        // workspace's lints, so the string is the ordinary form and not a contrivance.
+        let quoted =
+            "#[expect(lint, reason = \"]\")] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(quoted).contains(&"raw".to_owned()), "{quoted}");
+        // An escaped quote inside the reason, so the scan cannot simply toggle on `\"`.
+        let escaped = "#[expect(lint, reason = \"a \\\"]\\\" here\")] pub fn raw() {}\n";
+        assert!(counted(escaped).contains(&"raw".to_owned()), "{escaped}");
+        // And the direction that under-reports rather than over-reports: an attribute the
+        // scan cannot finish leaves the item unclassified, never counted as public.
+        assert!(!counted("#[expect(lint, reason = \"open").contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
+        // The reader beside `public_functions` had the same blindness, and it is what
+        // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
+        // same-line attribute was invisible to both.
+        let module = format!(
+            "{}\n#[rustfmt::skip] impl {CTX_TYPE} {{ pub(crate) fn commit_raw() {{}} }}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("commit_raw")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_public_method_is_counted_whatever_modifier_follows_pub() {
+        // Codex round 1. The prefix before ` fn ` ends in the *modifier* rather than in
+        // `pub`, so `impl Bank { pub const fn raw() {} }` read as private and nine surface
+        // pins and `size-probe-reach` stayed blind to the same one-line escape this change
+        // exists to close. Driven against the reader itself: `ctx-facade`'s method pin
+        // catches such a line on `Ctx` for a different reason, so a test that went through
+        // the rule would pass with the reader still broken.
+        for modifier in ["", "const ", "async ", "unsafe ", "extern \"C\" "] {
+            let inline = format!("#[rustfmt::skip]\nimpl Bank {{ pub {modifier}fn raw() {{}} }}\n");
+            assert!(
+                counted(&inline).contains(&"raw".to_owned()),
+                "pub {modifier}fn was not counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_pub_crate_method_is_not_counted_as_public() {
+        // The two paths must agree on what `pub` means: the non-inline one reads
+        // `starts_with("pub ")`, so a `pub(crate)` member is not public there and must not
+        // become public here — `size-probe-reach` would then demand a probe call for it.
+        let inline = "#[rustfmt::skip]\nimpl Bank { pub(crate) fn raw() {} }\n";
+        assert!(!counted(inline).contains(&"raw".to_owned()));
+        // And a private member of an inline block is still private.
+        let private = "#[rustfmt::skip]\nimpl Bank { fn raw() {} }\n";
+        assert!(!counted(private).contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_pub_crate_method_on_the_context_is_reported() {
+        // The defeat CLAUDE.md records against `timer-capability` and `effect-protocol`,
+        // met here: a surface pin counts `pub ` and not `pub(`, and this crate is one crate.
+        let module = tests_support::clean_ctx_facade().replace(
+            "    fn ending() {}",
+            "    fn ending() {}\n    pub(crate) fn commit_raw() {}",
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("commit_raw")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_associated_constant_on_the_context_is_reported() {
+        // The other half of that defeat: the pin reads `fn`, so a `const` is a value every
+        // caller reaches without changing a surface.
+        let module = tests_support::clean_ctx_facade().replace(
+            "    fn ending() {}",
+            "    fn ending() {}\n    pub const AUTHORITY: usize = 1;",
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("AUTHORITY")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_behind_a_leading_attribute_is_reported() {
+        // Reading the start of a line after one `pub` prefix let this through, and it
+        // survives `cargo fmt`. Review of this change landed exactly it.
+        let module = format!(
+            "{}\n#[allow(dead_code)] static SHARED_PAGE: [u8; 8] = [0; 8];\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("hidden global state")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_in_the_facade_crate_is_reported() {
+        // A scanner cannot expand a macro, so it refuses the construct — the answer
+        // `effect-protocol` gives to a closure and a short-circuit. Review of this change
+        // expanded a tenth public method into `impl Ctx` from a sibling module.
+        let module = format!(
+            "{}\nmacro_rules! escape_hatch {{ () => {{}} }}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("macro_rules")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_journal_side_is_held_to_the_same_two_bans() {
+        // The vocabulary ban and the `static` ban read every file of the crate, so the
+        // second path is exercised rather than assumed.
+        for (mutation, expected) in [
+            (
+                "pub use waymaker_flash::storage::StableStorage as Device;",
+                "StableStorage",
+            ),
+            ("static SHARED: usize = 0;", "hidden global state"),
+        ] {
+            let module = format!("{}\n{mutation}\n", tests_support::clean_ctx_journal());
+            let details = facade_details(CTX_JOURNAL_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains(expected)),
+                "{mutation}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fifth_future_in_a_sibling_module_is_reported() {
+        // The future *count* reads `ctx.rs`; the future *set* reads every file of the
+        // crate. Review of this change declared one in `dispatch.rs`, where the count
+        // cannot see it.
+        let module = format!(
+            "{}\npub struct SignalFuture;\nimpl core::future::Future for SignalFuture {{}}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("SignalFuture")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_fifth_future_behind_a_leading_attribute_is_reported() {
+        // Codex round 4. The set scan tested `starts_with("impl")` on the raw line while
+        // every classifier beside it stripped attributes first, so the one spelling
+        // `cargo fmt` preserves walked past the only reader that looks outside `ctx.rs`.
+        for mutation in [
+            "#[rustfmt::skip] impl core::future::Future for SignalFuture {}",
+            "#[cfg(all(a, b))] #[rustfmt::skip] impl core::future::Future for SignalFuture {}",
+            "#[expect(lint, reason = \"]\")] impl core::future::Future for SignalFuture {}",
+        ] {
+            let module = format!(
+                "{}\npub struct SignalFuture;\n{mutation}\n",
+                tests_support::clean_ctx_journal()
+            );
+            let details = facade_details(CTX_JOURNAL_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains("SignalFuture")),
+                "{mutation}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pinned_futures_are_not_reported_by_the_crate_wide_set() {
+        // The clean fixture implements `Future` for all four, so a set pin that could not
+        // read the spelling `impl core::future::Future for X` would report every one of
+        // them and this test would be the one that noticed.
+        assert!(facade_details("", "").is_empty());
+    }
+
+    #[test]
+    fn a_driver_module_that_routes_through_the_bridge_is_reported() {
+        // Naming no crate and reaching the façade anyway. Review of this change added
+        // exactly this line to `drive.rs` and watched a ban on the crate name stay green.
+        for mutation in [
+            "use crate::facade::Bridge;",
+            "use crate::Bridge;",
+            "use crate::ota::Ota;",
+        ] {
+            let module = format!("//! A driver module.\n{mutation}\n");
+            let details = facade_driver_details("waymaker-drive/src/drive.rs", &module);
+            assert!(!details.is_empty(), "{mutation}: {details:?}");
+        }
+    }
+
+    #[test]
+    fn a_facade_module_that_is_gone_is_reported() {
+        // Fails closed, for `timer-capability`'s reason: a pin that cannot find its file is
+        // a pin that has stopped checking.
+        let details: Vec<String> = check_ctx_facade(&[], &[])
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect();
+        assert!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("in the workspace"))
+                .count()
+                >= 2,
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_module_that_names_the_facade_is_reported() {
+        // Issue #35's second "done when": removing the façade must leave the protocol
+        // usable, so the edge belongs in the two files that exist to hold it.
+        let module = "//! A driver module.\nuse waymaker_embassy::Journal;\n";
+        let details = facade_driver_details("waymaker-drive/src/drive.rs", module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("waymaker_embassy")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_module_that_only_mentions_the_facade_in_a_comment_is_not_reported() {
+        let module = "//! See waymaker_embassy for the façade.\n// waymaker_embassy again.\n";
+        assert!(
+            facade_driver_details("waymaker-drive/src/drive.rs", module).is_empty(),
+            "prose is not a dependency"
+        );
+    }
+
     #[test]
     fn the_clean_timer_capability_passes() {
         assert!(
@@ -9194,7 +10222,7 @@ mod deferred_answer_pins {
     }
 
     #[test]
-    fn the_generic_scan_sees_the_three_shapes_that_once_escaped_it() {
+    fn the_generic_scan_sees_the_shapes_that_once_escaped_it() {
         // Each of these reached a seal through the check and passed the whole gate, because
         // the scan read one line at a time. A `where` clause puts the bound on a line with no
         // `fn`; a method in a generic `impl` block has a `fn` on a line with no bound; and a
@@ -9203,8 +10231,17 @@ mod deferred_answer_pins {
             "fn shadow_where<C>(bytes: &[u8]) -> u16\nwhere\n    C: IntegrityCheck,\n{\n    0\n}\n",
             "impl<'a, C: IntegrityCheck> Scan<'a, C> {\n    fn shadow_method(&self) -> u16 {\n        0\n    }\n}\n",
             "fn shadow_wrapped<\n    C: IntegrityCheck,\n>(bytes: &[u8]) -> u16 {\n    0\n}\n",
+            // Codex round 4's class, met a third time. An attribute in front of the header
+            // left it unjoined, so the block registered no depth and `shadow_behind` — a
+            // method whose own signature never names `C` — was found by nothing.
+            "#[rustfmt::skip] impl<C: IntegrityCheck> Scan<C> {\n    fn shadow_behind(&self) -> u16 {\n        0\n    }\n}\n",
         ];
-        let expected = ["shadow_where", "shadow_method", "shadow_wrapped"];
+        let expected = [
+            "shadow_where",
+            "shadow_method",
+            "shadow_wrapped",
+            "shadow_behind",
+        ];
         for (shape, name) in shapes.iter().zip(expected) {
             let found = integrity_generic_functions(shape);
             assert!(
@@ -10708,6 +11745,7 @@ pub mod tests_support {
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
         BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
         CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE,
+        CTX_FUTURES, CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE,
         DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
         INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
         SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
@@ -10805,6 +11843,45 @@ pub mod tests_support {
             "//! A kernel crate root.\npub mod timer;\npub use timer::{{{}}};\n",
             exported.join(", ")
         )
+    }
+
+    /// A façade module declaring exactly [`CTX_SURFACE`] and [`CTX_FUTURES`], naming no
+    /// authority and holding no `static`.
+    ///
+    /// The futures implement `Future` rather than declaring an inherent `impl`. That is the
+    /// shape the `poll` exemption exists for: a trait impl's method is public whether or
+    /// not it says so, so a fixture built from inherent `impl`s would let the exemption be
+    /// deleted with every test still green. Review of this change measured exactly that.
+    #[must_use]
+    pub fn clean_ctx_facade() -> String {
+        let mut source = format!("//! The façade.\npub struct {CTX_TYPE};\nimpl {CTX_TYPE} {{\n");
+        for name in CTX_SURFACE {
+            let _ = writeln!(source, "    pub fn {name}() {{}}");
+        }
+        for name in CTX_PRIVATE_METHODS {
+            let _ = writeln!(source, "    fn {name}() {{}}");
+        }
+        source.push_str("}\n");
+        for future in CTX_FUTURES {
+            let _ = writeln!(source, "pub struct {future};");
+            let _ = writeln!(
+                source,
+                "impl core::future::Future for {future} {{\n    fn poll() {{}}\n}}"
+            );
+        }
+        source
+    }
+
+    /// A durable half declaring exactly [`CTX_JOURNAL_SURFACE`].
+    #[must_use]
+    pub fn clean_ctx_journal() -> String {
+        surface("The durable half.", CTX_JOURNAL_SURFACE)
+    }
+
+    /// A driver module that names no façade type.
+    #[must_use]
+    pub fn clean_facade_free_driver_module() -> String {
+        "//! A driver module that knows nothing about the façade.\n".to_owned()
     }
 
     /// A clock module declaring exactly [`CLOCK_SURFACE`], naming no boot clock, and
@@ -11374,6 +12451,8 @@ mod tests {
             .chain(SWAP_SURFACE)
             .chain(TIMER_SURFACE)
             .chain(CLOCK_SURFACE)
+            .chain(CTX_SURFACE)
+            .chain(CTX_JOURNAL_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

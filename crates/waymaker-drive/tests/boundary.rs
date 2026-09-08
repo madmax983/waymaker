@@ -158,9 +158,12 @@ fn a_recorded_outcome_longer_than_the_callers_buffer_is_refused() {
     let mut world = World::new();
     let mut page = [0_u8; 256];
     // History was written under the reference bounds. This boot declares two bytes, which
-    // is the firmware whose bounds shrank under a journal that is already there.
+    // is the firmware whose bounds shrank under a journal that is already there. Both
+    // bounds, because the caller's buffer must hold the wider of them and a two-byte buffer
+    // would otherwise be refused before the run starts.
     let narrow = Bounds {
         effect_result_bytes: 2,
+        terminal_bytes: 2,
         ..BOUNDS
     };
     // `DOWNLOAD` recorded twenty-one bytes, and this holds two.
@@ -421,14 +424,16 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
     let mut page = [0_u8; 256];
     let mut workflow = Verbose { payload: [7; 32] };
 
-    // Eight bytes of effect result, so that an eight-byte buffer is a legal one and the
-    // refusal below is about the *terminal* payload rather than about the buffer's width.
+    // Eight bytes of terminal payload, and a buffer wider than that — so the refusal below
+    // is about the *bound* the run declared rather than about the buffer's width. The
+    // workflow's payload is thirty-two.
     let bounds = Bounds {
         effect_result_bytes: 8,
+        terminal_bytes: 8,
         ..BOUNDS
     };
     {
-        let mut small = [0_u8; 8];
+        let mut small = [0_u8; 16];
         let Err(error) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
             &mut device,
             &mut world,
@@ -454,8 +459,37 @@ fn a_terminal_payload_that_does_not_fit_is_refused_before_the_record_is_written(
     // it, whatever buffer the caller brought.
     assert_eq!(kinds(&mut device), ["started"]);
 
+    // A buffer narrower than the run's own bounds is refused earlier still, before a record
+    // is read: the caller cannot carry what this run may hand back, and discovering that at
+    // the last record would mean every effect had already been performed.
+    {
+        let mut narrower = [0_u8; 4];
+        let refused = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut narrower,
+            },
+        );
+        assert_eq!(
+            refused,
+            Err(DriveError::ResultBufferTooSmall {
+                needed: 8,
+                available: 4
+            })
+        );
+        assert_eq!(kinds(&mut device), ["started"]);
+    }
+
+    // The same run under bounds the payload fits.
+    let wide = Bounds {
+        terminal_bytes: 32,
+        ..bounds
+    };
     let mut roomy = [0_u8; 64];
-    let Ok(progress) = Driver::new(region(), RUN, reserve_for(bounds)).boot(
+    let Ok(progress) = Driver::new(region(), RUN, reserve_for(wide)).boot(
         &mut device,
         &mut world,
         &mut workflow,

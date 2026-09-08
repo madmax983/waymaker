@@ -2098,9 +2098,33 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     .filter(|(body_depth, _)| *body_depth == depth)
                     .map_or(Block::Other, |(_, kind)| *kind);
 
-                if let Some(name) = function_name(trimmed) {
-                    let callable = trimmed.starts_with("pub ")
-                        || matches!(enclosing, Block::Trait | Block::TraitImpl);
+                // Any leading attributes are set aside first: every classifier below reads
+                // the start of the line, and `#[rustfmt::skip] impl X { pub fn y() {} }` is
+                // one line that survives `cargo fmt`.
+                let classified = without_leading_attributes(trimmed);
+                if let Some(name) = function_name(classified) {
+                    // A block header and one of its members on the same line —
+                    // `#[rustfmt::skip] impl Ctx { pub fn seal_now(..) { .. } }`. Neither
+                    // test below sees it: the line does not begin with `pub `, and the
+                    // block that makes the method callable is declared on this very line
+                    // rather than above it. Review of issue #35 landed exactly that and
+                    // watched nine surface pins and `size-probe-reach` stay green, so it is
+                    // closed in the reader they share rather than in one rule.
+                    let declared_here = declaration_kind(classified);
+                    let inline = declared_here.is_some() && opens > 0;
+                    // The member's *own* prefix, which is what follows the block's opening
+                    // brace — not the whole line before the `fn` keyword. Testing that the
+                    // line ended in `pub` read `impl Bank { pub const fn raw()` as private,
+                    // because the prefix ends in the modifier; the same for `pub async`,
+                    // `pub unsafe` and `pub extern "C"`. Codex round 1 found it.
+                    let marked_public = classified.split_once(" fn ").is_some_and(|(before, _)| {
+                        declares_public(before.rsplit('{').next().unwrap_or("").trim())
+                    });
+                    let callable = declares_public(classified)
+                        || matches!(enclosing, Block::Trait | Block::TraitImpl)
+                        || (inline
+                            && (marked_public
+                                || matches!(declared_here, Some(Block::Trait | Block::TraitImpl))));
                     if callable {
                         found.push(PublicFunction {
                             crate_name: source.crate_name.clone(),
@@ -2110,7 +2134,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(trimmed) {
+                if let Some(kind) = declaration_kind(classified) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -2167,6 +2191,71 @@ fn declaration_kind(line: &str) -> Option<Block> {
         });
     }
     None
+}
+
+/// `line` with any leading attributes removed.
+///
+/// `#[rustfmt::skip] impl Bank { pub fn raw() {} }` is one line, survives `cargo fmt`, and
+/// every classifier here reads the start of a line — so an attribute in front of the item
+/// hid the `impl` from `declaration_kind` and the `pub` from the visibility test. Codex
+/// round 3 found it, in the same one-line form round 1's finding was about.
+///
+/// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
+/// attribute — and a bracket inside an *ordinary* string literal is not a bracket, so
+/// `#[expect(lint, reason = "]")]` is one too. Codex round 4 found the version that read
+/// every `]` as syntax and left the classifier standing on `")]` rather than on the item.
+///
+/// Two literal forms are outside it, and both leave the item **unclassified** rather than
+/// reporting a private function as public — the direction that under-reports. A `']'`
+/// *character* literal, because telling one from the lifetime in
+/// `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. And a *raw* string,
+/// because `"` both opens and closes here: `#[doc = r#"a"]b"#]` is read as ending at the
+/// quote inside it. Codex round 6 found that one, and it is issue #108.
+///
+/// Three rounds have now landed on this function, each closing one construct and leaving
+/// the next. What closes the class is lexing the attribute rather than scanning it, which
+/// is #108's own point; this reads what a reviewer can check by eye.
+pub(crate) fn without_leading_attributes(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    while let Some(after) = rest.strip_prefix("#[") {
+        let mut depth = 1_u32;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, character) in after.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                '[' if !quoted => depth = depth.saturating_add(1),
+                ']' if !quoted => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index.saturating_add(1));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end.and_then(|end| after.get(end..)) else {
+            return rest;
+        };
+        rest = end.trim_start();
+    }
+    rest
+}
+
+/// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.
+///
+/// The same visibility the non-inline path reads with `starts_with("pub ")`, split out so
+/// that the two agree: a `pub(crate)` member is not public in either, and a modifier between
+/// the visibility and the keyword changes neither.
+fn declares_public(prefix: &str) -> bool {
+    prefix == "pub" || prefix.starts_with("pub ")
 }
 
 /// The name declared by a function signature, if the line declares one.
@@ -2477,9 +2566,26 @@ fn remove_worktree(root: &Path, worktree: &Path) {
     let _ = git(root).args(["worktree", "prune"]).output();
 }
 
+/// `git`, run against `root` and against nothing the environment says.
+///
+/// A git hook exports `GIT_DIR`, `GIT_INDEX_FILE` and friends, pointing at the repository
+/// being committed to. Inherited here, `git worktree add` writes into *that* repository's
+/// index rather than into the checkout this gate is measuring — which is a measurement of
+/// a tree nobody asked about, taken silently. `current_dir` alone does not stop it: the
+/// environment outranks the working directory.
 fn git(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command.current_dir(root);
+    for inherited in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(inherited);
+    }
     command
 }
 

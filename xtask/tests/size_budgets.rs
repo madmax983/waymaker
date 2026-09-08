@@ -197,8 +197,19 @@ fn a_base_commit_from_before_the_probe_existed_is_reported_rather_than_measured(
 fn repository_without_a_probe(label: &str) -> PathBuf {
     let root = scratch(label);
     let git = |args: &[&str]| {
+        // A git hook exports `GIT_DIR`, `GIT_INDEX_FILE` and friends, pointing at the
+        // repository being committed to. Inherited here, `git init` and `git commit` act on
+        // *that* repository instead of on the fixture, and this test fails inside
+        // `.githooks/pre-commit` while passing everywhere else — which is exactly the
+        // configuration `cargo xtask install-hooks` asks a contributor to run in.
         let output = std::process::Command::new("git")
             .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .args(args)
             .output()
             .expect("git should run");

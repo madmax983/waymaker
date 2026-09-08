@@ -57,6 +57,7 @@ pub const RULES: &[&str] = &[
     "claude-md",
     "commit-discipline",
     "crate-attributes",
+    "ctx-facade",
     "deferred-questions",
     "dependency-direction",
     "dependency-direction-transitive",
@@ -312,6 +313,10 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.driver_sources,
     ));
     violations.extend(source::check_effect_protocol(&inputs.driver_sources));
+    violations.extend(source::check_ctx_facade(
+        &inputs.layer_sources,
+        &inputs.driver_sources,
+    ));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -889,6 +894,7 @@ mod tests {
             "claude-md",
             "commit-discipline",
             "crate-attributes",
+            "ctx-facade",
             "deferred-questions",
             "dependency-direction",
             "dependency-direction-transitive",
@@ -980,6 +986,16 @@ mod tests {
                 contents: source::tests_support::clean_effect_module(),
             },
         ]
+        .into_iter()
+        // And one module outside the façade edge, which `ctx-facade` requires to name no
+        // façade type. That rule fails closed when the crate has none, so a fixture without
+        // this row describes a workspace the gate rejects for a reason no test here is about.
+        .chain([size::LayerSource {
+            crate_name: DRIVER_PACKAGE.to_owned(),
+            path: "crates/waymaker-drive/src/boundary.rs".to_owned(),
+            contents: source::tests_support::clean_facade_free_driver_module(),
+        }])
+        .collect()
     }
 
     /// A `waymaker-rig` whose pinned modules are exactly what the gate pins.
@@ -1063,6 +1079,18 @@ mod tests {
                 crate_name: "waymaker-embassy".to_owned(),
                 path: format!("crates/{}", source::CLOCK_CAPABILITY_PATH),
                 contents: source::tests_support::clean_clock_module(),
+            },
+            // And issue #35's façade, which `ctx-facade` pins in both halves and which
+            // fails closed when either module is absent.
+            size::LayerSource {
+                crate_name: "waymaker-embassy".to_owned(),
+                path: format!("crates/{}", source::CTX_FACADE_PATH),
+                contents: source::tests_support::clean_ctx_facade(),
+            },
+            size::LayerSource {
+                crate_name: "waymaker-embassy".to_owned(),
+                path: format!("crates/{}", source::CTX_JOURNAL_PATH),
+                contents: source::tests_support::clean_ctx_journal(),
             },
             // And the kernel's crate root, which `timer-capability` reads to check that the
             // types its member pin found are the ones the crate re-exports. A pin that only

@@ -17,6 +17,13 @@ waymaker-core.workspace = true
 # The bytes the boundary is answered from: the recovery scan, the two-barrier writer, and
 # the input digest the kernel may not compute for itself.
 waymaker-flash.workspace = true
+# The façade issue #35 put over this protocol. `facade` and `ota` are the bridge and design
+# document §06's example: they turn "waymaker-embassy is a façade over exactly this protocol"
+# into something that compiles, and `tests/power_loss.rs` drives the two board clocks through
+# `PersistentClock`. The edge goes this way and never the other — nothing in
+# `waymaker-embassy` names this crate — which is what keeps `Boundary` usable with the façade
+# removed.
+waymaker-embassy.workspace = true
 
 [dev-dependencies]
 # The in-memory NOR model and the crash injector. The driver is run at every crash point the
@@ -26,12 +33,27 @@ waymaker-fault.workspace = true
 # every crash point into a row the rig also names, so both halves of issue #31's matrix use
 # one vocabulary.
 waymaker-rig.workspace = true
-# `PersistentClock`, so that `tests/power_loss.rs` drives the boundary against the two board
-# clocks `waymaker-rig` brings rather than against a world whose epoch a test sets.
-waymaker-embassy.workspace = true
 
 [features]
 default = []
+# Build this crate as it would be with the façade deleted: `facade` and `ota` are the two
+# modules that name `waymaker-embassy`, and this removes them. The `drive-facadeless` stage
+# builds it, which turns issue #35's "removing the Embassy crate leaves the protocol fully
+# usable through the synchronous driver" into a compile rather than a text search.
+#
+# A negative feature, which is normally an anti-pattern because feature unification turns one
+# crate's opt-out into everyone's. It is safe here for a reason particular to this crate:
+# nothing depends on it. The alternative — an optional dependency, off by default — would take
+# the façade out of the lint, test, docs and coverage stages, which all pass
+# `--no-default-features`.
+#
+# What it does not prove: the manifest entry above is not optional, so `waymaker-embassy` is
+# still resolved and built, and a compile error inside the façade fails the `drive-facadeless`
+# stage too. So the stage says "no module outside those two needs the façade" and not "this
+# crate builds with the façade deleted". Issue #106 is the crate split that would make the
+# dependency graph say the second. That the *source* names the façade in two files and
+# nowhere else is `ctx-facade`'s.
+without-facade = []
 
 [lints]
 workspace = true
