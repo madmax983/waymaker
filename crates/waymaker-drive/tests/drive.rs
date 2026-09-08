@@ -69,6 +69,8 @@ enum RecordKindAndBytes {
     EffectScheduled(u32),
     EffectCompleted(u32, Vec<u8>),
     EffectFailed(u32, Vec<u8>),
+    TimerScheduled(u32),
+    TimerFired(u32),
     RunCompleted(Vec<u8>),
     RunFailed(Vec<u8>),
 }
@@ -86,6 +88,8 @@ impl RecordKindAndBytes {
                 Self::EffectCompleted(seq.0, result.to_vec())
             }
             RecordRef::EffectFailed { seq, error } => Self::EffectFailed(seq.0, error.to_vec()),
+            RecordRef::TimerScheduled { seq, .. } => Self::TimerScheduled(seq.0),
+            RecordRef::TimerFired { seq } => Self::TimerFired(seq.0),
             RecordRef::RunCompleted { result } => Self::RunCompleted(result.to_vec()),
             RecordRef::RunFailed { error } => Self::RunFailed(error.to_vec()),
         }

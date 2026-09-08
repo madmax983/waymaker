@@ -310,3 +310,35 @@ fn the_deadline_and_the_specs_are_evaluated_in_a_const_context() {
     };
     assert_eq!(VERDICT, Deadline::Remaining { ticks: 3 });
 }
+
+#[test]
+fn a_spec_and_its_recorded_pair_are_the_same_deadline() {
+    // Issue #33's `TimerScheduled` record stores a clock kind and a deadline, and replay
+    // rebuilds the spec from them. A round trip that lost the kind would rebuild the other
+    // policy, which is the silent reinterpretation §11 forbids.
+    for spec in EVERY_SPEC {
+        assert_eq!(
+            TimerSpec::recorded(spec.clock_kind(), spec.deadline()),
+            Some(spec),
+            "{spec:?}"
+        );
+    }
+}
+
+#[test]
+fn each_spec_reports_its_own_deadline() {
+    assert_eq!(TimerSpec::AfterBoot { ticks: 50 }.deadline(), 50);
+    assert_eq!(
+        TimerSpec::AtPersistentTime { instant: 2_000 }.deadline(),
+        2_000
+    );
+}
+
+#[test]
+fn a_clock_kind_number_no_firmware_wrote_is_no_spec_at_all() {
+    // Zero is not a kind, and neither is an erased byte. A conversion with a wildcard arm
+    // would read either as a policy — which is how a zeroed page becomes a timer.
+    for number in [0_u8, 3, 0x7F, 0xFF] {
+        assert_eq!(TimerSpec::recorded(ClockKind(number), 10), None, "{number}");
+    }
+}

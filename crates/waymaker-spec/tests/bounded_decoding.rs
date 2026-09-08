@@ -133,7 +133,11 @@ fn borrows<'a>(record: &RecordRef<'a>) -> Vec<&'a [u8]> {
             vec![result]
         }
         RecordRef::EffectFailed { error, .. } | RecordRef::RunFailed { error } => vec![error],
-        RecordRef::EffectScheduled { .. } => Vec::new(),
+        // Three records whose bodies are numbers rather than the caller's bytes, so there
+        // is no borrow to check.
+        RecordRef::EffectScheduled { .. }
+        | RecordRef::TimerScheduled { .. }
+        | RecordRef::TimerFired { .. } => Vec::new(),
     }
 }
 

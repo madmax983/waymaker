@@ -526,6 +526,10 @@ fn payload_of(record: &RecordRef<'_>) -> u32 {
         }
         // ADR 0011: a sequence, a kind, a length and a digest, and nothing else.
         RecordRef::EffectScheduled { .. } => 8,
+        // A clock kind, a deadline and an arming reading.
+        RecordRef::TimerScheduled { .. } => 17,
+        // A firing is a header and nothing else.
+        RecordRef::TimerFired { .. } => 0,
     }
 }
 

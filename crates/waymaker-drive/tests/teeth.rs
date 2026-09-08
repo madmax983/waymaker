@@ -6,13 +6,14 @@
 //! is always two-part — the refusal, and that nothing reached the world or the media after
 //! it.
 
+use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, Outcome, RunId};
 use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Activities, Boundary, Conclusion, DriveError, Driver, DurableIntent, Identity, Performed,
-    Progress, Scratch, Suspended, Workflow,
+    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
@@ -53,7 +54,7 @@ fn reserve() -> Reserve {
 }
 
 /// One boot, with a fresh page and result buffer.
-fn boot<W: Workflow, A: Activities>(
+fn boot<W: Workflow, A: Activities + Clocks>(
     device: &mut Device,
     world: &mut A,
     workflow: &mut W,
@@ -260,6 +261,19 @@ fn a_workflow_that_ends_while_history_continues_is_refused() {
 /// edge from an unresolved effect to a terminal record, and every later boot meets the same
 /// answer.
 struct Greedy;
+
+impl Clocks for Greedy {
+    fn capability(&self) -> ClockCapability {
+        ClockCapability::BootOnly
+    }
+
+    fn now(&mut self, _kind: ClockKind) -> Option<u64> {
+        // The workflow this tooth drives waits for nothing, so nothing reads this. A value
+        // is answered rather than `None` so that a future test which does wait meets a
+        // clock rather than a refusal it did not ask about.
+        Some(0)
+    }
+}
 
 impl Activities for Greedy {
     fn perform(

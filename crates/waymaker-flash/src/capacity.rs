@@ -491,10 +491,21 @@ impl Reserve {
         match record {
             // §08 has no edge from an unresolved effect to a terminal record, so a schedule
             // owes the outcome that resolves it *and* the terminal record after that.
-            RecordRef::EffectScheduled { .. } => self.tail_bytes(),
+            //
+            // A timer is the same shape of obligation, and it is priced at the same figure
+            // rather than at its own. A `TimerFired` has no payload, so it is never wider
+            // than an effect outcome priced at `effect_result_bytes`: the reserve therefore
+            // holds back a few bytes more than a timer needs, and never fewer. That is a
+            // refusal slightly early in the last moments of a bank's life, which is the safe
+            // direction, and it is what keeps this a two-term sum rather than a three-term
+            // one on a firmware with a 12 KiB code budget.
+            RecordRef::EffectScheduled { .. } | RecordRef::TimerScheduled { .. } => {
+                self.tail_bytes()
+            }
             RecordRef::RunStarted { .. }
             | RecordRef::EffectCompleted { .. }
-            | RecordRef::EffectFailed { .. } => self.terminal_bytes,
+            | RecordRef::EffectFailed { .. }
+            | RecordRef::TimerFired { .. } => self.terminal_bytes,
             // A terminal record is the exit. Nothing may follow it.
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => 0,
         }
@@ -549,11 +560,16 @@ impl Reserve {
     /// the padded frame was priced either way; what it costs is the promise, which is the
     /// thing [`Refusal::OverDeclaredBound`] exists to keep.
     ///
-    /// An `EffectScheduled` has one size that ADR 0011 fixed, so there is no bound to exceed.
+    /// An `EffectScheduled` and the two timer records each have one size the format fixed,
+    /// so there is no bound to exceed.
     const fn within_bounds(&self, record: &RecordRef<'_>) -> bool {
         let (payload, bound) = match record {
             RecordRef::RunStarted { input, .. } => (input.len(), self.bounds.run_input_bytes),
-            RecordRef::EffectScheduled { .. } => return true,
+            // Three records whose bodies are one fixed size, so there is no bound to
+            // exceed: ADR 0011's eight bytes, issue #33's seventeen, and a firing's none.
+            RecordRef::EffectScheduled { .. }
+            | RecordRef::TimerScheduled { .. }
+            | RecordRef::TimerFired { .. } => return true,
             RecordRef::EffectCompleted { result, .. } => {
                 (result.len(), self.bounds.effect_result_bytes)
             }

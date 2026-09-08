@@ -146,7 +146,11 @@ const fn identify(record: &RecordRef<'_>) -> RecordId {
         RecordRef::RunStarted { .. } => id(0),
         RecordRef::EffectScheduled { seq, .. } => id(seq.0.wrapping_mul(2).wrapping_add(1)),
         RecordRef::EffectCompleted { seq, .. } => id(seq.0.wrapping_mul(2).wrapping_add(2)),
+        // The fixture writes a run start, and a schedule and a completion each. Named
+        // rather than left to a wildcard, so a record kind added later is a decision here.
         RecordRef::EffectFailed { .. }
+        | RecordRef::TimerScheduled { .. }
+        | RecordRef::TimerFired { .. }
         | RecordRef::RunCompleted { .. }
         | RecordRef::RunFailed { .. } => RecordId(u32::MAX),
     }

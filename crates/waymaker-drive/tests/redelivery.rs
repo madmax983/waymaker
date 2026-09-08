@@ -39,8 +39,8 @@ use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Activities, Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended,
-    Workflow,
+    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, Identity, Progress, Scratch,
+    Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
@@ -92,7 +92,7 @@ fn reserve() -> Reserve {
 }
 
 /// One boot, with a fresh page and result buffer.
-fn boot<W: Workflow, A: Activities>(
+fn boot<W: Workflow, A: Activities + Clocks>(
     device: &mut Device,
     world: &mut A,
     workflow: &mut W,
@@ -137,10 +137,15 @@ impl Shape {
     const fn of(record: &RecordRef<'_>) -> Self {
         match *record {
             RecordRef::RunStarted { .. } => Self::RunStarted,
-            RecordRef::EffectScheduled { seq, .. } => Self::EffectScheduled(seq.0),
-            RecordRef::EffectCompleted { seq, .. } | RecordRef::EffectFailed { seq, .. } => {
-                Self::EffectResolved(seq.0)
+            // A timer is an open boundary and a firing resolves it, so the two share those
+            // arms. The workflow this file drives waits for nothing, so neither timer arm is
+            // reached.
+            RecordRef::EffectScheduled { seq, .. } | RecordRef::TimerScheduled { seq, .. } => {
+                Self::EffectScheduled(seq.0)
             }
+            RecordRef::EffectCompleted { seq, .. }
+            | RecordRef::EffectFailed { seq, .. }
+            | RecordRef::TimerFired { seq } => Self::EffectResolved(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }

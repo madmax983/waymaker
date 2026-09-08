@@ -26,14 +26,15 @@
 //!
 //! A record kind is a number on a device in the field. §09's forward-compatibility rule —
 //! "unknown record kinds are skippable only when the format version permits" — only means
-//! anything if a number, once spent, stays spent. So [`RecordKind`] names the five records
-//! this rung cannot decode as well as the six it can: `TimerScheduled` and `TimerFired`
-//! are v0.1-required and arrive with the timer issue, and reserving 5 and 6 for them now
-//! is what stops that issue from renumbering `RunCompleted` under firmware that has
-//! already written it.
+//! anything if a number, once spent, stays spent. So [`RecordKind`] names the three records
+//! this rung cannot decode as well as the eight it can. `TimerScheduled` and `TimerFired`
+//! were reserved at 5 and 6 before they had bodies, and issue
+//! [#33](https://github.com/madmax983/waymaker/issues/33) filled those bodies in behind the
+//! same two numbers — which is what the reservation was for.
 
 use crate::activity::ActivityKind;
 use crate::id::EffectSeq;
+use crate::timer::ClockKind;
 
 /// Which record this is, as the byte on media says it.
 ///
@@ -63,13 +64,9 @@ impl RecordKind {
     pub const EFFECT_COMPLETED: Self = Self(3);
     /// A bounded failure payload. §09: required at v0.1.
     pub const EFFECT_FAILED: Self = Self(4);
-    /// Clock capability and deadline semantics. §09: required at v0.1, and reserved here.
-    ///
-    /// Not decodable yet: its clock-kind field belongs to the timer record issue. The
-    /// number is spent now so that issue adds a body rather than a renumbering.
+    /// A durable deadline and the clock it is stated against. §09: required at v0.1.
     pub const TIMER_SCHEDULED: Self = Self(5);
-    /// A recorded timer completion. §09: required at v0.1, and reserved here for the same
-    /// reason as [`TIMER_SCHEDULED`](Self::TIMER_SCHEDULED).
+    /// A recorded timer firing. §09: required at v0.1.
     pub const TIMER_FIRED: Self = Self(6);
     /// Terminal success and a bounded result. §09: required at v0.1.
     pub const RUN_COMPLETED: Self = Self(7);
@@ -151,6 +148,32 @@ pub enum RecordRef<'a> {
         /// The failure payload, opaque to the kernel.
         error: &'a [u8],
     },
+    /// A timer was armed: durable intent, before the hardware is armed.
+    ///
+    /// The clock kind is on media so that recovery cannot read a persistent instant as a
+    /// boot interval, or the reverse, after a firmware change. Design document §11 and
+    /// issue [#33](https://github.com/madmax983/waymaker/issues/33).
+    TimerScheduled {
+        /// Where this timer falls in the run's history. One sequence space with the
+        /// activities, because §08 replays one ordered history.
+        seq: EffectSeq,
+        /// Which clock the deadline is stated against.
+        clock_kind: ClockKind,
+        /// The deadline, in that clock's unit.
+        deadline: u64,
+        /// The reading the timer was armed at.
+        ///
+        /// The monotonicity floor a persistent deadline is measured against. It lives in
+        /// RAM while the device runs, and a power cut takes RAM, so it is recorded here.
+        armed_at: u64,
+    },
+    /// The timer fired, and replay hands the workflow back nothing.
+    ///
+    /// An effect completion with no bytes: a deadline's whole result is that it passed.
+    TimerFired {
+        /// The timer this firing resolves.
+        seq: EffectSeq,
+    },
     /// The run finished successfully. Terminal.
     RunCompleted {
         /// The workflow's result, opaque to the kernel.
@@ -168,7 +191,7 @@ impl RecordRef<'_> {
     ///
     /// # Postconditions
     ///
-    /// Total, `const`, and one of the six decodable constants on [`RecordKind`] — never a
+    /// Total, `const`, and one of the eight decodable constants on [`RecordKind`] — never a
     /// reserved one, because no reserved kind has a variant to be reached from. The
     /// encoder writes what this returns, so the mapping lives once: a completion cannot
     /// go to media wearing a failure's byte.
@@ -179,6 +202,8 @@ impl RecordRef<'_> {
             Self::EffectScheduled { .. } => RecordKind::EFFECT_SCHEDULED,
             Self::EffectCompleted { .. } => RecordKind::EFFECT_COMPLETED,
             Self::EffectFailed { .. } => RecordKind::EFFECT_FAILED,
+            Self::TimerScheduled { .. } => RecordKind::TIMER_SCHEDULED,
+            Self::TimerFired { .. } => RecordKind::TIMER_FIRED,
             Self::RunCompleted { .. } => RecordKind::RUN_COMPLETED,
             Self::RunFailed { .. } => RecordKind::RUN_FAILED,
         }
@@ -205,13 +230,15 @@ mod tests {
             RecordRef::EffectScheduled { .. } => 2,
             RecordRef::EffectCompleted { .. } => 3,
             RecordRef::EffectFailed { .. } => 4,
-            RecordRef::RunCompleted { .. } => 5,
-            RecordRef::RunFailed { .. } => 6,
+            RecordRef::TimerScheduled { .. } => 5,
+            RecordRef::TimerFired { .. } => 6,
+            RecordRef::RunCompleted { .. } => 7,
+            RecordRef::RunFailed { .. } => 8,
         }
     }
 
     /// One of each variant, for a test that wants to walk them all.
-    const EVERY_VARIANT: [RecordRef<'static>; 6] = [
+    const EVERY_VARIANT: [RecordRef<'static>; 8] = [
         RecordRef::RunStarted {
             workflow_kind: 0x1234,
             workflow_version: 2,
@@ -231,6 +258,13 @@ mod tests {
             seq: EffectSeq(11),
             error: b"err",
         },
+        RecordRef::TimerScheduled {
+            seq: EffectSeq(11),
+            clock_kind: ClockKind::AT_PERSISTENT_TIME,
+            deadline: 9_000,
+            armed_at: 1_000,
+        },
+        RecordRef::TimerFired { seq: EffectSeq(11) },
         RecordRef::RunCompleted { result: b"done" },
         RecordRef::RunFailed { error: b"bad" },
     ];
@@ -251,13 +285,15 @@ mod tests {
     fn each_variant_reports_its_own_kind() {
         // Six distinct kinds over six variants: one arm returning another's constant
         // shows up as a duplicate rather than as a value nobody looked at.
-        let kinds: [RecordKind; 6] = [
+        let kinds: [RecordKind; 8] = [
             EVERY_VARIANT[0].kind(),
             EVERY_VARIANT[1].kind(),
             EVERY_VARIANT[2].kind(),
             EVERY_VARIANT[3].kind(),
             EVERY_VARIANT[4].kind(),
             EVERY_VARIANT[5].kind(),
+            EVERY_VARIANT[6].kind(),
+            EVERY_VARIANT[7].kind(),
         ];
 
         for (left_index, left) in kinds.iter().enumerate() {
@@ -270,7 +306,7 @@ mod tests {
             }
         }
         assert_eq!(kinds[0], RecordKind::RUN_STARTED);
-        assert_eq!(kinds[5], RecordKind::RUN_FAILED);
+        assert_eq!(kinds[7], RecordKind::RUN_FAILED);
     }
 
     #[test]

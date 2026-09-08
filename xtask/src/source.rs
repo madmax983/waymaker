@@ -824,6 +824,10 @@ pub const REPLAY_SURFACE_PATH: &str = "waymaker-core/src/replay.rs";
 /// whose whole runtime budget is 768 bytes, an index is the difference between replay
 /// working and replay being impossible.
 ///
+/// `pending_timer` is issue #33's, and it is the same shape of answer as `pending`: the one
+/// open boundary, named. It is not a lookup — it takes no key and reads no history — which
+/// is what makes it admissible beside a rule about random access.
+///
 /// Sorted, so that the comparison below can be a set comparison and the list can be read.
 pub const REPLAY_SURFACE: &[&str] = &[
     "advance",
@@ -832,6 +836,7 @@ pub const REPLAY_SURFACE: &[&str] = &[
     "next_effect_id",
     "next_seq",
     "pending",
+    "pending_timer",
     "position",
     "run",
 ];
@@ -852,6 +857,12 @@ pub const TRANSITION_SURFACE_PATH: &str = "waymaker-core/src/transition.rs";
 /// which is the half that matters more: a name the module no longer declares means the
 /// machine was renamed or deleted and the pin has stopped checking anything.
 ///
+/// `timer_intent`, `timer_outcome` and `pending_timer` are issue #33's, and they are a
+/// second *pair of halves* rather than a second table. §08's five rows are asked of a
+/// deadline as well as of an activity, and the two boundaries share one cursor and one
+/// sequence space. A `timer_downgrade`, a `timer_force_elapsed` or a `clear_timer` would be
+/// the same door this list exists to keep shut, arriving on the timer side.
+///
 /// What it does **not** catch, so that nobody reads more into a green build than is there:
 /// this compares *names*. A `force: bool` added to `intent`, or any other change of
 /// signature or behaviour behind a name already on the list, is invisible to it and is a
@@ -867,8 +878,11 @@ pub const TRANSITION_SURFACE: &[&str] = &[
     "new",
     "outcome",
     "pending",
+    "pending_timer",
     "position",
     "run",
+    "timer_intent",
+    "timer_outcome",
 ];
 
 /// Rule: the replay cursor's public surface is exactly the one that was reviewed.
@@ -927,6 +941,16 @@ pub const CLOCK_CAPABILITY_PATH: &str = "waymaker-embassy/src/clock.rs";
 /// §11 into a preference. A test cannot call a function that is not there, so the surface is
 /// pinned and a way to pretend is a line a reviewer writes on purpose.
 ///
+/// `deadline` and `recorded` are issue #33's, and they are the two halves of one round trip:
+/// a spec becomes a clock kind and a number on media, and comes back. `recorded` is the one
+/// that has to be weighed, because it *builds* a spec from a byte — and it is admissible for
+/// exactly one reason, which is that it is total with no wildcard arm. A kind number this
+/// firmware does not know has no spec, so an erased or zeroed byte cannot decode as a
+/// policy. That is the reinterpretation §11 forbids, closed at the only place it could
+/// arrive. The caller supplies the kind, so it is not a downgrade route either: the one
+/// module that must never choose a kind is `waymaker-embassy`'s, where
+/// [`CLOCK_SPEC_CONSTRUCTION`] already refuses every `TimerSpec` name but the persistent one.
+///
 /// The pin fails in the other direction too: a name this file no longer declares means the
 /// module was renamed or deleted and the pin has stopped checking anything.
 ///
@@ -936,7 +960,9 @@ pub const TIMER_SURFACE: &[&str] = &[
     "arm",
     "armed_at",
     "clock_kind",
+    "deadline",
     "evaluate",
+    "recorded",
     "spec",
 ];
 
@@ -1011,7 +1037,7 @@ pub const CLOCK_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 /// visibility; this is that guard, for the module where the policy lives.
 pub const TIMER_TYPE_METHODS: &[(&str, &[&str])] = &[
     ("Timer", &["arm", "armed_at", "evaluate", "spec"]),
-    ("TimerSpec", &["clock_kind"]),
+    ("TimerSpec", &["clock_kind", "deadline", "recorded"]),
     ("ClockCapability", &["admits"]),
 ];
 
@@ -2783,6 +2809,41 @@ pub const EFFECT_SCHEDULED_PATH: &str = "waymaker-core/src/record.rs";
 /// Sorted, so that the comparison below can be a set comparison and the list can be read.
 pub const EFFECT_SCHEDULED_FIELDS: &[&str] = &["input_crc", "input_len", "kind", "seq"];
 
+/// Every field `RecordRef::TimerScheduled` is allowed to carry, and every field
+/// `RecordRef::TimerFired` is, in sorted order.
+///
+/// [`EFFECT_SCHEDULED_FIELDS`]'s twin for issue
+/// [#33](https://github.com/madmax983/waymaker/issues/33)'s two record bodies, and it holds
+/// two things design document §11 says a build must fail over.
+///
+/// `clock_kind` is the first. §11: a persistent timer record includes its clock kind so
+/// recovery cannot silently reinterpret one policy as another. A record that carried the
+/// deadline alone would decode without error and mean something else after a firmware
+/// change — a boot interval where a persistent instant was meant, or the reverse — and
+/// nothing downstream could tell.
+///
+/// `armed_at` is the second, and it is the field a reviewer is most likely to read as
+/// redundant. The monotonicity floor a persistent deadline is measured against lives in
+/// RAM, and a power cut takes RAM; this is what carries it across the reset. Without it a
+/// clock that moved backwards while the power was absent is invisible.
+///
+/// A `remaining`, a `fired_at`, a `retry_count` or a payload on the firing is the shape the
+/// pin stops in the other direction. Each is bytes on every timer for the life of the
+/// format, and none breaks another rule.
+///
+/// The empty body for `TimerFired` is deliberate rather than an oversight: a deadline's
+/// whole result is that it passed, and the sequence that says which timer is in the frame
+/// header. It is also what the codec's exact-length refusal rests on.
+///
+/// Sorted, so that the comparisons can be set comparisons and the lists can be read.
+pub const TIMER_RECORD_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "TimerScheduled",
+        &["armed_at", "clock_kind", "deadline", "seq"],
+    ),
+    ("TimerFired", &["seq"]),
+];
+
 /// The file whose kernel-boundary types [`BOUNDARY_TYPES`] pins.
 pub const KERNEL_BOUNDARY_PATH: &str = "waymaker-core/src/transition.rs";
 
@@ -2807,6 +2868,15 @@ pub struct BoundaryType {
 /// A `Resolve::TimerFired`, an `Intent::Signal`, or a `kind: RecordKind` field on
 /// `EffectRequest` would each break no other rule, need no dependency, and turn one boundary
 /// into a boundary per record.
+///
+/// Issue [#33](https://github.com/madmax983/waymaker/issues/33) wrote the first two of those
+/// five bodies and the five types above did not move, which is the claim holding. What it
+/// added is a *boundary* — §11's deadline is a different question from §08's effect, asked
+/// with a capability the effect boundary has no use for — and its three types are pinned
+/// here beside them. `TimerRequest`'s two fields are the whole of §02 decision 8: the
+/// deadline, and what this firmware can measure. A `TimerRequest::best_effort` flag, a
+/// `TimerIntent::Downgrade` or a `TimerResolve::Assume` would each break no other rule and
+/// turn the refusal into a preference.
 ///
 /// The pin fails in both directions, and the second matters more: a member the list no
 /// longer finds means the type was renamed or deleted and the pin is checking nothing.
@@ -2838,6 +2908,18 @@ pub const BOUNDARY_TYPES: &[BoundaryType] = &[
     BoundaryType {
         header: "pub enum Next",
         members: &["EndOfHistory", "Record"],
+    },
+    BoundaryType {
+        header: "pub struct TimerRequest",
+        members: &["capability", "spec"],
+    },
+    BoundaryType {
+        header: "pub enum TimerIntent",
+        members: &["Finished", "Recorded", "Schedule"],
+    },
+    BoundaryType {
+        header: "pub enum TimerResolve",
+        members: &["Fired", "Rearm"],
     },
 ];
 
@@ -4636,6 +4718,102 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
                  record firmware in the field has already written"
             ),
         ));
+    }
+
+    violations
+}
+
+/// Rule: design document §11's two timer records carry what §11 says they carry.
+///
+/// `effect-scheduled-fields`'s twin, and a rule of its own rather than a second list inside
+/// it because the two answer different questions: ADR 0011 settled how much *metadata* a
+/// scheduled effect carries, and this settles which *facts about time* reach media. A
+/// failure that named the effect rule would send a reader to ADR 0011 for a decision it
+/// does not hold.
+///
+/// The pin fails in both directions. A field added is bytes on every timer for the life of
+/// the format; a field removed is a wire-format change on a record firmware in the field
+/// has already written, and for `clock_kind` and `armed_at` it is also the semantic loss
+/// §11 names — see [`TIMER_RECORD_FIELDS`].
+///
+/// Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason, and the
+/// declaration is found by locating the `enum RecordRef` body first: `Self::TimerFired`
+/// appears in every `match` over the enum, so a scan that took the first mention would pin
+/// a pattern.
+///
+/// What it cannot see is a *width*: it compares names, exactly as `effect-scheduled-fields`
+/// does, so a `deadline` narrowed to a `u32` is invisible to it and is
+/// `crates/waymaker-flash/tests/frame.rs`'s golden bytes.
+#[must_use]
+pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "timer-record-fields";
+    const KERNEL: &str = "waymaker-core";
+    const ENUM: &str = "enum RecordRef";
+
+    let Some(source) = find_source(sources, EFFECT_SCHEDULED_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {EFFECT_SCHEDULED_PATH} in the workspace, so the pinned timer record \
+                 bodies are checking nothing; \u{a7}11 puts a clock kind on media so that \
+                 recovery cannot reinterpret one policy as another"
+            ),
+        )];
+    };
+
+    let code = code_only(&source.contents);
+    let Some(body) = braced_body(&code, ENUM) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares no `{ENUM}`, so the pinned timer record \
+                 bodies are checking nothing"
+            ),
+        )];
+    };
+
+    let mut violations = Vec::new();
+    for (variant, fields) in TIMER_RECORD_FIELDS {
+        let Some(declared) = braced_body(body, variant) else {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{ENUM}` in {EFFECT_SCHEDULED_PATH} has no `{variant}` variant with a \
+                     field list, so the pinned field set is checking nothing"
+                ),
+            ));
+            continue;
+        };
+        let pinned: BTreeSet<&str> = fields.iter().copied().collect();
+        let names = field_names(declared);
+        let found: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+
+        for added in found.difference(&pinned) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`RecordRef::{variant}` declares `{added}`, which is not in \
+                     TIMER_RECORD_FIELDS; a field added here is paid on every timer, in \
+                     flash and in write amplification, for the life of the format"
+                ),
+            ));
+        }
+        for removed in pinned.difference(&found) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`RecordRef::{variant}` no longer declares `{removed}`, which \
+                     TIMER_RECORD_FIELDS pins; \u{a7}11 needs the clock kind so recovery \
+                     cannot reinterpret one policy as another, and the arming reading \
+                     because the floor it is measured against does not survive a power cut"
+                ),
+            ));
+        }
     }
 
     violations
@@ -9941,8 +10119,8 @@ pub mod tests_support {
         INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
         SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES,
-        TRANSITION_SURFACE,
+        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
+        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -10249,14 +10427,23 @@ mod tests {
     pub fn clean_record_module() -> String {
         use std::fmt::Write as _;
 
-        let mut fields = String::new();
+        let mut variants = String::new();
+        let _ = writeln!(variants, "    EffectScheduled {{");
         for field in EFFECT_SCHEDULED_FIELDS {
-            let _ = writeln!(fields, "        {field}: u32,");
+            let _ = writeln!(variants, "        {field}: u32,");
         }
-        format!(
-            "//! A record module.\npub enum RecordRef<'a> {{\n    EffectScheduled {{\n{fields}\
-             \x20   }},\n}}\n"
-        )
+        let _ = writeln!(variants, "    }},");
+        // The timer bodies too, because `timer-record-fields` fails closed when the variant
+        // it pins is absent — a fixture without them describes a workspace the gate rejects
+        // for a reason no test here is about.
+        for (variant, fields) in TIMER_RECORD_FIELDS {
+            let _ = writeln!(variants, "    {variant} {{");
+            for field in *fields {
+                let _ = writeln!(variants, "        {field}: u32,");
+            }
+            let _ = writeln!(variants, "    }},");
+        }
+        format!("//! A record module.\npub enum RecordRef<'a> {{\n{variants}}}\n")
     }
 
     /// A checksum module carrying every pinned parameter and declaring no lookup table.

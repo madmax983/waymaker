@@ -93,6 +93,54 @@ impl TimerSpec {
             Self::AtPersistentTime { .. } => ClockKind::AT_PERSISTENT_TIME,
         }
     }
+
+    /// The deadline this spec names, in its own clock's unit.
+    ///
+    /// The other half of what issue
+    /// [#33](https://github.com/madmax983/waymaker/issues/33)'s `TimerScheduled` record
+    /// stores. A number alone means nothing: it is ticks of this boot for
+    /// [`AfterBoot`](Self::AfterBoot) and a reading of the persistent clock for
+    /// [`AtPersistentTime`](Self::AtPersistentTime), and
+    /// [`clock_kind`](Self::clock_kind) is what says which.
+    ///
+    /// # Postconditions
+    ///
+    /// Total, `const`, and the inverse of [`recorded`](Self::recorded) at this spec's own
+    /// kind.
+    #[must_use]
+    pub const fn deadline(self) -> u64 {
+        match self {
+            Self::AfterBoot { ticks } => ticks,
+            Self::AtPersistentTime { instant } => instant,
+        }
+    }
+
+    /// The spec a recorded `clock_kind` and `deadline` name, or [`None`].
+    ///
+    /// Replay's half of the record. `waymaker-flash` decodes the two fields and this turns
+    /// them back into a policy.
+    ///
+    /// # Postconditions
+    ///
+    /// Total and `const`. [`None`] for a kind number this firmware does not know — an
+    /// erased byte, a zeroed one, or a policy a later format adds. The refusal is what
+    /// stops §11's reinterpretation: a wildcard arm here would read an unknown byte as one
+    /// of the two policies, so a zeroed page would decode as a timer.
+    ///
+    /// It is not a downgrade route. The caller supplies the kind, and the one caller that
+    /// must never choose it is `waymaker-embassy`'s clock module, where the
+    /// `timer-capability` rule already refuses every `TimerSpec` name but the persistent
+    /// one.
+    #[must_use]
+    pub const fn recorded(clock_kind: ClockKind, deadline: u64) -> Option<Self> {
+        match clock_kind.0 {
+            n if n == ClockKind::AFTER_BOOT.0 => Some(Self::AfterBoot { ticks: deadline }),
+            n if n == ClockKind::AT_PERSISTENT_TIME.0 => {
+                Some(Self::AtPersistentTime { instant: deadline })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Which clocks this firmware can service.

@@ -18,7 +18,8 @@
 //! about a workflow. It validates history against itself.
 
 use waymaker_core::budget::SCRATCH_PAGE_BYTES;
-use waymaker_core::replay::{PendingEffect, Position, ReplayCursor, Step};
+use waymaker_core::replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
+use waymaker_core::timer::ClockKind;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
 
 /// The run every test below replays, unless it says otherwise.
@@ -418,8 +419,13 @@ fn a_halted_cursor_mints_nothing() {
 /// #14 forbids, would satisfy both and every other assertion in this file. An equality
 /// notices it. The number is the same on `thumbv6m-none-eabi`, where a `u64` aligns to four
 /// rather than eight: the allocator is 16 either way, and `Scheduled` is 12 bytes of
-/// four-aligned scalars.
-const CURSOR_BYTES: usize = 32;
+/// four-aligned scalars, as `Armed` is 24 bytes of them.
+///
+/// It moved from 32 to 48 with issue #33's timer boundary: a timer's recorded state is a
+/// clock kind, a deadline and an arming reading, which is 24 bytes where an effect's
+/// digest is 12. The state is a union, so a run pays for the larger of the two and not for
+/// both.
+const CURSOR_BYTES: usize = 48;
 
 #[test]
 fn the_cursor_is_exactly_the_state_it_declares() {
@@ -778,4 +784,165 @@ fn a_cursor_halted_mid_effect_offers_nothing_to_redeliver() {
     );
     assert_eq!(cursor.pending(), None);
     assert_eq!(cursor.next_effect_id(), Err(KernelError::MalformedHistory));
+}
+
+// Issue #33: timers consume this cursor in workflow order, alongside the activities. One
+// ordered history, one sequence space, one unresolved boundary at a time.
+
+/// `RecordRef::TimerScheduled` for `seq`, on the persistent clock.
+const fn arm(seq: u32) -> RecordRef<'static> {
+    RecordRef::TimerScheduled {
+        seq: EffectSeq(seq),
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 9_000,
+        armed_at: 1_000,
+    }
+}
+
+/// The timer `arm(seq)` commits, as the cursor reports it.
+const fn pending_timer(seq: u32) -> PendingTimer {
+    PendingTimer {
+        id: EffectId {
+            run: RUN,
+            seq: EffectSeq(seq),
+        },
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 9_000,
+        armed_at: 1_000,
+    }
+}
+
+#[test]
+fn a_scheduled_timer_becomes_the_runs_unresolved_boundary() {
+    let mut cursor = started();
+
+    assert_eq!(
+        cursor.advance(arm(0)),
+        Ok(Step::TimerScheduled(pending_timer(0)))
+    );
+    assert_eq!(cursor.position(), Position::AwaitingTimer);
+    assert_eq!(cursor.pending_timer(), Some(pending_timer(0)));
+    // An armed timer is not an unresolved *effect*: a driver that redelivered it to an
+    // activity would perform work no schedule record asked for.
+    assert_eq!(cursor.pending(), None);
+}
+
+#[test]
+fn a_firing_resolves_the_timer_it_names() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Ok(Step::TimerFired {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0)
+            }
+        })
+    );
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.pending_timer(), None);
+}
+
+#[test]
+fn timers_and_activities_share_one_sequence_space() {
+    // §33: one ordered history, not a parallel timer table. A timer that numbered itself
+    // separately would let a timer and an effect claim sequence 0, and every downstream
+    // system that deduplicates on `(RunId, EffectSeq)` would see one identity for two
+    // boundaries.
+    let mut cursor = started();
+
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert!(
+        cursor
+            .advance(RecordRef::TimerFired { seq: EffectSeq(0) })
+            .is_ok()
+    );
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
+    assert!(cursor.advance(schedule(1)).is_ok());
+    assert!(
+        cursor
+            .advance(RecordRef::EffectCompleted {
+                seq: EffectSeq(1),
+                result: b"ok"
+            })
+            .is_ok()
+    );
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(2)));
+    assert!(cursor.advance(arm(2)).is_ok());
+}
+
+#[test]
+fn a_timer_that_skips_a_sequence_is_refused() {
+    let mut cursor = started();
+    assert_eq!(cursor.advance(arm(1)), Err(KernelError::MalformedHistory));
+}
+
+#[test]
+fn a_firing_for_another_timer_is_refused() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(1) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn an_effect_outcome_cannot_resolve_a_timer_and_a_firing_cannot_resolve_an_effect() {
+    // The two boundaries are told apart by the record that resolves them. Without this a
+    // journal could be read two ways, which is history that is not one ordered sequence.
+    let mut awaiting_timer = started();
+    assert!(awaiting_timer.advance(arm(0)).is_ok());
+    assert_eq!(
+        awaiting_timer.advance(RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"ok"
+        }),
+        Err(KernelError::MalformedHistory)
+    );
+
+    let mut awaiting_effect = started();
+    assert!(awaiting_effect.advance(schedule(0)).is_ok());
+    assert_eq!(
+        awaiting_effect.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_firing_with_no_armed_timer_is_refused() {
+    let mut cursor = started();
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_run_cannot_end_with_a_timer_unresolved() {
+    // §08 has no edge from an open boundary to a terminal record, and a timer is a
+    // boundary. Without this a run could end while history still owes a firing.
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.advance(RecordRef::RunCompleted { result: b"" }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn no_effect_is_minted_while_a_timer_is_unresolved() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.next_effect_id(),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+}
+
+#[test]
+fn an_armed_timer_is_not_a_terminal_position() {
+    assert!(!Position::AwaitingTimer.is_terminal());
 }

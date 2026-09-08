@@ -106,10 +106,16 @@ impl Summary {
     const fn of(record: &RecordRef<'_>) -> Self {
         match *record {
             RecordRef::RunStarted { .. } => Self::RunStarted,
-            RecordRef::EffectScheduled { seq, .. } => Self::EffectScheduled(seq.0),
-            RecordRef::EffectCompleted { seq, .. } | RecordRef::EffectFailed { seq, .. } => {
-                Self::EffectResolved(seq.0)
+            // A timer is an open boundary and a firing resolves it, so the two summarise as
+            // the effect pair does and share its arms. The workflow this file sweeps waits
+            // for nothing, so neither timer arm is reached; both are named rather than left
+            // to a wildcard, because a record kind added later must be a decision here.
+            RecordRef::EffectScheduled { seq, .. } | RecordRef::TimerScheduled { seq, .. } => {
+                Self::EffectScheduled(seq.0)
             }
+            RecordRef::EffectCompleted { seq, .. }
+            | RecordRef::EffectFailed { seq, .. }
+            | RecordRef::TimerFired { seq } => Self::EffectResolved(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }

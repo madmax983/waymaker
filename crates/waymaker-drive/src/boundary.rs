@@ -1,16 +1,18 @@
 //! The workflow's half of design document §06's explicit kernel boundary.
 //!
-//! One method, and it is the whole vocabulary a workflow has: ask for an effect, and get
-//! either its outcome or an instruction to stop. There is no `Future` here and no executor
-//! — a synchronous workflow suspends by propagating [`Suspended`] with `?`, which is what
-//! `.await` does in the façade one layer up.
+//! Two methods, and they are the whole vocabulary a workflow has: ask for an effect, or
+//! wait for a deadline, and get either the answer or an instruction to stop. There is no
+//! `Future` here and no executor — a synchronous workflow suspends by propagating
+//! [`Suspended`] with `?`, which is what `.await` does in the façade one layer up.
 
+use waymaker_core::timer::TimerSpec;
 use waymaker_core::{ActivityKind, Outcome};
 
 /// The run cannot continue now. Return it.
 ///
-/// Three different things produce it, and a workflow may not tell them apart: the run is
-/// waiting for an activity, history says the run already ended, or the driver met an error.
+/// Four different things produce it, and a workflow may not tell them apart: the run is
+/// waiting for an activity, the run is waiting for a deadline, history says the run already
+/// ended, or the driver met an error.
 /// Which one it was is [`Progress`](crate::Progress) or [`DriveError`](crate::DriveError),
 /// and both are the *driver's* answer rather than the workflow's.
 ///
@@ -82,4 +84,28 @@ pub trait Boundary {
     ///
     /// [`Suspended`] whenever the run must stop here. Nothing about *why* travels in it.
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended>;
+
+    /// Wait until `spec`'s deadline has passed, or stop.
+    ///
+    /// Design document §11 and issue
+    /// [#33](https://github.com/madmax983/waymaker/issues/33). A deadline is a boundary like
+    /// an effect: the intent is recorded before the wait begins, and a reboot re-arms the
+    /// same deadline from what the record holds rather than starting it again.
+    ///
+    /// It returns no bytes. A deadline's whole result is that it passed, which is why
+    /// `TimerFired` has no body and why this is a `Result<(), Suspended>`.
+    ///
+    /// # The clock is the world's, never the workflow's
+    ///
+    /// A workflow that read a clock of its own would be nondeterministic, and §08 would
+    /// catch it only where the reading changed an effect. The deadline enters through this
+    /// call, is recorded, and is replayed — so the second execution of a run waits for what
+    /// the first one waited for.
+    ///
+    /// # Errors
+    ///
+    /// [`Suspended`] whenever the run must stop here — including the ordinary case that the
+    /// deadline has not passed yet. Nothing about *why* travels in it;
+    /// [`Progress`](crate::Progress) is the driver's answer.
+    fn wait(&mut self, spec: TimerSpec) -> Result<(), Suspended>;
 }

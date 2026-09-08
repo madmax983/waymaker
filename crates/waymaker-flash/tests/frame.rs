@@ -13,7 +13,7 @@
 //! * numeric kinds and borrowed bytes — the decoded record borrows the caller's page,
 //!   which [`a_decoded_record_borrows_the_callers_page`] pins.
 //!
-//! Every one of the six [`RecordRef`] variants has a golden frame: two of them would
+//! Every one of the eight [`RecordRef`] variants has a golden frame: two of them would
 //! otherwise be pinned only by the encoder and the decoder agreeing with each other, which
 //! is the one comparison a golden vector exists to avoid.
 //!
@@ -26,6 +26,7 @@
 //! perfectly. These arrays are the one place where the format is stated by something other
 //! than the implementation, which is what makes the round-trip tests below mean anything.
 
+use waymaker_core::timer::ClockKind;
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 use waymaker_flash::frame::{
     self, Decoded, ERASED_BYTE, FORMAT_VERSION, FRAME_OVERHEAD_BYTES, HEADER_BYTES, MAGIC,
@@ -92,6 +93,24 @@ mod golden {
         0x17, // commit seal: 0x97 & 0x7F
     ];
 
+    /// `TimerScheduled { seq: 5, clock_kind: 2, deadline: 0x6543_2100,
+    /// armed_at: 0x1234_5678 }`, alignment 1. The body is seventeen bytes: the clock kind,
+    /// then the deadline and the arming reading as little-endian `u64`s.
+    pub const TIMER_SCHEDULED: [u8; 34] = [
+        0x57, 0x4D, 0x01, 0x05, 0x05, 0x00, 0x00, 0x00, 0x11, 0x00, 0x92, 0x57, 0x02, 0x00, 0x21,
+        0x43, 0x65, 0x00, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x97,
+        0x63, 0x6E, 0xBE, //
+        0x17, // commit seal: 0x97 & 0x7F
+    ];
+
+    /// `TimerFired { seq: 5 }` at alignment 4: an empty body, a sixteen-byte frame that is
+    /// already aligned, and a four-byte commit seal.
+    pub const TIMER_FIRED_ALIGNED: [u8; 20] = [
+        0x57, 0x4D, 0x01, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0xBF, 0x1F, 0xAC, 0x81,
+        0x29, //
+        0x1F, 0x2C, 0x01, 0x29, // commit seal: 1F AC 81 29 masked
+    ];
+
     /// `RunCompleted { result: &[] }`, alignment 1: the shortest record there is.
     pub const RUN_COMPLETED_EMPTY: [u8; 17] = [
         0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x44, 0x0B, 0xF6, 0x88,
@@ -153,9 +172,9 @@ const SCRATCH: usize = 2_048;
 ///
 /// Proven equal to the number of variants there are by
 /// [`the_sweep_draws_every_record_variant`], which maps each through an exhaustive `match`.
-const SAMPLED_VARIANTS: usize = 6;
+const SAMPLED_VARIANTS: usize = 8;
 
-/// Builds one of the six records from a generator and a borrowed payload.
+/// Builds one of the eight records from a generator and a borrowed payload.
 ///
 /// Returns the record and nothing else: every assertion belongs in a `#[test]`, because
 /// `clippy.toml` exempts test *bodies* from the workspace's `unwrap`, `panic` and
@@ -186,7 +205,22 @@ fn sample_record<'a>(rng: &mut Rng, payload: &'a [u8]) -> RecordRef<'a> {
             seq: EffectSeq(u32::try_from(rng.next_u64() >> 32).unwrap_or(0)),
             error: payload,
         },
-        4 => RecordRef::RunCompleted { result: payload },
+        4 => RecordRef::TimerScheduled {
+            seq: EffectSeq(u32::try_from(rng.next_u64() >> 32).unwrap_or(0)),
+            // One of the two kinds the format spends, drawn rather than fixed: a decoder
+            // that accepted only the one a fixture used would pass a sweep of that fixture.
+            clock_kind: if rng.below(2) == 0 {
+                ClockKind::AFTER_BOOT
+            } else {
+                ClockKind::AT_PERSISTENT_TIME
+            },
+            deadline: rng.next_u64(),
+            armed_at: rng.next_u64(),
+        },
+        5 => RecordRef::TimerFired {
+            seq: EffectSeq(u32::try_from(rng.next_u64() >> 32).unwrap_or(0)),
+        },
+        6 => RecordRef::RunCompleted { result: payload },
         _ => RecordRef::RunFailed { error: payload },
     }
 }
@@ -227,7 +261,7 @@ fn the_encoder_writes_the_golden_frames_byte_for_byte() {
     // The one test that can catch a wrong constant, a swapped field or a checksum over the
     // wrong range: the expected bytes came from a reference implementation written from
     // §09 rather than from this crate.
-    let cases: [(RecordRef<'_>, u16, &[u8]); 6] = [
+    let cases: [(RecordRef<'_>, u16, &[u8]); 8] = [
         (
             RecordRef::RunStarted {
                 workflow_kind: 0xBEEF,
@@ -267,6 +301,21 @@ fn the_encoder_writes_the_golden_frames_byte_for_byte() {
             RecordRef::RunFailed { error: b"why" },
             1,
             &golden::RUN_FAILED,
+        ),
+        (
+            RecordRef::TimerScheduled {
+                seq: EffectSeq(5),
+                clock_kind: ClockKind::AT_PERSISTENT_TIME,
+                deadline: 0x6543_2100,
+                armed_at: 0x1234_5678,
+            },
+            1,
+            &golden::TIMER_SCHEDULED,
+        ),
+        (
+            RecordRef::TimerFired { seq: EffectSeq(5) },
+            4,
+            &golden::TIMER_FIRED_ALIGNED,
         ),
         (
             RecordRef::RunCompleted { result: &[] },
@@ -334,6 +383,19 @@ fn the_golden_frames_decode_to_the_records_they_were_built_from() {
         decoded_record(&golden::RUN_COMPLETED_EMPTY),
         Some(RecordRef::RunCompleted { result: &[] })
     );
+    assert_eq!(
+        decoded_record(&golden::TIMER_SCHEDULED),
+        Some(RecordRef::TimerScheduled {
+            seq: EffectSeq(5),
+            clock_kind: ClockKind::AT_PERSISTENT_TIME,
+            deadline: 0x6543_2100,
+            armed_at: 0x1234_5678,
+        })
+    );
+    assert_eq!(
+        decoded_record(&golden::TIMER_FIRED_ALIGNED),
+        Some(RecordRef::TimerFired { seq: EffectSeq(5) })
+    );
 }
 
 #[test]
@@ -348,8 +410,10 @@ fn the_sweep_draws_every_record_variant() {
             RecordRef::EffectScheduled { .. } => 1,
             RecordRef::EffectCompleted { .. } => 2,
             RecordRef::EffectFailed { .. } => 3,
-            RecordRef::RunCompleted { .. } => 4,
-            RecordRef::RunFailed { .. } => 5,
+            RecordRef::TimerScheduled { .. } => 4,
+            RecordRef::TimerFired { .. } => 5,
+            RecordRef::RunCompleted { .. } => 6,
+            RecordRef::RunFailed { .. } => 7,
         }
     }
 
@@ -444,6 +508,8 @@ const fn payload_len_of(record: &RecordRef<'_>) -> usize {
     match record {
         RecordRef::RunStarted { input, .. } => 4 + input.len(),
         RecordRef::EffectScheduled { .. } => 8,
+        RecordRef::TimerScheduled { .. } => 17,
+        RecordRef::TimerFired { .. } => 0,
         RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
             result.len()
         }
@@ -1018,8 +1084,6 @@ fn every_decodable_record_kind_decodes_to_a_record() {
     // The reserved kinds are the complement: known numbers this firmware deliberately
     // cannot read, so a decoder that grew an arm for one of them by accident shows up here.
     for reserved in [
-        RecordKind::TIMER_SCHEDULED,
-        RecordKind::TIMER_FIRED,
         RecordKind::VERSION_MARKER,
         RecordKind::SIGNAL_RECEIVED,
         RecordKind::CHILD_STARTED,
@@ -1130,9 +1194,9 @@ fn a_body_that_does_not_fit_its_kind_is_refused() {
 fn an_unknown_kind_is_self_delimiting() {
     // The property that makes forward compatibility possible at all: a reader that cannot
     // interpret a record can still say where it ends, because the length is in the header
-    // and the header is checksummed on its own. `TimerScheduled` is the real case — a
-    // v0.1-required record whose body arrives with the timer issue — so the number is
-    // reserved and this is what a firmware built before that issue sees.
+    // and the header is checksummed on its own. `VersionMarker` is the real case — §09
+    // numbers it at v0.2 and no body exists yet — so this is what a firmware built before
+    // that issue sees when a later one writes the record.
     let mut page = [0_u8; SCRATCH];
     let written = frame::encode(
         &RecordRef::RunCompleted { result: b"body" },
@@ -1141,7 +1205,7 @@ fn an_unknown_kind_is_self_delimiting() {
     )
     .expect("room");
 
-    page[3] = RecordKind::TIMER_SCHEDULED.0;
+    page[3] = RecordKind::VERSION_MARKER.0;
     reseal(&mut page[..written], ProgramAlign::BYTE);
 
     // `written` is the whole record — body, padding and commit seal — and the frame the
@@ -1152,7 +1216,7 @@ fn an_unknown_kind_is_self_delimiting() {
         frame::decode(&page[..written]),
         Ok(frame::Frame {
             format_version: FORMAT_VERSION,
-            decoded: Decoded::UnknownKind(RecordKind::TIMER_SCHEDULED),
+            decoded: Decoded::UnknownKind(RecordKind::VERSION_MARKER),
             frame_len: body,
             frame_crc: crc32(&page[..body - frame::FRAME_CRC_BYTES]),
         })
@@ -1387,7 +1451,7 @@ fn a_scan_will_not_skip_an_unknown_kind() {
     )
     .expect("room");
 
-    journal[first + 3] = RecordKind::TIMER_FIRED.0;
+    journal[first + 3] = RecordKind::SIGNAL_RECEIVED.0;
     reseal(&mut journal[first..first + second], align);
 
     let mut scan = Scan::new(&journal, align);
@@ -2120,4 +2184,84 @@ fn reseal_header(frame_bytes: &mut [u8]) {
         unreachable!("a frame is at least sixteen bytes long")
     };
     seal.copy_from_slice(&header.to_le_bytes());
+}
+
+#[test]
+fn a_scheduled_timer_body_is_refused_at_every_other_length() {
+    // The body is a fixed shape, so its length is part of the record's identity. A decoder
+    // that read the first seventeen bytes of a longer body would accept two byte sequences
+    // as one record, and §09 is a format that has to be reasoned about by looking at it.
+    let sound = [0x01_u8, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
+    assert!(frame::decode(&reframed(RecordKind::TIMER_SCHEDULED, 1, &sound)).is_ok());
+
+    for length in [0_usize, 1, 8, 16, 18, 32] {
+        let mut body = sound.to_vec();
+        body.resize(length, 0);
+        assert_eq!(
+            frame::decode(&reframed(RecordKind::TIMER_SCHEDULED, 1, &body)),
+            Err(DecodeError::MalformedRecord),
+            "a seventeen-byte body must not be readable as {length} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_firing_carries_no_payload_at_all() {
+    // A firing's whole content is that the deadline passed. Bytes after it would be bytes
+    // nothing reads, which is the one thing a self-delimiting format must not have.
+    assert_eq!(
+        frame::decode(&reframed(RecordKind::TIMER_FIRED, 1, &[])).map(|read| read.decoded),
+        Ok(Decoded::Record(RecordRef::TimerFired { seq: EffectSeq(1) }))
+    );
+
+    for length in [1_usize, 4, 17] {
+        assert_eq!(
+            frame::decode(&reframed(RecordKind::TIMER_FIRED, 1, &vec![0; length])),
+            Err(DecodeError::MalformedRecord),
+            "a firing must carry no payload, and not {length} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_clock_kind_number_no_firmware_wrote_is_a_malformed_record() {
+    // Design document §11's reinterpretation, refused at the decoder. A body whose first
+    // byte is not one of the two kinds the format spends is not a timer, and a decoder with
+    // a wildcard arm would read a zeroed page as a boot deadline.
+    for number in [0_u8, 3, 0x7F, 0xFF] {
+        let mut body = vec![number];
+        body.resize(17, 0);
+        assert_eq!(
+            frame::decode(&reframed(RecordKind::TIMER_SCHEDULED, 1, &body)),
+            Err(DecodeError::MalformedRecord),
+            "clock kind {number} is not a policy"
+        );
+    }
+}
+
+/// Builds a sound frame of `kind`, for `seq`, carrying `payload`.
+///
+/// The mutation tests above change a body and then have to make the frame *sound* again,
+/// or the decoder refuses them for a checksum rather than for the reason under test. Built
+/// from the reference `crc16` and `crc32` above rather than from the encoder, for the
+/// reason the golden frames are: a fixture the code under test produces is not a fixture.
+///
+/// Alignment one, so the commit seal is one byte and there is no padding to describe.
+fn reframed(kind: RecordKind, seq: u32, payload: &[u8]) -> Vec<u8> {
+    let Ok(len) = u16::try_from(payload.len()) else {
+        unreachable!("the bodies these tests build fit a u16")
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(&MAGIC.to_le_bytes());
+    bytes.push(FORMAT_VERSION);
+    bytes.push(kind.0);
+    bytes.extend_from_slice(&seq.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&crc16(&bytes).to_le_bytes());
+    bytes.extend_from_slice(payload);
+    let frame_crc = crc32(&bytes);
+    bytes.extend_from_slice(&frame_crc.to_le_bytes());
+    bytes.extend_from_slice(&frame::commit_seal(frame_crc));
+    bytes.truncate(HEADER_BYTES + payload.len() + 4 + 1);
+    bytes
 }
