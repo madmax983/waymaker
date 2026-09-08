@@ -8516,6 +8516,47 @@ mod deferred_answer_pins {
         );
     }
 
+    /// The names `public_functions` collects from one file's text.
+    fn counted(contents: &str) -> Vec<String> {
+        crate::size::public_functions(&[crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "waymaker-flash/src/bank.rs".to_owned(),
+            contents: contents.to_owned(),
+        }])
+        .into_iter()
+        .map(|function| function.name)
+        .collect()
+    }
+
+    #[test]
+    fn an_inline_public_method_is_counted_whatever_modifier_follows_pub() {
+        // Codex round 1. The prefix before ` fn ` ends in the *modifier* rather than in
+        // `pub`, so `impl Bank { pub const fn raw() {} }` read as private and nine surface
+        // pins and `size-probe-reach` stayed blind to the same one-line escape this change
+        // exists to close. Driven against the reader itself: `ctx-facade`'s method pin
+        // catches such a line on `Ctx` for a different reason, so a test that went through
+        // the rule would pass with the reader still broken.
+        for modifier in ["", "const ", "async ", "unsafe ", "extern \"C\" "] {
+            let inline = format!("#[rustfmt::skip]\nimpl Bank {{ pub {modifier}fn raw() {{}} }}\n");
+            assert!(
+                counted(&inline).contains(&"raw".to_owned()),
+                "pub {modifier}fn was not counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_pub_crate_method_is_not_counted_as_public() {
+        // The two paths must agree on what `pub` means: the non-inline one reads
+        // `starts_with("pub ")`, so a `pub(crate)` member is not public there and must not
+        // become public here — `size-probe-reach` would then demand a probe call for it.
+        let inline = "#[rustfmt::skip]\nimpl Bank { pub(crate) fn raw() {} }\n";
+        assert!(!counted(inline).contains(&"raw".to_owned()));
+        // And a private member of an inline block is still private.
+        let private = "#[rustfmt::skip]\nimpl Bank { fn raw() {} }\n";
+        assert!(!counted(private).contains(&"raw".to_owned()));
+    }
+
     #[test]
     fn a_pub_crate_method_on_the_context_is_reported() {
         // The defeat CLAUDE.md records against `timer-capability` and `effect-protocol`,

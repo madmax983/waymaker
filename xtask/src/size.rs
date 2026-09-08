@@ -2108,9 +2108,14 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // closed in the reader they share rather than in one rule.
                     let declared_here = declaration_kind(trimmed);
                     let inline = declared_here.is_some() && opens > 0;
-                    let marked_public = trimmed
-                        .split_once(" fn ")
-                        .is_some_and(|(before, _)| before.trim_end().ends_with("pub"));
+                    // The member's *own* prefix, which is what follows the block's opening
+                    // brace — not the whole line before the `fn` keyword. Testing that the
+                    // line ended in `pub` read `impl Bank { pub const fn raw()` as private,
+                    // because the prefix ends in the modifier; the same for `pub async`,
+                    // `pub unsafe` and `pub extern "C"`. Codex round 1 found it.
+                    let marked_public = trimmed.split_once(" fn ").is_some_and(|(before, _)| {
+                        declares_public(before.rsplit('{').next().unwrap_or("").trim())
+                    });
                     let callable = trimmed.starts_with("pub ")
                         || matches!(enclosing, Block::Trait | Block::TraitImpl)
                         || (inline
@@ -2182,6 +2187,15 @@ fn declaration_kind(line: &str) -> Option<Block> {
         });
     }
     None
+}
+
+/// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.
+///
+/// The same visibility the non-inline path reads with `starts_with("pub ")`, split out so
+/// that the two agree: a `pub(crate)` member is not public in either, and a modifier between
+/// the visibility and the keyword changes neither.
+fn declares_public(prefix: &str) -> bool {
+    prefix == "pub" || prefix.starts_with("pub ")
 }
 
 /// The name declared by a function signature, if the line declares one.

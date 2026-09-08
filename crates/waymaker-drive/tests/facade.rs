@@ -151,6 +151,57 @@ fn scheduling_while_an_effect_is_outstanding_is_refused() {
 }
 
 #[test]
+fn a_caller_that_ends_the_run_with_an_effect_outstanding_is_refused_by_name() {
+    // Codex round 1. A caller that took `Handoff::Dispatch` and then returned an outcome
+    // rather than resolving it left the writer inside the effect, so `conclude` reached
+    // `peek`, found `Source::Spent`, and reported `NoAppendPoint` — the refusal reserved
+    // for a bank that can never be appended to again. §08 has no edge from an unresolved
+    // effect to a terminal record either way; what changed is that the diagnosis names the
+    // caller's mistake rather than the media.
+    struct Abandoning;
+
+    impl Workflow for Abandoning {
+        fn identity(&self) -> Identity<'_> {
+            Identity {
+                kind: WORKFLOW_KIND,
+                version: WORKFLOW_VERSION,
+                input: URL,
+            }
+        }
+
+        fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+            let Ok(Handoff::Dispatch(_)) = boundary.schedule(DOWNLOAD, b"one") else {
+                return Ok(Outcome::Failed(b"schedule"));
+            };
+            // The effect is committed and outstanding, and this says the run is over.
+            Ok(Outcome::Completed(&[]))
+        }
+    }
+
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut Idle,
+        &mut Abandoning,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert_eq!(progress, Err(DriveError::EffectOutstanding));
+    // No terminal record: the run really is unfinished, and history says so.
+    let mut recovery = waymaker_flash::recovery::Recovery::new(region());
+    let mut records = 0_usize;
+    while recovery.next(&mut device, &mut page).is_some() {
+        records += 1;
+    }
+    assert_eq!(records, 2, "the run's record and the schedule record");
+}
+
+#[test]
 fn a_refused_misuse_writes_no_effect_record() {
     // The refusal is a refusal, not a repair: the run's own record is on media because the
     // boot wrote it, and nothing else is.

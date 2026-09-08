@@ -693,19 +693,31 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             None => {}
         }
 
-        let Ok(outcome) = ended else {
-            // A caller that split §07 in two, took the identity, and stopped before
-            // recording an outcome. The schedule record is committed, so the effect is
-            // outstanding and the next boot redelivers it — which is what
-            // `Performed::Pending` reports on the undivided path. The knowledge is here
-            // rather than in the caller because only the driver holds the identity.
-            if let Some(outstanding) = pending {
+        // A caller that split §07 in two, took the identity, and never resolved it. The
+        // writer is inside the outstanding effect, so every path below reaches `peek`,
+        // finds `Source::Spent`, and reports `NoAppendPoint` — the refusal reserved for a
+        // bank that can never be appended to again. Read before `ended`, because what the
+        // workflow returned changes which answer is right and neither of them is that one.
+        if let Some(outstanding) = pending {
+            let Ok(_ended) = ended else {
+                // The caller stopped. The schedule record is committed, so the effect is
+                // outstanding and the next boot redelivers it — which is what
+                // `Performed::Pending` reports on the undivided path. The knowledge is here
+                // because only the driver holds the identity.
                 return Ok(Progress::Waiting {
                     id: outstanding.intent().id(),
                 });
-            }
-            // Unreachable: every other `Suspended` this crate hands out is recorded above
-            // first. Refused rather than panicked, because the workspace denies both.
+            };
+            // The caller says the run is over with an effect outstanding. §08 has no edge
+            // from an unresolved effect to a terminal record, so this is refused either
+            // way; it is named for what it is rather than for the media.
+            return Err(DriveError::EffectOutstanding);
+        }
+
+        let Ok(outcome) = ended else {
+            // Unreachable: every `Suspended` this crate hands out is recorded above first,
+            // and a caller that stopped with an effect outstanding is the arm above.
+            // Refused rather than panicked, because the workspace denies both.
             return Err(DriveError::Kernel(KernelError::NondeterministicWorkflow));
         };
 
