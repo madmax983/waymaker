@@ -22,6 +22,11 @@
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
 //!   builds them too.
+//! * [`facade`] and [`ota`] — the bridge to `waymaker-embassy`'s [`Ctx`] and design
+//!   document §06's OTA example. The edge goes one way: nothing below them names a façade
+//!   type, so removing the façade removes these two files and nothing else.
+//!
+//! [`Ctx`]: waymaker_embassy::Ctx
 //!
 //! # What this crate must not own
 //!
@@ -98,10 +103,13 @@ mod boundary;
 pub mod demo;
 mod drive;
 mod effect;
+pub mod facade;
+pub mod ota;
 mod workflow;
 
 pub use activity::{Activities, Clocks, Performed};
-pub use boundary::{Boundary, Suspended};
+pub use boundary::{Answered, Boundary, Handoff, Suspended};
 pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 pub use effect::{Dispatchable, DurableIntent, Effect, Resolution, Resolved, Scheduled};
+pub use facade::Bridge;
 pub use workflow::{Identity, Workflow};

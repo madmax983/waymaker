@@ -22,7 +22,7 @@ use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::StableStorage;
 
 use crate::activity::{Activities, Clocks, Performed};
-use crate::boundary::{Boundary, Suspended};
+use crate::boundary::{Answered, Boundary, Handoff, Suspended};
 use crate::effect::{Dispatchable, Effect, Resolution, Resolved, Scheduled};
 use crate::workflow::Workflow;
 
@@ -147,6 +147,24 @@ pub enum DriveError<E> {
     /// of that kind. Either way the deadline cannot be measured, and design document §02
     /// decision 8 is that a deadline nothing can measure is refused rather than guessed at.
     ClockUnavailable,
+    /// §07's two halves were called out of order: a schedule while one was outstanding.
+    ///
+    /// [`Boundary::schedule`](crate::Boundary::schedule) hands the writer to the effect it
+    /// committed, so a second schedule before
+    /// [`Boundary::resolve`](crate::Boundary::resolve) would leave the first effect with no
+    /// way to record its outcome, and §08 has no edge from an unresolved effect to a
+    /// terminal record.
+    EffectOutstanding,
+    /// §07's two halves were called out of order: a resolve with no effect outstanding.
+    ///
+    /// A caller that never committed an intent has no outcome to record.
+    NoEffectOutstanding,
+    /// §10's `continue_as_new` was asked of a driver that cannot swap banks.
+    ///
+    /// See [`Boundary::continue_as_new`](crate::Boundary::continue_as_new): this driver is
+    /// pointed at a journal region rather than at a bank, so it cannot name the bank a swap
+    /// would install into.
+    ContinueUnsupported,
     /// §10 refused the record, before the device was asked for anything.
     ///
     /// The refusal that keeps this driver honest. Without it a schedule record is committed,
@@ -301,6 +319,7 @@ impl<C: IntegrityCheck> Driver<C> {
             source,
             reserve: self.reserve,
             stop: None,
+            pending: None,
         };
         let ended = workflow.run(&mut context);
         context.conclude(ended)
@@ -614,6 +633,12 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     source: Source<C>,
     reserve: Reserve,
     stop: Option<Stop<S::Error>>,
+    /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
+    ///
+    /// [`Boundary::call`] never uses it: that path holds the value on its own stack for
+    /// the length of one call. This is where it waits when the two halves are split, and
+    /// it holds the writer, so a run with an effect in flight still has no appender.
+    pending: Option<Dispatchable<C>>,
 }
 
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
@@ -634,6 +659,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             mut source,
             reserve,
             stop,
+            pending,
             ..
         } = self;
         match stop {
@@ -662,8 +688,18 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         }
 
         let Ok(outcome) = ended else {
-            // Unreachable: every `Suspended` this crate hands out is recorded above first.
-            // Refused rather than panicked, because the workspace denies both.
+            // A caller that split §07 in two, took the identity, and stopped before
+            // recording an outcome. The schedule record is committed, so the effect is
+            // outstanding and the next boot redelivers it — which is what
+            // `Performed::Pending` reports on the undivided path. The knowledge is here
+            // rather than in the caller because only the driver holds the identity.
+            if let Some(outstanding) = pending {
+                return Ok(Progress::Waiting {
+                    id: outstanding.intent().id(),
+                });
+            }
+            // Unreachable: every other `Suspended` this crate hands out is recorded above
+            // first. Refused rather than panicked, because the workspace denies both.
             return Err(DriveError::Kernel(KernelError::NondeterministicWorkflow));
         };
 
@@ -921,6 +957,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
+            ..
         } = self;
 
         let intent = dispatchable.intent();
@@ -1188,6 +1225,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
+            ..
         } = self;
 
         if stop.is_some() {
@@ -1281,6 +1319,73 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     }
 }
 
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
+    /// §07 steps 5, 6 and 7 for the effect [`Boundary::schedule`] handed out.
+    ///
+    /// The stop is recorded rather than returned, for [`Context::decide`]'s reason: the
+    /// only thing a [`Boundary`] method may hand a workflow is [`Suspended`].
+    fn record_answer(&mut self, answered: Answered<'_>) -> Option<(Conclusion, usize)> {
+        let Self {
+            storage,
+            machine,
+            page,
+            result,
+            source,
+            reserve,
+            stop,
+            pending,
+            ..
+        } = self;
+
+        if stop.is_some() {
+            return None;
+        }
+        let Some(dispatchable) = pending.take() else {
+            *stop = Some(Stop::Failed(DriveError::NoEffectOutstanding));
+            return None;
+        };
+
+        let bound = usize::from(reserve.bounds().effect_result_bytes);
+        // An answer over the bound is exhausted rather than refused, for
+        // `Context::dispatch`'s reason: the schedule record is committed, and a refusal
+        // strands the run for ever.
+        let resolution = match answered {
+            Answered::Exhausted => Resolution::Exhausted,
+            Answered::Completed(bytes) | Answered::Failed(bytes) if bytes.len() > bound => {
+                Resolution::Exhausted
+            }
+            Answered::Completed(bytes) => Resolution::Completed(bytes),
+            Answered::Failed(bytes) => Resolution::Failed(bytes),
+        };
+
+        let Resolved {
+            next,
+            record,
+            outcome,
+        } = match dispatchable.resolve(*storage, resolution, page) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                *stop = Some(Stop::Failed(error));
+                return None;
+            }
+        };
+        if let Err(error) = machine.advance(record) {
+            *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+            return None;
+        }
+        *source = Source::Writing(next.into_writer());
+        // Copied into the caller's result buffer, because the bytes the workflow observes
+        // must outlive the answer they were handed in.
+        match store(outcome, result, reserve.bounds().effect_result_bytes) {
+            Ok(recorded) => Some(recorded),
+            Err(error) => {
+                *stop = Some(Stop::Failed(error));
+                None
+            }
+        }
+    }
+}
+
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     for Context<'_, S, A, C>
 {
@@ -1297,5 +1402,42 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
             TimerDecision::Passed => Ok(()),
             TimerDecision::Stop => Err(Suspended::NEW),
         }
+    }
+
+    fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Suspended> {
+        if self.pending.is_some() {
+            if self.stop.is_none() {
+                self.stop = Some(Stop::Failed(DriveError::EffectOutstanding));
+            }
+            return Err(Suspended::NEW);
+        }
+        match self.decide(kind, input) {
+            Decision::Replayed(conclusion, len) => {
+                Ok(Handoff::Replayed(self.observed(conclusion, len)))
+            }
+            Decision::Dispatch(dispatchable) => {
+                let id = dispatchable.intent().id();
+                self.pending = Some(dispatchable);
+                Ok(Handoff::Dispatch(id))
+            }
+            Decision::Stop => Err(Suspended::NEW),
+        }
+    }
+
+    fn resolve(&mut self, answered: Answered<'_>) -> Result<Outcome<'_>, Suspended> {
+        let Some((conclusion, len)) = self.record_answer(answered) else {
+            return Err(Suspended::NEW);
+        };
+        Ok(self.observed(conclusion, len))
+    }
+
+    fn continue_as_new(&mut self, input: &[u8]) -> Suspended {
+        // `input` is §10's next run input. This driver reads it no further than here: it
+        // cannot name the bank the new run would be installed into.
+        let _ = input;
+        if self.stop.is_none() {
+            self.stop = Some(Stop::Failed(DriveError::ContinueUnsupported));
+        }
+        Suspended::NEW
     }
 }

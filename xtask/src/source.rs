@@ -5238,6 +5238,347 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
     violations
 }
 
+/// The façade's own module, whose public surface `ctx-facade` pins.
+pub const CTX_FACADE_PATH: &str = "waymaker-embassy/src/ctx.rs";
+
+/// The durable half the façade asks, whose public surface `ctx-facade` pins.
+pub const CTX_JOURNAL_PATH: &str = "waymaker-embassy/src/journal.rs";
+
+/// Every public function issue #35's `Ctx` declares.
+///
+/// Four futures, a constructor, and three accessors a caller reads after a boot. A ninth
+/// name is a way for the façade to do something, and the whole of issue #35 is that it may
+/// only ask.
+pub const CTX_SURFACE: &[&str] = &[
+    "activity",
+    "complete",
+    "conclusion",
+    "continue_as_new",
+    "dispatch_error",
+    "fail",
+    "new",
+    "payload",
+    "timer",
+];
+
+/// The four futures `Ctx` hands out.
+///
+/// Pinned so that a fifth is a reviewer's decision. It is also what makes the `poll`
+/// exemption below safe: the surface pin cannot speak about a name declared four times, so
+/// the count is held here instead.
+pub const CTX_FUTURES: &[&str] = &[
+    "ActivityFuture",
+    "ContinueFuture",
+    "TerminalFuture",
+    "TimerFuture",
+];
+
+/// The one name the façade's surface pin does not compare.
+///
+/// `Future::poll` is `core`'s name and every future declares it exactly once, so a pin that
+/// is a list of names cannot say anything about four of them. [`CTX_FUTURES`] holds the
+/// count instead.
+const FUTURE_POLL: &str = "poll";
+
+/// Every method the durable half declares.
+///
+/// Four, one per thing a workflow can ask for. A fifth is a question the façade would be
+/// answering for itself.
+pub const CTX_JOURNAL_SURFACE: &[&str] = &["continue_as_new", "resolve", "schedule", "wait"];
+
+/// What the façade may not name, and why.
+///
+/// Each is a piece of authority the façade must not hold. `waymaker-embassy`'s must-not-own
+/// cell is "on-media authority or hidden global state", and every one of these is the first.
+pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
+    (
+        "StableStorage",
+        "is the device, and a façade that reached one would write records for itself",
+    ),
+    (
+        "Reserved",
+        "is §10's gated writer, and admitting a record is the journal's decision",
+    ),
+    (
+        "RecordRef",
+        "is a record, and a façade that named one would decide what history holds",
+    ),
+    (
+        "Recovery",
+        "is the recovery scan, which decides what committed history is",
+    ),
+    (
+        "ReplayMachine",
+        "is §08's transition table, which decides what may follow what",
+    ),
+    (
+        "BankLayout",
+        "is §10's two-bank layout, which decides which bank is authoritative",
+    ),
+    (
+        "Swap",
+        "is §10's bank swap, which is the journal's to perform",
+    ),
+];
+
+/// The driver modules that may not name the façade.
+///
+/// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
+/// fully usable through the synchronous driver. These are the files that would have to keep
+/// compiling, so the edge is confined to `facade.rs` and `ota.rs` and this is what says so.
+pub const FACADE_FREE_DRIVER_MODULES: &[&str] = &[
+    "waymaker-drive/src/activity.rs",
+    "waymaker-drive/src/boundary.rs",
+    "waymaker-drive/src/demo.rs",
+    "waymaker-drive/src/drive.rs",
+    "waymaker-drive/src/effect.rs",
+    "waymaker-drive/src/workflow.rs",
+];
+
+/// The crate a driver module that names the façade would break.
+const FACADE_CRATE: &str = "waymaker_embassy";
+
+/// Rule: the façade adds sugar and never authority.
+///
+/// Issue [#35](https://github.com/madmax983/waymaker/issues/35) says it in one line — "it
+/// must add sugar, never authority" — and design document §05 says it as
+/// `waymaker-embassy`'s must-not-own cell: on-media authority or hidden global state. Both
+/// are absences, and an absence is what a test cannot check: a `Ctx::record` that appended
+/// a record for itself would break no layering rule, need no new dependency, and pass every
+/// test in the workspace, because the run would still complete.
+///
+/// So this pins three things.
+///
+/// The **surface**, in both directions. A tenth public function on `Ctx` or a fifth method
+/// on the journal is a reviewer's decision rather than a commit.
+///
+/// The **vocabulary**. `waymaker-embassy` may depend on `waymaker-flash`, so nothing else
+/// stops the façade reaching a `StableStorage` or a `Reserved` and writing through it.
+/// [`CTX_FORBIDDEN_VOCABULARY`] names each piece of authority and why it is not the
+/// façade's.
+///
+/// And **no hidden global state**: a `static` in either module is the other half of the
+/// must-not-own cell, and a façade with one is a façade two runs on a device would share.
+///
+/// The fourth half is the driver's. [`FACADE_FREE_DRIVER_MODULES`] may not name
+/// `waymaker_embassy`, which is what makes "removing the Embassy crate leaves the protocol
+/// fully usable" a fact about the source rather than a claim about it.
+///
+/// # What it cannot see
+///
+/// A function added from a sibling module — it pins two files, exactly as
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
+/// pin. And it compares *names*: a `Ctx::payload` that started returning the journal's
+/// buffer rather than the caller's is `crates/waymaker-embassy/tests/ctx.rs`'s.
+#[must_use]
+pub fn check_ctx_facade(
+    sources: &[crate::size::LayerSource],
+    driver: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    const RULE: &str = "ctx-facade";
+    const FACADE: &str = "waymaker-embassy";
+    const DRIVER: &str = "waymaker-drive";
+
+    let mut violations = Vec::new();
+    for (path, pinned) in [
+        (CTX_FACADE_PATH, CTX_SURFACE),
+        (CTX_JOURNAL_PATH, CTX_JOURNAL_SURFACE),
+    ] {
+        violations.extend(check_facade_surface(RULE, FACADE, path, pinned, sources));
+        let Some(source) = find_source(sources, path) else {
+            continue;
+        };
+        let code = without_test_modules(&code_only(&source.contents));
+        if path == CTX_FACADE_PATH {
+            violations.extend(check_facade_futures(RULE, FACADE, path, &code));
+        }
+        for (forbidden, why) in CTX_FORBIDDEN_VOCABULARY {
+            if names_identifier(&code, forbidden) {
+                violations.push(Violation::new(
+                    RULE,
+                    FACADE,
+                    format!("{path} names `{forbidden}`, which {why}"),
+                ));
+            }
+        }
+        violations.extend(check_no_hidden_state(RULE, FACADE, path, &code));
+    }
+
+    for path in FACADE_FREE_DRIVER_MODULES {
+        let Some(source) = find_source(driver, path) else {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "no {path} in the workspace, so nothing says the synchronous driver \
+                     still compiles with the façade removed"
+                ),
+            ));
+            continue;
+        };
+        let code = code_only(&source.contents);
+        if names_identifier(&code, FACADE_CRATE) {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{path} names `{FACADE_CRATE}`, so removing the façade would stop the \
+                     synchronous driver compiling; the edge belongs in \
+                     waymaker-drive/src/facade.rs and waymaker-drive/src/ota.rs"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// The pinned surface, with [`FUTURE_POLL`] set aside.
+///
+/// [`check_pinned_surface`] refuses a name declared twice, and four futures declare `poll`.
+/// Everything else is compared the same way and in both directions.
+fn check_facade_surface(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    pinned: &[&str],
+    sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    let Some(source) = find_source(sources, path) else {
+        return vec![Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "no {path} in the workspace, so the pinned surface is checking nothing; \
+                 issue #35's façade must add sugar and never authority"
+            ),
+        )];
+    };
+
+    let mut declarations: Vec<String> =
+        crate::size::public_functions(core::slice::from_ref(source))
+            .into_iter()
+            .map(|function| function.name)
+            .filter(|name| name != FUTURE_POLL)
+            .collect();
+    declarations.sort_unstable();
+
+    let mut violations = Vec::new();
+    for (index, name) in declarations.iter().enumerate() {
+        if declarations.get(index.wrapping_add(1)) == Some(name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}` more than once, so the pin can no longer speak \
+                     about it; give the second one a name of its own"
+                ),
+            ));
+        }
+    }
+    for name in &declarations {
+        if !pinned.contains(&name.as_str()) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}`, which the pinned surface does not list: the \
+                     façade must add sugar and never authority, so a way for it to do \
+                     something rather than ask cannot be added without a reviewer writing it \
+                     down"
+                ),
+            ));
+        }
+    }
+    for name in pinned {
+        if !declarations.iter().any(|declared| declared == name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{path} no longer declares `{name}`, which the pinned surface lists"),
+            ));
+        }
+    }
+    violations
+}
+
+/// Exactly the futures [`CTX_FUTURES`] names, each with one `poll`.
+///
+/// The count is what the surface pin gave up when it set `poll` aside. A fifth future is a
+/// fifth thing a workflow can `.await`, which is a reviewer's decision rather than a commit.
+fn check_facade_futures(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    code: &str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for future in CTX_FUTURES {
+        let header = format!("pub struct {future}");
+        let declarations = declaration_count(code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{path} declares `{header}` {declarations} times, not once"),
+            ));
+        }
+    }
+    let polls = code
+        .lines()
+        .filter(|line| line.trim_start().starts_with("fn poll("))
+        .count();
+    if polls != CTX_FUTURES.len() {
+        violations.push(Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "{path} declares {polls} `fn poll` bodies and {} futures; the surface pin \
+                 sets `poll` aside, so a future the pin cannot see is one nobody weighed",
+                CTX_FUTURES.len()
+            ),
+        ));
+    }
+    violations
+}
+
+/// A module that declares no `static`.
+///
+/// `waymaker-embassy`'s must-not-own cell names hidden global state, and a `static` is what
+/// that means in a `no_std` crate with no allocator: one device, two runs, one buffer.
+/// `const` is not global state — it has no address a caller can observe — so only `static`
+/// is refused.
+fn check_no_hidden_state(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    code: &str,
+) -> Vec<Violation> {
+    code.lines()
+        .filter(|line| {
+            let rest = line.trim_start();
+            let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+            let rest = match rest.split_once(") ") {
+                Some((visibility, after)) if visibility.starts_with("pub(") => after,
+                _ => rest,
+            };
+            rest.starts_with("static ")
+        })
+        .map(|line| {
+            Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{}`, which is hidden global state; the façade's \
+                     must-not-own cell names it, and a buffer two runs share is the failure \
+                     it names",
+                    line.trim()
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Rule: design document §07's seven steps happen in §07's order, and step 4 cannot be
 /// reached without step 3.
 ///
@@ -7804,6 +8145,209 @@ mod deferred_answer_pins {
             .into_iter()
             .map(|violation| violation.detail)
             .collect()
+    }
+
+    /// The two façade files `ctx-facade` reads, with one of them replaced.
+    fn facade_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        [
+            (CTX_FACADE_PATH, tests_support::clean_ctx_facade()),
+            (CTX_JOURNAL_PATH, tests_support::clean_ctx_journal()),
+        ]
+        .into_iter()
+        .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+        .collect()
+    }
+
+    /// The driver files the same rule reads, with one of them replaced.
+    fn facade_free_driver_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        FACADE_FREE_DRIVER_MODULES
+            .iter()
+            .map(|at| {
+                let body = tests_support::clean_facade_free_driver_module();
+                layer(at, if *at == path { contents } else { &body })
+            })
+            .collect()
+    }
+
+    /// Every violation the rule emits when the façade file `path` holds `contents`.
+    fn facade_details(path: &str, contents: &str) -> Vec<String> {
+        check_ctx_facade(
+            &facade_sources(path, contents),
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect()
+    }
+
+    /// Every violation the rule emits when the driver file `path` holds `contents`.
+    fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
+        check_ctx_facade(
+            &facade_sources("", ""),
+            &facade_free_driver_sources(path, contents),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect()
+    }
+
+    #[test]
+    fn the_clean_facade_passes() {
+        assert!(facade_details("", "").is_empty());
+    }
+
+    #[test]
+    fn a_facade_that_reaches_the_device_is_reported() {
+        // The sharpest mutation the rule exists for. `waymaker-embassy` may depend on
+        // `waymaker-flash`, so nothing else stops the façade programming a record itself.
+        let module = format!(
+            "{}\npub fn record(storage: &mut impl StableStorage) {{ let _ = storage; }}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("StableStorage")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_that_holds_a_static_is_reported() {
+        // The other half of the must-not-own cell. A buffer two runs share is the failure.
+        for declaration in [
+            "static SHARED: [u8; 8] = [0; 8];",
+            "pub static SHARED: [u8; 8] = [0; 8];",
+            "pub(crate) static SHARED: [u8; 8] = [0; 8];",
+        ] {
+            let module = format!("{}\n{declaration}\n", tests_support::clean_ctx_facade());
+            let details = facade_details(CTX_FACADE_PATH, &module);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("hidden global state")),
+                "{declaration}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_const_is_not_hidden_state() {
+        let module = format!(
+            "{}\npub const WIDTH: usize = 8;\n",
+            tests_support::clean_ctx_facade()
+        );
+        assert!(facade_details(CTX_FACADE_PATH, &module).is_empty());
+    }
+
+    #[test]
+    fn a_fifth_future_is_reported() {
+        // The surface pin sets `poll` aside, so this is the only thing that counts them.
+        let module = format!(
+            "{}\npub struct SignalFuture;\nimpl SignalFuture {{\n    fn poll() {{}}\n}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`fn poll`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_function_the_pin_does_not_list_is_reported() {
+        let module = format!(
+            "{}\npub fn record() {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`record`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_function_declared_twice_is_reported() {
+        // A pin that is a list of names cannot speak about a name used twice.
+        let module = format!(
+            "{}\npub fn payload() {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("more than once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_facade_function_is_reported() {
+        let module = tests_support::clean_ctx_facade().replace("pub fn payload()", "fn payload()");
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no longer declares `payload`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_fifth_journal_method_is_reported() {
+        let module = format!(
+            "{}\npub fn append() {{}}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`append`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_module_that_is_gone_is_reported() {
+        // Fails closed, for `timer-capability`'s reason: a pin that cannot find its file is
+        // a pin that has stopped checking.
+        let details: Vec<String> = check_ctx_facade(&[], &[])
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect();
+        assert!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("in the workspace"))
+                .count()
+                >= 2 + FACADE_FREE_DRIVER_MODULES.len(),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_module_that_names_the_facade_is_reported() {
+        // Issue #35's second "done when": removing the façade must leave the protocol
+        // usable, so the edge belongs in the two files that exist to hold it.
+        let module = "//! A driver module.\nuse waymaker_embassy::Journal;\n";
+        let details = facade_driver_details("waymaker-drive/src/drive.rs", module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("waymaker_embassy")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_module_that_only_mentions_the_facade_in_a_comment_is_not_reported() {
+        let module = "//! See waymaker_embassy for the façade.\n// waymaker_embassy again.\n";
+        assert!(
+            facade_driver_details("waymaker-drive/src/drive.rs", module).is_empty(),
+            "prose is not a dependency"
+        );
     }
 
     #[test]
@@ -10708,12 +11252,12 @@ pub mod tests_support {
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
         BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
         CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE,
-        DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
-        INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
-        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
-        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
+        CTX_FUTURES, CTX_JOURNAL_SURFACE, CTX_SURFACE, DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS,
+        FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS,
+        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
+        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TIMER_BRACED_STRUCTS,
+        TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -10805,6 +11349,30 @@ pub mod tests_support {
             "//! A kernel crate root.\npub mod timer;\npub use timer::{{{}}};\n",
             exported.join(", ")
         )
+    }
+
+    /// A façade module declaring exactly [`CTX_SURFACE`] and [`CTX_FUTURES`], naming no
+    /// authority and holding no `static`.
+    #[must_use]
+    pub fn clean_ctx_facade() -> String {
+        let mut source = surface("The façade.", CTX_SURFACE);
+        for future in CTX_FUTURES {
+            let _ = writeln!(source, "pub struct {future};");
+            let _ = writeln!(source, "impl {future} {{\n    fn poll() {{}}\n}}");
+        }
+        source
+    }
+
+    /// A durable half declaring exactly [`CTX_JOURNAL_SURFACE`].
+    #[must_use]
+    pub fn clean_ctx_journal() -> String {
+        surface("The durable half.", CTX_JOURNAL_SURFACE)
+    }
+
+    /// A driver module that names no façade type.
+    #[must_use]
+    pub fn clean_facade_free_driver_module() -> String {
+        "//! A driver module that knows nothing about the façade.\n".to_owned()
     }
 
     /// A clock module declaring exactly [`CLOCK_SURFACE`], naming no boot clock, and
@@ -11374,6 +11942,8 @@ mod tests {
             .chain(SWAP_SURFACE)
             .chain(TIMER_SURFACE)
             .chain(CLOCK_SURFACE)
+            .chain(CTX_SURFACE)
+            .chain(CTX_JOURNAL_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

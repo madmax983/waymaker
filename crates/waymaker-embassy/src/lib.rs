@@ -12,18 +12,45 @@
 //! [`waymaker-flash`]: https://docs.rs/waymaker-flash
 //! [`waymaker-core`]: https://docs.rs/waymaker-core
 //!
+//! # What is here
+//!
+//! * [`ctx`] — issue [#35](https://github.com/madmax983/waymaker/issues/35)'s [`Ctx`] and
+//!   its futures: an activity, a deadline, a new run, and the run's own ending.
+//! * [`journal`] — the durable half [`Ctx`] asks. An implementor owns the media.
+//! * [`dispatch`] — the world's half: what performs design document §07 step 4.
+//! * [`decode`] — how a workflow reads recorded bytes. It names no codec.
+//! * [`clock`] — design document §11's `PersistentClock` capability. It is here rather
+//!   than in the kernel because the kernel's must-not-own cell names a clock, and
+//!   `waymaker-flash`'s names timers.
+//!
+//! # There is no Embassy dependency
+//!
+//! The futures here are plain [`core::future::Future`]s, so Embassy's executor polls them
+//! and this crate has no executor, no timer queue and no waker of its own. §02 decision 5
+//! is that async syntax is an adapter; a façade that pulled in an executor to hand out four
+//! futures would be more than one.
+//!
 //! # Status
 //!
-//! Rung 0.5's first item is here, ahead of rung 0.4: [`clock`] holds design document §11's
-//! `PersistentClock` capability. It is here rather than later because the layering leaves
-//! nowhere else — the kernel's must-not-own cell names a clock and `waymaker-flash`'s names
-//! timers — and it needs no dispatcher to be correct. The async `Ctx`, the dispatcher and
-//! in-boot sleep still arrive with rung 0.4.
+//! Rung 0.4's first item is here. Still owed: the dispatcher's ergonomic wrapper (issue
+//! [#36](https://github.com/madmax983/waymaker/issues/36)), the optional codec helpers
+//! (issue [#37](https://github.com/madmax983/waymaker/issues/37)), the provisioning example
+//! (issue [#38](https://github.com/madmax983/waymaker/issues/38)), in-boot sleep, and the
+//! budgets this rung exits on (issue
+//! [#39](https://github.com/madmax983/waymaker/issues/39)).
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod clock;
+pub mod ctx;
+pub mod decode;
+pub mod dispatch;
+pub mod journal;
 
 pub use clock::{ClockError, PersistentClock, PersistentTimer};
+pub use ctx::{ActivityFuture, ContinueFuture, Ctx, Failure, TerminalFuture, TimerFuture};
+pub use decode::Decode;
+pub use dispatch::ActivityDispatcher;
+pub use journal::{Answer, Halted, Handoff, Journal};
