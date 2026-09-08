@@ -2200,17 +2200,32 @@ fn declaration_kind(line: &str) -> Option<Block> {
 /// hid the `impl` from `declaration_kind` and the `pub` from the visibility test. Codex
 /// round 3 found it, in the same one-line form round 1's finding was about.
 ///
-/// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` and
-/// `#[expect(lint, reason = "]")]` are each one attribute.
+/// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
+/// attribute — and a bracket inside a string literal is not a bracket, so
+/// `#[expect(lint, reason = "]")]` is one too. Codex round 4 found the version that read
+/// every `]` as syntax and left the classifier standing on `")]` rather than on the item.
+///
+/// What it does not read is a `']'` *character* literal, because telling one from the
+/// lifetime in `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. An
+/// attribute holding one would leave the item unclassified, which is the direction that
+/// under-reports; it is stated here rather than left to be discovered.
 pub(crate) fn without_leading_attributes(line: &str) -> &str {
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix("#[") {
         let mut depth = 1_u32;
+        let mut quoted = false;
+        let mut escaped = false;
         let mut end = None;
         for (index, character) in after.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
             match character {
-                '[' => depth = depth.saturating_add(1),
-                ']' => {
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                '[' if !quoted => depth = depth.saturating_add(1),
+                ']' if !quoted => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         end = Some(index.saturating_add(1));

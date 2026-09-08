@@ -4386,7 +4386,15 @@ fn integrity_generic_functions(code: &str) -> Vec<String> {
             continue;
         }
         if joining.is_none() {
-            let is_impl = trimmed.starts_with("impl");
+            // Leading attributes set aside for `future_implementors`'s reason, and this is
+            // the sharper of the two: an `impl` header the scan does not join registers no
+            // depth, so every method inside a generic `impl` block goes unfound and is
+            // pinned by no row of `SEALING_FUNCTIONS`. Codex round 4's class, third
+            // instance. `struct_literal_positions`'s `starts_with("impl")` is the fourth
+            // and is left alone: blinding it reports a declaration as a construction, so
+            // it over-reports rather than going quiet.
+            let bare = crate::size::without_leading_attributes(trimmed);
+            let is_impl = bare.starts_with("impl");
             if is_impl || trimmed.contains("fn ") {
                 joining = Some((String::new(), is_impl));
             }
@@ -5734,7 +5742,12 @@ fn check_facade_futures(
 fn future_implementors(code: &str) -> Vec<String> {
     let mut found = Vec::new();
     for line in code.lines() {
-        let trimmed = line.trim();
+        // Leading attributes first, for the reason every other classifier here sets them
+        // aside: `#[rustfmt::skip] impl Future for SignalFuture { .. }` is one line that
+        // `cargo fmt` preserves, and this was the third reader still reading past it. The
+        // `fn poll` count is `ctx.rs`'s alone, so a fifth future declared anywhere else in
+        // the crate rested on this scan. Codex round 4.
+        let trimmed = crate::size::without_leading_attributes(line.trim());
         if !trimmed.starts_with("impl") {
             continue;
         }
@@ -8574,6 +8587,24 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_bracket_inside_an_attributes_string_is_not_the_end_of_the_attribute() {
+        // Codex round 4, and the finding is against round 3's own fix rather than against
+        // the reader it replaced: matching brackets counted every `]` as syntax, so
+        // `reason = "]"` ended the attribute early and left the classifier standing on
+        // `")]` rather than on the item. `#[expect(..)]` needs a reason under this
+        // workspace's lints, so the string is the ordinary form and not a contrivance.
+        let quoted =
+            "#[expect(lint, reason = \"]\")] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(quoted).contains(&"raw".to_owned()), "{quoted}");
+        // An escaped quote inside the reason, so the scan cannot simply toggle on `\"`.
+        let escaped = "#[expect(lint, reason = \"a \\\"]\\\" here\")] pub fn raw() {}\n";
+        assert!(counted(escaped).contains(&"raw".to_owned()), "{escaped}");
+        // And the direction that under-reports rather than over-reports: an attribute the
+        // scan cannot finish leaves the item unclassified, never counted as public.
+        assert!(!counted("#[expect(lint, reason = \"open").contains(&"raw".to_owned()));
+    }
+
+    #[test]
     fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
         // The reader beside `public_functions` had the same blindness, and it is what
         // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
@@ -8715,6 +8746,28 @@ mod deferred_answer_pins {
             details.iter().any(|detail| detail.contains("SignalFuture")),
             "{details:?}"
         );
+    }
+
+    #[test]
+    fn a_fifth_future_behind_a_leading_attribute_is_reported() {
+        // Codex round 4. The set scan tested `starts_with("impl")` on the raw line while
+        // every classifier beside it stripped attributes first, so the one spelling
+        // `cargo fmt` preserves walked past the only reader that looks outside `ctx.rs`.
+        for mutation in [
+            "#[rustfmt::skip] impl core::future::Future for SignalFuture {}",
+            "#[cfg(all(a, b))] #[rustfmt::skip] impl core::future::Future for SignalFuture {}",
+            "#[expect(lint, reason = \"]\")] impl core::future::Future for SignalFuture {}",
+        ] {
+            let module = format!(
+                "{}\npub struct SignalFuture;\n{mutation}\n",
+                tests_support::clean_ctx_journal()
+            );
+            let details = facade_details(CTX_JOURNAL_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains("SignalFuture")),
+                "{mutation}: {details:?}"
+            );
+        }
     }
 
     #[test]
@@ -10169,7 +10222,7 @@ mod deferred_answer_pins {
     }
 
     #[test]
-    fn the_generic_scan_sees_the_three_shapes_that_once_escaped_it() {
+    fn the_generic_scan_sees_the_shapes_that_once_escaped_it() {
         // Each of these reached a seal through the check and passed the whole gate, because
         // the scan read one line at a time. A `where` clause puts the bound on a line with no
         // `fn`; a method in a generic `impl` block has a `fn` on a line with no bound; and a
@@ -10178,8 +10231,17 @@ mod deferred_answer_pins {
             "fn shadow_where<C>(bytes: &[u8]) -> u16\nwhere\n    C: IntegrityCheck,\n{\n    0\n}\n",
             "impl<'a, C: IntegrityCheck> Scan<'a, C> {\n    fn shadow_method(&self) -> u16 {\n        0\n    }\n}\n",
             "fn shadow_wrapped<\n    C: IntegrityCheck,\n>(bytes: &[u8]) -> u16 {\n    0\n}\n",
+            // Codex round 4's class, met a third time. An attribute in front of the header
+            // left it unjoined, so the block registered no depth and `shadow_behind` — a
+            // method whose own signature never names `C` — was found by nothing.
+            "#[rustfmt::skip] impl<C: IntegrityCheck> Scan<C> {\n    fn shadow_behind(&self) -> u16 {\n        0\n    }\n}\n",
         ];
-        let expected = ["shadow_where", "shadow_method", "shadow_wrapped"];
+        let expected = [
+            "shadow_where",
+            "shadow_method",
+            "shadow_wrapped",
+            "shadow_behind",
+        ];
         for (shape, name) in shapes.iter().zip(expected) {
             let found = integrity_generic_functions(shape);
             assert!(
