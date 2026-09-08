@@ -141,6 +141,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher: self.dispatcher,
             out: self.out,
             payload: &mut self.payload,
+            concluded: &self.conclusion,
             kind,
             input,
             stage: Stage::Scheduling,
@@ -159,6 +160,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub const fn timer(&mut self, spec: TimerSpec) -> TimerFuture<'_, J> {
         TimerFuture {
             journal: self.journal,
+            concluded: &self.conclusion,
             spec,
             ended: false,
         }
@@ -172,6 +174,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub const fn continue_as_new<'b>(&'b mut self, input: &'b [u8]) -> ContinueFuture<'b, J> {
         ContinueFuture {
             journal: self.journal,
+            concluded: &self.conclusion,
             input,
             asked: false,
         }
@@ -182,6 +185,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     /// It writes no record. The terminal record is the journal's, and the caller that drove
     /// the boot reads [`conclusion`](Self::conclusion) and writes it. That is what keeps
     /// on-media authority out of this crate.
+    ///
+    /// The returned future never resolves: the run is over, so nothing after it runs.
     #[must_use]
     pub fn complete<'b, E>(&'b mut self, result: &'b [u8]) -> TerminalFuture<'b, E> {
         self.ending(result, false)
@@ -247,6 +252,7 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'b mut D,
     out: &'b mut [u8],
     payload: &'b mut usize,
+    concluded: &'b Option<Ending>,
     kind: ActivityKind,
     input: &'b [u8],
     stage: Stage,
@@ -282,6 +288,13 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 
     fn poll(self: Pin<&mut Self>, task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        // A run that has recorded its ending has no boundaries left. `TerminalFuture` never
+        // resolves, so an `async fn` stops there on its own; this is the same statement for
+        // a caller that reaches a boundary without going through `.await`, and it is what
+        // stops the recorded ending — which points into `out` — being overwritten.
+        if me.concluded.is_some() {
+            return Poll::Pending;
+        }
         loop {
             match me.stage {
                 // A boundary that is over answers nothing more. The run stops here, and it
@@ -335,6 +348,7 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 #[derive(Debug)]
 pub struct TimerFuture<'b, J: Journal> {
     journal: &'b mut J,
+    concluded: &'b Option<Ending>,
     spec: TimerSpec,
     ended: bool,
 }
@@ -344,7 +358,7 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if me.ended {
+        if me.ended || me.concluded.is_some() {
             return Poll::Pending;
         }
         // The deadline is asked again on every poll until it passes. Ending here would make
@@ -367,6 +381,7 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 #[derive(Debug)]
 pub struct ContinueFuture<'b, J: Journal> {
     journal: &'b mut J,
+    concluded: &'b Option<Ending>,
     input: &'b [u8],
     asked: bool,
 }
@@ -376,7 +391,7 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if !me.asked {
+        if !me.asked && me.concluded.is_none() {
             me.asked = true;
             let Halted = me.journal.continue_as_new(me.input);
         }
@@ -387,7 +402,17 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 /// The run's own ending, recorded for the caller that drove the boot.
 ///
 /// `E` is the workflow's error type, so that `ctx.complete(&[]).await` is the tail of a
-/// function returning `Result<(), E>`. This future never produces one.
+/// function returning `Result<(), E>`. This future never produces one, and never resolves:
+/// the run that asked is over, exactly as it is for [`ContinueFuture`].
+///
+/// # Why it does not resolve
+///
+/// The recorded ending points into the caller's buffer, and that buffer is where the next
+/// boundary writes. A future that resolved would let a workflow record its ending and then
+/// perform an activity, and the run would be committed with the activity's bytes as its
+/// terminal payload. §08 has no edge from a terminal record to another boundary either, so
+/// stopping here is the protocol rather than a guard over it. Codex round 2 found the
+/// version that resolved.
 #[derive(Debug)]
 pub struct TerminalFuture<'b, E> {
     out: &'b mut [u8],
@@ -416,6 +441,9 @@ impl<E> Future for TerminalFuture<'_, E> {
                 Ending::Completed(copy(me.bytes, me.out))
             });
         }
-        Poll::Ready(Ok(()))
+        // The run is over. Nothing after this runs, so nothing can overwrite the buffer the
+        // ending points into. The caller that drove the boot reads
+        // [`Ctx::conclusion`](Ctx::conclusion), which is why this needs no value.
+        Poll::Pending
     }
 }

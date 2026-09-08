@@ -476,7 +476,8 @@ fn a_terminal_call_records_no_record_and_leaves_the_conclusion_for_the_caller() 
 
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"done"));
 
-    assert_eq!(ended, Poll::Ready(Ok(())));
+    // The run is over, so the future never resolves. What it ended with is the conclusion.
+    assert_eq!(ended, Poll::Pending);
     assert_eq!(
         ctx.conclusion(),
         Some(Conclusion::Ended(Outcome::Completed(b"done")))
@@ -493,7 +494,7 @@ fn a_failing_run_ends_with_a_failure_payload() {
 
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"bad"));
 
-    assert_eq!(ended, Poll::Ready(Ok(())));
+    assert_eq!(ended, Poll::Pending);
     assert_eq!(
         ctx.conclusion(),
         Some(Conclusion::Ended(Outcome::Failed(b"bad")))
@@ -526,7 +527,7 @@ fn a_terminal_payload_wider_than_the_buffer_is_refused_rather_than_truncated() {
 
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"too long"));
 
-    assert_eq!(ended, Poll::Ready(Ok(())));
+    assert_eq!(ended, Poll::Pending);
     assert_eq!(ctx.conclusion(), Some(Conclusion::Refused));
 }
 
@@ -541,7 +542,7 @@ fn a_refused_failure_is_not_read_back_as_a_completion() {
 
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"the image did not verify"));
 
-    assert_eq!(ended, Poll::Ready(Ok(())));
+    assert_eq!(ended, Poll::Pending);
     assert_eq!(ctx.conclusion(), Some(Conclusion::Refused));
     assert_ne!(
         ctx.conclusion(),
@@ -682,4 +683,59 @@ fn a_halt_registers_no_waker_at_all() {
     assert_eq!(answered, Poll::Pending);
     assert!(world.kept.is_none(), "the world was never asked");
     assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_boundary_after_a_terminal_call_cannot_rewrite_what_the_run_ended_with() {
+    // Codex round 2. The recorded ending points into the caller's buffer, and that buffer
+    // is where the next boundary writes — so a terminal future that *resolved* let a
+    // workflow record its ending and then perform an activity, and the run was committed
+    // with the activity's bytes as its terminal payload. §08 has no edge from a terminal
+    // record to another boundary either, so the future never resolving is the protocol
+    // rather than a guard over it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(Handoff::Replayed(Outcome::Completed(
+        b"\x63\x63\x63\x63",
+    )))]);
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"done"));
+    let _after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Completed(b"done")))
+    );
+}
+
+#[test]
+fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
+    // The other half of the guard above, measured rather than implied: the boundary is not
+    // merely harmless after an ending, it does not happen. A journal call would be a record
+    // after a terminal one, which §08 refuses anyway.
+    let spec = TimerSpec::AfterBoot { ticks: 1 };
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(dispatch(0))])
+        .waiting(vec![Ok(())]);
+    let mut world = World::answering(vec![Ok(b"\x01\x00\x00\x00".to_vec())]);
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"bad"));
+    let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let waited = poll_once(ctx.timer(spec));
+    let restarted = poll_once(ctx.continue_as_new(b"next"));
+
+    assert_eq!(after, Poll::Pending);
+    assert_eq!(waited, Poll::Pending);
+    assert!(restarted.is_pending());
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Failed(b"bad")))
+    );
+    // The `Ctx` borrow ends here, so the two counters below can be read.
+    let _ = ctx;
+    assert_eq!(world.polls, 0, "the world was never asked");
+    assert!(ledger.asked.is_empty(), "the journal was never asked");
 }

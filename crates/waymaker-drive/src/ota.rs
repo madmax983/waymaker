@@ -170,6 +170,10 @@ where
 /// next boundary within the same poll, so one poll carries the run as far as it goes. A
 /// dispatcher that answers [`Poll::Pending`] ends the boot, exactly as
 /// [`Performed::Pending`](crate::Performed) does on the synchronous path.
+///
+/// A run that *finished* is `Poll::Pending` too, because `ctx.complete(..)` never resolves.
+/// What the run ended with is [`Ctx::conclusion`](waymaker_embassy::Ctx::conclusion), and
+/// this reads it whatever the poll said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ota<D> {
     dispatcher: D,
@@ -226,24 +230,28 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
                 let mut future = pin!(ota_update(&mut ctx, OtaInput::at(URL)));
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
-            match (polled, ctx.conclusion()) {
-                // The run did not reach its end in this boot — either the workflow
-                // suspended, or it asked to end with a payload wider than the buffer. The
-                // second must not be recorded as ending with something *else*, so this boot
-                // writes no terminal record either way and the caller sees a run that did
-                // not conclude. `Refused` is unreachable here: `OUT_BYTES` is the wider of
-                // the run's two bounds.
-                (Poll::Pending, _) | (Poll::Ready(_), Some(Conclusion::Refused)) => None,
-                (Poll::Ready(_), Some(Conclusion::Ended(Outcome::Completed(bytes)))) => {
+            // The recorded ending outranks what the poll said, because `TerminalFuture`
+            // never resolves: a workflow that ended is a future that is `Pending` for ever,
+            // which is what stops a later boundary overwriting the buffer the ending points
+            // into.
+            match (ctx.conclusion(), polled) {
+                (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => {
                     Some(Ended::Completed(bytes.len()))
                 }
-                (Poll::Ready(_), Some(Conclusion::Ended(Outcome::Failed(bytes)))) => {
+                (Some(Conclusion::Ended(Outcome::Failed(bytes))), _) => {
                     Some(Ended::Failed(bytes.len()))
                 }
-                // The workflow returned without recording an ending. Its own `Result` is
-                // then what the run ended with.
-                (Poll::Ready(Ok(())), None) => Some(Ended::Completed(0)),
-                (Poll::Ready(Err(_)), None) => Some(Ended::Failed(0)),
+                // Two runs that did not conclude in this boot. `Refused` is a workflow
+                // that asked to end with a payload wider than the buffer: it must not be
+                // recorded as ending with something *else*, so no terminal record is
+                // written, and it is unreachable here because `OUT_BYTES` is the wider of
+                // the run's two bounds. `Pending` with no ending is a workflow that
+                // suspended.
+                (Some(Conclusion::Refused), _) | (None, Poll::Pending) => None,
+                // The workflow returned without recording an ending, so its own `Result` is
+                // what the run ended with.
+                (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),
+                (None, Poll::Ready(Err(_))) => Some(Ended::Failed(0)),
             }
         };
         let Some(ended) = ended else {

@@ -107,6 +107,19 @@ is an `EffectCompleted` — which §09 gives `EffectFailed` and this signature d
 #36's is to close. Neither is a retry *policy*: §16's `retry-policy-placement` stays open,
 and nothing here counts attempts or waits.
 
+**A run that ended has no boundaries left.** `TerminalFuture` never resolves, so an
+`async fn` that calls `ctx.complete(..)` stops there; and every other future refuses once a
+conclusion is recorded, so a caller that reaches a boundary without going through `.await`
+does not overwrite the buffer the ending points into. Codex round 2 found the version that
+resolved: a workflow could record its ending and then perform an activity, and the run was
+committed with the activity's bytes as its terminal payload — permanently, on media. §08
+has no edge from a terminal record to another boundary either, so stopping is the protocol
+rather than a guard over it.
+
+The cost is that the caller reads `Ctx::conclusion` whatever the poll said: a finished run
+and a suspended one are both `Poll::Pending`, and the recorded ending is what tells them
+apart.
+
 **The terminal payload has a third answer.** `Ctx::conclusion()` returns
 `Conclusion::Refused` for a payload wider than the caller's buffer, rather than the `None`
 that also means "the run has not ended". Review of the first commit found that a caller

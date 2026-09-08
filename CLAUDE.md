@@ -1181,6 +1181,12 @@ Stated so that nobody mistakes silence for coverage:
   compiles the façade crate; what it proves is that no *source* outside `facade.rs` and
   `ota.rs` needs it. Making the dependency optional would take the façade out of the lint,
   test, docs and coverage stages, which all pass `--no-default-features`.
+- **That a workflow stops at its own ending, for a caller that is not an `async fn`.**
+  `TerminalFuture` never resolves and every other future refuses once a conclusion is
+  recorded, which is two mechanisms for one rule: a run that ended has no boundaries left.
+  Both are `crates/waymaker-embassy/tests/ctx.rs`'s. What neither can stop is a caller that
+  never asks — nothing obliges anybody to read `Ctx::conclusion` at all, and a caller that
+  ignored it would report a run that did not end.
 - **That the façade's journal is the driver below it.** `ctx-facade` pins two files in
   `waymaker-embassy` and six in `waymaker-drive`. It says the façade declares no authority
   and that the driver names no façade type; it cannot say that a given `Journal`
