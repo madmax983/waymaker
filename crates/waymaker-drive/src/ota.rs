@@ -34,6 +34,7 @@ use core::task::{Context as Task, Poll, Waker};
 use waymaker_core::EffectId;
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
+use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
 use waymaker_flash::capacity::Bounds;
 
@@ -289,14 +290,16 @@ impl ActivityDispatcher for Downloader {
         kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
-    ) -> Poll<Result<usize, Offline>> {
+    ) -> Poll<Result<Produced, Offline>> {
         let answer: &[u8] = if kind == DOWNLOAD { HANDLE } else { b"ok" };
         let taken = answer.len().min(out.len());
         let (Some(from), Some(into)) = (answer.get(..taken), out.get_mut(..taken)) else {
-            return Poll::Ready(Ok(answer.len()));
+            return Poll::Ready(Ok(Produced::Completed(answer.len())));
         };
         into.copy_from_slice(from);
-        Poll::Ready(Ok(answer.len()))
+        // The answer's whole length, which is what the trait asks for even when it is wider
+        // than `out`.
+        Poll::Ready(Ok(Produced::Completed(answer.len())))
     }
 }
 

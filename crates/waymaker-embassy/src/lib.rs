@@ -18,6 +18,8 @@
 //!   its futures: an activity, a deadline, a new run, and the run's own ending.
 //! * [`journal`] — the durable half [`Ctx`] asks. An implementor owns the media.
 //! * [`dispatch`] — the world's half: what performs design document §07 step 4.
+//! * [`wiring`] — issue [#36](https://github.com/madmax983/waymaker/issues/36)'s table: a
+//!   row per activity, selected by its number, named for a log.
 //! * [`decode`] — how a workflow reads recorded bytes. It names no codec.
 //! * [`clock`] — design document §11's `PersistentClock` capability. It is here rather
 //!   than in the kernel because the kernel's must-not-own cell names a clock, and
@@ -32,12 +34,12 @@
 //!
 //! # Status
 //!
-//! Rung 0.4's first item is here. Still owed: the dispatcher's ergonomic wrapper (issue
-//! [#36](https://github.com/madmax983/waymaker/issues/36)), the optional codec helpers
-//! (issue [#37](https://github.com/madmax983/waymaker/issues/37)), the provisioning example
-//! (issue [#38](https://github.com/madmax983/waymaker/issues/38)), in-boot sleep, and the
-//! budgets this rung exits on (issue
-//! [#39](https://github.com/madmax983/waymaker/issues/39)).
+//! Rung 0.4's first two items are here. Still owed: the optional codec helpers (issue
+//! [#37](https://github.com/madmax983/waymaker/issues/37)), the provisioning example (issue
+//! [#38](https://github.com/madmax983/waymaker/issues/38)), in-boot sleep and the
+//! `continue_as_new` join (issue
+//! [#110](https://github.com/madmax983/waymaker/issues/110)), and the budgets this rung
+//! exits on (issue [#39](https://github.com/madmax983/waymaker/issues/39)).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -48,9 +50,11 @@ pub mod ctx;
 pub mod decode;
 pub mod dispatch;
 pub mod journal;
+pub mod wiring;
 
 pub use clock::{ClockError, PersistentClock, PersistentTimer};
 pub use ctx::{ActivityFuture, ContinueFuture, Ctx, Failure, TerminalFuture, TimerFuture};
 pub use decode::Decode;
-pub use dispatch::ActivityDispatcher;
+pub use dispatch::{ActivityDispatcher, Produced};
 pub use journal::{Answer, Halted, Handoff, Journal};
+pub use wiring::{Activity, Perform, Table, Unhandled};

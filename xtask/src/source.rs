@@ -5514,6 +5514,288 @@ pub fn check_ctx_facade(
     violations
 }
 
+/// The dispatcher trait's own module, whose public surface `dispatch-wiring` pins.
+pub const DISPATCH_PATH: &str = "waymaker-embassy/src/dispatch.rs";
+
+/// The dispatch table's module, whose public surface `dispatch-wiring` pins.
+pub const WIRING_PATH: &str = "waymaker-embassy/src/wiring.rs";
+
+/// Every public function the dispatcher trait declares.
+///
+/// One. Design document §13's dispatcher performs §07 step 4 and answers; a second method
+/// is a second thing the façade would have to sequence.
+pub const DISPATCH_SURFACE: &[&str] = &["poll_dispatch"];
+
+/// Every public function the dispatch wiring declares.
+///
+/// Two constructors, two accessors on a row, two on the world, one name lookup, and the
+/// trait method. Issue [#36](https://github.com/madmax983/waymaker/issues/36) names two
+/// non-goals — no dynamic workflow loading, no string-addressed activity registry — and
+/// both are reached by *adding* a name here: a `by_name`, a `register`, an `insert`, a
+/// `load`. None breaks a layering rule, and a run through any of them still completes.
+pub const WIRING_SURFACE: &[&str] = &[
+    "kind",
+    "name",
+    "name_of",
+    "new",
+    "over",
+    "poll_dispatch",
+    "world",
+    "world_mut",
+];
+
+/// The wiring's types, and the methods each declares at *every* visibility.
+///
+/// A surface pin counts `pub ` and not `pub(`, which is the defeat `timer-capability`,
+/// `effect-protocol` and `ctx-facade` each record. `waymaker-embassy` is one crate, so a
+/// `pub(crate) fn by_name` here is reachable from `ctx.rs`.
+pub const WIRING_TYPE_METHODS: &[(&str, &[&str])] = &[
+    ("Activity", &["kind", "name", "new"]),
+    ("Table", &["name_of", "over", "row", "world", "world_mut"]),
+];
+
+/// The bodies that select a row.
+///
+/// `poll_dispatch` is a *trait* method, so `inherent_impl_bodies` cannot see it and the
+/// file is read instead — with the count checked first, because `braced_body` takes the
+/// first match and a decoy above the real one is what a first-match scan reads.
+pub const WIRING_SELECTION_BODIES: &[&str] = &["poll_dispatch", "row"];
+
+/// What a selection body may not name, and why.
+pub const WIRING_SELECTION_FORBIDDEN: &[(&str, &str)] = &[(
+    "name",
+    "is a row's compile-time label, and a dispatch path that read one would be the \
+     string-addressed activity registry issue #36 names as an explicit non-goal",
+)];
+
+/// Rule: an activity is reached by its number, and its name is only ever metadata.
+///
+/// Issue [#36](https://github.com/madmax983/waymaker/issues/36) states two work items as
+/// absences. "Numeric `ActivityKind` on the dispatch path. Activity names are compile-time
+/// metadata for logs and diagnostics and are never stored in records", and "no dynamic
+/// workflow loading and no string-addressed activity registry — that is an explicit
+/// non-goal". Neither is a thing a test can fail on: a `Table::by_name` would break no
+/// layering rule, need no dependency, and pass every test in the workspace, because every
+/// run still completes.
+///
+/// So this pins three things.
+///
+/// The **surfaces** of both modules, in both directions. A second trait method, or a ninth
+/// function on the wiring, is a reviewer's decision rather than a commit.
+///
+/// The **methods** of `Activity` and `Table`, at every visibility, and no public field on
+/// either. A `pub rows` field is a table any caller can rebuild at run time, which is the
+/// dynamic-loading non-goal reached without adding a function.
+///
+/// And the **selection bodies**: the two places a row is chosen may not name a row's
+/// label. Without it, a lookup that fell back to a name would satisfy both pins above.
+///
+/// # What it cannot see
+///
+/// A function added from a sibling module — it pins two files, exactly as
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
+/// pin, and a `trait TableExt` with a blanket impl is the shape. And it compares *names*:
+/// that a name never reaches media is `crates/waymaker-drive/tests/dispatch.rs`, which
+/// reads the device image back, and §09's `EffectScheduled` is what makes it true.
+#[must_use]
+pub fn check_dispatch_wiring(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "dispatch-wiring";
+    const FACADE: &str = "waymaker-embassy";
+
+    let mut violations = Vec::new();
+    for (path, pinned) in [
+        (DISPATCH_PATH, DISPATCH_SURFACE),
+        (WIRING_PATH, WIRING_SURFACE),
+    ] {
+        violations.extend(check_dispatch_surface(RULE, FACADE, path, pinned, sources));
+    }
+
+    let Some(source) = find_source(sources, WIRING_PATH) else {
+        return violations;
+    };
+    let code = without_test_modules(&code_only(&source.contents));
+    violations.extend(check_wiring_types(RULE, FACADE, &code));
+    violations.extend(check_wiring_selection(RULE, FACADE, &code));
+    violations
+}
+
+/// One module declares exactly the public functions its pin lists.
+fn check_dispatch_surface(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    pinned: &[&str],
+    sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    let Some(source) = find_source(sources, path) else {
+        return vec![Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "no {path} in the workspace, so the pinned surface is checking nothing; \
+                 issue #36's dispatch path is a number and never a name"
+            ),
+        )];
+    };
+
+    let mut declarations: Vec<String> =
+        crate::size::public_functions(core::slice::from_ref(source))
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+    declarations.sort_unstable();
+
+    let mut violations = Vec::new();
+    for (index, name) in declarations.iter().enumerate() {
+        if declarations.get(index.wrapping_add(1)) == Some(name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}` more than once, so the pin can no longer speak \
+                     about it; give the second one a name of its own"
+                ),
+            ));
+        }
+    }
+    for name in &declarations {
+        if !pinned.contains(&name.as_str()) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{path} declares `{name}`, which the pinned surface does not list: a way \
+                     to reach an activity that is not its number is issue #36's explicit \
+                     non-goal"
+                ),
+            ));
+        }
+    }
+    for name in pinned {
+        if !declarations.iter().any(|declared| declared == name) {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{path} no longer declares `{name}`, which the pinned surface lists"),
+            ));
+        }
+    }
+    violations
+}
+
+/// `Activity` and `Table` declare their pinned methods, at every visibility, and no public
+/// field.
+fn check_wiring_types(rule: &'static str, subject: &str, code: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (type_name, methods) in WIRING_TYPE_METHODS {
+        let blocks = inherent_impl_bodies(code, type_name);
+        if blocks.is_empty() {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{WIRING_PATH} declares no inherent `impl` for `{type_name}`, so its \
+                     methods are pinned against nothing"
+                ),
+            ));
+            continue;
+        }
+        let declared = declared_function_names(&blocks.join("\n"));
+        let mut expected: Vec<String> = methods.iter().map(|name| (*name).to_owned()).collect();
+        expected.sort();
+        if declared != expected {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "`{type_name}` declares {declared:?} rather than {expected:?}: read at \
+                     every visibility, because a surface pin counts `pub ` and not `pub(`, \
+                     and the crate that would call a `pub(crate)` lookup is this one"
+                ),
+            ));
+        }
+        let Some(body) = braced_body(code, &format!("struct {type_name}")) else {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{WIRING_PATH} declares no braced `struct {type_name}`"),
+            ));
+            continue;
+        };
+        for field in body
+            .lines()
+            .map(str::trim)
+            .filter(|line| crate::size::without_leading_attributes(line).starts_with("pub"))
+        {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "`{type_name}` declares the public field `{field}`: a caller that can \
+                     write the rows can build a table at run time, which is issue #36's \
+                     dynamic-loading non-goal reached without adding a function"
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// A row is chosen by its number, and never by its label.
+fn check_wiring_selection(rule: &'static str, subject: &str, code: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for body_name in WIRING_SELECTION_BODIES {
+        let header = format!("fn {body_name}");
+        if count_declarations(code, &header) != 1 {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{WIRING_PATH} declares `fn {body_name}` other than exactly once, so the \
+                     selection pin reads whichever comes first"
+                ),
+            ));
+            continue;
+        }
+        let Some(body) = braced_body(code, &header) else {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!("{WIRING_PATH} declares no `fn {body_name}` body to pin"),
+            ));
+            continue;
+        };
+        for (forbidden, why) in WIRING_SELECTION_FORBIDDEN {
+            if names_identifier(body, forbidden) {
+                violations.push(Violation::new(
+                    rule,
+                    subject.to_owned(),
+                    format!("`{body_name}` names `{forbidden}`, which {why}"),
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// How many times `header` is declared at a token boundary.
+fn count_declarations(code: &str, header: &str) -> usize {
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+    code.match_indices(header)
+        .filter(|(index, _)| {
+            let before = code
+                .get(..*index)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|character| !continues(character));
+            let after = code
+                .get(index.wrapping_add(header.len())..)
+                .and_then(|rest| rest.chars().next())
+                .is_none_or(|character| !continues(character));
+            before && after
+        })
+        .count()
+}
+
 /// Every `waymaker-drive` module but the three that hold the façade edge names no façade.
 ///
 /// Discovered from the sources rather than listed, so a module added tomorrow is covered.
@@ -5774,6 +6056,9 @@ fn future_implementors(code: &str) -> Vec<String> {
 /// that means in a `no_std` crate with no allocator: one device, two runs, one buffer.
 /// `const` is not global state — it has no address a caller can observe — so only `static`
 /// is refused.
+/// The `'static` lifetime, which [`check_no_hidden_state`] is not about.
+const LIFETIME: &str = "'static";
+
 fn check_no_hidden_state(
     rule: &'static str,
     subject: &str,
@@ -5784,7 +6069,15 @@ fn check_no_hidden_state(
         // The `static` keyword as a *token*, anywhere on the line. Reading the start of the
         // line after one `pub` prefix let `#[allow(dead_code)] static SHARED: [u8; 8] = ..`
         // through, and it survives `cargo fmt`. Review of this change landed exactly that.
-        .filter(|line| names_identifier(line, "static"))
+        //
+        // The `'static` *lifetime* is set aside first, because this rule is about a `static`
+        // item and a lifetime is not one. `&'static str` is what compile-time metadata is
+        // spelled as — issue #36's activity names — and refusing it would push a name into a
+        // borrow the table cannot outlive, for no gain. An item is `static NAME:`, never
+        // `'static`, so dropping the apostrophe form loses nothing the rule was written for.
+        .map(|line| (line, line.replace(LIFETIME, "")))
+        .filter(|(_, without_lifetimes)| names_identifier(without_lifetimes, "static"))
+        .map(|(line, _)| line)
         .map(|line| {
             Violation::new(
                 rule,
@@ -8404,6 +8697,184 @@ mod deferred_answer_pins {
         .collect()
     }
 
+    /// The two wiring files `dispatch-wiring` reads, with one of them replaced.
+    fn wiring_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        [
+            (DISPATCH_PATH, tests_support::clean_dispatch_module()),
+            (WIRING_PATH, tests_support::clean_wiring_module()),
+        ]
+        .into_iter()
+        .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+        .collect()
+    }
+
+    /// Every violation the rule emits when the wiring file `path` holds `contents`.
+    fn wiring_details(path: &str, contents: &str) -> Vec<String> {
+        check_dispatch_wiring(&wiring_sources(path, contents))
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect()
+    }
+
+    #[test]
+    fn the_clean_wiring_is_accepted() {
+        assert!(check_dispatch_wiring(&wiring_sources("", "")).is_empty());
+    }
+
+    #[test]
+    fn a_missing_wiring_module_is_reported() {
+        // A pin whose file is gone is a pin checking nothing, which is the failure mode
+        // every surface rule here fails closed on.
+        for path in [DISPATCH_PATH, WIRING_PATH] {
+            let sources: Vec<crate::size::LayerSource> = wiring_sources("", "")
+                .into_iter()
+                .filter(|source| !source.path.ends_with(path))
+                .collect();
+            let details: Vec<String> = check_dispatch_wiring(&sources)
+                .into_iter()
+                .map(|violation| violation.detail)
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("checking nothing")),
+                "{path}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookup_by_name_is_reported() {
+        // Issue #36's string-addressed activity registry, as the addition it would be.
+        let module = format!(
+            "{}\npub fn by_name(label: &str) -> usize {{ label.len() }}\n",
+            tests_support::clean_wiring_module()
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("`by_name`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_trait_method_is_reported() {
+        let module = format!(
+            "{}\npub fn poll_cancel() {{}}\n",
+            tests_support::clean_dispatch_module()
+        );
+        let details = wiring_details(DISPATCH_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("`poll_cancel`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_function_that_went_away_is_reported() {
+        let details = wiring_details(DISPATCH_PATH, "//! Nothing here.\n");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no longer declares")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_function_declared_twice_is_reported() {
+        // A pin that is a list of names cannot speak about a name declared twice.
+        let module = format!(
+            "{}\npub fn name_of() {{}}\n",
+            tests_support::clean_wiring_module()
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("more than once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_private_lookup_is_reported() {
+        // The defeat `timer-capability`, `effect-protocol` and `ctx-facade` each record: a
+        // surface pin counts `pub ` and not `pub(`, and this crate is the one that would
+        // call the escape hatch.
+        let module = tests_support::clean_wiring_module().replace(
+            "impl Table {",
+            "impl Table {\n    pub(crate) fn by_name(&self) {}",
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("by_name")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_public_row_field_is_reported() {
+        // A caller that can write the rows can build a table at run time, which is issue
+        // #36's dynamic-loading non-goal reached without adding a function.
+        let module = tests_support::clean_wiring_module().replace(
+            "pub struct Table {\n    kind: u16,\n}",
+            "pub struct Table {\n    pub rows: u16,\n    kind: u16,\n}",
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("public field")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_body_that_reads_a_label_is_reported() {
+        let module = tests_support::clean_wiring_module().replace(
+            "fn row(&self) { let _ = self.kind; }",
+            "fn row(&self) { let _ = self.name; }",
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("`row` names `name`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_selection_body_is_reported() {
+        // `braced_body` takes the first match, so a decoy above the real one is what a
+        // first-match scan reads. `effect-protocol` records the same defeat.
+        let module = format!(
+            "//! A decoy.\nfn row() {{ let _ = 1; }}\n{}",
+            tests_support::clean_wiring_module()
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("other than exactly once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_wiring_type_that_lost_its_impl_is_reported() {
+        let module =
+            tests_support::clean_wiring_module().replace("impl Activity {", "impl Other {");
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no inherent `impl` for `Activity`")),
+            "{details:?}"
+        );
+    }
+
     /// Every violation the rule emits when the driver file `path` holds `contents`.
     fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
@@ -8454,6 +8925,43 @@ mod deferred_answer_pins {
                 "{declaration}: {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_static_lifetime_is_not_hidden_state() {
+        // Issue #36's activity names are `&'static str`, which is what compile-time metadata
+        // is spelled as. The rule is about a `static` *item*, and an item is `static NAME:`.
+        for declaration in [
+            "pub const fn name(&self) -> &'static str { self.name }",
+            "    name: &'static str,",
+            "pub fn name_of(&self) -> Option<&'static str> { None }",
+        ] {
+            let module = format!("{}\n{declaration}\n", tests_support::clean_ctx_facade());
+            let details = facade_details(CTX_FACADE_PATH, &module);
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("hidden global state")),
+                "{declaration}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_item_beside_a_static_lifetime_is_still_reported() {
+        // The exemption removes the lifetime and nothing else, so a line holding both is
+        // still a line declaring an item.
+        let module = format!(
+            "{}\nstatic SHARED: &'static [u8; 8] = &[0; 8];\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("hidden global state")),
+            "{details:?}"
+        );
     }
 
     #[test]
@@ -11746,12 +12254,13 @@ pub mod tests_support {
         BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
         CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE,
         CTX_FUTURES, CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE,
-        DIGEST_FUNCTION, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
+        DIGEST_FUNCTION, DISPATCH_SURFACE, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
         INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
         SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
         SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
+        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, WIRING_SELECTION_BODIES,
+        WIRING_SURFACE, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -11876,6 +12385,42 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_ctx_journal() -> String {
         surface("The durable half.", CTX_JOURNAL_SURFACE)
+    }
+
+    /// A dispatcher module declaring exactly [`DISPATCH_SURFACE`].
+    #[must_use]
+    pub fn clean_dispatch_module() -> String {
+        surface("The world's half.", DISPATCH_SURFACE)
+    }
+
+    /// A wiring module declaring exactly [`WIRING_SURFACE`], with the two types
+    /// [`WIRING_TYPE_METHODS`] pins and selection bodies that name no label.
+    ///
+    /// Rendered from the pins rather than written out, for [`surface`]'s reason.
+    #[must_use]
+    pub fn clean_wiring_module() -> String {
+        let mut source = String::from("//! The dispatch wiring.\n");
+        for (type_name, methods) in WIRING_TYPE_METHODS {
+            let _ = writeln!(&mut source, "pub struct {type_name} {{\n    kind: u16,\n}}");
+            let _ = writeln!(&mut source, "impl {type_name} {{");
+            for method in *methods {
+                if WIRING_SELECTION_BODIES.contains(method) {
+                    let _ = writeln!(
+                        &mut source,
+                        "    fn {method}(&self) {{ let _ = self.kind; }}"
+                    );
+                } else {
+                    let _ = writeln!(&mut source, "    pub fn {method}(&self) {{}}");
+                }
+            }
+            let _ = writeln!(&mut source, "}}");
+        }
+        // The trait method, which lives in a trait `impl` rather than an inherent one.
+        let _ = writeln!(
+            &mut source,
+            "impl Dispatcher for Table {{\n    pub fn poll_dispatch(&self) {{ let _ = self.row(); }}\n}}"
+        );
+        source
     }
 
     /// A driver module that names no façade type.
@@ -12453,6 +12998,8 @@ mod tests {
             .chain(CLOCK_SURFACE)
             .chain(CTX_SURFACE)
             .chain(CTX_JOURNAL_SURFACE)
+            .chain(DISPATCH_SURFACE)
+            .chain(WIRING_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

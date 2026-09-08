@@ -44,7 +44,9 @@ impl Journal for Bridge<'_> {
             Ok(Handoff::Replayed(outcome)) => {
                 Ok(waymaker_embassy::journal::Handoff::Replayed(outcome))
             }
-            Ok(Handoff::Dispatch(id)) => Ok(waymaker_embassy::journal::Handoff::Dispatch(id)),
+            Ok(Handoff::Dispatch { id, result_bytes }) => {
+                Ok(waymaker_embassy::journal::Handoff::Dispatch { id, result_bytes })
+            }
             Err(_) => Err(Halted),
         }
     }

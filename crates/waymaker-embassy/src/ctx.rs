@@ -29,8 +29,8 @@
 //! boot is over: the caller that drove it looks at the journal next. A deadline that has
 //! not passed registers nothing because there is no in-boot sleep yet — [`Journal::wait`]
 //! is asked again on the next poll, and issue
-//! [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatcher is where a hardware
-//! alarm arrives.
+//! [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot sleep is where a
+//! hardware alarm arrives.
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -42,7 +42,7 @@ use waymaker_core::timer::TimerSpec;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 use crate::decode::Decode;
-use crate::dispatch::ActivityDispatcher;
+use crate::dispatch::{ActivityDispatcher, Produced};
 use crate::journal::{Answer, Halted, Handoff, Journal};
 
 /// Why an activity did not yield a value.
@@ -239,8 +239,14 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
 enum Stage {
     /// §07 steps 1 to 3 have not been asked for yet.
     Scheduling,
-    /// The intent is durable. Step 4 is legal, under this identity.
-    Dispatching(EffectId),
+    /// The intent is durable. Step 4 is legal, under this identity, for an answer no
+    /// wider than `result_bytes`.
+    Dispatching {
+        /// The identity the schedule record committed.
+        id: EffectId,
+        /// §10's `effect_result_bytes`, as the journal stated it.
+        result_bytes: usize,
+    },
     /// The boundary is over. A further poll asks nothing.
     Ended,
 }
@@ -283,6 +289,29 @@ fn observed<T: Decode>(
     }
 }
 
+/// What the journal is told, for a length the world reported against `room`.
+///
+/// A free function, for [`observed`]'s reason: it takes the buffer rather than `self`, so
+/// the journal borrow beside it stays disjoint.
+fn answered(produced: Produced, out: &[u8], room: usize) -> Answer<'_> {
+    let (len, completed) = match produced {
+        Produced::Completed(len) => (len, true),
+        Produced::Failed(len) => (len, false),
+    };
+    if len > room {
+        return Answer::Exhausted;
+    }
+    let Some(bytes) = out.get(..len) else {
+        // Unreachable: `room` is at most `out.len()`. Refused rather than panicked.
+        return Answer::Exhausted;
+    };
+    if completed {
+        Answer::Completed(bytes)
+    } else {
+        Answer::Failed(bytes)
+    }
+}
+
 impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_, T, D, J> {
     type Output = Result<T, Failure<T::Error>>;
 
@@ -310,28 +339,40 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         return Poll::Ready(observed(recorded, me.out, me.payload));
                     }
                     // The intent is durable. Only this value reaches the world.
-                    Ok(Handoff::Dispatch(id)) => me.stage = Stage::Dispatching(id),
+                    Ok(Handoff::Dispatch { id, result_bytes }) => {
+                        me.stage = Stage::Dispatching { id, result_bytes };
+                    }
                 },
-                Stage::Dispatching(id) => {
+                Stage::Dispatching { id, result_bytes } => {
+                    // The room, not the caller's whole buffer. `out` is the wider of the
+                    // run's two bounds, so a world handed all of it could write an answer
+                    // the run cannot record. Narrowing here is issue #36's "validated
+                    // against the bound" as an impossibility rather than a check — and it
+                    // is the smaller of the two figures, so a caller that undersized `out`
+                    // still cannot be written past.
+                    let room = result_bytes.min(me.out.len());
+                    let Some(into) = me.out.get_mut(..room) else {
+                        // Unreachable: `room` is at most `out.len()`. Refused rather than
+                        // panicked, because the workspace denies both.
+                        return Poll::Pending;
+                    };
                     let dispatched = me
                         .dispatcher
-                        .poll_dispatch(task, id, me.kind, me.input, me.out);
+                        .poll_dispatch(task, id, me.kind, me.input, into);
                     let answer = match dispatched {
                         // The world asked to be tried again. Nothing is recorded, so the
                         // effect stays outstanding under the identity it was committed with.
                         Poll::Pending => return Poll::Pending,
-                        // The activity failed. It is recorded as a failure with no payload,
-                        // so the run makes progress and every replay answers the same way.
-                        // The error value stops here: a workflow that branched on it would
-                        // branch on something no replay can reproduce.
+                        // The activity failed with nothing to record. It is recorded as a
+                        // failure with no payload, so the run makes progress and every
+                        // replay answers the same way. The error value stops here: a
+                        // workflow that branched on it would branch on something no replay
+                        // can reproduce.
                         Poll::Ready(Err(_dropped)) => Answer::Failed(&[]),
-                        // A length over the buffer is recorded as a failure with no
-                        // payload: a truncation replays a wrong answer for ever, and a
-                        // refusal strands the run.
-                        Poll::Ready(Ok(produced)) => me
-                            .out
-                            .get(..produced)
-                            .map_or(Answer::Exhausted, Answer::Completed),
+                        // A length over the bound is recorded as a failure with no payload:
+                        // a truncation replays a wrong answer for ever, and a refusal
+                        // strands the run. Both shapes are bounded by the same figure.
+                        Poll::Ready(Ok(produced)) => answered(produced, me.out, room),
                     };
                     me.stage = Stage::Ended;
                     return match me.journal.resolve(answer) {

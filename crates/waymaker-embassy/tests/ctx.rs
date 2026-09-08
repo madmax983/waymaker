@@ -17,6 +17,7 @@ use std::task::Wake;
 use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
+use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
 
 const RUN: RunId = RunId(9);
@@ -148,6 +149,12 @@ struct World {
     /// How many polls each answer waits for before it is given.
     stalls: usize,
     stalled: usize,
+    /// How wide the buffer was on each poll that reached an answer.
+    widths: Vec<usize>,
+    /// What to report instead of the answer's own length.
+    reports: Option<usize>,
+    /// Whether an answer is a failure payload rather than a result.
+    as_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,7 +168,22 @@ impl World {
             polls: 0,
             stalls: 0,
             stalled: 0,
+            widths: Vec::new(),
+            reports: None,
+            as_failure: false,
         }
+    }
+
+    /// Report `len` rather than the answer's own length.
+    const fn reporting(mut self, len: usize) -> Self {
+        self.reports = Some(len);
+        self
+    }
+
+    /// Answer with a failure payload rather than a result.
+    const fn failing(mut self) -> Self {
+        self.as_failure = true;
+        self
     }
 
     const fn silent() -> Self {
@@ -184,12 +206,13 @@ impl ActivityDispatcher for World {
         _kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
-    ) -> Poll<Result<usize, Fault>> {
+    ) -> Poll<Result<Produced, Fault>> {
         self.polls += 1;
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
         }
+        self.widths.push(out.len());
         let answer = self.answers.get(self.taken).cloned();
         self.taken += 1;
         match answer {
@@ -201,7 +224,12 @@ impl ActivityDispatcher for World {
                     return Poll::Ready(Err(Fault));
                 };
                 into.copy_from_slice(from);
-                Poll::Ready(Ok(bytes.len()))
+                let reported = self.reports.unwrap_or(bytes.len());
+                Poll::Ready(Ok(if self.as_failure {
+                    Produced::Failed(reported)
+                } else {
+                    Produced::Completed(reported)
+                }))
             }
         }
     }
@@ -229,11 +257,20 @@ fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
     pin!(future).poll(&mut task)
 }
 
+/// A handoff whose bound is the widest a test buffer here ever is.
 const fn dispatch(seq: u32) -> Handoff<'static> {
-    Handoff::Dispatch(EffectId {
-        run: RUN,
-        seq: EffectSeq(seq),
-    })
+    bounded(seq, usize::MAX)
+}
+
+/// A handoff that declares how wide an answer this run can record.
+const fn bounded(seq: u32, result_bytes: usize) -> Handoff<'static> {
+    Handoff::Dispatch {
+        id: EffectId {
+            run: RUN,
+            seq: EffectSeq(seq),
+        },
+        result_bytes,
+    }
 }
 
 #[test]
@@ -627,7 +664,7 @@ impl ActivityDispatcher for Deferred {
         _kind: ActivityKind,
         _input: &[u8],
         _out: &mut [u8],
-    ) -> Poll<Result<usize, Fault>> {
+    ) -> Poll<Result<Produced, Fault>> {
         // What a real dispatcher does: keep the waker and answer when the world does.
         self.kept = Some(task.waker().clone());
         Poll::Pending
@@ -738,4 +775,144 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
     let _ = ctx;
     assert_eq!(world.polls, 0, "the world was never asked");
     assert!(ledger.asked.is_empty(), "the journal was never asked");
+}
+
+#[test]
+fn a_dispatcher_is_handed_exactly_the_runs_declared_result_bound() {
+    // The caller's buffer is the wider of the run's two bounds, so it is wider than an
+    // activity answer may be. Issue #36 asks that the length be validated against the
+    // *bound*; narrowing the slice is the stronger half of that, because a dispatcher then
+    // cannot write past it at all.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 4))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Ok(b"ab".to_vec())]);
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        world.widths,
+        vec![4],
+        "the world is handed the bound, not the caller's whole buffer"
+    );
+}
+
+#[test]
+fn an_answer_over_the_declared_bound_is_exhausted_rather_than_truncated() {
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 4))])
+        .resolving(vec![Ok(Vec::new())]);
+    // Five bytes reported against a four-byte bound, in a sixteen-byte buffer: the buffer
+    // would take it and the run's declared bound would not.
+    let mut world = World::answering(vec![Ok(b"abcde".to_vec())]).reporting(5);
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        ledger.asked,
+        vec![
+            Asked::Schedule(DOWNLOAD, b"url".to_vec()),
+            Asked::Resolve(Answered::Exhausted),
+        ],
+        "over the bound is a clean refusal, and no part of the answer is recorded"
+    );
+    assert_eq!(answered, Poll::Ready(Err(Failure::Activity { len: 0 })));
+}
+
+#[test]
+fn a_failure_payload_over_the_declared_bound_is_exhausted_rather_than_truncated() {
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 4))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Ok(b"abcde".to_vec())])
+        .reporting(5)
+        .failing();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        ledger.asked,
+        vec![
+            Asked::Schedule(DOWNLOAD, b"url".to_vec()),
+            Asked::Resolve(Answered::Exhausted),
+        ],
+        "a failure payload is bounded by the same figure a result is"
+    );
+}
+
+#[test]
+fn a_typed_failure_payload_is_recorded_rather_than_dropped() {
+    // Design document §09 gives `EffectFailed` a bounded payload. Before issue #36 the
+    // dispatcher had no route to one: `Err(E)` recorded an empty failure and `Ok(len)` a
+    // completion, so an activity could not report bytes and failure together.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 8))])
+        .resolving(vec![Ok(b"why".to_vec())]);
+    let mut world = World::answering(vec![Ok(b"why".to_vec())]).failing();
+    let mut out = [0_u8; 8];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        ledger.asked,
+        vec![
+            Asked::Schedule(DOWNLOAD, b"url".to_vec()),
+            Asked::Resolve(Answered::Failed(b"why".to_vec())),
+        ]
+    );
+    assert_eq!(answered, Poll::Ready(Err(Failure::Activity { len: 3 })));
+}
+
+#[test]
+fn an_untyped_failure_still_records_no_payload() {
+    // The other half of the same decision. `Self::Error` is the implementor's own value and
+    // reaches no record: a workflow that branched on it would branch on something no replay
+    // reproduces.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 8))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Err(Fault)]);
+    let mut out = [0_u8; 8];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        ledger.asked,
+        vec![
+            Asked::Schedule(DOWNLOAD, b"url".to_vec()),
+            Asked::Resolve(Answered::Failed(Vec::new())),
+        ]
+    );
+}
+
+#[test]
+fn a_bound_wider_than_the_callers_buffer_cannot_produce_a_truncated_record() {
+    // A caller that sized `out` under the run's declared bound. The room is the smaller of
+    // the two, so an answer that overflows it is `Exhausted` — never a short record that
+    // replays for ever.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(0, 32))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Ok(b"abcdefgh".to_vec())]).reporting(8);
+    let mut out = [0_u8; 4];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(world.widths, vec![4], "the room is the smaller of the two");
+    assert_eq!(
+        ledger.asked,
+        vec![
+            Asked::Schedule(DOWNLOAD, b"url".to_vec()),
+            Asked::Resolve(Answered::Exhausted),
+        ]
+    );
 }

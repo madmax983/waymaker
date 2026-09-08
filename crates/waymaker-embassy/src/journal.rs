@@ -39,7 +39,18 @@ pub enum Handoff<'a> {
     ///
     /// The same identity arrives again after a retry or a reset. A downstream system that
     /// must not repeat the effect deduplicates on this pair.
-    Dispatch(EffectId),
+    Dispatch {
+        /// The stable `(RunId, EffectSeq)` the schedule record committed.
+        id: EffectId,
+        /// How wide an answer this run declared it can record.
+        ///
+        /// Design document §10's `effect_result_bytes`. The journal states it here, at the
+        /// moment it commits the intent, because it is the journal that priced the bank —
+        /// so the façade narrows the caller's buffer to this figure before it reaches the
+        /// world, and an answer over it is [`Answer::Exhausted`] rather than a truncated
+        /// record. Issue [#36](https://github.com/madmax983/waymaker/issues/36).
+        result_bytes: usize,
+    },
 }
 
 /// What the world answered for the effect [`Journal::schedule`] handed out.

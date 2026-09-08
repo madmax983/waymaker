@@ -1450,8 +1450,12 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
             }
             Decision::Dispatch(dispatchable) => {
                 let id = dispatchable.intent().id();
+                // The bound travels with the identity. `Boundary::resolve` refuses an
+                // answer over it, and a caller that never learned the figure could only
+                // discover that after the world had already produced one.
+                let result_bytes = usize::from(self.reserve.bounds().effect_result_bytes);
                 self.pending = Some(dispatchable);
-                Ok(Handoff::Dispatch(id))
+                Ok(Handoff::Dispatch { id, result_bytes })
             }
             Decision::Stop => Err(Suspended::NEW),
         }
