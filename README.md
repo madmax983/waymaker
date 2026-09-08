@@ -99,7 +99,7 @@ budget is measured against.
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
-| Incremental code flash | ≤ 18 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve) |
+| Incremental code flash | ≤ 12 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the probe's own arithmetic) |
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
@@ -225,9 +225,18 @@ against a **baseline image that links no Waymaker at all**. The budget is increm
 the measurement is a subtraction rather than an absolute size that would charge Waymaker for
 the panic handler and drift with the toolchain.
 
+One more subtraction, and it is the one that makes the number mean what §04 says. The probe
+is a crate too, and `size-probe-reach` makes it call every public function each layer
+declares, so its own `match` arms and folds grow with the library's. The gate therefore
+reads the symbol table as well as the section headers and charges the image delta **less
+what the symbol table attributes to the probe** — 7534 B of 18386 B at rung 0.5, which is
+[ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
+Everything no symbol names as the probe's stays charged to the layers, and the report prints
+`Δflash`, `probe` and `layers` on every row so the split is legible rather than trusted.
+
 | Measured | Gated on | How |
 | --- | --- | --- |
-| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 18 KiB | every allocated section whose bytes are stored in the image, minus the baseline |
+| Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 12 KiB | every allocated section whose bytes are stored in the image, minus the baseline, minus what the symbol table attributes to the probe |
 | Engine statics | the `default` row, 256 B | every allocated writable, non-thread-local section, minus the baseline: 768 B of runtime RAM less the 512 B scratch page the caller owns |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 

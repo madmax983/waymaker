@@ -281,6 +281,329 @@ fn the_parser_agrees_with_llvm_size_about_the_probe() {
     }
 }
 
+#[test]
+fn the_gated_figure_is_the_layers_share_rather_than_the_whole_image() {
+    // Issue #72: the probe's own `match` arms, folds and calls exist only to keep the
+    // layers' code alive past `--gc-sections`, and design document §04's budget is stated
+    // for "core + flash adapter". This is the correction, measured on the real image.
+    let report = measured();
+    let delta = report.delta_of("default").expect("a default row");
+    let probe = report
+        .probe_delta_of("default")
+        .expect("the symbol table names the probe's own code");
+    let layers = report
+        .layers_flash_of("default")
+        .expect("the layers' share is measurable");
+
+    assert!(
+        probe > 0,
+        "no byte of the engine image is attributed to the probe, but the probe is what was linked"
+    );
+    assert!(
+        layers < delta.flash,
+        "the layers' share ({layers} B) is the image delta ({} B) less the probe's own \
+         growth, so it cannot be the whole delta",
+        delta.flash
+    );
+    assert_eq!(
+        layers,
+        delta.flash - probe,
+        "the layers' share is the delta less the probe's own growth and nothing else"
+    );
+}
+
+#[test]
+fn the_probes_own_code_is_a_real_share_of_the_image_it_is_subtracted_from() {
+    // A sanity bound in both directions. Zero would mean the symbol table was not read;
+    // everything would mean the layers were dead-stripped and the gate measures nothing.
+    let report = measured();
+    for name in ["default", "facade"] {
+        let row = report.row(name).expect("a measured row");
+        assert!(
+            row.probe_flash > 0 && row.probe_flash < row.sizes.flash,
+            "`{name}` attributes {} B to the probe out of an image of {} B",
+            row.probe_flash,
+            row.sizes.flash
+        );
+    }
+}
+
+#[test]
+fn the_symbol_reader_agrees_with_llvm_nm_about_what_the_probe_costs() {
+    // The second opinion for the symbol *reader*, as the `llvm-size` test above is for the
+    // sections: a symbol table read at the wrong offsets answers with well-formed nonsense,
+    // and the gate would then subtract it. It says nothing about the *attribution*, because
+    // `defining_crate` decides both sides of the comparison — the test below this one holds
+    // that, and the per-symbol section index is held in `xtask::elf`'s own tests, against
+    // `llvm-readobj`.
+    let Some(llvm_nm) = llvm_tool("llvm-nm") else {
+        panic!(
+            "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+    };
+
+    let report = measured();
+    let row = report.row("default").expect("a default row");
+    let image = default_image();
+
+    let output = std::process::Command::new(&llvm_nm)
+        .args(["--print-size", "--defined-only"])
+        .arg(&image)
+        .output()
+        .expect("llvm-nm should run");
+    assert!(output.status.success(), "llvm-nm failed on {image:?}");
+
+    let probe = size::probe_crate_name();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut second_opinion: Vec<(u64, u64)> = listing
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // `<address> <size> <type> <name>`; a symbol with no size prints three fields.
+            let (Some(address), Some(bytes), Some(name)) =
+                (fields.first(), fields.get(1), fields.get(3))
+            else {
+                return None;
+            };
+            // `n`/`N` is debug information, which costs no flash. Everything else
+            // `--defined-only` prints is in an allocated section of this image.
+            if matches!(fields.get(2), Some(&"n" | &"N")) {
+                return None;
+            }
+            if size::defining_crate(name) != Some(probe.as_str()) {
+                return None;
+            }
+            Some((
+                u64::from_str_radix(address, 16).ok()?,
+                u64::from_str_radix(bytes, 16).ok()?,
+            ))
+        })
+        .collect();
+    second_opinion.sort_unstable();
+
+    // Each symbol's placement and width, not their total. A total would be a reading of
+    // `attributed_flash`'s rule as well as of this reader — that rule measures the union of
+    // address ranges, so the two agree only while nothing is folded — and this test is
+    // about the offsets the table is read at. `llvm-nm` clears the ARM interworking bit
+    // that `st_value` carries on a Thumb function, so it is masked here.
+    let mut ours: Vec<(u64, u64)> = xtask::elf::symbols(&std::fs::read(&image).expect("readable"))
+        .expect("the image should parse")
+        .into_iter()
+        .filter(|symbol| symbol.size > 0)
+        .filter(|symbol| size::defining_crate(&symbol.name) == Some(probe.as_str()))
+        .map(|symbol| (symbol.address & !1, symbol.size))
+        .collect();
+    ours.sort_unstable();
+
+    assert!(!ours.is_empty(), "no symbol is credited to `{probe}`");
+    assert_eq!(
+        ours, second_opinion,
+        "our symbol reader and llvm-nm disagree about `{probe}`'s symbols in {image:?}"
+    );
+    assert!(
+        row.probe_flash > 0 && row.probe_flash <= ours.iter().map(|(_, size)| size).sum::<u64>(),
+        "the attributed figure ({} B) is not within the bytes those symbols name",
+        row.probe_flash
+    );
+}
+
+#[test]
+fn stripping_the_symbol_table_moves_no_byte_the_gate_measures() {
+    // ADR 0029's central claim, driven rather than argued. The matrix links with
+    // `--config profile.release.strip="none"` so that there are symbols to attribute, and
+    // gates the section sizes of that same image. That is one measurement only while
+    // stripping touches nothing allocated. `size::check_symbols_are_not_measured` asks each
+    // image whether that holds; this links the workspace's own release profile beside it
+    // and compares the answer.
+    let stripped = scratch("stripped");
+    let output = xtask::coverage::uninstrumented_cargo()
+        .current_dir(workspace_root())
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--message-format",
+            "json-render-diagnostics",
+            "--target",
+            xtask::pipeline::FIRMWARE_TARGET,
+            "--target-dir",
+        ])
+        .arg(&stripped)
+        .args([
+            "--package",
+            size::PROBE_PACKAGE,
+            "--no-default-features",
+            "--features",
+            "probe,engine",
+        ])
+        .output()
+        .expect("cargo build should run");
+    assert!(
+        output.status.success(),
+        "linking the stripped image failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image = size::executable_path(
+        &String::from_utf8_lossy(&output.stdout),
+        size::PROBE_PACKAGE,
+    )
+    .expect("the build produced an image");
+    let bytes = std::fs::read(&image).expect("the image should be readable");
+    let sections = xtask::elf::sections(&bytes).expect("the image should parse");
+    let stripped_sizes = size::SectionSizes::of(&sections);
+
+    // The stripped image has no symbol table, which is exactly why the gate does not use it.
+    assert!(
+        size::check_symbols_are_not_measured(&sections).is_err(),
+        "the release profile strips symbols, so the gated image cannot be the attributed one"
+    );
+
+    let measured = measured().row("default").expect("a default row").sizes;
+    assert_eq!(
+        stripped_sizes, measured,
+        "stripping changed a section the budget is measured on, so the attribution and the \
+         gated sizes are readings of two different images"
+    );
+}
+
+#[test]
+fn no_symbol_the_gate_credits_to_the_probe_is_a_traits_own_provided_body() {
+    // `defining_crate` reads the first crate root of a mangled path, and one v0 production
+    // puts them the other way round: `Y` is `<Self as Trait>::method` for a method the
+    // *trait* provides, and it names the self type first. A layer trait with a default
+    // body, implemented for a probe type, would then be a layer's bytes under the probe's
+    // name — and this gate subtracts what it reads as the probe's.
+    //
+    // `X`, the impl's own method, demangles to the same `<A as B>::m` shape and is
+    // genuinely the probe's, so a demangler cannot tell the two apart. The mangled form
+    // can, and this scans for it the other way round from `defining_crate`: find the
+    // length-prefixed crate name as a substring and look at what came before it, rather
+    // than parse crate roots left to right. `llvm-nm --demangle` supplies the name a
+    // failure has to be readable as.
+    let Some(llvm_nm) = llvm_tool("llvm-nm") else {
+        panic!(
+            "llvm-nm is missing from the toolchain sysroot; rust-toolchain.toml pins llvm-tools-preview, so this is a broken toolchain rather than a skippable test"
+        );
+    };
+
+    let image = default_image();
+    let output = std::process::Command::new(&llvm_nm)
+        .args(["--print-size", "--defined-only", "--demangle"])
+        .arg(&image)
+        .output()
+        .expect("llvm-nm should run");
+    assert!(output.status.success(), "llvm-nm failed on {image:?}");
+    let demangled = String::from_utf8_lossy(&output.stdout);
+
+    let bytes = std::fs::read(&image).expect("the image should be readable");
+    let symbols = xtask::elf::symbols(&bytes).expect("the image should parse");
+    let probe = size::probe_crate_name();
+
+    let credited: Vec<&xtask::elf::Symbol> = symbols
+        .iter()
+        .filter(|symbol| size::defining_crate(&symbol.name) == Some(probe.as_str()))
+        .collect();
+    assert!(
+        !credited.is_empty(),
+        "no symbol is credited to the probe, so this test checks nothing"
+    );
+
+    // Falsifiable on this image rather than only on one a future layer produces: it
+    // already carries `<waymaker_flash::storage::Geometry as core::cmp::PartialEq>::ne`,
+    // whose body is `core`'s. A `defining_crate` that read the first crate root of a `Y`
+    // name would answer `waymaker_flash` for it.
+    let qualified: Vec<&xtask::elf::Symbol> = symbols
+        .iter()
+        .filter(|symbol| head_of(&symbol.name).is_some_and(|head| head.contains('Y')))
+        .collect();
+    assert!(
+        !qualified.is_empty(),
+        "the image carries no `Y` symbol, so the half of this test that can fail checks nothing"
+    );
+    for symbol in qualified {
+        assert_eq!(
+            size::defining_crate(&symbol.name),
+            None,
+            "`{}` is a trait's own provided body, whose crate the mangled path names second",
+            symbol.name
+        );
+    }
+
+    for symbol in credited {
+        // `llvm-nm --print-size` prints `<address> <size> <type> <name>`, and the address
+        // is what identifies a defined symbol: any number of functions share a size, so
+        // pairing on one picks whichever came first. Bit 0 of `st_value` is the ARM
+        // interworking flag — a Thumb function is odd — and `llvm-nm` clears it while the
+        // ELF field carries it, so it is masked here; the size is matched as well, which
+        // is what tells a Thumb function from the zero-sized `$t` symbol at the same place.
+        let spelled = demangled
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let address = u64::from_str_radix(fields.first()?, 16).ok()?;
+                let size = u64::from_str_radix(fields.get(1)?, 16).ok()?;
+                if address != symbol.address & !1 || size != symbol.size {
+                    return None;
+                }
+                Some(fields.get(3..)?.join(" "))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "llvm-nm lists no {} B symbol at {:#x}, which our reader credits to `{probe}`",
+                    symbol.size,
+                    symbol.address & !1
+                )
+            });
+
+        let head = head_of(&symbol.name).unwrap_or_else(|| {
+            panic!("`{spelled}` is credited to `{probe}` and names no crate of this workspace")
+        });
+        assert!(
+            !head.contains('Y'),
+            "the gate credits {} B to `{probe}` for `{spelled}`, whose mangled path opens with the `Y` production — the body of a provided method belongs to the trait, so this would subtract a layer's bytes from the budget",
+            symbol.size,
+        );
+    }
+}
+
+/// The part of a `v0` mangled name before the first crate of this workspace it names.
+///
+/// Found by searching for the length-prefixed crate name as a substring, which is the
+/// opposite way round from `size::defining_crate` — that parses crate roots left to right.
+/// Two readings of one name agreeing is worth more than one reading checked against itself.
+fn head_of(mangled: &str) -> Option<&str> {
+    [
+        "waymaker-core",
+        "waymaker-flash",
+        "waymaker-embassy",
+        size::PROBE_PACKAGE,
+    ]
+    .iter()
+    .map(|package| package.replace('-', "_"))
+    .filter_map(|crate_name| mangled.find(&format!("{}{crate_name}", crate_name.len())))
+    .min()
+    .and_then(|at| mangled.get(..at))
+}
+
+/// The `default` row's linked image, once [`measured`] has linked it.
+///
+/// Through `measured` rather than by joining the path, because the matrix is what links
+/// these images: a test that only names the file passes on a developer's machine, where a
+/// previous run left one behind, and fails on a clean checkout — or, worse, measures the
+/// image a previous run left.
+fn default_image() -> PathBuf {
+    assert!(
+        measured().row("default").is_some(),
+        "the matrix linked no `default` image"
+    );
+    workspace_root()
+        .join("target/waymaker-size-build/default")
+        .join(xtask::pipeline::FIRMWARE_TARGET)
+        .join("release")
+        .join(size::PROBE_PACKAGE)
+}
+
 /// The size `llvm-size -A` reports for one section.
 fn section_size(listing: &str, section: &str) -> Option<u64> {
     listing.lines().find_map(|line| {
@@ -293,6 +616,11 @@ fn section_size(listing: &str, section: &str) -> Option<u64> {
 
 /// `llvm-size` from the pinned toolchain's sysroot, where `llvm-tools-preview` puts it.
 fn llvm_size() -> Option<PathBuf> {
+    llvm_tool("llvm-size")
+}
+
+/// One tool from the pinned toolchain's sysroot, where `llvm-tools-preview` puts it.
+fn llvm_tool(tool: &str) -> Option<PathBuf> {
     let sysroot = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
@@ -308,7 +636,11 @@ fn llvm_size() -> Option<PathBuf> {
         .find_map(|line| line.strip_prefix("host: "))?
         .trim()
         .to_owned();
-    let path = sysroot.join("lib/rustlib").join(host).join("bin/llvm-size");
+    let path = sysroot
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(tool);
     path.is_file().then_some(path)
 }
 

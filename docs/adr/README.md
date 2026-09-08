@@ -37,6 +37,7 @@ be superseded.
 | [0026](0026-redelivery-is-the-kernels-answer-and-at-least-once-is-the-contract.md) | Redelivery is the kernel's answer, and at-least-once is the contract | accepted |
 | [0027](0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md) | The failure matrix is ten named tests, and a rig that resumes | accepted |
 | [0028](0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md) | Timer semantics are a spec, a capability, and no downgrade | accepted |
+| [0029](0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) | The code-flash gate charges the layers, and the probe pays for itself | accepted |
 
 ## Reading the numbers
 
@@ -54,7 +55,7 @@ of these are older than their numbers suggest:
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
-0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028.
+0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029.
 
 ## Writing one
 

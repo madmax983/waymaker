@@ -6,8 +6,9 @@
 //! * the `const` assertions in this module, which fail the build for
 //!   `thumbv6m-none-eabi` — the target the budgets are stated for — the moment kernel
 //!   state outgrows [`KERNEL_STATE_BYTES`];
-//! * `cargo xtask size`, which links the size probe once per feature and measures the
-//!   section deltas against a firmware that links nothing from Waymaker.
+//! * `cargo xtask size`, which links the size probe once per feature, measures the section
+//!   deltas against a firmware that links nothing from Waymaker, and subtracts what each
+//!   image's symbol table attributes to the probe itself.
 //!
 //! Neither transcribes the numbers: the gate depends on this crate, so a budget changed
 //! here is a budget changed everywhere.
@@ -49,16 +50,21 @@ pub const KERNEL_STATE_BYTES: usize = 128;
 /// This is a gate, not an unverified claim."
 ///
 /// §04 states **8 KiB** and labels the column "v0.1 target". This is that number raised
-/// twice, and both raises are recorded rather than assumed:
+/// twice and then cut, and all three moves are recorded rather than assumed:
 /// [ADR 0017](https://github.com/madmax983/waymaker/blob/main/docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md)
-/// took it to 16 KiB for rung 0.2's two-bank lifecycle, and
+/// took it to 16 KiB for rung 0.2's two-bank lifecycle,
 /// [ADR 0020](https://github.com/madmax983/waymaker/blob/main/docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
-/// to 18 KiB for §10's capacity reserve — where the module itself is tens of bytes and the
-/// rest is what the size probe links to reach it, which is issue
-/// [#72](https://github.com/madmax983/waymaker/issues/72). It is still a gate: `cargo xtask
-/// size` fails a build over it, and the number lives here rather than in the gate so that
-/// there is one place to change.
-pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 18 * 1024;
+/// to 18 KiB for §10's capacity reserve, and
+/// [ADR 0029](https://github.com/madmax983/waymaker/blob/main/docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md)
+/// back to **12 KiB**. Both raises were argued from a figure that charged the layers for
+/// the size probe's own arithmetic — 7534 B of the 18386 B measured at rung 0.5, which is
+/// issue [#72](https://github.com/madmax983/waymaker/issues/72). `cargo xtask size` now
+/// gates what the symbol table attributes to the layers, which is 10852 B, so the ceiling
+/// is set against that instead.
+///
+/// It is still a gate: `cargo xtask size` fails a build over it, and the number lives here
+/// rather than in the gate so that there is one place to change.
+pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 12 * 1024;
 
 /// One type that is part of the kernel's live state, and the space it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

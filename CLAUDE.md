@@ -353,7 +353,8 @@ firmware traits to accommodate host conveniences.
 Seven crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
-- `waymaker-size-probe` — firmware linked only so its section sizes can be measured. It
+- `waymaker-size-probe` — firmware linked only so its section sizes and its symbols can be
+  measured. It
   declares all three layers as *optional* dependencies, on purpose — the baseline variant
   links none of them, which is what makes the code-flash budget a delta rather than an
   absolute — and nothing depends on it.
@@ -427,7 +428,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1) |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
-| Incremental code flash | ≤ 18 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve) |
+| Incremental code flash | ≤ 12 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic) |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree, and
@@ -453,15 +454,25 @@ a corrected figure rather than against a third raise, and it was: §10's seven-s
 lands at **18098 B** against the same 18 KiB gate, with no raise asked for. §11's timer
 vocabulary then took it to **18386 B** against that same gate, leaving 46 B —
 [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md), which
-says plainly that issue #33's record bodies do not fit under it.
+says plainly that issue #33's record bodies do not fit under it — a conclusion the next
+paragraph corrects, because the figure it was drawn from was measuring the wrong thing.
 [ADR 0022](docs/adr/0022-the-bank-swap-is-a-typestate-and-step-one-is-a-value-being-consumed.md)
 records what it took, because the first measurement was 42 B *over* — a plan carrying a
 geometry the region beside it already held, and five steps taking that plan by value to
 compare one field of it. Both were real defects, and with a trim of the probe's own
-arithmetic beside them they are 444 B. A third of the
-measured "core + flash adapter" figure is still the probe rather than either, which is a
-defect in the measurement and is filed as issue
-[#72](https://github.com/madmax983/waymaker/issues/72).
+arithmetic beside them they are 444 B.
+
+Every number in that paragraph is a whole-image delta, and issue
+[#72](https://github.com/madmax983/waymaker/issues/72) is that a third of each one is the
+size probe. `cargo xtask size` now reads the symbol table and gates what it attributes to the
+layers instead —
+[ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
+Of rung 0.5's 18386 B, **7534 B is the probe's own arithmetic and 10852 B is the layers'**,
+so the gate comes down from 18 KiB to **12 KiB** — a cut of 6 KiB, not a raise, and 1436 B
+of room for issue #33's record bodies. Every byte no symbol attributes to the probe stays
+charged to the layers: `.rodata` strings, `compiler_builtins`, the `__aeabi_*` helpers and
+the padding between functions. The report prints `Δflash`, `probe` and `layers` on every row
+of every run, so the split is legible rather than taken on trust.
 
 The workflow future is user memory and is reported separately. A kernel state type added to
 `kernel_state_types!` is asserted at compile time, registered in the size report, and
@@ -752,12 +763,32 @@ Stated so that nobody mistakes silence for coverage:
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
-- **How much of the code-flash delta is the library.** `cargo xtask size` measures an image
-  the probe keeps alive, so the probe's own `match` arms and folds are in the number §04
-  calls "core + flash adapter" — roughly 5 KiB of 18098 B at rung 0.2. ADR 0002 says so, ADR
-  0017 attributes rung 0.2's first figure by symbol, ADR 0019 splits the writer out and
-  ADR 0020 the reserve, but nothing *checks* the split: doing so needs a call graph, and all
-  three attributions are readings of measurements rather than gates.
+- **A layer body the optimiser inlined into the probe.** The code-flash gate subtracts what
+  the symbol table attributes to `waymaker-size-probe`, which is the whole of issue #72's
+  fix. Fat LTO can inline a layer's body into a probe symbol, and the subtraction then
+  charges that body to the probe — the one direction in which the corrected figure
+  *understates* the layers. The `facade` row shows the shape of it: `waymaker-embassy`
+  carries no symbol of its own, because its `const fn` façade is inlined into the probe's
+  call sites. Deciding it needs a call graph, not a symbol table. What errs the other way is
+  everything unattributable — `.rodata`, `compiler_builtins`, padding — which stays charged
+  to the layers.
+  [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
+- **Which layer a byte belongs to.** The gate attributes to the probe or to nobody, and
+  everything that is not the probe's is the layers'. It is not a per-crate accounting: ADR
+  0017 attributes rung 0.2's figure by symbol, ADR 0019 splits the writer out and ADR 0020
+  the reserve, and all three are readings of a measurement rather than gates.
+- **A trait's provided method, on either side.** `defining_crate` refuses the `v0` `Y`
+  production — `<Self as Trait>::method` for a body the trait provides — because it names
+  the self type first, so its first crate root is the crate that wrote the `impl` rather
+  than the crate that wrote the code. Refusing charges it to the layers, which is right when
+  the trait is a layer's and wrong when the trait is the probe's. The wrong case makes the
+  gate stricter, which is the direction to be wrong in; reading it correctly would need most
+  of the mangling grammar rather than one production of it.
+- **That the corrected figure is stable under a different optimiser.** Rebuilt with
+  `lto = false` the same two images attribute 12414 B to the layers rather than 10852 B, a
+  14% swing and larger than the headroom under the gate. `release-profile` fails a build in
+  which `[profile.release]` moves at all, so the settings cannot drift — but the number is a
+  reading of one optimiser's output, not a property of the source.
 - **That a bank's journal region holds a legal journal.** `bank::sealed_generation` decides
   whether a bank is a candidate from its header and its seal. What is between them is
   `frame::Scan`'s, and the two are joined by `BankHeader::journal_offset` rather than by
@@ -1574,6 +1605,35 @@ a floor within one arming, which is one reason #33's record carries the arming r
 nothing obliges a caller to reach the persistent capability through the façade, which is rung
 0.4's dispatcher. See
 [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md).
+
+Issue #72 then answers the budget question ADR 0028 had just made this rung's binding
+constraint, and the answer is that the gate had been measuring the wrong thing. §04 states
+the code-flash budget for "core + flash adapter"; `cargo xtask size` gated the delta between
+two linked images, and the larger one holds the size probe's `match` arms, folds and calls
+as well as the layers'. That is not incidental: `size-probe-reach` requires a call for every
+public function a layer declares, so the probe's share rises with the library's. It had
+reached **7534 B of 18386 B** — more than a third of a budget stated for two crates, spent
+by a third crate that ships nothing. `xtask::elf::symbols` now reads `.symtab` the way
+`sections` reads the section header table, `size::defining_crate` reads the first crate-root
+component of a mangled name — the crate that *declares* the body, so a generic
+`waymaker-flash` defines and the probe instantiates stays the engine's — and the gate
+charges the image delta less what the probe grew by. The corrected figure is **10852 B**,
+and the budget comes down from 18 KiB to **12 KiB**, which is the first move of that number
+in this repository that is not a raise. Two things err deliberately. Everything
+unattributable stays charged to the layers, so `.rodata` strings, `compiler_builtins` and
+the padding between functions are the engine's. And the split is *printed* as well as gated
+— `Δflash`, `probe` and `layers` on every row of the table and of the JSON, every run, and
+`probe` beside `layers` in the base-branch diff for the row the budget is held against — so a
+reader is never asked to take the gated number on trust. The
+matrix links with `strip` off to have symbols to read, which is the one thing ADR 0002
+decided against; `check_symbols_are_not_measured` is why that is safe rather than assumed,
+because it fails a run in which the image carries no symbol table or in which a symbol,
+string or debug section is allocated. Everything that reads zero still fails closed: a row
+that attributes nothing to the probe, or more to it than the image holds, is `Unmeasurable`
+rather than a probe that cost nothing. What is owed is written down: fat LTO can inline a
+layer body into a probe symbol, and that body is then charged to the probe — the `facade`
+row is the visible case, where `waymaker-embassy` carries no symbol at all. See
+[ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 88 B of it is spent. The

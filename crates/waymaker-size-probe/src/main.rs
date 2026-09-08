@@ -1245,8 +1245,9 @@ fn journal_append() -> usize {
 
     // §10's reserve and §10's swap are measured with the geometry and the writer this
     // function already built rather than with ones of their own. A second geometry, region,
-    // recovery and `Journal::after` in the probe would be charged to the engine's row, and
-    // issue #72 is about how much of this figure is already the probe's own arithmetic.
+    // recovery and `Journal::after` here is this file's arithmetic, which the gate now
+    // subtracts from the engine's row by symbol rather than charging to it — so it costs a
+    // longer image and a larger `probe` column rather than a smaller budget.
     kept = kept.wrapping_add(match waymaker_flash::bank::BankLayout::new(geometry) {
         Ok(layout) => capacity_reserve(&mut media, layout, journal)
             .wrapping_add(bank_swap(&mut media, layout)),
@@ -1442,9 +1443,11 @@ fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -
 /// Whether a swap's own accessor named a bank, folded so the call cannot be discarded.
 ///
 /// Deliberately not a three-armed `match` over [`waymaker_flash::bank::Authority`]. That
-/// enum's arms are already linked by `bank_seal_and_selection`, and a second `match` here
-/// would charge the engine's row for arithmetic that belongs to this file — which is issue
-/// [#72](https://github.com/madmax983/waymaker/issues/72).
+/// enum's arms are already linked by `bank_seal_and_selection`, and a second `match` here is
+/// arithmetic that belongs to this file. Since
+/// [ADR 0029](https://github.com/madmax983/waymaker/blob/main/docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md)
+/// the gate reads the symbol table and subtracts it rather than charging it to the engine's
+/// row, so the cost is a bigger image and a bigger `probe` column, not a tighter budget.
 #[cfg(feature = "engine")]
 const fn generation_cost(authority: waymaker_flash::bank::Authority) -> usize {
     matches!(authority, waymaker_flash::bank::Authority::Bank { .. }) as usize

@@ -16,11 +16,12 @@ fn the_budgets_are_the_numbers_from_the_design_document() {
     // The one budget that is *not* the design document's number, and the assertion says so
     // rather than being quietly relaxed. §04 states 8 KiB and labels its column "v0.1
     // target"; ADR 0017 raised the gate to 16 KiB for rung 0.2's two-bank lifecycle and ADR
-    // 0020 to 18 KiB for §10's capacity reserve, neither of which §04's row scopes. Changing
-    // it again is changing this line, which is the point — and ADR 0020 argues that the next
-    // change should be issue #72 correcting what the figure measures rather than a third
-    // raise.
-    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 18 * 1024);
+    // 0020 to 18 KiB for §10's capacity reserve, neither of which §04's row scopes. ADR 0020
+    // argued that the next change should be issue #72 correcting what the figure measures
+    // rather than a third raise, and ADR 0029 is that correction: the gate now charges the
+    // layers rather than the linked image, and the ceiling comes down to 12 KiB against a
+    // measured 10852 B. Changing it again is changing this line, which is the point.
+    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 12 * 1024);
     // A relation between two constants is a compile-time fact, so it is asserted at compile
     // time — see the note below the next test.
     const {
