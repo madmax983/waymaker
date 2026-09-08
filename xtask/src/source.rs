@@ -5449,6 +5449,22 @@ pub fn check_ctx_facade(
             }
         }
         violations.extend(check_no_hidden_state(RULE, FACADE, &path, &code));
+        // And the future set, for the same reason: a fifth future whose `impl Future` lives
+        // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
+        // cannot see. Review of this change declared one in `dispatch.rs`.
+        for future in future_implementors(&code) {
+            if !CTX_FUTURES.contains(&future.as_str()) {
+                violations.push(Violation::new(
+                    RULE,
+                    FACADE,
+                    format!(
+                        "{path} implements `Future` for `{future}`, which `CTX_FUTURES` does \
+                         not name: a fifth thing a workflow can `.await` is a reviewer's \
+                         decision rather than a commit"
+                    ),
+                ));
+            }
+        }
         // A scanner cannot expand a macro, so it refuses the construct — the answer
         // `effect-protocol` gives to a closure and a short-circuit.
         if names_identifier(&code, "macro_rules") {
@@ -5684,6 +5700,36 @@ fn check_facade_futures(
         ));
     }
     violations
+}
+
+/// Every type the file implements `Future` for.
+///
+/// A line scan, like every other rule here: the header may be spelled `impl Future for X`,
+/// `impl core::future::Future for X` or with generics in between, and what is wanted is the
+/// self type. Generics on the type itself are dropped, so `ActivityFuture<'_, T, D, J>` is
+/// `ActivityFuture`.
+fn future_implementors(code: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("impl") {
+            continue;
+        }
+        let Some((before, after)) = trimmed.split_once(" for ") else {
+            continue;
+        };
+        if !names_identifier(before, "Future") {
+            continue;
+        }
+        let name: String = after
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        if !name.is_empty() {
+            found.push(name);
+        }
+    }
+    found
 }
 
 /// A module that declares no `static`.
@@ -8551,6 +8597,30 @@ mod deferred_answer_pins {
                 "{mutation}: {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_fifth_future_in_a_sibling_module_is_reported() {
+        // The future *count* reads `ctx.rs`; the future *set* reads every file of the
+        // crate. Review of this change declared one in `dispatch.rs`, where the count
+        // cannot see it.
+        let module = format!(
+            "{}\npub struct SignalFuture;\nimpl core::future::Future for SignalFuture {{}}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("SignalFuture")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_pinned_futures_are_not_reported_by_the_crate_wide_set() {
+        // The clean fixture implements `Future` for all four, so a set pin that could not
+        // read the spelling `impl core::future::Future for X` would report every one of
+        // them and this test would be the one that noticed.
+        assert!(facade_details("", "").is_empty());
     }
 
     #[test]

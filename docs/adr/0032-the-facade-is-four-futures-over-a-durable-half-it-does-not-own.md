@@ -68,7 +68,7 @@ its own. A façade that pulled in an executor to hand out four futures would be 
 adapter §02 decision 5 says it is. `embassy-below-facade` still guards the edge.
 
 **`ctx-facade`** is what stops the shape being given back. It pins both surfaces in both
-directions, pins the four futures by name and by `fn poll` count, pins `Ctx`'s methods at
+directions, pins the four futures by name and by `fn poll` count, pins the set of types the crate implements `Future` for, pins `Ctx`'s methods at
 every visibility and refuses an associated constant on it, refuses each piece of on-media
 authority by identifier — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`,
 `ReplayMachine`, `BankLayout`, `Swap` — refuses a `static` and refuses a `macro_rules!`.
