@@ -639,14 +639,30 @@ fn transition_timers() -> usize {
         Err(error) => error.message().len(),
     });
     // Row 1: the firing is in history, so replay answers it and arms nothing.
+    //
+    // On a machine of its own, because the one above has re-armed: `timer_outcome` settles
+    // the *phase* and leaves the cursor at `AwaitingTimer`, so a second `timer_intent` on it
+    // diverges at the boundary gate and the firing arm is never reached. Codex found that,
+    // and the consequence is the one this row exists to prevent — a path the probe claims to
+    // charge for that fat LTO is free to strip.
+    let mut fired = ReplayMachine::new(RunId(core::hint::black_box(7)));
     kept = kept.wrapping_add(
-        match machine.timer_intent(request, Next::Record(recorded)) {
+        match fired.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
             Ok(_) => 0,
             Err(error) => error.message().len(),
         },
     );
+    kept = kept.wrapping_add(match fired.timer_intent(request, Next::Record(recorded)) {
+        Ok(TimerIntent::Recorded { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+        Ok(TimerIntent::Schedule { .. } | TimerIntent::Finished { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
     kept = kept.wrapping_add(
-        match machine.timer_outcome(Next::Record(RecordRef::TimerFired {
+        match fired.timer_outcome(Next::Record(RecordRef::TimerFired {
             seq: core::hint::black_box(EffectSeq::FIRST),
         })) {
             Ok(TimerResolve::Fired { id }) => usize::try_from(id.seq.0).unwrap_or(0),

@@ -4743,7 +4743,7 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
         )];
     };
 
-    let code = code_only(&source.contents);
+    let code = without_test_modules(&code_only(&source.contents));
     // Read the *only* declaration, or none at all. `braced_body` takes the first
     // token-boundary match, so a same-named decoy above the real enum — a conforming
     // `mod compat { pub(crate) enum RecordRef { .. } }` — is what every scan below would
@@ -4751,6 +4751,12 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
     // change ran exactly that and watched the gate print `ok`. The same guard
     // `kernel-boundary`, `timer-capability` and `effect-protocol` already apply, and for the
     // same reason.
+    //
+    // Counted over production code alone. `code_only` strips comments and strings and leaves
+    // `#[cfg(test)]` modules, so a harmless test fixture named `enum RecordRef` would fail
+    // this guard — and, worse, a conforming test-only declaration would satisfy the pin if
+    // the shipped enum ever moved to another file, with nothing that ships checked. Codex
+    // found that. A fixture discharges nothing about the code on a device.
     let declarations = declaration_count(&code, ENUM);
     if declarations != 1 {
         return vec![Violation::new(
@@ -4853,7 +4859,7 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
         )];
     };
 
-    let code = code_only(&source.contents);
+    let code = without_test_modules(&code_only(&source.contents));
     // Read the *only* declaration, or none at all. `braced_body` takes the first
     // token-boundary match, so a same-named decoy above the real enum — a conforming
     // `mod compat { pub(crate) enum RecordRef { .. } }` — is what every scan below would
@@ -4861,6 +4867,12 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
     // change ran exactly that and watched the gate print `ok`. The same guard
     // `kernel-boundary`, `timer-capability` and `effect-protocol` already apply, and for the
     // same reason.
+    //
+    // Counted over production code alone. `code_only` strips comments and strings and leaves
+    // `#[cfg(test)]` modules, so a harmless test fixture named `enum RecordRef` would fail
+    // this guard — and, worse, a conforming test-only declaration would satisfy the pin if
+    // the shipped enum ever moved to another file, with nothing that ships checked. Codex
+    // found that. A fixture discharges nothing about the code on a device.
     let declarations = declaration_count(&code, ENUM);
     if declarations != 1 {
         return vec![Violation::new(
