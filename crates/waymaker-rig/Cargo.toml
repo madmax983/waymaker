@@ -1,6 +1,6 @@
 [package]
 name = "waymaker-rig"
-description = "The power-cut and watchdog-reset rig of design document §15. Test support: never linked into Waymaker's own firmware, never published, but written to run on the part."
+description = "The power-cut and watchdog-reset rig of design document §15, and the two board clocks of §11. Board support: never linked into Waymaker's own firmware, never published, but written to run on the part."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,11 @@ publish = false
 [dependencies]
 waymaker-core.workspace = true
 waymaker-flash.workspace = true
+# Design document §11's `PersistentClock`. The two board clocks of issue #34 implement it,
+# and it lives in the façade because its one method reads hardware. The edge is legal in this
+# direction only: `policy::LAYERS` is what forbids a layer reaching this crate, and the rig is
+# not a layer.
+waymaker-embassy.workspace = true
 
 [dev-dependencies]
 # The in-memory NOR model and the crash injector. The rig is driven through it at every crash

@@ -103,6 +103,20 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// knew in RAM, because RAM is the thing a power cut takes. See
 /// [ADR 0021](https://github.com/madmax983/waymaker/blob/main/docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md).
 ///
+/// It is also, since issue [#34](https://github.com/madmax983/waymaker/issues/34), where the
+/// two board clocks of design document §11 live: an RTC in a battery- or
+/// supercapacitor-backed domain, and an epoch a network restores. Those are board *support*
+/// rather than test support, which stretches this category's own description — the reason
+/// they are here rather than in the façade is that a layer pays for every public function it
+/// declares against §04's code-flash budget, of which ADR 0030 left 66 B, and a concrete
+/// driver for hardware Waymaker does not ship is not what that budget is for. The
+/// consequence is stated rather than hidden: a firmware built on Waymaker gets no RTC driver
+/// from this workspace, only the `PersistentClock` capability to write one against. It is
+/// also why this crate carries the workspace's one normal dependency from above the layers
+/// onto [`EMBASSY_FACADE`] — legal because every rule that would forbid it reads [`LAYERS`]
+/// and this crate is not a layer. See
+/// [ADR 0031](https://github.com/madmax983/waymaker/blob/main/docs/adr/0031-a-persistent-clock-is-two-registers-and-the-board-run-is-a-checked-absence.md).
+///
 /// `waymaker-drive` is issue [#28](https://github.com/madmax983/waymaker/issues/28)'s
 /// synchronous driver for design document §06's explicit kernel boundary. It is the third
 /// member of this category that is `#![no_std]` and allocation-free, and the reason is the

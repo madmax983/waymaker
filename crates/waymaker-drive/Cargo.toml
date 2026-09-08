@@ -26,6 +26,9 @@ waymaker-fault.workspace = true
 # every crash point into a row the rig also names, so both halves of issue #31's matrix use
 # one vocabulary.
 waymaker-rig.workspace = true
+# `PersistentClock`, so that `tests/power_loss.rs` drives the boundary against the two board
+# clocks `waymaker-rig` brings rather than against a world whose epoch a test sets.
+waymaker-embassy.workspace = true
 
 [features]
 default = []

@@ -2128,8 +2128,9 @@ pub enum Attestation {
 /// exit criterion no amount of host-side work discharges, and a repository whose CI is green
 /// is a repository somebody will read as finished. Design document §15's opening sentence is
 /// that crash testing is part of the design; §16's rung 0.2 exit criterion is that it happen
-/// on hardware. Everything in `waymaker-rig` is written to run on a board and has never been
-/// on one.
+/// on hardware, and §16's rung 0.5 exit criterion asks the same of a deadline that outlives a
+/// power cut. Everything in `waymaker-rig` is written to run on a board and has never been on
+/// one.
 ///
 /// This is the same move [`SPEC_CLAUSES`]'s `owed` column and
 /// [`STORAGE_CONTRACT_CLAUSES`]'s "Discharged by" column make: the thing that is *not*
@@ -2159,9 +2160,9 @@ impl HardwareTarget {
     }
 }
 
-/// The two boards rung 0.2's exit criterion names.
+/// The board runs two rungs owe: rung 0.2's two, and rung 0.5's power-loss timer.
 ///
-/// Both `NotRun`. Flipping one to [`Attestation::Passed`] without an accepted ADR carrying
+/// All `NotRun`. Flipping one to [`Attestation::Passed`] without an accepted ADR carrying
 /// `Attests hardware target:` and the id fails the build, and so does writing that ADR line
 /// without flipping the row — which is the pair of failures a list like this normally rots
 /// through.
@@ -2180,6 +2181,19 @@ pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
         attestation: Attestation::NotRun,
         evidence: "the same log from a second core, because a rig that only ever ran on one \
                    part has measured that part rather than the protocol",
+    },
+    HardwareTarget {
+        id: "rtc-power-loss",
+        headline: "an AtPersistentTime deadline across a total power cut on a board with a \
+                   backed RTC",
+        attestation: Attestation::NotRun,
+        evidence: "a board with a battery- or supercapacitor-backed RTC, the supply removed \
+                   for longer than the interval, and the first replay after it recognising \
+                   the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are \
+                   written to link on the target and have never been on one. \
+                   `waymaker-drive/tests/power_loss.rs` drives the scenario on a host, but \
+                   against a model: no oscillator to drift, no supply to sag, and a \
+                   continuity flag a test sets rather than a backup domain that failed",
     },
 ];
 
@@ -2310,7 +2324,7 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
                 target.id,
                 if rows.is_empty() {
                     "CLAUDE.md has no table row naming this hardware target in backticks, so \
-                     a reader cannot tell that rung 0.2's exit criterion is unmet"
+                     a reader cannot tell that the exit criterion it belongs to is unmet"
                         .to_owned()
                 } else {
                     format!(
@@ -2353,8 +2367,8 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
             "hardware-attestation",
             "target count",
             format!(
-                "CLAUDE.md does not say `{count}s`, which is what rung 0.2's exit criterion \
-                 names"
+                "CLAUDE.md does not say `{count}s`, which is how many board runs the rungs \
+                 named here owe"
             ),
         ));
     }

@@ -66,6 +66,7 @@ graph TD
   waymaker-size-probe -.-> waymaker-core
   waymaker-fault -.-> waymaker-flash
   waymaker-rig -.-> waymaker-flash
+  waymaker-rig -.-> waymaker-embassy
   waymaker-rig -.-> waymaker-core
   xtask -.-> waymaker-rig
   xtask -.-> waymaker-fault
