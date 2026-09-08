@@ -1191,7 +1191,9 @@ Stated so that nobody mistakes silence for coverage:
   reported separately, and nothing measures one yet. What *is* true is that it is compiled
   for the part: `ota_update` and `Ota` are generic, and a generic body no caller names is
   type-checked rather than compiled — `nm` on the `thumbv6m` rlib found zero `ota_update`
-  symbols before `ota::Downloader` and `ota::poll_ota` were added to name them. Issue
+  symbols before `ota::Downloader` and `ota::poll_ota` were added to name them. §06's
+  example uses two of the four futures, so the rlib holds two; the size probe drives all
+  four, which is what the `facade` row measures. Issue
   [#38](https://github.com/madmax983/waymaker/issues/38) is where each example's generated
   future size is measured. A handle held across three boundaries is a discipline the OTA
   example demonstrates rather than one anything enforces.

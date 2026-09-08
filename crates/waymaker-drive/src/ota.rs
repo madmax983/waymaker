@@ -18,7 +18,13 @@
 //! [`ota_update`] and [`Ota`] are generic, and a generic body no caller names is
 //! type-checked rather than compiled. [`Downloader`] and [`poll_ota`] are what make the
 //! claim true: they are concrete, so the firmware build monomorphises this workflow's
-//! future, the four façade futures and the bridge, and `nm` on the rlib finds them.
+//! future, [`Bridge`], and the two façade futures §06's example uses —
+//! `ActivityFuture` and `TerminalFuture`. `nm` on the rlib finds them.
+//!
+//! It uses neither `TimerFuture` nor `ContinueFuture`, so neither is in this rlib. The size
+//! probe drives all four, which is what the `facade` row of `cargo xtask size` measures.
+//!
+//! [`Bridge`]: crate::Bridge
 
 use core::convert::Infallible;
 use core::future::Future;

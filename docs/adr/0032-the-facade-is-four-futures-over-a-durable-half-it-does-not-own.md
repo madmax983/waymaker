@@ -148,11 +148,13 @@ deadline that has not passed, because there is no in-boot sleep. The timer futur
 journal again on every poll instead, which is what makes a retained one able to make
 progress; issue #36's dispatcher is where a hardware alarm arrives.
 
-**Two things are compiled for the part, and two were not.** `ota_update` and `Ota` are
-generic, and a generic body no caller names is type-checked rather than compiled: `nm` on
-the `thumbv6m` rlib found zero `ota_update` and zero `ActivityFuture` symbols. `Downloader`
-and `poll_ota` are concrete and name them, so the firmware build monomorphises this
-workflow's future and the four façade futures.
+**A generic body no caller names is compiled for nothing.** `ota_update` and `Ota` are
+generic, so `nm` on the `thumbv6m` rlib found zero `ota_update` and zero `ActivityFuture`
+symbols: the firmware build type-checked them and compiled neither. `Downloader` and
+`poll_ota` are concrete and name them, so it now monomorphises this workflow's future, the
+bridge, and the two futures §06's example uses. It uses neither `TimerFuture` nor
+`ContinueFuture`, so neither is in that rlib; the size probe drives all four, which is what
+the `facade` row measures.
 
 **`continue_as_new` has no implementation that swaps.** `waymaker-drive` refuses with
 `DriveError::ContinueUnsupported`, because §10's swap works on a bank and this driver is
