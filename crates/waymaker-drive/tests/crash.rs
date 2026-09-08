@@ -31,7 +31,8 @@ use core::cell::RefCell;
 
 use waymaker_core::{EffectId, EffectSeq, RecordRef, RunId};
 use waymaker_drive::demo::{
-    BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
+    BOUNDS, DELAYED_BOUNDS, DOWNLOAD, DOWNLOADED, Delayed, HASHED, Pipeline, WORKFLOW_KIND,
+    WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{DriveError, Driver, Scratch};
 use waymaker_fault::{Device, FaultError, Harness, Session};
@@ -739,5 +740,116 @@ fn a_crash_between_an_activity_and_its_completion_barrier_redelivers_the_identic
         unextendable > 0,
         "and no crash in this window tore the outcome frame, so the other half of it was \
          measured by nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The timer records, at every crash point.
+//
+// Issue #33's two records go through the same `Reserved::stage → payload_barrier → commit`
+// sequence as an effect's, so they are swept the same way. What the sweep is *for* is the
+// two properties the effect sweep above holds, restated for a boundary that resolves with a
+// firing rather than with an outcome: history is never invented or reordered, and a run
+// that recovers to a committed `TimerScheduled` still holds a boundary a later boot can
+// close.
+// ---------------------------------------------------------------------------------------
+
+/// One boot of the deadline workflow over `session`, on a world whose epoch is `epoch`.
+fn drive_delayed<S>(storage: &mut S, epoch: u64) -> Result<(), DriveError<S::Error>>
+where
+    S: waymaker_flash::storage::StableStorage,
+{
+    let mut workflow = Delayed::new();
+    let mut world = World::new();
+    world.set_epoch(epoch);
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    Driver::new(region(), RUN, delayed_reserve())
+        .boot(
+            storage,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        )
+        .map(|_| ())
+}
+
+/// §10's reserve for the deadline workflow's bounds.
+fn delayed_reserve() -> Reserve {
+    let Ok(layout) = BankLayout::new(geometry()) else {
+        unreachable!("this geometry holds two erase blocks")
+    };
+    let Ok(reserve) = Reserve::for_layout(DELAYED_BOUNDS, layout) else {
+        unreachable!("the deadline workflow's bounds fit this layout")
+    };
+    reserve
+}
+
+#[test]
+fn a_deadline_recovers_to_a_prefix_at_every_crash_point_and_the_run_carries_on() {
+    // The deadline has already passed at this epoch, so one fault-free boot writes the run,
+    // the timer, its firing, the effect that follows and the terminal record — five records
+    // through the two-barrier writer, and every byte of every one of them is a crash point.
+    let epoch = 1_700_000_001;
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(|session| drive_delayed(session, epoch))
+        .expect("the fault-free run completes");
+    assert!(
+        runs.len() > 1,
+        "the enumeration found crash points to sweep"
+    );
+
+    let whole = recovered(runs.first().expect("the fault-free run is first").image());
+    assert_eq!(
+        whole,
+        [
+            Summary::RunStarted,
+            // A timer summarises as the schedule and outcome pair it is.
+            Summary::EffectScheduled(0),
+            Summary::EffectResolved(0),
+            Summary::EffectScheduled(1),
+            Summary::EffectResolved(1),
+            Summary::Terminal,
+        ]
+    );
+
+    let mut truncated = 0_usize;
+    let mut carried_on = 0_usize;
+    let mut refused = 0_usize;
+    for run in &runs {
+        let history = recovered(run.image());
+        assert!(
+            whole.starts_with(&history),
+            "{:?} is not a prefix of the fault-free history: {history:?}",
+            run.injection()
+        );
+        if history.len() < whole.len() {
+            truncated += 1;
+        }
+
+        // And the crash image is one a later boot either carries on from or refuses before
+        // it writes anything. A `TimerScheduled` the crash committed leaves the run's
+        // boundary open, and §08 gives an open boundary no edge to a terminal record — so a
+        // boot that neither closed it nor refused would be a run stranded by the crash.
+        let Some(mut device) = Device::restored(geometry(), run.image().to_vec()) else {
+            unreachable!("the image is device-sized")
+        };
+        match drive_delayed(&mut device, epoch) {
+            Ok(()) => carried_on += 1,
+            Err(DriveError::NoAppendPoint | DriveError::Recovery(_)) => refused += 1,
+            Err(error) => panic!("a reboot reported {error:?} at {:?}", run.injection()),
+        }
+    }
+    assert!(
+        truncated > 0,
+        "a sweep in which no crash ever shortened history is a sweep that measured nothing"
+    );
+    assert!(
+        carried_on > 0 && refused > 0,
+        "both endings must be reached: {carried_on} carried on, {refused} refused"
     );
 }
