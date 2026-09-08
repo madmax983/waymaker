@@ -2915,8 +2915,8 @@ fn inherent_impl_bodies(code: &str, type_name: &str) -> Vec<String> {
     // *Every* block, not the first. Review of this change pointed out that a second
     // `impl Staged { .. }` further down the file is invisible to a rule that stops at the
     // first, and a private helper in it could program a seal with the pin green.
-    while let Some(at) = code.get(cursor..).and_then(|rest| rest.find("\nimpl")) {
-        let start = cursor.saturating_add(at).saturating_add(1);
+    while let Some(at) = code.get(cursor..).and_then(next_impl_line) {
+        let start = cursor.saturating_add(at);
         let Some(rest) = code.get(start..) else {
             break;
         };
@@ -2934,6 +2934,29 @@ fn inherent_impl_bodies(code: &str, type_name: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Where the next `impl` keyword at the start of a line begins.
+///
+/// The offset of the keyword, not of the newline, because a leading attribute may sit
+/// between them: `#[rustfmt::skip] impl Bank { pub(crate) fn raw() {} }` is one line that
+/// survives `cargo fmt`, and a scan for `"\nimpl"` does not see it. Codex round 3 found the
+/// same blindness in the reader beside this one.
+fn next_impl_line(code: &str) -> Option<usize> {
+    let mut offset = 0_usize;
+    for line in code.split_inclusive('\n') {
+        // A line at the very start of `code` is mid-line as far as this scan is concerned:
+        // the caller resumes from inside a block it has already read.
+        if offset > 0 {
+            let bare = crate::size::without_leading_attributes(line);
+            if bare.starts_with("impl") {
+                let within = line.len().saturating_sub(bare.len());
+                return Some(offset.saturating_add(within));
+            }
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    None
 }
 
 /// The type an inherent `impl` header names, with its generics stripped.
@@ -8526,6 +8549,44 @@ mod deferred_answer_pins {
         .into_iter()
         .map(|function| function.name)
         .collect()
+    }
+
+    #[test]
+    fn an_attribute_on_the_same_line_hides_nothing() {
+        // Codex round 3. Round 1's finding was about `#[rustfmt::skip] impl X { pub fn y()
+        // {} }` — one line — and the fix's own fixture put the attribute on a line of its
+        // own, so it never exercised the form the mutation used. Every classifier in the
+        // reader tests the *start* of a line, so an attribute in front of the item hid the
+        // `impl` and the `pub` alike. rustfmt leaves that line exactly as written.
+        for modifier in ["", "const ", "async ", "unsafe "] {
+            let inline = format!("#[rustfmt::skip] impl Bank {{ pub {modifier}fn raw() {{}} }}\n");
+            assert!(
+                counted(&inline).contains(&"raw".to_owned()),
+                "same-line attribute hid `pub {modifier}fn`"
+            );
+        }
+        // And an attribute in front of an ordinary declaration, which is the same shape one
+        // nesting level down.
+        assert!(counted("#[inline] pub fn raw() {}\n").contains(&"raw".to_owned()));
+        // Two of them, and one carrying a bracket of its own.
+        let stacked = "#[cfg(all(a, b))] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(stacked).contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
+        // The reader beside `public_functions` had the same blindness, and it is what
+        // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
+        // same-line attribute was invisible to both.
+        let module = format!(
+            "{}\n#[rustfmt::skip] impl {CTX_TYPE} {{ pub(crate) fn commit_raw() {{}} }}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("commit_raw")),
+            "{details:?}"
+        );
     }
 
     #[test]

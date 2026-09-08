@@ -48,8 +48,11 @@ default = []
 # `--no-default-features`.
 #
 # What it does not prove: the manifest entry above is not optional, so `waymaker-embassy` is
-# still resolved and built. That the *source* names it in two files and nowhere else is
-# `ctx-facade`'s.
+# still resolved and built, and a compile error inside the façade fails the `drive-facadeless`
+# stage too. So the stage says "no module outside those two needs the façade" and not "this
+# crate builds with the façade deleted". Issue #106 is the crate split that would make the
+# dependency graph say the second. That the *source* names the façade in two files and
+# nowhere else is `ctx-facade`'s.
 without-facade = []
 
 [lints]

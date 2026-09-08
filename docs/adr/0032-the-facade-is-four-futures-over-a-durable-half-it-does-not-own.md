@@ -134,12 +134,21 @@ reason: the façade tells the journal nothing on a stall, and only the driver ho
 identity. `Driver`'s `conclude` now reports the outstanding effect as `Progress::Waiting`,
 which is what `Performed::Pending` reports on the undivided path.
 
-**A negative cargo feature.** `without-facade` is normally an anti-pattern: feature
-unification turns one crate's opt-out into everyone's. It is safe here for a reason
-particular to this crate — nothing depends on it. The alternative, an optional dependency
-off by default, would have taken the façade out of the lint, test, docs and coverage stages,
-which all pass `--no-default-features`. What the build does not prove is that the *manifest*
-entry can go: the dependency is not optional, so `waymaker-embassy` is still resolved.
+**A negative cargo feature, and a claim it does not quite reach.** `without-facade` is
+normally an anti-pattern: feature unification turns one crate's opt-out into everyone's. It
+is safe here for a reason particular to this crate — nothing depends on it. The alternative,
+an optional dependency off by default, would have taken the façade out of the lint, test,
+docs and coverage stages, which all pass `--no-default-features`.
+
+What the `drive-facadeless` build establishes is that no `waymaker-drive` module outside
+`facade.rs` and `ota.rs` *needs* the façade. It does not establish that the crate would build
+with `waymaker-embassy` deleted: the manifest entry is not optional, so that configuration
+still resolves and compiles the façade, and a `compile_error!` inside the façade fails the
+stage. Codex round 3 measured that rather than arguing it. The answer that would say it in
+the dependency graph is to move the two modules into a crate of their own, above
+`waymaker-drive` — which also removes this feature and this stage — and it is issue
+[#106](https://github.com/madmax983/waymaker/issues/106) rather than this change, because a
+restructure taken at the end of a review round is one no round has reviewed.
 
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
@@ -160,6 +169,14 @@ register nothing at all — a halted boot, because there is nothing left to wake
 deadline that has not passed, because there is no in-boot sleep. The timer future asks its
 journal again on every poll instead, which is what makes a retained one able to make
 progress; issue #36's dispatcher is where a hardware alarm arrives.
+
+**The gate's readers had to be fixed twice.** Round 1 found that a public method sharing a
+line with its `impl` was invisible to nine surface pins and to `size-probe-reach`; round 3
+found that the fix read the line's *start*, so an attribute in front of the item —
+`#[rustfmt::skip] impl Bank { pub fn raw() {} }`, which is the exact form of the mutation
+round 1 was about, and which `cargo fmt` leaves alone — hid it again. Leading attributes are
+now set aside before anything classifies a line, in `public_functions` and in the `impl`-body
+reader beside it, so `ctx-facade`'s method pin and `effect-protocol` see through them too.
 
 **A generic body no caller names is compiled for nothing.** `ota_update` and `Ota` are
 generic, so `nm` on the `thumbv6m` rlib found zero `ota_update` and zero `ActivityFuture`

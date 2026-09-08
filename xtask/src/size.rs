@@ -2098,7 +2098,11 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     .filter(|(body_depth, _)| *body_depth == depth)
                     .map_or(Block::Other, |(_, kind)| *kind);
 
-                if let Some(name) = function_name(trimmed) {
+                // Any leading attributes are set aside first: every classifier below reads
+                // the start of the line, and `#[rustfmt::skip] impl X { pub fn y() {} }` is
+                // one line that survives `cargo fmt`.
+                let classified = without_leading_attributes(trimmed);
+                if let Some(name) = function_name(classified) {
                     // A block header and one of its members on the same line —
                     // `#[rustfmt::skip] impl Ctx { pub fn seal_now(..) { .. } }`. Neither
                     // test below sees it: the line does not begin with `pub `, and the
@@ -2106,17 +2110,17 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here = declaration_kind(trimmed);
+                    let declared_here = declaration_kind(classified);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
                     // line ended in `pub` read `impl Bank { pub const fn raw()` as private,
                     // because the prefix ends in the modifier; the same for `pub async`,
                     // `pub unsafe` and `pub extern "C"`. Codex round 1 found it.
-                    let marked_public = trimmed.split_once(" fn ").is_some_and(|(before, _)| {
+                    let marked_public = classified.split_once(" fn ").is_some_and(|(before, _)| {
                         declares_public(before.rsplit('{').next().unwrap_or("").trim())
                     });
-                    let callable = trimmed.starts_with("pub ")
+                    let callable = declares_public(classified)
                         || matches!(enclosing, Block::Trait | Block::TraitImpl)
                         || (inline
                             && (marked_public
@@ -2130,7 +2134,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(trimmed) {
+                if let Some(kind) = declaration_kind(classified) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -2187,6 +2191,41 @@ fn declaration_kind(line: &str) -> Option<Block> {
         });
     }
     None
+}
+
+/// `line` with any leading attributes removed.
+///
+/// `#[rustfmt::skip] impl Bank { pub fn raw() {} }` is one line, survives `cargo fmt`, and
+/// every classifier here reads the start of a line — so an attribute in front of the item
+/// hid the `impl` from `declaration_kind` and the `pub` from the visibility test. Codex
+/// round 3 found it, in the same one-line form round 1's finding was about.
+///
+/// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` and
+/// `#[expect(lint, reason = "]")]` are each one attribute.
+pub(crate) fn without_leading_attributes(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    while let Some(after) = rest.strip_prefix("#[") {
+        let mut depth = 1_u32;
+        let mut end = None;
+        for (index, character) in after.char_indices() {
+            match character {
+                '[' => depth = depth.saturating_add(1),
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index.saturating_add(1));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end.and_then(|end| after.get(end..)) else {
+            return rest;
+        };
+        rest = end.trim_start();
+    }
+    rest
 }
 
 /// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.
