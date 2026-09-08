@@ -10,8 +10,17 @@
 //!
 //! [`ReplayCursor`] — the position, the run's effect identity, and the rules that say
 //! which record may legally follow which. [`Position`] is where the cursor stands,
-//! [`PendingEffect`] is the first unresolved effect when there is one, and [`Step`] is what
-//! a record meant once the cursor placed it in the run's order.
+//! [`PendingEffect`] is the first unresolved effect when there is one, [`PendingTimer`] is
+//! the armed timer when there is one, and [`Step`] is what a record meant once the cursor
+//! placed it in the run's order.
+//!
+//! # Timers are boundaries, not a second table
+//!
+//! Design document §11 and issue
+//! [#33](https://github.com/madmax983/waymaker/issues/33). A timer is a second kind of
+//! unresolved boundary, and it takes its sequence from the same allocator an activity does.
+//! One ordered history follows: a run has at most one open boundary, of either kind, and a
+//! `(RunId, EffectSeq)` names exactly one of them.
 //!
 //! # What this module must not own
 //!
@@ -61,6 +70,7 @@ use crate::activity::ActivityKind;
 use crate::error::KernelError;
 use crate::id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
 use crate::record::RecordRef;
+use crate::timer::ClockKind;
 
 /// An effect whose durable intent is committed and whose outcome is not.
 ///
@@ -88,18 +98,51 @@ pub struct PendingEffect {
     pub input_crc: u32,
 }
 
+/// A timer whose durable intent is committed and whose firing is not.
+///
+/// The timer half of [`PendingEffect`], and the same shape for the same reason: a run has
+/// at most one open boundary, and this is what the cursor reports when that boundary is a
+/// timer.
+///
+/// # Invariants
+///
+/// * `id.run` is the cursor's run, paired here rather than stored in the record. §07 keeps
+///   the run id in the bank header.
+/// * `clock_kind`, `deadline` and `armed_at` are what the schedule record recorded, moved
+///   rather than recomputed. The kernel reads no clock, so it cannot have produced any of
+///   them.
+/// * `clock_kind` is not checked against the firmware's capability here. That check needs
+///   a capability, which is a fact about hardware rather than about history — it is
+///   [`ReplayMachine::timer_intent`](crate::ReplayMachine::timer_intent)'s, and it answers
+///   [`KernelError::IncompatibleWorkflow`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PendingTimer {
+    /// The stable identity this timer was armed under.
+    pub id: EffectId,
+    /// Which clock the deadline is stated against, as history recorded it.
+    pub clock_kind: ClockKind,
+    /// The deadline, in that clock's unit.
+    pub deadline: u64,
+    /// The reading the timer was armed at.
+    pub armed_at: u64,
+}
+
 /// Where the cursor stands in history.
 ///
-/// Six positions, and the reachable transitions between them are the whole of what a legal
+/// Seven positions, and the reachable transitions between them are the whole of what a legal
 /// history is:
 ///
 /// ```text
 ///   BeforeRun --RunStarted--> Replaying --EffectScheduled--> AwaitingOutcome
-///                             |  |  ^                              |
+///                             ^  |  ^                              |
 ///                             |  |  +--EffectCompleted/Failed------+
 ///                             |  |
-///                             |  +--RunCompleted--> RunCompleted (terminal)
-///                             +-----RunFailed-----> RunFailed    (terminal)
+///                             |  +-----TimerScheduled--------> AwaitingTimer
+///                             |                                     |
+///                             +---------TimerFired------------------+
+///
+///   Replaying --RunCompleted--> RunCompleted (terminal)
+///   Replaying --RunFailed-----> RunFailed    (terminal)
 ///
 ///   any position --a record that could not follow--> Halted(MalformedHistory)
 ///   Replaying    --a legal schedule past EffectSeq::MAX--> Halted(IdExhausted)
@@ -125,6 +168,8 @@ pub enum Position {
     Replaying,
     /// A schedule is committed with no outcome: [`ReplayCursor::pending`] names it.
     AwaitingOutcome,
+    /// A timer is armed with no firing: [`ReplayCursor::pending_timer`] names it.
+    AwaitingTimer,
     /// A [`RunCompleted`](RecordRef::RunCompleted) record was consumed. Terminal.
     RunCompleted,
     /// A [`RunFailed`](RecordRef::RunFailed) record was consumed. Terminal.
@@ -142,7 +187,8 @@ impl Position {
     /// # Postconditions
     ///
     /// True for exactly [`RunCompleted`](Self::RunCompleted) and
-    /// [`RunFailed`](Self::RunFailed). [`Halted`](Self::Halted) is deliberately *not*
+    /// [`RunFailed`](Self::RunFailed). An open boundary of either kind is not terminal:
+    /// §08 has no edge from one to a terminal record. [`Halted`](Self::Halted) is deliberately *not*
     /// terminal in this sense: a run that stopped being recoverable is not a run that
     /// finished, and a driver that treated the two alike would report a corrupt journal as
     /// a successful workflow.
@@ -201,6 +247,14 @@ pub enum Step<'a> {
         /// The recorded failure payload, opaque to the kernel.
         error: &'a [u8],
     },
+    /// A timer's durable intent. Until its firing arrives this is the run's open
+    /// boundary, and [`ReplayCursor::pending_timer`] keeps naming it.
+    TimerScheduled(PendingTimer),
+    /// The timer fired. Replay hands the workflow back nothing but the fact.
+    TimerFired {
+        /// The timer this firing resolves.
+        id: EffectId,
+    },
     /// The run finished successfully. Terminal: nothing may follow.
     RunCompleted {
         /// The workflow's recorded result, opaque to the kernel.
@@ -226,6 +280,19 @@ struct Scheduled {
     input_crc: u32,
 }
 
+/// The timer the cursor is holding a firing open for.
+///
+/// [`Scheduled`]'s twin, and deliberately not a [`PendingTimer`]: the run id is already in
+/// the allocator, and storing it twice would charge the 128-byte kernel-state budget for a
+/// number the cursor cannot disagree with itself about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenTimer {
+    seq: EffectSeq,
+    clock_kind: ClockKind,
+    deadline: u64,
+    armed_at: u64,
+}
+
 /// The cursor's position, with what each position needs to remember.
 ///
 /// The public [`Position`] is a projection of this. They are separate types because the
@@ -237,6 +304,7 @@ enum State {
     BeforeRun,
     Replaying,
     AwaitingOutcome(Scheduled),
+    AwaitingTimer(OpenTimer),
     RunCompleted,
     RunFailed,
     Halted(KernelError),
@@ -314,6 +382,7 @@ impl ReplayCursor {
             State::BeforeRun => Position::BeforeRun,
             State::Replaying => Position::Replaying,
             State::AwaitingOutcome(_) => Position::AwaitingOutcome,
+            State::AwaitingTimer(_) => Position::AwaitingTimer,
             State::RunCompleted => Position::RunCompleted,
             State::RunFailed => Position::RunFailed,
             State::Halted(error) => Position::Halted(error),
@@ -343,6 +412,33 @@ impl ReplayCursor {
                 kind: scheduled.kind,
                 input_len: scheduled.input_len,
                 input_crc: scheduled.input_crc,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The run's armed timer, when history left one unresolved.
+    ///
+    /// [`pending`](Self::pending)'s twin. The three recorded fields are what a driver needs
+    /// to re-arm the same deadline after a reset: the kind says which clock measures it,
+    /// the deadline says what to wait for, and the arming reading is the monotonicity floor
+    /// that RAM did not keep.
+    ///
+    /// # Postconditions
+    ///
+    /// `Some` exactly when `position() == Position::AwaitingTimer`, and `None` everywhere
+    /// else — a halted cursor included, for [`pending`](Self::pending)'s reason.
+    #[must_use]
+    pub const fn pending_timer(&self) -> Option<PendingTimer> {
+        match self.state {
+            State::AwaitingTimer(armed) => Some(PendingTimer {
+                id: EffectId {
+                    run: self.ids.run(),
+                    seq: armed.seq,
+                },
+                clock_kind: armed.clock_kind,
+                deadline: armed.deadline,
+                armed_at: armed.armed_at,
             }),
             _ => None,
         }
@@ -454,6 +550,55 @@ impl ReplayCursor {
         }
     }
 
+    /// Spends `seq` on the boundary that just committed, and pairs it with the run.
+    ///
+    /// The one place a sequence moves, shared by both kinds of boundary — which is what
+    /// makes issue #33's "one ordered history" a fact about this function rather than a
+    /// discipline over two arms.
+    ///
+    /// Checked against the allocator rather than trusted from the record: the allocator is
+    /// the one thing that cannot issue a sequence twice or wrap, so "history's sequences are
+    /// the ones this run would have issued, in order" is checked by the same type that
+    /// guarantees it going forwards.
+    ///
+    /// Compared before anything moves. A rejected record must leave the counter where it
+    /// was, or `next_seq` on the halted cursor would report a sequence history never
+    /// committed — and the run id in an `EffectId` handed to a dispatcher would be one
+    /// nothing on media accounts for.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::MalformedHistory`] when `seq` is not the one this run would issue
+    /// next, and [`KernelError::IdExhausted`] when the space is spent. The second needs a
+    /// run that has committed `EffectSeq::MAX` schedules — 2^32 records at the frame's
+    /// 16-byte floor, or 64 GiB — so no test here walks to it; the ceiling is exercised in
+    /// [`EffectIdAllocator`].
+    #[allow(
+        clippy::inline_always,
+        reason = "two call sites and a `Result` return, so `opt-level = \"z\"` outlines it: \
+                  measured, that costs 124 B of a 12 KiB budget for the whole engine, which \
+                  is more than this rung had left"
+    )]
+    #[inline(always)]
+    const fn commit(&mut self, seq: EffectSeq) -> Result<EffectId, KernelError> {
+        let Some(expected) = self.ids.peek() else {
+            return Err(KernelError::IdExhausted);
+        };
+        if expected.0 != seq.0 {
+            return Err(KernelError::MalformedHistory);
+        }
+        // `resume` is the documented replay path — "continue *after* the highest committed
+        // sequence" — and this is a record that has just been committed, so it is exactly
+        // that call. Using it rather than `allocate` keeps one ceiling check instead of two,
+        // and keeps the counter a pure function of history: nothing but a committed schedule
+        // ever moves it.
+        self.ids = EffectIdAllocator::resume(self.ids.run(), Some(seq));
+        Ok(EffectId {
+            run: self.ids.run(),
+            seq,
+        })
+    }
+
     /// The transition itself, without the halting.
     ///
     /// Split out so that [`advance`](Self::advance) owns "a failure is sticky" in one place
@@ -464,8 +609,51 @@ impl ReplayCursor {
     /// [`RecordRef`] later would then need an arm per position before it compiled, when the
     /// right default for a record this rung does not understand is exactly the refusal §09
     /// asks for.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transition table over two boundary kinds: every arm is a legal \
+                  transition, and splitting them would put the state twice in two decision \
+                  trees against a 12 KiB budget for the whole engine"
+    )]
     const fn transition<'a>(&mut self, record: RecordRef<'a>) -> Result<Step<'a>, KernelError> {
         match (self.state, record) {
+            (
+                State::Replaying,
+                RecordRef::TimerScheduled {
+                    seq,
+                    clock_kind,
+                    deadline,
+                    armed_at,
+                },
+            ) => {
+                // The same allocator an activity goes through: one sequence space is what
+                // makes history one order rather than two interleaved ones.
+                let id = match self.commit(seq) {
+                    Ok(id) => id,
+                    Err(error) => return Err(error),
+                };
+                self.state = State::AwaitingTimer(OpenTimer {
+                    seq,
+                    clock_kind,
+                    deadline,
+                    armed_at,
+                });
+                Ok(Step::TimerScheduled(PendingTimer {
+                    id,
+                    clock_kind,
+                    deadline,
+                    armed_at,
+                }))
+            }
+            (State::AwaitingTimer(open), RecordRef::TimerFired { seq }) if open.seq.0 == seq.0 => {
+                self.state = State::Replaying;
+                Ok(Step::TimerFired {
+                    id: EffectId {
+                        run: self.ids.run(),
+                        seq,
+                    },
+                })
+            }
             (
                 State::BeforeRun,
                 RecordRef::RunStarted {
@@ -490,35 +678,9 @@ impl ReplayCursor {
                     input_crc,
                 },
             ) => {
-                // Checked against the allocator rather than trusted from the record: the
-                // allocator is the one thing that cannot issue a sequence twice or wrap, so
-                // "history's sequences are the ones this run would have issued, in order"
-                // is checked by the same type that guarantees it going forwards.
-                //
-                // Compared before anything moves. A rejected record must leave the counter
-                // where it was, or `next_seq` on the halted cursor would report a sequence
-                // history never committed — and the run id in an `EffectId` handed to a
-                // dispatcher would be one nothing on media accounts for.
-                let Some(expected) = self.ids.peek() else {
-                    // The run has committed `EffectSeq::MAX` schedules. Unreachable at any
-                    // journal size a device has: 2^32 records at the frame's 16-byte floor
-                    // is 64 GiB. It is here because the ceiling is real, not because a test
-                    // can walk to it — see `EffectIdAllocator`, where exhaustion *is*
-                    // exercised.
-                    return Err(KernelError::IdExhausted);
-                };
-                if expected.0 != seq.0 {
-                    return Err(KernelError::MalformedHistory);
-                }
-                // `resume` is the documented replay path — "continue *after* the highest
-                // committed sequence" — and this is a record that has just been committed,
-                // so it is exactly that call. Using it rather than `allocate` keeps one
-                // ceiling check instead of two, and keeps the counter a pure function of
-                // history: nothing but a committed schedule ever moves it.
-                self.ids = EffectIdAllocator::resume(self.ids.run(), Some(seq));
-                let id = EffectId {
-                    run: self.ids.run(),
-                    seq,
+                let id = match self.commit(seq) {
+                    Ok(id) => id,
+                    Err(error) => return Err(error),
                 };
                 self.state = State::AwaitingOutcome(Scheduled {
                     seq,
@@ -587,7 +749,7 @@ impl ReplayCursor {
 // all. A `&'static mut [u8]` is sixteen bytes and needs no lifetime parameter. What rules
 // that out is the *absence* of a lifetime parameter for a non-`'static` page, plus this
 // number being too small for an inline one — and review for the rest.
-const _: () = assert!(size_of::<ReplayCursor>() == 32);
+const _: () = assert!(size_of::<ReplayCursor>() == 48);
 
 #[cfg(test)]
 mod tests {
@@ -597,7 +759,7 @@ mod tests {
     use crate::record::RecordRef;
 
     /// Every internal state, so the projection below has something to be total over.
-    const EVERY_STATE: [State; 6] = [
+    const EVERY_STATE: [State; 7] = [
         State::BeforeRun,
         State::Replaying,
         State::AwaitingOutcome(super::Scheduled {
@@ -605,6 +767,12 @@ mod tests {
             kind: crate::activity::ActivityKind(1),
             input_len: 0,
             input_crc: 0,
+        }),
+        State::AwaitingTimer(super::OpenTimer {
+            seq: crate::id::EffectSeq(3),
+            clock_kind: crate::timer::ClockKind::AFTER_BOOT,
+            deadline: 5,
+            armed_at: 1,
         }),
         State::RunCompleted,
         State::RunFailed,
@@ -639,12 +807,13 @@ mod tests {
             Position::BeforeRun,
             Position::Replaying,
             Position::AwaitingOutcome,
+            Position::AwaitingTimer,
             Position::RunCompleted,
             Position::RunFailed,
             Position::Halted(KernelError::MalformedHistory),
         ]
         .map(Position::is_terminal);
-        assert_eq!(terminal, [false, false, false, true, true, false]);
+        assert_eq!(terminal, [false, false, false, false, true, true, false]);
     }
 
     #[test]

@@ -205,6 +205,7 @@ fn engine() -> usize {
     kept = kept.wrapping_add(journal_append());
     kept = kept.wrapping_add(replay_cursor());
     kept = kept.wrapping_add(transition_table());
+    kept = kept.wrapping_add(transition_timers());
     kept = kept.wrapping_add(timers());
 
     core::hint::black_box(kept)
@@ -221,7 +222,7 @@ fn engine() -> usize {
 #[cfg(feature = "engine")]
 #[inline(never)]
 fn timers() -> usize {
-    use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
+    use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 
     // The whole spec and the whole capability go through `black_box`, not just the numbers
     // inside them. Codex found the version that boxed only the `ticks`: the discriminant was
@@ -255,6 +256,32 @@ fn timers() -> usize {
             }
             Err(error) => error.message().len(),
         },
+    );
+
+    // Issue #33's round trip: a spec becomes a clock kind and a number on media, and comes
+    // back. Both arms of `recorded` are reached — the kind above is one the format spends,
+    // and the one below is not — so the row charges for the refusal that stops an erased
+    // byte decoding as a policy.
+    kept = kept.wrapping_add(usize::try_from(spec.deadline()).unwrap_or(0));
+    kept = kept.wrapping_add(
+        TimerSpec::recorded(spec.clock_kind(), core::hint::black_box(7))
+            .map_or(0, |round| usize::from(round.clock_kind().0)),
+    );
+    kept = kept.wrapping_add(
+        TimerSpec::recorded(ClockKind(core::hint::black_box(0)), 1)
+            .map_or(1, |round| usize::from(round.clock_kind().0)),
+    );
+    // What a recorded arming reading means after a reset. Both arms are reached: the spec
+    // above is the persistent one, and the boot one is drawn beside it, so the row charges
+    // for the branch that stops a reset stranding a run.
+    kept = kept.wrapping_add(
+        usize::try_from(spec.rearmed_at(core::hint::black_box(5_000), 200)).unwrap_or(0),
+    );
+    kept = kept.wrapping_add(
+        usize::try_from(
+            core::hint::black_box(TimerSpec::AfterBoot { ticks: 50 }).rearmed_at(5_000, 200),
+        )
+        .unwrap_or(0),
     );
 
     core::hint::black_box(kept)
@@ -319,6 +346,13 @@ fn replay_cursor() -> usize {
             .pending()
             .map_or(0, |pending| usize::from(pending.input_len)),
     );
+    // `None` here — an effect is open, not a timer — which is the arm that costs the
+    // projection its refusal. `transition_timers` reaches the `Some`.
+    kept = kept.wrapping_add(
+        cursor
+            .pending_timer()
+            .map_or(0, |timer| usize::from(timer.clock_kind.0)),
+    );
     kept = kept.wrapping_add(
         cursor
             .next_seq()
@@ -355,6 +389,7 @@ fn replay_cursor() -> usize {
         Position::BeforeRun
         | Position::Replaying
         | Position::AwaitingOutcome
+        | Position::AwaitingTimer
         | Position::RunCompleted
         | Position::RunFailed => 0,
     });
@@ -540,6 +575,119 @@ fn transition_recovery() -> usize {
     core::hint::black_box(kept)
 }
 
+/// The timer boundary of design document §11: the same five rows, asked of a deadline.
+///
+/// A function of its own for [`transition_divergence`]'s reason. Every arm the boundary can
+/// take is reached — a fresh deadline, a recorded one, the firing that answers it, the
+/// re-arming that does not, and the refusal a firmware with no persistent clock gives — so
+/// the delta charges for the whole of issue
+/// [#33](https://github.com/madmax983/waymaker/issues/33) rather than for its happy path.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn transition_timers() -> usize {
+    use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
+    use waymaker_core::transition::{Next, ReplayMachine, TimerIntent, TimerRequest, TimerResolve};
+    use waymaker_core::{EffectSeq, RecordRef, RunId};
+
+    let request = TimerRequest {
+        spec: core::hint::black_box(TimerSpec::AtPersistentTime { instant: 2_000 }),
+        capability: core::hint::black_box(ClockCapability::Persistent),
+    };
+    let mut machine = ReplayMachine::new(RunId(core::hint::black_box(5)));
+    let mut kept = match machine.advance(RecordRef::RunStarted {
+        workflow_kind: core::hint::black_box(1),
+        workflow_version: core::hint::black_box(1),
+        input: core::hint::black_box(b"in"),
+    }) {
+        Ok(_) => 0,
+        Err(error) => error.message().len(),
+    };
+
+    // Row 3: a deadline history has not seen.
+    kept = kept.wrapping_add(match machine.timer_intent(request, Next::EndOfHistory) {
+        Ok(TimerIntent::Schedule { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+        Ok(TimerIntent::Recorded { .. } | TimerIntent::Finished { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
+
+    let recorded = RecordRef::TimerScheduled {
+        seq: core::hint::black_box(EffectSeq::FIRST),
+        clock_kind: ClockKind(core::hint::black_box(ClockKind::AT_PERSISTENT_TIME.0)),
+        deadline: core::hint::black_box(2_000),
+        armed_at: core::hint::black_box(1_000),
+    };
+    // Rows 1 and 2's first half, and the projection that names the open boundary.
+    kept = kept.wrapping_add(
+        match machine.timer_intent(request, Next::Record(recorded)) {
+            Ok(TimerIntent::Recorded { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+            Ok(TimerIntent::Schedule { .. } | TimerIntent::Finished { .. }) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        machine
+            .pending_timer()
+            .map_or(0, |open| usize::try_from(open.armed_at).unwrap_or(0)),
+    );
+    // Row 2: the intent is committed and the firing is not, so the deadline comes back off
+    // media. This is the arm that rebuilds a spec from a recorded clock kind.
+    kept = kept.wrapping_add(match machine.timer_outcome(Next::EndOfHistory) {
+        Ok(TimerResolve::Rearm { spec, armed_at, .. }) => {
+            usize::from(spec.clock_kind().0).wrapping_add(usize::try_from(armed_at).unwrap_or(0))
+        }
+        Ok(TimerResolve::Fired { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
+    // Row 1: the firing is in history, so replay answers it and arms nothing.
+    //
+    // On a machine of its own, because the one above has re-armed: `timer_outcome` settles
+    // the *phase* and leaves the cursor at `AwaitingTimer`, so a second `timer_intent` on it
+    // diverges at the boundary gate and the firing arm is never reached. Codex found that,
+    // and the consequence is the one this row exists to prevent — a path the probe claims to
+    // charge for that fat LTO is free to strip.
+    let mut fired = ReplayMachine::new(RunId(core::hint::black_box(7)));
+    kept = kept.wrapping_add(
+        match fired.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(match fired.timer_intent(request, Next::Record(recorded)) {
+        Ok(TimerIntent::Recorded { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+        Ok(TimerIntent::Schedule { .. } | TimerIntent::Finished { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
+    kept = kept.wrapping_add(
+        match fired.timer_outcome(Next::Record(RecordRef::TimerFired {
+            seq: core::hint::black_box(EffectSeq::FIRST),
+        })) {
+            Ok(TimerResolve::Fired { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+            Ok(TimerResolve::Rearm { .. }) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    // The refusal §02 decision 8 exists for: a firmware with no persistent clock meeting a
+    // journal an RTC wrote.
+    kept = kept.wrapping_add(
+        match ReplayMachine::new(RunId(core::hint::black_box(6))).timer_intent(
+            TimerRequest {
+                capability: core::hint::black_box(ClockCapability::BootOnly),
+                ..request
+            },
+            Next::Record(recorded),
+        ) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
+    core::hint::black_box(kept)
+}
+
 /// Row 4 of the table: the refusal, its sticky diagnosis, and the pure rule behind it.
 ///
 /// A function of its own rather than more lines in [`transition_table`], because the
@@ -604,6 +752,7 @@ fn transition_divergence() -> usize {
         Position::BeforeRun
         | Position::Replaying
         | Position::AwaitingOutcome
+        | Position::AwaitingTimer
         | Position::RunCompleted
         | Position::RunFailed => 0,
     });

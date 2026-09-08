@@ -118,10 +118,15 @@ impl Record {
     const fn of(record: &RecordRef<'_>) -> Self {
         match *record {
             RecordRef::RunStarted { .. } => Self::Started,
-            RecordRef::EffectScheduled { seq, .. } => Self::Schedule(seq.0),
-            RecordRef::EffectCompleted { seq, .. } | RecordRef::EffectFailed { seq, .. } => {
-                Self::Outcome(seq.0)
+            // As in `tests/crash.rs`: a timer is a schedule and a firing is its outcome, so
+            // the two share those arms. The workload here waits for nothing, so neither
+            // timer arm is reached.
+            RecordRef::EffectScheduled { seq, .. } | RecordRef::TimerScheduled { seq, .. } => {
+                Self::Schedule(seq.0)
             }
+            RecordRef::EffectCompleted { seq, .. }
+            | RecordRef::EffectFailed { seq, .. }
+            | RecordRef::TimerFired { seq } => Self::Outcome(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }

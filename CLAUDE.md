@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 47 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 48 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -469,7 +469,11 @@ layers instead —
 [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
 Of rung 0.5's 18386 B, **7534 B is the probe's own arithmetic and 10852 B is the layers'**,
 so the gate comes down from 18 KiB to **12 KiB** — a cut of 6 KiB, not a raise, and 1436 B
-of room for issue #33's record bodies. Every byte no symbol attributes to the probe stays
+of room for issue #33's record bodies. They cost **1370 B** of it, so the layers now measure
+**12222 B** of 12288 with 66 B left and no raise asked for —
+[ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md), which also
+says plainly that rung 0.4 does not fit under it and needs issue #72's kind of accounting
+rather than a third raise. Every byte no symbol attributes to the probe stays
 charged to the layers: `.rodata` strings, `compiler_builtins`, the `__aeabi_*` helpers and
 the padding between functions. The report prints `Δflash`, `probe` and `layers` on every row
 of every run, so the split is legible rather than taken on trust.
@@ -557,7 +561,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 47 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 48 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -570,6 +574,7 @@ this table is how you find out what a red build is telling you.
 | `kernel-owns-no-encoding` | A `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its five siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>`. `kernel-zero-dependencies` stops the kernel *importing* a serialization framework; this stops it *writing* one, which needs no dependency and no `pub`. A floor, not a proof: a hand-rolled shift-and-or loop is still a review question. |
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
+| `timer-record-fields` | `RecordRef::TimerScheduled` or `RecordRef::TimerFired` declares a field set other than `source::TIMER_RECORD_FIELDS`, in either direction — or the `enum RecordRef` body is gone, so the pin checks nothing. `effect-scheduled-fields`'s twin, and a rule of its own because the two settle different things: ADR 0011 settled how much metadata a scheduled effect carries, and this settles which facts about *time* reach media. Two fields are the point. §11 says a persistent timer record includes its clock kind "so recovery cannot silently reinterpret one policy as another": a record carrying the deadline alone decodes without error and means something else after a firmware change, and nothing downstream can tell. And `armed_at` is the monotonicity floor a persistent deadline is measured against — it lives in RAM, a power cut takes RAM, and this is what carries it across the reset. In the other direction a `remaining`, a `fired_at` or a payload on the firing is bytes on every timer for the life of the format. What it cannot see is a *width*: it compares names, so a `deadline` narrowed to a `u32` is `crates/waymaker-flash/tests/frame.rs`'s golden bytes. [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md). |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts, in any of the four files that have one. In `waymaker-flash/src/frame.rs`: a body pinned by `source::SEALING_FUNCTIONS` stops computing the seals its row names exactly once, or the file names `crc16` or `crc32` anywhere outside `input_digest` — the one documented exception, because a `const fn` cannot go through a trait method — or `decode_with` and `frame_len_of_with` stop verifying a header through `verify_header_with`, or the scan's `next` stops walking with `decode_with`. The rows are *derived* rather than whitelisted: a function generic over the check that no row pins is a body that can compute a seal and is pinned by nothing, and the scan that finds them reads joined signatures and generic `impl` blocks, because a `where` clause and a method in `impl<C: IntegrityCheck>` each escaped a one-line scan. The same in `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names. And in `waymaker-flash/src/append.rs`, which is the writer: its `stage` must reach the codec through `frame::encode_with::<C>` — one call covers both the frame and its commit seal, because the seal is derived from the check the codec just computed — and it may name neither a checksum function nor a seal method. Without it, `frame::encode` in place of the generic sibling would seal every appended record with the shipped check whatever the recovery that positioned the writer verified with, which is a journal one half of a firmware can read. And in `waymaker-flash/src/recovery.rs`, which computes no seal at all: its two steps must reach the codec through `frame::decode_with::<C>` and `frame::frame_len_of_with::<C>`, and the file may name neither a checksum function nor a seal method — `Recovery<C>`'s parameter is a promise that a journal is verified with the algorithm that sealed it, and dropping both turbofishes passed every rule and every test before this existed. And in `waymaker-flash/src/swap.rs`, which installs a bank: its `stage` must reach the bank codec through `bank::encode_header_with::<C>`, `bank::seal_for_with::<C>` and `bank::encode_seal_with::<C>`, and the file may name neither a checksum function nor a seal method — a device whose two banks were sealed by two algorithms is a device only half of which boots. A trait nothing is obliged to call is a swap point that selects nothing. A firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
@@ -1079,6 +1084,37 @@ Stated so that nobody mistakes silence for coverage:
   ran at the wrong rate produces deadlines this code cannot fault, because it has no second
   source to disagree with. That is design document §11's own division of labour — the clock
   is the driver's — and issue #34's board test is where a real one is measured.
+- **How long a boot deadline really waits once a reset has happened.**
+  `TimerSpec::rearmed_at` measures an `AfterBoot` interval from the lower of the recorded
+  arming reading and the clock now, so the interval accrues within a power cycle and restarts
+  across one — which is what stops a reset stranding the run for ever with
+  `ClockWentBackwards` on a boundary §08 gives no way to close. What it cannot do is tell a
+  reset from an in-boot re-drive once the new cycle's clock has climbed back past the old
+  mark: there the interval accrues from that mark, and a 1000-tick deadline armed at 5000 is
+  reached at 6000 ticks of the new cycle.
+  `a_boot_deadline_carried_across_a_reset_waits_longer_than_it_asked_for` measures it rather
+  than describing it. A boot clock offers no reset evidence at all, which is §11's own reason
+  for calling this deadline not power-loss durable; a reset-cause register and retained RAM
+  are a board's, and issue #34 is where a real one is met.
+- **That a timer's capacity reserve is exact.** `Reserve::exit_bytes_after` prices a
+  `TimerScheduled` at an `EffectScheduled`'s figure — the outcome record the run's bounds
+  declare, plus a terminal record. A `TimerFired` has no payload, so it is never wider than
+  that: the reserve holds back a few bytes more than a timer needs and never fewer, which
+  refuses slightly early in the last moments of a bank's life. The approximation errs in the
+  safe direction and is stated rather than discovered; pricing it exactly is a third term in a
+  sum on a firmware with 66 B of code budget left.
+- **That a firmware's declared clock capability is the hardware it has.**
+  `Clocks::capability` and `ClockCapability` are the firmware's word, and `timer_intent`
+  believes it exactly as `Swap::beginning` believes the two arguments it is handed. The
+  witness is `waymaker-embassy`'s `PersistentTimer::arm`, which takes a `&mut C:
+  PersistentClock`, and nothing obliges a caller to take that path. Joining the two by
+  construction is rung 0.4's dispatcher — the same standing as "nothing obliges a future
+  dispatcher to use the gated writer".
+- **When a timer fired.** `TimerFired` carries a sequence and no body, so a journal says that
+  a deadline passed and never when. Replay hands the workflow back the fact and nothing else,
+  which is all `Boundary::wait` returns; a firing reading would be a second `u64` on media
+  that nothing reads. It can be added later behind the same record number, which is what §09's
+  forward-compatibility rule is for. ADR 0030 records the loss rather than hiding it.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -1635,9 +1671,51 @@ layer body into a probe symbol, and that body is then charged to the probe — t
 row is the visible case, where `waymaker-embassy` carries no symbol at all. See
 [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
 
+Issue #33 then puts §11's deadlines on media, which is the last thing §09's v0.1 record
+table owed. `TimerScheduled` carries a sequence, a clock kind, a deadline and the reading it
+was armed at; `TimerFired` carries a sequence and nothing else. The clock kind is the field
+§11 asks for by name — "a persistent timer record includes its clock kind so recovery cannot
+silently reinterpret one policy as another" — and the failure it prevents is the quiet one: a
+firmware built without an RTC replaying a journal an RTC wrote, with no checksum failing and
+no frame malformed. The arming reading is the field that reads as redundant and is not. A
+persistent deadline's monotonicity floor lives in RAM, a power cut takes RAM, and ADR 0028
+named this record as what would carry it across the reset.
+An unknown clock-kind byte is not a policy at either layer: `TimerSpec::recorded` is total
+with no wildcard arm, so the codec refuses such a body with `MalformedRecord` and the kernel
+with `IncompatibleWorkflow` — a `_ =>` on that path is how a zeroed page becomes a boot
+deadline. A recorded clock this firmware cannot service is `IncompatibleWorkflow` and never a
+substitution, which is issue #33's fourth work item and the distinction from
+`NoPersistentClock`: one is this firmware refusing what a workflow asks for now, the other is
+this firmware refusing history that already exists.
+Timers share the run's sequence space and its cursor — `ReplayCursor` gains one state beside
+`AwaitingOutcome`, a timer takes its sequence from the same allocator an activity does, and a
+run has at most one open boundary of either kind — which is #33's "one ordered history, not a
+parallel timer table" as a representation rather than a convention. §08's five rows are asked
+of a deadline through a second pair of calls, `timer_intent` and `timer_outcome`, and
+`Intent`, `Resolve`, `Next`, `Outcome` and `EffectRequest` did not move: issue #28's "adding
+a new record kind does not change this signature" survived the first two of the five bodies
+it was written against, and `kernel-boundary` now pins all eight types.
+Both "done when"s are driven rather than argued. `waymaker-drive` grows `Clocks` beside
+`Activities` and `Boundary::wait` beside `call`, and reading a clock is the only thing that
+driver does to timing hardware — so "replay of a fired timer re-arms nothing" is a counted
+call, and `replaying_a_fired_timer_reads_no_clock_at_all` requires zero. The second flips the
+kind byte *on media* and re-seals the frame with the real codec, so what recovery meets is a
+frame a writer could have written: the firmware with the clock refuses it as a divergence and
+the firmware without one refuses it as an incompatible workflow.
+Two numbers are worth recording. The record bodies cost **1370 B** of the 1436 B ADR 0029
+left for them, so the layers measure 12222 B of a 12288 B gate with 66 B to spare and no
+raise asked for; and kernel state goes from 88 B to 104 B of 128, because a timer's recorded
+state is 24 bytes where an effect's digest is 12. Both say the same thing about rung 0.4.
+What is owed is written down: a `TimerFired` records no firing time, the capacity reserve
+prices a timer at an effect's figure and so over-reserves by a few bytes, an `AfterBoot`
+timer's recorded arming reading is meaningless after the reset that cleared its clock, and
+this driver polls rather than sleeps — §11's in-boot sleep and a dispatcher that arms a
+hardware alarm are rung 0.4's. See
+[ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md).
+
 The kernel-state registry has three entries — the replay machine, the record view and an
-armed timer — so the 128 B budget is a number about something, and 88 B of it is spent. The
-`TimerScheduled`/`TimerFired` records are issue #33's, the RTC driver and the board test are
-issue #34's, and the async `Ctx`, the dispatcher and in-boot sleep arrive with 0.4. The
+armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
+RTC driver and the board test are issue #34's, and the async `Ctx`, the dispatcher and
+in-boot sleep arrive with 0.4. The
 gates went in before the code they govern, which is the point: a gate retrofitted after
 coverage has slipped is a gate that ratifies the slip.

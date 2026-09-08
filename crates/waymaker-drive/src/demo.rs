@@ -9,13 +9,17 @@
 //! [`Pipeline`] is also the shape a workflow has to have against a synchronous boundary:
 //! every result is copied into the workflow's own storage before the next call, because the
 //! borrow it arrived in ends there.
+//!
+//! [`Delayed`] is the same for design document §11: a run that waits for a durable deadline
+//! and then performs one effect, so a test can watch the two share one sequence space.
 
+use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 use crate::effect::DurableIntent;
 use waymaker_flash::capacity::Bounds;
 
-use crate::activity::{Activities, Performed};
+use crate::activity::{Activities, Clocks, Performed};
 use crate::boundary::{Boundary, Suspended};
 use crate::workflow::{Identity, Workflow};
 
@@ -140,6 +144,94 @@ impl Workflow for Pipeline {
     }
 }
 
+/// [`Delayed`]'s kind, as its `RunStarted` record records it.
+pub const DELAYED_KIND: u16 = 8;
+/// [`Delayed`]'s version.
+pub const DELAYED_VERSION: u16 = 1;
+
+/// What [`Delayed`]'s records may be worth, for §10's reserve.
+pub const DELAYED_BOUNDS: Bounds = Bounds {
+    run_input_bytes: 4,
+    effect_result_bytes: 32,
+    terminal_bytes: 32,
+};
+
+/// Wait for a durable deadline, then download.
+///
+/// The timer half of this crate's reference pair, and the shape design document §11's
+/// deadlines have against a synchronous boundary: [`Boundary::wait`] returns no bytes, so
+/// the workflow keeps nothing from it, and a reboot replays the wait from history rather
+/// than starting it again.
+///
+/// One effect *after* the timer, so that the two share the run's sequence space and a test
+/// can see that they do — issue #33's "one ordered history, not a parallel timer table".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delayed {
+    input: [u8; 4],
+    downloaded: [u8; 32],
+    downloaded_len: usize,
+}
+
+impl Delayed {
+    /// The deadline this workflow waits for.
+    ///
+    /// A persistent instant, because that is the policy a boot clock cannot serve and
+    /// therefore the one that has anything to prove.
+    pub const SPEC: TimerSpec = TimerSpec::AtPersistentTime {
+        instant: 1_700_000_000,
+    };
+
+    /// A workflow that has waited for nothing yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            input: *b"seed",
+            downloaded: [0; 32],
+            downloaded_len: 0,
+        }
+    }
+
+    /// What [`DOWNLOAD`] answered, as this run observed it.
+    #[must_use]
+    pub fn downloaded(&self) -> &[u8] {
+        self.downloaded
+            .get(..self.downloaded_len)
+            .unwrap_or_default()
+    }
+}
+
+impl Default for Delayed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for Delayed {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: DELAYED_KIND,
+            version: DELAYED_VERSION,
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        boundary.wait(Self::SPEC)?;
+
+        let downloaded = match boundary.call(DOWNLOAD, b"url")? {
+            Outcome::Completed(bytes) => bytes,
+            Outcome::Failed(_) => return Ok(Outcome::Failed(b"download")),
+        };
+        self.downloaded_len = copy(downloaded, &mut self.downloaded);
+
+        Ok(Outcome::Completed(
+            self.downloaded
+                .get(..self.downloaded_len)
+                .unwrap_or_default(),
+        ))
+    }
+}
+
 /// One effect the world was asked to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Dispatch {
@@ -168,6 +260,10 @@ pub struct World {
     failing_at: Option<usize>,
     exhausting_at: Option<usize>,
     exhausting_seq: Option<u32>,
+    capability: ClockCapability,
+    boot_ticks: u64,
+    epoch: u64,
+    clock_reads: usize,
 }
 
 impl World {
@@ -194,6 +290,13 @@ impl World {
             failing_at: None,
             exhausting_at: None,
             exhausting_seq: None,
+            // A world with both clocks, because the reference workflow that waits needs the
+            // one that survives power loss. `set_capability` is what a test takes it away
+            // with.
+            capability: ClockCapability::Persistent,
+            boot_ticks: 0,
+            epoch: 0,
+            clock_reads: 0,
         }
     }
 
@@ -313,6 +416,62 @@ impl World {
     #[must_use]
     pub const fn performed(&self) -> usize {
         self.count
+    }
+
+    /// Declares which clocks this world has.
+    ///
+    /// A firmware built without an RTC is [`ClockCapability::BootOnly`], and a journal an
+    /// RTC wrote is then history it cannot honour — which is the failure issue #33 exists
+    /// to refuse.
+    pub const fn set_capability(&mut self, capability: ClockCapability) {
+        self.capability = capability;
+    }
+
+    /// Sets what the persistent clock reads.
+    ///
+    /// A reboot is a fresh `World` with the epoch it should have. The boot clock starts at
+    /// zero on every one of them, which is the difference §11 is about.
+    pub const fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    /// Moves both clocks on by `ticks`.
+    pub const fn advance(&mut self, ticks: u64) {
+        self.boot_ticks = self.boot_ticks.saturating_add(ticks);
+        self.epoch = self.epoch.saturating_add(ticks);
+    }
+
+    /// How many times a clock was read.
+    ///
+    /// The only thing this driver does to timing hardware, so it is the instrument issue
+    /// #33's first "done when" is measured with: a boot that answers a deadline from
+    /// history reads zero.
+    #[must_use]
+    pub const fn clock_reads(&self) -> usize {
+        self.clock_reads
+    }
+}
+
+impl Clocks for World {
+    fn capability(&self) -> ClockCapability {
+        self.capability
+    }
+
+    fn now(&mut self, kind: ClockKind) -> Option<u64> {
+        self.clock_reads = self.clock_reads.saturating_add(1);
+        if kind == ClockKind::AT_PERSISTENT_TIME {
+            // A firmware that declares no persistent clock has none to read. Answering a
+            // number here would be the substitution §02 decision 8 forbids, arriving from
+            // the one place the kernel cannot see.
+            return match self.capability {
+                ClockCapability::Persistent => Some(self.epoch),
+                ClockCapability::BootOnly => None,
+            };
+        }
+        if kind == ClockKind::AFTER_BOOT {
+            return Some(self.boot_ticks);
+        }
+        None
     }
 }
 

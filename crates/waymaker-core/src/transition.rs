@@ -16,8 +16,24 @@
 //!
 //! [`ReplayMachine`], which is a [`ReplayCursor`] plus the one thing the cursor cannot
 //! know — what the workflow just asked for. [`EffectRequest`] is that question,
-//! [`Divergence`] is the three ways it can disagree with history, and [`Intent`] and
+//! [`Divergence`] is the ways it can disagree with history, and [`Intent`] and
 //! [`Resolve`] are the engine actions the table prescribes.
+//!
+//! # The timer boundary
+//!
+//! Design document §11 and issue
+//! [#33](https://github.com/madmax983/waymaker/issues/33). A deadline is a second kind of
+//! boundary, and the same five rows hold for it: [`TimerRequest`] is what the workflow
+//! asked for, and [`TimerIntent`] and [`TimerResolve`] are the actions. It is a second pair
+//! of calls rather than a widened [`Intent`], because "adding a record kind does not change
+//! this signature" is what the `kernel-boundary` rule holds — a `Resolve::TimerFired` is
+//! the shape that rule names. What the two boundaries *do* share is the cursor, the
+//! sequence space and the order, which is issue #33's "one ordered history, not a parallel
+//! timer table".
+//!
+//! One thing the timer boundary owns that the effect boundary does not is a *capability*.
+//! A recorded clock kind this firmware cannot service is
+//! [`KernelError::IncompatibleWorkflow`] and never a substitution — §02 decision 8.
 //!
 //! # What this module must not own
 //!
@@ -111,7 +127,8 @@ use crate::activity::ActivityKind;
 use crate::error::KernelError;
 use crate::id::EffectId;
 use crate::record::RecordRef;
-use crate::replay::{PendingEffect, Position, ReplayCursor, Step};
+use crate::replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
+use crate::timer::{ClockCapability, TimerSpec};
 
 /// What the driver found at the cursor's position.
 ///
@@ -199,6 +216,77 @@ pub enum Resolve<'a> {
     },
 }
 
+/// What the workflow asked for at a timer boundary.
+///
+/// The deadline, and what this firmware can measure. Both are needed at once: §02 decision
+/// 8 is that a persistent deadline is never served by a boot clock, and the only place that
+/// can be decided is where the two meet.
+///
+/// # Invariants
+///
+/// None this type enforces; the fields are public so a façade can build one. `capability`
+/// must be what the firmware really has. `waymaker-embassy`'s `PersistentTimer` is where a
+/// declaration is witnessed by a clock the caller holds; here it is the firmware's word,
+/// exactly as [`ClockCapability::admits`] takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TimerRequest {
+    /// The deadline the workflow asked to wait for.
+    pub spec: TimerSpec,
+    /// Which clocks this firmware can service.
+    pub capability: ClockCapability,
+}
+
+/// What history said about the *intent* half of a timer boundary.
+///
+/// [`Intent`]'s twin, row for row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerIntent<'a> {
+    /// Rows 1 and 2. History already holds this timer's committed intent, under `id`.
+    Recorded {
+        /// The identity history committed, paired with the machine's run.
+        id: EffectId,
+    },
+    /// Row 3. History ended: commit a `TimerScheduled` record for `id`, then arm.
+    ///
+    /// Nothing is spent yet, for [`Intent::Schedule`]'s reason.
+    Schedule {
+        /// The identity the schedule record must carry.
+        id: EffectId,
+    },
+    /// Row 5. History holds a terminal run record: return this and poll no further.
+    Finished {
+        /// The run's recorded outcome.
+        outcome: Outcome<'a>,
+    },
+}
+
+/// What history said about the *outcome* half of a timer boundary.
+///
+/// [`Resolve`]'s twin. Reached only after [`TimerIntent::Recorded`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerResolve {
+    /// Row 1. History holds the firing: the deadline passed, and nothing is armed again.
+    Fired {
+        /// The timer this firing resolves.
+        id: EffectId,
+    },
+    /// Row 2. Intent is committed and no firing is: arm this deadline again, writing
+    /// nothing.
+    ///
+    /// The spec and the arming reading come from media rather than from a clock. A reset
+    /// took the RAM they were in, and re-reading the clock instead would restart a
+    /// persistent deadline's monotonicity floor at whatever the clock says now — which is
+    /// the reading a clock that moved backwards would have to be caught by.
+    Rearm {
+        /// The identity to arm under.
+        id: EffectId,
+        /// The deadline history recorded, rebuilt from its clock kind.
+        spec: TimerSpec,
+        /// The reading history recorded the timer as armed at.
+        armed_at: u64,
+    },
+}
+
 /// The way a workflow disagreed with history.
 ///
 /// §08 names three — "different kind, digest, or sequence" — and there is a fourth here
@@ -244,6 +332,20 @@ pub enum Divergence {
     Kind,
     /// The input digest differs: a different length, a different checksum, or both.
     Digest,
+    /// The workflow asked for a timer where history recorded an activity, or the reverse.
+    ///
+    /// Not one of §08's three either. The two boundaries share one sequence space, so a
+    /// record at the right position can still be the wrong *kind of thing*, and reporting
+    /// [`Kind`](Self::Kind) would send a reader to look for a renamed activity.
+    BoundaryKind,
+    /// The workflow asked for a different deadline, or a different clock, than history
+    /// recorded.
+    ///
+    /// [`Digest`](Self::Digest)'s twin at a timer boundary. It is the answer where the
+    /// firmware *can* service the recorded clock; where it cannot, the refusal is
+    /// [`KernelError::IncompatibleWorkflow`] instead, because that is history this firmware
+    /// cannot honour rather than a workflow that changed.
+    Deadline,
     /// The workflow reached an effect boundary where history says none can come next.
     ///
     /// Not one of §08's three, because there is no recorded schedule here to differ from —
@@ -278,6 +380,8 @@ impl Divergence {
             Self::Sequence => "the effect is not the one history recorded here",
             Self::Kind => "a different activity kind than history recorded",
             Self::Digest => "a different activity input than history recorded",
+            Self::BoundaryKind => "a different kind of boundary than history recorded",
+            Self::Deadline => "a different deadline than history recorded",
             Self::Boundary => "an effect boundary history cannot account for",
         }
     }
@@ -370,6 +474,9 @@ enum Phase {
     /// [`ReplayMachine::intent`] matched a committed schedule.
     /// [`ReplayMachine::outcome`] is the only legal next call.
     AwaitingOutcome,
+    /// [`ReplayMachine::timer_intent`] matched a committed timer.
+    /// [`ReplayMachine::timer_outcome`] is the only legal next call.
+    AwaitingFiring,
     /// The workflow disagreed with history. Terminal, and there is no path out.
     Diverged(Divergence),
 }
@@ -460,6 +567,17 @@ impl ReplayMachine {
         self.cursor.pending()
     }
 
+    /// The run's armed timer, when history left one unresolved.
+    ///
+    /// # Postconditions
+    ///
+    /// The same as [`ReplayCursor::pending_timer`]: `Some` exactly at
+    /// [`Position::AwaitingTimer`].
+    #[must_use]
+    pub const fn pending_timer(&self) -> Option<PendingTimer> {
+        self.cursor.pending_timer()
+    }
+
     /// The divergence that stopped this machine, if one did.
     ///
     /// # Postconditions
@@ -483,7 +601,7 @@ impl ReplayMachine {
     pub const fn diverged(&self) -> Option<Divergence> {
         match self.phase {
             Phase::Diverged(divergence) => Some(divergence),
-            Phase::Settled | Phase::AwaitingOutcome => None,
+            Phase::Settled | Phase::AwaitingOutcome | Phase::AwaitingFiring => None,
         }
     }
 
@@ -540,7 +658,7 @@ impl ReplayMachine {
             return Err(error);
         }
         match self.phase {
-            Phase::Diverged(_) | Phase::AwaitingOutcome => {
+            Phase::Diverged(_) | Phase::AwaitingOutcome | Phase::AwaitingFiring => {
                 Err(KernelError::NondeterministicWorkflow)
             }
             Phase::Settled => self.cursor.advance(record),
@@ -596,7 +714,7 @@ impl ReplayMachine {
             // below refuses — with the same recorded `Boundary` divergence. A second check
             // here would be a branch no test could distinguish from the one that does the
             // work, which is how a guard ends up believed in and not exercised.
-            Phase::Settled | Phase::AwaitingOutcome => {}
+            Phase::Settled | Phase::AwaitingOutcome | Phase::AwaitingFiring => {}
         }
 
         // The one source of identity in the kernel, and the position gate with it.
@@ -679,6 +797,8 @@ impl ReplayMachine {
                             Step::RunStarted { .. }
                             | Step::EffectCompleted { .. }
                             | Step::EffectFailed { .. }
+                            | Step::TimerScheduled(_)
+                            | Step::TimerFired { .. }
                             | Step::RunCompleted { .. }
                             | Step::RunFailed { .. },
                         ) => Err(KernelError::MalformedHistory),
@@ -698,23 +818,38 @@ impl ReplayMachine {
                             Step::RunStarted { .. }
                             | Step::EffectScheduled(_)
                             | Step::EffectCompleted { .. }
-                            | Step::EffectFailed { .. },
+                            | Step::EffectFailed { .. }
+                            | Step::TimerScheduled(_)
+                            | Step::TimerFired { .. },
                         ) => Err(KernelError::MalformedHistory),
                         Err(error) => Err(error),
                     }
                 }
+                // History recorded a timer where the workflow called an activity. The
+                // position is legal and the record is sound, so this is the workflow
+                // disagreeing rather than history being impossible: §08 row 4, with the
+                // flavour that says which. Refused before the cursor is advanced, so a
+                // diagnosis can still name the record.
+                RecordRef::TimerScheduled { .. } => Err(self.diverge(Divergence::BoundaryKind)),
                 // No row: a run cannot start twice, and an outcome cannot precede its
-                // schedule. Handed to the cursor rather than refused here so that one type
-                // owns "what may follow what" and so that the refusal is sticky — recovery
-                // stops at the first record it cannot account for, and stays stopped.
+                // schedule. A `TimerFired` here is the second of those — the cursor is at
+                // `Replaying`, so no timer is open for it to resolve — and it is history
+                // that is impossible rather than a workflow that changed. Handed to the
+                // cursor rather than refused here so that one type owns "what may follow
+                // what", so that the two faults stay apart, and so that the refusal is
+                // sticky — recovery stops at the first record it cannot account for, and
+                // stays stopped.
                 RecordRef::RunStarted { .. }
                 | RecordRef::EffectCompleted { .. }
-                | RecordRef::EffectFailed { .. } => match self.cursor.advance(record) {
+                | RecordRef::EffectFailed { .. }
+                | RecordRef::TimerFired { .. } => match self.cursor.advance(record) {
                     Ok(
                         Step::RunStarted { .. }
                         | Step::EffectScheduled(_)
                         | Step::EffectCompleted { .. }
                         | Step::EffectFailed { .. }
+                        | Step::TimerScheduled(_)
+                        | Step::TimerFired { .. }
                         | Step::RunCompleted { .. }
                         | Step::RunFailed { .. },
                     ) => Err(KernelError::MalformedHistory),
@@ -752,8 +887,8 @@ impl ReplayMachine {
             return Err(error);
         }
         match self.phase {
-            // No boundary is open, or the machine has diverged.
-            Phase::Diverged(_) | Phase::Settled => {
+            // No effect boundary is open, or the machine has diverged.
+            Phase::Diverged(_) | Phase::Settled | Phase::AwaitingFiring => {
                 return Err(KernelError::NondeterministicWorkflow);
             }
             Phase::AwaitingOutcome => {}
@@ -793,6 +928,266 @@ impl ReplayMachine {
                 Ok(
                     Step::RunStarted { .. }
                     | Step::EffectScheduled(_)
+                    | Step::TimerScheduled(_)
+                    | Step::TimerFired { .. }
+                    | Step::RunCompleted { .. }
+                    | Step::RunFailed { .. },
+                ) => Err(KernelError::MalformedHistory),
+                Err(error) => Err(error),
+            },
+        }
+    }
+}
+
+impl ReplayMachine {
+    /// The workflow reached a timer boundary: rows 3, 4 and 5, and the first half of 1
+    /// and 2.
+    ///
+    /// [`intent`](Self::intent)'s twin. `next` is the record the driver read at the
+    /// cursor's position, or [`Next::EndOfHistory`].
+    ///
+    /// # Postconditions
+    ///
+    /// The same rule as [`intent`](Self::intent): [`Next::EndOfHistory`] consumes nothing,
+    /// an [`Ok`] consumed the record, and an [`Err`] did not.
+    ///
+    /// # Errors
+    ///
+    /// * [`KernelError::IncompatibleWorkflow`] when history recorded a clock this firmware
+    ///   cannot service, or a clock-kind number it does not know. Design document §02
+    ///   decision 8: never a substitution. It is not
+    ///   [`NondeterministicWorkflow`](KernelError::NondeterministicWorkflow), because the
+    ///   workflow did not change — this image did, and the journal is one it cannot honour.
+    /// * [`KernelError::NoPersistentClock`] when the *request* needs a clock this firmware
+    ///   has none of. Refused at row 3, before a record is committed: the other order
+    ///   commits a deadline the firmware cannot arm, and §08 has no edge from an open
+    ///   boundary to a terminal record.
+    /// * [`KernelError::NondeterministicWorkflow`] when the request disagrees with what
+    ///   history recorded — [`diverged`](Self::diverged) says how — and when no boundary
+    ///   can come next at all.
+    /// * [`KernelError::MalformedHistory`] when `next` could not legally follow.
+    /// * [`KernelError::IdExhausted`] when the run's sequence space is spent.
+    pub const fn timer_intent<'a>(
+        &mut self,
+        request: TimerRequest,
+        next: Next<'a>,
+    ) -> Result<TimerIntent<'a>, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
+        match self.phase {
+            Phase::Diverged(_) => return Err(KernelError::NondeterministicWorkflow),
+            // A boundary already open is not an arm here, for the reason `intent` gives:
+            // the cursor's own gate below refuses, with the same recorded divergence.
+            Phase::Settled | Phase::AwaitingOutcome | Phase::AwaitingFiring => {}
+        }
+
+        let expected = match self.cursor.next_effect_id() {
+            Ok(id) => Some(id),
+            Err(KernelError::NondeterministicWorkflow) => {
+                return Err(self.diverge(Divergence::Boundary));
+            }
+            Err(KernelError::IdExhausted) => None,
+            Err(error) => return Err(error),
+        };
+
+        match next {
+            // Row 3. Nothing is committed, so this is the one place a *new* deadline is
+            // weighed against the firmware's clocks.
+            Next::EndOfHistory => {
+                if let Err(error) = request.capability.admits(request.spec) {
+                    return Err(error);
+                }
+                match expected {
+                    Some(id) => Ok(TimerIntent::Schedule { id }),
+                    None => Err(KernelError::IdExhausted),
+                }
+            }
+            Next::Record(record) => match record {
+                // Rows 1, 2 and 4.
+                RecordRef::TimerScheduled { .. } => self.recorded_timer(request, expected, record),
+                // Row 5.
+                RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => {
+                    match self.cursor.advance(record) {
+                        Ok(Step::RunCompleted { result }) => Ok(TimerIntent::Finished {
+                            outcome: Outcome::Completed(result),
+                        }),
+                        Ok(Step::RunFailed { error }) => Ok(TimerIntent::Finished {
+                            outcome: Outcome::Failed(error),
+                        }),
+                        Ok(
+                            Step::RunStarted { .. }
+                            | Step::EffectScheduled(_)
+                            | Step::EffectCompleted { .. }
+                            | Step::EffectFailed { .. }
+                            | Step::TimerScheduled(_)
+                            | Step::TimerFired { .. },
+                        ) => Err(KernelError::MalformedHistory),
+                        Err(error) => Err(error),
+                    }
+                }
+                // History recorded an activity where the workflow asked to wait. The
+                // position is legal and the record is sound, so it is §08 row 4.
+                RecordRef::EffectScheduled { .. } => Err(self.diverge(Divergence::BoundaryKind)),
+                // No row. Handed to the cursor so that one type owns "what may follow
+                // what", and so that the refusal is sticky.
+                RecordRef::RunStarted { .. }
+                | RecordRef::EffectCompleted { .. }
+                | RecordRef::EffectFailed { .. }
+                | RecordRef::TimerFired { .. } => match self.cursor.advance(record) {
+                    Ok(
+                        Step::RunStarted { .. }
+                        | Step::EffectScheduled(_)
+                        | Step::EffectCompleted { .. }
+                        | Step::EffectFailed { .. }
+                        | Step::TimerScheduled(_)
+                        | Step::TimerFired { .. }
+                        | Step::RunCompleted { .. }
+                        | Step::RunFailed { .. },
+                    ) => Err(KernelError::MalformedHistory),
+                    Err(error) => Err(error),
+                },
+            },
+        }
+    }
+
+    /// Rows 1, 2 and 4 for a timer, once history has produced a `TimerScheduled` record.
+    ///
+    /// Split out of [`timer_intent`](Self::timer_intent) for clippy's line budget, and
+    /// because it is the half that owns the two refusals §11 rests on: a clock this firmware
+    /// cannot service, and a deadline that is not the one history recorded.
+    ///
+    /// # Errors
+    ///
+    /// As [`timer_intent`](Self::timer_intent), for this row.
+    ///
+    const fn recorded_timer<'a>(
+        &mut self,
+        request: TimerRequest,
+        expected: Option<EffectId>,
+        record: RecordRef<'a>,
+    ) -> Result<TimerIntent<'a>, KernelError> {
+        let RecordRef::TimerScheduled {
+            seq,
+            clock_kind,
+            deadline,
+            ..
+        } = record
+        else {
+            // Unreachable: the one caller matched this variant. Refused rather than
+            // panicked, because the workspace denies both.
+            return Err(KernelError::MalformedHistory);
+        };
+        let Some(expected) = expected else {
+            return Err(KernelError::IdExhausted);
+        };
+        // The recorded policy, rebuilt without a wildcard. A kind number this firmware does
+        // not know has no spec, and reading it as one of the two it does know is the
+        // reinterpretation §11 forbids.
+        let Some(recorded) = TimerSpec::recorded(clock_kind, deadline) else {
+            return Err(KernelError::IncompatibleWorkflow);
+        };
+        // §02 decision 8, and issue #33's fourth work item. Asked before the divergence
+        // check, because a firmware with no persistent clock cannot honour this record
+        // whatever the workflow asks for.
+        if request.capability.admits(recorded).is_err() {
+            return Err(KernelError::IncompatibleWorkflow);
+        }
+        if expected.seq.0 != seq.0 {
+            return Err(self.diverge(Divergence::Sequence));
+        }
+        // The whole spec, so a flipped clock kind is caught as surely as a changed deadline.
+        // The integers rather than the enums: derived `PartialEq` is not `const`.
+        if recorded.clock_kind().0 != request.spec.clock_kind().0
+            || recorded.deadline() != request.spec.deadline()
+        {
+            return Err(self.diverge(Divergence::Deadline));
+        }
+        match self.cursor.advance(record) {
+            Ok(Step::TimerScheduled(pending)) => {
+                self.phase = Phase::AwaitingFiring;
+                Ok(TimerIntent::Recorded { id: pending.id })
+            }
+            // Unreachable: the cursor answers a timer record with a timer step. Written out
+            // for the reason `intent`'s twin arms are.
+            Ok(
+                Step::RunStarted { .. }
+                | Step::EffectScheduled(_)
+                | Step::EffectCompleted { .. }
+                | Step::EffectFailed { .. }
+                | Step::TimerFired { .. }
+                | Step::RunCompleted { .. }
+                | Step::RunFailed { .. },
+            ) => Err(KernelError::MalformedHistory),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The outcome half of a timer boundary: rows 1 and 2.
+    ///
+    /// [`outcome`](Self::outcome)'s twin. Legal only after [`TimerIntent::Recorded`].
+    ///
+    /// # Postconditions
+    ///
+    /// * [`TimerResolve::Fired`] consumed the firing record; the run carries on at the next
+    ///   sequence.
+    /// * [`TimerResolve::Rearm`] consumed nothing; the timer stays unresolved and
+    ///   [`pending_timer`](Self::pending_timer) keeps naming it, so a driver that resets
+    ///   again arms the same deadline under the same identity.
+    ///
+    /// # Errors
+    ///
+    /// * [`KernelError::NondeterministicWorkflow`] with no timer boundary open, and once
+    ///   the machine has diverged.
+    /// * [`KernelError::IncompatibleWorkflow`] when the recorded clock kind has no spec.
+    ///   Unreachable through [`timer_intent`](Self::timer_intent), which refuses it first.
+    /// * [`KernelError::MalformedHistory`] when `next` could not resolve the open timer.
+    /// * On a halted cursor, the failure that stopped it.
+    pub const fn timer_outcome(&mut self, next: Next<'_>) -> Result<TimerResolve, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
+        match self.phase {
+            Phase::Diverged(_) | Phase::Settled | Phase::AwaitingOutcome => {
+                return Err(KernelError::NondeterministicWorkflow);
+            }
+            Phase::AwaitingFiring => {}
+        }
+
+        let Some(open) = self.cursor.pending_timer() else {
+            // Unreachable: the phase is set only by the arm that advanced the cursor over a
+            // timer record. Refused rather than panicked.
+            return Err(KernelError::MalformedHistory);
+        };
+
+        match next {
+            // Row 2.
+            Next::EndOfHistory => {
+                let Some(spec) = TimerSpec::recorded(open.clock_kind, open.deadline) else {
+                    // Unreachable: `timer_intent` built the same spec before it advanced.
+                    return Err(KernelError::IncompatibleWorkflow);
+                };
+                self.phase = Phase::Settled;
+                Ok(TimerResolve::Rearm {
+                    id: open.id,
+                    spec,
+                    armed_at: open.armed_at,
+                })
+            }
+            // Row 1.
+            Next::Record(record) => match self.cursor.advance(record) {
+                Ok(Step::TimerFired { id }) => {
+                    self.phase = Phase::Settled;
+                    Ok(TimerResolve::Fired { id })
+                }
+                // The cursor accepts only a firing while a timer is unresolved, so these
+                // arms are unreachable; written out for the reason `outcome`'s are.
+                Ok(
+                    Step::RunStarted { .. }
+                    | Step::EffectScheduled(_)
+                    | Step::EffectCompleted { .. }
+                    | Step::EffectFailed { .. }
+                    | Step::TimerScheduled(_)
                     | Step::RunCompleted { .. }
                     | Step::RunFailed { .. },
                 ) => Err(KernelError::MalformedHistory),
@@ -826,17 +1221,20 @@ mod tests {
     const RUN: RunId = RunId(5);
 
     /// One of each phase, so a test can be total over them.
-    const EVERY_PHASE: [Phase; 3] = [
+    const EVERY_PHASE: [Phase; 4] = [
         Phase::Settled,
         Phase::AwaitingOutcome,
+        Phase::AwaitingFiring,
         Phase::Diverged(Divergence::Kind),
     ];
 
     /// Every `Divergence`, in declaration order.
-    const EVERY_DIVERGENCE: [Divergence; 4] = [
+    const EVERY_DIVERGENCE: [Divergence; 6] = [
         Divergence::Sequence,
         Divergence::Kind,
         Divergence::Digest,
+        Divergence::BoundaryKind,
+        Divergence::Deadline,
         Divergence::Boundary,
     ];
 
@@ -851,7 +1249,9 @@ mod tests {
             Divergence::Sequence => 0,
             Divergence::Kind => 1,
             Divergence::Digest => 2,
-            Divergence::Boundary => 3,
+            Divergence::BoundaryKind => 3,
+            Divergence::Deadline => 4,
+            Divergence::Boundary => 5,
         }
     }
 
@@ -875,7 +1275,7 @@ mod tests {
             }
             .diverged()
         });
-        assert_eq!(reported, [None, None, Some(Divergence::Kind)]);
+        assert_eq!(reported, [None, None, None, Some(Divergence::Kind)]);
     }
 
     #[test]

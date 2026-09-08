@@ -158,7 +158,12 @@ fn recovered(image: &[u8]) -> Vec<RecordId> {
                 Some(RecordId(seq.0.wrapping_mul(2).wrapping_sub(1)))
             }
             RecordRef::EffectCompleted { seq, .. } => Some(RecordId(seq.0.wrapping_mul(2))),
+            // The writers this file drives schedule and complete effects and nothing else.
+            // Named rather than left to a wildcard, so a record kind added later is a
+            // decision here.
             RecordRef::EffectFailed { .. }
+            | RecordRef::TimerScheduled { .. }
+            | RecordRef::TimerFired { .. }
             | RecordRef::RunCompleted { .. }
             | RecordRef::RunFailed { .. } => None,
         })

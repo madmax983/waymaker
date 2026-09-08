@@ -47,6 +47,9 @@ pub use activity::{ActivityKind, ActivityName};
 pub use error::{DecodeError, KernelError};
 pub use id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
 pub use record::{RecordKind, RecordRef};
-pub use replay::{PendingEffect, Position, ReplayCursor, Step};
+pub use replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
 pub use timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
-pub use transition::{Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve};
+pub use transition::{
+    Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve, TimerIntent,
+    TimerRequest, TimerResolve,
+};

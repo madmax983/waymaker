@@ -18,7 +18,8 @@
 //! about a workflow. It validates history against itself.
 
 use waymaker_core::budget::SCRATCH_PAGE_BYTES;
-use waymaker_core::replay::{PendingEffect, Position, ReplayCursor, Step};
+use waymaker_core::replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
+use waymaker_core::timer::ClockKind;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
 
 /// The run every test below replays, unless it says otherwise.
@@ -418,8 +419,13 @@ fn a_halted_cursor_mints_nothing() {
 /// #14 forbids, would satisfy both and every other assertion in this file. An equality
 /// notices it. The number is the same on `thumbv6m-none-eabi`, where a `u64` aligns to four
 /// rather than eight: the allocator is 16 either way, and `Scheduled` is 12 bytes of
-/// four-aligned scalars.
-const CURSOR_BYTES: usize = 32;
+/// four-aligned scalars, as `Armed` is 24 bytes of them.
+///
+/// It moved from 32 to 48 with issue #33's timer boundary: a timer's recorded state is a
+/// clock kind, a deadline and an arming reading, which is 24 bytes where an effect's
+/// digest is 12. The state is a union, so a run pays for the larger of the two and not for
+/// both.
+const CURSOR_BYTES: usize = 48;
 
 #[test]
 fn the_cursor_is_exactly_the_state_it_declares() {
@@ -629,17 +635,20 @@ fn a_forward_only_single_pass_source_is_enough_to_replay() {
 // Every state against every record.
 // ---------------------------------------------------------------------------
 
-/// The six positions a cursor can be advanced *from*, each with a cursor standing in it.
+/// The seven positions a cursor can be advanced *from*, each with a cursor standing in it.
 ///
 /// `Halted` is reached the way a device reaches it — by being handed a record that could not
 /// legally follow — rather than by construction, so the row below is the real thing.
-fn every_source_position() -> [(Position, ReplayCursor); 6] {
+fn every_source_position() -> [(Position, ReplayCursor); 7] {
     let before_run = ReplayCursor::new(RUN);
 
     let replaying = started();
 
     let mut awaiting = started();
     let _ = awaiting.advance(schedule(0));
+
+    let mut awaiting_timer = started();
+    let _ = awaiting_timer.advance(arm(0));
 
     let mut completed = started();
     let _ = completed.advance(RecordRef::RunCompleted { result: b"" });
@@ -654,6 +663,7 @@ fn every_source_position() -> [(Position, ReplayCursor); 6] {
         (Position::BeforeRun, before_run),
         (Position::Replaying, replaying),
         (Position::AwaitingOutcome, awaiting),
+        (Position::AwaitingTimer, awaiting_timer),
         (Position::RunCompleted, completed),
         (Position::RunFailed, failed),
         (Position::Halted(KernelError::MalformedHistory), halted),
@@ -666,7 +676,7 @@ fn every_source_position() -> [(Position, ReplayCursor); 6] {
 /// unissued sequence, and an outcome at the pending one — so the caller passes the sequence
 /// each of those should carry from that position. Anything the position refuses is refused
 /// for the *kind*, not because the test picked an unlucky number.
-const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 6] {
+const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 8] {
     [
         RecordRef::RunStarted {
             workflow_kind: 1,
@@ -682,6 +692,10 @@ const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static
             seq: EffectSeq(outcome_seq),
             error: b"bad",
         },
+        arm(schedule_seq),
+        RecordRef::TimerFired {
+            seq: EffectSeq(outcome_seq),
+        },
         RecordRef::RunCompleted { result: b"done" },
         RecordRef::RunFailed { error: b"gone" },
     ]
@@ -689,27 +703,32 @@ const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static
 
 #[test]
 fn every_position_accepts_exactly_the_records_a_run_could_have_written_next() {
-    // All thirty-six cells, stated as a table rather than reached by whichever tests
-    // happened to be written. Six of them are legal — the six edges of the transition
-    // diagram on `Position` — and the other thirty are histories no execution could have
-    // produced. Before this table existed, twenty-one cells were never exercised, and a
-    // mutation that let a *failed* run carry on running passed the whole suite.
+    // All fifty-six cells, stated as a table rather than reached by whichever tests
+    // happened to be written. Eight of them are legal — the eight edges of the transition
+    // diagram on `Position` — and the other forty-eight are histories no execution could
+    // have produced. Before this table existed, twenty-one cells were never exercised, and
+    // a mutation that let a *failed* run carry on running passed the whole suite; issue
+    // #33 added a position and two records, and the twenty cells they bring are the same
+    // argument again.
     //
     // Columns are the record variants in §09's order: RunStarted, EffectScheduled,
-    // EffectCompleted, EffectFailed, RunCompleted, RunFailed.
-    const LEGAL: [[bool; 6]; 6] = [
+    // EffectCompleted, EffectFailed, TimerScheduled, TimerFired, RunCompleted, RunFailed.
+    const LEGAL: [[bool; 8]; 7] = [
         // BeforeRun: only the record that starts the run.
-        [true, false, false, false, false, false],
-        // Replaying: the next effect, or either terminal record.
-        [false, true, false, false, true, true],
+        [true, false, false, false, false, false, false, false],
+        // Replaying: the next boundary of either kind, or either terminal record.
+        [false, true, false, false, true, false, true, true],
         // AwaitingOutcome: only this effect's outcome. A run cannot end mid-effect,
         // because §07 commits an outcome frame before the workflow can observe anything.
-        [false, false, true, true, false, false],
+        [false, false, true, true, false, false, false, false],
+        // AwaitingTimer: only this timer's firing. A timer is a boundary like an effect,
+        // so the same rule holds and for the same reason.
+        [false, false, false, false, false, true, false, false],
         // RunCompleted, RunFailed: terminal. Nothing may follow either of them.
-        [false, false, false, false, false, false],
-        [false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
         // Halted: recovery stopped, and stays stopped.
-        [false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
     ];
 
     for (row, (position, _)) in every_source_position().iter().enumerate() {
@@ -778,4 +797,196 @@ fn a_cursor_halted_mid_effect_offers_nothing_to_redeliver() {
     );
     assert_eq!(cursor.pending(), None);
     assert_eq!(cursor.next_effect_id(), Err(KernelError::MalformedHistory));
+}
+
+// Issue #33: timers consume this cursor in workflow order, alongside the activities. One
+// ordered history, one sequence space, one unresolved boundary at a time.
+
+/// `RecordRef::TimerScheduled` for `seq`, on the persistent clock.
+const fn arm(seq: u32) -> RecordRef<'static> {
+    RecordRef::TimerScheduled {
+        seq: EffectSeq(seq),
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 9_000,
+        armed_at: 1_000,
+    }
+}
+
+/// The timer `arm(seq)` commits, as the cursor reports it.
+const fn pending_timer(seq: u32) -> PendingTimer {
+    PendingTimer {
+        id: EffectId {
+            run: RUN,
+            seq: EffectSeq(seq),
+        },
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 9_000,
+        armed_at: 1_000,
+    }
+}
+
+#[test]
+fn a_scheduled_timer_becomes_the_runs_unresolved_boundary() {
+    let mut cursor = started();
+
+    assert_eq!(
+        cursor.advance(arm(0)),
+        Ok(Step::TimerScheduled(pending_timer(0)))
+    );
+    assert_eq!(cursor.position(), Position::AwaitingTimer);
+    assert_eq!(cursor.pending_timer(), Some(pending_timer(0)));
+    // An armed timer is not an unresolved *effect*: a driver that redelivered it to an
+    // activity would perform work no schedule record asked for.
+    assert_eq!(cursor.pending(), None);
+}
+
+#[test]
+fn a_firing_resolves_the_timer_it_names() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Ok(Step::TimerFired {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0)
+            }
+        })
+    );
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.pending_timer(), None);
+}
+
+#[test]
+fn timers_and_activities_share_one_sequence_space() {
+    // §33: one ordered history, not a parallel timer table. A timer that numbered itself
+    // separately would let a timer and an effect claim sequence 0, and every downstream
+    // system that deduplicates on `(RunId, EffectSeq)` would see one identity for two
+    // boundaries.
+    let mut cursor = started();
+
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert!(
+        cursor
+            .advance(RecordRef::TimerFired { seq: EffectSeq(0) })
+            .is_ok()
+    );
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
+    assert!(cursor.advance(schedule(1)).is_ok());
+    assert!(
+        cursor
+            .advance(RecordRef::EffectCompleted {
+                seq: EffectSeq(1),
+                result: b"ok"
+            })
+            .is_ok()
+    );
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(2)));
+    assert!(cursor.advance(arm(2)).is_ok());
+}
+
+#[test]
+fn a_timer_that_skips_a_sequence_is_refused() {
+    let mut cursor = started();
+    assert_eq!(cursor.advance(arm(1)), Err(KernelError::MalformedHistory));
+}
+
+#[test]
+fn a_firing_for_another_timer_is_refused() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(1) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn an_effect_outcome_cannot_resolve_a_timer_and_a_firing_cannot_resolve_an_effect() {
+    // The two boundaries are told apart by the record that resolves them. Without this a
+    // journal could be read two ways, which is history that is not one ordered sequence.
+    let mut awaiting_timer = started();
+    assert!(awaiting_timer.advance(arm(0)).is_ok());
+    assert_eq!(
+        awaiting_timer.advance(RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"ok"
+        }),
+        Err(KernelError::MalformedHistory)
+    );
+
+    let mut awaiting_effect = started();
+    assert!(awaiting_effect.advance(schedule(0)).is_ok());
+    assert_eq!(
+        awaiting_effect.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_firing_with_no_armed_timer_is_refused() {
+    let mut cursor = started();
+    assert_eq!(
+        cursor.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_run_cannot_end_with_a_timer_unresolved() {
+    // §08 has no edge from an open boundary to a terminal record, and a timer is a
+    // boundary. Without this a run could end while history still owes a firing.
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.advance(RecordRef::RunCompleted { result: b"" }),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn no_effect_is_minted_while_a_timer_is_unresolved() {
+    let mut cursor = started();
+    assert!(cursor.advance(arm(0)).is_ok());
+    assert_eq!(
+        cursor.next_effect_id(),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+}
+
+#[test]
+fn an_armed_timer_is_not_a_terminal_position() {
+    assert!(!Position::AwaitingTimer.is_terminal());
+}
+
+#[test]
+fn a_boundary_of_either_kind_refuses_the_other_kind_while_it_is_open() {
+    // "At most one unresolved boundary" has to hold *across* the two kinds, not only within
+    // each. A timer accepted while an effect is unresolved overwrites the schedule the
+    // cursor was holding — the dispatched effect is silently forgotten, `pending()` goes
+    // `None`, and §14's stable-redelivery subject is gone. An effect accepted while a timer
+    // is armed drops the deadline, which is then never re-armed and never fires. Neither is
+    // caught by the same-kind tests above, and review of this change ran both mutants.
+    let mut awaiting_effect = started();
+    assert!(awaiting_effect.advance(schedule(0)).is_ok());
+    assert_eq!(
+        awaiting_effect.advance(arm(1)),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        awaiting_effect.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+
+    let mut awaiting_timer = started();
+    assert!(awaiting_timer.advance(arm(0)).is_ok());
+    assert_eq!(
+        awaiting_timer.advance(schedule(1)),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        awaiting_timer.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
 }

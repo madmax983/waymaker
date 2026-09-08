@@ -3,8 +3,12 @@
 //! Synchronous, and bounded by the run's declared result bound. An activity that cannot
 //! answer now says [`Performed::Pending`] rather than blocking, which is how a driver with
 //! no executor still has a way to wait.
+//!
+//! [`Clocks`] is the same half of the boundary for design document §11's deadlines: the
+//! world is what a run asks things of, and time is one of them.
 
 use waymaker_core::ActivityKind;
+use waymaker_core::timer::{ClockCapability, ClockKind};
 
 use crate::effect::DurableIntent;
 
@@ -91,4 +95,46 @@ pub trait Activities {
         input: &[u8],
         out: &mut [u8],
     ) -> Performed;
+}
+
+/// The clocks a driver may read.
+///
+/// Design document §11's other half of the world. An activity changes something outside the
+/// device; a clock tells the device what time it is. Both are the world's, so both are
+/// declared here, and a driver needs the two together — which is what
+/// [`Driver::boot`](crate::Driver::boot)'s bound says.
+///
+/// # What an implementor must uphold
+///
+/// * A reading is in that clock's own unit, and the same unit across reboots. The kernel
+///   compares readings; it never converts them.
+/// * [`capability`](Self::capability) must be what the firmware really has. Declaring
+///   [`ClockCapability::Persistent`] without a clock that survives power loss is the one
+///   substitution §02 decision 8 exists to forbid, and no code below can catch it.
+/// * A reading that cannot be trusted is [`None`]. An implementor must not substitute a
+///   value: a zero fires every persistent deadline at once, and a maximum fires none.
+/// * A persistent reading must not go backwards. Where it can — a battery change, a
+///   re-synchronised epoch — the kernel refuses with
+///   [`KernelError::ClockWentBackwards`](waymaker_core::KernelError::ClockWentBackwards)
+///   rather than crediting an interval it cannot measure.
+pub trait Clocks {
+    /// Which clocks this firmware can service.
+    ///
+    /// # Postconditions
+    ///
+    /// The same value for the life of a boot. A firmware whose capability changed mid-run
+    /// would admit a deadline at one boundary and refuse it at the next.
+    fn capability(&self) -> ClockCapability;
+
+    /// The current reading of `kind`'s clock, or [`None`] if it cannot be read.
+    ///
+    /// This is the only thing the synchronous driver does to timing hardware, which is what
+    /// makes "replay of a fired timer re-arms nothing" observable: a boot that answers a
+    /// deadline from history calls this zero times.
+    ///
+    /// # Postconditions
+    ///
+    /// [`None`] for a kind this firmware cannot service, and for a read that failed. The
+    /// driver reports either as [`DriveError::ClockUnavailable`](crate::DriveError).
+    fn now(&mut self, kind: ClockKind) -> Option<u64>;
 }

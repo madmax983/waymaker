@@ -10,8 +10,10 @@
 
 use waymaker_core::budget::SCRATCH_PAGE_BYTES;
 use waymaker_core::replay::{PendingEffect, Position};
+use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::transition::{
-    Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve,
+    Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve, TimerIntent,
+    TimerRequest, TimerResolve,
 };
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
 
@@ -898,4 +900,365 @@ fn the_machine_reports_the_run_it_replays() {
     assert_eq!(machine.position(), Position::BeforeRun);
     assert_eq!(machine.pending(), None);
     assert_eq!(machine.diverged(), None);
+}
+
+// ---------------------------------------------------------------------------
+// The timer boundary: design document §11 and issue #33.
+//
+// The same five rows, asked of a deadline instead of an activity. Written here rather
+// than in a file of its own because the rows are §08's, and because the two boundaries
+// share one cursor and one sequence space.
+// ---------------------------------------------------------------------------
+
+/// The deadline the synthetic histories arm, on a clock that survives power loss.
+const INSTANT: u64 = 1_700_000_000;
+/// The reading those histories were armed at.
+const ARMED_AT: u64 = 1_699_999_000;
+
+/// What the workflow asks for at every timer boundary below.
+const TIMER_REQUEST: TimerRequest = TimerRequest {
+    spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+    capability: ClockCapability::Persistent,
+};
+
+/// `RecordRef::TimerScheduled` for `seq`, matching [`TIMER_REQUEST`].
+const fn armed(seq: u32) -> RecordRef<'static> {
+    RecordRef::TimerScheduled {
+        seq: EffectSeq(seq),
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: INSTANT,
+        armed_at: ARMED_AT,
+    }
+}
+
+#[test]
+fn a_timer_at_the_end_of_history_is_scheduled() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(TIMER_REQUEST, Next::EndOfHistory),
+        Ok(TimerIntent::Schedule { id: effect(0) })
+    );
+    // Row 3 mints nothing: the sequence is spent when its record is committed.
+    assert_eq!(machine.position(), Position::Replaying);
+}
+
+#[test]
+fn a_matching_timer_and_firing_returns_from_history() {
+    // Issue #33's first "done when". The answer is `Fired`, and no answer anywhere on this
+    // path tells a driver to arm anything.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(TIMER_REQUEST, Next::Record(armed(0))),
+        Ok(TimerIntent::Recorded { id: effect(0) })
+    );
+    assert_eq!(
+        machine.timer_outcome(Next::Record(RecordRef::TimerFired { seq: EffectSeq(0) })),
+        Ok(TimerResolve::Fired { id: effect(0) })
+    );
+    assert_eq!(machine.position(), Position::Replaying);
+}
+
+#[test]
+fn an_armed_timer_with_no_firing_is_re_armed_from_what_history_recorded() {
+    // Row 2's twin. The spec and the arming reading come back from media, because the
+    // reset took the RAM they lived in.
+    let mut machine = started();
+    assert!(
+        machine
+            .timer_intent(TIMER_REQUEST, Next::Record(armed(0)))
+            .is_ok()
+    );
+
+    assert_eq!(
+        machine.timer_outcome(Next::EndOfHistory),
+        Ok(TimerResolve::Rearm {
+            id: effect(0),
+            spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+            armed_at: ARMED_AT,
+        })
+    );
+    // Nothing was consumed, so a reset here re-arms the same timer again.
+    assert_eq!(
+        machine.pending_timer().map(|timer| timer.id),
+        Some(effect(0))
+    );
+}
+
+#[test]
+fn a_terminal_record_finishes_a_run_that_reached_a_timer_boundary() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TIMER_REQUEST,
+            Next::Record(RecordRef::RunCompleted { result: b"done" })
+        ),
+        Ok(TimerIntent::Finished {
+            outcome: Outcome::Completed(b"done")
+        })
+    );
+}
+
+#[test]
+fn a_recorded_clock_the_firmware_cannot_service_is_an_incompatible_workflow() {
+    // Issue #33's fourth work item, and the failure it exists to prevent: a firmware built
+    // without an RTC replaying a journal an RTC wrote. Nothing is corrupt, no checksum
+    // fails, and a best-effort substitution would wake the device early for the rest of
+    // its life.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::Record(armed(0))
+        ),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+    // Refused before the record was consumed, so a diagnosis can still name it.
+    assert_eq!(machine.position(), Position::Replaying);
+}
+
+#[test]
+fn a_recorded_clock_kind_no_firmware_wrote_is_an_incompatible_workflow() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TIMER_REQUEST,
+            Next::Record(RecordRef::TimerScheduled {
+                seq: EffectSeq(0),
+                clock_kind: ClockKind(3),
+                deadline: INSTANT,
+                armed_at: ARMED_AT,
+            })
+        ),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+}
+
+#[test]
+fn a_flipped_clock_kind_the_firmware_can_service_is_a_divergence() {
+    // The other half of "refuses rather than reinterprets". Where the firmware *has* the
+    // clock, a record whose kind was flipped is a different deadline than the workflow
+    // asked for, and §08 stops rather than guessing which one was meant.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TIMER_REQUEST,
+            Next::Record(RecordRef::TimerScheduled {
+                seq: EffectSeq(0),
+                clock_kind: ClockKind::AFTER_BOOT,
+                deadline: INSTANT,
+                armed_at: ARMED_AT,
+            })
+        ),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Deadline));
+}
+
+#[test]
+fn a_different_deadline_than_history_recorded_is_a_divergence() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AtPersistentTime {
+                    instant: INSTANT + 1
+                },
+                capability: ClockCapability::Persistent,
+            },
+            Next::Record(armed(0))
+        ),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Deadline));
+}
+
+#[test]
+fn a_timer_where_history_recorded_an_activity_is_a_divergence() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(TIMER_REQUEST, Next::Record(schedule(0))),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::BoundaryKind));
+}
+
+#[test]
+fn an_activity_where_history_recorded_a_timer_is_a_divergence() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.intent(REQUEST, Next::Record(armed(0))),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::BoundaryKind));
+}
+
+#[test]
+fn a_firmware_with_no_persistent_clock_cannot_schedule_a_new_persistent_timer() {
+    // Refused before the record is committed. The other order commits a `TimerScheduled`
+    // the firmware then cannot arm, and §08 has no edge from an open boundary to a
+    // terminal record — so the run could never end.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::EndOfHistory
+        ),
+        Err(KernelError::NoPersistentClock)
+    );
+}
+
+#[test]
+fn an_open_timer_boundary_refuses_every_other_call() {
+    let mut machine = started();
+    assert!(
+        machine
+            .timer_intent(TIMER_REQUEST, Next::Record(armed(0)))
+            .is_ok()
+    );
+
+    assert_eq!(
+        machine.outcome(Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(
+        machine.advance(RecordRef::TimerFired { seq: EffectSeq(0) }),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+}
+
+#[test]
+fn a_timer_outcome_with_no_timer_boundary_open_is_refused() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_outcome(Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    // The driver asked out of turn. The workflow made no claim, so it is not a divergence.
+    assert_eq!(machine.diverged(), None);
+}
+
+#[test]
+fn every_divergence_has_a_message_of_its_own() {
+    let messages = [
+        Divergence::Sequence,
+        Divergence::Kind,
+        Divergence::Digest,
+        Divergence::Boundary,
+        Divergence::BoundaryKind,
+        Divergence::Deadline,
+    ]
+    .map(Divergence::message);
+
+    for (left_index, left) in messages.iter().enumerate() {
+        for (right_index, right) in messages.iter().enumerate() {
+            assert_eq!(
+                left_index == right_index,
+                left == right,
+                "two divergences share the message {left:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_firing_with_no_timer_open_is_malformed_history_rather_than_a_divergence() {
+    // §08's divergence and §09's recovery stop are two different faults. History holding a
+    // firing with no schedule before it is a damaged or forged journal, not a workflow that
+    // changed, and a log line that could not tell them apart would send an engineer to the
+    // wrong place. The cursor halts on it; the machine must report what the cursor said.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.intent(
+            REQUEST,
+            Next::Record(RecordRef::TimerFired { seq: EffectSeq(0) })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_firing_with_no_timer_open_halts_the_timer_boundary_too() {
+    // The mirror, so the two boundaries cannot drift into two answers for one journal.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TIMER_REQUEST,
+            Next::Record(RecordRef::TimerFired { seq: EffectSeq(0) })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn the_capability_is_weighed_against_the_recorded_clock_and_not_the_requested_one() {
+    // Every other timer test has the recorded kind equal to the requested one at the point
+    // the capability is consulted, so `admits(recorded)` and `admits(request.spec)` cannot be
+    // told apart — and review of this change swapped them with the gate and the suite green.
+    // The swap is wrong in both directions, so both are pinned here.
+    //
+    // History recorded a persistent deadline and this firmware has no persistent clock. It
+    // cannot honour the record whatever the workflow now asks for, so the answer is about
+    // the *journal* — `IncompatibleWorkflow` — and never `NondeterministicWorkflow`, which
+    // would send an engineer to look for changed workflow code.
+    let mut boot_only = started();
+    assert_eq!(
+        boot_only.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AfterBoot { ticks: 5 },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::Record(armed(0))
+        ),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+
+    // And the reverse: history recorded a boot deadline, which a boot-only firmware can
+    // service perfectly. The workflow asking for a persistent one is a *divergence*, not an
+    // incompatible journal.
+    let mut recorded_boot = started();
+    assert_eq!(
+        recorded_boot.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::Record(RecordRef::TimerScheduled {
+                seq: EffectSeq(0),
+                clock_kind: ClockKind::AFTER_BOOT,
+                deadline: 5,
+                armed_at: 1,
+            })
+        ),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(recorded_boot.diverged(), Some(Divergence::Deadline));
 }

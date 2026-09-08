@@ -9,17 +9,20 @@
 //! is a format break dressed up as a refactor. Every number below is therefore written out
 //! as a literal rather than derived from the constant it checks.
 
+use waymaker_core::timer::ClockKind;
 use waymaker_core::{ActivityKind, EffectSeq, RecordKind, RecordRef};
 
 /// Every record kind this firmware can decode, beside the number it occupies on media.
 ///
 /// The literals are the point. Comparing `RecordKind::RUN_STARTED` with itself would pass
 /// under any renumbering; comparing it with `1` fails the moment the wire format moves.
-const DECODABLE_KINDS: [(RecordKind, u8); 6] = [
+const DECODABLE_KINDS: [(RecordKind, u8); 8] = [
     (RecordKind::RUN_STARTED, 1),
     (RecordKind::EFFECT_SCHEDULED, 2),
     (RecordKind::EFFECT_COMPLETED, 3),
     (RecordKind::EFFECT_FAILED, 4),
+    (RecordKind::TIMER_SCHEDULED, 5),
+    (RecordKind::TIMER_FIRED, 6),
     (RecordKind::RUN_COMPLETED, 7),
     (RecordKind::RUN_FAILED, 8),
 ];
@@ -29,9 +32,7 @@ const DECODABLE_KINDS: [(RecordKind, u8); 6] = [
 /// Reserved rather than free: a later issue fills the body in behind the same number, so
 /// the format never has to renumber a record that firmware in the field has already
 /// written.
-const RESERVED_KINDS: [(RecordKind, u8); 5] = [
-    (RecordKind::TIMER_SCHEDULED, 5),
-    (RecordKind::TIMER_FIRED, 6),
+const RESERVED_KINDS: [(RecordKind, u8); 3] = [
     (RecordKind::VERSION_MARKER, 9),
     (RecordKind::SIGNAL_RECEIVED, 10),
     (RecordKind::CHILD_STARTED, 11),
@@ -73,11 +74,11 @@ fn no_two_record_kinds_share_a_number() {
         DECODABLE_KINDS[3],
         DECODABLE_KINDS[4],
         DECODABLE_KINDS[5],
+        DECODABLE_KINDS[6],
+        DECODABLE_KINDS[7],
         RESERVED_KINDS[0],
         RESERVED_KINDS[1],
         RESERVED_KINDS[2],
-        RESERVED_KINDS[3],
-        RESERVED_KINDS[4],
     ];
 
     for (left_index, (left, _)) in all.iter().enumerate() {
@@ -97,7 +98,7 @@ fn a_record_reports_the_kind_it_is() {
     // The encoder asks a record which number to write, and a mismatch here would put a
     // completion on media wearing a failure's kind byte — decodable, self-consistent, and
     // wrong.
-    let cases: [(RecordRef<'_>, RecordKind); 6] = [
+    let cases: [(RecordRef<'_>, RecordKind); 8] = [
         (
             RecordRef::RunStarted {
                 workflow_kind: 7,
@@ -128,6 +129,19 @@ fn a_record_reports_the_kind_it_is() {
                 error: b"no",
             },
             RecordKind::EFFECT_FAILED,
+        ),
+        (
+            RecordRef::TimerScheduled {
+                seq: EffectSeq(3),
+                clock_kind: ClockKind::AT_PERSISTENT_TIME,
+                deadline: 9_000,
+                armed_at: 1_000,
+            },
+            RecordKind::TIMER_SCHEDULED,
+        ),
+        (
+            RecordRef::TimerFired { seq: EffectSeq(3) },
+            RecordKind::TIMER_FIRED,
         ),
         (
             RecordRef::RunCompleted { result: b"done" },
@@ -210,4 +224,41 @@ fn records_compare_by_value() {
     assert_ne!(left, other_bytes);
     assert_ne!(left, other_seq);
     assert_ne!(left, other_kind);
+}
+
+#[test]
+fn a_scheduled_timer_carries_its_clock_kind_beside_its_deadline() {
+    // Design document §11 and issue #33: the record holds the kind so that recovery cannot
+    // read a persistent instant as a boot interval after a firmware change. A record that
+    // held the deadline alone would decode without error and mean something else.
+    let record = RecordRef::TimerScheduled {
+        seq: EffectSeq(2),
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 1_700_000_000,
+        armed_at: 1_699_999_000,
+    };
+    let same_deadline_other_clock = RecordRef::TimerScheduled {
+        seq: EffectSeq(2),
+        clock_kind: ClockKind::AFTER_BOOT,
+        deadline: 1_700_000_000,
+        armed_at: 1_699_999_000,
+    };
+
+    assert_ne!(record, same_deadline_other_clock);
+}
+
+#[test]
+fn a_scheduled_timer_carries_the_reading_it_was_armed_at() {
+    // The floor a persistent deadline is measured against lives in RAM, which a power cut
+    // takes. This field is what carries it across the reset.
+    let RecordRef::TimerScheduled { armed_at, .. } = (RecordRef::TimerScheduled {
+        seq: EffectSeq(0),
+        clock_kind: ClockKind::AT_PERSISTENT_TIME,
+        deadline: 500,
+        armed_at: 400,
+    }) else {
+        unreachable!("the record was built as a scheduled timer")
+    };
+
+    assert_eq!(armed_at, 400);
 }

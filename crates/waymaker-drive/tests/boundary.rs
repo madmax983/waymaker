@@ -405,6 +405,8 @@ fn kinds(device: &mut Device) -> Vec<&'static str> {
             RecordRef::EffectScheduled { .. } => "scheduled",
             RecordRef::EffectCompleted { .. } => "completed",
             RecordRef::EffectFailed { .. } => "failed",
+            RecordRef::TimerScheduled { .. } => "timer-scheduled",
+            RecordRef::TimerFired { .. } => "timer-fired",
             RecordRef::RunCompleted { .. } => "run-completed",
             RecordRef::RunFailed { .. } => "run-failed",
         });
@@ -600,7 +602,8 @@ fn payloads(device: &mut Device) -> Vec<usize> {
         };
         out.push(match record {
             RecordRef::RunStarted { input, .. } => input.len(),
-            RecordRef::EffectScheduled { .. } => 0,
+            RecordRef::EffectScheduled { .. } | RecordRef::TimerFired { .. } => 0,
+            RecordRef::TimerScheduled { .. } => 17,
             RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
                 result.len()
             }

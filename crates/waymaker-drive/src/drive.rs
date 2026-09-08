@@ -9,9 +9,10 @@
 use core::marker::PhantomData;
 use core::mem;
 
+use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 use waymaker_core::{
     ActivityKind, EffectId, EffectRequest, Intent, KernelError, Next, Outcome, RecordRef,
-    ReplayMachine, Resolve, RunId,
+    ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve,
 };
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
@@ -20,7 +21,7 @@ use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::StableStorage;
 
-use crate::activity::{Activities, Performed};
+use crate::activity::{Activities, Clocks, Performed};
 use crate::boundary::{Boundary, Suspended};
 use crate::effect::{Dispatchable, Effect, Resolution, Resolved, Scheduled};
 use crate::workflow::Workflow;
@@ -36,9 +37,11 @@ pub enum Conclusion {
 
 /// How far one boot got.
 ///
-/// Two answers, because a synchronous driver has two: the run reached a terminal record, or
-/// an activity was not ready and the run is waiting under a committed identity. There is no
-/// third — an error is the [`Err`] this is returned beside.
+/// Three answers: the run reached a terminal record, an activity was not ready, or a
+/// deadline has not passed. The last two are both waits under a committed identity, kept
+/// apart because a caller acts on them differently — an activity may answer on the next
+/// pass, and a deadline will not answer before its own clock says so. There is no fourth —
+/// an error is the [`Err`] this is returned beside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Progress {
     /// The run has a terminal record, and the first `result_len` bytes of the caller's
@@ -54,6 +57,27 @@ pub enum Progress {
     Waiting {
         /// The effect the run is waiting on.
         id: EffectId,
+    },
+    /// A deadline has not passed. Its `TimerScheduled` record is committed, so the next
+    /// boot arms the same deadline from the reading history recorded.
+    ///
+    /// `remaining` is in `clock_kind`'s unit, and the kind travels beside it because the two
+    /// units need not be the same one. [`Clocks`] says a reading is "in that clock's own
+    /// unit" and that the kernel never converts, so a firmware whose RTC counts seconds and
+    /// whose boot clock counts milliseconds is an ordinary firmware — and a caller handed a
+    /// bare number could not tell which alarm to set it on, or by how much to scale it. A
+    /// wait this driver documents as usable for sleeping has to say what it is measured in.
+    /// Codex found the version that did not.
+    ///
+    /// This driver has no sleep of its own: design document §11's in-boot sleep is rung
+    /// 0.4's.
+    WaitingUntil {
+        /// The timer the run is waiting on.
+        id: EffectId,
+        /// Which clock `remaining` is counted in.
+        clock_kind: ClockKind,
+        /// Ticks of that clock still owed, as of this boot's last reading.
+        remaining: u64,
     },
 }
 
@@ -117,6 +141,12 @@ pub enum DriveError<E> {
     /// Decided when the writer is opened, before a record is staged: a journal that cannot
     /// hold the reserve is a journal in which the run's exits were never affordable.
     Reserve(CapacityError),
+    /// A clock could not be read.
+    ///
+    /// [`Clocks::now`] answered [`None`]: the hardware failed, or the firmware has no clock
+    /// of that kind. Either way the deadline cannot be measured, and design document §02
+    /// decision 8 is that a deadline nothing can measure is refused rather than guessed at.
+    ClockUnavailable,
     /// §10 refused the record, before the device was asked for anything.
     ///
     /// The refusal that keeps this driver honest. Without it a schedule record is committed,
@@ -205,6 +235,12 @@ impl<C: IntegrityCheck> Driver<C> {
 
     /// One boot: recover, replay, and carry the run as far as it goes.
     ///
+    /// `world` is the two halves of design document §06's outward boundary: the
+    /// [`Activities`] a workflow calls and the [`Clocks`] its deadlines are measured
+    /// against. They are one argument because a run needs both and neither is optional —
+    /// a firmware with no timers still declares
+    /// [`ClockCapability::BootOnly`](waymaker_core::timer::ClockCapability::BootOnly).
+    ///
     /// `page` is the scratch page every record is staged through — one record at a time,
     /// never retained. `result` is where an activity writes its outcome and where a
     /// terminal payload is left for the caller; it is a second buffer because a record is
@@ -225,13 +261,13 @@ impl<C: IntegrityCheck> Driver<C> {
     pub fn boot<S, A, W>(
         &self,
         storage: &mut S,
-        activities: &mut A,
+        world: &mut A,
         workflow: &mut W,
         scratch: Scratch<'_>,
     ) -> Result<Progress, DriveError<S::Error>>
     where
         S: StableStorage,
-        A: Activities,
+        A: Activities + Clocks,
         W: Workflow,
     {
         let Scratch { page, result } = scratch;
@@ -258,7 +294,7 @@ impl<C: IntegrityCheck> Driver<C> {
 
         let mut context = Context {
             storage,
-            activities,
+            activities: world,
             machine: &mut machine,
             page,
             result,
@@ -534,7 +570,9 @@ const fn recorded(record: RecordRef<'_>) -> Option<Outcome<'_>> {
         RecordRef::RunStarted { .. }
         | RecordRef::EffectScheduled { .. }
         | RecordRef::EffectCompleted { .. }
-        | RecordRef::EffectFailed { .. } => None,
+        | RecordRef::EffectFailed { .. }
+        | RecordRef::TimerScheduled { .. }
+        | RecordRef::TimerFired { .. } => None,
     }
 }
 
@@ -553,6 +591,8 @@ const fn terminal(outcome: Outcome<'_>) -> RecordRef<'_> {
 enum Stop<E> {
     /// An activity was not ready.
     Waiting(EffectId),
+    /// A deadline has not passed, with the clock its remaining ticks are counted in.
+    WaitingUntil(EffectId, ClockKind, u64),
     /// History holds a terminal record.
     Finished {
         /// Which one.
@@ -565,7 +605,7 @@ enum Stop<E> {
 }
 
 /// The driver, as the workflow sees it.
-struct Context<'a, S: StableStorage, A: Activities, C: IntegrityCheck> {
+struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> {
     storage: &'a mut S,
     activities: &'a mut A,
     machine: &'a mut ReplayMachine,
@@ -576,7 +616,7 @@ struct Context<'a, S: StableStorage, A: Activities, C: IntegrityCheck> {
     stop: Option<Stop<S::Error>>,
 }
 
-impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
     /// What the boot amounts to, once the workflow has returned.
     ///
     /// The driver's own stop outranks whatever the workflow returned. A workflow that
@@ -599,6 +639,13 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
         match stop {
             Some(Stop::Failed(error)) => return Err(error),
             Some(Stop::Waiting(id)) => return Ok(Progress::Waiting { id }),
+            Some(Stop::WaitingUntil(id, clock_kind, remaining)) => {
+                return Ok(Progress::WaitingUntil {
+                    id,
+                    clock_kind,
+                    remaining,
+                });
+            }
             Some(Stop::Finished {
                 conclusion,
                 result_len,
@@ -746,7 +793,7 @@ where
     Decision::Dispatch(dispatch)
 }
 
-impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
     /// The kernel's answer for one boundary, with nothing borrowed from it.
     ///
     /// Every arm is a row of design document §08's table. A refusal is recorded in `stop`
@@ -963,12 +1010,292 @@ impl<S: StableStorage, A: Activities, C: IntegrityCheck> Context<'_, S, A, C> {
     }
 }
 
-impl<S: StableStorage, A: Activities, C: IntegrityCheck> Boundary for Context<'_, S, A, C> {
+/// What one timer boundary needs next, once every borrow of the page has been collapsed.
+///
+/// Two answers rather than three: a deadline yields no bytes, so there is nothing to hand
+/// back and nothing to copy.
+enum TimerDecision {
+    /// The deadline has passed and its firing is committed. The workflow carries on.
+    Passed,
+    /// The run stops here; `Context::stop` says why.
+    Stop,
+}
+
+/// What the intent half of a timer boundary decided.
+enum TimerHalf<E> {
+    /// Row 3. Nothing is committed yet: read the clock, record the deadline, then measure.
+    Arm(EffectId),
+    /// Rows 1 and 2. The intent is committed; the outcome half decides which.
+    Recorded,
+    /// Row 5. History holds a terminal record, already copied into the result buffer.
+    Finished(Conclusion, usize),
+    /// Row 4, and everything else the kernel or the media refused.
+    Failed(DriveError<E>),
+}
+
+/// Design document §11's arming, as the first three of §07's steps applied to a deadline.
+///
+/// Split out of [`Context::decide_timer`] for clippy's line budget, and because this is the
+/// half that touches the clock: the reading it takes is the one the record carries, so the
+/// floor a persistent deadline is measured against is the floor that goes to media.
+///
+/// §07's typestate is deliberately not used here. Its purpose is that no *physical effect*
+/// precedes its committed intent, and this driver performs none for a deadline: it records
+/// the intent and then compares readings. A dispatcher that armed a hardware alarm would
+/// have a physical act to order, and that is rung 0.4's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one of the driver's fields, destructured by its caller"
+)]
+fn arming<S, C, K>(
+    source: &mut Source<C>,
+    storage: &mut S,
+    machine: &mut ReplayMachine,
+    clocks: &mut K,
+    page: &mut [u8],
+    stop: &mut Option<Stop<S::Error>>,
+    id: EffectId,
+    spec: TimerSpec,
+) -> TimerDecision
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+    K: Clocks,
+{
+    let capability = clocks.capability();
+    let Some(now) = clocks.now(spec.clock_kind()) else {
+        *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+        return TimerDecision::Stop;
+    };
+    let record = RecordRef::TimerScheduled {
+        seq: id.seq,
+        clock_kind: spec.clock_kind(),
+        deadline: spec.deadline(),
+        armed_at: now,
+    };
+    // Through §10's gate, like every other append: a deadline committed into a journal with
+    // no room for the firing that resolves it strands the run, because §08 has no edge from
+    // an open boundary to a terminal record.
+    if let Err(error) = write(source, storage, &record, page) {
+        *stop = Some(Stop::Failed(error));
+        return TimerDecision::Stop;
+    }
+    if let Err(error) = machine.advance(record) {
+        *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+        return TimerDecision::Stop;
+    }
+    // Read again, *after* the commit. Programming a frame and crossing two barriers is not
+    // instant, and the ticks that go into it are ticks the run really waited: measuring
+    // against the pre-write reading discards every one of them, so a deadline shorter than
+    // its own commit latency is reported as owing its whole interval and suspends a run that
+    // has already waited long enough.
+    let Some(reading) = clocks.now(spec.clock_kind()) else {
+        *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+        return TimerDecision::Stop;
+    };
+    // `now` is the floor, not `rearmed_at(now, reading)`. Both readings were taken in this
+    // boot, microseconds apart, so there is no reset here for `rearmed_at` to accommodate —
+    // and on a boot clock it answers the *lower* of the two, which would take a clock that
+    // regressed or wrapped between the two reads and report it as zero elapsed time instead
+    // of `ClockWentBackwards`. Codex found that: the round-1 fix reached for `rearmed_at`
+    // defensively and masked the fault it was meant to leave visible. Re-arming a *recorded*
+    // deadline is the only place a reset can have intervened, and that path still uses it.
+    measure(
+        source, storage, machine, page, stop, id, spec, capability, now, reading,
+    )
+}
+
+/// Whether `spec` has elapsed at `reading`, and the firing record if it has.
+///
+/// The one place a deadline is judged. `armed_at` comes from the clock on a fresh arming
+/// and from media on a re-arming, which is the whole of what issue #33's record carries
+/// across a reset.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one of the driver's fields, destructured by its caller"
+)]
+fn measure<S, C>(
+    source: &mut Source<C>,
+    storage: &mut S,
+    machine: &mut ReplayMachine,
+    page: &mut [u8],
+    stop: &mut Option<Stop<S::Error>>,
+    id: EffectId,
+    spec: TimerSpec,
+    capability: ClockCapability,
+    armed_at: u64,
+    reading: u64,
+) -> TimerDecision
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    // The firmware's own declaration, carried here rather than derived from the spec. The
+    // boundary already admitted this spec against it, so this cannot refuse today — but a
+    // capability computed from the spec is `admits` being handed the answer it exists to
+    // compute, and it would arm a persistent deadline on boot-only firmware the day a
+    // caller reached this function without going through the boundary first. Spelled as the
+    // refusal it has to be, because the workspace denies a panic.
+    let armed = match Timer::arm(spec, capability, armed_at) {
+        Ok(armed) => armed,
+        Err(error) => {
+            *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+            return TimerDecision::Stop;
+        }
+    };
+    let elapsed = match armed.evaluate(reading) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+            return TimerDecision::Stop;
+        }
+    };
+    let Deadline::Elapsed = elapsed else {
+        let Deadline::Remaining { ticks } = elapsed else {
+            // Unreachable: `Deadline` has two shapes and the other is the arm above.
+            *stop = Some(Stop::Failed(DriveError::Kernel(
+                KernelError::NondeterministicWorkflow,
+            )));
+            return TimerDecision::Stop;
+        };
+        *stop = Some(Stop::WaitingUntil(id, spec.clock_kind(), ticks));
+        return TimerDecision::Stop;
+    };
+
+    let record = RecordRef::TimerFired { seq: id.seq };
+    if let Err(error) = write(source, storage, &record, page) {
+        *stop = Some(Stop::Failed(error));
+        return TimerDecision::Stop;
+    }
+    if let Err(error) = machine.advance(record) {
+        *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+        return TimerDecision::Stop;
+    }
+    TimerDecision::Passed
+}
+
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
+    /// The kernel's answer for one timer boundary, with nothing borrowed from it.
+    ///
+    /// [`decide`](Self::decide)'s twin, row for row.
+    fn decide_timer(&mut self, spec: TimerSpec) -> TimerDecision {
+        let Self {
+            storage,
+            activities,
+            machine,
+            page,
+            result,
+            source,
+            reserve,
+            stop,
+        } = self;
+
+        if stop.is_some() {
+            return TimerDecision::Stop;
+        }
+
+        let request = TimerRequest {
+            spec,
+            capability: activities.capability(),
+        };
+
+        let half = match peek(source, *storage, page, *reserve) {
+            Err(error) => TimerHalf::Failed(error),
+            Ok(next) => match machine.timer_intent(request, next) {
+                Ok(TimerIntent::Schedule { id }) => TimerHalf::Arm(id),
+                Ok(TimerIntent::Recorded { .. }) => TimerHalf::Recorded,
+                Ok(TimerIntent::Finished { outcome }) => {
+                    match store(outcome, result, reserve.bounds().terminal_bytes) {
+                        Ok((conclusion, len)) => TimerHalf::Finished(conclusion, len),
+                        Err(error) => TimerHalf::Failed(error),
+                    }
+                }
+                Err(error) => TimerHalf::Failed(DriveError::Kernel(error)),
+            },
+        };
+
+        match half {
+            TimerHalf::Failed(error) => {
+                *stop = Some(Stop::Failed(error));
+                TimerDecision::Stop
+            }
+            TimerHalf::Finished(conclusion, result_len) => {
+                *stop = Some(Stop::Finished {
+                    conclusion,
+                    result_len,
+                });
+                TimerDecision::Stop
+            }
+            TimerHalf::Arm(id) => {
+                arming(source, *storage, machine, *activities, page, stop, id, spec)
+            }
+            TimerHalf::Recorded => {
+                let resolved = match peek(source, *storage, page, *reserve) {
+                    Err(error) => Err(error),
+                    Ok(next) => machine.timer_outcome(next).map_err(DriveError::Kernel),
+                };
+                match resolved {
+                    // Row 1. History holds the firing, so the deadline passed in an earlier
+                    // boot. Nothing is armed, no clock is read, and no record is written —
+                    // which is issue #33's first "done when".
+                    Ok(TimerResolve::Fired { .. }) => TimerDecision::Passed,
+                    // Row 2. The intent is committed and the firing is not. The spec and the
+                    // arming reading come back from media, because the reset took the RAM
+                    // they were in.
+                    Ok(TimerResolve::Rearm {
+                        id,
+                        spec: recorded,
+                        armed_at,
+                    }) => {
+                        let Some(reading) = activities.now(recorded.clock_kind()) else {
+                            *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+                            return TimerDecision::Stop;
+                        };
+                        // Which reading the deadline is measured from is §11's, not this
+                        // driver's: a persistent floor crosses the reset and a boot floor
+                        // does not, because the clock that set it restarted. Taking the
+                        // recorded reading for both is a permanent `ClockWentBackwards` on
+                        // every boot deadline that outlives a reset, on a run §08 gives no
+                        // way to end.
+                        let floor = recorded.rearmed_at(armed_at, reading);
+                        measure(
+                            source,
+                            *storage,
+                            machine,
+                            page,
+                            stop,
+                            id,
+                            recorded,
+                            request.capability,
+                            floor,
+                            reading,
+                        )
+                    }
+                    Err(error) => {
+                        *stop = Some(Stop::Failed(error));
+                        TimerDecision::Stop
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
+    for Context<'_, S, A, C>
+{
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),
             Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, kind, input),
             Decision::Stop => Err(Suspended::NEW),
+        }
+    }
+
+    fn wait(&mut self, spec: TimerSpec) -> Result<(), Suspended> {
+        match self.decide_timer(spec) {
+            TimerDecision::Passed => Ok(()),
+            TimerDecision::Stop => Err(Suspended::NEW),
         }
     }
 }

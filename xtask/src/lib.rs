@@ -91,6 +91,7 @@ pub const RULES: &[&str] = &[
     "storage-contract",
     "swap-discipline",
     "timer-capability",
+    "timer-record-fields",
     "toolchain-targets",
     "transition-surface",
     "workspace-lints",
@@ -294,6 +295,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_swap_discipline(&inputs.layer_sources));
     violations.extend(source::check_recovery_routing(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
+    violations.extend(source::check_timer_record_fields(&inputs.layer_sources));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
@@ -916,6 +918,7 @@ mod tests {
             "storage-contract",
             "swap-discipline",
             "timer-capability",
+            "timer-record-fields",
             "toolchain-targets",
             "transition-surface",
             "workspace-lints",

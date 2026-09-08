@@ -128,8 +128,15 @@ const fn record_id(record: &RecordRef<'_>) -> Option<RecordId> {
         RecordRef::EffectCompleted { seq, .. } => {
             Some(RecordId(seq.0.wrapping_mul(2).wrapping_add(1)))
         }
+        // The writers this file drives schedule and complete effects and nothing else. A
+        // timer is a schedule and a firing is its outcome, so the model has dimensions for
+        // both; what it has no numbering for is a journal that mixes them, which no writer
+        // here produces. Named rather than left to a wildcard, so a record kind added later
+        // is a decision here.
         RecordRef::RunStarted { .. }
         | RecordRef::EffectFailed { .. }
+        | RecordRef::TimerScheduled { .. }
+        | RecordRef::TimerFired { .. }
         | RecordRef::RunCompleted { .. }
         | RecordRef::RunFailed { .. } => None,
     }

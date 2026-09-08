@@ -12,8 +12,9 @@
 //!   propagates with `?` where an async façade would `.await`.
 //! * [`Workflow`] and [`Identity`] — a plain value re-run from its beginning after every
 //!   reset.
-//! * [`Activities`] and [`Performed`] — the world's half, bounded by the run's declared
-//!   result bound.
+//! * [`Activities`], [`Performed`] and [`Clocks`] — the world's half: what a run asks of
+//!   the world, bounded by the run's declared result bound, and the clocks its deadlines
+//!   are measured against.
 //! * [`Effect`], [`Dispatchable`], [`DurableIntent`], [`Resolution`], [`Scheduled`] and
 //!   [`Resolved`] — design document §07's seven steps, in an order that is the only order
 //!   that compiles.
@@ -99,7 +100,7 @@ mod drive;
 mod effect;
 mod workflow;
 
-pub use activity::{Activities, Performed};
+pub use activity::{Activities, Clocks, Performed};
 pub use boundary::{Boundary, Suspended};
 pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 pub use effect::{Dispatchable, DurableIntent, Effect, Resolution, Resolved, Scheduled};

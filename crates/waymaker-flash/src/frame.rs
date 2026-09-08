@@ -21,6 +21,11 @@
 //! [`seal_bytes`], which is that unit. A record occupies `B + A` bytes, which is
 //! [`encoded_len`].
 //!
+//! Two record bodies are fixed-shape rather than opaque bytes, and both are decoded here:
+//! `EffectScheduled`'s eight (ADR 0011) and `TimerScheduled`'s seventeen — a clock kind
+//! byte, then a deadline and an arming reading as little-endian `u64`s. `TimerFired` has no
+//! body at all.
+//!
 //! # What this module owns
 //!
 //! The bytes, and only the bytes: the constants above, the seal widths, [`encode`],
@@ -114,6 +119,7 @@
 
 use core::marker::PhantomData;
 
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 
 use crate::crc::crc32;
@@ -352,6 +358,12 @@ pub const fn permits_unknown_record_skip(version: u8) -> bool {
 /// workflow kind and version, two bytes each.
 pub(crate) const RUN_STARTED_PREFIX_BYTES: usize = 4;
 pub(crate) const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
+/// The clock kind, then the deadline and the arming reading as little-endian `u64`s.
+///
+/// The kind comes first so a reader refuses an unknown policy before it reads sixteen
+/// bytes it would have to throw away. Issue
+/// [#33](https://github.com/madmax983/waymaker/issues/33).
+pub(crate) const TIMER_SCHEDULED_BODY_BYTES: usize = 1 + 8 + 8;
 
 /// The device's program granularity: a power of two, and never zero.
 ///
@@ -689,7 +701,9 @@ pub fn encode_with<C: IntegrityCheck>(
     let sequence = match record {
         RecordRef::EffectScheduled { seq, .. }
         | RecordRef::EffectCompleted { seq, .. }
-        | RecordRef::EffectFailed { seq, .. } => seq.0,
+        | RecordRef::EffectFailed { seq, .. }
+        | RecordRef::TimerScheduled { seq, .. }
+        | RecordRef::TimerFired { seq } => seq.0,
         // A run-scoped record has no effect to number, and the decoder insists on the
         // zero: two byte sequences decoding to one record is a format that cannot be
         // reasoned about by looking at it.
@@ -1033,6 +1047,37 @@ fn decode_body(
                 input_crc,
             }
         }
+        RecordKind::TIMER_SCHEDULED => {
+            if payload.len() != TIMER_SCHEDULED_BODY_BYTES {
+                return Err(DecodeError::MalformedRecord);
+            }
+            let mut reader = Reader::new(payload);
+            let (Some(clock_kind), Some(deadline), Some(armed_at)) =
+                (reader.u8(), reader.u64(), reader.u64())
+            else {
+                return Err(DecodeError::MalformedRecord);
+            };
+            // The kind is checked here rather than left to the kernel, because a body whose
+            // first byte names no policy is not a timer record at all — and a decoder that
+            // handed it on would leave the reinterpretation §11 forbids to whoever read it
+            // next. `TimerSpec::recorded` is the kernel's total conversion, with no wildcard
+            // arm to read an unknown byte as a policy.
+            if TimerSpec::recorded(ClockKind(clock_kind), deadline).is_none() {
+                return Err(DecodeError::MalformedRecord);
+            }
+            RecordRef::TimerScheduled {
+                seq,
+                clock_kind: ClockKind(clock_kind),
+                deadline,
+                armed_at,
+            }
+        }
+        RecordKind::TIMER_FIRED => {
+            if !payload.is_empty() {
+                return Err(DecodeError::MalformedRecord);
+            }
+            RecordRef::TimerFired { seq }
+        }
         RecordKind::EFFECT_COMPLETED => RecordRef::EffectCompleted {
             seq,
             result: payload,
@@ -1056,7 +1101,26 @@ fn decode_body(
 /// describe. `RunStarted` spends four of those bytes on the workflow identity, so its
 /// input ceiling is four lower — a distinction a check written against the input rather
 /// than against the payload would get wrong.
+///
+/// [`DecodeError::MalformedRecord`] for a `TimerScheduled` whose clock kind names no
+/// policy. [`ClockKind`] is a public newtype over a `u8`, exactly as [`RecordKind`] is, so
+/// a caller can build one the format does not spend — and [`decode`] refuses such a body.
+/// An encoder that wrote it anyway would put a checksum-sound, correctly sealed record on
+/// media that this firmware cannot read back, and under
+/// [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
+/// a scan that stops at a damaged frame leaves the bank no append point. Refused here
+/// rather than in [`encode`] alone, so that [`encoded_len`] refuses it too: a caller that
+/// priced the record and then could not write it would be told at the wrong step.
 fn payload_len(record: &RecordRef<'_>) -> Result<usize, DecodeError> {
+    if let RecordRef::TimerScheduled {
+        clock_kind,
+        deadline,
+        ..
+    } = *record
+        && TimerSpec::recorded(clock_kind, deadline).is_none()
+    {
+        return Err(DecodeError::MalformedRecord);
+    }
     let body = body(record);
     let len = body.prefix_len.saturating_add(body.tail.len());
     if len > MAX_PAYLOAD_BYTES {
@@ -1071,14 +1135,14 @@ fn payload_len(record: &RecordRef<'_>) -> Result<usize, DecodeError> {
 /// this way is what lets [`encode`] write any record through one path — so a variant
 /// cannot acquire a second, subtly different encoder.
 struct Body<'a> {
-    prefix: [u8; EFFECT_SCHEDULED_BODY_BYTES],
+    prefix: [u8; TIMER_SCHEDULED_BODY_BYTES],
     prefix_len: usize,
     tail: &'a [u8],
 }
 
 /// Splits `record` into the fixed prefix its kind defines and the bytes after it.
 fn body<'a>(record: &RecordRef<'a>) -> Body<'a> {
-    let mut prefix = [0_u8; EFFECT_SCHEDULED_BODY_BYTES];
+    let mut prefix = [0_u8; TIMER_SCHEDULED_BODY_BYTES];
     match *record {
         RecordRef::RunStarted {
             workflow_kind,
@@ -1120,6 +1184,35 @@ fn body<'a>(record: &RecordRef<'a>) -> Body<'a> {
                 tail: &[],
             }
         }
+        RecordRef::TimerScheduled {
+            clock_kind,
+            deadline,
+            armed_at,
+            ..
+        } => {
+            for (slot, byte) in prefix.iter_mut().zip(
+                clock_kind
+                    .0
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(deadline.to_le_bytes())
+                    .chain(armed_at.to_le_bytes()),
+            ) {
+                *slot = byte;
+            }
+            Body {
+                prefix,
+                prefix_len: TIMER_SCHEDULED_BODY_BYTES,
+                tail: &[],
+            }
+        }
+        // A firing's whole content is that the deadline passed, and the sequence that says
+        // which timer is in the header. There is nothing left to put in a body.
+        RecordRef::TimerFired { .. } => Body {
+            prefix,
+            prefix_len: 0,
+            tail: &[],
+        },
         RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => Body {
             prefix,
             prefix_len: 0,
@@ -1154,6 +1247,12 @@ impl<'a> Reader<'a> {
         Some(head)
     }
 
+    fn u8(&mut self) -> Option<u8> {
+        let bytes: [u8; 1] = self.take(1)?.try_into().ok()?;
+        let [byte] = bytes;
+        Some(byte)
+    }
+
     fn u16(&mut self) -> Option<u16> {
         let bytes: [u8; 2] = self.take(2)?.try_into().ok()?;
         Some(u16::from_le_bytes(bytes))
@@ -1162,6 +1261,11 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Option<u32> {
         let bytes: [u8; 4] = self.take(4)?.try_into().ok()?;
         Some(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
     }
 
     /// Everything not yet read.
@@ -1453,6 +1557,9 @@ const _: () = assert!(FRAME_OVERHEAD_BYTES == 16);
 const _: () = assert!(MAX_FRAME_BYTES == 65_551);
 const _: () = assert!(MAGIC != 0x0000 && MAGIC != 0xFFFF);
 const _: () = assert!(RUN_STARTED_PREFIX_BYTES <= EFFECT_SCHEDULED_BODY_BYTES);
+// `Body::prefix` is one array for every record's fixed head, so it has to be the widest.
+const _: () = assert!(EFFECT_SCHEDULED_BODY_BYTES <= TIMER_SCHEDULED_BODY_BYTES);
+const _: () = assert!(TIMER_SCHEDULED_BODY_BYTES == 17);
 
 #[cfg(test)]
 mod tests {
@@ -1513,8 +1620,28 @@ mod tests {
             input_crc: 0x0807_0605,
         });
         assert_eq!(scheduled.prefix_len, 8);
-        assert_eq!(scheduled.prefix, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            scheduled.prefix.get(..8),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8][..])
+        );
         assert!(scheduled.tail.is_empty());
+
+        let armed = body(&RecordRef::TimerScheduled {
+            seq: EffectSeq(0),
+            clock_kind: ClockKind::AT_PERSISTENT_TIME,
+            deadline: 0x0908_0706_0504_0302,
+            armed_at: 0x1110_0F0E_0D0C_0B0A,
+        });
+        assert_eq!(armed.prefix_len, 17);
+        assert_eq!(
+            armed.prefix.get(..17),
+            Some(&[2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17][..])
+        );
+        assert!(armed.tail.is_empty());
+
+        let fired = body(&RecordRef::TimerFired { seq: EffectSeq(1) });
+        assert_eq!(fired.prefix_len, 0);
+        assert!(fired.tail.is_empty());
 
         let failed = body(&RecordRef::RunFailed { error: b"why" });
         assert_eq!(failed.prefix_len, 0);
