@@ -12,10 +12,11 @@
 
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
-use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
+use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
-    Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
+    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
@@ -369,13 +370,27 @@ fn the_delayed_workflow_waits_for_the_deadline_this_test_file_names() {
 /// that strands a run when the driver treats the two alike.
 struct Napping {
     input: [u8; 4],
+    spec: TimerSpec,
 }
 
 impl Napping {
     const SPEC: TimerSpec = TimerSpec::AfterBoot { ticks: 1_000 };
+    /// Shorter than the latency of committing its own schedule record.
+    const BRIEF: TimerSpec = TimerSpec::AfterBoot { ticks: 1 };
 
     const fn new() -> Self {
-        Self { input: *b"seed" }
+        Self {
+            input: *b"seed",
+            spec: Self::SPEC,
+        }
+    }
+
+    /// The same workflow, waiting for `spec`.
+    const fn waiting(spec: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            spec,
+        }
     }
 }
 
@@ -389,7 +404,7 @@ impl Workflow for Napping {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        boundary.wait(Self::SPEC)?;
+        boundary.wait(self.spec)?;
         Ok(Outcome::Completed(b"woke"))
     }
 }
@@ -526,4 +541,87 @@ fn a_persistent_clock_that_moved_backwards_across_a_reset_is_still_refused() {
         boot(&mut device, &mut moved_back),
         Err(DriveError::Kernel(KernelError::ClockWentBackwards))
     );
+}
+
+/// A world whose clock runs while the driver programs flash.
+///
+/// `World`'s clock only moves when a test moves it, so nothing above can see time pass
+/// *during* a write. Programming a frame and crossing two barriers is not instant, and a
+/// deadline shorter than that latency has already elapsed by the time its own intent is
+/// committed. This clock advances on every read, which is what a real one does.
+struct Ticking {
+    world: World,
+    per_read: u64,
+}
+
+impl Ticking {
+    const fn new(per_read: u64) -> Self {
+        let mut world = World::new();
+        world.set_capability(ClockCapability::BootOnly);
+        Self { world, per_read }
+    }
+}
+
+impl Clocks for Ticking {
+    fn capability(&self) -> ClockCapability {
+        self.world.capability()
+    }
+
+    fn now(&mut self, kind: ClockKind) -> Option<u64> {
+        let reading = self.world.now(kind);
+        self.world.advance(self.per_read);
+        reading
+    }
+}
+
+impl Activities for Ticking {
+    fn perform(
+        &mut self,
+        intent: DurableIntent,
+        kind: ActivityKind,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Performed {
+        self.world.perform(intent, kind, input, out)
+    }
+}
+
+#[test]
+fn a_deadline_shorter_than_its_own_commit_latency_fires_in_the_boot_that_armed_it() {
+    // Codex found this. The deadline is measured after the schedule record is committed, not
+    // before it, so the ticks spent programming the frame and crossing its two barriers are
+    // ticks the run really waited. Measuring against the pre-write reading discards them:
+    // a deadline shorter than the write latency is reported as owing its whole interval and
+    // suspends a run that has already waited long enough.
+    //
+    // The recorded arming reading is still the pre-write one — that is what went to media,
+    // and it is the floor. Only the measurement moved.
+    let mut device = Device::new(geometry());
+    let mut world = Ticking::new(100);
+    let mut workflow = Napping::waiting(Napping::BRIEF);
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
+        "a 1-tick deadline armed on a clock that moves 100 ticks per read has elapsed by the \
+         time its own record is committed: {progress:?}"
+    );
+    assert!(kinds(&mut device).contains(&RecordKind::TIMER_FIRED));
 }

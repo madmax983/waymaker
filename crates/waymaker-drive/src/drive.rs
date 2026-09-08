@@ -1070,10 +1070,28 @@ where
         *stop = Some(Stop::Failed(DriveError::Kernel(error)));
         return TimerDecision::Stop;
     }
-    // The same reading the record carries. A second read here would measure the deadline
-    // against a moment the journal does not describe.
+    // Read again, *after* the commit. Programming a frame and crossing two barriers is not
+    // instant, and the ticks that go into it are ticks the run really waited: measuring
+    // against the pre-write reading discards every one of them, so a deadline shorter than
+    // its own commit latency is reported as owing its whole interval and suspends a run that
+    // has already waited long enough. The recorded reading stays the arming floor — that is
+    // what went to media — and only the measurement moves, which makes this path the same
+    // two values the re-arming path below uses.
+    let Some(reading) = clocks.now(spec.clock_kind()) else {
+        *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+        return TimerDecision::Stop;
+    };
     measure(
-        source, storage, machine, page, stop, id, spec, capability, now, now,
+        source,
+        storage,
+        machine,
+        page,
+        stop,
+        id,
+        spec,
+        capability,
+        spec.rearmed_at(now, reading),
+        reading,
     )
 }
 
