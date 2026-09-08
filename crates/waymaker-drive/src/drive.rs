@@ -9,7 +9,7 @@
 use core::marker::PhantomData;
 use core::mem;
 
-use waymaker_core::timer::{ClockCapability, Deadline, Timer, TimerSpec};
+use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 use waymaker_core::{
     ActivityKind, EffectId, EffectRequest, Intent, KernelError, Next, Outcome, RecordRef,
     ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve,
@@ -61,12 +61,22 @@ pub enum Progress {
     /// A deadline has not passed. Its `TimerScheduled` record is committed, so the next
     /// boot arms the same deadline from the reading history recorded.
     ///
-    /// `remaining` is in the deadline's own clock unit, so a caller with a sleep can use
-    /// it. This driver has none: design document §11's in-boot sleep is rung 0.4's.
+    /// `remaining` is in `clock_kind`'s unit, and the kind travels beside it because the two
+    /// units need not be the same one. [`Clocks`] says a reading is "in that clock's own
+    /// unit" and that the kernel never converts, so a firmware whose RTC counts seconds and
+    /// whose boot clock counts milliseconds is an ordinary firmware — and a caller handed a
+    /// bare number could not tell which alarm to set it on, or by how much to scale it. A
+    /// wait this driver documents as usable for sleeping has to say what it is measured in.
+    /// Codex found the version that did not.
+    ///
+    /// This driver has no sleep of its own: design document §11's in-boot sleep is rung
+    /// 0.4's.
     WaitingUntil {
         /// The timer the run is waiting on.
         id: EffectId,
-        /// Ticks of that timer's clock still owed, as of this boot's last reading.
+        /// Which clock `remaining` is counted in.
+        clock_kind: ClockKind,
+        /// Ticks of that clock still owed, as of this boot's last reading.
         remaining: u64,
     },
 }
@@ -581,8 +591,8 @@ const fn terminal(outcome: Outcome<'_>) -> RecordRef<'_> {
 enum Stop<E> {
     /// An activity was not ready.
     Waiting(EffectId),
-    /// A deadline has not passed.
-    WaitingUntil(EffectId, u64),
+    /// A deadline has not passed, with the clock its remaining ticks are counted in.
+    WaitingUntil(EffectId, ClockKind, u64),
     /// History holds a terminal record.
     Finished {
         /// Which one.
@@ -629,8 +639,12 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         match stop {
             Some(Stop::Failed(error)) => return Err(error),
             Some(Stop::Waiting(id)) => return Ok(Progress::Waiting { id }),
-            Some(Stop::WaitingUntil(id, remaining)) => {
-                return Ok(Progress::WaitingUntil { id, remaining });
+            Some(Stop::WaitingUntil(id, clock_kind, remaining)) => {
+                return Ok(Progress::WaitingUntil {
+                    id,
+                    clock_kind,
+                    remaining,
+                });
             }
             Some(Stop::Finished {
                 conclusion,
@@ -1148,7 +1162,7 @@ where
             )));
             return TimerDecision::Stop;
         };
-        *stop = Some(Stop::WaitingUntil(id, ticks));
+        *stop = Some(Stop::WaitingUntil(id, spec.clock_kind(), ticks));
         return TimerDecision::Stop;
     };
 

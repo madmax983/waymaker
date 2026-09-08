@@ -625,3 +625,40 @@ fn a_deadline_shorter_than_its_own_commit_latency_fires_in_the_boot_that_armed_i
     );
     assert!(kinds(&mut device).contains(&RecordKind::TIMER_FIRED));
 }
+
+#[test]
+fn a_wait_says_which_clock_its_remaining_ticks_are_counted_in() {
+    // `Clocks` lets the two clocks keep different units — "a reading is in that clock's own
+    // unit", and the kernel never converts — so a firmware whose RTC counts seconds and
+    // whose boot clock counts milliseconds is an ordinary one. A caller handed a bare
+    // `remaining` could not tell which alarm to set it on, or by how much to scale it, which
+    // makes a wait this driver documents as usable for sleeping unusable. Both kinds are
+    // pinned here, because one arm reporting the other's kind is the mistake.
+    let mut device = Device::new(geometry());
+    let mut world = world_at(DEADLINE - 500);
+    assert!(
+        matches!(
+            boot(&mut device, &mut world),
+            Ok(Progress::WaitingUntil {
+                clock_kind: ClockKind::AT_PERSISTENT_TIME,
+                remaining: 500,
+                ..
+            })
+        ),
+        "a persistent deadline counts in the persistent clock's unit"
+    );
+
+    let mut boot_device = Device::new(geometry());
+    let mut ticking = booted(5_000);
+    assert!(
+        matches!(
+            nap(&mut boot_device, &mut ticking),
+            Ok(Progress::WaitingUntil {
+                clock_kind: ClockKind::AFTER_BOOT,
+                remaining: 1_000,
+                ..
+            })
+        ),
+        "a boot deadline counts in the boot clock's unit"
+    );
+}
