@@ -19,9 +19,9 @@ use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 /// The run cannot go on in this boot.
 ///
-/// It carries no reason. A workflow may not tell a wait from a finished run from a refusal,
-/// because acting on the difference is how a workflow starts guessing at history. The
-/// caller that drove the boot asks the journal what happened.
+/// It carries no reason. A workflow cannot tell a wait, a finished run and a refusal apart.
+/// If it could, it would guess at history. The caller that drove the boot asks the journal
+/// what happened instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Halted;
 

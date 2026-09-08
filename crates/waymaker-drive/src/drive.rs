@@ -291,7 +291,13 @@ impl<C: IntegrityCheck> Driver<C> {
         let Scratch { page, result } = scratch;
         // Before anything reaches media. A boot that discovered this at the first effect
         // would already have committed the run's opening record.
-        let needed = usize::from(self.reserve.bounds().effect_result_bytes);
+        //
+        // The *wider* of the run's two bounds, not the effect one alone. A terminal payload
+        // is bounded by `terminal_bytes`, and a buffer that held every effect result and
+        // not every terminal payload would refuse a legal run at its last record — after
+        // every effect had been performed.
+        let bounds = self.reserve.bounds();
+        let needed = usize::from(bounds.effect_result_bytes.max(bounds.terminal_bytes));
         if result.len() < needed {
             return Err(DriveError::ResultBufferTooSmall {
                 needed,
@@ -844,11 +850,20 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
+            pending,
             ..
         } = self;
 
         // A boundary the driver has already stopped at answers nothing and touches nothing.
         if stop.is_some() {
+            return Decision::Stop;
+        }
+        // A caller that split §07 in two and then took another boundary. The writer is
+        // inside the outstanding effect, so every path below would reach `peek` and report
+        // `NoAppendPoint` — the one refusal reserved for a bank that can never be appended
+        // to again. Named for what it is instead.
+        if pending.is_some() {
+            *stop = Some(Stop::Failed(DriveError::EffectOutstanding));
             return Decision::Stop;
         }
 
@@ -1225,10 +1240,16 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
-            ..
+            pending,
         } = self;
 
         if stop.is_some() {
+            return TimerDecision::Stop;
+        }
+        // `decide`'s guard, for the same reason: the writer is inside the outstanding
+        // effect, so a deadline here would report `NoAppendPoint`.
+        if pending.is_some() {
+            *stop = Some(Stop::Failed(DriveError::EffectOutstanding));
             return TimerDecision::Stop;
         }
 

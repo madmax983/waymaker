@@ -160,6 +160,23 @@ pub const STAGES: &[Stage] = &[
         why: "issue #28: \"no `Future`, no Embassy, no allocation\" is a build failure rather than an inspection",
     },
     Stage {
+        name: "drive-facadeless",
+        job: "firmware",
+        // Issue #35's second "done when": "removing the Embassy crate leaves the protocol
+        // fully usable through the synchronous driver". `waymaker-drive`'s `without-facade`
+        // feature deletes the two modules that name `waymaker-embassy`, so this stage
+        // compiles the driver, §06's boundary, §07's typestate and the reference workflow
+        // with the façade edge gone.
+        //
+        // A build rather than a scan. `ctx-facade` reads the modules that may not name the
+        // façade, and a scanner cannot see an import routed through `crate::facade` or a
+        // dependency renamed in a manifest; a compiler sees both. On the firmware target
+        // rather than the host, because that is where the claim is worth something.
+        command: "cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi",
+        in_hook: false,
+        why: "issue #35: \"the protocol is fully usable with the fa\u{e7}ade removed\" is a build failure rather than a text search",
+    },
+    Stage {
         name: "probe-lint",
         job: "firmware",
         // The size probe's binary is behind `required-features`, so the `lint` stage above

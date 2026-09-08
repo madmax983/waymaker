@@ -11,10 +11,12 @@
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context as Task, Poll, Waker};
+use std::sync::Arc;
+use std::task::Wake;
 
 use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
-use waymaker_embassy::ctx::{Ctx, Failure};
+use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
 
 const RUN: RunId = RunId(9);
@@ -314,7 +316,6 @@ fn a_dispatcher_that_fails_records_a_failure_with_no_payload_and_keeps_the_typed
     let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
 
     assert_eq!(answered, Poll::Ready(Err(Failure::Activity { len: 0 })));
-    assert_eq!(ctx.dispatch_error(), Some(&Fault));
     assert_eq!(
         ledger.asked,
         vec![
@@ -363,9 +364,9 @@ fn a_failed_effect_is_an_error_and_its_payload_stays_in_the_callers_buffer() {
 }
 
 #[test]
-fn a_halted_journal_stops_the_workflow_and_wakes_nobody() {
-    // A halt is this boot ending. There is nothing left to wake, so the future is `Pending`
-    // and no waker is registered: the caller that drove the boot is what looks at the
+fn a_halted_journal_stops_the_workflow_and_reaches_no_dispatcher() {
+    // A halt is this boot ending. The world is never asked, and no waker is registered:
+    // there is nothing left to wake, and the caller that drove the boot looks at the
     // journal next.
     let mut ledger = Ledger::new().scheduling(vec![Err(Halted)]);
     let mut world = World::silent();
@@ -376,6 +377,47 @@ fn a_halted_journal_stops_the_workflow_and_wakes_nobody() {
 
     assert_eq!(answered, Poll::Pending);
     assert_eq!(world.polls, 0);
+}
+
+#[test]
+fn a_schedule_that_halted_is_asked_again_on_the_next_poll() {
+    // Nothing was committed and nothing was consumed, so the boundary has not happened.
+    // Ending it here would make a retained future one that can never make progress.
+    let mut ledger = Ledger::new().scheduling(vec![
+        Err(Halted),
+        Ok(Handoff::Replayed(Outcome::Completed(b"\x04\x00\x00\x00"))),
+    ]);
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let mut future = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let mut task = Task::from_waker(Waker::noop());
+    let first = future.as_mut().poll(&mut task);
+    let second = future.as_mut().poll(&mut task);
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Ready(Ok(Slot(4))));
+}
+
+#[test]
+fn a_deadline_that_has_not_passed_is_asked_again_on_the_next_poll() {
+    // §11's deadline is the one case an in-boot wakeup exists for, and this crate has none
+    // yet. Asking again on every poll is what a retained timer future needs instead.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new().waiting(vec![Err(Halted), Ok(())]);
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let mut future = pin!(ctx.timer(spec));
+    let mut task = Task::from_waker(Waker::noop());
+    let first = future.as_mut().poll(&mut task);
+    let second = future.as_mut().poll(&mut task);
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Ready(()));
+    assert_eq!(ledger.asked, vec![Asked::Wait(spec), Asked::Wait(spec)]);
 }
 
 #[test]
@@ -435,7 +477,10 @@ fn a_terminal_call_records_no_record_and_leaves_the_conclusion_for_the_caller() 
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"done"));
 
     assert_eq!(ended, Poll::Ready(Ok(())));
-    assert_eq!(ctx.conclusion(), Some(Outcome::Completed(b"done")));
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Completed(b"done")))
+    );
     assert!(ledger.asked.is_empty());
 }
 
@@ -449,7 +494,10 @@ fn a_failing_run_ends_with_a_failure_payload() {
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"bad"));
 
     assert_eq!(ended, Poll::Ready(Ok(())));
-    assert_eq!(ctx.conclusion(), Some(Outcome::Failed(b"bad")));
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Failed(b"bad")))
+    );
 }
 
 #[test]
@@ -461,14 +509,16 @@ fn a_run_that_has_not_ended_has_no_conclusion() {
 
     assert_eq!(ctx.conclusion(), None);
     assert_eq!(ctx.payload(), b"");
-    assert_eq!(ctx.dispatch_error(), None);
 }
 
 #[test]
 fn a_terminal_payload_wider_than_the_buffer_is_refused_rather_than_truncated() {
     // The buffer is the caller's and the bound is the run's. A short terminal record that
-    // replayed for ever is the same defect an exhausted effect has, so it is refused here
-    // and the caller sees a run that never concluded.
+    // replayed for ever is the same defect an exhausted effect has, so it is refused.
+    //
+    // `Refused` rather than `None`. The two are different runs — one did not finish, the
+    // other asked to finish with bytes the caller cannot carry — and a caller that read the
+    // refusal as "never ended" would record a completion for a run that asked to fail.
     let mut ledger = Ledger::new();
     let mut world = World::silent();
     let mut out = [0_u8; 2];
@@ -477,7 +527,26 @@ fn a_terminal_payload_wider_than_the_buffer_is_refused_rather_than_truncated() {
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"too long"));
 
     assert_eq!(ended, Poll::Ready(Ok(())));
-    assert_eq!(ctx.conclusion(), None);
+    assert_eq!(ctx.conclusion(), Some(Conclusion::Refused));
+}
+
+#[test]
+fn a_refused_failure_is_not_read_back_as_a_completion() {
+    // The sharpest shape of the defect above: a run that asked to *fail* with a payload the
+    // buffer cannot carry. Answering `None` here made a caller record `RunCompleted`.
+    let mut ledger = Ledger::new();
+    let mut world = World::silent();
+    let mut out = [0_u8; 2];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"the image did not verify"));
+
+    assert_eq!(ended, Poll::Ready(Ok(())));
+    assert_eq!(ctx.conclusion(), Some(Conclusion::Refused));
+    assert_ne!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Completed(b"")))
+    );
 }
 
 #[test]
@@ -528,4 +597,89 @@ fn a_stalled_dispatcher_is_polled_again_and_the_effect_resolves_once() {
             Asked::Resolve(Answered::Completed(b"\x09\x00\x00\x00".to_vec())),
         ]
     );
+}
+
+/// A waker that counts how often it was woken, so a test can see registration.
+struct Counting {
+    woken: core::sync::atomic::AtomicUsize,
+}
+
+impl Wake for Counting {
+    fn wake(self: Arc<Self>) {
+        self.woken
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A dispatcher that keeps the waker it was handed and wakes it later.
+struct Deferred {
+    kept: Option<Waker>,
+}
+
+impl ActivityDispatcher for Deferred {
+    type Error = Fault;
+
+    fn poll_dispatch(
+        &mut self,
+        task: &mut Task<'_>,
+        _id: EffectId,
+        _kind: ActivityKind,
+        _input: &[u8],
+        _out: &mut [u8],
+    ) -> Poll<Result<usize, Fault>> {
+        // What a real dispatcher does: keep the waker and answer when the world does.
+        self.kept = Some(task.waker().clone());
+        Poll::Pending
+    }
+}
+
+#[test]
+fn the_task_waker_reaches_the_dispatcher_and_is_the_one_the_executor_gave() {
+    // Issue #35's first work bullet says the futures "register Embassy wakeups". This crate
+    // registers none of its own: it plumbs the task's waker to the one thing that knows when
+    // the world will answer. That plumbing is what this measures — the dispatcher keeps the
+    // waker, wakes it, and the executor's own counter moves.
+    let counter = Arc::new(Counting {
+        woken: core::sync::atomic::AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut task = Task::from_waker(&waker);
+
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = Deferred { kept: None };
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url")).poll(&mut task);
+
+    assert_eq!(answered, Poll::Pending);
+    let kept = world
+        .kept
+        .take()
+        .expect("the dispatcher was handed a waker");
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 0);
+    kept.wake();
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_halt_registers_no_waker_at_all() {
+    // The other half, and the honest one: a halted boot has nothing to wake. Nothing in the
+    // façade holds the waker, so an executor is never asked to poll a run that is over.
+    let counter = Arc::new(Counting {
+        woken: core::sync::atomic::AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut task = Task::from_waker(&waker);
+
+    let mut ledger = Ledger::new().scheduling(vec![Err(Halted)]);
+    let mut world = Deferred { kept: None };
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url")).poll(&mut task);
+
+    assert_eq!(answered, Poll::Pending);
+    assert!(world.kept.is_none(), "the world was never asked");
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 0);
 }

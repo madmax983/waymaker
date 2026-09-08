@@ -11,9 +11,9 @@ use waymaker_core::{ActivityKind, EffectId};
 ///
 /// # Why it is poll-shaped
 ///
-/// §13 sketches `async fn dispatch`. A future that must survive between polls has to be
-/// stored, and the type an `async fn` in a trait returns cannot be named — so a named
-/// [`ActivityFuture`](crate::ctx::ActivityFuture) cannot hold one without an allocation.
+/// §13 sketches `async fn dispatch`. A future that survives between polls must be stored.
+/// You cannot name the type an `async fn` in a trait returns, so
+/// [`ActivityFuture`](crate::ctx::ActivityFuture) cannot store one without an allocation.
 /// The poll form stores nothing. Issue
 /// [#36](https://github.com/madmax983/waymaker/issues/36) owns the ergonomic wrapper over
 /// it.
@@ -46,12 +46,15 @@ pub trait ActivityDispatcher {
     ///
     /// # Errors
     ///
-    /// [`Self::Error`] when the activity failed. It is recorded as an `EffectFailed` with
+    /// [`Self::Error`] when the activity failed. The façade records an `EffectFailed` with
     /// no payload, so the run makes progress and every replay answers the same way. The
-    /// error value itself reaches
-    /// [`Ctx::dispatch_error`](crate::ctx::Ctx::dispatch_error) for a log, and no further:
-    /// a workflow that branched on it would branch on something history does not hold. An
-    /// activity with a failure payload writes it into `out` and reports its length instead.
+    /// error value goes no further: a workflow that branched on it would branch on
+    /// something history does not hold. Keep it in the dispatcher if a log needs it.
+    ///
+    /// A *typed* failure payload has no route through this trait. `Ok(len)` is recorded as
+    /// an `EffectCompleted`, so an activity cannot report bytes and failure together. §09
+    /// gives `EffectFailed` a bounded payload and this signature does not, which is issue
+    /// [#36](https://github.com/madmax983/waymaker/issues/36)'s to close.
     fn poll_dispatch(
         &mut self,
         task: &mut Context<'_>,

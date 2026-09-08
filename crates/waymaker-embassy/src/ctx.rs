@@ -2,9 +2,8 @@
 //!
 //! Issue [#35](https://github.com/madmax983/waymaker/issues/35). A workflow written against
 //! [`Ctx`] is an ordinary `async fn`: it `.await`s an activity, a deadline, or a new run,
-//! and the compiler builds the state machine. Nothing here owns media and nothing here
-//! keeps global state — a [`Journal`] holds the first and a [`Ctx`] borrows everything it
-//! touches.
+//! and the compiler builds the state machine. This crate owns no media and keeps no global
+//! state. The [`Journal`] implementation owns the media. A [`Ctx`] borrows all it uses.
 //!
 //! # What the futures do
 //!
@@ -15,16 +14,23 @@
 //!
 //! # Disposable, by design
 //!
-//! Within one boot a future may be retained and polled normally. After a reset the future
-//! is gone; the workflow is created again and replay reconstructs its observable state.
-//! Recreating it *is* the recovery mechanism, so no future here holds anything a reset must
-//! not take.
+//! Create the future again to recover. Within one boot a future may be retained and polled
+//! normally; after a reset the future is gone, the workflow is built again, and replay
+//! rebuilds what it observed. No future here holds data that must survive a reset.
 //!
-//! # The executor is not ours
+//! # The executor is not ours, and neither are the wakeups
 //!
-//! These are plain [`Future`]s. Embassy's executor polls them; this crate has no executor,
-//! no timer queue and no waker of its own. A [`Halted`] run registers no waker at all,
-//! because the boot is over and the caller that drove it is what looks next.
+//! These are plain [`Future`]s. Embassy's executor polls them. This crate has no executor,
+//! no timer queue and no waker of its own, and it registers no waker itself. What it does
+//! is *plumb* the task's waker through to [`ActivityDispatcher::poll_dispatch`], which is
+//! the one place that knows when the world will answer.
+//!
+//! Two paths therefore register nothing. A [`Halted`] run registers nothing because the
+//! boot is over: the caller that drove it looks at the journal next. A deadline that has
+//! not passed registers nothing because there is no in-boot sleep yet — [`Journal::wait`]
+//! is asked again on the next poll, and issue
+//! [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatcher is where a hardware
+//! alarm arrives.
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -55,11 +61,28 @@ pub enum Failure<T> {
     Decode(T),
 }
 
+/// What a workflow said its run ends with.
+///
+/// Three answers rather than two. "The payload does not fit" is not "the run has not
+/// ended". A caller that could not tell them apart would record a completion for a run that
+/// asked to fail, which is what this type prevents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conclusion<'a> {
+    /// The run ended. These are its terminal bytes.
+    Ended(Outcome<'a>),
+    /// The run asked to end with a payload wider than the caller's buffer.
+    ///
+    /// Refused rather than truncated: a short terminal record replays for ever. The caller
+    /// must not write a terminal record for this run.
+    Refused,
+}
+
 /// How a run ended, and how much of the caller's buffer it ended with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Ending {
     Completed(usize),
     Failed(usize),
+    Refused,
 }
 
 /// Copies as much of `src` into `dst` as fits, and says how much that was.
@@ -84,15 +107,16 @@ pub struct Ctx<'a, D: ActivityDispatcher, J: Journal> {
     out: &'a mut [u8],
     payload: usize,
     conclusion: Option<Ending>,
-    stalled: Option<D::Error>,
 }
 
 impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     /// A context over `journal`, `dispatcher` and `out`.
     ///
-    /// `out` must be at least as wide as the run's declared effect-result bound. A narrower
-    /// buffer makes every wider answer [`Answer::Exhausted`], which the run records and
-    /// replays for ever.
+    /// `out` must be at least as wide as the **wider** of the run's two declared bounds:
+    /// its effect-result bound and its terminal bound. An activity answer over the first is
+    /// recorded as [`Answer::Exhausted`] and replays for ever; a terminal payload over the
+    /// second is [`Conclusion::Refused`] and the run cannot end. Both bounds are §10's, and
+    /// neither is one this crate can read.
     pub const fn new(journal: &'a mut J, dispatcher: &'a mut D, out: &'a mut [u8]) -> Self {
         Self {
             journal,
@@ -100,7 +124,6 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             out,
             payload: 0,
             conclusion: None,
-            stalled: None,
         }
     }
 
@@ -118,7 +141,6 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher: self.dispatcher,
             out: self.out,
             payload: &mut self.payload,
-            stalled: &mut self.stalled,
             kind,
             input,
             stage: Stage::Scheduling,
@@ -126,7 +148,10 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
         }
     }
 
-    /// Wait until `spec`'s deadline has passed.
+    /// Ask whether `spec`'s deadline has passed.
+    ///
+    /// If it has not, the run stops for this boot. The future asks again on every poll, so
+    /// a caller that drives more than one poll per boot sees the deadline pass.
     ///
     /// It carries no dispatcher. A deadline is not an activity: §11 measures it against a
     /// clock the journal reads, and nothing outside the device is asked.
@@ -179,16 +204,19 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
         }
     }
 
-    /// What the run ended with, or [`None`] if it has not ended.
+    /// What the run ends with, or [`None`] if it has not ended.
     ///
-    /// [`None`] also answers a terminal payload wider than `out`. A short terminal record
-    /// would replay for ever, so it is refused rather than truncated, and the caller sees a
-    /// run that never concluded.
+    /// A refused payload answers [`Conclusion::Refused`] and never [`None`]. The two are
+    /// different runs: one did not finish, the other asked to finish with bytes the caller
+    /// cannot carry.
     #[must_use]
-    pub fn conclusion(&self) -> Option<Outcome<'_>> {
+    pub fn conclusion(&self) -> Option<Conclusion<'_>> {
         match self.conclusion? {
-            Ending::Completed(len) => Some(Outcome::Completed(self.out.get(..len)?)),
-            Ending::Failed(len) => Some(Outcome::Failed(self.out.get(..len)?)),
+            Ending::Completed(len) => {
+                Some(Conclusion::Ended(Outcome::Completed(self.out.get(..len)?)))
+            }
+            Ending::Failed(len) => Some(Conclusion::Ended(Outcome::Failed(self.out.get(..len)?))),
+            Ending::Refused => Some(Conclusion::Refused),
         }
     }
 
@@ -198,16 +226,6 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         self.out.get(..self.payload).unwrap_or_default()
-    }
-
-    /// The last dispatcher error, for a log.
-    ///
-    /// It is diagnosis and not control flow. History records that the effect failed and
-    /// nothing about why, so a workflow that branched on this would branch on something no
-    /// replay can reproduce.
-    #[must_use]
-    pub const fn dispatch_error(&self) -> Option<&D::Error> {
-        self.stalled.as_ref()
     }
 }
 
@@ -229,7 +247,6 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'b mut D,
     out: &'b mut [u8],
     payload: &'b mut usize,
-    stalled: &'b mut Option<D::Error>,
     kind: ActivityKind,
     input: &'b [u8],
     stage: Stage,
@@ -238,9 +255,9 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
 
 /// The workflow's value, once the outcome is committed.
 ///
-/// A free function rather than a method: `outcome` borrows the journal, and `out` and
-/// `payload` are the other two fields, so the three borrows are disjoint only while they
-/// stay apart.
+/// A free function rather than a method. Separate arguments keep the three borrows
+/// disjoint: `outcome` borrows the journal, `out` and `payload` are two other fields. A
+/// method would borrow all of `self`, and none of them would be usable.
 fn observed<T: Decode>(
     outcome: Outcome<'_>,
     out: &mut [u8],
@@ -271,10 +288,10 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                 // is the caller of the boot that acts on it.
                 Stage::Ended => return Poll::Pending,
                 Stage::Scheduling => match me.journal.schedule(me.kind, me.input) {
-                    Err(Halted) => {
-                        me.stage = Stage::Ended;
-                        return Poll::Pending;
-                    }
+                    // Nothing was committed and nothing was consumed, so the stage does not
+                    // move: an executor that polls again asks again. A journal that has
+                    // stopped answers the same way, and one that has not may have moved on.
+                    Err(Halted) => return Poll::Pending,
                     Ok(Handoff::Replayed(recorded)) => {
                         me.stage = Stage::Ended;
                         return Poll::Ready(observed(recorded, me.out, me.payload));
@@ -290,10 +307,11 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         // The world asked to be tried again. Nothing is recorded, so the
                         // effect stays outstanding under the identity it was committed with.
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(error)) => {
-                            *me.stalled = Some(error);
-                            Answer::Failed(&[])
-                        }
+                        // The activity failed. It is recorded as a failure with no payload,
+                        // so the run makes progress and every replay answers the same way.
+                        // The error value stops here: a workflow that branched on it would
+                        // branch on something no replay can reproduce.
+                        Poll::Ready(Err(_dropped)) => Answer::Failed(&[]),
                         // A length over the buffer is recorded as a failure with no
                         // payload: a truncation replays a wrong answer for ever, and a
                         // refusal strands the run.
@@ -329,9 +347,14 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
         if me.ended {
             return Poll::Pending;
         }
-        me.ended = true;
+        // The deadline is asked again on every poll until it passes. Ending here would make
+        // a retained timer future one that can never make progress within a boot, which is
+        // the opposite of what §06 says a future may be.
         match me.journal.wait(me.spec) {
-            Ok(()) => Poll::Ready(()),
+            Ok(()) => {
+                me.ended = true;
+                Poll::Ready(())
+            }
             Err(Halted) => Poll::Pending,
         }
     }
@@ -383,15 +406,15 @@ impl<E> Future for TerminalFuture<'_, E> {
         if !me.ended {
             me.ended = true;
             // Refused rather than truncated when it does not fit: a short terminal record
-            // replays for ever, and the caller sees a run that never concluded.
-            if me.bytes.len() <= me.out.len() {
-                let len = copy(me.bytes, me.out);
-                *me.conclusion = Some(if me.failed {
-                    Ending::Failed(len)
-                } else {
-                    Ending::Completed(len)
-                });
-            }
+            // replays for ever. The refusal is recorded, so the caller cannot read it as a
+            // run that never ended and complete it with nothing.
+            *me.conclusion = Some(if me.bytes.len() > me.out.len() {
+                Ending::Refused
+            } else if me.failed {
+                Ending::Failed(copy(me.bytes, me.out))
+            } else {
+                Ending::Completed(copy(me.bytes, me.out))
+            });
         }
         Poll::Ready(Ok(()))
     }

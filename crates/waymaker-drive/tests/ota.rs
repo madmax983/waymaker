@@ -1,3 +1,4 @@
+#![cfg(not(feature = "without-facade"))]
 //! Design document §06's OTA example, over real media.
 //!
 //! Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s two "done when"s. The
@@ -11,13 +12,15 @@
 use core::task::{Context as Task, Poll};
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
-use waymaker_core::{ActivityKind, EffectId, EffectSeq, RecordRef, RunId};
+use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
 use waymaker_drive::ota::{
-    BOUNDS, DOWNLOAD, FLASH_IMAGE, Ota, URL, VERIFY_SIGNATURE, WORKFLOW_KIND, WORKFLOW_VERSION,
+    BOUNDS, DOWNLOAD, Downloader, FLASH_IMAGE, HANDLE, Ota, URL, VERIFY_SIGNATURE, WORKFLOW_KIND,
+    WORKFLOW_VERSION, poll_ota,
 };
 use waymaker_drive::{
-    Activities, Clocks, Conclusion, DriveError, Driver, Performed, Progress, Scratch,
+    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, Identity, Performed, Progress,
+    Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_fault::Device;
@@ -28,9 +31,6 @@ use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::Geometry;
 
 const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
-
-/// What [`Fleet`] answers a [`DOWNLOAD`] with: the handle, never the image.
-const HANDLE: &[u8] = b"slot0001";
 
 fn geometry() -> Geometry {
     let Ok(geometry) = Geometry::new(4096, 1024, 4, 1) else {
@@ -95,6 +95,8 @@ struct Fleet {
     stalled: usize,
     /// Which dispatch fails, if any.
     fails_at: Option<usize>,
+    /// What a [`DOWNLOAD`] answers with, when it is not the handle.
+    download: Option<&'static [u8]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +109,13 @@ impl Fleet {
             stalls: 0,
             stalled: 0,
             fails_at: None,
+            download: None,
         }
+    }
+
+    const fn answering_download(mut self, bytes: &'static [u8]) -> Self {
+        self.download = Some(bytes);
+        self
     }
 
     const fn stalling(mut self, polls: usize) -> Self {
@@ -145,7 +153,11 @@ impl ActivityDispatcher for Fleet {
             return Poll::Ready(Err(NoNetwork));
         }
         self.dispatched.push((id, kind));
-        let answer: &[u8] = if kind == DOWNLOAD { HANDLE } else { b"ok" };
+        let answer: &[u8] = if kind == DOWNLOAD {
+            self.download.unwrap_or(HANDLE)
+        } else {
+            b"ok"
+        };
         let taken = answer.len().min(out.len());
         let (Some(from), Some(into)) = (answer.get(..taken), out.get_mut(..taken)) else {
             return Poll::Ready(Err(NoNetwork));
@@ -357,8 +369,6 @@ fn continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank() {
     // §10's swap is `waymaker-flash`'s and works on a bank. This driver is pointed at a
     // journal region, so it refuses rather than swapping a bank it cannot name. Issue #36's
     // dispatcher is where the two are joined.
-    use waymaker_drive::{Boundary, Identity, Suspended, Workflow};
-
     struct Restarting;
 
     impl Workflow for Restarting {
@@ -400,9 +410,10 @@ fn continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank() {
 fn the_synchronous_driver_still_runs_a_workflow_that_names_no_facade_type() {
     // Issue #35's second "done when", as far as a test can put it: the reference workflow
     // of issue #28 reaches the same end with the façade in the workspace. The structural
-    // half is the dependency graph — `Boundary`, `Driver` and §07's typestate name no
-    // `waymaker-embassy` type — and `crates/waymaker-drive/tests/facade.rs` is where that
-    // is asserted.
+    // half is not a test — it is the `drive-facadeless` pipeline stage, which builds this
+    // crate with `without-facade` and so compiles the driver, §06's boundary and §07's
+    // typestate with the façade edge deleted. The `ctx-facade` gate rule is the fast,
+    // local half of the same claim.
     let mut device = Device::new(geometry());
     let mut workflow = Pipeline::new();
     let mut world = SyncWorld::new();
@@ -426,4 +437,102 @@ fn the_synchronous_driver_still_runs_a_workflow_that_names_no_facade_type() {
             ..
         })
     ));
+}
+
+/// [`Ota<Downloader>`] driven through [`poll_ota`], which is the concrete path.
+///
+/// `Ota` and `ota_update` are generic, and a generic body no caller names is type-checked
+/// rather than compiled. `poll_ota` names one, so the firmware build monomorphises this
+/// workflow's future and the four façade futures — and this drives the same call the
+/// firmware build compiles.
+struct Concrete(Ota<Downloader>);
+
+impl Workflow for Concrete {
+    fn identity(&self) -> Identity<'_> {
+        self.0.identity()
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        poll_ota(&mut self.0, boundary)
+    }
+}
+
+#[test]
+fn the_concrete_workflow_runs_to_completion_through_poll_ota() {
+    let mut device = Device::new(geometry());
+    let mut world = Unused { performed: 0 };
+    let mut workflow = Concrete(Ota::new(Downloader));
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve(BOUNDS)).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Completed,
+            result_len: 0,
+        })
+    );
+    let journal = history(&mut device);
+    assert_eq!(journal.len(), 8);
+    // The download's outcome is the handle and not the image, which is the lesson §06's
+    // example exists for.
+    assert_eq!(journal.get(2), Some(&(2, HANDLE.to_vec())));
+}
+
+#[test]
+fn an_answer_that_is_not_a_handle_fails_the_run_rather_than_replaying_for_ever() {
+    // A decode failure is a workflow fault, not an effect failure: the outcome is committed
+    // and replay hands back the same bytes, so the same call fails the same way on every
+    // boot. The run must therefore *end*, and it ends failed.
+    let mut device = Device::new(geometry());
+    let mut world = Unused { performed: 0 };
+    let mut workflow = Ota::new(Fleet::new().answering_download(b"no"));
+
+    let progress = boot(&mut device, &mut workflow, &mut world);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: 0,
+        })
+    );
+    // The download happened once and nothing after it did.
+    assert_eq!(workflow.dispatcher().kinds(), vec![DOWNLOAD]);
+    let journal = history(&mut device);
+    assert_eq!(
+        journal.len(),
+        4,
+        "the run, the download's two records, the end"
+    );
+    assert_eq!(journal.last(), Some(&(7, Vec::new())));
+}
+
+#[test]
+fn a_download_that_fails_ends_the_run_through_the_other_conversion() {
+    // `Failure<NotAnImageSlot>`'s activity arm, where the test above takes its decode arm.
+    let mut device = Device::new(geometry());
+    let mut world = Unused { performed: 0 };
+    let mut workflow = Ota::new(Fleet::new().failing_at(0));
+
+    let progress = boot(&mut device, &mut workflow, &mut world);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Failed,
+            result_len: 0,
+        })
+    );
+    assert_eq!(workflow.dispatcher().kinds(), vec![DOWNLOAD]);
 }

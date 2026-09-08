@@ -54,10 +54,13 @@ allocation. `poll_dispatch` stores nothing. Issue #36 owns the ergonomic wrapper
 through no other value, so §02 decision 3 holds at the façade for the reason it holds in
 §07's typestate.
 
-Three of the four are the shape §13 asks for. `TimerFuture<'b, J>` drops the dispatcher §13
-gives it, for the reason §13 itself drops it from `ContinueFuture`: a deadline never reaches
-the world. `ContinueFuture`'s output is `Infallible`, so the code after the `.await` is
-unreachable rather than merely unlikely — the run that asked is replaced.
+§13 names three futures and this crate ships four. `ActivityFuture` is §13's shape exactly.
+`ContinueFuture` is too, and its output is `Infallible`, so the code after the `.await` is
+unreachable rather than merely unlikely — the run that asked is replaced. `TimerFuture<'b,
+J>` drops the dispatcher §13 gives it, for the reason §13 itself drops it from
+`ContinueFuture`: a deadline never reaches the world. `TerminalFuture` is the fourth and is
+in neither sketch; §06's example ends with `ctx.complete(&[]).await`, so the "done when"
+asks for it even though the API sketch does not list it.
 
 **There is no Embassy dependency.** The futures are plain `core::future::Future`s, so
 Embassy's executor polls them and this crate has no executor, no timer queue and no waker of
@@ -65,11 +68,22 @@ its own. A façade that pulled in an executor to hand out four futures would be 
 adapter §02 decision 5 says it is. `embassy-below-facade` still guards the edge.
 
 **`ctx-facade`** is what stops the shape being given back. It pins both surfaces in both
-directions, pins the four futures by name and by `fn poll` count, refuses each piece of
-on-media authority by identifier — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`,
-`ReplayMachine`, `BankLayout`, `Swap` — and refuses a `static`. Its fourth half is the
-driver's: six `waymaker-drive` modules may not name `waymaker_embassy`, so the façade edge is
-`facade.rs` and `ota.rs` and issue #35's second "done when" is a fact about the source.
+directions, pins the four futures by name and by `fn poll` count, pins `Ctx`'s methods at
+every visibility and refuses an associated constant on it, refuses each piece of on-media
+authority by identifier — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`,
+`ReplayMachine`, `BankLayout`, `Swap` — refuses a `static` and refuses a `macro_rules!`.
+The last three read *every* file of the crate rather than the two the surfaces are pinned in,
+because they are statements about the crate: review of this change put a renamed
+`StableStorage`, a `pub static AtomicUsize` and a macro that expands a tenth public method
+into `impl Ctx` one file over, and watched a two-file version stay green.
+
+Its fourth half is the driver's, and it is the fast half of issue #35's second "done when":
+every `waymaker-drive` module but `facade.rs`, `ota.rs` and `lib.rs` is held to naming
+neither the façade crate nor the two modules nor the `Bridge` they re-export. The half a
+*compiler* decides is the `drive-facadeless` pipeline stage: `waymaker-drive`'s
+`without-facade` feature deletes those two modules, and the stage builds the result for the
+firmware target. Both exist because a scanner cannot see an import routed through
+`crate::facade` or a dependency renamed in a manifest, and a compiler sees each at once.
 
 `waymaker-drive`'s `Boundary` grows `schedule`, `resolve` and `continue_as_new`, in its own
 vocabulary. That is what keeps the driver façade-free: `Handoff` and `Answered` are the
@@ -83,11 +97,23 @@ of `Context::dispatch`. The writer lives inside the `Dispatchable` between the t
 with an effect in flight still has no appender.
 
 **A dispatcher error is a failed effect.** `Poll::Pending` is "try again", and `Err` is
-recorded as an `EffectFailed` with no payload. The typed error reaches
-`Ctx::dispatch_error` for a log and no further: a workflow that branched on it would branch
-on something no replay can reproduce. It costs the failure's detail, which ADR 0025 already
-records as the price of an empty payload fitting every bound. Neither is a retry *policy* —
-§16's `retry-policy-placement` stays open, and nothing here counts attempts or waits.
+recorded as an `EffectFailed` with no payload. The typed error goes no further than the
+dispatcher that raised it: a workflow that branched on it would branch on something no
+replay can reproduce, and a first review round pointed out that an accessor on `Ctx` made
+exactly that available on the first run and never on a replay. It costs the failure's
+detail, which ADR 0025 already records as the price of an empty payload fitting every bound.
+It also means a *typed* failure payload has no route through this trait at all — `Ok(len)`
+is an `EffectCompleted` — which §09 gives `EffectFailed` and this signature does not. Issue
+#36's is to close. Neither is a retry *policy*: §16's `retry-policy-placement` stays open,
+and nothing here counts attempts or waits.
+
+**The terminal payload has a third answer.** `Ctx::conclusion()` returns
+`Conclusion::Refused` for a payload wider than the caller's buffer, rather than the `None`
+that also means "the run has not ended". Review of the first commit found that a caller
+reading the two as one recorded a `RunCompleted` for a run that called `ctx.fail`. The
+buffer is bounded by *both* of the run's declared bounds, not by `effect_result_bytes`
+alone, and `Driver::boot` now refuses a narrower one before a record is read — the
+alternative is discovering it at the last record, after every effect has been performed.
 
 **A defect fell out of the first end-to-end test.** A dispatcher that answered
 `Poll::Pending` after the schedule record was committed left the boot with no recorded
@@ -95,16 +121,38 @@ reason: the façade tells the journal nothing on a stall, and only the driver ho
 identity. `Driver`'s `conclude` now reports the outstanding effect as `Progress::Waiting`,
 which is what `Performed::Pending` reports on the undivided path.
 
+**A negative cargo feature.** `without-facade` is normally an anti-pattern: feature
+unification turns one crate's opt-out into everyone's. It is safe here for a reason
+particular to this crate — nothing depends on it. The alternative, an optional dependency
+off by default, would have taken the façade out of the lint, test, docs and coverage stages,
+which all pass `--no-default-features`. What the build does not prove is that the *manifest*
+entry can go: the dependency is not optional, so `waymaker-embassy` is still resolved.
+
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
 caller's, so §04's runtime-RAM statics gate does not move, but a device running the façade
 carries two buffers where the synchronous driver carries one. Issue #39 is where that is
 measured.
 
-**178 B of code flash.** The `facade` row goes from 12334 B to 12512 B of layers. The
-*gated* row does not move: §04 states the budget over "core + flash adapter", which is the
-`default` row, and the façade row is printed rather than gated. Issue #39 is where it
+**182 B of code flash.** The `facade` row goes from 12334 B to 12516 B of layers. The
+*gated* row does not move at all: §04 states the budget over "core + flash adapter", which
+is the `default` row, and the façade row is printed rather than gated. Issue #39 is where it
 becomes a gate.
+
+**Wakeups are the dispatcher's.** §05's Owns cell names wakeups and this crate registers
+none of its own. What it does is plumb the task's waker to
+`ActivityDispatcher::poll_dispatch`, the one thing that knows when the world will answer;
+`crates/waymaker-embassy/tests/ctx.rs` measures that with a counting waker. Two paths
+register nothing at all — a halted boot, because there is nothing left to wake, and a
+deadline that has not passed, because there is no in-boot sleep. The timer future asks its
+journal again on every poll instead, which is what makes a retained one able to make
+progress; issue #36's dispatcher is where a hardware alarm arrives.
+
+**Two things are compiled for the part, and two were not.** `ota_update` and `Ota` are
+generic, and a generic body no caller names is type-checked rather than compiled: `nm` on
+the `thumbv6m` rlib found zero `ota_update` and zero `ActivityFuture` symbols. `Downloader`
+and `poll_ota` are concrete and name them, so the firmware build monomorphises this
+workflow's future and the four façade futures.
 
 **`continue_as_new` has no implementation that swaps.** `waymaker-drive` refuses with
 `DriveError::ContinueUnsupported`, because §10's swap works on a bank and this driver is
@@ -112,10 +160,20 @@ pointed at a `JournalRegion`. `ContinueFuture` is a real future over a real boun
 operation whose one implementation today is a refusal. That is stated here rather than left
 to be discovered; issue #36's dispatcher is where the two are joined.
 
-**§06's example is adapted in one place.** `ctx.activity(VERIFY_SIGNATURE, ..).await?` with
-its result discarded leaves `T` unconstrained, so the example binds `let ()` instead. The
-`Decode` implementation for `()` is what makes that read as what it is: an activity whose
-result is only that it happened.
+**§06's example is adapted in five places**, and none of them changes what it demonstrates.
+`ctx.activity(VERIFY_SIGNATURE, ..).await?` with its result discarded leaves `T`
+unconstrained, so the example binds `let ()` instead; the `Decode` implementation for `()`
+is what makes that read as what it is. `ota_update` is generic over `D` and `J`, which is
+§13's own `Ctx<'a, D, J>` rather than §06's bare `Ctx<'_>` — the two sketches disagree and
+§13 is the specific one. `OtaInput` borrows its url rather than owning it, because a
+workflow future holds every local that survives an `.await`. The activity kinds are
+`ota::DOWNLOAD` rather than `ActivityKind::DOWNLOAD`, because the kernel must not carry one
+workflow's constants. And the run input comes from a module constant rather than from the
+recorded `RunStarted` record: `Workflow::run` has no channel for it, so the example
+exercises §06's "recorded effect results" and not its "recorded input". That last one is a
+gap in the example rather than in the engine — `Driver::begin` compares the recorded input
+against `Workflow::identity` on every boot — and issue #38's provisioning example is where a
+run reads its own input.
 
 ## Alternatives considered
 

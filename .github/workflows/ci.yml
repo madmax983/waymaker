@@ -127,6 +127,13 @@ jobs:
       - name: Build the synchronous driver for the firmware target
         run: cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 
+      # Issue #35's second "done when". `without-facade` deletes the two modules that name
+      # `waymaker-embassy`, so this builds the driver, §06's boundary, §07's typestate and
+      # the reference workflow with the façade edge gone. A compiler sees an import routed
+      # through `crate::facade` or a dependency renamed in a manifest; a scanner does not.
+      - name: Build the synchronous driver with the façade removed
+        run: cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+
       # The size probe's binary is behind `required-features`, so the `check` job's clippy
       # stage — `--all-targets` on the host — never compiles it. Without this step the
       # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and

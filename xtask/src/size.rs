@@ -2099,8 +2099,23 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     .map_or(Block::Other, |(_, kind)| *kind);
 
                 if let Some(name) = function_name(trimmed) {
+                    // A block header and one of its members on the same line —
+                    // `#[rustfmt::skip] impl Ctx { pub fn seal_now(..) { .. } }`. Neither
+                    // test below sees it: the line does not begin with `pub `, and the
+                    // block that makes the method callable is declared on this very line
+                    // rather than above it. Review of issue #35 landed exactly that and
+                    // watched nine surface pins and `size-probe-reach` stay green, so it is
+                    // closed in the reader they share rather than in one rule.
+                    let declared_here = declaration_kind(trimmed);
+                    let inline = declared_here.is_some() && opens > 0;
+                    let marked_public = trimmed
+                        .split_once(" fn ")
+                        .is_some_and(|(before, _)| before.trim_end().ends_with("pub"));
                     let callable = trimmed.starts_with("pub ")
-                        || matches!(enclosing, Block::Trait | Block::TraitImpl);
+                        || matches!(enclosing, Block::Trait | Block::TraitImpl)
+                        || (inline
+                            && (marked_public
+                                || matches!(declared_here, Some(Block::Trait | Block::TraitImpl))));
                     if callable {
                         found.push(PublicFunction {
                             crate_name: source.crate_name.clone(),
@@ -2477,9 +2492,26 @@ fn remove_worktree(root: &Path, worktree: &Path) {
     let _ = git(root).args(["worktree", "prune"]).output();
 }
 
+/// `git`, run against `root` and against nothing the environment says.
+///
+/// A git hook exports `GIT_DIR`, `GIT_INDEX_FILE` and friends, pointing at the repository
+/// being committed to. Inherited here, `git worktree add` writes into *that* repository's
+/// index rather than into the checkout this gate is measuring — which is a measurement of
+/// a tree nobody asked about, taken silently. `current_dir` alone does not stop it: the
+/// environment outranks the working directory.
 fn git(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command.current_dir(root);
+    for inherited in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(inherited);
+    }
     command
 }
 

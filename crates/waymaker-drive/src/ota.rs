@@ -13,16 +13,21 @@
 //! # Here rather than in `tests/`
 //!
 //! For [`demo`](crate::demo)'s reason. The `drive-firmware` stage builds this crate's
-//! library for `thumbv6m-none-eabi`, so the façade, the futures the compiler generates for
-//! this workflow, and the bridge under them are all built for the part.
+//! library for `thumbv6m-none-eabi`.
+//!
+//! [`ota_update`] and [`Ota`] are generic, and a generic body no caller names is
+//! type-checked rather than compiled. [`Downloader`] and [`poll_ota`] are what make the
+//! claim true: they are concrete, so the firmware build monomorphises this workflow's
+//! future, the four façade futures and the bridge, and `nm` on the rlib finds them.
 
 use core::convert::Infallible;
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context as Task, Poll, Waker};
 
+use waymaker_core::EffectId;
 use waymaker_core::{ActivityKind, Outcome};
-use waymaker_embassy::ctx::{Ctx, Failure};
+use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
 use waymaker_flash::capacity::Bounds;
 
@@ -162,15 +167,26 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ota<D> {
     dispatcher: D,
-    out: [u8; BOUNDS.effect_result_bytes as usize],
+    out: [u8; OUT_BYTES],
 }
+
+/// How wide the context buffer must be.
+///
+/// The wider of the run's two bounds. An activity answer is bounded by
+/// `effect_result_bytes` and a terminal payload by `terminal_bytes`, and both are written
+/// through this one buffer — so sizing it from either alone refuses a legal run.
+const OUT_BYTES: usize = if BOUNDS.effect_result_bytes > BOUNDS.terminal_bytes {
+    BOUNDS.effect_result_bytes as usize
+} else {
+    BOUNDS.terminal_bytes as usize
+};
 
 impl<D> Ota<D> {
     /// A run that reaches the world through `dispatcher`.
     pub const fn new(dispatcher: D) -> Self {
         Self {
             dispatcher,
-            out: [0; BOUNDS.effect_result_bytes as usize],
+            out: [0; OUT_BYTES],
         }
     }
 
@@ -205,12 +221,19 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
             match (polled, ctx.conclusion()) {
-                // The run did not reach its end in this boot.
-                (Poll::Pending, _) => None,
-                (Poll::Ready(_), Some(Outcome::Completed(bytes))) => {
+                // The run did not reach its end in this boot — either the workflow
+                // suspended, or it asked to end with a payload wider than the buffer. The
+                // second must not be recorded as ending with something *else*, so this boot
+                // writes no terminal record either way and the caller sees a run that did
+                // not conclude. `Refused` is unreachable here: `OUT_BYTES` is the wider of
+                // the run's two bounds.
+                (Poll::Pending, _) | (Poll::Ready(_), Some(Conclusion::Refused)) => None,
+                (Poll::Ready(_), Some(Conclusion::Ended(Outcome::Completed(bytes)))) => {
                     Some(Ended::Completed(bytes.len()))
                 }
-                (Poll::Ready(_), Some(Outcome::Failed(bytes))) => Some(Ended::Failed(bytes.len())),
+                (Poll::Ready(_), Some(Conclusion::Ended(Outcome::Failed(bytes)))) => {
+                    Some(Ended::Failed(bytes.len()))
+                }
                 // The workflow returned without recording an ending. Its own `Result` is
                 // then what the run ended with.
                 (Poll::Ready(Ok(())), None) => Some(Ended::Completed(0)),
@@ -225,4 +248,56 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
             Ended::Failed(len) => Outcome::Failed(self.out.get(..len).unwrap_or_default()),
         })
     }
+}
+
+/// What [`Downloader`] answers a [`DOWNLOAD`] with.
+pub const HANDLE: &[u8] = b"slot0001";
+
+/// A world that answers from constants.
+///
+/// It exists so that [`Ota`] has a concrete `D`. Without one, this crate's firmware build
+/// type-checks [`ota_update`] and compiles none of it, and the futures the compiler
+/// generates for the workflow never reach the part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Downloader;
+
+/// A [`Downloader`] never fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Offline {}
+
+impl ActivityDispatcher for Downloader {
+    type Error = Offline;
+
+    fn poll_dispatch(
+        &mut self,
+        _task: &mut Task<'_>,
+        _id: EffectId,
+        kind: ActivityKind,
+        _input: &[u8],
+        out: &mut [u8],
+    ) -> Poll<Result<usize, Offline>> {
+        let answer: &[u8] = if kind == DOWNLOAD { HANDLE } else { b"ok" };
+        let taken = answer.len().min(out.len());
+        let (Some(from), Some(into)) = (answer.get(..taken), out.get_mut(..taken)) else {
+            return Poll::Ready(Ok(answer.len()));
+        };
+        into.copy_from_slice(from);
+        Poll::Ready(Ok(answer.len()))
+    }
+}
+
+/// One boot of the OTA run, with every type fixed.
+///
+/// The whole reason this function exists is that it names no type parameter. It is what the
+/// firmware build monomorphises, so `Ota<Downloader>`'s future, the four façade futures and
+/// [`Bridge`] are code on the part rather than code the part type-checked.
+///
+/// # Errors
+///
+/// [`Suspended`] whenever the run must stop in this boot.
+pub fn poll_ota<'a>(
+    workflow: &'a mut Ota<Downloader>,
+    boundary: &mut dyn Boundary,
+) -> Result<Outcome<'a>, Suspended> {
+    workflow.run(boundary)
 }

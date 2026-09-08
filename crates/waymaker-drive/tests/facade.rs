@@ -1,3 +1,4 @@
+#![cfg(not(feature = "without-facade"))]
 //! The two halves of design document §07, called out of order.
 //!
 //! [`Boundary::schedule`] hands the writer to the effect it committed, and
@@ -7,13 +8,14 @@
 //!
 //! The ordinary path is `crates/waymaker-drive/tests/ota.rs`.
 
-use waymaker_core::timer::{ClockCapability, ClockKind};
+use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_drive::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_drive::{
-    Activities, Answered, Boundary, Clocks, DriveError, Driver, DurableIntent, Handoff, Identity,
-    Performed, Scratch, Suspended, Workflow,
+    Activities, Answered, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Handoff,
+    Identity, Performed, Scratch, Suspended, Workflow,
 };
+use waymaker_embassy::journal::{Answer, Journal as _};
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -178,3 +180,125 @@ fn a_refused_misuse_writes_no_effect_record() {
 // in, and `Driver` reports it as `Progress::Waiting`. It cannot be driven from here:
 // `Suspended` has a private field, so only this crate can stop a run without going through a
 // boundary. `crates/waymaker-drive/tests/ota.rs` drives it through the façade instead.
+
+/// A workflow that drives the bridge itself, one call at a time.
+///
+/// `Bridge` is four renames over the boundary, and the only caller that reaches it in
+/// anger is a `Ctx`. Driving it directly is what puts each rename under a test: the
+/// façade's own sequencing is `crates/waymaker-embassy/tests/ctx.rs`, and what is here is
+/// that each of the four calls lands where the driver expects it.
+struct Bridging(Bridged);
+
+/// Which of the bridge's four calls to make.
+#[derive(Clone, Copy)]
+enum Bridged {
+    /// A deadline that has already passed, then a completion.
+    Deadline,
+    /// §10's swap, which this driver refuses.
+    Restart,
+    /// An effect the world answered with a failure payload.
+    FailedEffect,
+    /// An effect whose answer is wider than the run's bound.
+    ExhaustedEffect,
+}
+
+impl Workflow for Bridging {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            version: WORKFLOW_VERSION,
+            input: URL,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let mut bridge = Bridge::over(boundary);
+        match self.0 {
+            Bridged::Deadline => {
+                // Zero ticks after this boot began, so the deadline has already passed. A
+                // halt here is the driver's answer and the assertion is in the test.
+                if bridge.wait(TimerSpec::AfterBoot { ticks: 0 }).is_err() {
+                    return Ok(Outcome::Failed(&[]));
+                }
+            }
+            Bridged::Restart => {
+                // The driver has recorded its refusal, and a recorded stop outranks
+                // whatever the workflow returns — so this may return anything at all.
+                let _halted = bridge.continue_as_new(b"next");
+            }
+            Bridged::FailedEffect | Bridged::ExhaustedEffect => {
+                // Each `else` is a way this could go wrong, named so the test that reads
+                // the outcome says which. A panicking helper is denied here.
+                let Ok(waymaker_embassy::Handoff::Dispatch(_)) = bridge.schedule(DOWNLOAD, b"one")
+                else {
+                    return Ok(Outcome::Failed(b"schedule"));
+                };
+                let answer = match self.0 {
+                    Bridged::FailedEffect => Answer::Failed(b"nope"),
+                    _ => Answer::Exhausted,
+                };
+                let Ok(Outcome::Failed(_)) = bridge.resolve(answer) else {
+                    return Ok(Outcome::Failed(b"resolve"));
+                };
+            }
+        }
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+fn bridged(case: Bridged) -> Result<waymaker_drive::Progress, DriveError<FaultError>> {
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut Idle,
+        &mut Bridging(case),
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    )
+}
+
+#[test]
+fn a_deadline_reaches_the_driver_through_the_bridge() {
+    // `Bridge::wait` is one rename, and this is what says it lands on §11's boundary rather
+    // than somewhere else: a deadline of zero ticks has passed, so the run carries on.
+    assert_eq!(
+        bridged(Bridged::Deadline),
+        Ok(waymaker_drive::Progress::Finished {
+            conclusion: waymaker_drive::Conclusion::Completed,
+            result_len: 0,
+        })
+    );
+}
+
+#[test]
+fn continue_as_new_through_the_bridge_reaches_the_drivers_refusal() {
+    // §10's swap works on a bank and this driver is pointed at a journal region. The façade
+    // hands the ask down; the refusal is the driver's.
+    assert_eq!(
+        bridged(Bridged::Restart),
+        Err(DriveError::ContinueUnsupported)
+    );
+}
+
+#[test]
+fn a_failed_answer_and_an_exhausted_one_both_reach_the_driver_as_failures() {
+    // The two arms of `Bridge::resolve` a completion does not take. On media they are the
+    // same statement — an `EffectFailed` — and the payload is what differs.
+    for case in [Bridged::FailedEffect, Bridged::ExhaustedEffect] {
+        let progress = bridged(case);
+        assert!(
+            matches!(
+                progress,
+                Ok(waymaker_drive::Progress::Finished {
+                    conclusion: waymaker_drive::Conclusion::Completed,
+                    ..
+                })
+            ),
+            "{progress:?}"
+        );
+    }
+}

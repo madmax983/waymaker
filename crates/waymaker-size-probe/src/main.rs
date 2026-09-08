@@ -1767,7 +1767,7 @@ fn ctx_facade() -> usize {
 
     use waymaker_core::timer::TimerSpec;
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
-    use waymaker_embassy::ctx::{Ctx, Failure, TerminalFuture};
+    use waymaker_embassy::ctx::{Conclusion, Ctx, Failure, TerminalFuture};
     use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
 
     /// A stand-in durable half. It writes nothing; the probe is never run.
@@ -1921,11 +1921,11 @@ fn ctx_facade() -> usize {
     }
     kept = kept.wrapping_add(ctx.payload().len());
     kept = kept.wrapping_add(match ctx.conclusion() {
-        Some(Outcome::Completed(bytes)) => bytes.len(),
-        Some(Outcome::Failed(bytes)) => bytes.len().wrapping_add(1),
-        None => 10,
+        Some(Conclusion::Ended(Outcome::Completed(bytes))) => bytes.len(),
+        Some(Conclusion::Ended(Outcome::Failed(bytes))) => bytes.len().wrapping_add(1),
+        Some(Conclusion::Refused) => 10,
+        None => 11,
     });
-    kept = kept.wrapping_add(ctx.dispatch_error().copied().unwrap_or(11));
 
     core::hint::black_box(kept)
 }

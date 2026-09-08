@@ -987,18 +987,14 @@ mod tests {
             },
         ]
         .into_iter()
-        // And the modules `ctx-facade` requires to name no façade type, which fail closed
-        // when absent: without them nothing says the driver compiles with the façade gone.
-        .chain(
-            source::FACADE_FREE_DRIVER_MODULES
-                .iter()
-                .filter(|path| !path.ends_with("drive.rs") && !path.ends_with("effect.rs"))
-                .map(|path| size::LayerSource {
-                    crate_name: DRIVER_PACKAGE.to_owned(),
-                    path: format!("crates/{path}"),
-                    contents: source::tests_support::clean_facade_free_driver_module(),
-                }),
-        )
+        // And one module outside the façade edge, which `ctx-facade` requires to name no
+        // façade type. That rule fails closed when the crate has none, so a fixture without
+        // this row describes a workspace the gate rejects for a reason no test here is about.
+        .chain([size::LayerSource {
+            crate_name: DRIVER_PACKAGE.to_owned(),
+            path: "crates/waymaker-drive/src/boundary.rs".to_owned(),
+            contents: source::tests_support::clean_facade_free_driver_module(),
+        }])
         .collect()
     }
 

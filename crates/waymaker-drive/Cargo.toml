@@ -36,6 +36,21 @@ waymaker-rig.workspace = true
 
 [features]
 default = []
+# Build this crate as it would be with the façade deleted: `facade` and `ota` are the two
+# modules that name `waymaker-embassy`, and this removes them. The `drive-facadeless` stage
+# builds it, which turns issue #35's "removing the Embassy crate leaves the protocol fully
+# usable through the synchronous driver" into a compile rather than a text search.
+#
+# A negative feature, which is normally an anti-pattern because feature unification turns one
+# crate's opt-out into everyone's. It is safe here for a reason particular to this crate:
+# nothing depends on it. The alternative — an optional dependency, off by default — would take
+# the façade out of the lint, test, docs and coverage stages, which all pass
+# `--no-default-features`.
+#
+# What it does not prove: the manifest entry above is not optional, so `waymaker-embassy` is
+# still resolved and built. That the *source* names it in two files and nowhere else is
+# `ctx-facade`'s.
+without-facade = []
 
 [lints]
 workspace = true
