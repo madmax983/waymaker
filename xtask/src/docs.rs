@@ -2128,8 +2128,9 @@ pub enum Attestation {
 /// exit criterion no amount of host-side work discharges, and a repository whose CI is green
 /// is a repository somebody will read as finished. Design document §15's opening sentence is
 /// that crash testing is part of the design; §16's rung 0.2 exit criterion is that it happen
-/// on hardware. Everything in `waymaker-rig` is written to run on a board and has never been
-/// on one.
+/// on hardware, and §16's rung 0.5 exit criterion asks the same of a deadline that outlives a
+/// power cut. Everything in `waymaker-rig` is written to run on a board and has never been on
+/// one.
 ///
 /// This is the same move [`SPEC_CLAUSES`]'s `owed` column and
 /// [`STORAGE_CONTRACT_CLAUSES`]'s "Discharged by" column make: the thing that is *not*
@@ -2323,7 +2324,7 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
                 target.id,
                 if rows.is_empty() {
                     "CLAUDE.md has no table row naming this hardware target in backticks, so \
-                     a reader cannot tell that rung 0.2's exit criterion is unmet"
+                     a reader cannot tell that the exit criterion it belongs to is unmet"
                         .to_owned()
                 } else {
                     format!(
@@ -2366,8 +2367,8 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
             "hardware-attestation",
             "target count",
             format!(
-                "CLAUDE.md does not say `{count}s`, which is what rung 0.2's exit criterion \
-                 names"
+                "CLAUDE.md does not say `{count}s`, which is how many board runs the rungs \
+                 named here owe"
             ),
         ));
     }

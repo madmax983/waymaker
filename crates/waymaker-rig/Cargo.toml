@@ -1,6 +1,6 @@
 [package]
 name = "waymaker-rig"
-description = "The power-cut and watchdog-reset rig of design document §15. Test support: never linked into Waymaker's own firmware, never published, but written to run on the part."
+description = "The power-cut and watchdog-reset rig of design document §15, and the two board clocks of §11. Board support: never linked into Waymaker's own firmware, never published, but written to run on the part."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

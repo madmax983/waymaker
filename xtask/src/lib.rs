@@ -105,7 +105,8 @@ pub const RULES: &[&str] = &[
 /// list is a rule that moves when somebody sorts it.
 pub const DRIVER_PACKAGE: &str = "waymaker-drive";
 
-/// The crate whose oracle and census `rig-oracle` pins.
+/// The crate whose oracle and census `rig-oracle` pins, and whose two board clocks
+/// `timer-capability` pins.
 ///
 /// Named here rather than taken from [`policy::TEST_SUPPORT_CRATES`] by position, because a
 /// rule that pinned whichever crate happened to be fourth in that list is a rule that moves
@@ -987,7 +988,7 @@ mod tests {
     /// fail closed when a file is absent, so a fixture without these would describe a
     /// workspace the gate rejects for a reason no test here is about.
     fn clean_rig_sources() -> Vec<size::LayerSource> {
-        vec![
+        [
             size::LayerSource {
                 crate_name: RIG_PACKAGE.to_owned(),
                 path: format!("crates/{}", source::RIG_AUDIT_PATH),
@@ -1008,17 +1009,18 @@ mod tests {
                 path: format!("crates/{}", source::RIG_MATRIX_PATH),
                 contents: source::tests_support::clean_rig_matrix(),
             },
-            size::LayerSource {
-                crate_name: RIG_PACKAGE.to_owned(),
-                path: format!("crates/{}", source::RIG_RTC_PATH),
-                contents: source::tests_support::clean_board_rtc(),
-            },
-            size::LayerSource {
-                crate_name: RIG_PACKAGE.to_owned(),
-                path: format!("crates/{}", source::RIG_EPOCH_PATH),
-                contents: source::tests_support::clean_board_epoch(),
-            },
         ]
+        .into_iter()
+        .chain(
+            source::BOARD_CLOCK_MODULES
+                .iter()
+                .map(|clock| size::LayerSource {
+                    crate_name: RIG_PACKAGE.to_owned(),
+                    path: format!("crates/{}", clock.path),
+                    contents: source::tests_support::clean_board_clock(clock),
+                }),
+        )
+        .collect()
     }
 
     fn clean_layer_sources() -> Vec<size::LayerSource> {

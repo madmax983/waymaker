@@ -312,13 +312,90 @@ fn a_monotonic_clock_that_cannot_be_read_is_a_fault() {
 }
 
 #[test]
+fn a_re_sync_after_a_boot_clock_reset_is_accepted() {
+    // The lockout the review of this change found. A boot clock that reset is exactly the
+    // state a re-sync is the remedy for, so refusing every `restore` while it holds leaves
+    // the device unable to tell the time for the rest of the power cycle.
+    let uptime = Uptime::at(500);
+    let mut clock = epoch(&uptime);
+    clock
+        .restore(1_700_000_000)
+        .expect("the boot clock answered");
+
+    uptime.ticks.set(10);
+    assert_eq!(clock.now(), Err(EpochFault::Regressed));
+
+    clock
+        .restore(1_700_000_400)
+        .expect("the network answered while the boot clock was below its anchor");
+    assert_eq!(clock.now(), Ok(1_700_000_400));
+}
+
+#[test]
+fn a_re_sync_below_a_reading_already_given_is_refused_after_a_reset_too() {
+    // The other half of the same rule. The anchor is gone, so the only floor left is the
+    // highest reading this clock ever gave — and it still refuses a network answer behind it.
+    let uptime = Uptime::at(500);
+    let mut clock = epoch(&uptime);
+    clock
+        .restore(1_700_000_000)
+        .expect("the boot clock answered");
+    uptime.ticks.set(900);
+    assert_eq!(clock.now(), Ok(1_700_000_400));
+
+    uptime.ticks.set(10);
+    assert_eq!(clock.restore(1_700_000_200), Err(EpochFault::Regressed));
+    clock
+        .restore(1_700_000_400)
+        .expect("an answer level with the highest reading given is not a move backwards");
+}
+
+#[test]
+fn a_clock_that_climbed_back_past_its_anchor_does_not_resume_below_a_reading_it_gave() {
+    // The reading the anchor alone believes. At tick 600 the anchor's own arithmetic works
+    // again and answers 1_700_000_100 — below the 1_700_000_400 this clock already gave, and
+    // `Ok` without the floor. A deadline armed under that reading fires late rather than
+    // being refused, which is worse than either.
+    let uptime = Uptime::at(500);
+    let mut clock = epoch(&uptime);
+    clock
+        .restore(1_700_000_000)
+        .expect("the boot clock answered");
+    uptime.ticks.set(900);
+    assert_eq!(clock.now(), Ok(1_700_000_400));
+
+    uptime.ticks.set(10);
+    assert_eq!(clock.now(), Err(EpochFault::Regressed));
+
+    uptime.ticks.set(600);
+    assert_eq!(clock.now(), Err(EpochFault::Regressed));
+}
+
+#[test]
+fn an_unrepresentable_reading_does_not_lock_out_a_re_sync() {
+    // The same lockout wearing the other fault's hat: an anchor whose sum has overflowed is
+    // an anchor no reading can come from, and a re-sync is the only way out of it.
+    let uptime = Uptime::at(0);
+    let mut clock = epoch(&uptime);
+    clock.restore(u64::MAX).expect("the boot clock answered");
+
+    uptime.ticks.set(1);
+    assert_eq!(clock.now(), Err(EpochFault::Unrepresentable));
+
+    clock
+        .restore(u64::MAX)
+        .expect("re-anchoring at the same reading moves nothing backwards");
+    assert_eq!(clock.now(), Ok(u64::MAX));
+}
+
+#[test]
 fn a_restored_epoch_does_not_survive_the_power_cut_an_rtc_does() {
     // The two drivers side by side, which is what the documentation of this path has to
     // say. The RTC's counter is in the backup domain and crosses the cut; the epoch is in
     // RAM and does not. So a network device answers `NotRestored` until it has been told
     // the time again, and never fires a durable deadline early on the strength of a zero.
     let domain = Domain::holding(1_700_000_000);
-    let uptime = Uptime::at(0);
+    let uptime = Uptime::at(400);
     // The power cycle before the cut. Both drivers live in this block and neither leaves it.
     {
         let mut before_rtc = rtc(&domain);
@@ -327,11 +404,13 @@ fn a_restored_epoch_does_not_survive_the_power_cut_an_rtc_does() {
             .restore(1_700_000_000)
             .expect("the boot clock answered");
         assert_eq!(before_rtc.now(), Ok(1_700_000_000));
-        assert_eq!(before_epoch.now(), Ok(1_700_000_000));
+        // The boot clock runs, and the restored epoch runs with it.
+        uptime.ticks.set(700);
+        assert_eq!(before_epoch.now(), Ok(1_700_000_300));
     }
 
     // The cut. The backup domain kept counting; RAM did not survive at all, so the epoch
-    // driver is built again with nothing in it and the boot clock is back at zero.
+    // driver is built again with nothing in it and the boot clock really is back at zero.
     domain.counter.set(1_700_000_900);
     uptime.ticks.set(0);
     let mut after_rtc = rtc(&domain);

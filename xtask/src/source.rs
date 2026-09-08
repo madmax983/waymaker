@@ -1109,14 +1109,44 @@ pub const RIG_RTC_SURFACE: &[&str] = &["continuity", "counter", "now", "over"];
 /// Sorted, for [`RIG_RTC_SURFACE`]'s reason.
 pub const RIG_EPOCH_SURFACE: &[&str] = &["awaiting", "now", "restore", "ticks"];
 
-/// The board clock modules `timer-capability` pins, and the surface each may declare.
+/// One board clock module, and everything `timer-capability` pins about it.
 ///
-/// Two files rather than one, because a pinned surface is a list of *names* and both
-/// modules implement `PersistentClock`. One file holding both would declare `now` twice, and
-/// a pin cannot speak about a name used twice.
-pub const BOARD_CLOCK_MODULES: &[(&str, &[&str])] = &[
-    (RIG_RTC_PATH, RIG_RTC_SURFACE),
-    (RIG_EPOCH_PATH, RIG_EPOCH_SURFACE),
+/// Two modules rather than one, because a pinned surface is a list of *names* and both
+/// implement `PersistentClock`. One file holding both would declare `now` twice, and a pin
+/// cannot speak about a name used twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardClock {
+    /// Where the module lives, relative to `crates/`.
+    pub path: &'static str,
+    /// Every public function it may declare.
+    pub surface: &'static [&'static str],
+    /// The driver type, whose fields must all be private.
+    pub driver: &'static str,
+    /// Every method the driver's inherent `impl` blocks may declare, at *any* visibility.
+    pub methods: &'static [&'static str],
+}
+
+/// The board clock modules `timer-capability` pins.
+///
+/// `methods` names a private helper as well as the public ones, which reads as
+/// over-specification and is the point: review of this change added
+/// `pub(crate) fn counter_unchecked` to `impl Rtc` and watched the gate stay green, because
+/// a surface pin counts `pub ` and not `pub(`. `TIMER_TYPE_METHODS` closed exactly that on
+/// the kernel side, and CLAUDE.md had recorded the defeat; the board side was added without
+/// it. So the list is every method, and a private helper is one a reviewer writes down.
+pub const BOARD_CLOCK_MODULES: &[BoardClock] = &[
+    BoardClock {
+        path: RIG_RTC_PATH,
+        surface: RIG_RTC_SURFACE,
+        driver: "Rtc",
+        methods: &["over"],
+    },
+    BoardClock {
+        path: RIG_EPOCH_PATH,
+        surface: RIG_EPOCH_SURFACE,
+        driver: "RestoredEpoch",
+        methods: &["awaiting", "reading_at", "restore"],
+    },
 ];
 
 /// What a board clock module may not name, beyond [`CLOCK_FORBIDDEN_VOCABULARY`].
@@ -1246,18 +1276,18 @@ fn check_board_clocks(rig_sources: &[crate::size::LayerSource]) -> Vec<Violation
     const BOARD: &str = "waymaker-rig";
 
     let mut violations = Vec::new();
-    for (path, surface) in BOARD_CLOCK_MODULES {
+    for clock in BOARD_CLOCK_MODULES {
         violations.extend(check_pinned_surface(
             RULE,
             BOARD,
-            path,
-            surface,
+            clock.path,
+            clock.surface,
             rig_sources,
             "a board clock is where a reading enters the workspace, so a way to hand out one \
              the hardware never vouched for cannot be added without a reviewer writing it \
              down",
         ));
-        let Some(source) = find_source(rig_sources, path) else {
+        let Some(source) = find_source(rig_sources, clock.path) else {
             continue;
         };
         let code = without_test_modules(&code_only(&source.contents));
@@ -1269,12 +1299,162 @@ fn check_board_clocks(rig_sources: &[crate::size::LayerSource]) -> Vec<Violation
                 violations.push(Violation::new(
                     RULE,
                     BOARD,
-                    format!("{path} names `{forbidden}`, which {why}"),
+                    format!("{} names `{forbidden}`, which {why}", clock.path),
                 ));
             }
         }
+        violations.extend(check_board_clock_driver(clock, &code));
+        violations.extend(check_board_clock_has_no_constant(clock, &code));
     }
     violations
+}
+
+/// The driver type keeps its fields private and declares only the methods it is pinned for.
+///
+/// The two defeats CLAUDE.md records against the kernel half, closed here as well. A public
+/// field is a constructor — `pub struct Rtc<R> { pub registers: R }` lets every caller reach
+/// `rtc.registers.counter()` and skip the continuity check entirely — and a `pub(crate) fn`
+/// is reach enough within a crate that already holds the rig the drivers are written for.
+fn check_board_clock_driver(clock: &BoardClock, code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const BOARD: &str = "waymaker-rig";
+
+    let mut violations = Vec::new();
+    let header = format!("pub struct {}", clock.driver);
+    let declarations = declaration_count(code, &header);
+    if declarations != 1 {
+        violations.push(Violation::new(
+            RULE,
+            BOARD,
+            format!(
+                "{} declares `{header}` {declarations} times, not once; the scans below read \
+                 the first, so a decoy above the real one is what they would check",
+                clock.path
+            ),
+        ));
+        return violations;
+    }
+    if !declares_braced_struct(code, &header) {
+        violations.push(Violation::new(
+            RULE,
+            BOARD,
+            format!(
+                "`{}` is not a braced struct: the field scan reads the first `{{` after the \
+                 declaration, so a tuple struct would have it reporting on whatever follows \
+                 — and a `pub` tuple field is a register block anybody can read around the \
+                 driver",
+                clock.driver
+            ),
+        ));
+        return violations;
+    }
+    if braced_body(code, &header).is_some_and(|body| count_tokens(body, "pub") != 0) {
+        violations.push(Violation::new(
+            RULE,
+            BOARD,
+            format!(
+                "`{}` declares a public field: the whole of this driver is that a reading \
+                 comes with the register that vouches for it, and a public field is a way \
+                 round it that adds no function",
+                clock.driver
+            ),
+        ));
+    }
+
+    let blocks = inherent_impl_bodies(code, clock.driver);
+    if blocks.is_empty() {
+        violations.push(Violation::new(
+            RULE,
+            BOARD,
+            format!(
+                "{} declares no inherent `impl` for `{}`, so its methods are pinned against \
+                 nothing",
+                clock.path, clock.driver
+            ),
+        ));
+        return violations;
+    }
+    let body = blocks.join("\n");
+    let declared = declared_function_names(&body);
+    let mut expected: Vec<String> = clock
+        .methods
+        .iter()
+        .map(|method| (*method).to_owned())
+        .collect();
+    expected.sort();
+    if declared != expected {
+        violations.push(Violation::new(
+            RULE,
+            BOARD,
+            format!(
+                "`{}` declares {declared:?} rather than {expected:?}: read at every \
+                 visibility, because a surface pin counts `pub ` and not `pub(`, and this \
+                 crate is the one the drivers were written for",
+                clock.driver
+            ),
+        ));
+    }
+    violations
+}
+
+/// A board clock module declares no constant.
+///
+/// Refused outright rather than listed, and read over the whole module rather than over one
+/// `impl` body. Review of this change added `impl Continuity { pub const ASSUME_HELD: Self =
+/// Self::Held; }` and watched every other half of this rule stay green: it adds no function,
+/// changes no enum member, and gives a caller a `Continuity` the hardware never reported.
+/// These modules have no honest constant — every value in them comes from a register or from
+/// the network — so a whitelist would be a list of one exception waiting to be added to.
+fn check_board_clock_has_no_constant(clock: &BoardClock, code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const BOARD: &str = "waymaker-rig";
+
+    module_constants(code)
+        .into_iter()
+        .map(|constant| {
+            Violation::new(
+                RULE,
+                BOARD,
+                format!(
+                    "{} declares the constant `{constant}`; a clock driver has no honest \
+                     constant, and one that names a reading or a continuity is a value a \
+                     caller can reach without changing a surface",
+                    clock.path
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Every `const` a module declares at any depth, `const fn` excepted.
+///
+/// [`declared_associated_constants`] reads one `impl` body and reports its top level. This
+/// reads the file, because the door it is written against is an `impl` block on a *second*
+/// type — the enum a driver answers with — which no per-driver pin looks at.
+fn module_constants(code: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("pub ")
+            .or_else(|| {
+                trimmed
+                    .split_once(") ")
+                    .filter(|(head, _)| head.starts_with("pub("))
+                    .map(|(_, rest)| rest)
+            })
+            .unwrap_or(trimmed);
+        if let Some(declaration) = rest.strip_prefix("const ")
+            && !declaration.starts_with("fn ")
+            && let Some(name) = declaration.split([':', ' ']).next()
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort_unstable();
+    names
 }
 
 /// Every `TimerSpec` the clock module names is the persistent one, and it names at least one.
@@ -7590,14 +7770,24 @@ mod deferred_answer_pins {
 
     /// The two board clock files the same rule reads, with one of them replaced.
     fn board_clock_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
-        let clean: [(&str, String); 2] = [
-            (RIG_RTC_PATH, tests_support::clean_board_rtc()),
-            (RIG_EPOCH_PATH, tests_support::clean_board_epoch()),
-        ];
-        clean
-            .into_iter()
-            .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+        BOARD_CLOCK_MODULES
+            .iter()
+            .map(|clock| {
+                let body = tests_support::clean_board_clock(clock);
+                layer(
+                    clock.path,
+                    if clock.path == path { contents } else { &body },
+                )
+            })
             .collect()
+    }
+
+    /// The clean fixture for `path`, so a mutation test starts from what the pin accepts.
+    fn clean_board_clock(path: &str) -> String {
+        let Some(clock) = BOARD_CLOCK_MODULES.iter().find(|clock| clock.path == path) else {
+            unreachable!("{path} is a board clock module")
+        };
+        tests_support::clean_board_clock(clock)
     }
 
     /// Every violation the rule emits when the layer file `path` holds `contents`.
@@ -7739,17 +7929,18 @@ mod deferred_answer_pins {
             details.iter().any(|detail| detail.contains("lib.rs")),
             "{details:?}"
         );
-        for (path, _) in BOARD_CLOCK_MODULES {
+        for clock in BOARD_CLOCK_MODULES {
             assert!(
-                details.iter().any(|detail| detail.contains(path)),
-                "{path} is not reported: {details:?}"
+                details.iter().any(|detail| detail.contains(clock.path)),
+                "{} is not reported: {details:?}",
+                clock.path
             );
         }
     }
 
     #[test]
     fn the_clean_board_clocks_pass() {
-        assert!(board_clock_details(RIG_RTC_PATH, &tests_support::clean_board_rtc()).is_empty());
+        assert!(board_clock_details(RIG_RTC_PATH, &clean_board_clock(RIG_RTC_PATH)).is_empty());
     }
 
     #[test]
@@ -7759,7 +7950,7 @@ mod deferred_answer_pins {
         // that lost power reads zero — which fires every persistent deadline at once.
         let module = format!(
             "{}pub fn counter_unchecked() {{}}\n",
-            tests_support::clean_board_rtc()
+            clean_board_clock(RIG_RTC_PATH)
         );
         let details = board_clock_details(RIG_RTC_PATH, &module);
         assert!(
@@ -7786,7 +7977,7 @@ mod deferred_answer_pins {
         for (forbidden, _) in CLOCK_FORBIDDEN_VOCABULARY {
             let module = format!(
                 "{}pub fn extra() {{ let _ = {forbidden}; }}\n",
-                tests_support::clean_board_rtc()
+                clean_board_clock(RIG_RTC_PATH)
             );
             let details = board_clock_details(RIG_RTC_PATH, &module);
             assert!(
@@ -7797,13 +7988,84 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_public_field_on_a_board_clock_driver_is_reported() {
+        // A public field is a constructor. `pub registers: R` lets every caller reach
+        // `rtc.registers.counter()` and skip the continuity check, adding no function.
+        let module =
+            clean_board_clock(RIG_RTC_PATH).replace("    registers: u8,", "    pub registers: u8,");
+        let details = board_clock_details(RIG_RTC_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares a public field")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_pub_crate_accessor_on_a_board_clock_driver_is_reported() {
+        // A surface pin counts `pub ` and not `pub(`, and this crate is the one the drivers
+        // were written for, so `pub(crate)` is reach enough.
+        let module = clean_board_clock(RIG_RTC_PATH).replace(
+            "impl Rtc {",
+            "impl Rtc {\n    pub(crate) fn counter_unchecked() {}",
+        );
+        let details = board_clock_details(RIG_RTC_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("counter_unchecked")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_with_no_inherent_impl_is_reported() {
+        // Fails closed: a method pin with nothing to read is a pin that has stopped checking.
+        let module =
+            clean_board_clock(RIG_EPOCH_PATH).replace("impl RestoredEpoch {", "impl Other {");
+        let details = board_clock_details(RIG_EPOCH_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares no inherent `impl`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_board_clock_module_is_reported() {
+        // The door every other half of this rule walks past: it adds no function, changes no
+        // member, and hands a caller a continuity the hardware never reported. Declared on a
+        // *second* type, which is why the scan reads the module rather than one impl body.
+        let module = format!(
+            "{}impl Continuity {{\n    pub const ASSUME_HELD: Self = Self::Held;\n}}\n",
+            clean_board_clock(RIG_RTC_PATH)
+        );
+        let details = board_clock_details(RIG_RTC_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("ASSUME_HELD")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_fn_on_a_board_clock_module_is_not_a_constant() {
+        // The two real modules declare `pub const fn over` and `pub const fn awaiting`, so a
+        // scan that read `const fn` as a constant would fail the workspace it is written for.
+        let module = clean_board_clock(RIG_RTC_PATH)
+            .replace("    pub fn over() {}", "    pub const fn over() {}");
+        assert!(board_clock_details(RIG_RTC_PATH, &module).is_empty());
+    }
+
+    #[test]
     fn a_board_clock_naming_a_deadline_policy_is_reported() {
         // A driver reports a reading. A driver that named a `TimerSpec` or a
         // `ClockCapability` would be deciding §02 decision 8 where neither pin above looks.
         for (forbidden, _) in BOARD_CLOCK_FORBIDDEN_VOCABULARY {
             let module = format!(
                 "{}pub fn extra() {{ let _ = {forbidden}; }}\n",
-                tests_support::clean_board_epoch()
+                clean_board_clock(RIG_EPOCH_PATH)
             );
             let details = board_clock_details(RIG_EPOCH_PATH, &module);
             assert!(
@@ -10721,16 +10983,34 @@ mod tests {
         surface("A failure matrix.", super::RIG_MATRIX_SURFACE)
     }
 
-    /// A board RTC whose public surface is exactly the pin.
+    /// A board clock module satisfying every half of `timer-capability`'s board side.
+    ///
+    /// Rendered from the pin for [`clean_timer_module`]'s reason, and with each name emitted
+    /// once: the surface pin reports a name declared twice, so a fixture that put a pinned
+    /// method in the `impl` *and* beside it would describe a workspace the gate rejects for a
+    /// reason no test here is about.
     #[must_use]
-    pub fn clean_board_rtc() -> String {
-        surface("A board RTC.", super::RIG_RTC_SURFACE)
-    }
+    pub fn clean_board_clock(clock: &super::BoardClock) -> String {
+        use std::fmt::Write as _;
 
-    /// An externally-restored epoch whose public surface is exactly the pin.
-    #[must_use]
-    pub fn clean_board_epoch() -> String {
-        surface("A restored epoch.", super::RIG_EPOCH_SURFACE)
+        let mut source = format!("//! A board clock.\npub struct {} {{\n", clock.driver);
+        source.push_str("    registers: u8,\n}\n");
+        let _ = writeln!(source, "impl {} {{", clock.driver);
+        for method in clock.methods {
+            let visibility = if clock.surface.contains(method) {
+                "pub "
+            } else {
+                ""
+            };
+            let _ = writeln!(source, "    {visibility}fn {method}() {{}}");
+        }
+        source.push_str("}\n");
+        for name in clock.surface {
+            if !clock.methods.contains(name) {
+                let _ = writeln!(source, "pub fn {name}() {{}}");
+            }
+        }
+        source
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.

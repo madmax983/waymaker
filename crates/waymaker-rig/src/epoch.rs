@@ -45,13 +45,20 @@ use waymaker_embassy::clock::PersistentClock;
 ///
 /// # What an implementor must uphold
 ///
+/// * **A tick is one unit of the epoch the firmware restores.** This module adds the two
+///   numbers and never converts them, for [`Timer`]'s reason: a conversion needs a rate, and
+///   a rate nobody checked is a clock that runs fast. A board whose epoch is seconds and
+///   whose timer counts 32 kHz must divide before it answers here. Nothing below can catch
+///   this — every arithmetic guard in this module passes on a reading 32768 times too large.
 /// * Readings do not go backwards within one power cycle.
 /// * A read that fails is an [`Err`]. An implementor must not substitute a value.
+///
+/// [`Timer`]: waymaker_core::timer::Timer
 pub trait Monotonic {
     /// How a failed read reports. The board's own type; this crate never inspects it.
     type Error;
 
-    /// Ticks since this power cycle began.
+    /// Ticks since this power cycle began, in the unit the restored epoch counts in.
     ///
     /// # Errors
     ///
@@ -70,8 +77,8 @@ pub enum EpochFault<E> {
     Monotonic(E),
     /// No epoch has been restored into this power cycle.
     NotRestored,
-    /// The monotonic clock read below the reading the epoch was anchored to, or a re-sync
-    /// would move the clock backwards.
+    /// A reading would be below one this clock has already given, or below the reading it
+    /// stands at now. Either way it is a clock going backwards, which this driver refuses.
     Regressed,
     /// The epoch plus the ticks since it was restored does not fit a reading.
     Unrepresentable,
@@ -97,16 +104,37 @@ struct Anchor {
 ///   neither operation wraps: an underflow is [`EpochFault::Regressed`] and an overflow is
 ///   [`EpochFault::Unrepresentable`].
 /// * Before the first [`restore`](Self::restore), there is no reading at all.
-/// * [`restore`](Self::restore) never moves the answer backwards.
+/// * **No reading is below one already given.** That is what the `floor` field is for, and
+///   the anchor alone does not supply it — see below.
+///
+/// # Why the anchor is not enough
+///
+/// Review of this change found the version without the floor. An anchor detects a boot clock
+/// that regressed *below the anchor tick*, and stops detecting it the moment the clock climbs
+/// back. Anchored at `(epoch 1000, ticks 500)`: a read at tick 900 answers 1400, a reset to
+/// tick 10 answers [`EpochFault::Regressed`], and a read at tick 600 then answers **1100** —
+/// below a reading already given, and `Ok`. A deadline is not refused there; it fires late,
+/// because [`Timer::evaluate`] floors at the reading the record was armed at and 1100 clears
+/// it.
+///
+/// So the floor is the highest reading this clock has produced or been anchored to, and it
+/// stands whether or not the anchor still evaluates. That second half is what stops the floor
+/// becoming a lock: a boot clock that regressed makes the current reading unknowable, which is
+/// the one state [`restore`](Self::restore) exists for, so it must not be the state that
+/// refuses every re-sync.
 ///
 /// # No derives
 ///
 /// For [`crate::rtc::Rtc`]'s reason: a derive would put the same bound on `M`.
+///
+/// [`Timer::evaluate`]: waymaker_core::timer::Timer::evaluate
 pub struct RestoredEpoch<M> {
     /// The board's boot clock.
     monotonic: M,
     /// Where the epoch was anchored, once it has been.
     anchor: Option<Anchor>,
+    /// The highest reading this clock has produced or been anchored to.
+    floor: u64,
 }
 
 impl<M> RestoredEpoch<M> {
@@ -119,6 +147,7 @@ impl<M> RestoredEpoch<M> {
         Self {
             monotonic,
             anchor: None,
+            floor: 0,
         }
     }
 }
@@ -126,36 +155,51 @@ impl<M> RestoredEpoch<M> {
 impl<M: Monotonic> RestoredEpoch<M> {
     /// Anchors this clock at `reading`.
     ///
-    /// The firmware calls this with what the network said. A later call re-synchronises,
-    /// and a re-synchronisation that would move the clock backwards is refused rather than
-    /// applied: §11 requires a persistent clock's readings not to go backwards, and a
-    /// per-timer high-water mark catches such a move for one deadline and misses it for the
-    /// next.
+    /// The firmware calls this with what the network said. A later call re-synchronises, and
+    /// a re-synchronisation that would move the clock backwards is refused rather than
+    /// applied. `PersistentClock` requires a driver whose hardware can move back to return an
+    /// [`Err`], and a per-timer high-water mark is not that: it catches such a move for one
+    /// deadline and misses it for the next.
+    ///
+    /// What it refuses `reading` against is the higher of the reading this clock stands at
+    /// and the highest it has already given. Where the anchor no longer evaluates — a boot
+    /// clock that reset, an epoch that overflowed — only the second is left, and it is used
+    /// rather than the failure being propagated. Propagating it locks a device out of the
+    /// re-sync that is the whole remedy for the state it is in.
     ///
     /// # Errors
     ///
-    /// [`EpochFault::Monotonic`] when the boot clock cannot be read,
-    /// [`EpochFault::Regressed`] when the boot clock read below the current anchor or when
-    /// `reading` is behind what this clock already reports, and
-    /// [`EpochFault::Unrepresentable`] when the current reading does not fit.
+    /// [`EpochFault::Monotonic`] when the boot clock cannot be read, and
+    /// [`EpochFault::Regressed`] when `reading` is behind what this clock reads or has read.
     pub fn restore(&mut self, reading: u64) -> Result<(), EpochFault<M::Error>> {
         let ticks = self.monotonic.ticks().map_err(EpochFault::Monotonic)?;
-        if self.anchor.is_some() && reading < self.reading_at(ticks)? {
+        let floor = self.reading_at(ticks).map_or(self.floor, |standing| {
+            if standing > self.floor {
+                standing
+            } else {
+                self.floor
+            }
+        });
+        if reading < floor {
             return Err(EpochFault::Regressed);
         }
         self.anchor = Some(Anchor {
             epoch: reading,
             ticks,
         });
+        self.floor = reading;
         Ok(())
     }
 
     /// What this clock reads when the boot clock reads `ticks`.
     ///
+    /// The anchor's arithmetic and nothing else: the floor is applied by the two callers,
+    /// each in its own way, which is why it is not applied here.
+    ///
     /// # Errors
     ///
-    /// [`EpochFault::NotRestored`], [`EpochFault::Regressed`] or
-    /// [`EpochFault::Unrepresentable`], as [`restore`](Self::restore) describes.
+    /// [`EpochFault::NotRestored`] with no anchor, [`EpochFault::Regressed`] when `ticks` is
+    /// below the anchor's, and [`EpochFault::Unrepresentable`] when the sum does not fit.
     fn reading_at(&self, ticks: u64) -> Result<u64, EpochFault<M::Error>> {
         let anchor = self.anchor.ok_or(EpochFault::NotRestored)?;
         let elapsed = ticks
@@ -176,10 +220,16 @@ impl<M: Monotonic> PersistentClock for RestoredEpoch<M> {
     /// # Errors
     ///
     /// [`EpochFault::NotRestored`] before the first [`restore`](Self::restore) of this power
-    /// cycle, and the three faults [`restore`](Self::restore) describes.
+    /// cycle, [`EpochFault::Monotonic`], [`EpochFault::Unrepresentable`], and
+    /// [`EpochFault::Regressed`] for a reading below one this clock has already given.
     fn now(&mut self) -> Result<u64, Self::Error> {
         let ticks = self.monotonic.ticks().map_err(EpochFault::Monotonic)?;
-        self.reading_at(ticks)
+        let reading = self.reading_at(ticks)?;
+        if reading < self.floor {
+            return Err(EpochFault::Regressed);
+        }
+        self.floor = reading;
+        Ok(reading)
     }
 }
 
@@ -210,5 +260,22 @@ mod tests {
         assert_eq!(clock.restore(1_000), Ok(()));
         clock.monotonic = Fixed(60);
         assert_eq!(clock.now(), Ok(1_050));
+    }
+
+    #[test]
+    fn a_clock_that_climbed_back_past_its_anchor_does_not_resume_below_a_reading_it_gave() {
+        // The failure the floor exists for, in the order it happens on a part.
+        let mut clock = RestoredEpoch::awaiting(Fixed(500));
+        assert_eq!(clock.restore(1_000), Ok(()));
+        clock.monotonic = Fixed(900);
+        assert_eq!(clock.now(), Ok(1_400));
+
+        clock.monotonic = Fixed(10);
+        assert_eq!(clock.now(), Err(EpochFault::Regressed));
+
+        // Back above the anchor tick, so the anchor's own arithmetic works again and answers
+        // 1100. Without the floor that is `Ok`, and a deadline armed below it fires late.
+        clock.monotonic = Fixed(600);
+        assert_eq!(clock.now(), Err(EpochFault::Regressed));
     }
 }

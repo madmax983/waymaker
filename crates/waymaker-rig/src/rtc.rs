@@ -30,6 +30,21 @@
 //! persistent deadline on the device at once. [`Rtc::now`] returns
 //! [`RtcFault::ContinuityLost`] instead, and there is no second constructor and no accessor
 //! that hands the raw counter out.
+//!
+//! # What this driver does not do, and where that is caught instead
+//!
+//! `PersistentClock` asks a driver whose hardware can move back to return an [`Err`]. This
+//! one does not: it reports the counter, and a part with a 32-bit counter wraps. It has
+//! nothing to detect the wrap with — a floor would have to survive the power cut, and RAM
+//! does not, so the only floor it could keep is one from a power cycle that is gone.
+//!
+//! Two floors do survive, and both are outside this module. Within a boot it is
+//! `PersistentTimer`'s high-water mark. Across a boot it is the arming reading issue
+//! [#33](https://github.com/madmax983/waymaker/issues/33)'s `TimerScheduled` record carries,
+//! which `Timer::evaluate` refuses a reading below. So a wrapped counter is
+//! `KernelError::ClockWentBackwards` rather than a credited interval — a refusal, in the
+//! layer that has the evidence for it. Whether a given part's counter can wrap inside a
+//! given deadline is arithmetic about a board, and the board is what has to do it.
 
 use waymaker_embassy::clock::PersistentClock;
 

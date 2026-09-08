@@ -52,6 +52,17 @@ an `Rtc::counter_unchecked` is a line a reviewer writes on purpose. That pin is 
 had to be added rather than argued for, because such an accessor breaks no layering rule,
 needs no dependency, and passes every other gate.
 
+It is four checks rather than one, and the extra three were bought the way the kernel half's
+were. Review of this change landed a `pub(crate) fn counter_unchecked` on `impl Rtc`, a
+`pub registers` field on `Rtc`, and a `pub const ASSUME_HELD: Self = Self::Held` on
+`impl Continuity`, and watched a surface pin stay green through all three: it counts `pub `
+and not `pub(`, a public field adds no function, and a constant declared on the *enum a driver
+answers with* is not in any driver's `impl` body. So the board half pins each driver's methods
+at every visibility, refuses a public field on it, and refuses any constant in the module,
+read over the whole file. CLAUDE.md had already recorded the first two defeats against the
+kernel half; the board half was written without the countermeasures they bought, which is the
+way a rule normally rots.
+
 **The counter is read first and the continuity bit second.** A supercapacitor that browns out
 *during* the counter read latches the bit, so a read that follows the counter catches a break
 the counter met and a read that precedes it cannot. The order reads as arbitrary and is not,
@@ -94,10 +105,25 @@ value is left holding it. That is ADR 0021's split at the reset boundary, applie
 measures what it measured before. The 66 B ADR 0030 left is still 66 B, and rung 0.4 still has
 the accounting problem ADR 0029 named.
 
-**`waymaker-rig` now depends on `waymaker-embassy`.** The edge is legal in this direction only:
-`policy::LAYERS` is what forbids a layer reaching a test-support crate, and `dependency-direction`
-reads that table and nothing else. It is the same standing `waymaker-rig`'s dependency on
-`waymaker-conformance` has.
+**A firmware built on Waymaker gets no RTC driver from this workspace.** `waymaker-rig` is
+`publish = false` and is never linked into anything Waymaker ships. What a firmware author
+gets from this change is `waymaker-embassy`'s `PersistentClock` — which existed already — and
+two worked implementations to copy, with the register that matters named and a test suite that
+runs on a host. That is less than issue #34's first work item reads as, and it is the honest
+consequence of the placement above. If a shipped driver is wanted later it is a crate of its
+own beside the façade, not a public function added to a layer with 66 B of budget left.
+
+**`waymaker-rig` now depends on `waymaker-embassy`.** The edge is legal because
+`dependency-direction` and `embassy-below-facade` both read `policy::LAYERS`, and this crate is
+not a layer. It is *not* the same standing `waymaker-rig`'s dependency on
+`waymaker-conformance` has: that one is a dev-dependency between two test-support crates, and
+this is a normal dependency onto the one crate `policy::is_embassy_package` returns true for.
+The consequence is dated rather than absent. `policy::LAYERS` records that rung 0.4 gives
+`waymaker-embassy` a real `may_depend_on_external` of Embassy crates, and from that day the CI
+stage `cargo build -p waymaker-rig --lib --target thumbv6m-none-eabi` links the Embassy
+ecosystem to build a rig that has no use for it. The fix when it arrives is a feature on this
+crate or a third module home, and it is cheaper to write that down now than to meet it as a
+build-time surprise.
 
 **A 32-bit counter that rolls over reads backwards, and that is the documented answer.** The
 driver reports the register. It has no epoch to widen a wrapped counter with, because RAM did
@@ -120,6 +146,21 @@ tell apart is two *instances* of one driver — the limit ADR 0028 recorded, unc
 **Neither driver sleeps or arms an alarm.** They answer a reading. §11's in-boot sleep and a
 dispatcher that arms a hardware alarm are rung 0.4's, as ADR 0030 already records.
 
+**A monotonic tick must already be in the epoch's unit, and nothing checks it.**
+`RestoredEpoch` adds a tick count to a restored reading and never converts, for the kernel's
+reason: a conversion needs a rate, and a rate nobody checked is a clock that runs fast. A board
+whose epoch is seconds and whose timer counts 32 kHz must divide before it answers, and every
+arithmetic guard in the module passes on a reading 32768 times too large. Stated on
+`Monotonic::ticks`, and it is a board's obligation the way the continuity bit is.
+
+**The board half pins one file each, so a sibling module is still a door.** Review of this
+change put a `macro_rules!` in `waymaker-rig/src/window.rs` and invoked it inside
+`impl<R> Rtc<R>`; it expands to a public inherent method returning the raw counter, and the
+gate stays green. That is the limit CLAUDE.md already records for the kernel and the façade
+halves, met again rather than a new one, and closing it needs a scanner that expands macros
+rather than a longer list. It is written down because the alternative is a claim in this ADR
+that the pin is stronger than it is.
+
 ## Alternatives considered
 
 **A concrete driver for one part, over `embedded-hal`.** A DS3231 or an STM32 backup domain,
@@ -132,6 +173,17 @@ in the same crate.
 **The driver in `waymaker-embassy`.** §11 puts `PersistentClock` there, so the driver reads as
 belonging beside it. It would have cost a code-flash raise on a budget with 66 B left, for a
 driver Waymaker does not ship. The capability stays; the driver does not.
+
+**A `RestoredEpoch` whose only guard is its anchor.** The first version compared a reading
+against the tick the epoch was anchored at, and nothing else. Review found two failures in it,
+and the second is the one worth recording: an anchor stops detecting a boot clock that reset
+the moment the clock climbs back past the anchor tick, so a reading already given as 1400 is
+followed by an `Ok(1100)` — and a deadline armed under that reading fires *late* rather than
+being refused, because `Timer::evaluate` floors at the recorded arming reading and 1100 clears
+it. The first was the mirror image: propagating the anchor's own failure out of `restore` locks
+a device out of the re-sync that is the remedy for the state it is in. One floor answers both —
+the highest reading produced or anchored to, standing whether or not the anchor still
+evaluates.
 
 **Inferring continuity from the counter.** "A counter below the last recorded reading means the
 battery died" needs no second register and is wrong in the direction that hides bugs: a battery

@@ -147,17 +147,28 @@ impl BackedRtc for Registers<'_> {
     }
 }
 
-/// A monotonic boot clock. Zero on every power cycle, which is what makes the epoch driver
-/// need the network again after a cut.
-struct BootClock<'a> {
-    ticks: &'a Cell<u64>,
+/// How far a boot clock moves between two reads.
+///
+/// Non-zero on purpose. A clock that never moves lets a restored epoch pass every test in
+/// this file while ignoring the monotonic reading altogether, which is the arithmetic the
+/// path exists for.
+const TICKS_PER_READ: u64 = 10;
+
+/// A monotonic boot clock, built for one power-up and dropped with it.
+///
+/// It starts at zero on every power cycle — which is what makes the epoch driver need the
+/// network again after a cut — and it moves on every read, as a real one does.
+struct BootClock {
+    ticks: u64,
 }
 
-impl Monotonic for BootClock<'_> {
+impl Monotonic for BootClock {
     type Error = ();
 
     fn ticks(&mut self) -> Result<u64, ()> {
-        Ok(self.ticks.get())
+        let reading = self.ticks;
+        self.ticks = self.ticks.saturating_add(TICKS_PER_READ);
+        Ok(reading)
     }
 }
 
@@ -169,6 +180,7 @@ impl Monotonic for BootClock<'_> {
 /// than the same one lying about itself.
 struct Board<C> {
     clock: Option<C>,
+    boot_ticks: u64,
     world: World,
 }
 
@@ -177,6 +189,7 @@ impl<C> Board<C> {
     const fn with(clock: C) -> Self {
         Self {
             clock: Some(clock),
+            boot_ticks: 0,
             world: World::new(),
         }
     }
@@ -185,6 +198,7 @@ impl<C> Board<C> {
     const fn without_a_clock() -> Self {
         Self {
             clock: None,
+            boot_ticks: 0,
             world: World::new(),
         }
     }
@@ -207,9 +221,12 @@ impl<C: PersistentClock> Clocks for Board<C> {
             return self.clock.as_mut()?.now().ok();
         }
         if kind == ClockKind::AFTER_BOOT {
-            // This file's workflow waits on the persistent clock only. A boot clock is
-            // answered so that the board is a whole firmware rather than half of one.
-            return Some(0);
+            // A counter rather than a constant. `Clocks` says an implementor must not
+            // substitute a value, and a fixed number in this file would be one — even though
+            // nothing here waits on a boot deadline.
+            let reading = self.boot_ticks;
+            self.boot_ticks = self.boot_ticks.saturating_add(TICKS_PER_READ);
+            return Some(reading);
         }
         None
     }
@@ -257,14 +274,14 @@ const fn on_rtc(domain: &BackupDomain) -> Board<Rtc<Registers<'_>>> {
 /// One power-up of a device that gets its time from a network.
 ///
 /// `restored` is what the network answered on this boot, or [`None`] where it has not
-/// answered yet. The board is built here and dropped on return, for [`power_up`]'s reason:
-/// a restored epoch lives in RAM, so a cut has to take it.
+/// answered yet. The boot clock is built here too, not only the board: it starts at zero on
+/// every power cycle, so a cut that left it running would be no cut. Media is the only thing
+/// this call shares with the last one.
 fn power_up_on_network_time(
     media: &mut Device,
-    uptime: &Cell<u64>,
     restored: Option<u64>,
 ) -> Result<Progress, DriveError<<Device as StableStorage>::Error>> {
-    let mut board = Board::with(RestoredEpoch::awaiting(BootClock { ticks: uptime }));
+    let mut board = Board::with(RestoredEpoch::awaiting(BootClock { ticks: 0 }));
     if let (Some(clock), Some(reading)) = (board.clock.as_mut(), restored) {
         let Ok(()) = clock.restore(reading) else {
             unreachable!("this board's boot clock always answers")
@@ -349,7 +366,12 @@ fn a_board_whose_battery_died_refuses_rather_than_firing_the_deadline() {
     // other one on the device, at once.
     let mut media = Device::new(geometry());
     let domain = BackupDomain::counting_from(DEADLINE - INTERVAL);
-    assert!(power_up(&mut media, &mut on_rtc(&domain)).is_ok());
+    let armed = power_up(&mut media, &mut on_rtc(&domain));
+    assert!(
+        matches!(armed, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == INTERVAL),
+        "the first boot has to arm the deadline for the second to be about anything: {armed:?}"
+    );
+    assert_eq!(schedules(&mut media), 1);
 
     domain.battery_died();
 
@@ -371,7 +393,11 @@ fn a_counter_that_moved_backwards_across_the_cut_is_refused() {
     // measure, refused rather than credited or discarded.
     let mut media = Device::new(geometry());
     let domain = BackupDomain::counting_from(DEADLINE - INTERVAL);
-    assert!(power_up(&mut media, &mut on_rtc(&domain)).is_ok());
+    let armed = power_up(&mut media, &mut on_rtc(&domain));
+    assert!(
+        matches!(armed, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == INTERVAL),
+        "{armed:?}"
+    );
 
     domain.counter.set(DEADLINE - INTERVAL - 400);
 
@@ -388,26 +414,24 @@ fn a_network_device_waits_until_its_epoch_is_restored() {
     // time it is, and the deadline is neither fired nor discarded. It fires on the boot that
     // has been told the time again.
     let mut media = Device::new(geometry());
-    let uptime = Cell::new(0_u64);
 
-    let armed = power_up_on_network_time(&mut media, &uptime, Some(DEADLINE - INTERVAL));
+    let armed = power_up_on_network_time(&mut media, Some(DEADLINE - INTERVAL));
     assert!(
-        matches!(armed, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == INTERVAL),
-        "the first boot arms the deadline against the epoch it was told: {armed:?}"
+        matches!(armed, Ok(Progress::WaitingUntil { remaining, .. }) if remaining < INTERVAL),
+        "the first boot arms the deadline against the epoch it was told, and the epoch has \
+         moved with the boot clock by the time the intent is committed: {armed:?}"
     );
 
-    // The cut. The epoch was in RAM and is gone; the boot clock is back at zero.
-    uptime.set(0);
-
+    // The cut. The epoch and the boot clock were both in RAM, and both are gone.
     assert_eq!(
-        power_up_on_network_time(&mut media, &uptime, None),
+        power_up_on_network_time(&mut media, None),
         Err(DriveError::ClockUnavailable),
         "a device that has not been told the time does not guess at one"
     );
     assert!(!kinds(&mut media).contains(&RecordKind::TIMER_FIRED));
 
     // The network answers, past the instant the workflow waited for.
-    let replayed = power_up_on_network_time(&mut media, &uptime, Some(DEADLINE + 1));
+    let replayed = power_up_on_network_time(&mut media, Some(DEADLINE + 1));
     assert!(
         matches!(
             replayed,
@@ -422,5 +446,29 @@ fn a_network_device_waits_until_its_epoch_is_restored() {
         schedules(&mut media),
         1,
         "three boots, one committed deadline"
+    );
+}
+
+#[test]
+fn a_restored_epoch_advances_while_the_boot_it_was_restored_in_runs() {
+    // The claim the assertion above rests on, stated where it can fail on its own. The
+    // driver reads the persistent clock to arm the deadline and again once the intent is
+    // committed, and a restored epoch that ignored its boot clock would report the same
+    // number both times — so `remaining` would be the whole interval rather than less.
+    let mut media = Device::new(geometry());
+
+    let armed = power_up_on_network_time(&mut media, Some(DEADLINE - INTERVAL));
+    let Ok(Progress::WaitingUntil { remaining, .. }) = armed else {
+        unreachable!("the deadline is in the future, so this boot suspends: {armed:?}")
+    };
+    assert!(
+        remaining < INTERVAL,
+        "a restored epoch that ignored the boot clock would owe the whole {INTERVAL}, and \
+         this one owes {remaining}"
+    );
+    assert!(
+        remaining >= INTERVAL.saturating_sub(TICKS_PER_READ * 8),
+        "and it would owe far less than {remaining} if it were advancing by something other \
+         than the boot clock"
     );
 }
