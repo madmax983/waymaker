@@ -1217,3 +1217,48 @@ fn a_firing_with_no_timer_open_halts_the_timer_boundary_too() {
         Position::Halted(KernelError::MalformedHistory)
     );
 }
+
+#[test]
+fn the_capability_is_weighed_against_the_recorded_clock_and_not_the_requested_one() {
+    // Every other timer test has the recorded kind equal to the requested one at the point
+    // the capability is consulted, so `admits(recorded)` and `admits(request.spec)` cannot be
+    // told apart — and review of this change swapped them with the gate and the suite green.
+    // The swap is wrong in both directions, so both are pinned here.
+    //
+    // History recorded a persistent deadline and this firmware has no persistent clock. It
+    // cannot honour the record whatever the workflow now asks for, so the answer is about
+    // the *journal* — `IncompatibleWorkflow` — and never `NondeterministicWorkflow`, which
+    // would send an engineer to look for changed workflow code.
+    let mut boot_only = started();
+    assert_eq!(
+        boot_only.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AfterBoot { ticks: 5 },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::Record(armed(0))
+        ),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+
+    // And the reverse: history recorded a boot deadline, which a boot-only firmware can
+    // service perfectly. The workflow asking for a persistent one is a *divergence*, not an
+    // incompatible journal.
+    let mut recorded_boot = started();
+    assert_eq!(
+        recorded_boot.timer_intent(
+            TimerRequest {
+                spec: TimerSpec::AtPersistentTime { instant: INSTANT },
+                capability: ClockCapability::BootOnly,
+            },
+            Next::Record(RecordRef::TimerScheduled {
+                seq: EffectSeq(0),
+                clock_kind: ClockKind::AFTER_BOOT,
+                deadline: 5,
+                armed_at: 1,
+            })
+        ),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(recorded_boot.diverged(), Some(Divergence::Deadline));
+}

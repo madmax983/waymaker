@@ -1289,7 +1289,8 @@ fn check_timer_types(code: &str) -> Vec<Violation> {
             ));
             continue;
         }
-        let declared = declared_function_names(&blocks.join("\n"));
+        let body = blocks.join("\n");
+        let declared = declared_function_names(&body);
         let mut expected: Vec<String> = methods.iter().map(|method| (*method).to_owned()).collect();
         expected.sort();
         if declared != expected {
@@ -1301,6 +1302,26 @@ fn check_timer_types(code: &str) -> Vec<Violation> {
                      visibility, because a surface pin counts `pub ` and not `pub(`, and a \
                      `pub(crate) fn arm_or_downgrade` is reach enough for rung 0.4's `Ctx`, \
                      which lands in this crate"
+                ),
+            ));
+        }
+        // And no associated constant at all, which is the door the pin above cannot see. A
+        // `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 };` adds no function and
+        // changes no member, and `TimerSpec::BEST_EFFORT` behind an "epoch not restored yet"
+        // guard is the downgrade §02 decision 8 forbids. Issue #99 records it against the
+        // façade, where `CLOCK_SPEC_CONSTRUCTION` at least pins the spellings; issue #33 made
+        // `transition.rs` a `TimerSpec`-constructing module with no such pin, so the door is
+        // inside the kernel now. Refused outright rather than listed: these three types have
+        // no honest associated constant, so a whitelist would be a list of one exception
+        // waiting to be added to.
+        for constant in declared_associated_constants(&body) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{name}` declares the associated constant `{constant}`, which the method \
+                     pin cannot see; a constant that names a deadline is a spec any caller \
+                     can reach without changing a surface"
                 ),
             ));
         }
@@ -2789,6 +2810,47 @@ fn declared_function_names(body: &str) -> Vec<String> {
             && let Some(name) = function_declaration_name(trimmed)
         {
             names.push(name);
+        }
+        let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+        let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+        depth = depth.saturating_add(opens).saturating_sub(closes);
+    }
+    names.sort_unstable();
+    names
+}
+
+/// The associated constants an `impl` body declares, at any visibility.
+///
+/// [`declared_function_names`]'s twin, and it exists because that one reads `fn`. A
+/// `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 };` on `impl TimerSpec` adds no
+/// function, changes no member, and is reached as `TimerSpec::BEST_EFFORT` — a downgrade
+/// behind a plausible guard, with the gate green. Review of this change ran exactly that.
+///
+/// Depth-zero lines only, for [`declared_function_names`]'s reason: a `const` inside a
+/// function body is a local, not a door.
+fn declared_associated_constants(body: &str) -> Vec<String> {
+    let mut depth = 0_i32;
+    let mut names = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if depth == 0
+            && let Some(rest) = trimmed
+                .strip_prefix("pub ")
+                .or_else(|| {
+                    trimmed
+                        .split_once(") ")
+                        .filter(|(head, _)| head.starts_with("pub("))
+                        .map(|(_, rest)| rest)
+                })
+                .or(Some(trimmed))
+            && let Some(declaration) = rest.strip_prefix("const ")
+            // `const fn` is a function, and `declared_function_names` owns those.
+            && !declaration.starts_with("fn ")
+            && let Some(name) = declaration.split([':', ' ']).next()
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            names.push(name.to_owned());
         }
         let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
         let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
@@ -4682,6 +4744,23 @@ pub fn check_effect_scheduled_fields(sources: &[crate::size::LayerSource]) -> Ve
     };
 
     let code = code_only(&source.contents);
+    // Read the *only* declaration, or none at all. `braced_body` takes the first
+    // token-boundary match, so a same-named decoy above the real enum — a conforming
+    // `mod compat { pub(crate) enum RecordRef { .. } }` — is what every scan below would
+    // check, and the shipped enum could then gain or lose any field it liked. Review of this
+    // change ran exactly that and watched the gate print `ok`. The same guard
+    // `kernel-boundary`, `timer-capability` and `effect-protocol` already apply, and for the
+    // same reason.
+    let declarations = declaration_count(&code, ENUM);
+    if declarations != 1 {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares `{ENUM}` {declarations} times, not once;                  the scan below reads the first, so a decoy above the real one is what it                  would check"
+            ),
+        )];
+    }
     let Some(body) = braced_body(&code, ENUM) else {
         return vec![Violation::new(
             RULE,
@@ -4775,6 +4854,23 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
     };
 
     let code = code_only(&source.contents);
+    // Read the *only* declaration, or none at all. `braced_body` takes the first
+    // token-boundary match, so a same-named decoy above the real enum — a conforming
+    // `mod compat { pub(crate) enum RecordRef { .. } }` — is what every scan below would
+    // check, and the shipped enum could then gain or lose any field it liked. Review of this
+    // change ran exactly that and watched the gate print `ok`. The same guard
+    // `kernel-boundary`, `timer-capability` and `effect-protocol` already apply, and for the
+    // same reason.
+    let declarations = declaration_count(&code, ENUM);
+    if declarations != 1 {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares `{ENUM}` {declarations} times, not once;                  the scan below reads the first, so a decoy above the real one is what it                  would check"
+            ),
+        )];
+    }
     let Some(body) = braced_body(&code, ENUM) else {
         return vec![Violation::new(
             RULE,

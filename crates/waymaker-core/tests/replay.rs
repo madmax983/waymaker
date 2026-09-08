@@ -959,3 +959,34 @@ fn no_effect_is_minted_while_a_timer_is_unresolved() {
 fn an_armed_timer_is_not_a_terminal_position() {
     assert!(!Position::AwaitingTimer.is_terminal());
 }
+
+#[test]
+fn a_boundary_of_either_kind_refuses_the_other_kind_while_it_is_open() {
+    // "At most one unresolved boundary" has to hold *across* the two kinds, not only within
+    // each. A timer accepted while an effect is unresolved overwrites the schedule the
+    // cursor was holding — the dispatched effect is silently forgotten, `pending()` goes
+    // `None`, and §14's stable-redelivery subject is gone. An effect accepted while a timer
+    // is armed drops the deadline, which is then never re-armed and never fires. Neither is
+    // caught by the same-kind tests above, and review of this change ran both mutants.
+    let mut awaiting_effect = started();
+    assert!(awaiting_effect.advance(schedule(0)).is_ok());
+    assert_eq!(
+        awaiting_effect.advance(arm(1)),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        awaiting_effect.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+
+    let mut awaiting_timer = started();
+    assert!(awaiting_timer.advance(arm(0)).is_ok());
+    assert_eq!(
+        awaiting_timer.advance(schedule(1)),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        awaiting_timer.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
