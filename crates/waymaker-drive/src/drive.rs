@@ -1088,24 +1088,20 @@ where
     // instant, and the ticks that go into it are ticks the run really waited: measuring
     // against the pre-write reading discards every one of them, so a deadline shorter than
     // its own commit latency is reported as owing its whole interval and suspends a run that
-    // has already waited long enough. The recorded reading stays the arming floor — that is
-    // what went to media — and only the measurement moves, which makes this path the same
-    // two values the re-arming path below uses.
+    // has already waited long enough.
     let Some(reading) = clocks.now(spec.clock_kind()) else {
         *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
         return TimerDecision::Stop;
     };
+    // `now` is the floor, not `rearmed_at(now, reading)`. Both readings were taken in this
+    // boot, microseconds apart, so there is no reset here for `rearmed_at` to accommodate —
+    // and on a boot clock it answers the *lower* of the two, which would take a clock that
+    // regressed or wrapped between the two reads and report it as zero elapsed time instead
+    // of `ClockWentBackwards`. Codex found that: the round-1 fix reached for `rearmed_at`
+    // defensively and masked the fault it was meant to leave visible. Re-arming a *recorded*
+    // deadline is the only place a reset can have intervened, and that path still uses it.
     measure(
-        source,
-        storage,
-        machine,
-        page,
-        stop,
-        id,
-        spec,
-        capability,
-        spec.rearmed_at(now, reading),
-        reading,
+        source, storage, machine, page, stop, id, spec, capability, now, reading,
     )
 }
 

@@ -662,3 +662,57 @@ fn a_wait_says_which_clock_its_remaining_ticks_are_counted_in() {
         "a boot deadline counts in the boot clock's unit"
     );
 }
+
+#[test]
+fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
+    // Both of the arming path's readings are taken in one boot, microseconds apart, so a
+    // clock that goes backwards between them is a regressing or wrapped clock and not a
+    // reset. `rearmed_at` exists for the reset case and answers the lower of the two, which
+    // here would report zero elapsed time and hide the fault; the arming floor is the
+    // recorded reading, so the kernel sees the regression and refuses.
+    struct Regressing(u64, ClockCapability);
+
+    impl Clocks for Regressing {
+        fn capability(&self) -> ClockCapability {
+            self.1
+        }
+
+        fn now(&mut self, _kind: ClockKind) -> Option<u64> {
+            let reading = self.0;
+            // The second read is below the first: the clock went backwards.
+            self.0 = self.0.saturating_sub(500);
+            Some(reading)
+        }
+    }
+
+    impl Activities for Regressing {
+        fn perform(
+            &mut self,
+            _intent: DurableIntent,
+            _kind: ActivityKind,
+            _input: &[u8],
+            _out: &mut [u8],
+        ) -> Performed {
+            Performed::Pending
+        }
+    }
+
+    let mut device = Device::new(geometry());
+    let mut world = Regressing(5_000, ClockCapability::BootOnly);
+    let mut workflow = Napping::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    assert_eq!(
+        Driver::new(region(), RUN, reserve()).boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        ),
+        Err(DriveError::Kernel(KernelError::ClockWentBackwards))
+    );
+}
