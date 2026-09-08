@@ -185,6 +185,7 @@ name = "waymaker-drive"
 version = "0.0.0"
 dependencies = [
  "waymaker-core",
+ "waymaker-embassy",
  "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",
@@ -220,6 +221,7 @@ dependencies = [
  "embedded-storage",
  "waymaker-conformance",
  "waymaker-core",
+ "waymaker-embassy",
  "waymaker-fault",
  "waymaker-flash",
 ]

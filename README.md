@@ -83,7 +83,9 @@ Seven workspace members are not layers: `xtask` is the gate itself, `waymaker-si
 firmware linked only so that its section sizes can be measured, `waymaker-fault` is the crash
 harness, `waymaker-spec` is the formal specification of the recovery invariants,
 `waymaker-conformance` is the storage-contract suite and the `embedded-storage` port,
-`waymaker-rig` is the power-cut and watchdog-reset rig, and `waymaker-drive` is the
+`waymaker-rig` is the power-cut and watchdog-reset rig and the two board clocks of design
+document §11 — an RTC in a backed-up domain and an epoch a network restores — and
+`waymaker-drive` is the
 synchronous driver that runs a workflow to completion through the kernel boundary, together
 with design document §07's seven-step effect protocol — which is here rather than in
 `waymaker-flash` because step 4 is an activity, and that layer must not own activities. No layer

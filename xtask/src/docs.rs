@@ -2159,9 +2159,9 @@ impl HardwareTarget {
     }
 }
 
-/// The two boards rung 0.2's exit criterion names.
+/// The board runs two rungs owe: rung 0.2's two, and rung 0.5's power-loss timer.
 ///
-/// Both `NotRun`. Flipping one to [`Attestation::Passed`] without an accepted ADR carrying
+/// All `NotRun`. Flipping one to [`Attestation::Passed`] without an accepted ADR carrying
 /// `Attests hardware target:` and the id fails the build, and so does writing that ADR line
 /// without flipping the row — which is the pair of failures a list like this normally rots
 /// through.
@@ -2180,6 +2180,19 @@ pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
         attestation: Attestation::NotRun,
         evidence: "the same log from a second core, because a rig that only ever ran on one \
                    part has measured that part rather than the protocol",
+    },
+    HardwareTarget {
+        id: "rtc-power-loss",
+        headline: "an AtPersistentTime deadline across a total power cut on a board with a \
+                   backed RTC",
+        attestation: Attestation::NotRun,
+        evidence: "a board with a battery- or supercapacitor-backed RTC, the supply removed \
+                   for longer than the interval, and the first replay after it recognising \
+                   the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are \
+                   written to link on the target and have never been on one. \
+                   `waymaker-drive/tests/power_loss.rs` drives the scenario on a host, but \
+                   against a model: no oscillator to drift, no supply to sag, and a \
+                   continuity flag a test sets rather than a backup domain that failed",
     },
 ];
 

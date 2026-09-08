@@ -197,10 +197,12 @@ growing that dependency fails `kernel-zero-dependencies` and `waymaker-flash` gr
 
 ## What the boards still owe
 
-Design document §16's rung 0.2 exit criterion is issue
-[#27](https://github.com/madmax983/waymaker/issues/27), and one bullet of it is not a thing
-any amount of host-side work discharges: "power-cut loops pass on one Cortex-M0+ board and one
-Cortex-M4 board". Nothing in this repository has ever run on a board.
+Two rungs have an exit criterion no amount of host-side work discharges. Rung 0.2's is issue
+[#27](https://github.com/madmax983/waymaker/issues/27): "power-cut loops pass on one Cortex-M0+
+board and one Cortex-M4 board". Rung 0.5's is issue
+[#34](https://github.com/madmax983/waymaker/issues/34): an `AtPersistentTime` deadline armed,
+the supply removed entirely for longer than the interval, and the deadline recognised as
+elapsed on the first replay after it. Nothing in this repository has ever run on a board.
 
 That is a sentence a green CI would otherwise contradict, so it is a table.
 `xtask::docs::HARDWARE_TARGETS` holds it and the `hardware-attestation` rule compares it
@@ -208,12 +210,13 @@ against this section in both directions — the same move
 [the guarantees table](#the-guarantees-and-what-holds-each-up) makes for what
 `waymaker-spec` still owes.
 
-All 2 hardware targets, with the id to cite when a change touches one:
+All 3 hardware targets, with the id to cite when a change touches one:
 
 | Id | Target | Where it stands | What would discharge it |
 | --- | --- | --- | --- |
 | `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one. The census completes on a host now, but against a model: no weak bits, no reset-cause register, no retained RAM, and a watchdog that lands at a call boundary rather than on a timer. |
 | `cortex-m4` | power-cut and watchdog-reset loops on a Cortex-M4 board | Not run | the same log from a second core, because a rig that only ever ran on one part has measured that part rather than the protocol. |
+| `rtc-power-loss` | an AtPersistentTime deadline across a total power cut on a board with a backed RTC | Not run | a board with a battery- or supercapacitor-backed RTC, the supply removed for longer than the interval, and the first replay after it recognising the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are written to link on the target and have never been on one. `waymaker-drive/tests/power_loss.rs` drives the scenario on a host, but against a model: no oscillator to drift, no supply to sag, and a continuity flag a test sets rather than a backup domain that failed. |
 
 Moving a row to `Passed` needs an accepted ADR carrying the attestation marker and the id, in
 the same change; writing that line without moving the row fails the build too. Those are the
@@ -1110,6 +1113,27 @@ Stated so that nobody mistakes silence for coverage:
   PersistentClock`, and nothing obliges a caller to take that path. Joining the two by
   construction is rung 0.4's dispatcher — the same standing as "nothing obliges a future
   dispatcher to use the gated writer".
+- **That a board's continuity register tells the truth.** `waymaker_rig::rtc::BackedRtc`
+  asks a board two things: the counter, and whether the backup domain held. The driver
+  believes the second, exactly as `Timer::arm` believes a declared `ClockCapability`. A board
+  whose implementation returned `Continuity::Held` unconditionally would fire every
+  persistent deadline on the device on the boot after its battery died, and nothing below the
+  board can see it. That is what the `rtc-power-loss` row in
+  [what the boards still owe](#what-the-boards-still-owe) is for.
+- **That an RTC counter is wide enough for the deadline it is asked to measure.** The driver
+  reports the register and never widens it: RAM did not survive the cut, so there is no epoch
+  to widen it with, and inventing one is the substitution §02 decision 8 forbids. A counter
+  that wrapped therefore reads below the arming reading the record carries, and the kernel
+  refuses the interval rather than crediting a wrong one —
+  `a_counter_that_rolled_over_is_refused_rather_than_credited` measures that. Whether a given
+  part's counter can wrap inside a given deadline is arithmetic about a board, and the board
+  is what has to do it.
+- **That a device on the externally-restored-epoch path can reach its network.**
+  `waymaker_rig::epoch::RestoredEpoch` answers `NotRestored` until the firmware has told it
+  the time, and a driver reports that as a clock it cannot read — so the run suspends and the
+  deadline is neither fired nor discarded. A device that never reaches the network never
+  fires an `AtPersistentTime` deadline at all. That is the honest outcome for a device with
+  no clock and no time, and it is not a thing this engine can improve on.
 - **When a timer fired.** `TimerFired` carries a sequence and no body, so a journal says that
   a deadline passed and never when. Replay hands the workflow back the fact and nothing else,
   which is all `Boundary::wait` returns; a firing reading would be a second `u64` on media
@@ -1713,9 +1737,41 @@ this driver polls rather than sleeps — §11's in-boot sleep and a dispatcher t
 hardware alarm are rung 0.4's. See
 [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md).
 
+Issue #34 is rung 0.5's exit criterion, and it closes §11 with the two clocks a board really
+brings. `waymaker_rig::rtc` is the first: `BackedRtc` is two register reads — the counter, and
+whether the backup domain held — and `Rtc` is the driver over them. The continuity bit is the
+one every part has and every abstraction drops, and it is the whole point. A backup domain
+that lost power leaves the counter at its reset value, which is zero on most parts and below
+every instant a workflow ever waits for, so a driver that reported the number would fire every
+persistent deadline on the device at once with no checksum failing and no record malformed.
+`Rtc::now` answers `RtcFault::ContinuityLost` instead, the counter is read *before* the
+continuity bit so that a supply which sagged during the read is still caught, and
+`timer-capability` now pins that module's surface as well — an `Rtc::assume_held` or an
+`Rtc::counter_unchecked` breaks no layering rule, needs no dependency and passes every other
+gate.
+`waymaker_rig::epoch` is the second, and it is what §11's "an epoch a network restores" means
+as code rather than as a phrase. A restored epoch is anchored in RAM, a cut takes RAM, and so
+`RestoredEpoch::now` answers `NotRestored` until the network has answered again. A device on
+that path never fires a durable deadline early on the strength of a zero, and one that never
+reaches the network never fires it at all.
+Both drivers live in `waymaker-rig` rather than in the façade, for two reasons and the second
+decided it: they are board support for hardware Waymaker does not ship, and a layer pays for
+every public function it declares against §04's budget, which ADR 0030 left 66 B of.
+Both "done when"s are driven.
+`a_persistent_deadline_survives_a_total_power_cut_and_is_elapsed_on_the_first_replay` arms the
+deadline, takes the supply away for longer than the interval and requires the first replay
+after it to finish the run — and the cut is a *function boundary*, because
+`power_loss.rs`'s `power_up` takes the media and the backup domain and builds the board, the
+driver, the workflow and both buffers itself, so nothing else can cross it.
+`a_board_with_no_persistent_clock_refuses_the_same_workflow` is the complementary image:
+`NoPersistentClock`, whose message is "this firmware has no persistent clock", and a journal
+holding the run's own record and nothing else.
+What is *not* discharged is the thing the issue asks for first, and it is a row rather than a
+claim: `rtc-power-loss` joins the two boards rung 0.2 owes, `Not run`. See
+[ADR 0031](docs/adr/0031-a-persistent-clock-is-two-registers-and-the-board-run-is-a-checked-absence.md).
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
-RTC driver and the board test are issue #34's, and the async `Ctx`, the dispatcher and
-in-boot sleep arrive with 0.4. The
+async `Ctx`, the dispatcher and in-boot sleep arrive with 0.4. The
 gates went in before the code they govern, which is the point: a gate retrofitted after
 coverage has slipped is a gate that ratifies the slip.

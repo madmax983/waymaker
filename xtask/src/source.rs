@@ -1076,15 +1076,83 @@ pub const TIMER_BRACED_STRUCTS: &[&str] = &["Timer"];
 /// nobody has thought of, where a blacklist closes the two that were.
 pub const CLOCK_SPEC_CONSTRUCTION: &str = "TimerSpec::AtPersistentTime";
 
+/// The file whose board RTC `timer-capability` pins.
+pub const RIG_RTC_PATH: &str = "waymaker-rig/src/rtc.rs";
+
+/// The file whose externally-restored epoch `timer-capability` pins.
+pub const RIG_EPOCH_PATH: &str = "waymaker-rig/src/epoch.rs";
+
+/// Every public function the board RTC is allowed to have.
+///
+/// `counter` and `continuity` are the board's two register reads, and `now` is the reading
+/// they produce. `over` is the one constructor.
+///
+/// What the list refuses is an accessor. An `Rtc::counter_unchecked`, an `Rtc::assume_held`
+/// or an `Rtc::set` would each hand out a number the continuity register never vouched for,
+/// break no layering rule, need no dependency, and pass every other gate. A backup domain
+/// that lost power reads zero on most parts, and zero is below every instant a workflow
+/// waits for, so such a reading fires every persistent deadline on the device at once.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const RIG_RTC_SURFACE: &[&str] = &["continuity", "counter", "now", "over"];
+
+/// Every public function the externally-restored epoch is allowed to have.
+///
+/// `ticks` is the board's boot clock, `awaiting` the one constructor, `restore` what the
+/// firmware calls with the network's answer, and `now` the reading.
+///
+/// The absence is the same one. A `RestoredEpoch::assume`, a `now_or_zero`, or a second
+/// constructor carrying an epoch nobody restored would each turn "this device does not know
+/// the time" into a number — and that number is the boot clock's, which is design document
+/// §11's downgrade arriving through a driver instead of through a spec.
+///
+/// Sorted, for [`RIG_RTC_SURFACE`]'s reason.
+pub const RIG_EPOCH_SURFACE: &[&str] = &["awaiting", "now", "restore", "ticks"];
+
+/// The board clock modules `timer-capability` pins, and the surface each may declare.
+///
+/// Two files rather than one, because a pinned surface is a list of *names* and both
+/// modules implement `PersistentClock`. One file holding both would declare `now` twice, and
+/// a pin cannot speak about a name used twice.
+pub const BOARD_CLOCK_MODULES: &[(&str, &[&str])] = &[
+    (RIG_RTC_PATH, RIG_RTC_SURFACE),
+    (RIG_EPOCH_PATH, RIG_EPOCH_SURFACE),
+];
+
+/// What a board clock module may not name, beyond [`CLOCK_FORBIDDEN_VOCABULARY`].
+///
+/// Matched as identifiers over code with comments and string literals stripped, for
+/// [`CLOCK_FORBIDDEN_VOCABULARY`]'s reason.
+///
+/// A driver reports a reading. It decides no policy and it answers for no image. Both names
+/// below are policy, and a driver that reached for either would be deciding §02 decision 8
+/// in the one place the kernel cannot see.
+pub const BOARD_CLOCK_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
+    (
+        "TimerSpec",
+        "is a deadline policy; a clock driver reports a reading, and which deadline that \
+         reading meets is decided in `waymaker-core` and nowhere a board can reach",
+    ),
+    (
+        "ClockCapability",
+        "is a firmware's declaration of which clocks it can service; a driver that names it \
+         is answering for the image it happens to be linked into",
+    ),
+];
+
 /// Rule: design document §11's timer semantics are the ones that were reviewed, and a
 /// persistent deadline still needs a persistent clock.
 ///
-/// Two halves, one id, because it is one decision. The kernel half pins the semantics
+/// Three halves, one id, because it is one decision. The kernel half pins the semantics
 /// module's surface and the three vocabularies §11 and issue #33 rest on. The façade half
 /// pins the capability's surface and refuses the boot clock's vocabulary in the one module
-/// that exists because a boot clock is not good enough.
+/// that exists because a boot clock is not good enough. The board half is issue
+/// [#34](https://github.com/madmax983/waymaker/issues/34)'s two drivers: it pins what each
+/// may declare and refuses both the boot vocabulary and any deadline policy, because a
+/// reading enters the workspace there and a driver that could hand out one the hardware
+/// never vouched for gives §02 decision 8 back from below the two pins above.
 ///
-/// Both halves fail closed: a module the pin cannot find is a pin that has stopped checking,
+/// All three fail closed: a module the pin cannot find is a pin that has stopped checking,
 /// which is the failure mode every rule here is written to avoid. Both read the file with
 /// its `#[cfg(test)]` modules removed, for `integrity-check`'s reason — a downgrade written
 /// under `cfg(test)` discharges nothing about the code that ships.
@@ -1098,7 +1166,10 @@ pub const CLOCK_SPEC_CONSTRUCTION: &str = "TimerSpec::AtPersistentTime";
 /// `trait PersistentTimerExt` with a blanket impl beside the façade, adds the door with the
 /// rule silent.
 #[must_use]
-pub fn check_timer_capability(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+pub fn check_timer_capability(
+    sources: &[crate::size::LayerSource],
+    rig_sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
     const RULE: &str = "timer-capability";
     const KERNEL: &str = "waymaker-core";
     const FACADE: &str = "waymaker-embassy";
@@ -1155,6 +1226,54 @@ pub fn check_timer_capability(sources: &[crate::size::LayerSource]) -> Vec<Viola
         violations.extend(check_clock_spec_construction(&code));
     }
 
+    violations.extend(check_board_clocks(rig_sources));
+
+    violations
+}
+
+/// The board's half: the two drivers issue #34 brings, and the vocabulary neither may name.
+///
+/// A third half of one decision. The kernel decides what a deadline means, the façade holds
+/// the capability, and a driver reports a reading. This is the pin on the third: a clock
+/// driver that could hand out a number no register vouched for, or that reached for a
+/// deadline policy of its own, would give back §02 decision 8 from the one place the two
+/// pins above cannot see.
+///
+/// It fails closed for [`check_timer_capability`]'s reason: a module the pin cannot find is
+/// a pin that has stopped checking.
+fn check_board_clocks(rig_sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const BOARD: &str = "waymaker-rig";
+
+    let mut violations = Vec::new();
+    for (path, surface) in BOARD_CLOCK_MODULES {
+        violations.extend(check_pinned_surface(
+            RULE,
+            BOARD,
+            path,
+            surface,
+            rig_sources,
+            "a board clock is where a reading enters the workspace, so a way to hand out one \
+             the hardware never vouched for cannot be added without a reviewer writing it \
+             down",
+        ));
+        let Some(source) = find_source(rig_sources, path) else {
+            continue;
+        };
+        let code = without_test_modules(&code_only(&source.contents));
+        for (forbidden, why) in CLOCK_FORBIDDEN_VOCABULARY
+            .iter()
+            .chain(BOARD_CLOCK_FORBIDDEN_VOCABULARY)
+        {
+            if names_identifier(&code, forbidden) {
+                violations.push(Violation::new(
+                    RULE,
+                    BOARD,
+                    format!("{path} names `{forbidden}`, which {why}"),
+                ));
+            }
+        }
+    }
     violations
 }
 
@@ -7453,7 +7572,7 @@ mod deferred_answer_pins {
         vec![layer(EFFECT_PROTOCOL_PATH, contents)]
     }
 
-    /// The three files `timer-capability` reads, with one of them replaced.
+    /// The three layer files `timer-capability` reads, with one of them replaced.
     fn timer_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
         let clean: [(&str, String); 3] = [
             (TIMER_SEMANTICS_PATH, tests_support::clean_timer_module()),
@@ -7469,9 +7588,29 @@ mod deferred_answer_pins {
             .collect()
     }
 
-    /// Every violation the rule emits when `path` holds `contents`.
+    /// The two board clock files the same rule reads, with one of them replaced.
+    fn board_clock_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
+        let clean: [(&str, String); 2] = [
+            (RIG_RTC_PATH, tests_support::clean_board_rtc()),
+            (RIG_EPOCH_PATH, tests_support::clean_board_epoch()),
+        ];
+        clean
+            .into_iter()
+            .map(|(at, body)| layer(at, if at == path { contents } else { body.as_str() }))
+            .collect()
+    }
+
+    /// Every violation the rule emits when the layer file `path` holds `contents`.
     fn timer_details(path: &str, contents: &str) -> Vec<String> {
-        check_timer_capability(&timer_sources(path, contents))
+        check_timer_capability(&timer_sources(path, contents), &board_clock_sources("", ""))
+            .into_iter()
+            .map(|violation| violation.detail)
+            .collect()
+    }
+
+    /// Every violation the rule emits when the board file `path` holds `contents`.
+    fn board_clock_details(path: &str, contents: &str) -> Vec<String> {
+        check_timer_capability(&timer_sources("", ""), &board_clock_sources(path, contents))
             .into_iter()
             .map(|violation| violation.detail)
             .collect()
@@ -7584,7 +7723,7 @@ mod deferred_answer_pins {
 
     #[test]
     fn a_missing_timer_module_fails_closed() {
-        let details: Vec<String> = check_timer_capability(&[])
+        let details: Vec<String> = check_timer_capability(&[], &[])
             .into_iter()
             .map(|violation| violation.detail)
             .collect();
@@ -7600,6 +7739,78 @@ mod deferred_answer_pins {
             details.iter().any(|detail| detail.contains("lib.rs")),
             "{details:?}"
         );
+        for (path, _) in BOARD_CLOCK_MODULES {
+            assert!(
+                details.iter().any(|detail| detail.contains(path)),
+                "{path} is not reported: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clean_board_clocks_pass() {
+        assert!(board_clock_details(RIG_RTC_PATH, &tests_support::clean_board_rtc()).is_empty());
+    }
+
+    #[test]
+    fn a_board_clock_that_hands_out_an_unvouched_reading_is_reported() {
+        // The mutation this pin exists for: an accessor beside `now` that returns the raw
+        // counter. It breaks no layering rule and needs no dependency, and a backup domain
+        // that lost power reads zero — which fires every persistent deadline at once.
+        let module = format!(
+            "{}pub fn counter_unchecked() {{}}\n",
+            tests_support::clean_board_rtc()
+        );
+        let details = board_clock_details(RIG_RTC_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("counter_unchecked")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_clock_that_could_not_be_found_is_reported() {
+        // Fails closed, for the two halves above's reason: a module the pin cannot find is
+        // a pin that has stopped checking.
+        let details = board_clock_details(RIG_EPOCH_PATH, "//! A module with no surface.\n");
+        assert!(
+            details.iter().any(|detail| detail.contains("awaiting")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_clock_naming_the_boot_vocabulary_is_reported() {
+        for (forbidden, _) in CLOCK_FORBIDDEN_VOCABULARY {
+            let module = format!(
+                "{}pub fn extra() {{ let _ = {forbidden}; }}\n",
+                tests_support::clean_board_rtc()
+            );
+            let details = board_clock_details(RIG_RTC_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains(forbidden)),
+                "{forbidden} is not refused: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_board_clock_naming_a_deadline_policy_is_reported() {
+        // A driver reports a reading. A driver that named a `TimerSpec` or a
+        // `ClockCapability` would be deciding §02 decision 8 where neither pin above looks.
+        for (forbidden, _) in BOARD_CLOCK_FORBIDDEN_VOCABULARY {
+            let module = format!(
+                "{}pub fn extra() {{ let _ = {forbidden}; }}\n",
+                tests_support::clean_board_epoch()
+            );
+            let details = board_clock_details(RIG_EPOCH_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains(forbidden)),
+                "{forbidden} is not refused: {details:?}"
+            );
+        }
     }
 
     /// Every violation the rule emits for `source`, so a test cannot pass on another half's
@@ -10508,6 +10719,18 @@ mod tests {
     #[must_use]
     pub fn clean_rig_matrix() -> String {
         surface("A failure matrix.", super::RIG_MATRIX_SURFACE)
+    }
+
+    /// A board RTC whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_board_rtc() -> String {
+        surface("A board RTC.", super::RIG_RTC_SURFACE)
+    }
+
+    /// An externally-restored epoch whose public surface is exactly the pin.
+    #[must_use]
+    pub fn clean_board_epoch() -> String {
+        surface("A restored epoch.", super::RIG_EPOCH_SURFACE)
     }
 
     /// A capacity module the `capacity-reserve` rule accepts whole.
