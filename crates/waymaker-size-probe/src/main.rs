@@ -271,6 +271,18 @@ fn timers() -> usize {
         TimerSpec::recorded(ClockKind(core::hint::black_box(0)), 1)
             .map_or(1, |round| usize::from(round.clock_kind().0)),
     );
+    // What a recorded arming reading means after a reset. Both arms are reached: the spec
+    // above is the persistent one, and the boot one is drawn beside it, so the row charges
+    // for the branch that stops a reset stranding a run.
+    kept = kept.wrapping_add(
+        usize::try_from(spec.rearmed_at(core::hint::black_box(5_000), 200)).unwrap_or(0),
+    );
+    kept = kept.wrapping_add(
+        usize::try_from(
+            core::hint::black_box(TimerSpec::AfterBoot { ticks: 50 }).rearmed_at(5_000, 200),
+        )
+        .unwrap_or(0),
+    );
 
     core::hint::black_box(kept)
 }

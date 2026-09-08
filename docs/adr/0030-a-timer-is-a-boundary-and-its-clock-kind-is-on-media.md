@@ -97,8 +97,8 @@ that does not refuses it as an incompatible workflow.
 
 **The code-flash gate is nearly spent, and the number is the point.** ADR 0029 cut the budget
 to 12 KiB against a measured 10852 B and said in as many words that this left "1436 B of room
-for issue #33's record bodies". They cost **1346 B**: the layers measure **12198 B** of
-12288, with 90 B left. That is the budget doing the job it was set for, and it is also a
+for issue #33's record bodies". They cost **1370 B**: the layers measure **12222 B** of
+12288, with 66 B left. That is the budget doing the job it was set for, and it is also a
 warning — rung 0.4's `Ctx`, dispatcher and wakeups do not fit under it. What that rung needs
 is the accounting issue [#72](https://github.com/madmax983/waymaker/issues/72) did for the
 probe, not a raise argued from a figure nobody has taken apart. No raise is asked for here.
@@ -114,7 +114,7 @@ prices a `TimerScheduled` at the same figure as an `EffectScheduled` — the out
 run's bounds declare, plus a terminal record. A `TimerFired` has no payload, so it is never
 wider than that: the reserve holds back a few bytes more than a timer needs and never fewer,
 which refuses slightly early in the last moments of a bank's life. Pricing it exactly would
-be a third term in a sum on a firmware with 90 B of budget left, and the direction the
+be a third term in a sum on a firmware with 66 B of budget left, and the direction the
 approximation errs in is the safe one. It is written down rather than left to be discovered.
 
 **A `TimerFired` records no firing time.** A second `u64` on media would answer "when did it
@@ -123,11 +123,24 @@ deadline passed and nothing else. It is bytes on the record kind §04's journal 
 afford, and it can be added later behind the same record number, which is what §09's
 forward-compatibility rule is for.
 
-**An `AfterBoot` timer's recorded `armed_at` is not meaningful after a reset.** The boot clock
-restarts, so the recorded reading belongs to a boot that is gone. The record carries it anyway
-— one body for both policies is what keeps the codec one path — and the driver re-arms an
-`AfterBoot` deadline at the current reading. ADR 0028 already says a boot deadline restarts
-its whole interval after a reset; this is that statement on media.
+**An `AfterBoot` deadline's recorded arming reading is a high-water mark, not a floor, and
+what it costs is measured.** `TimerSpec::rearmed_at` is where the difference lives:
+`AtPersistentTime` measures from the recorded reading, because the clock that set it survived
+the power cut; `AfterBoot` measures from the lower of the recorded reading and the clock now,
+because a boot clock reads below its own arming reading only after a reset. Review of this
+change found the version without that rule, and it was not a corner: a boot deadline armed at
+5000 ticks and met by a reset answered `ClockWentBackwards` on **every** boot afterwards, and
+§08 gives a run with an open boundary no way to end. A stranded device on the ordinary path.
+
+What the rule buys is that the interval accrues within a power cycle and restarts across one.
+What it does not buy is precision. A boot clock offers no evidence that a reset happened, so
+once the new cycle climbs back past the old mark the interval accrues from it: a 1000-tick
+deadline armed at 5000 is reached at 6000 ticks of the new cycle rather than at 1000.
+`a_boot_deadline_carried_across_a_reset_waits_longer_than_it_asked_for` measures exactly that
+rather than leaving it in prose. §11 calls this deadline not power-loss durable and this is the
+shape that takes; a reset-cause register or retained RAM would close it, and both are a
+board's — issue [#34](https://github.com/madmax983/waymaker/issues/34) is where a real one is
+met.
 
 **The synchronous driver polls; it does not sleep.** `Progress::WaitingUntil` carries the
 ticks still owed so a caller with a sleep can use them, and this driver has none. §11's
@@ -168,4 +181,4 @@ Issue #33 rules it out in as many words.
 
 **Pricing a timer's tail exactly in the capacity reserve.** A third stored figure and a third
 term in `exit_bytes_after`, for a few bytes of journal in the last moments of a bank's life,
-on a firmware with 90 B of code budget left. Not taken; see Consequences.
+on a firmware with 66 B of code budget left. Not taken; see Consequences.

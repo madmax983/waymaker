@@ -941,7 +941,8 @@ pub const CLOCK_CAPABILITY_PATH: &str = "waymaker-embassy/src/clock.rs";
 /// §11 into a preference. A test cannot call a function that is not there, so the surface is
 /// pinned and a way to pretend is a line a reviewer writes on purpose.
 ///
-/// `deadline` and `recorded` are issue #33's, and they are the two halves of one round trip:
+/// `deadline`, `recorded` and `rearmed_at` are issue #33's. The first two are the halves of
+/// one round trip:
 /// a spec becomes a clock kind and a number on media, and comes back. `recorded` is the one
 /// that has to be weighed, because it *builds* a spec from a byte — and it is admissible for
 /// exactly one reason, which is that it is total with no wildcard arm. A kind number this
@@ -950,6 +951,13 @@ pub const CLOCK_CAPABILITY_PATH: &str = "waymaker-embassy/src/clock.rs";
 /// arrive. The caller supplies the kind, so it is not a downgrade route either: the one
 /// module that must never choose a kind is `waymaker-embassy`'s, where
 /// [`CLOCK_SPEC_CONSTRUCTION`] already refuses every `TimerSpec` name but the persistent one.
+///
+/// `rearmed_at` is the third, and it is the one that decides what a recorded arming reading
+/// means on the far side of a reset. It is admissible because it pretends nothing: it returns
+/// one of the two readings it was handed and never a third, so it cannot credit an interval
+/// that did not pass. What it must not become is a `TimerSpec::assume_elapsed` or a
+/// `rearmed_at` that answers `now.saturating_sub(ticks)` — either would make a deadline
+/// arrive because a firmware wanted it to, which is §02 decision 8's whole subject.
 ///
 /// The pin fails in the other direction too: a name this file no longer declares means the
 /// module was renamed or deleted and the pin has stopped checking anything.
@@ -962,6 +970,7 @@ pub const TIMER_SURFACE: &[&str] = &[
     "clock_kind",
     "deadline",
     "evaluate",
+    "rearmed_at",
     "recorded",
     "spec",
 ];
@@ -1037,7 +1046,10 @@ pub const CLOCK_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 /// visibility; this is that guard, for the module where the policy lives.
 pub const TIMER_TYPE_METHODS: &[(&str, &[&str])] = &[
     ("Timer", &["arm", "armed_at", "evaluate", "spec"]),
-    ("TimerSpec", &["clock_kind", "deadline", "recorded"]),
+    (
+        "TimerSpec",
+        &["clock_kind", "deadline", "rearmed_at", "recorded"],
+    ),
     ("ClockCapability", &["admits"]),
 ];
 

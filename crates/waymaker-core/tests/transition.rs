@@ -1176,3 +1176,44 @@ fn every_divergence_has_a_message_of_its_own() {
         }
     }
 }
+
+#[test]
+fn a_firing_with_no_timer_open_is_malformed_history_rather_than_a_divergence() {
+    // §08's divergence and §09's recovery stop are two different faults. History holding a
+    // firing with no schedule before it is a damaged or forged journal, not a workflow that
+    // changed, and a log line that could not tell them apart would send an engineer to the
+    // wrong place. The cursor halts on it; the machine must report what the cursor said.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.intent(
+            REQUEST,
+            Next::Record(RecordRef::TimerFired { seq: EffectSeq(0) })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_firing_with_no_timer_open_halts_the_timer_boundary_too() {
+    // The mirror, so the two boundaries cannot drift into two answers for one journal.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.timer_intent(
+            TIMER_REQUEST,
+            Next::Record(RecordRef::TimerFired { seq: EffectSeq(0) })
+        ),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(machine.diverged(), None);
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}

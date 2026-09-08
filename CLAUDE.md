@@ -469,8 +469,8 @@ layers instead —
 [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
 Of rung 0.5's 18386 B, **7534 B is the probe's own arithmetic and 10852 B is the layers'**,
 so the gate comes down from 18 KiB to **12 KiB** — a cut of 6 KiB, not a raise, and 1436 B
-of room for issue #33's record bodies. They cost **1346 B** of it, so the layers now measure
-**12198 B** of 12288 with 90 B left and no raise asked for —
+of room for issue #33's record bodies. They cost **1370 B** of it, so the layers now measure
+**12222 B** of 12288 with 66 B left and no raise asked for —
 [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md), which also
 says plainly that rung 0.4 does not fit under it and needs issue #72's kind of accounting
 rather than a third raise. Every byte no symbol attributes to the probe stays
@@ -1084,21 +1084,25 @@ Stated so that nobody mistakes silence for coverage:
   ran at the wrong rate produces deadlines this code cannot fault, because it has no second
   source to disagree with. That is design document §11's own division of labour — the clock
   is the driver's — and issue #34's board test is where a real one is measured.
-- **That a timer's recorded arming reading means anything to the clock now running.**
-  `timer-record-fields` pins the field and `crates/waymaker-flash/tests/frame.rs` pins its
-  bytes. Neither can say the reading belongs to *this* boot's clock, and for
-  `TimerSpec::AfterBoot` it does not: the boot clock restarts, so the recorded number belongs
-  to a boot that is gone and the driver re-arms at the current reading instead. One body for
-  both policies is what keeps the codec one path, and the cost is a field that is load-bearing
-  for one of the two kinds and diagnostic for the other. ADR 0028 already says a boot deadline
-  restarts its whole interval after a reset; ADR 0030 says this is that statement on media.
+- **How long a boot deadline really waits once a reset has happened.**
+  `TimerSpec::rearmed_at` measures an `AfterBoot` interval from the lower of the recorded
+  arming reading and the clock now, so the interval accrues within a power cycle and restarts
+  across one — which is what stops a reset stranding the run for ever with
+  `ClockWentBackwards` on a boundary §08 gives no way to close. What it cannot do is tell a
+  reset from an in-boot re-drive once the new cycle's clock has climbed back past the old
+  mark: there the interval accrues from that mark, and a 1000-tick deadline armed at 5000 is
+  reached at 6000 ticks of the new cycle.
+  `a_boot_deadline_carried_across_a_reset_waits_longer_than_it_asked_for` measures it rather
+  than describing it. A boot clock offers no reset evidence at all, which is §11's own reason
+  for calling this deadline not power-loss durable; a reset-cause register and retained RAM
+  are a board's, and issue #34 is where a real one is met.
 - **That a timer's capacity reserve is exact.** `Reserve::exit_bytes_after` prices a
   `TimerScheduled` at an `EffectScheduled`'s figure — the outcome record the run's bounds
   declare, plus a terminal record. A `TimerFired` has no payload, so it is never wider than
   that: the reserve holds back a few bytes more than a timer needs and never fewer, which
   refuses slightly early in the last moments of a bank's life. The approximation errs in the
   safe direction and is stated rather than discovered; pricing it exactly is a third term in a
-  sum on a firmware with 90 B of code budget left.
+  sum on a firmware with 66 B of code budget left.
 - **That a firmware's declared clock capability is the hardware it has.**
   `Clocks::capability` and `ClockCapability` are the firmware's word, and `timer_intent`
   believes it exactly as `Swap::beginning` believes the two arguments it is handed. The
@@ -1698,8 +1702,8 @@ call, and `replaying_a_fired_timer_reads_no_clock_at_all` requires zero. The sec
 kind byte *on media* and re-seals the frame with the real codec, so what recovery meets is a
 frame a writer could have written: the firmware with the clock refuses it as a divergence and
 the firmware without one refuses it as an incompatible workflow.
-Two numbers are worth recording. The record bodies cost **1346 B** of the 1436 B ADR 0029
-left for them, so the layers measure 12198 B of a 12288 B gate with 90 B to spare and no
+Two numbers are worth recording. The record bodies cost **1370 B** of the 1436 B ADR 0029
+left for them, so the layers measure 12222 B of a 12288 B gate with 66 B to spare and no
 raise asked for; and kernel state goes from 88 B to 104 B of 128, because a timer's recorded
 state is 24 bytes where an effect's digest is 12. Both say the same thing about rung 0.4.
 What is owed is written down: a `TimerFired` records no firing time, the capacity reserve

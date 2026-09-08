@@ -1031,7 +1031,7 @@ fn every_decodable_record_kind_decodes_to_a_record() {
     // wrong for one it forgot: a decode arm left out when a variant is added produces a
     // green build with a record type that can be written and never read. Coverage cannot
     // see it — the wildcard is exercised either way — so the completeness is asserted here.
-    let cases: [(RecordKind, RecordRef<'_>); 6] = [
+    let cases: [(RecordKind, RecordRef<'_>); 8] = [
         (
             RecordKind::RUN_STARTED,
             RecordRef::RunStarted {
@@ -1062,6 +1062,19 @@ fn every_decodable_record_kind_decodes_to_a_record() {
                 seq: EffectSeq(1),
                 error: b"no",
             },
+        ),
+        (
+            RecordKind::TIMER_SCHEDULED,
+            RecordRef::TimerScheduled {
+                seq: EffectSeq(1),
+                clock_kind: ClockKind::AFTER_BOOT,
+                deadline: 7,
+                armed_at: 3,
+            },
+        ),
+        (
+            RecordKind::TIMER_FIRED,
+            RecordRef::TimerFired { seq: EffectSeq(1) },
         ),
         (
             RecordKind::RUN_COMPLETED,
@@ -2264,4 +2277,51 @@ fn reframed(kind: RecordKind, seq: u32, payload: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&frame::commit_seal(frame_crc));
     bytes.truncate(HEADER_BYTES + payload.len() + 4 + 1);
     bytes
+}
+
+#[test]
+fn a_clock_kind_the_decoder_refuses_is_a_clock_kind_the_encoder_refuses() {
+    // The encoder must not be able to write a record this firmware cannot read back.
+    // `ClockKind` is a public newtype over a `u8`, so a caller can build one the format does
+    // not spend; without this the codec would program a checksum-sound, correctly sealed
+    // frame, and the next boot's scan would stop at it — which under ADR 0018 leaves the
+    // bank no append point at all. A bad record is a refusal, never a bricked bank.
+    let mut page = [0_u8; SCRATCH];
+    for number in [0_u8, 3, 0x7F, ERASED_BYTE] {
+        let record = RecordRef::TimerScheduled {
+            seq: EffectSeq(1),
+            clock_kind: ClockKind(number),
+            deadline: 3,
+            armed_at: 2,
+        };
+        assert_eq!(
+            frame::encode(&record, ProgramAlign::BYTE, &mut page),
+            Err(DecodeError::MalformedRecord),
+            "clock kind {number} is not a policy, so it is not a record either"
+        );
+        // And the price is refused too, so a caller is told at the step that asks rather
+        // than at the step that writes.
+        assert_eq!(
+            frame::encoded_len(&record, ProgramAlign::BYTE),
+            Err(DecodeError::MalformedRecord)
+        );
+    }
+
+    // The two the format does spend still encode.
+    for kind in [ClockKind::AFTER_BOOT, ClockKind::AT_PERSISTENT_TIME] {
+        assert!(
+            frame::encode(
+                &RecordRef::TimerScheduled {
+                    seq: EffectSeq(1),
+                    clock_kind: kind,
+                    deadline: 3,
+                    armed_at: 2,
+                },
+                ProgramAlign::BYTE,
+                &mut page,
+            )
+            .is_ok(),
+            "{kind:?}"
+        );
+    }
 }

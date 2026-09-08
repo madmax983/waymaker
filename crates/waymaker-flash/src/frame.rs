@@ -1101,7 +1101,26 @@ fn decode_body(
 /// describe. `RunStarted` spends four of those bytes on the workflow identity, so its
 /// input ceiling is four lower — a distinction a check written against the input rather
 /// than against the payload would get wrong.
+///
+/// [`DecodeError::MalformedRecord`] for a `TimerScheduled` whose clock kind names no
+/// policy. [`ClockKind`] is a public newtype over a `u8`, exactly as [`RecordKind`] is, so
+/// a caller can build one the format does not spend — and [`decode`] refuses such a body.
+/// An encoder that wrote it anyway would put a checksum-sound, correctly sealed record on
+/// media that this firmware cannot read back, and under
+/// [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
+/// a scan that stops at a damaged frame leaves the bank no append point. Refused here
+/// rather than in [`encode`] alone, so that [`encoded_len`] refuses it too: a caller that
+/// priced the record and then could not write it would be told at the wrong step.
 fn payload_len(record: &RecordRef<'_>) -> Result<usize, DecodeError> {
+    if let RecordRef::TimerScheduled {
+        clock_kind,
+        deadline,
+        ..
+    } = *record
+        && TimerSpec::recorded(clock_kind, deadline).is_none()
+    {
+        return Err(DecodeError::MalformedRecord);
+    }
     let body = body(record);
     let len = body.prefix_len.saturating_add(body.tail.len());
     if len > MAX_PAYLOAD_BYTES {

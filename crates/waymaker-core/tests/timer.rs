@@ -342,3 +342,43 @@ fn a_clock_kind_number_no_firmware_wrote_is_no_spec_at_all() {
         assert_eq!(TimerSpec::recorded(ClockKind(number), 10), None, "{number}");
     }
 }
+
+#[test]
+fn a_persistent_floor_crosses_a_reset_and_a_boot_floor_does_not() {
+    // Issue #33 puts the arming reading on media, and what it means on the other side of a
+    // reset depends on the clock. The persistent one survives, so the floor does. The boot
+    // one restarts, so a reading below the recorded value is a reset rather than a clock
+    // that went backwards — and taking the recorded value there refuses a healthy clock.
+    let persistent = TimerSpec::AtPersistentTime { instant: 2_000 };
+    assert_eq!(persistent.rearmed_at(1_500, 1_400), 1_500);
+    assert_eq!(persistent.rearmed_at(1_500, 1_600), 1_500);
+
+    let boot = TimerSpec::AfterBoot { ticks: 50 };
+    assert_eq!(boot.rearmed_at(5_000, 20), 20);
+    assert_eq!(boot.rearmed_at(5_000, 5_100), 5_000);
+}
+
+#[test]
+fn a_boot_deadline_re_armed_after_a_reset_is_never_a_backwards_clock() {
+    // The whole point of the rule above, stated against `evaluate`: the floor a reset
+    // leaves must not be one the kernel refuses, because a run whose boundary is open has
+    // no edge to a terminal record and so no way to end.
+    let boot = TimerSpec::AfterBoot { ticks: 50 };
+    let armed = Timer::arm(boot, ClockCapability::BootOnly, boot.rearmed_at(5_000, 20));
+    assert_eq!(
+        armed.and_then(|timer| timer.evaluate(20)),
+        Ok(Deadline::Remaining { ticks: 50 })
+    );
+
+    // And the persistent twin still catches a clock that really did move backwards.
+    let persistent = TimerSpec::AtPersistentTime { instant: 9_000 };
+    let armed = Timer::arm(
+        persistent,
+        ClockCapability::Persistent,
+        persistent.rearmed_at(5_000, 4_000),
+    );
+    assert_eq!(
+        armed.and_then(|timer| timer.evaluate(4_000)),
+        Err(KernelError::ClockWentBackwards)
+    );
+}

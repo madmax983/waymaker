@@ -830,16 +830,19 @@ impl ReplayMachine {
                 // disagreeing rather than history being impossible: §08 row 4, with the
                 // flavour that says which. Refused before the cursor is advanced, so a
                 // diagnosis can still name the record.
-                RecordRef::TimerScheduled { .. } | RecordRef::TimerFired { .. } => {
-                    Err(self.diverge(Divergence::BoundaryKind))
-                }
+                RecordRef::TimerScheduled { .. } => Err(self.diverge(Divergence::BoundaryKind)),
                 // No row: a run cannot start twice, and an outcome cannot precede its
-                // schedule. Handed to the cursor rather than refused here so that one type
-                // owns "what may follow what" and so that the refusal is sticky — recovery
-                // stops at the first record it cannot account for, and stays stopped.
+                // schedule. A `TimerFired` here is the second of those — the cursor is at
+                // `Replaying`, so no timer is open for it to resolve — and it is history
+                // that is impossible rather than a workflow that changed. Handed to the
+                // cursor rather than refused here so that one type owns "what may follow
+                // what", so that the two faults stay apart, and so that the refusal is
+                // sticky — recovery stops at the first record it cannot account for, and
+                // stays stopped.
                 RecordRef::RunStarted { .. }
                 | RecordRef::EffectCompleted { .. }
-                | RecordRef::EffectFailed { .. } => match self.cursor.advance(record) {
+                | RecordRef::EffectFailed { .. }
+                | RecordRef::TimerFired { .. } => match self.cursor.advance(record) {
                     Ok(
                         Step::RunStarted { .. }
                         | Step::EffectScheduled(_)

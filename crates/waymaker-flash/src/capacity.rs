@@ -53,9 +53,13 @@
 //!
 //! | After | Still owed |
 //! | --- | --- |
-//! | `EffectScheduled` | an outcome, then a terminal record |
-//! | `RunStarted`, `EffectCompleted`, `EffectFailed` | a terminal record |
+//! | `EffectScheduled`, `TimerScheduled` | an outcome, then a terminal record |
+//! | `RunStarted`, `EffectCompleted`, `EffectFailed`, `TimerFired` | a terminal record |
 //! | `RunCompleted`, `RunFailed` | nothing |
+//!
+//! A timer is priced at an effect's figure rather than its own. A `TimerFired` has no
+//! payload, so it is never wider than an outcome priced at `effect_result_bytes`: the
+//! reserve holds back a few bytes more than a timer needs and never fewer.
 //!
 //! # Where the gate is
 //!
@@ -91,9 +95,26 @@ use waymaker_core::{DecodeError, KernelError, RecordRef};
 
 use crate::append::{AppendError, Journal, Staged};
 use crate::bank::{self, BankId, BankLayout};
-use crate::frame::{self, EFFECT_SCHEDULED_BODY_BYTES, ProgramAlign, RUN_STARTED_PREFIX_BYTES};
+use crate::frame::{
+    self, EFFECT_SCHEDULED_BODY_BYTES, ProgramAlign, RUN_STARTED_PREFIX_BYTES,
+    TIMER_SCHEDULED_BODY_BYTES,
+};
 use crate::integrity::{Catalogued, IntegrityCheck};
 use crate::storage::StableStorage;
+
+/// The widest payload a *schedule* record has, whichever kind of boundary it opens.
+///
+/// [`Reserve::for_layout`]'s floor prices one scheduled boundary, and issue #33 made a
+/// `TimerScheduled` an ordinary schedulable record in the same sequence space — seventeen
+/// payload bytes where an effect's is eight. Pricing the floor at the narrower of the two
+/// accepts a bank on which the run's very first deadline is refused for ever, which is the
+/// failure this floor exists to refuse.
+const WIDEST_SCHEDULE_BODY_BYTES: usize =
+    if EFFECT_SCHEDULED_BODY_BYTES > TIMER_SCHEDULED_BODY_BYTES {
+        EFFECT_SCHEDULED_BODY_BYTES
+    } else {
+        TIMER_SCHEDULED_BODY_BYTES
+    };
 
 /// `value` as a `u32`, saturating rather than truncating.
 ///
@@ -408,7 +429,13 @@ impl Reserve {
             // A `RunStarted` spends four payload bytes on the workflow identity before its
             // input, so a run input a header can carry is not always one a record can.
             frame::encoded_len_for(RUN_STARTED_PREFIX_BYTES.saturating_add(input), align),
-            frame::encoded_len_for(EFFECT_SCHEDULED_BODY_BYTES, align),
+            // The *widest* schedule, not the effect one. Issue #33 made a `TimerScheduled`
+            // an ordinary schedulable record in the same sequence space, and its body is
+            // seventeen bytes where an effect's is eight. Pricing the floor at the narrower
+            // of the two accepts a bank on which the run's very first deadline is refused
+            // for ever — the same shape of defect issue #25 found 4004 configurations of,
+            // and the reason this floor exists at all.
+            frame::encoded_len_for(WIDEST_SCHEDULE_BODY_BYTES, align),
             // §09 puts the effect sequence in the frame *header*, beside the kind and the
             // length, so an outcome's payload is its result or its error and nothing else.
             frame::encoded_len_for(bounds.effect_result_bytes as usize, align),
@@ -749,6 +776,8 @@ const _: () = assert!(size_of::<Reserved>() == size_of::<Journal>() + size_of::<
 mod tests {
     use super::*;
     use crate::storage::Geometry;
+    use waymaker_core::timer::ClockKind;
+    use waymaker_core::{ActivityKind, EffectSeq};
 
     fn layout() -> BankLayout {
         let Ok(geometry) = Geometry::new(8192, 4096, 8, 1) else {
@@ -895,22 +924,95 @@ mod tests {
         // codec rather than against fields of its own — so a floor that stopped counting the
         // schedule, the term that separates a usable bank from one that can only start and
         // end a run, is a failure here rather than 4004 silently accepted configurations.
+        //
+        // The schedule term is the *widest* of the two kinds, which is issue #33's: a floor
+        // priced at an effect's eight payload bytes accepts a bank on which the run's first
+        // seventeen-byte deadline is refused for ever.
         let reserve = reserve();
         let align = layout().align();
-        let (Ok(start), Ok(schedule)) = (
+        let (Ok(start), Ok(schedule), Ok(effect)) = (
             frame::encoded_len_for(
                 RUN_STARTED_PREFIX_BYTES + BOUNDS.run_input_bytes as usize,
                 align,
             ),
+            frame::encoded_len_for(TIMER_SCHEDULED_BODY_BYTES, align),
             frame::encoded_len_for(EFFECT_SCHEDULED_BODY_BYTES, align),
         ) else {
             unreachable!("these bounds encode")
         };
+        assert!(
+            schedule >= effect,
+            "the floor must price the widest schedule, not whichever kind was written first"
+        );
         assert_eq!(
             reserve.floor_bytes,
             narrow(start) + narrow(schedule) + reserve.tail_bytes()
         );
         assert!(reserve.floor_bytes > reserve.tail_bytes());
+    }
+
+    #[test]
+    fn a_bank_the_floor_accepts_can_always_open_the_runs_first_boundary_of_either_kind() {
+        // Issue #33 made a `TimerScheduled` an ordinary schedulable record, seventeen
+        // payload bytes where an effect's is eight. A floor priced at the narrower of the
+        // two accepts a bank on which the run's very first deadline is refused for ever —
+        // the run can start and end and never wait on anything, which is exactly the state
+        // this floor exists to refuse and which issue #25 found 4004 configurations of for
+        // the effect half.
+        //
+        // Swept rather than argued, over the geometries a small part really reports. The
+        // room asserted against is the floor's own promise: what is left once the opening
+        // record is committed.
+        let bounds = Bounds {
+            run_input_bytes: 0,
+            effect_result_bytes: 0,
+            terminal_bytes: 0,
+        };
+        let mut swept = 0_usize;
+        for capacity in (128_u32..=2_048).step_by(64) {
+            for erase in [64_u32, 128, 256, 1_024] {
+                for program in [1_u32, 2, 4, 8] {
+                    let Ok(geometry) = Geometry::new(capacity, erase, program, 1) else {
+                        continue;
+                    };
+                    let Ok(layout) = BankLayout::new(geometry) else {
+                        continue;
+                    };
+                    let Ok(reserve) = Reserve::for_layout(bounds, layout) else {
+                        continue;
+                    };
+                    let Ok(start) =
+                        frame::encoded_len_for(RUN_STARTED_PREFIX_BYTES, layout.align())
+                    else {
+                        continue;
+                    };
+                    swept = swept.saturating_add(1);
+                    let after_start = reserve.floor_bytes.saturating_sub(narrow(start));
+                    for record in [
+                        RecordRef::EffectScheduled {
+                            seq: EffectSeq::FIRST,
+                            kind: ActivityKind(1),
+                            input_len: 0,
+                            input_crc: 0,
+                        },
+                        RecordRef::TimerScheduled {
+                            seq: EffectSeq::FIRST,
+                            clock_kind: ClockKind::AT_PERSISTENT_TIME,
+                            deadline: 1,
+                            armed_at: 0,
+                        },
+                    ] {
+                        assert_eq!(
+                            reserve.admits(&record, after_start),
+                            Ok(()),
+                            "a bank this floor accepted refuses {record:?} at \
+                             {capacity}/{erase}/{program}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(swept > 0, "the sweep accepted no layout at all");
     }
 
     #[test]

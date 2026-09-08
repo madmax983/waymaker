@@ -115,6 +115,46 @@ impl TimerSpec {
         }
     }
 
+    /// The reading a recorded deadline is re-armed at, given what its clock says now.
+    ///
+    /// Replay's other half of issue
+    /// [#33](https://github.com/madmax983/waymaker/issues/33)'s record. The arming reading
+    /// crosses a reset on media, and what it *means* on the other side depends on the clock:
+    ///
+    /// * [`AtPersistentTime`](Self::AtPersistentTime) → `recorded`. The clock survives power
+    ///   loss, so the floor does too, and a reading below it is a clock that moved backwards
+    ///   — which [`Timer::evaluate`] refuses rather than credits.
+    /// * [`AfterBoot`](Self::AfterBoot) → the lower of the two. A boot clock reads below its
+    ///   own arming reading only after a reset, and §11 says a boot interval restarts after
+    ///   one. Taking `recorded` unconditionally makes every reset a permanent
+    ///   [`ClockWentBackwards`](KernelError::ClockWentBackwards) on a run that has no way to
+    ///   end, because §08 has no edge from an open boundary to a terminal record.
+    ///
+    /// # Postconditions
+    ///
+    /// Total, `const`, and never above `now` or above `recorded`. It reads no clock: both
+    /// readings are arguments, as everywhere else in this module.
+    ///
+    /// What it cannot do is tell a reset from an in-boot re-drive when the boot clock has
+    /// already run past the recorded reading. There it measures from `recorded` and credits
+    /// the previous boot's uptime. A boot clock offers no reset evidence, which is §11's own
+    /// reason for calling this deadline not power-loss durable; a reset-cause register is a
+    /// board's, and issue [#34](https://github.com/madmax983/waymaker/issues/34) is where a
+    /// real one is met.
+    #[must_use]
+    pub const fn rearmed_at(self, recorded: u64, now: u64) -> u64 {
+        match self {
+            Self::AfterBoot { .. } => {
+                if now < recorded {
+                    now
+                } else {
+                    recorded
+                }
+            }
+            Self::AtPersistentTime { .. } => recorded,
+        }
+    }
+
     /// The spec a recorded `clock_kind` and `deadline` name, or [`None`].
     ///
     /// Replay's half of the record. `waymaker-flash` decodes the two fields and this turns

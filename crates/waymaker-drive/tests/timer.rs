@@ -10,10 +10,13 @@
 //!   media* and the frame re-sealed with the real codec, so what recovery meets is a frame
 //!   a writer could have written.
 
+use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
-use waymaker_drive::{Conclusion, DriveError, Driver, Progress, Scratch};
+use waymaker_drive::{
+    Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
+};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -356,5 +359,171 @@ fn the_delayed_workflow_waits_for_the_deadline_this_test_file_names() {
     assert_eq!(
         Delayed::SPEC,
         TimerSpec::AtPersistentTime { instant: DEADLINE }
+    );
+}
+
+/// A workflow that waits on the boot clock, which no reset carries across.
+///
+/// `Delayed` waits on the persistent clock, so every test above exercises the kind for
+/// which the recorded arming reading survives. This is the other one, and it is the case
+/// that strands a run when the driver treats the two alike.
+struct Napping {
+    input: [u8; 4],
+}
+
+impl Napping {
+    const SPEC: TimerSpec = TimerSpec::AfterBoot { ticks: 1_000 };
+
+    const fn new() -> Self {
+        Self { input: *b"seed" }
+    }
+}
+
+impl Workflow for Napping {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 9,
+            version: 1,
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        boundary.wait(Self::SPEC)?;
+        Ok(Outcome::Completed(b"woke"))
+    }
+}
+
+/// One boot of [`Napping`].
+fn nap(
+    device: &mut Device,
+    world: &mut World,
+) -> Result<Progress, DriveError<<Device as StableStorage>::Error>> {
+    let mut workflow = Napping::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    Driver::new(region(), RUN, reserve()).boot(
+        device,
+        world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    )
+}
+
+/// A boot-only world whose clock has been running for `ticks`.
+const fn booted(ticks: u64) -> World {
+    let mut world = World::new();
+    world.set_capability(ClockCapability::BootOnly);
+    world.advance(ticks);
+    world
+}
+
+#[test]
+fn a_boot_deadline_that_outlives_a_reset_owes_its_whole_interval_and_refuses_nothing() {
+    // The boot clock restarts at zero, so the arming reading the record carries belongs to
+    // a power cycle that is gone. Measuring against it refuses a healthy clock with
+    // `ClockWentBackwards` — and §08 has no edge from an open boundary to a terminal
+    // record, so the run could never end. That is a device stranded for ever on the
+    // ordinary path, and this is the test that says it does not happen.
+    let mut device = Device::new(geometry());
+    let mut world = booted(5_000);
+    assert!(
+        matches!(
+            nap(&mut device, &mut world),
+            Ok(Progress::WaitingUntil { .. })
+        ),
+        "the first boot arms the deadline"
+    );
+
+    let mut rebooted = booted(200);
+    assert!(
+        matches!(
+            nap(&mut device, &mut rebooted),
+            Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 1_000
+        ),
+        "a reset owes the whole interval again, and refuses nothing"
+    );
+}
+
+#[test]
+fn a_boot_deadline_accrues_within_one_power_cycle_and_fires() {
+    // The other side of the same rule: while the clock is still above the reading the
+    // record carries, no reset has happened and the interval accrues. Without this a boot
+    // deadline would restart on every poll and could never elapse at all.
+    let mut device = Device::new(geometry());
+    let mut world = booted(5_000);
+    assert!(matches!(
+        nap(&mut device, &mut world),
+        Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 1_000
+    ));
+
+    let mut later = booted(5_400);
+    assert!(matches!(
+        nap(&mut device, &mut later),
+        Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 600
+    ));
+
+    let mut elapsed = booted(6_000);
+    assert!(matches!(
+        nap(&mut device, &mut elapsed),
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Completed,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_boot_deadline_carried_across_a_reset_waits_longer_than_it_asked_for() {
+    // The imprecision a boot clock cannot avoid, measured rather than described. The
+    // recorded arming reading is a high-water mark from a power cycle that is gone, and a
+    // boot clock offers no evidence that a reset happened — so once the new cycle's clock
+    // climbs back past that mark the interval accrues from it, and the deadline is reached
+    // at 6000 ticks of the new cycle rather than at the 1000 it asked for.
+    //
+    // Design document §11 calls this deadline not power-loss durable, and this is the shape
+    // that takes. What would close it is a reset-cause register or retained RAM; both are a
+    // board's, and issue [#34](https://github.com/madmax983/waymaker/issues/34) is where a
+    // real one is met.
+    let mut device = Device::new(geometry());
+    let mut world = booted(5_000);
+    assert!(nap(&mut device, &mut world).is_ok());
+
+    // The reset, and then the new cycle at the interval it actually asked for.
+    let mut owed = booted(1_200);
+    assert!(
+        matches!(
+            nap(&mut device, &mut owed),
+            Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 1_000
+        ),
+        "1200 ticks of a new cycle do not reach a deadline armed at 5000 of the old one"
+    );
+
+    let mut past = booted(6_000);
+    assert!(matches!(
+        nap(&mut device, &mut past),
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Completed,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_persistent_clock_that_moved_backwards_across_a_reset_is_still_refused() {
+    // The other half of the same rule. A persistent floor does cross the reset, so a clock
+    // that really moved back — a battery change, a re-synchronised epoch — is an interval
+    // the kernel cannot measure, and it refuses rather than crediting or discarding one.
+    let mut device = Device::new(geometry());
+    let mut world = world_at(DEADLINE - 500);
+    assert!(boot(&mut device, &mut world).is_ok());
+
+    let mut moved_back = world_at(DEADLINE - 900);
+    assert_eq!(
+        boot(&mut device, &mut moved_back),
+        Err(DriveError::Kernel(KernelError::ClockWentBackwards))
     );
 }

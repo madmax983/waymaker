@@ -1048,6 +1048,7 @@ where
     C: IntegrityCheck,
     K: Clocks,
 {
+    let capability = clocks.capability();
     let Some(now) = clocks.now(spec.clock_kind()) else {
         *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
         return TimerDecision::Stop;
@@ -1071,7 +1072,9 @@ where
     }
     // The same reading the record carries. A second read here would measure the deadline
     // against a moment the journal does not describe.
-    measure(source, storage, machine, page, stop, id, spec, now, now)
+    measure(
+        source, storage, machine, page, stop, id, spec, capability, now, now,
+    )
 }
 
 /// Whether `spec` has elapsed at `reading`, and the firing record if it has.
@@ -1091,6 +1094,7 @@ fn measure<S, C>(
     stop: &mut Option<Stop<S::Error>>,
     id: EffectId,
     spec: TimerSpec,
+    capability: ClockCapability,
     armed_at: u64,
     reading: u64,
 ) -> TimerDecision
@@ -1098,10 +1102,13 @@ where
     S: StableStorage,
     C: IntegrityCheck,
 {
-    // The capability is the one the boundary already admitted this spec against, so this
-    // cannot refuse. Spelled as the refusal it has to be, because the workspace denies a
-    // panic.
-    let armed = match Timer::arm(spec, spec_capability(spec), armed_at) {
+    // The firmware's own declaration, carried here rather than derived from the spec. The
+    // boundary already admitted this spec against it, so this cannot refuse today — but a
+    // capability computed from the spec is `admits` being handed the answer it exists to
+    // compute, and it would arm a persistent deadline on boot-only firmware the day a
+    // caller reached this function without going through the boundary first. Spelled as the
+    // refusal it has to be, because the workspace denies a panic.
+    let armed = match Timer::arm(spec, capability, armed_at) {
         Ok(armed) => armed,
         Err(error) => {
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
@@ -1137,20 +1144,6 @@ where
         return TimerDecision::Stop;
     }
     TimerDecision::Passed
-}
-
-/// The capability a spec needs, which is the one the boundary admitted it against.
-///
-/// `Timer::arm` takes a capability and this driver has already been through
-/// `ReplayMachine::timer_intent`, which refused a spec the firmware cannot service. Naming
-/// the spec's own requirement here rather than carrying the firmware's declaration into
-/// `measure` keeps the two decisions in one place: the boundary decides, and this only
-/// rebuilds the value the boundary approved.
-const fn spec_capability(spec: TimerSpec) -> ClockCapability {
-    match spec {
-        TimerSpec::AfterBoot { .. } => ClockCapability::BootOnly,
-        TimerSpec::AtPersistentTime { .. } => ClockCapability::Persistent,
-    }
 }
 
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
@@ -1230,8 +1223,24 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                             *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
                             return TimerDecision::Stop;
                         };
+                        // Which reading the deadline is measured from is §11's, not this
+                        // driver's: a persistent floor crosses the reset and a boot floor
+                        // does not, because the clock that set it restarted. Taking the
+                        // recorded reading for both is a permanent `ClockWentBackwards` on
+                        // every boot deadline that outlives a reset, on a run §08 gives no
+                        // way to end.
+                        let floor = recorded.rearmed_at(armed_at, reading);
                         measure(
-                            source, *storage, machine, page, stop, id, recorded, armed_at, reading,
+                            source,
+                            *storage,
+                            machine,
+                            page,
+                            stop,
+                            id,
+                            recorded,
+                            request.capability,
+                            floor,
+                            reading,
                         )
                     }
                     Err(error) => {

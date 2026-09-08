@@ -635,17 +635,20 @@ fn a_forward_only_single_pass_source_is_enough_to_replay() {
 // Every state against every record.
 // ---------------------------------------------------------------------------
 
-/// The six positions a cursor can be advanced *from*, each with a cursor standing in it.
+/// The seven positions a cursor can be advanced *from*, each with a cursor standing in it.
 ///
 /// `Halted` is reached the way a device reaches it — by being handed a record that could not
 /// legally follow — rather than by construction, so the row below is the real thing.
-fn every_source_position() -> [(Position, ReplayCursor); 6] {
+fn every_source_position() -> [(Position, ReplayCursor); 7] {
     let before_run = ReplayCursor::new(RUN);
 
     let replaying = started();
 
     let mut awaiting = started();
     let _ = awaiting.advance(schedule(0));
+
+    let mut awaiting_timer = started();
+    let _ = awaiting_timer.advance(arm(0));
 
     let mut completed = started();
     let _ = completed.advance(RecordRef::RunCompleted { result: b"" });
@@ -660,6 +663,7 @@ fn every_source_position() -> [(Position, ReplayCursor); 6] {
         (Position::BeforeRun, before_run),
         (Position::Replaying, replaying),
         (Position::AwaitingOutcome, awaiting),
+        (Position::AwaitingTimer, awaiting_timer),
         (Position::RunCompleted, completed),
         (Position::RunFailed, failed),
         (Position::Halted(KernelError::MalformedHistory), halted),
@@ -672,7 +676,7 @@ fn every_source_position() -> [(Position, ReplayCursor); 6] {
 /// unissued sequence, and an outcome at the pending one — so the caller passes the sequence
 /// each of those should carry from that position. Anything the position refuses is refused
 /// for the *kind*, not because the test picked an unlucky number.
-const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 6] {
+const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 8] {
     [
         RecordRef::RunStarted {
             workflow_kind: 1,
@@ -688,6 +692,10 @@ const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static
             seq: EffectSeq(outcome_seq),
             error: b"bad",
         },
+        arm(schedule_seq),
+        RecordRef::TimerFired {
+            seq: EffectSeq(outcome_seq),
+        },
         RecordRef::RunCompleted { result: b"done" },
         RecordRef::RunFailed { error: b"gone" },
     ]
@@ -695,27 +703,32 @@ const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static
 
 #[test]
 fn every_position_accepts_exactly_the_records_a_run_could_have_written_next() {
-    // All thirty-six cells, stated as a table rather than reached by whichever tests
-    // happened to be written. Six of them are legal — the six edges of the transition
-    // diagram on `Position` — and the other thirty are histories no execution could have
-    // produced. Before this table existed, twenty-one cells were never exercised, and a
-    // mutation that let a *failed* run carry on running passed the whole suite.
+    // All fifty-six cells, stated as a table rather than reached by whichever tests
+    // happened to be written. Eight of them are legal — the eight edges of the transition
+    // diagram on `Position` — and the other forty-eight are histories no execution could
+    // have produced. Before this table existed, twenty-one cells were never exercised, and
+    // a mutation that let a *failed* run carry on running passed the whole suite; issue
+    // #33 added a position and two records, and the twenty cells they bring are the same
+    // argument again.
     //
     // Columns are the record variants in §09's order: RunStarted, EffectScheduled,
-    // EffectCompleted, EffectFailed, RunCompleted, RunFailed.
-    const LEGAL: [[bool; 6]; 6] = [
+    // EffectCompleted, EffectFailed, TimerScheduled, TimerFired, RunCompleted, RunFailed.
+    const LEGAL: [[bool; 8]; 7] = [
         // BeforeRun: only the record that starts the run.
-        [true, false, false, false, false, false],
-        // Replaying: the next effect, or either terminal record.
-        [false, true, false, false, true, true],
+        [true, false, false, false, false, false, false, false],
+        // Replaying: the next boundary of either kind, or either terminal record.
+        [false, true, false, false, true, false, true, true],
         // AwaitingOutcome: only this effect's outcome. A run cannot end mid-effect,
         // because §07 commits an outcome frame before the workflow can observe anything.
-        [false, false, true, true, false, false],
+        [false, false, true, true, false, false, false, false],
+        // AwaitingTimer: only this timer's firing. A timer is a boundary like an effect,
+        // so the same rule holds and for the same reason.
+        [false, false, false, false, false, true, false, false],
         // RunCompleted, RunFailed: terminal. Nothing may follow either of them.
-        [false, false, false, false, false, false],
-        [false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
         // Halted: recovery stopped, and stays stopped.
-        [false, false, false, false, false, false],
+        [false, false, false, false, false, false, false, false],
     ];
 
     for (row, (position, _)) in every_source_position().iter().enumerate() {
