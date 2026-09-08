@@ -120,6 +120,19 @@ The cost is that the caller reads `Ctx::conclusion` whatever the poll said: a fi
 and a suspended one are both `Poll::Pending`, and the recorded ending is what tells them
 apart.
 
+What this is *not* is a cancellation story, and Codex round 5 is where the difference
+showed. Both mechanisms assume the future that recorded the ending is still alive:
+`TerminalFuture` guards on a field of its own rather than on the `Ctx`'s conclusion, and
+`ContinueFuture` on a field of its own because a continued run has no `Ending` to record. A
+dropped future takes its flag with it, so a cancelled `complete` followed by a `fail` keeps
+the second, and a cancelled `continue_as_new` leaves the `Ctx` unconcluded with the run
+already asked to be replaced. No `async fn` can express either, since neither future
+resolves; it takes a manual poll or a cancellation combinator, and the one that brings those
+is #36's executor. One flag on the `Ctx` closes both, and issue
+[#107](https://github.com/madmax983/waymaker/issues/107) carries the done-when list. It is
+recorded here rather than fixed in #105 because that PR's review budget was spent and
+neither finding is reachable by the code #105 ships.
+
 **The terminal payload has a third answer.** `Ctx::conclusion()` returns
 `Conclusion::Refused` for a payload wider than the caller's buffer, rather than the `None`
 that also means "the run has not ended". Review of the first commit found that a caller

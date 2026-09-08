@@ -1188,9 +1188,18 @@ Stated so that nobody mistakes silence for coverage:
 - **That a workflow stops at its own ending, for a caller that is not an `async fn`.**
   `TerminalFuture` never resolves and every other future refuses once a conclusion is
   recorded, which is two mechanisms for one rule: a run that ended has no boundaries left.
-  Both are `crates/waymaker-embassy/tests/ctx.rs`'s. What neither can stop is a caller that
-  never asks — nothing obliges anybody to read `Ctx::conclusion` at all, and a caller that
-  ignored it would report a run that did not end.
+  Both are `crates/waymaker-embassy/tests/ctx.rs`'s. Two things neither can stop. A caller
+  that never asks — nothing obliges anybody to read `Ctx::conclusion` at all, and a caller
+  that ignored it would report a run that did not end. And a caller that *cancels*: the rule
+  holds only while the future that recorded the ending is alive, because `TerminalFuture`
+  and `ContinueFuture` each keep their "I have done my side" flag in the future rather than
+  in the `Ctx`. Poll a `complete`, drop it, poll a `fail`, and the second overwrites the
+  first; poll a `continue_as_new`, drop it, and the `Ctx` is unconcluded with the run
+  already asked to be replaced. No `async fn` reaches either — both futures are `Pending`
+  for ever, so no straight-line code follows the `.await` — which is why this is stated
+  rather than fixed at the round it was found. Codex round 5 of #105; issue
+  [#107](https://github.com/madmax983/waymaker/issues/107), and #36's executor is what makes
+  cancellation a thing a caller really does.
 - **That the façade's journal is the driver below it.** `ctx-facade` pins two files in
   `waymaker-embassy` and six in `waymaker-drive`. It says the façade declares no authority
   and that the driver names no façade type; it cannot say that a given `Journal`
