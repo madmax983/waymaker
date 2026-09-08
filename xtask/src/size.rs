@@ -2201,14 +2201,20 @@ fn declaration_kind(line: &str) -> Option<Block> {
 /// round 3 found it, in the same one-line form round 1's finding was about.
 ///
 /// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
-/// attribute — and a bracket inside a string literal is not a bracket, so
+/// attribute — and a bracket inside an *ordinary* string literal is not a bracket, so
 /// `#[expect(lint, reason = "]")]` is one too. Codex round 4 found the version that read
 /// every `]` as syntax and left the classifier standing on `")]` rather than on the item.
 ///
-/// What it does not read is a `']'` *character* literal, because telling one from the
-/// lifetime in `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. An
-/// attribute holding one would leave the item unclassified, which is the direction that
-/// under-reports; it is stated here rather than left to be discovered.
+/// Two literal forms are outside it, and both leave the item **unclassified** rather than
+/// reporting a private function as public — the direction that under-reports. A `']'`
+/// *character* literal, because telling one from the lifetime in
+/// `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. And a *raw* string,
+/// because `"` both opens and closes here: `#[doc = r#"a"]b"#]` is read as ending at the
+/// quote inside it. Codex round 6 found that one, and it is issue #108.
+///
+/// Three rounds have now landed on this function, each closing one construct and leaving
+/// the next. What closes the class is lexing the attribute rather than scanning it, which
+/// is #108's own point; this reads what a reviewer can check by eye.
 pub(crate) fn without_leading_attributes(line: &str) -> &str {
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix("#[") {
