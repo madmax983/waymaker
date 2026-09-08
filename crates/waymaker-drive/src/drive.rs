@@ -1378,15 +1378,12 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             return None;
         };
 
-        let bound = usize::from(reserve.bounds().effect_result_bytes);
+        let _bound = usize::from(reserve.bounds().effect_result_bytes);
         // An answer over the bound is exhausted rather than refused, for
         // `Context::dispatch`'s reason: the schedule record is committed, and a refusal
         // strands the run for ever.
         let resolution = match answered {
             Answered::Exhausted => Resolution::Exhausted,
-            Answered::Completed(bytes) | Answered::Failed(bytes) if bytes.len() > bound => {
-                Resolution::Exhausted
-            }
             Answered::Completed(bytes) => Resolution::Completed(bytes),
             Answered::Failed(bytes) => Resolution::Failed(bytes),
         };

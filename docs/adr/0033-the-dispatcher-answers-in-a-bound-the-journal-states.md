@@ -85,6 +85,14 @@ why. A route for "this firmware cannot service this kind" — the mirror of `Tim
 `IncompatibleWorkflow` for a recorded clock kind — has no place in this trait, and is issue
 [#111](https://github.com/madmax983/waymaker/issues/111).
 
+[ADR 0020](0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) expected this
+issue to be what obliges a caller to hold a `Reserved`: "the thing that would make it
+obligatory is a dispatcher that only ever holds a `Reserved`, and that is rung 0.4's — issue
+#36". It is not. This dispatcher performs §07 step 4 and nothing else; the party that would
+hold the reserve is the one that owns the boot, and that is issue
+[#110](https://github.com/madmax983/waymaker/issues/110). ADR 0020 is accepted and stays as
+written; this paragraph is where the expectation is corrected.
+
 `Handoff::Dispatch` is a struct variant in two crates now, so a caller that split §07's two
 halves reads `Handoff::Dispatch { id, result_bytes }`. That is churn for a figure most
 callers ignore, and it is the price of the bound being the journal's word rather than the
