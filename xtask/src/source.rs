@@ -5544,6 +5544,34 @@ pub const WIRING_SURFACE: &[&str] = &[
     "world_mut",
 ];
 
+/// Every function `waymaker-embassy/src/dispatch.rs` declares that is not on its surface.
+///
+/// None. The module is a trait and a two-shape answer.
+pub const DISPATCH_PRIVATE_FUNCTIONS: &[&str] = &[];
+
+/// Every function the wiring declares that is not on its surface.
+///
+/// One: the row lookup both `name_of` and `poll_dispatch` go through. Pinned rather than
+/// allowed, so a second private function is a line a reviewer writes.
+pub const WIRING_PRIVATE_FUNCTIONS: &[&str] = &["row"];
+
+/// The fields each pinned struct declares.
+///
+/// A *name* pin as well as a visibility one, because the label ban below is one identifier
+/// deep: renaming `Activity::name` to `label` — with `pub const fn name(&self) -> &'static
+/// str { self.label }` left in place — keeps the surface and method pins intact and frees a
+/// selection body to compare `row.label`, which names nothing forbidden. Review of this
+/// change identified exactly that.
+///
+/// It is also what refuses a *tuple* struct. `braced_body` walks to the next `{` when a
+/// declaration has no brace of its own, so a tuple struct with public fields reads back
+/// either the `impl` block below it — noisy but safe — or, with a field-free braced item
+/// between them, an empty body that passes. Comparing the field set catches both.
+pub const WIRING_TYPE_FIELDS: &[(&str, &[&str])] = &[
+    ("Activity", &["kind", "name", "perform"]),
+    ("Table", &["rows", "world"]),
+];
+
 /// The wiring's types, and the methods each declares at *every* visibility.
 ///
 /// A surface pin counts `pub ` and not `pub(`, which is the defeat `timer-capability`,
@@ -5610,6 +5638,19 @@ pub fn check_dispatch_wiring(sources: &[crate::size::LayerSource]) -> Vec<Violat
         violations.extend(check_dispatch_surface(RULE, FACADE, path, pinned, sources));
     }
 
+    for (path, surface, private) in [
+        (DISPATCH_PATH, DISPATCH_SURFACE, DISPATCH_PRIVATE_FUNCTIONS),
+        (WIRING_PATH, WIRING_SURFACE, WIRING_PRIVATE_FUNCTIONS),
+    ] {
+        let Some(source) = find_source(sources, path) else {
+            continue;
+        };
+        let code = without_test_modules(&code_only(&source.contents));
+        violations.extend(check_module_functions(
+            RULE, FACADE, path, surface, private, &code,
+        ));
+    }
+
     let Some(source) = find_source(sources, WIRING_PATH) else {
         return violations;
     };
@@ -5617,6 +5658,72 @@ pub fn check_dispatch_wiring(sources: &[crate::size::LayerSource]) -> Vec<Violat
     violations.extend(check_wiring_types(RULE, FACADE, &code));
     violations.extend(check_wiring_selection(RULE, FACADE, &code));
     violations
+}
+
+/// Every function a file declares, anywhere in it and at any visibility.
+///
+/// [`declared_function_names`] reads one body at depth zero and
+/// [`crate::size::public_functions`] reads `pub`, so a free `pub(crate) fn by_name` at
+/// *module* scope is in neither reader's field of view. Review of this change wrote one,
+/// routed `poll_dispatch` through it, and watched the gate stay green — and the label ban
+/// did not fire either, because `names_identifier` reads `by_name` as one identifier and
+/// the `_` before `name` is a token character. `waymaker-embassy` is one crate, so such a
+/// function is reachable from `ctx.rs`.
+///
+/// `fn ` with the space is what makes a `fn(..)` pointer type — `Perform`'s own definition —
+/// not a declaration.
+fn declared_functions_anywhere(code: &str) -> Vec<String> {
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+    let mut names = Vec::new();
+    for (index, _) in code.match_indices("fn ") {
+        let preceded = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_some_and(continues);
+        if preceded {
+            continue;
+        }
+        let Some(rest) = code.get(index.wrapping_add("fn ".len())..) else {
+            continue;
+        };
+        let name: String = rest.chars().take_while(|c| continues(*c)).collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+/// One module declares exactly the functions its two pins list, at every visibility.
+fn check_module_functions(
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    surface: &[&str],
+    private: &[&str],
+    code: &str,
+) -> Vec<Violation> {
+    let declared = declared_functions_anywhere(code);
+    let mut expected: Vec<String> = surface
+        .iter()
+        .chain(private)
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    if declared == expected {
+        return Vec::new();
+    }
+    vec![Violation::new(
+        rule,
+        subject.to_owned(),
+        format!(
+            "{path} declares {declared:?} rather than {expected:?}: read anywhere in the \
+             file and at every visibility, because a free `pub(crate) fn by_name` at module \
+             scope is on neither a surface pin nor a method pin, and this crate is the one \
+             that would call it"
+        ),
+    )]
 }
 
 /// One module declares exactly the public functions its pin lists.
@@ -5687,7 +5794,39 @@ fn check_dispatch_surface(
 /// field.
 fn check_wiring_types(rule: &'static str, subject: &str, code: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
+
+    // One flat module, for `effect-protocol`'s reason: `inherent_impl_bodies` reads `impl`
+    // at column zero, so an `impl` in a nested module of this same file is indented and
+    // invisible to it. Review of this change put a `mod shim { pub struct Table {} }` above
+    // the real one and made both of `Table`'s fields public, and the gate stayed green.
+    if count_tokens(code, "mod") != 0 {
+        violations.push(Violation::new(
+            rule,
+            subject.to_owned(),
+            format!(
+                "{WIRING_PATH} declares a module: the wiring is one flat module, because \
+                 the method pin below reads `impl` at column zero and an `impl` inside a \
+                 submodule escapes it"
+            ),
+        ));
+    }
+
     for (type_name, methods) in WIRING_TYPE_METHODS {
+        // Declared twice fails too. `braced_body` reads the first declaration, so a decoy
+        // above the real one is the body the public-field scan reads — which is how the
+        // `mod shim` above got two public fields past a version without this.
+        let declarations = count_declarations(code, &format!("struct {type_name}"));
+        if declarations != 1 {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "{WIRING_PATH} declares `struct {type_name}` {declarations} times rather \
+                     than once, so the field pin reads whichever comes first"
+                ),
+            ));
+            continue;
+        }
         let blocks = inherent_impl_bodies(code, type_name);
         if blocks.is_empty() {
             violations.push(Violation::new(
@@ -5734,6 +5873,29 @@ fn check_wiring_types(rule: &'static str, subject: &str, code: &str) -> Vec<Viol
                     "`{type_name}` declares the public field `{field}`: a caller that can \
                      write the rows can build a table at run time, which is issue #36's \
                      dynamic-loading non-goal reached without adding a function"
+                ),
+            ));
+        }
+        let Some(pinned) = WIRING_TYPE_FIELDS
+            .iter()
+            .find(|(named, _)| named == type_name)
+        else {
+            continue;
+        };
+        let mut declared = field_names(body);
+        declared.sort();
+        let mut expected: Vec<String> = pinned.1.iter().map(|name| (*name).to_owned()).collect();
+        expected.sort();
+        if declared != expected {
+            violations.push(Violation::new(
+                rule,
+                subject.to_owned(),
+                format!(
+                    "`{type_name}` declares the fields {declared:?} rather than {expected:?}: \
+                     the label ban is one identifier deep, so a `name` renamed to `label` \
+                     frees a selection body to compare it and names nothing forbidden — and a \
+                     tuple struct has no braced body of its own for the public-field scan \
+                     above to read"
                 ),
             ));
         }
@@ -8819,10 +8981,8 @@ mod deferred_answer_pins {
     fn a_public_row_field_is_reported() {
         // A caller that can write the rows can build a table at run time, which is issue
         // #36's dynamic-loading non-goal reached without adding a function.
-        let module = tests_support::clean_wiring_module().replace(
-            "pub struct Table {\n    kind: u16,\n}",
-            "pub struct Table {\n    pub rows: u16,\n    kind: u16,\n}",
-        );
+        let module =
+            tests_support::clean_wiring_module().replace("    rows: u16,", "    pub rows: u16,");
         let details = wiring_details(WIRING_PATH, &module);
         assert!(
             details.iter().any(|detail| detail.contains("public field")),
@@ -8858,6 +9018,82 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("other than exactly once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_free_lookup_at_module_scope_is_reported() {
+        // The sharpest of the evasions review found. `public_functions` reads `pub` and
+        // `inherent_impl_bodies` reads the two `impl` blocks, so a free
+        // `pub(crate) fn by_name` at module scope was in neither reader's field of view —
+        // and the label ban did not fire either, because `names_identifier` reads `by_name`
+        // as one identifier.
+        for declaration in [
+            "pub(crate) fn by_name(wanted: &str) -> usize { wanted.len() }",
+            "fn label_for(kind: u16) -> &'static str { let _ = kind; \"x\" }",
+            "pub(crate) fn register(at: usize) -> bool { at == 0 }",
+        ] {
+            let module = format!("{}\n{declaration}\n", tests_support::clean_wiring_module());
+            let details = wiring_details(WIRING_PATH, &module);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("read anywhere in the file")),
+                "{declaration}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renamed_label_field_is_reported() {
+        // The label ban is one identifier deep: a `name` renamed to `label`, with
+        // `pub const fn name(&self) -> &'static str { self.label }` left in place, keeps
+        // both the surface and the method pins intact and frees a selection body to compare
+        // `row.label`.
+        let module =
+            tests_support::clean_wiring_module().replace("    name: u16,", "    label: u16,");
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares the fields")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_type_above_the_real_one_is_reported() {
+        // `braced_body` reads the first declaration, so a decoy above the real one is the
+        // body the public-field scan reads. Review of this change put a
+        // `mod shim { pub struct Table {} }` above the real `Table`, made both of its fields
+        // public, and watched a version without this stay green.
+        let module = format!(
+            "//! A decoy.\npub struct Table {{}}\n{}",
+            tests_support::clean_wiring_module()
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("2 times rather than once")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_submodule_is_reported() {
+        // `effect-protocol`'s reason: `inherent_impl_bodies` reads `impl` at column zero, so
+        // an `impl` inside a submodule of this same file is indented and invisible to it.
+        let module = format!(
+            "{}\nmod shim {{\n    impl Table {{\n        pub fn by_name() {{}}\n    }}\n}}\n",
+            tests_support::clean_wiring_module()
+        );
+        let details = wiring_details(WIRING_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("declares a module")),
             "{details:?}"
         );
     }
@@ -12260,7 +12496,7 @@ pub mod tests_support {
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
         SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
         TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, WIRING_SELECTION_BODIES,
-        WIRING_SURFACE, WIRING_TYPE_METHODS,
+        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -12401,7 +12637,18 @@ pub mod tests_support {
     pub fn clean_wiring_module() -> String {
         let mut source = String::from("//! The dispatch wiring.\n");
         for (type_name, methods) in WIRING_TYPE_METHODS {
-            let _ = writeln!(&mut source, "pub struct {type_name} {{\n    kind: u16,\n}}");
+            let fields: String = WIRING_TYPE_FIELDS
+                .iter()
+                .find(|(named, _)| named == type_name)
+                .map(|(_, fields)| {
+                    let mut rendered = String::new();
+                    for field in *fields {
+                        let _ = writeln!(&mut rendered, "    {field}: u16,");
+                    }
+                    rendered
+                })
+                .unwrap_or_default();
+            let _ = writeln!(&mut source, "pub struct {type_name} {{\n{fields}}}");
             let _ = writeln!(&mut source, "impl {type_name} {{");
             for method in *methods {
                 if WIRING_SELECTION_BODIES.contains(method) {

@@ -155,6 +155,8 @@ struct World {
     reports: Option<usize>,
     /// Whether an answer is a failure payload rather than a result.
     as_failure: bool,
+    /// The identity each poll was handed.
+    ids: Vec<EffectId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +173,7 @@ impl World {
             widths: Vec::new(),
             reports: None,
             as_failure: false,
+            ids: Vec::new(),
         }
     }
 
@@ -202,12 +205,13 @@ impl ActivityDispatcher for World {
     fn poll_dispatch(
         &mut self,
         _task: &mut Task<'_>,
-        _id: EffectId,
+        id: EffectId,
         _kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
     ) -> Poll<Result<Produced, Fault>> {
         self.polls += 1;
+        self.ids.push(id);
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
@@ -915,4 +919,54 @@ fn a_bound_wider_than_the_callers_buffer_cannot_produce_a_truncated_record() {
             Asked::Resolve(Answered::Exhausted),
         ]
     );
+}
+
+#[test]
+fn the_world_is_handed_the_identity_the_handoff_carried() {
+    // Issue #36's first work bullet: the dispatcher receives the stable `EffectId` so a
+    // downstream system can deduplicate on it. The façade mints none of its own — it copies
+    // the one the journal committed — and a fabricated identity here is a second effect to
+    // every system that sees it.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(7, 8))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Ok(b"ok".to_vec())]);
+    let mut out = [0_u8; 8];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(
+        world.ids,
+        vec![EffectId {
+            run: RUN,
+            seq: EffectSeq(7),
+        }],
+        "the identity the schedule record committed, and no other"
+    );
+}
+
+#[test]
+fn a_stalled_dispatcher_is_re_polled_under_the_same_identity() {
+    // The retry half of the same guarantee. §14's fourth: a retry reuses the original
+    // identity, so a world polled twice must see one pair.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(bounded(7, 8)), Ok(bounded(7, 8))])
+        .resolving(vec![Ok(Vec::new())]);
+    let mut world = World::answering(vec![Ok(b"ok".to_vec())]).stalling(1);
+    let mut out = [0_u8; 8];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    {
+        let mut effect = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+        let mut task = Task::from_waker(Waker::noop());
+        assert_eq!(effect.as_mut().poll(&mut task), Poll::Pending);
+        let _resolved = effect.as_mut().poll(&mut task);
+    }
+
+    let expected = EffectId {
+        run: RUN,
+        seq: EffectSeq(7),
+    };
+    assert_eq!(world.ids, vec![expected, expected]);
 }

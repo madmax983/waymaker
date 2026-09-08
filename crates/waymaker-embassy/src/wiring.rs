@@ -9,8 +9,8 @@
 //!
 //! Its number. [`ActivityKind`] is what a schedule record holds, so the number is the only
 //! thing replay can reproduce. A row also carries a **name**, and the name is compile-time
-//! metadata for a log: [`Table::name_of`] is the whole of what reads it, no lookup takes
-//! one, and no record holds one. Design document §09's `EffectScheduled` carries a
+//! metadata for a log: [`Table::name_of`] and [`Activity::name`] are what read it, no lookup
+//! takes one, and no record holds one. Design document §09's `EffectScheduled` carries a
 //! sequence, a kind, a length and a digest, and the `effect-scheduled-fields` rule is what
 //! keeps it that way.
 //!
@@ -107,9 +107,8 @@ impl<'t, W, E> Table<'t, W, E> {
     /// A dispatcher that reaches `world` through `rows`.
     ///
     /// `rows` is read top to bottom, so where two rows declare one number the first
-    /// answers. Nothing refuses the second: a `const` cannot be searched at compile time
-    /// without a sort, and a run-time refusal would be a boot that fails on a table a
-    /// reviewer can read.
+    /// answers. Nothing refuses the second, because a run-time refusal would fail the boot
+    /// over a table a reviewer can check by eye.
     #[must_use]
     pub const fn over(world: W, rows: &'t [Activity<W, E>]) -> Self {
         Self { world, rows }
@@ -129,8 +128,8 @@ impl<'t, W, E> Table<'t, W, E> {
 
     /// What a log calls `kind`, or [`None`] if no row declares it.
     ///
-    /// The one thing that reads a name. It is not on the dispatch path: `poll_dispatch`
-    /// selects by number, so a firmware that dropped every name would behave identically.
+    /// Diagnostics only. It is not on the dispatch path: `poll_dispatch` selects by number,
+    /// so a firmware that dropped every name would behave identically.
     #[must_use]
     pub fn name_of(&self, kind: ActivityKind) -> Option<&'static str> {
         self.row(kind).map(|row| row.name)

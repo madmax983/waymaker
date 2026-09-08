@@ -45,7 +45,13 @@ const WORKFLOW_VERSION: u16 = 1;
 const URL: &[u8] = b"fw://a";
 
 /// The name this firmware knows `DOWNLOAD` by. It is never recorded.
-const DOWNLOAD_NAME: &str = "download-the-image";
+///
+/// Two bytes, and that is the point. An eighteen-byte name could not fit any record this run
+/// writes — the result bound is four bytes and the terminal bound eight — so a scan for it
+/// would be true whatever the code did. Review of this change proved that: a table that
+/// wrote the row's label into the answer buffer put four bytes of an eighteen-byte name on
+/// media and the scan still passed. A name that fits is a scan that can fail.
+const DOWNLOAD_NAME: &str = "dl";
 
 /// The terminal payload of a run that reached a branch this file argues is unreachable.
 const UNREACHED: &[u8] = &[254];
@@ -103,6 +109,8 @@ struct World {
     answer: Vec<u8>,
     /// What it reports, when that is not the answer's own length.
     reports: Option<usize>,
+    /// Whether the answer is a failure payload rather than a result.
+    as_failure: bool,
 }
 
 fn download(
@@ -119,9 +127,12 @@ fn download(
         return Poll::Ready(Err(Offline));
     };
     into.copy_from_slice(from);
-    Poll::Ready(Ok(Produced::Completed(
-        world.reports.unwrap_or(world.answer.len()),
-    )))
+    let reported = world.reports.unwrap_or(world.answer.len());
+    Poll::Ready(Ok(if world.as_failure {
+        Produced::Failed(reported)
+    } else {
+        Produced::Completed(reported)
+    }))
 }
 
 const ACTIVITIES: &[Activity<World, Offline>] = &[Activity::new(DOWNLOAD, DOWNLOAD_NAME, download)];
@@ -378,6 +389,123 @@ fn an_activity_name_never_reaches_media() {
             .windows(DOWNLOAD_NAME.len())
             .any(|window| window == DOWNLOAD_NAME.as_bytes()),
         "no byte of the name is on media"
+    );
+}
+
+#[test]
+fn a_name_written_into_the_answer_would_be_found_on_media() {
+    // The tooth for the test above. Without it, a name-scan whose needle cannot fit a record
+    // is true whatever the code does, and says nothing about §09's record bodies.
+    let mut device = Device::new(geometry());
+    let mut workflow = Wired::new(World {
+        answer: DOWNLOAD_NAME.as_bytes().to_vec(),
+        ..World::default()
+    });
+
+    let _progress = boot(&mut device, &mut workflow);
+
+    let image = device.image().to_vec();
+    assert!(
+        image
+            .windows(DOWNLOAD_NAME.len())
+            .any(|window| window == DOWNLOAD_NAME.as_bytes()),
+        "a needle this scan cannot find is a scan that measures nothing"
+    );
+}
+
+#[test]
+fn a_typed_failure_payload_reaches_media_and_replays() {
+    // The route §09 gives `EffectFailed` a bounded payload for. Before issue #36 a
+    // dispatcher could report bytes or failure and never both, so the bridge's
+    // `Answer::Failed(bytes)` arm could only ever carry an empty slice. Review of this
+    // change dropped those bytes in `facade.rs` and no test went red.
+    let mut device = Device::new(geometry());
+    let mut workflow = Wired::new(World {
+        answer: b"why".to_vec(),
+        as_failure: true,
+        ..World::default()
+    });
+
+    let _progress = boot(&mut device, &mut workflow);
+
+    let journal = history(&mut device);
+    assert_eq!(
+        journal.get(2),
+        Some(&(3, b"why".to_vec())),
+        "the failure's payload is on media, not an empty EffectFailed"
+    );
+
+    // And it replays: a second boot answers from history and asks the world nothing.
+    let mut replayed = Wired::new(World {
+        answer: b"why".to_vec(),
+        as_failure: true,
+        ..World::default()
+    });
+    let _resumed = boot(&mut device, &mut replayed);
+
+    assert!(
+        replayed.world().dispatched.is_empty(),
+        "a committed outcome is replayed, never performed again"
+    );
+    assert_eq!(
+        history(&mut device).get(2),
+        Some(&(3, b"why".to_vec())),
+        "and the recorded payload is the one the first boot wrote"
+    );
+}
+
+/// A workflow that calls §07's two halves itself and hands `resolve` an over-bound answer.
+///
+/// It goes round the façade on purpose: the bound the *driver* refuses against is the last
+/// line of defence for any `Journal` implementor other than `Bridge`, and ADR 0033 names it.
+/// Review of this change deleted that arm from `waymaker-drive/src/drive.rs` and every test
+/// in two crates still passed, because the façade refused first.
+struct OverBound;
+
+impl Workflow for OverBound {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            version: WORKFLOW_VERSION,
+            input: URL,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let handed = boundary.schedule(DOWNLOAD, URL)?;
+        assert!(
+            matches!(handed, waymaker_drive::Handoff::Dispatch { .. }),
+            "the first boot schedules"
+        );
+        // Five bytes against a four-byte bound, offered straight to the driver.
+        boundary.resolve(waymaker_drive::Answered::Completed(b"abcde"))?;
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+#[test]
+fn the_driver_refuses_an_over_bound_answer_a_caller_offers_it_directly() {
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let mut world = Unused { performed: 0 };
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut OverBound,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(progress.is_ok(), "the run makes progress: {progress:?}");
+    let journal = history(&mut device);
+    assert_eq!(
+        journal.get(2),
+        Some(&(3, Vec::new())),
+        "five bytes against a four-byte bound is a failure with no payload, not a record \
+         holding four of them"
     );
 }
 

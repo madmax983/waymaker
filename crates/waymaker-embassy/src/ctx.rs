@@ -347,9 +347,7 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                     // The room, not the caller's whole buffer. `out` is the wider of the
                     // run's two bounds, so a world handed all of it could write an answer
                     // the run cannot record. Narrowing here is issue #36's "validated
-                    // against the bound" as an impossibility rather than a check — and it
-                    // is the smaller of the two figures, so a caller that undersized `out`
-                    // still cannot be written past.
+                    // against the bound" as an impossibility rather than a check.
                     let room = result_bytes.min(me.out.len());
                     let Some(into) = me.out.get_mut(..room) else {
                         // Unreachable: `room` is at most `out.len()`. Refused rather than

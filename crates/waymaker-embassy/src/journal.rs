@@ -44,11 +44,11 @@ pub enum Handoff<'a> {
         id: EffectId,
         /// How wide an answer this run declared it can record.
         ///
-        /// Design document §10's `effect_result_bytes`. The journal states it here, at the
-        /// moment it commits the intent, because it is the journal that priced the bank —
-        /// so the façade narrows the caller's buffer to this figure before it reaches the
-        /// world, and an answer over it is [`Answer::Exhausted`] rather than a truncated
-        /// record. Issue [#36](https://github.com/madmax983/waymaker/issues/36).
+        /// Design document §10's `effect_result_bytes`. The journal states it at the moment
+        /// it commits the intent, because the journal is what priced the bank. The façade
+        /// narrows the caller's buffer to this figure before it reaches the world, so an
+        /// answer over it is [`Answer::Exhausted`] and never a truncated record. Issue
+        /// [#36](https://github.com/madmax983/waymaker/issues/36).
         result_bytes: usize,
     },
 }
@@ -62,7 +62,8 @@ pub enum Answer<'a> {
     Completed(&'a [u8]),
     /// Failure, within the run's declared bound.
     Failed(&'a [u8]),
-    /// The answer is wider than the buffer. It is recorded as a failure with no payload.
+    /// The answer is wider than the run's declared bound. It is recorded as a failure with
+    /// no payload.
     ///
     /// The two alternatives are worse. A truncation records a short answer and replays it
     /// for ever. A refusal strands the run, because §08 has no edge from an unresolved

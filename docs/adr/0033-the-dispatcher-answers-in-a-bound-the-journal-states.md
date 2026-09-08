@@ -103,6 +103,28 @@ run was priced against. `waymaker-drive` reads it from the reserve, so the two c
 disagree there; another `Journal` implementor could state anything. It is a precondition on
 the implementor, the same standing as `Swap::beginning`'s two unverified arguments.
 
+Review of this change found four ways past `dispatch-wiring`, and each was watched staying
+green before it was closed. A free `pub(crate) fn by_name` at *module* scope is on neither a
+surface pin (which reads `pub`) nor a method pin (which reads the two `impl` blocks) — and the
+label ban does not catch it either, because `names_identifier` reads `by_name` as one
+identifier. A `register` beside it is the dynamic-loading non-goal as a free function. A
+`mod shim { pub struct Table {} }` above the real one gives `braced_body` an empty body to
+read, so both of `Table`'s fields could be made public. And `Activity::name` renamed to
+`label`, with `pub const fn name(&self) -> &'static str { self.label }` left in place, keeps
+both pins intact and frees a selection body to compare `row.label`. The rule now reads every
+`fn` in each file at every visibility, refuses a type declared twice and a submodule, and
+compares field *names* as well as their visibility.
+
+Two tests were vacuous or missing, and review proved both by mutation. The name-on-media scan
+used an eighteen-byte needle against a run whose widest record is eight bytes, so it was true
+whatever the code did — a table that wrote the row's label into the answer buffer put four
+bytes of the name on media and the scan still passed. The needle is two bytes now, and
+`a_name_written_into_the_answer_would_be_found_on_media` is the tooth that keeps it findable.
+And `Boundary::resolve`'s own over-bound refusal — the last line of defence for a caller that
+splits §07 itself, which this ADR's Context section rests on by name — had no test at all:
+deleting it left every test in two crates green.
+`the_driver_refuses_an_over_bound_answer_a_caller_offers_it_directly` is that test.
+
 `ctx-facade`'s `static` ban had to be narrowed. It fired on the identifier anywhere on a
 line, so `&'static str` — which is what compile-time metadata is spelled as — failed the
 gate. The lifetime is set aside now and the item forms are unchanged;
@@ -135,8 +157,8 @@ slice makes the overwrite impossible and the check redundant, and both are kept 
 dispatcher may still *report* a length over the bound.
 
 **A `Produced::Exhausted`.** The trait could let a dispatcher say "the answer does not fit",
-as `Performed::Exhausted` does on the synchronous path. It is unnecessary here: `out` is
-exactly the bound, so a length over it says the same thing, and one figure is easier to be
+as `Performed::Exhausted` does on the synchronous path. It is unnecessary here: `out` is never
+wider than the bound, so a length over it says the same thing, and one figure is easier to be
 right about than two.
 
 **A blanket `impl ActivityDispatcher` for a simpler trait.** A blanket impl conflicts with

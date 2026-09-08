@@ -30,9 +30,9 @@ pub enum Produced {
 ///
 /// # Why it is poll-shaped
 ///
-/// §13 sketches `async fn dispatch`. A future that survives between polls must be stored,
-/// and the future an `async fn` in a trait returns borrows the dispatcher —
-/// [`ActivityFuture`](crate::ctx::ActivityFuture) already holds that borrow, so storing it
+/// §13 sketches `async fn dispatch`. A future that survives between polls must be stored.
+/// The future an `async fn` in a trait returns borrows the dispatcher, and
+/// [`ActivityFuture`](crate::ctx::ActivityFuture) already holds that borrow — so storing it
 /// needs a self-referential value or an allocation, and this crate has neither. The poll
 /// form stores nothing. [`Table`](crate::wiring::Table) is the ergonomic form over it: a
 /// row per activity, and no state machine to write.
@@ -55,9 +55,10 @@ pub trait ActivityDispatcher {
     ///
     /// # Preconditions
     ///
-    /// `out` is exactly as wide as the run declared its effect results may be — the façade
-    /// narrows the caller's buffer to that bound before this call, so an implementor cannot
-    /// write past it.
+    /// `out` is never wider than the bound the run declared for an effect result: the
+    /// façade narrows the caller's buffer before this call, so an implementor cannot write
+    /// past the bound. It may be *narrower*, when the caller's own buffer is — so `out.len()`
+    /// is the room, and a length over it is recorded as a failure with no payload.
     ///
     /// # Postconditions
     ///
