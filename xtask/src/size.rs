@@ -1243,7 +1243,7 @@ impl SizeReport {
         }
 
         match self.runtime_ram_total() {
-            Some(total) if total > u64::MAX => {
+            Some(total) if total > RUNTIME_RAM_BUDGET_BYTES => {
                 shortfalls.push(BudgetShortfall::Exceeded {
                     budget: Budget::RuntimeRam,
                     subject: format!(
