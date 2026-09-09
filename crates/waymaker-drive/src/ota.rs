@@ -346,13 +346,15 @@ const fn returned_future_bytes<F: Future>(
 /// Sized for whichever target this crate was compiled for, so `xtask` reports host figures
 /// and a firmware build holds the part's. Neither is gated — §04 sets no budget for user
 /// memory, and a future that grew moves no line above this one.
-pub const WORKFLOW_FUTURES: [(&str, usize); 1] =
-    [("ota_update", returned_future_bytes(ota_update))];
+pub const WORKFLOW_FUTURES: [(&str, usize); 1] = [("ota_update", OTA_FUTURE_BYTES)];
+
+/// [`ota_update`]'s generated state machine, in bytes.
+const OTA_FUTURE_BYTES: usize = returned_future_bytes(ota_update);
 
 const _: () = assert!(
-    WORKFLOW_FUTURES[0].1 > CONTEXT_BYTES,
-    "a generated workflow future narrower than the context it borrows is a measurement of \
-     something else",
+    OTA_FUTURE_BYTES > 0,
+    "a workflow that holds a context across three boundaries has state; a zero-sized future \
+     means something other than the future was measured",
 );
 
 /// One boot of the OTA run, with every type fixed.

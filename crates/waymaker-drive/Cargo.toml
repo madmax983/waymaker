@@ -42,8 +42,11 @@ default = []
 # usable through the synchronous driver" into a compile rather than a text search.
 #
 # A negative feature, which is normally an anti-pattern because feature unification turns one
-# crate's opt-out into everyone's. It is safe here for a reason particular to this crate:
-# nothing depends on it. The alternative — an optional dependency, off by default — would take
+# crate's opt-out into everyone's. The one crate that depends on this one is `xtask`, which
+# reads design document §04's context term out of `ota`; nothing selects this feature except
+# the `drive-facadeless` stage, which builds this crate alone, so no build unifies the two.
+# Enabling it workspace-wide would fail the `xtask` build loudly rather than quietly, which is
+# the direction to fail in. The alternative — an optional dependency, off by default — would take
 # the façade out of the lint, test, docs and coverage stages, which all pass
 # `--no-default-features`.
 #

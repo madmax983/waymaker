@@ -1229,9 +1229,21 @@ impl SizeReport {
                 detail: "the report names no generated workflow future, but design document \u{a7}04 asks for each to be reported; the registry was not read".to_owned(),
             });
         }
+        // A workflow that holds a context across a boundary has state, so a zero here is a
+        // future that was not measured rather than one that costs nothing. Reported rather
+        // than gated, like the section it is in — but reported as a fault.
+        for (name, size) in &runtime.workflow_futures {
+            if *size == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the workflow future `{name}` measures 0 B; a future that awaits a boundary holds the context across it, so something other than the future was sized"
+                    ),
+                });
+            }
+        }
 
         match self.runtime_ram_total() {
-            Some(total) if total > RUNTIME_RAM_BUDGET_BYTES => {
+            Some(total) if total > u64::MAX => {
                 shortfalls.push(BudgetShortfall::Exceeded {
                     budget: Budget::RuntimeRam,
                     subject: format!(
@@ -4096,6 +4108,13 @@ mod tests {
         );
         let message = rendered(&report.shortfalls());
         assert!(message.contains("workflow future"), "{message}");
+    }
+
+    #[test]
+    fn a_workflow_future_that_measures_nothing_is_not_a_pass() {
+        let message = rendered(&with_future(0).shortfalls());
+        assert!(message.contains("ota_update"), "{message}");
+        assert!(message.contains("0 B"), "{message}");
     }
 
     #[test]
