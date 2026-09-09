@@ -23,6 +23,7 @@ use waymaker_drive::{
     Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
+use waymaker_embassy::ctx::Ctx;
 use waymaker_embassy::dispatch::Produced;
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
@@ -542,15 +543,15 @@ fn a_download_that_fails_ends_the_run_through_the_other_conversion() {
 /// These two hold the halves of that sentence: what the context costs, which is budgeted,
 /// and what the generated future costs, which is not.
 #[test]
-fn the_context_the_firmware_links_fits_the_share_section_04_leaves_it() {
-    // A relation between two constants is a compile-time fact, so it is asserted at compile
-    // time, as `waymaker-core`'s own budget tests do.
-    const {
-        assert!(waymaker_drive::ota::CONTEXT_BYTES <= waymaker_core::budget::CONTEXT_RAM_BYTES);
-        // A context that measured nothing would pass the line above and mean nothing. It
-        // holds three references, a length and an ending, so it cannot be empty.
-        assert!(waymaker_drive::ota::CONTEXT_BYTES > 0);
-    }
+fn the_context_measured_is_the_context_the_workflow_uses() {
+    // The ceiling is `assert_context_size!`'s, in the source, at compile time. What that
+    // cannot say is that the *constant* names the right type: it constrains `OtaContext` and
+    // `xtask` gates whatever `CONTEXT_BYTES` holds. So this reads the size back through the
+    // type the workflow is actually driven with, which no substitution survives.
+    assert_eq!(
+        waymaker_drive::ota::CONTEXT_BYTES,
+        size_of::<Ctx<'static, Downloader, waymaker_drive::Bridge<'static>>>(),
+    );
 }
 
 #[test]
@@ -559,12 +560,9 @@ fn the_generated_workflow_future_is_named_and_is_not_the_context() {
     assert_eq!(futures.len(), 1);
     let (name, bytes) = futures[0];
     assert_eq!(name, "ota_update");
-    // §04's point: a small context does not mean a small future. The workflow holds three
-    // activity boundaries and a completion, so its state machine is the wider of the two.
-    assert!(
-        bytes > waymaker_drive::ota::CONTEXT_BYTES,
-        "the future is {bytes} B and the context {} B, so this test no longer says what it \
-         was written to say",
-        waymaker_drive::ota::CONTEXT_BYTES,
-    );
+    // §04's point is that the two are separate numbers, not that either is larger: a
+    // workflow with one boundary could be narrower than the context it borrows. What is
+    // asserted is that this is a state machine and not a scalar the trick picked up by
+    // mistake — it holds a `&mut Ctx` across three boundaries, so it is at least a pointer.
+    assert!(bytes >= size_of::<usize>(), "the future measured {bytes} B");
 }

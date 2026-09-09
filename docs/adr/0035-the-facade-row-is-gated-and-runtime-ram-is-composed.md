@@ -47,7 +47,7 @@ ceiling, which is the stricter of the two.
 
 **Runtime RAM is composed, and the composition is what is gated.**
 `SizeReport::runtime_ram_total` adds the 512 B caller-owned scratch page, the kernel-state
-registry, the context, and the largest `Δram` of the gated rows, and `Budget::RuntimeRam`
+registry, the context, and the largest `Δram` of any row, and `Budget::RuntimeRam`
 holds the sum to §04's 768 B. Each term keeps a sub-budget: `KERNEL_STATE_BYTES` is 128 B,
 and `CONTEXT_RAM_BYTES` is what that leaves of `ENGINE_RAM_BYTES` — 128 B — asserted at
 compile time to partition it exactly, so two shares cannot both pass while their sum fails.
@@ -102,9 +102,9 @@ firmware stages compile. There is no exact check for the future: a future's size
 `const` value a firmware build can compare, and reading it off the linked image would need a
 symbol this workspace cannot declare without the `unsafe` it forbids.
 
-What is still not measured is a **stack frame**. §04 names four terms and the composition
-covers all four, with the statics delta added on top; a deeper call chain is none of them,
-because it moves no writable section and no type size. The report says so where it prints the total, rather than printing "runtime RAM: ok".
+What is still not measured is the **depth of the call chain**. §04 names four terms and the
+composition covers all four, with the statics delta added on top; three of them live on the
+stack, and a deeper chain holding them moves no writable section and no type size. The report says so where it prints the total, rather than printing "runtime RAM: ok".
 
 The report schema is 3. `runtime` is absent from a base-branch report, because
 `measure_baseline` links that worktree with *this* binary and can no more read its context

@@ -450,7 +450,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the gated rows' statics |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
 | Incremental code flash | ≤ 12 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic) |
@@ -1253,11 +1253,12 @@ Stated so that nobody mistakes silence for coverage:
   diff cannot read the base checkout's registry, for `kernel_state_change`'s reason — the
   head binary is the only one that can read a type size — so `runtime_ram_change` always says
   "not compared". A future that grew is visible in the run that measured it and nowhere else.
-- **A stack frame.** Runtime RAM is now composed rather than sampled — the caller's scratch
-  page, the kernel-state registry, the context, and the gated rows' statics, gated against
-  §04's 768 B. A deeper call chain is none of those four: it moves no writable section and no
-  type size. The report says so where it prints the total rather than printing "runtime RAM:
-  ok", and stack accounting needs a call graph.
+- **How deep the call chain goes.** Runtime RAM is now composed rather than sampled — the
+  caller's scratch page, the kernel-state registry, the context, and the largest statics
+  delta of any row, gated against §04's 768 B. Three of those four live on the stack, and
+  what is still unaccounted is the *depth* of the chain holding them: a deeper one moves no
+  writable section and no type size. The report says so where it prints the total rather
+  than printing "runtime RAM: ok", and stack accounting needs a call graph.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -2121,7 +2122,7 @@ number is how a kernel budget widens for a cost the kernel does not carry. A `co
 assertion refuses a façade ceiling below the engine's, because the façade image strictly
 contains the engine one, and any *other* gated row falls back to the stricter of the two.
 Runtime RAM is now composed rather than sampled — the 512 B caller-owned scratch page, the
-kernel-state registry, the context, and the largest `Δram` of the gated rows — and the sum is
+kernel-state registry, the context, and the largest `Δram` of any row — and the sum is
 what is held to §04's 768 B. Each term keeps a sub-budget, and `CONTEXT_RAM_BYTES` is what
 kernel state leaves of `ENGINE_RAM_BYTES` rather than a number of its own, asserted at
 compile time to partition it exactly: two independent shares can both pass while their sum

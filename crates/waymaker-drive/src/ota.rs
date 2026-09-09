@@ -324,11 +324,21 @@ pub const CONTEXT_BYTES: usize = size_of::<OtaContext<'static>>();
 
 waymaker_core::assert_context_size!(OtaContext<'static>);
 
+// A ceiling alone lets a narrower type stand in for the context and pass every check: the
+// macro above constrains the type, not the constant, and `xtask` gates whatever this holds.
+// `Ctx` is a journal borrow, a dispatcher borrow, a slice borrow, a length and an ending, so
+// five words is a floor no substitute of a scalar or a thinner reference clears.
+const _: () = assert!(
+    CONTEXT_BYTES >= 5 * size_of::<usize>(),
+    "the context measures less than its own borrows; something narrower than `Ctx` was sized",
+);
+
 /// The size of the future `make` returns, without building one.
 ///
-/// `make` is never called; it is a function pointer so that this is `const`. An `async
-/// fn`'s return type cannot be written down, and building a value of it would need a
-/// journal, a dispatcher and a buffer — inference gives `F` from the signature alone.
+/// `make` is never called. An `async fn`'s return type cannot be written down, and building
+/// a value of it would need a journal, a dispatcher and a buffer; the parameter is there so
+/// that inference gives `F` from the signature. A function pointer rather than a closure
+/// because a closure has a destructor, which a `const fn` may not drop.
 const fn returned_future_bytes<F: Future>(
     _make: fn(&'static mut OtaContext<'static>, OtaInput<'static>) -> F,
 ) -> usize {

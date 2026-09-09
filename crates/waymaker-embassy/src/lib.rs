@@ -39,11 +39,12 @@
 //!
 //! # Status
 //!
-//! Rung 0.4's first three items are here. Still owed: the provisioning example (issue
-//! [#38](https://github.com/madmax983/waymaker/issues/38)), in-boot sleep and the
-//! `continue_as_new` join (issue
-//! [#110](https://github.com/madmax983/waymaker/issues/110)), and the budgets this rung
-//! exits on (issue [#39](https://github.com/madmax983/waymaker/issues/39)).
+//! Rung 0.4's first three items are here, and so is the exit criterion: `cargo xtask size`
+//! gates this crate's row against a ceiling of its own (issue
+//! [#39](https://github.com/madmax983/waymaker/issues/39)). Still owed: the provisioning
+//! example (issue [#38](https://github.com/madmax983/waymaker/issues/38)), and in-boot sleep
+//! and the `continue_as_new` join (issue
+//! [#110](https://github.com/madmax983/waymaker/issues/110)).
 
 #![no_std]
 #![forbid(unsafe_code)]

@@ -29,8 +29,9 @@
 //! caller-owned: the engine borrows it. A probe that declared one would put the caller's
 //! buffer into `.bss` and charge the engine for it. The statics gate is therefore
 //! `waymaker_core::budget::ENGINE_RAM_BYTES` — what is left of the 768 B once the page is
-//! accounted for. It is a floor on §04's runtime RAM and not the rule itself: section
-//! sizes cannot see a cursor or a context that lives on the caller's stack.
+//! accounted for. That is a sub-cap and not §04's rule: section sizes see no term that
+//! lives on the caller's stack. `cargo xtask size` composes the rule from four terms and
+//! gates the sum.
 
 #![no_std]
 #![no_main]

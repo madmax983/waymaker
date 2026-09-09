@@ -655,6 +655,112 @@ fn llvm_tool(tool: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Builds `source` as a crate that path-depends on the real `waymaker-core`.
+///
+/// Returns whether it built and what it complained about. The shipped macro is what is
+/// exercised, so a crate of its own is the only way to watch it refuse.
+fn build_against_the_kernel(label: &str, source: &str) -> (bool, String) {
+    let root = scratch(label);
+    std::fs::create_dir_all(root.join("src")).expect("the crate should be creatable");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{label}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nwaymaker-core = {{ path = \"{}\" }}\n\n[workspace]\n",
+            workspace_root().join("crates/waymaker-core").display()
+        ),
+    )
+    .expect("the manifest should be writable");
+    std::fs::write(root.join("src/lib.rs"), source).expect("the crate root should be writable");
+
+    // `uninstrumented_cargo` because under `cargo llvm-cov` a nested build inherits its
+    // wrapper and flags, and would fail for reasons that have nothing to do with the
+    // assertion under test.
+    let output = xtask::coverage::uninstrumented_cargo()
+        .current_dir(&root)
+        .args(["build", "--quiet"])
+        .output()
+        .expect("cargo should run");
+    let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
+    let built = output.status.success();
+    let _ = std::fs::remove_dir_all(&root);
+    (built, complaint)
+}
+
+#[test]
+fn a_context_over_its_share_fails_to_compile() {
+    // The falsifier for `assert_context_size!`. It is the exact check on the target the
+    // budget is stated for — `cargo xtask size` reports a host figure, which is only an
+    // upper bound — so a version of it that could not refuse would leave the target figure
+    // measured by nothing.
+    let over = waymaker_core::budget::CONTEXT_RAM_BYTES + 1;
+    let (built, complaint) = build_against_the_kernel(
+        "wide-context",
+        &format!("#![no_std]\nwaymaker_core::assert_context_size!([u8; {over}]);\n"),
+    );
+    assert!(
+        !built,
+        "a {over} byte context built cleanly against a {} byte share",
+        waymaker_core::budget::CONTEXT_RAM_BYTES
+    );
+    assert!(
+        complaint.contains("does not fit the context's share of runtime RAM"),
+        "the build failed for some other reason:\n{complaint}"
+    );
+
+    // And the same type exactly at the share builds, or the assertion above proves only
+    // that the crate does not compile.
+    let (built, complaint) = build_against_the_kernel(
+        "exact-context",
+        &format!(
+            "#![no_std]\nwaymaker_core::assert_context_size!([u8; {}]);\n",
+            waymaker_core::budget::CONTEXT_RAM_BYTES
+        ),
+    );
+    assert!(
+        built,
+        "a context exactly at the share must build:\n{complaint}"
+    );
+}
+
+#[test]
+fn a_caller_that_shadows_assert_cannot_turn_either_budget_off() {
+    // `macro_rules!` resolves macro names at the *call site*, so an unqualified `assert!`
+    // inside either expansion is one the calling crate can replace with a no-op. Both
+    // macros are the one part of this crate's surface downstream firmware touches, and a
+    // budget a caller can switch off is not a budget.
+    for (macro_name, share) in [
+        (
+            "assert_context_size",
+            waymaker_core::budget::CONTEXT_RAM_BYTES,
+        ),
+        (
+            "assert_kernel_state_size",
+            waymaker_core::budget::KERNEL_STATE_BYTES,
+        ),
+    ] {
+        let (built, complaint) = build_against_the_kernel(
+            "shadowed-assert",
+            &format!(
+                "#![no_std]\n\
+                 macro_rules! assert {{ ($($t:tt)*) => {{ () }} }}\n\
+                 macro_rules! concat {{ ($($t:tt)*) => {{ \"\" }} }}\n\
+                 macro_rules! stringify {{ ($($t:tt)*) => {{ \"\" }} }}\n\
+                 waymaker_core::{macro_name}!([u8; {}]);\n",
+                share + 1
+            ),
+        );
+        assert!(
+            !built,
+            "`{macro_name}` was switched off by a caller that shadowed `assert!`"
+        );
+        assert!(
+            complaint.contains("does not fit"),
+            "`{macro_name}` failed for some other reason:\n{complaint}"
+        );
+    }
+}
+
 #[test]
 fn a_kernel_state_type_over_budget_fails_to_compile() {
     // The `const` assertion is the kernel-state gate: it is what turns a regression into a

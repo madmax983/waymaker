@@ -99,7 +99,7 @@ budget is measured against.
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page — composed: the scratch page, the kernel-state registry, the context, and the gated rows' statics |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page — composed: the scratch page, the kernel-state registry, the context, and the largest statics delta of any row |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
 | Context (not a §04 row; §04 names it as a runtime RAM *term*) | ≤ 128 B — what kernel state leaves of runtime RAM after the scratch page ([ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md)) |
 | Incremental code flash | ≤ 12 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the probe's own arithmetic) |
@@ -249,7 +249,7 @@ Everything no symbol names as the probe's stays charged to the layers, and the r
 | Incremental code flash, with the façade | the `facade` row, `FACADE_CODE_FLASH_BYTES` — 13 KiB | the same measurement on the image that links `waymaker-embassy` as well |
 | Engine statics | both gated rows, 256 B | every allocated writable, non-thread-local section, minus the baseline |
 | Context | 128 B | `size_of` of the `Ctx` the firmware links, and a `const` assertion beside it that the `drive-firmware` stage evaluates for the target |
-| Runtime RAM | 768 B | the 512 B caller-owned scratch page, plus the kernel-state registry, plus the context, plus the largest statics delta of the gated rows |
+| Runtime RAM | 768 B | the 512 B caller-owned scratch page, plus the kernel-state registry, plus the context, plus the largest statics delta of any row |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 
 Generated workflow futures are reported in a section of their own and summed into nothing:

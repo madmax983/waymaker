@@ -33,7 +33,7 @@
 //! it requires the cost to be *shown*. The base-branch diff is what makes an unbudgeted
 //! row's growth visible in review.
 //!
-//! # The three budgets, and what carries each
+//! # §04's budgets, and what carries each
 //!
 //! Code flash is a section delta, less what the symbol table attributes to the probe.
 //! Kernel state is [`KernelState`]'s registry. Runtime RAM is [`RuntimeRam`] composed with
@@ -752,11 +752,10 @@ pub enum Budget {
     IncrementalCodeFlash,
     /// What the engine may own in statics once the caller's scratch page is counted.
     ///
-    /// Named for what it measures. Section sizes see `.data` and `.bss` and nothing else,
-    /// so this is a floor on §04's runtime RAM rather than the rule itself: a cursor,
-    /// context or record header that lives on the caller's stack moves no writable section,
-    /// and neither does a deeper call frame. Calling this "runtime RAM" would report a
-    /// budget as enforced that section sizes cannot enforce.
+    /// Named for what it measures: statics, and nothing else. §04's other runtime RAM terms
+    /// live on the caller's stack and move no writable section, so this is a sub-cap and
+    /// [`Self::RuntimeRam`] is the rule. It overlaps the other two sub-caps rather than
+    /// partitioning with them — what holds the three together is the composed gate.
     EngineStatics,
     /// `waymaker-core` state only, no page buffer.
     KernelState,
@@ -917,8 +916,10 @@ impl SizeReport {
     /// statics the gated rows own. `None` when a term could not be read, because a total
     /// with a term missing is a smaller number than the truth and would pass.
     ///
-    /// The statics term is the *largest* of the gated rows rather than their sum: the rows
-    /// are separate images of the same firmware, and a device runs one of them.
+    /// The statics term is the *largest* of the rows rather than their sum: the rows are
+    /// separate images of the same firmware, and a device runs one of them. Every row, not
+    /// only the gated ones — a per-feature row is a configuration somebody ships, and taking
+    /// the largest is the direction that fails closed.
     #[must_use]
     pub fn runtime_ram_total(&self) -> Option<u64> {
         let kernel_state = self.kernel_state.as_ref()?;
@@ -927,7 +928,6 @@ impl SizeReport {
         let statics = self
             .rows
             .iter()
-            .filter(|row| row.gated)
             .map(|row| row.sizes.saturating_delta(&baseline.sizes).ram)
             .max()
             .unwrap_or(0);
@@ -1106,34 +1106,8 @@ impl SizeReport {
             });
         }
 
-        // The report says which rows are gated, and `--report` gates a document this
-        // process did not produce. A report with no `default` row, or one whose `gated`
-        // flag says false, would otherwise leave the loop below with nothing to check and
-        // exit zero — letting the document choose whether it is gated.
-        for (row, why) in [
-            (
-                DEFAULT_ROW,
-                "the configuration design document \u{a7}04's budgets are stated for",
-            ),
-            (
-                FACADE_ROW,
-                "the configuration rung 0.4 ships, which is what issue #39 asks the budgets to be paid on",
-            ),
-        ] {
-            if !self.rows.iter().any(|have| have.name == row && have.gated) {
-                shortfalls.push(BudgetShortfall::Unmeasurable {
-                    detail: format!("the report has no gated `{row}` row, which is {why}"),
-                });
-            }
-        }
+        shortfalls.extend(self.gated_row_shortfalls());
 
-        // Every image the matrix links *is* the probe, so a row that attributes nothing to
-        // it is a row whose symbol table was not read — a stripped image, a parser that
-        // came back empty, a report written by an older build. Reading that as "the probe
-        // cost nothing" restores the figure this correction exists to remove, silently and
-        // in the direction that passes. Every row, not only the gated ones: the report
-        // states the split for all of them, and a misstatement is worth as much as a wrong
-        // gate to whoever reads it.
         for row in &self.rows {
             if row.probe_flash == 0 {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
@@ -1197,6 +1171,54 @@ impl SizeReport {
         shortfalls
     }
 
+    /// The rows a gated report must carry, and that they are the images their ceilings name.
+    ///
+    /// `--report` gates a document this process did not produce, so neither the presence of
+    /// a row nor its `gated` flag nor its name is taken at its word.
+    fn gated_row_shortfalls(&self) -> Vec<BudgetShortfall> {
+        let mut shortfalls = Vec::new();
+        for (row, why) in [
+            (
+                DEFAULT_ROW,
+                "the configuration design document \u{a7}04's budgets are stated for",
+            ),
+            (
+                FACADE_ROW,
+                "the configuration rung 0.4 ships, which is what issue #39 asks the budgets to be paid on",
+            ),
+        ] {
+            if !self.rows.iter().any(|have| have.name == row && have.gated) {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!("the report has no gated `{row}` row, which is {why}"),
+                });
+            }
+        }
+
+        // `code_flash_budget_for` chooses the looser ceiling from the row's *name*, and
+        // `--report` gates a document this process did not produce. The row carries the
+        // feature selection it was built with, so a `facade` row that never linked the
+        // façade is a document claiming the wider budget for the narrower image.
+        for row in self.rows.iter().filter(|row| row.name == FACADE_ROW) {
+            if !row.features.iter().any(|feature| feature == FACADE_FEATURE) {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the `{FACADE_ROW}` row was built with {:?}, which does not select `{FACADE_FEATURE}`, so it is not the image its ceiling is stated for",
+                        row.features
+                    ),
+                });
+            }
+        }
+
+        // Every image the matrix links *is* the probe, so a row that attributes nothing to
+        // it is a row whose symbol table was not read — a stripped image, a parser that
+        // came back empty, a report written by an older build. Reading that as "the probe
+        // cost nothing" restores the figure this correction exists to remove, silently and
+        // in the direction that passes. Every row, not only the gated ones: the report
+        // states the split for all of them, and a misstatement is worth as much as a wrong
+        // gate to whoever reads it.
+        shortfalls
+    }
+
     /// Design document §04's runtime RAM sentence, and the workflow futures beside it.
     ///
     /// Separate from [`Self::shortfalls`]'s row loop because none of it is a section size:
@@ -1211,6 +1233,15 @@ impl SizeReport {
             });
             return shortfalls;
         };
+
+        // Every sibling zero in this file is refused rather than read, and a context is no
+        // different: `Ctx` holds three borrows and a length, so 0 B is a section that was
+        // written and holds nothing. It understates the composed total by its whole term.
+        if runtime.context == 0 {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report attributes 0 B to the context, but a context holds three borrows and a length; the figure was not read".to_owned(),
+            });
+        }
 
         if runtime.context > CONTEXT_RAM_BUDGET_BYTES {
             shortfalls.push(BudgetShortfall::Exceeded {
@@ -1232,7 +1263,21 @@ impl SizeReport {
         // A workflow that holds a context across a boundary has state, so a zero here is a
         // future that was not measured rather than one that costs nothing. Reported rather
         // than gated, like the section it is in — but reported as a fault.
-        for (name, size) in &runtime.workflow_futures {
+        for (index, (name, size)) in runtime.workflow_futures.iter().enumerate() {
+            // Two futures under one name render two identical lines, and the section exists
+            // to say which one grew. `check_row_names_are_unique` is the same rule for rows.
+            if runtime
+                .workflow_futures
+                .iter()
+                .take(index)
+                .any(|(earlier, _)| earlier == name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names the workflow future `{name}` twice, so the section cannot say which one grew"
+                    ),
+                });
+            }
             if *size == 0 {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
@@ -1340,7 +1385,7 @@ impl SizeReport {
         }
 
         table.push(format!(
-            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B on `{DEFAULT_ROW}` and {FACADE_CODE_FLASH_BUDGET_BYTES} B on `{FACADE_ROW}`, runtime RAM {RUNTIME_RAM_BUDGET_BYTES} B (engine statics {ENGINE_RAM_BUDGET_BYTES} B and context {CONTEXT_RAM_BUDGET_BYTES} B of it, after a {SCRATCH_PAGE_BYTES} B caller-owned scratch page), kernel state {KERNEL_STATE_BUDGET_BYTES} B\n"
+            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B on `{DEFAULT_ROW}` and {FACADE_CODE_FLASH_BUDGET_BYTES} B on `{FACADE_ROW}`; runtime RAM {RUNTIME_RAM_BUDGET_BYTES} B, which is the one gated as a whole. Its sub-caps overlap rather than partition it and are read one at a time: engine statics {ENGINE_RAM_BUDGET_BYTES} B, context {CONTEXT_RAM_BUDGET_BYTES} B, kernel state {KERNEL_STATE_BUDGET_BYTES} B, after a {SCRATCH_PAGE_BYTES} B caller-owned scratch page\n"
         ));
         table.push(format!(
             "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Both are deltas against the baseline image, whose own probe symbols are {} B. Every byte no symbol attributes to the probe stays in `layers`.\n",
@@ -1373,7 +1418,7 @@ impl SizeReport {
             |total| format!("{total} B of {RUNTIME_RAM_BUDGET_BYTES} B"),
         );
         format!(
-            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of the gated rows. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. What it still does not see is a stack frame: a deeper call chain moves no writable section and no type size, and accounting for one needs a call graph.\n",
+            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
             self.kernel_state.as_ref().map_or(0, |state| state.total),
             runtime.context,
         )
@@ -2907,11 +2952,11 @@ pub fn measure_baseline(root: &Path, reference: &str) -> Result<SizeReport, Size
     // Linked into a directory beside the head build rather than inside the worktree, so
     // that the base half survives the worktree's removal and a CI build cache can see it.
     // Otherwise every pull request pays for a cold build of the base branch, for ever.
-    // No kernel state. `KernelState::measured` reads the `waymaker-core` that *this*
-    // `xtask` was compiled against, which is the head's — so recording it for the base too
-    // would put the same registry on both sides of the diff and make a pull request that
-    // changes the registry look like one that did not. Unknown is the truth here, and the
-    // diff says so.
+    // No kernel state, and no runtime section. `KernelState::measured` and
+    // `RuntimeRam::measured` read the crates *this* `xtask` was compiled against, which are
+    // the head's — so recording either for the base too would put the same figures on both
+    // sides of the diff and make a pull request that changed them look like one that did
+    // not. Unknown is the truth here, and the diff says so.
     // Named for the commit rather than for this process: two runs comparing *different*
     // bases must not share a directory — cargo's lock serialises their builds but is
     // released before the artifact is read, so one could measure the other's image and
@@ -3468,7 +3513,29 @@ mod tests {
         )
     }
 
-    /// A report with both gated rows and the runtime terms this checkout measures.
+    /// A kernel-state registry of known contents.
+    ///
+    /// Fixed rather than `KernelState::measured()`. These tests are about the gate's
+    /// arithmetic, and a helper that read the live registry would put the workspace's
+    /// current sizes into every headroom calculation below — so a kernel-state type added
+    /// tomorrow would turn a test named "within every budget has no shortfalls" red for a
+    /// reason that has nothing to do with what it asserts.
+    fn fixture_kernel_state() -> KernelState {
+        KernelState {
+            total: 104,
+            types: vec![("Machine".to_owned(), 104)],
+        }
+    }
+
+    /// Runtime terms of known contents, for [`fixture_kernel_state`]'s reason.
+    fn fixture_runtime() -> RuntimeRam {
+        RuntimeRam {
+            context: 56,
+            workflow_futures: vec![("ota_update".to_owned(), 168)],
+        }
+    }
+
+    /// A report with both gated rows and runtime terms of known size.
     fn full_report(
         default_flash: u64,
         default_ram: u64,
@@ -3481,8 +3548,8 @@ mod tests {
                 default_row(default_flash, default_ram),
                 facade_row(facade_flash, facade_ram),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         )
     }
 
@@ -3490,7 +3557,7 @@ mod tests {
     fn with_future(bytes: u64) -> SizeReport {
         SizeReport::new(
             vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
-            KernelState::measured(),
+            Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 24,
                 workflow_futures: vec![("ota_update".to_owned(), bytes)],
@@ -3709,8 +3776,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert_eq!(
             report.delta_of(DEFAULT_ROW).map(|sizes| sizes.flash),
@@ -3733,8 +3800,8 @@ mod tests {
                 ),
                 facade_row(1_024, 0),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(
             over_as_an_image.shortfalls().is_empty(),
@@ -3751,8 +3818,8 @@ mod tests {
                     BASELINE_PROBE_FLASH + 50,
                 ),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(
             rendered(&over_as_the_layers.shortfalls()).contains("incremental code flash"),
@@ -3768,8 +3835,8 @@ mod tests {
         // restores the number issue #72 exists to correct.
         let report = SizeReport::new(
             vec![baseline_row(), default_row_with_probe(1_000, 0, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(
             rendered(&report.shortfalls()).contains("nothing was measured"),
@@ -3787,8 +3854,8 @@ mod tests {
         feature.probe_flash = 0;
         let report = SizeReport::new(
             vec![baseline_row(), default, feature],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(
             rendered(&report.shortfalls()).contains("waymaker-core/serde"),
@@ -3801,8 +3868,8 @@ mod tests {
     fn a_probe_share_larger_than_the_image_is_not_a_measurement() {
         let report = SizeReport::new(
             vec![baseline_row(), default_row_with_probe(10, 0, 1_000_000)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(
             rendered(&report.shortfalls()).contains("nothing was measured"),
@@ -3818,8 +3885,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let rendered = report.render();
         assert!(rendered.contains("probe"), "{rendered}");
@@ -3837,8 +3904,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let json: serde_json::Value =
             serde_json::from_str(&report.to_json()).expect("the report is JSON");
@@ -3861,8 +3928,8 @@ mod tests {
     fn a_row_missing_its_probe_share_is_rejected_rather_than_read_as_zero() {
         let report = SizeReport::new(
             vec![baseline_row(), default_row(1_000, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let json = report
             .to_json()
@@ -3923,16 +3990,16 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let head = SizeReport::new(
             vec![
                 baseline_row(),
                 default_row_with_probe(1_200, 0, BASELINE_PROBE_FLASH + 600),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let rendered = render_diff(&diff(&base, &head));
         assert!(rendered.contains("probe 400 -> 600 (+200)"), "{rendered}");
@@ -3971,8 +4038,8 @@ mod tests {
 
     #[test]
     fn the_facade_row_is_gated() {
-        // Design document \u{a7}04's exit criterion for rung 0.4 is that the three budgets pass
-        // *with the facade in the build*. A facade row that is only reported is a row a
+        // Issue #39, rung 0.4's exit criterion: the three budgets pass *with the facade in
+        // the build*. A facade row that is only reported is a row a
         // regression passes through.
         let graph = probe_graph();
         let variants = matrix(&graph);
@@ -3986,8 +4053,8 @@ mod tests {
     fn a_report_with_no_gated_facade_row_cannot_be_gated() {
         let report = SizeReport::new(
             vec![baseline_row(), default_row(1_024, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let message = rendered(&report.shortfalls());
         assert!(message.contains(FACADE_ROW), "{message}");
@@ -4024,14 +4091,26 @@ mod tests {
 
     #[test]
     fn runtime_ram_is_the_scratch_page_the_kernel_state_and_the_context() {
-        let report = full_report(1_024, 0, 1_024, 0);
-        let kernel = KernelState::measured()
-            .expect("this checkout has a registry")
-            .total;
-        let runtime = RuntimeRam::measured().expect("this checkout has a context");
         assert_eq!(
-            report.runtime_ram_total(),
-            Some(SCRATCH_PAGE_BYTES + kernel + runtime.context),
+            full_report(1_024, 0, 1_024, 0).runtime_ram_total(),
+            Some(SCRATCH_PAGE_BYTES + 104 + 56),
+        );
+    }
+
+    #[test]
+    fn this_checkout_can_read_both_registries_the_composition_needs() {
+        // The fixtures hold the arithmetic still. This is the one test about the live
+        // figures, and it is what would notice `RuntimeRam::measured` coming back empty.
+        let kernel = KernelState::measured().expect("this checkout has a kernel state registry");
+        let runtime = RuntimeRam::measured().expect("this checkout has a context");
+        assert!(!kernel.types.is_empty());
+        assert!(runtime.context >= 5 * size_of::<usize>() as u64);
+        assert!(!runtime.workflow_futures.is_empty());
+        assert!(
+            runtime
+                .workflow_futures
+                .iter()
+                .all(|(name, size)| !name.is_empty() && *size > 0)
         );
     }
 
@@ -4051,9 +4130,9 @@ mod tests {
 
     #[test]
     fn exceeding_the_runtime_ram_budget_names_the_total() {
-        // Enough statics to push the composition over 768 B while staying under the
-        // statics gate would be impossible, so this drives it through the statics term and
-        // checks that both budgets are named rather than only the first.
+        // Through the statics term, over the statics sub-cap as well, so both budgets are
+        // named rather than only the first. The case where the composition alone fails is
+        // the test below.
         let over = ENGINE_RAM_BUDGET_BYTES + 1;
         let message = rendered(&full_report(1_024, over, 1_024, over).shortfalls());
         assert!(message.contains("runtime RAM"), "{message}");
@@ -4064,10 +4143,28 @@ mod tests {
     }
 
     #[test]
+    fn the_composition_fails_where_every_sub_cap_passes() {
+        // The sub-caps overlap rather than partition: statics may be 256 B, kernel state
+        // 128 B and the context 128 B, which is 512 B of the 256 B the scratch page leaves.
+        // 100 B of statics is inside every one of them and over the sum, which is why the
+        // composition is the gate and the sub-caps are readings.
+        let statics = 100;
+        assert!(statics <= ENGINE_RAM_BUDGET_BYTES);
+        let report = full_report(1_024, statics, 1_024, statics);
+        assert_eq!(
+            report.runtime_ram_total(),
+            Some(SCRATCH_PAGE_BYTES + 104 + 56 + statics)
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("runtime RAM"), "{message}");
+        assert!(!message.contains("engine statics"), "{message}");
+    }
+
+    #[test]
     fn a_context_over_its_share_names_the_context_budget() {
         let report = SizeReport::new(
             vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
-            KernelState::measured(),
+            Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: CONTEXT_RAM_BUDGET_BYTES + 1,
                 workflow_futures: vec![("ota_update".to_owned(), 96)],
@@ -4085,7 +4182,7 @@ mod tests {
     fn a_report_with_no_runtime_ram_section_is_not_a_pass() {
         let report = SizeReport::new(
             vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
-            KernelState::measured(),
+            Some(fixture_kernel_state()),
             None,
         );
         let message = rendered(&report.shortfalls());
@@ -4100,7 +4197,7 @@ mod tests {
         // one thing the report was asked to make visible disappears.
         let report = SizeReport::new(
             vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
-            KernelState::measured(),
+            Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 24,
                 workflow_futures: Vec::new(),
@@ -4108,6 +4205,102 @@ mod tests {
         );
         let message = rendered(&report.shortfalls());
         assert!(message.contains("workflow future"), "{message}");
+    }
+
+    #[test]
+    fn a_context_that_measures_nothing_is_not_a_pass() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(RuntimeRam {
+                context: 0,
+                workflow_futures: vec![("ota_update".to_owned(), 168)],
+            }),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("0 B to the context"), "{message}");
+    }
+
+    #[test]
+    fn a_composition_missing_a_term_is_not_a_pass() {
+        // A report whose kernel state was not read cannot be composed, and a total with a
+        // term missing is a smaller number than the truth. The fourth of the four fail-closed
+        // cases, and the one a base-branch-shaped artifact would land on.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            None,
+            Some(fixture_runtime()),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("cannot be composed"), "{message}");
+    }
+
+    #[test]
+    fn two_workflow_futures_under_one_name_are_not_a_pass() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(RuntimeRam {
+                context: 56,
+                workflow_futures: vec![("ota".to_owned(), 8), ("ota".to_owned(), 16)],
+            }),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("twice"), "{message}");
+    }
+
+    #[test]
+    fn a_facade_row_that_never_linked_the_facade_cannot_claim_its_ceiling() {
+        // `code_flash_budget_for` reads the row's name, and `--report` gates a document this
+        // process did not write. The row carries the features it was built with, so the
+        // wider ceiling can be checked against the image rather than against a label.
+        let mut mislabelled = facade_row(1_024, 0);
+        mislabelled.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), mislabelled],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains(FACADE_FEATURE), "{message}");
+        assert!(message.contains("not the image"), "{message}");
+    }
+
+    #[test]
+    fn a_runtime_term_that_moved_is_named_in_the_diff() {
+        // The only route by which a context or a workflow future reaches a pull request:
+        // both are type sizes, so no row moves when either grows.
+        let base = full_report(1_024, 0, 1_024, 0);
+        let head = SizeReport::new(
+            base.rows().to_vec(),
+            Some(fixture_kernel_state()),
+            Some(RuntimeRam {
+                context: 120,
+                workflow_futures: vec![("ota_update".to_owned(), 400)],
+            }),
+        );
+        let change = runtime_ram_change(&base, &head).expect("a moved term must be reported");
+        assert!(change.contains("56"), "{change}");
+        assert!(change.contains("120"), "{change}");
+        assert!(change.contains("400"), "{change}");
+        assert_eq!(runtime_ram_change(&base, &base), None);
+    }
+
+    #[test]
+    fn a_report_from_an_older_schema_is_refused_rather_than_gated() {
+        // `--report` reads a document this process did not write, and an older schema is one
+        // whose sections mean something else. Refusing is what stops it being gated as if it
+        // did not.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 0, 512, 0).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .insert("schema".to_owned(), Value::from(REPORT_SCHEMA - 1));
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("an older schema must not be read");
+        assert!(refusal.to_string().contains("schema"), "{refusal}");
     }
 
     #[test]
@@ -4204,17 +4397,21 @@ mod tests {
 
     #[test]
     fn the_report_does_not_claim_to_have_measured_stack_usage() {
-        // The runtime RAM line composes four terms design document \u{a7}04 names. A stack frame
-        // is none of them, and a report that stopped saying so would be claiming a budget
-        // it did not evaluate.
+        // The runtime RAM line composes four terms design document \u{a7}04 names, three of them
+        // stack-resident. How deep the chain holding them goes is none of them, and a report
+        // that stopped saying so would be claiming a budget it did not evaluate.
         let table = report(0, 0).render();
-        assert!(table.contains("does not see is a stack frame"), "{table}");
+        assert!(table.contains("of the call chain"), "{table}");
         assert!(table.contains("engine statics"), "{table}");
     }
 
     #[test]
     fn a_report_with_no_rows_at_all_fails_rather_than_passing_empty() {
-        let empty = SizeReport::new(Vec::new(), KernelState::measured(), RuntimeRam::measured());
+        let empty = SizeReport::new(
+            Vec::new(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
         let message = rendered(&empty.shortfalls());
         assert!(message.contains("no rows"), "{message}");
         assert!(empty.shortfall_report().is_some());
@@ -4233,8 +4430,8 @@ mod tests {
                 BASELINE_PROBE_FLASH,
                 false,
             )],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let message = rendered(&report.shortfalls());
         assert!(message.contains("no bytes in flash"), "{message}");
@@ -4278,8 +4475,8 @@ mod tests {
         );
         let report = SizeReport::new(
             vec![big_baseline, default_row(64, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let delta = report.delta_of(DEFAULT_ROW).expect("a default row");
         assert_eq!(delta.flash, 0, "a smaller image is not a negative cost");
@@ -4304,8 +4501,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(12_200, 0, BASELINE_PROBE_FLASH - 5),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(12_205));
         assert_eq!(report.probe_delta_of(DEFAULT_ROW), Some(0));
@@ -4320,8 +4517,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 1_000),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(0));
         assert!(
@@ -4338,8 +4535,8 @@ mod tests {
         // document this process did not produce.
         let report = SizeReport::new(
             vec![baseline_row(), default_row(20, 0), default_row(20, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let error = SizeReport::from_json(&report.to_json())
             .expect_err("two rows of one name is not a report");
@@ -4376,8 +4573,8 @@ mod tests {
                     INCREMENTAL_CODE_FLASH_BUDGET_BYTES + 1,
                 ),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(report.shortfalls().is_empty());
         assert!(report.render().contains("waymaker-core/serde"));
@@ -4392,8 +4589,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 32),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let increment = report
             .increment_of("waymaker-core/serde")
@@ -4408,8 +4605,8 @@ mod tests {
         // which is what a dead-stripped engine looks like from here.
         let report = SizeReport::new(
             vec![baseline_row(), default_row(0, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let notices = report.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -4432,8 +4629,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 0),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let notices = report.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
@@ -4452,8 +4649,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 8),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(report.notices().is_empty(), "{:?}", report.notices());
     }
@@ -4477,8 +4674,8 @@ mod tests {
         let message = rendered(
             &SizeReport::new(
                 vec![baseline_row(), ungated],
-                KernelState::measured(),
-                RuntimeRam::measured(),
+                Some(fixture_kernel_state()),
+                Some(fixture_runtime()),
             )
             .shortfalls(),
         );
@@ -4486,8 +4683,8 @@ mod tests {
 
         let missing = SizeReport::new(
             vec![baseline_row()],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         )
         .shortfalls();
         assert!(
@@ -4535,8 +4732,8 @@ mod tests {
     fn a_report_with_no_baseline_row_fails_rather_than_reporting_zero() {
         let report = SizeReport::new(
             vec![default_row(0, 0)],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let message = rendered(&report.shortfalls());
         assert!(message.contains("baseline"), "{message}");
@@ -4550,7 +4747,7 @@ mod tests {
                 total: KERNEL_STATE_BUDGET_BYTES + 7,
                 types: vec![("Cursor".to_owned(), KERNEL_STATE_BUDGET_BYTES + 7)],
             }),
-            RuntimeRam::measured(),
+            Some(fixture_runtime()),
         );
         let message = rendered(&report.shortfalls());
         assert!(
@@ -4677,8 +4874,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 900),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
 
         let table = render_diff(&diff(&base, &head));
@@ -4701,8 +4898,8 @@ mod tests {
                 small.clone(),
                 feature_row("waymaker-core/serde", &small, 8),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
 
         let grown = default_row(120, 0);
@@ -4713,8 +4910,8 @@ mod tests {
                 // The feature still costs the same 8 B on top of the engine.
                 feature_row("waymaker-core/serde", &grown, 8),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
 
         let diffs = diff(&base, &head);
@@ -4740,8 +4937,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 8),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let head = SizeReport::new(
             vec![
@@ -4749,8 +4946,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 40),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let diffs = diff(&base, &head);
         let names: Vec<&str> = diffs.iter().map(|entry| entry.name.as_str()).collect();
@@ -4806,8 +5003,8 @@ mod tests {
         );
         let head = SizeReport::new(
             vec![bigger_baseline, shifted_default, shifted_facade],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         assert!(diff(&base, &head).is_empty(), "{:?}", diff(&base, &head));
     }
@@ -4819,8 +5016,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         // 200 B more image, all of it the probe's own arithmetic. The image grew and the
         // layers did not, which is the distinction issue #72 is about.
@@ -4829,8 +5026,8 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_200, 0, BASELINE_PROBE_FLASH + 600),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let diffs = diff(&base, &head);
         let default = diffs
@@ -4853,16 +5050,16 @@ mod tests {
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let head = SizeReport::new(
             vec![
                 baseline_row(),
                 default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 300),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let diffs = diff(&base, &head);
         assert!(
@@ -4884,8 +5081,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 8),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let diffs = diff(&report, &report);
         assert!(
@@ -4898,8 +5095,8 @@ mod tests {
                 default.clone(),
                 feature_row("waymaker-core/serde", &default, 40),
             ],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let feature = diff(&report, &grown)
             .into_iter()
@@ -4918,7 +5115,7 @@ mod tests {
                 total: 24,
                 types: vec![("Cursor".to_owned(), 24)],
             }),
-            RuntimeRam::measured(),
+            Some(fixture_runtime()),
         );
         let change = kernel_state_change(&base, &head).expect("the registry changed");
         assert!(change.contains("24"), "{change}");
@@ -4936,8 +5133,8 @@ mod tests {
         let base = report(500, 16);
         let head = SizeReport::new(
             vec![baseline_row()],
-            KernelState::measured(),
-            RuntimeRam::measured(),
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
         );
         let table = render_diff(&diff(&base, &head));
         assert!(table.contains("removed"), "{table}");
