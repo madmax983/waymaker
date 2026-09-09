@@ -44,6 +44,19 @@ pub const ENGINE_RAM_BYTES: usize = RUNTIME_RAM_BYTES - SCRATCH_PAGE_BYTES;
 /// Kernel state budget in bytes: `waymaker-core` state only, no page buffer.
 pub const KERNEL_STATE_BYTES: usize = 128;
 
+/// Runtime RAM the context may occupy: what kernel state leaves of [`ENGINE_RAM_BYTES`].
+///
+/// Design document §04 lists runtime RAM as "cursor, context, record header, and storage
+/// scratch". The cursor and the record header are registered kernel state, the scratch page
+/// is the caller's, and this is the fourth term. It is a *partition* of what is left rather
+/// than a number of its own: two independent shares can sum to more than the budget they
+/// are drawn from, and the assertion below is what stops that.
+///
+/// The context is `waymaker-embassy`'s `Ctx`, which is above this crate. So the type cannot
+/// be registered here; what is here is the share, and the crate that names a concrete `Ctx`
+/// asserts against it with [`assert_context_size!`].
+pub const CONTEXT_RAM_BYTES: usize = ENGINE_RAM_BYTES - KERNEL_STATE_BYTES;
+
 /// Incremental code-flash budget in bytes for the kernel plus the flash adapter.
 ///
 /// Design document §04: "Measured on `thumbv6m-none-eabi` with release-size settings.
@@ -65,6 +78,20 @@ pub const KERNEL_STATE_BYTES: usize = 128;
 /// It is still a gate: `cargo xtask size` fails a build over it, and the number lives here
 /// rather than in the gate so that there is one place to change.
 pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 12 * 1024;
+
+/// Incremental code-flash budget in bytes for the three layers with the façade linked.
+///
+/// [`INCREMENTAL_CODE_FLASH_BYTES`] is design document §04's number and §04 states it for
+/// "core + flash adapter". The Embassy façade is a third crate, so it gets a ceiling of its
+/// own rather than a raise of the engine's: raising the engine's number to pay for the
+/// façade would widen the kernel's budget for a cost the kernel does not carry.
+///
+/// The engine's ceiling plus 1 KiB. The façade measured 398 B over the engine row at rung
+/// 0.4, so the 1 KiB is room for the rest of the rung rather than a figure fitted to
+/// today's build.
+///
+/// It is a gate: `cargo xtask size` fails a build over the `facade` row.
+pub const FACADE_CODE_FLASH_BYTES: usize = INCREMENTAL_CODE_FLASH_BYTES + 1024;
 
 /// One type that is part of the kernel's live state, and the space it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +116,34 @@ impl TypeSize {
             size: core::mem::size_of::<T>(),
         }
     }
+}
+
+/// Fails the build when `$ty` does not fit the context's share of runtime RAM.
+///
+/// [`CONTEXT_RAM_BYTES`] is stated in this crate and the context is declared above it, so
+/// this is how a crate that names a concrete context is held to §04 on the target the
+/// budget is stated for. `cargo xtask size` reports the same figure measured on the host,
+/// which is an upper bound; this is the exact one.
+///
+/// ```
+/// waymaker_core::assert_context_size!(u32);
+/// ```
+///
+/// The leading `::` on `::core::mem::size_of` is hygiene, for
+/// [`assert_kernel_state_size!`]'s reason.
+#[macro_export]
+macro_rules! assert_context_size {
+    ($ty:ty) => {
+        const _: () = assert!(
+            ::core::mem::size_of::<$ty>() <= $crate::budget::CONTEXT_RAM_BYTES,
+            concat!(
+                "`",
+                stringify!($ty),
+                "` does not fit the context's share of runtime RAM; see design document \
+                 \u{a7}04 and run `cargo xtask size` for the measured figure"
+            ),
+        );
+    };
 }
 
 /// Fails the build when `$ty` does not fit the kernel-state budget.
@@ -190,9 +245,24 @@ kernel_state_types! {
 #[doc(inline)]
 pub use crate::assert_kernel_state_size;
 
+/// The context assertion, documented beside the share it is stated against.
+#[doc(inline)]
+pub use crate::assert_context_size;
+
 const _: () = assert!(
     SCRATCH_PAGE_BYTES < RUNTIME_RAM_BYTES,
     "the scratch page must leave the engine some runtime RAM",
+);
+const _: () = assert!(
+    KERNEL_STATE_BYTES + CONTEXT_RAM_BYTES == ENGINE_RAM_BYTES,
+    "the kernel state and the context partition what the scratch page leaves of runtime \
+     RAM; two shares that do not add up are two budgets that can both pass while the sum \
+     fails",
+);
+const _: () = assert!(
+    FACADE_CODE_FLASH_BYTES >= INCREMENTAL_CODE_FLASH_BYTES,
+    "the facade image contains the engine one, so its ceiling cannot be the lower of the \
+     two",
 );
 const _: () = assert!(
     KERNEL_STATE_BYTES <= ENGINE_RAM_BYTES,

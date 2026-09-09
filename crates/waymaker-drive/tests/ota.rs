@@ -537,3 +537,34 @@ fn a_download_that_fails_ends_the_run_through_the_other_conversion() {
     );
     assert_eq!(workflow.dispatcher().kinds(), vec![DOWNLOAD]);
 }
+
+/// Design document §04 says the workflow future is user memory and is reported separately.
+/// These two hold the halves of that sentence: what the context costs, which is budgeted,
+/// and what the generated future costs, which is not.
+#[test]
+fn the_context_the_firmware_links_fits_the_share_section_04_leaves_it() {
+    // A relation between two constants is a compile-time fact, so it is asserted at compile
+    // time, as `waymaker-core`'s own budget tests do.
+    const {
+        assert!(waymaker_drive::ota::CONTEXT_BYTES <= waymaker_core::budget::CONTEXT_RAM_BYTES);
+        // A context that measured nothing would pass the line above and mean nothing. It
+        // holds three references, a length and an ending, so it cannot be empty.
+        assert!(waymaker_drive::ota::CONTEXT_BYTES > 0);
+    }
+}
+
+#[test]
+fn the_generated_workflow_future_is_named_and_is_not_the_context() {
+    let futures = waymaker_drive::ota::WORKFLOW_FUTURES;
+    assert_eq!(futures.len(), 1);
+    let (name, bytes) = futures[0];
+    assert_eq!(name, "ota_update");
+    // §04's point: a small context does not mean a small future. The workflow holds three
+    // activity boundaries and a completion, so its state machine is the wider of the two.
+    assert!(
+        bytes > waymaker_drive::ota::CONTEXT_BYTES,
+        "the future is {bytes} B and the context {} B, so this test no longer says what it \
+         was written to say",
+        waymaker_drive::ota::CONTEXT_BYTES,
+    );
+}

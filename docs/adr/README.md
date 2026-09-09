@@ -43,6 +43,7 @@ be superseded.
 | [0032](0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md) | The façade is four futures over a durable half it does not own | accepted |
 | [0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md) | The dispatcher answers in a bound the journal states, and a row is a number | accepted |
 | [0034](0034-a-codec-is-a-bridge-behind-a-feature-and-the-probe-mirrors-it.md) | A codec is a bridge behind a feature, and the probe mirrors it | accepted |
+| [0035](0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) | The façade row is gated, and runtime RAM is composed rather than sampled | accepted |
 
 ## Reading the numbers
 

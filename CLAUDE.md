@@ -415,7 +415,10 @@ Seven crates are in the workspace and are *not* layers:
   firmware target builds. §07 is here rather than in `waymaker-flash` because step 4 is an
   activity, and that crate's must-not-own cell names activities — see
   [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md).
-  Outside `default-members`, and nothing depends on it. It is the third member of this
+  Outside `default-members`, and the only crate that depends on it is `xtask`, which reads
+  §04's context term and the generated workflow future sizes out of §06's example rather than
+  transcribing them — the same reason `xtask` depends on `waymaker-fault` and
+  `waymaker-rig`. It is the third member of this
   category that is `#![no_std]` and allocation-free, and the reason is the claim it exists to
   make: issue #28 asks for a workflow driven to completion with "no `Future`, no Embassy, and
   no allocation", and a driver that could only be built for the host would leave the last
@@ -445,9 +448,11 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1) |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the gated rows' statics |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
+| Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
 | Incremental code flash | ≤ 12 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic) |
+| Incremental code flash, with the façade | ≤ 13 KiB for the three layers on `thumbv6m-none-eabi`. Not a §04 row either: §04 states the row above for "core + flash adapter", and [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) gives the façade a ceiling of its own rather than raising the kernel's to pay for a crate above it |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree, and
@@ -497,9 +502,13 @@ charged to the layers: `.rodata` strings, `compiler_builtins`, the `__aeabi_*` h
 the padding between functions. The report prints `Δflash`, `probe` and `layers` on every row
 of every run, so the split is legible rather than taken on trust.
 
-The workflow future is user memory and is reported separately. A kernel state type added to
-`kernel_state_types!` is asserted at compile time, registered in the size report, and
-counted in the total — it cannot be in one without being in the others.
+The workflow future is user memory and is reported separately, which since
+[ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) is a section
+of the size report rather than a sentence: `waymaker_drive::ota::WORKFLOW_FUTURES` is the
+registry, the report prints it under a heading saying it is in no total above it, and a
+report that names no future at all is `Unmeasurable` rather than a pass. A kernel state type
+added to `kernel_state_types!` is asserted at compile time, registered in the size report,
+and counted in the total — it cannot be in one without being in the others.
 
 ## Writing code here
 
@@ -1218,20 +1227,24 @@ Stated so that nobody mistakes silence for coverage:
   than from media would satisfy every rule here, and the façade would dispatch nothing.
   `crates/waymaker-drive/tests/ota.rs` is what runs the real driver under the real façade.
 - **That a workflow future is small.** §04 says the workflow future is user memory and is
-  reported separately, and nothing measures one yet. What *is* true is that it is compiled
-  for the part: `ota_update` and `Ota` are generic, and a generic body no caller names is
-  type-checked rather than compiled — `nm` on the `thumbv6m` rlib found zero `ota_update`
-  symbols before `ota::Downloader` and `ota::poll_ota` were added to name them. §06's
-  example uses two of the four futures, so the rlib holds two; the size probe drives all
-  four, which is what the `facade` row measures. Issue
-  [#38](https://github.com/madmax983/waymaker/issues/38) is where each example's generated
-  future size is measured. A handle held across three boundaries is a discipline the OTA
-  example demonstrates rather than one anything enforces.
-- **That the façade's own row is under a budget.** `cargo xtask size` gates the `default`
-  row — the kernel plus the flash adapter, which is what §04 states the code-flash budget
-  over — and prints the `facade` row beside it. Issue
-  [#39](https://github.com/madmax983/waymaker/issues/39) is rung 0.4's exit criterion and is
-  where the façade row becomes a gate rather than a reading.
+  *reported* rather than budgeted, and `cargo xtask size` now reports it: a section of its
+  own, summed into nothing, with a line saying it is not part of the runtime RAM total above
+  it. Nothing gates it, and a ceiling on a user's own state machine would be a limit on what
+  a workflow may be rather than on what this engine costs. Two things are still owed. The
+  figure is a *host* size, and the target's is rather smaller — 168 B against 104 B for
+  `ota_update` — because a state machine holding borrows narrows where a pointer does; there
+  is no exact check, since a future's size has no `const` value a firmware build can compare
+  and reading it off the linked image needs a symbol attribute this workspace cannot declare
+  without the `unsafe` it forbids. And the registry holds one workflow: §06's, which is the
+  only `async fn` here. Issue
+  [#38](https://github.com/madmax983/waymaker/issues/38) is where each further example joins
+  it. A handle held across three boundaries is a discipline the OTA example demonstrates
+  rather than one anything enforces.
+- **A stack frame.** Runtime RAM is now composed rather than sampled — the caller's scratch
+  page, the kernel-state registry, the context, and the gated rows' statics, gated against
+  §04's 768 B. A deeper call chain is none of those four: it moves no writable section and no
+  type size. The report says so where it prints the total rather than printing "runtime RAM:
+  ok", and stack accounting needs a call graph.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -2080,9 +2093,57 @@ reachable from a firmware layer, through `cobs`, when the feature is on — and
 `proc-macro2` are not, because none of them is in an image. See
 [ADR 0034](docs/adr/0034-a-codec-is-a-bridge-behind-a-feature-and-the-probe-mirrors-it.md).
 
+Issue #39 is rung 0.4's exit criterion, and what it asks for is that the budgets be *paid*
+on the configuration that ships rather than on the one below it. Three of them were not.
+The `facade` row was measured and gated by nothing, so a regression in `waymaker-embassy`
+moved a number no build failed over. Runtime RAM was gated as `.data + .bss`, which for this
+engine is 0 B — §04's sentence is "cursor, context, record header, and storage scratch", and
+three of those four are not statics. And the *context* — `waymaker-embassy`'s `Ctx`, the one
+term §04 names that no registry held — was measured nowhere at all, for five rungs, behind a
+report line that honestly called its own figure "a floor".
+All three are gates now. The `facade` row is held to `FACADE_CODE_FLASH_BYTES`, 13 KiB,
+which is a ceiling of its own rather than a raise of the kernel's: §04 states the 12 KiB for
+"core + flash adapter" and the façade is a third crate, so paying for it out of the engine's
+number is how a kernel budget widens for a cost the kernel does not carry. A `const`
+assertion refuses a façade ceiling below the engine's, because the façade image strictly
+contains the engine one, and any *other* gated row falls back to the stricter of the two.
+Runtime RAM is now composed rather than sampled — the 512 B caller-owned scratch page, the
+kernel-state registry, the context, and the largest `Δram` of the gated rows — and the sum is
+what is held to §04's 768 B. Each term keeps a sub-budget, and `CONTEXT_RAM_BYTES` is what
+kernel state leaves of `ENGINE_RAM_BYTES` rather than a number of its own, asserted at
+compile time to partition it exactly: two independent shares can both pass while their sum
+fails.
+The context is measured on the types the firmware links —
+`Ctx<'_, Downloader, Bridge<'_>>`, in §06's own example — and
+`waymaker_core::assert_context_size!` beside it is the gate for the target the budget is
+stated for, which the `drive-firmware` stage compiles. `Ctx` borrows everything it uses, so
+its size is the same for every `D` and `J`; naming the pair the firmware really links is what
+makes the figure a reading of this image rather than of a fixture.
+The generated workflow future is §04's fourth ask and the one that had nothing at all behind
+it: `WORKFLOW_FUTURES` is a `const` registry, the report prints it in a section of its own
+under a line saying it is part of no total above it, and a test drives a 64 KiB future
+through the gate and requires every gated number to stay where it was. Nothing budgets it —
+§04 excludes user workflow memory, and a ceiling on a user's state machine is a limit on what
+a workflow may be. Every one of these fails closed: no gated `facade` row, no runtime section,
+no named future, or a term missing from the composition is `Unmeasurable` rather than a pass.
+The numbers, all passing and with no ceiling raised to make them: code flash **12220 B** of
+12288 on `default` and **12618 B** of 13312 on `facade`; runtime RAM **672 B** of 768, being
+512 B of scratch page, 104 B of kernel state, 56 B of context and 0 B of statics; kernel state
+104 B of 128; and `ota_update`'s future **168 B**, budgeted by nothing.
+What is owed is written down. The context and future figures are *host* sizes, which is
+`KernelState::measured`'s standing and the same argument — only pointers differ and a
+`thumbv6m` pointer is narrower, so the host figure is an upper bound and gating it fails early
+rather than late. On the target the same two types are 28 B and 104 B, so both reported
+figures overstate the part by about a factor of two; the context has an exact check and the
+future has none, because a future's size has no `const` value a firmware build can compare and
+reading it off the linked image needs an attribute this workspace cannot declare without the
+`unsafe` it forbids. And a stack frame is still nobody's: it moves no section and no type
+size. See
+[ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md).
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
-async `Ctx` and the dispatcher are here — issues #35 and #36, below — and in-boot sleep and
-the codec helpers are the rest of 0.4. The
+async `Ctx`, the dispatcher, the codec helpers and rung 0.4's exit criterion are here —
+issues #35, #36, #37 and #39, below — and in-boot sleep is the rest of 0.4. The
 gates went in before the code they govern, which is the point: a gate retrofitted after
 coverage has slipped is a gate that ratifies the slip.
