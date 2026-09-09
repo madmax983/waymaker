@@ -38,10 +38,11 @@ impl Suspended {
 ///
 /// # Why this vocabulary is the driver's own
 ///
-/// So that removing the façade removes nothing here. Nothing below `facade` and `ota` names
-/// a `waymaker-embassy` type, and the `without-facade` feature deletes those two modules —
-/// which is what makes "the protocol is fully usable through the synchronous driver" a
-/// build rather than a claim. The `drive-facadeless` pipeline stage is that build.
+/// So that removing the façade removes nothing here. Nothing below `facade`, `ota` and
+/// `provisioning` names a `waymaker-embassy` type, and the `without-facade` feature deletes
+/// those modules — which is what makes "the protocol is fully usable through the
+/// synchronous driver" a build rather than a claim. The `drive-facadeless` pipeline stage is
+/// that build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handoff<'a> {
     /// History holds the outcome. Nothing may be dispatched.

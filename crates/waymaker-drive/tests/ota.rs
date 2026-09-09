@@ -1,14 +1,16 @@
 #![cfg(not(feature = "without-facade"))]
 //! Design document §06's OTA example, over real media.
 //!
-//! Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s two "done when"s. The
-//! workflow is `waymaker_drive::ota::ota_update` — §06's example as an `async fn` — the
-//! façade is `waymaker-embassy`'s, the driver is this crate's, and the media is
-//! `waymaker-fault`'s model of NOR. So what is measured below is the protocol and not a
-//! fixture that agrees with it.
+//! Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s two "done when"s, and
+//! issue [#38](https://github.com/madmax983/waymaker/issues/38)'s third — exercised by the
+//! crash rig, not only a happy-path run. The workflow is `waymaker_drive::ota::ota_update`
+//! — §06's example as an `async fn` — the façade is `waymaker-embassy`'s, the driver is
+//! this crate's, and the media is `waymaker-fault`'s model of NOR. So what is measured
+//! below is the protocol and not a fixture that agrees with it.
 //!
 //! The façade's own sequencing is `crates/waymaker-embassy/tests/ctx.rs`.
 
+use core::cell::RefCell;
 use core::task::{Context as Task, Poll};
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
@@ -25,7 +27,7 @@ use waymaker_drive::{
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::ctx::Ctx;
 use waymaker_embassy::dispatch::Produced;
-use waymaker_fault::Device;
+use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};
 use waymaker_flash::frame::ProgramAlign;
@@ -565,4 +567,97 @@ fn the_generated_workflow_future_is_named_and_is_not_the_context() {
     // asserted is that this is a state machine and not a scalar the trick picked up by
     // mistake — it holds a `&mut Ctx` across three boundaries, so it is at least a pointer.
     assert!(bytes >= size_of::<usize>(), "the future measured {bytes} B");
+}
+
+/// Every schedule sequence the image recovers to.
+fn scheduled(image: &[u8]) -> Vec<u32> {
+    let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
+        unreachable!("the image is device-sized")
+    };
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut out = Vec::new();
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        if let RecordRef::EffectScheduled { seq, .. } = record {
+            out.push(seq.0);
+        }
+    }
+    out
+}
+
+/// One boot over `session`, and the sequences the world was asked to perform.
+fn sweep_boot(
+    session: &mut Session,
+    dispatched: &RefCell<Vec<u32>>,
+) -> Result<(), DriveError<FaultError>> {
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let mut world = Unused { performed: 0 };
+    let mut workflow = Ota::new(Fleet::new());
+    let ended = Driver::new(region(), RUN, reserve(BOUNDS)).boot(
+        session,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    dispatched.borrow_mut().extend(
+        workflow
+            .dispatcher()
+            .dispatched
+            .iter()
+            .map(|(id, _)| id.seq.0),
+    );
+    ended.map(|_progress| ())
+}
+
+#[test]
+fn every_effect_the_ota_example_dispatched_has_a_recoverable_schedule_at_every_crash_point() {
+    // Issue #38's third "done when": exercised by the crash rig, not only a happy-path run.
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
+
+    let runs = harness
+        .run(|session| {
+            logs.borrow_mut().push(Vec::new());
+            let mine = RefCell::new(Vec::new());
+            let ended = sweep_boot(session, &mine);
+            if let Some(last) = logs.borrow_mut().last_mut() {
+                last.clone_from(&mine.borrow());
+            }
+            ended
+        })
+        .expect("the fault-free run completes");
+
+    let logs = logs.into_inner();
+    assert_eq!(logs.len(), runs.len());
+    assert!(
+        runs.len() > 1,
+        "the enumeration found crash points to sweep"
+    );
+
+    let mut shortened = 0_usize;
+    let whole = scheduled(runs.first().expect("the fault-free run is first").image());
+    for (run, dispatched) in runs.iter().zip(&logs) {
+        let recovered = scheduled(run.image());
+        if recovered.len() < whole.len() {
+            shortened += 1;
+        }
+        for seq in dispatched {
+            assert!(
+                recovered.contains(seq),
+                "effect {seq} was performed with no recoverable schedule record, at {:?}",
+                run.injection()
+            );
+        }
+    }
+    assert!(
+        shortened > 0,
+        "a sweep in which no crash ever shortened history measured nothing"
+    );
 }

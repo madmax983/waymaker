@@ -5708,7 +5708,7 @@ pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
     ),
 ];
 
-/// The three driver files that may name the façade.
+/// The driver files that may name the façade.
 ///
 /// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
 /// fully usable through the synchronous driver. Every *other* module of `waymaker-drive` is
@@ -5721,6 +5721,7 @@ pub const FACADE_DRIVER_MODULES: &[&str] = &[
     "waymaker-drive/src/facade.rs",
     "waymaker-drive/src/lib.rs",
     "waymaker-drive/src/ota.rs",
+    "waymaker-drive/src/provisioning.rs",
 ];
 
 /// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
@@ -5743,6 +5744,11 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
         "ota",
         "is design document §06's example over the façade; reaching it is reaching the \
          façade",
+    ),
+    (
+        "provisioning",
+        "is design document §06's second example over the façade; reaching it is reaching \
+         the façade",
     ),
     (
         "Bridge",
@@ -6336,7 +6342,8 @@ fn check_facade_free_driver(
                     subject.to_owned(),
                     format!(
                         "{path} names `{forbidden}`, which {why}; the edge belongs in \
-                         waymaker-drive/src/facade.rs and waymaker-drive/src/ota.rs"
+                         waymaker-drive/src/facade.rs, waymaker-drive/src/ota.rs or \
+                         waymaker-drive/src/provisioning.rs"
                     ),
                 ));
             }

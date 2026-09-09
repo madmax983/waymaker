@@ -22,10 +22,11 @@
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
 //!   builds them too.
-//! * `facade` and `ota` — the bridge to `waymaker-embassy`'s `Ctx` and design document
-//!   §06's OTA example. They are the only two modules that name the façade, so removing it
-//!   removes these two files and nothing else. The `without-facade` feature deletes them,
-//!   and the `drive-facadeless` pipeline stage builds that configuration for the part.
+//! * `facade`, `ota` and `provisioning` — the bridge to `waymaker-embassy`'s `Ctx` and
+//!   design document §06's two examples. They are the only modules that name the façade, so
+//!   removing it removes these three files and nothing else. The `without-facade` feature
+//!   deletes them, and the `drive-facadeless` pipeline stage builds that configuration for
+//!   the part.
 //!
 //! # What this crate must not own
 //!
@@ -105,6 +106,8 @@ mod effect;
 pub mod facade;
 #[cfg(not(feature = "without-facade"))]
 pub mod ota;
+#[cfg(not(feature = "without-facade"))]
+pub mod provisioning;
 mod workflow;
 
 pub use activity::{Activities, Clocks, Performed};

@@ -193,17 +193,17 @@ pub const STAGES: &[Stage] = &[
     Stage {
         name: "drive-facadeless",
         job: "firmware",
-        // `waymaker-drive`'s `without-facade` feature deletes the two modules that name
+        // `waymaker-drive`'s `without-facade` feature deletes the modules that name
         // `waymaker-embassy`, so this stage compiles the driver, design document §06's
-        // boundary, §07's typestate and the reference workflow with the façade edge gone.
+        // boundary, §07's typestate and the reference workflows with the façade edge gone.
         //
         // A build rather than a scan. `ctx-facade` reads the modules that may not name the
         // façade, and a scanner cannot see an import routed through `crate::facade` or a
         // dependency renamed in a manifest; a compiler sees both. On the firmware target
         // rather than the host, because that is where the claim is worth something.
         //
-        // What it establishes is that no `waymaker-drive` module outside those two *needs*
-        // the façade — not that the crate would build with `waymaker-embassy` deleted. The
+        // What it establishes is that no other `waymaker-drive` module *needs* the façade
+        // — not that the crate would build with `waymaker-embassy` deleted. The
         // manifest entry is not optional, so this configuration still resolves and compiles
         // it, and a compile error inside the façade fails this stage too. Codex round 3
         // measured that; issue

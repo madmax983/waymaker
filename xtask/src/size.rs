@@ -753,8 +753,11 @@ impl RuntimeRam {
     pub fn measured() -> Option<Self> {
         Some(Self {
             context: waymaker_drive::ota::CONTEXT_BYTES as u64,
+            // Every example's registry, chained: §04 asks each generated future to be
+            // reported, and a second example is a second row rather than a second section.
             workflow_futures: waymaker_drive::ota::WORKFLOW_FUTURES
                 .iter()
+                .chain(waymaker_drive::provisioning::WORKFLOW_FUTURES.iter())
                 .map(|(name, size)| ((*name).to_owned(), *size as u64))
                 .collect(),
         })
