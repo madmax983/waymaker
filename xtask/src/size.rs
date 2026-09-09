@@ -146,6 +146,21 @@ pub const BASELINE_ROW: &str = "baseline";
 /// The engine as it ships with no optional cost enabled.
 pub const DEFAULT_ROW: &str = "default";
 
+/// The feature selection each gated row is built from, as [`matrix`] builds it.
+///
+/// A gated row read out of a document is held to this rather than to its name alone.
+/// `code_flash_budget_for` picks the looser ceiling from the name, and the probe binary
+/// carries `required-features = ["probe"]`, so a `facade` row selecting only `facade` names
+/// an image that cannot have been linked — and a `default` row selecting `facade` names one
+/// linked from different code than the ceiling is stated for.
+///
+/// `the_gated_row_feature_pin_is_what_the_matrix_builds` compares this against [`matrix`],
+/// so the pin cannot drift from the images the gate actually links.
+pub const GATED_ROW_FEATURES: &[(&str, &[&str])] = &[
+    (DEFAULT_ROW, &[PROBE_FEATURE, ENGINE_FEATURE]),
+    (FACADE_ROW, &[PROBE_FEATURE, FACADE_FEATURE]),
+];
+
 /// The row that links the façade as well, named after [`FACADE_FEATURE`].
 ///
 /// An alias rather than a second literal: the row is named after the feature that builds
@@ -1196,16 +1211,21 @@ impl SizeReport {
 
         // `code_flash_budget_for` chooses the looser ceiling from the row's *name*, and
         // `--report` gates a document this process did not produce. The row carries the
-        // feature selection it was built with, so a `facade` row that never linked the
-        // façade is a document claiming the wider budget for the narrower image.
-        for row in self.rows.iter().filter(|row| row.name == FACADE_ROW) {
-            if !row.features.iter().any(|feature| feature == FACADE_FEATURE) {
-                shortfalls.push(BudgetShortfall::Unmeasurable {
-                    detail: format!(
-                        "the `{FACADE_ROW}` row was built with {:?}, which does not select `{FACADE_FEATURE}`, so it is not the image its ceiling is stated for",
-                        row.features
-                    ),
-                });
+        // feature selection it was built with, so the ceiling can be checked against the
+        // image rather than against a label.
+        for (name, expected) in GATED_ROW_FEATURES {
+            for row in self.rows.iter().filter(|row| &row.name == name) {
+                let selects = |feature: &str| row.features.iter().any(|have| have == feature);
+                if row.features.len() != expected.len()
+                    || !expected.iter().all(|feature| selects(feature))
+                {
+                    shortfalls.push(BudgetShortfall::Unmeasurable {
+                        detail: format!(
+                            "the `{name}` row was built with {:?} rather than {expected:?}, so it is not the image its budgets are stated for",
+                            row.features
+                        ),
+                    });
+                }
             }
         }
 
@@ -4250,20 +4270,61 @@ mod tests {
     }
 
     #[test]
-    fn a_facade_row_that_never_linked_the_facade_cannot_claim_its_ceiling() {
+    fn a_gated_row_built_from_other_features_cannot_claim_its_budgets() {
         // `code_flash_budget_for` reads the row's name, and `--report` gates a document this
-        // process did not write. The row carries the features it was built with, so the
-        // wider ceiling can be checked against the image rather than against a label.
-        let mut mislabelled = facade_row(1_024, 0);
-        mislabelled.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
+        // process did not write. Three ways a name can outrun its image, and each must be
+        // refused: the façade's ceiling on an image that never linked the façade; the
+        // engine's row built from façade code; and a selection the probe binary could not
+        // have been linked from at all, since it carries `required-features = ["probe"]`.
+        for features in [
+            vec![PROBE_FEATURE, ENGINE_FEATURE],
+            vec![FACADE_FEATURE],
+            vec![PROBE_FEATURE, ENGINE_FEATURE, FACADE_FEATURE],
+        ] {
+            let mut mislabelled = facade_row(1_024, 0);
+            mislabelled.features = features.iter().map(|f| (*f).to_owned()).collect();
+            let report = SizeReport::new(
+                vec![baseline_row(), default_row(1_024, 0), mislabelled],
+                Some(fixture_kernel_state()),
+                Some(fixture_runtime()),
+            );
+            let message = rendered(&report.shortfalls());
+            assert!(message.contains("not the image"), "{features:?}: {message}");
+        }
+
+        let mut mislabelled = default_row(1_024, 0);
+        mislabelled.features = vec![PROBE_FEATURE.to_owned(), FACADE_FEATURE.to_owned()];
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), mislabelled],
+            vec![baseline_row(), mislabelled, facade_row(1_024, 0)],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
         let message = rendered(&report.shortfalls());
-        assert!(message.contains(FACADE_FEATURE), "{message}");
+        assert!(message.contains(DEFAULT_ROW), "{message}");
         assert!(message.contains("not the image"), "{message}");
+    }
+
+    #[test]
+    fn the_gated_row_feature_pin_is_what_the_matrix_builds() {
+        // The pin is a table and the matrix is derived, so this is what stops the two
+        // drifting: a row the gate links from one selection and validates against another
+        // would refuse every report the gate itself produces.
+        let variants = matrix(&probe_graph());
+        for (name, expected) in GATED_ROW_FEATURES {
+            let built = find(&variants, name);
+            assert!(built.gated, "`{name}` is pinned but not gated");
+            assert_eq!(&built.features, expected, "`{name}`");
+        }
+        // And nothing else is gated, or it would be held to no pin at all.
+        for variant in variants.iter().filter(|variant| variant.gated) {
+            assert!(
+                GATED_ROW_FEATURES
+                    .iter()
+                    .any(|(name, _)| *name == variant.name),
+                "`{}` is gated and has no feature pin",
+                variant.name
+            );
+        }
     }
 
     #[test]
