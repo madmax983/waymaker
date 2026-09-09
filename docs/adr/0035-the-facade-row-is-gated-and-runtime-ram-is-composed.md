@@ -3,8 +3,11 @@
 - Status: accepted
 - Date: 2026-09-09
 - Issue: [#39](https://github.com/madmax983/waymaker/issues/39)
-- Supersedes: nothing
-- Related: [ADR 0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md),
+- Supersedes: one decision of
+  [ADR 0002](0002-size-budgets-are-measured-as-deltas-against-a-probe-firmware.md) — "RAM
+  accounting is a floor, and is named for what it measures". Nothing else in 0002 changes:
+  its deltas, its probe and its baseline are what this builds on.
+- Related:
   [ADR 0029](0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md),
   [ADR 0032](0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md)
 
@@ -22,9 +25,8 @@ the `default` row and covers the façade not at all. A regression in `waymaker-e
 a number nobody gated.
 
 Runtime RAM was gated as `.data + .bss`, which for this engine is 0 B. §04's sentence is
-"cursor, context, record header, and storage scratch", and three of those four are not
-statics: the cursor and the record header are in `waymaker_core::budget`'s kernel-state
-registry, and the **context** — `waymaker-embassy`'s `Ctx` — was measured nowhere at all.
+"cursor, context, record header, and storage scratch": the cursor and the record header are
+in `waymaker_core::budget`'s kernel-state registry, the scratch page is the caller's, and the **context** — `waymaker-embassy`'s `Ctx` — was measured nowhere at all.
 The size report said so honestly, calling its figure "a floor on §04's runtime RAM and not
 the rule itself", and a floor of zero is not a budget.
 
@@ -70,7 +72,9 @@ section, no named workflow future, or a term missing from the composition is
 
 ## Consequences
 
-The measured figures, on `thumbv6m-none-eabi` with the release-size profile:
+The measured figures. The code-flash and statics rows are read off images linked for
+`thumbv6m-none-eabi` with the release-size profile; the context, kernel-state and future rows
+are host `size_of`, which the paragraph below explains:
 
 | Budget | Measured | Ceiling |
 | --- | --- | --- |
@@ -98,9 +102,9 @@ firmware stages compile. There is no exact check for the future: a future's size
 `const` value a firmware build can compare, and reading it off the linked image would need a
 symbol this workspace cannot declare without the `unsafe` it forbids.
 
-What is still not measured is a **stack frame**. Runtime RAM now composes four terms §04
-names, and a deeper call chain is none of them: it moves no writable section and no type
-size. The report says so where it prints the total, rather than printing "runtime RAM: ok".
+What is still not measured is a **stack frame**. §04 names four terms and the composition
+covers all four, with the statics delta added on top; a deeper call chain is none of them,
+because it moves no writable section and no type size. The report says so where it prints the total, rather than printing "runtime RAM: ok".
 
 The report schema is 3. `runtime` is absent from a base-branch report, because
 `measure_baseline` links that worktree with *this* binary and can no more read its context
@@ -112,6 +116,23 @@ for a measurement it declines to transcribe — `waymaker-fault` and `waymaker-r
 other two, for the write-amplification figure. The gate is unaffected:
 `check_dependency_direction` iterates `policy::LAYERS` and `xtask` is `policy::HOST_TOOLS`,
 so this grants no layer anything.
+
+That edge does cost one thing, and
+[ADR 0032](0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md) named it
+before it existed. `waymaker-drive`'s `without-facade` is a negative feature, and the stated
+reason it was safe was that nothing depended on the crate. Something does now. Feature
+unification would take `ota` out of the crate `xtask` reads its context term from — so
+enabling `without-facade` workspace-wide breaks the `xtask` build. No build does: the
+`drive-facadeless` stage selects it with `-p waymaker-drive`, which unifies with nothing. The
+failure would be a compile error rather than a quiet zero, which is the direction to fail in,
+and the manifest comment says so where the feature is declared.
+
+Two things the gate still does not know. The registry of workflow futures is a list somebody
+writes, where `kernel_state_types!` applies its own assertion to every type it registers — a
+second `async fn` workflow joins neither the registry nor the context assertion, and no rule
+notices. And `runtime_ram_change` always reports "not compared", for `kernel_state_change`'s
+reason: only the head binary can read a type size, so a future that grew is visible in the run
+that measured it and in no diff.
 
 ## Alternatives considered
 

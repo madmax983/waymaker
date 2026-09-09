@@ -97,13 +97,13 @@ budget is measured against.
 
 ## Budgets
 
-| Budget | v0.1 target |
+| Budget | Target |
 | --- | --- |
 | Runtime RAM | ≤ 768 B with a 512 B scratch page — composed: the scratch page, the kernel-state registry, the context, and the gated rows' statics |
 | Kernel state | ≤ 128 B (`waymaker-core` only, no page buffer) |
-| Context | ≤ 128 B — what kernel state leaves of runtime RAM after the scratch page ([ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md)) |
+| Context (not a §04 row; §04 names it as a runtime RAM *term*) | ≤ 128 B — what kernel state leaves of runtime RAM after the scratch page ([ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md)) |
 | Incremental code flash | ≤ 12 KiB core + flash adapter on `thumbv6m-none-eabi` (§04 states 8 KiB as a *v0.1* target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raised it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for the capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the probe's own arithmetic) |
-| Incremental code flash, with the façade | ≤ 13 KiB for the three layers on `thumbv6m-none-eabi` — the façade's own ceiling rather than a raise of the row above ([ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md)) |
+| Incremental code flash, with the façade (not a §04 row) | ≤ 13 KiB for the three layers on `thumbv6m-none-eabi` — the façade's own ceiling rather than a raise of the row above ([ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md)) |
 | Persistent flash | Two erase blocks minimum |
 | Effect payload | Compile-time / application bound |
 
@@ -256,9 +256,10 @@ Generated workflow futures are reported in a section of their own and summed int
 §04 excludes user workflow memory from the budget, and a small context must not be able to
 hide a large state machine. A report that names none is a failure rather than a pass.
 
-What runtime RAM still does not see is a **stack frame**. The four terms above are the four
-§04 names, and a deeper call chain is none of them: it moves no writable section and no type
-size. The report says so where it prints the total rather than printing "runtime RAM: ok";
+What runtime RAM still does not see is a **stack frame**. §04 names four terms — cursor,
+context, record header, storage scratch — and the composition covers all four: the cursor and
+the record header are the kernel-state registry, and the statics term is added on top. A
+deeper call chain is none of them: it moves no writable section and no type size. The report says so where it prints the total rather than printing "runtime RAM: ok";
 stack accounting needs a call graph and arrives with the code that has one. The context and
 the future figures are host sizes, which are upper bounds on the target's, and the report
 labels them as such.

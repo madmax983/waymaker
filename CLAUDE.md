@@ -437,9 +437,11 @@ Seven crates are in the workspace and are *not* layers:
 
 ## Budgets
 
-Design document §04. The first three live in `waymaker_core::budget` and are gated by
+Design document §04. Every row but the last lives in `waymaker_core::budget` and is gated by
 `cargo xtask size` — the numbers are in the kernel rather than in the gate, because a budget
-in two places is a budget that ends up disagreeing with itself. The fourth,
+in two places is a budget that ends up disagreeing with itself. Two of the rows are not §04's
+own and say so: the context is a *term* §04 names inside runtime RAM, and the façade's
+code-flash ceiling is a crate §04's row does not cover. The last row,
 persistent flash, no longer has no gate behind it: `bank::BankLayout::new` refuses a device
 of fewer than two erase blocks, which is §04's "two erase blocks minimum" as a build-time
 refusal rather than a sentence — though it is still not a *measurement*, because there is no
@@ -992,7 +994,8 @@ Stated so that nobody mistakes silence for coverage:
   `waymaker-core` is a compile error in them. That is the compiler rather than this rule, and
   saying so is better than a row that reads as though the rule prevented it.
 - **That the synchronous driver is a driver anything is obliged to use.** `waymaker-drive` is
-  above the layers and nothing depends on it, so it demonstrates that the boundary is
+  above the layers, and the one crate that depends on it is `xtask`, which reads two numbers
+  out of it. So it demonstrates that the boundary is
   sufficient rather than obliging a future dispatcher to go through it. That is rung 0.4's,
   and it is the same standing as "nothing obliges a future dispatcher to use the gated
   writer".
@@ -1240,6 +1243,16 @@ Stated so that nobody mistakes silence for coverage:
   [#38](https://github.com/madmax983/waymaker/issues/38) is where each further example joins
   it. A handle held across three boundaries is a discipline the OTA example demonstrates
   rather than one anything enforces.
+- **That the workflow-future registry is complete.** `WORKFLOW_FUTURES` is a list somebody
+  writes, unlike `kernel_state_types!`, which applies its own assertion to every type it
+  registers. A second `async fn` workflow, or a second concrete `Ctx<_, D, J>`, joins neither
+  the registry nor `assert_context_size!`, and no rule notices. `ota_update` is the only
+  `async fn` workflow here today, so the registry is exhaustive as a fact rather than as a
+  guarantee.
+- **That a workflow future's growth is noticed between runs.** The size report's base-branch
+  diff cannot read the base checkout's registry, for `kernel_state_change`'s reason — the
+  head binary is the only one that can read a type size — so `runtime_ram_change` always says
+  "not compared". A future that grew is visible in the run that measured it and nowhere else.
 - **A stack frame.** Runtime RAM is now composed rather than sampled — the caller's scratch
   page, the kernel-state registry, the context, and the gated rows' statics, gated against
   §04's 768 B. A deeper call chain is none of those four: it moves no writable section and no
