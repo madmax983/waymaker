@@ -41,9 +41,14 @@ pub const LAYERS: &[LayerSpec] = &[
     LayerSpec {
         name: "waymaker-embassy",
         may_depend_on: &["waymaker-core", "waymaker-flash"],
-        // Rung 0.4 adds the Embassy crates the facade actually needs. Until then the
-        // facade is as dependency-free as the layers below it.
-        may_depend_on_external: &[],
+        // The designed escape hatch, used narrowly. Issue #37's codec helpers are
+        // optional dependencies. Only a non-default feature enables one, and
+        // `codec-is-optional` keeps that true. Two of these five names are chosen:
+        // `serde` and `postcard`. Three are their closure: `serde_core` under serde,
+        // `cobs` under postcard, `thiserror` under cobs. Proc macros are absent because
+        // `illegal_reach_paths` does not walk through one. They run on the build host and
+        // add no bytes to an image. Rung 0.4 adds the Embassy crates here.
+        may_depend_on_external: &["cobs", "postcard", "serde", "serde_core", "thiserror"],
         must_not_own: "on-media authority or hidden global state",
     },
 ];

@@ -75,6 +75,8 @@ fn probe() -> usize {
     let mut kept = core::hint::black_box(0_usize);
     kept = kept.wrapping_add(engine());
     kept = kept.wrapping_add(facade());
+    kept = kept.wrapping_add(codec_bridge());
+    kept = kept.wrapping_add(codec_postcard());
     core::hint::black_box(kept)
 }
 
@@ -2027,6 +2029,85 @@ fn ctx_facade() -> usize {
 #[cfg(not(feature = "facade"))]
 #[inline(never)]
 fn facade() -> usize {
+    core::hint::black_box(0)
+}
+
+/// Issue #37's codec bridge, driven over a format the probe supplies.
+///
+/// The probe supplies the format, because the bridge is what this row measures:
+/// `waymaker-embassy/serde` names serde's data model and no format, so the row has nothing
+/// else to reach. The format is real. It reads one byte through serde's value deserializer.
+/// A format that always fails lets the optimiser remove the success path, and the row then
+/// measures code that does not run.
+#[cfg(feature = "embassy-serde")]
+#[inline(never)]
+fn codec_bridge() -> usize {
+    use waymaker_embassy::Decode as _;
+    use waymaker_embassy::decode::serde::de::IntoDeserializer as _;
+    use waymaker_embassy::decode::{Coded, DeserializeOwned, Format};
+
+    /// One byte, through serde's smallest deserializer.
+    struct OneByte;
+
+    impl Format for OneByte {
+        type Error = waymaker_embassy::decode::serde::de::value::Error;
+
+        fn read<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error> {
+            T::deserialize(bytes.first().copied().unwrap_or(0).into_deserializer())
+        }
+    }
+
+    let bytes = core::hint::black_box(b"\x07".as_slice());
+    let kept = match Coded::<OneByte, u8>::decode(bytes) {
+        Ok(value) => usize::from(value.into_inner()),
+        Err(_refused) => 1,
+    };
+    core::hint::black_box(kept)
+}
+
+/// Issue #37's postcard format, driven over bytes the optimiser cannot see through.
+///
+/// This is the row §04 asks for by name. The `over base` column, measured against the
+/// `facade` row, is what postcard costs a firmware in code flash.
+#[cfg(feature = "embassy-postcard")]
+#[inline(never)]
+fn codec_postcard() -> usize {
+    use waymaker_embassy::Decode as _;
+    use waymaker_embassy::decode::FromPostcard;
+
+    /// The one answer type this row instantiates. `Format::read` is generic, so a second
+    /// type is a second deserializer: the row is a floor, not a per-feature figure.
+    type Answer = FromPostcard<(u8, u16)>;
+
+    let bytes = core::hint::black_box(b"\x07\x2a".as_slice());
+    let kept = match Answer::decode(bytes) {
+        Ok(value) => {
+            // `clone` is the wrapper's other public function, and `size-probe-reach` asks
+            // for a call to it. Taken as a function pointer, the way the engine row takes
+            // the two `Display::fmt` bodies: `(u8, u16)` is `Copy`, so a `.clone()` here is
+            // `clippy::clone_on_copy` — which the probe-lint stage now sees, because it
+            // selects this row. The pointer keeps the impl body for measurement either way.
+            let duplicate: fn(&Answer) -> Answer = Clone::clone;
+            core::hint::black_box(duplicate);
+            let (first, second) = value.into_inner();
+            usize::from(first).wrapping_add(usize::from(second))
+        }
+        Err(_refused) => 1,
+    };
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in an image built without postcard.
+#[cfg(not(feature = "embassy-postcard"))]
+#[inline(never)]
+fn codec_postcard() -> usize {
+    core::hint::black_box(0)
+}
+
+/// Nothing, in an image built without the codec bridge.
+#[cfg(not(feature = "embassy-serde"))]
+#[inline(never)]
+fn codec_bridge() -> usize {
     core::hint::black_box(0)
 }
 

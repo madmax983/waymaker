@@ -55,6 +55,7 @@ pub const RULES: &[&str] = &[
     "cargo-config-profile",
     "ci-pipeline",
     "claude-md",
+    "codec-is-optional",
     "commit-discipline",
     "crate-attributes",
     "ctx-facade",
@@ -319,6 +320,10 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.driver_sources,
     ));
     violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));
+    violations.extend(source::check_codec_is_optional(
+        &inputs.layer_sources,
+        &inputs.member_manifests,
+    ));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -894,6 +899,7 @@ mod tests {
             "cargo-config-profile",
             "ci-pipeline",
             "claude-md",
+            "codec-is-optional",
             "commit-discipline",
             "crate-attributes",
             "ctx-facade",
@@ -1172,6 +1178,21 @@ mod tests {
                 contents: source::tests_support::clean_checksum_module(),
             },
         ]
+        .into_iter()
+        .chain(clean_facade_sources())
+        .collect()
+    }
+
+    /// The façade's own files, which the layer-source rules read.
+    ///
+    /// `codec-is-optional` fails closed when the codec module is gone, because a pin whose
+    /// file is absent checks nothing.
+    fn clean_facade_sources() -> Vec<size::LayerSource> {
+        vec![size::LayerSource {
+            crate_name: source::CODEC_CRATE.to_owned(),
+            path: format!("crates/{}", source::CODEC_PATH),
+            contents: source::tests_support::clean_codec_module(),
+        }]
     }
 
     /// Inputs describing a workspace every rule accepts.
@@ -1188,10 +1209,15 @@ mod tests {
             // left them out would describe a workspace in which those rules never ran.
             member_manifests: policy::checked_members()
                 .map(|name| {
-                    (
-                        name.to_owned(),
-                        "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n".to_owned(),
-                    )
+                    // The façade's own manifest carries the codec features, because
+                    // `codec-is-optional` reads what they enable and whether the two
+                    // dependencies are optional.
+                    let contents = if name == source::CODEC_CRATE {
+                        source::tests_support::clean_codec_manifest()
+                    } else {
+                        "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n".to_owned()
+                    };
+                    (name.to_owned(), contents)
                 })
                 .collect(),
             crate_sources: policy::checked_members()

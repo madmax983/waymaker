@@ -38,6 +38,12 @@ engine = ["dep:waymaker-core", "dep:waymaker-flash"]
 # The async façade on top of the engine, measured separately so that its cost is its own
 # line rather than part of the kernel's.
 facade = ["engine", "dep:waymaker-embassy"]
+# The mirrors of the façade's own optional features. A `--features waymaker-embassy/serde`
+# on the command line enables that feature and defines no `cfg` here, so the probe could
+# not write a call the row turns on and the row would measure an image it never reached.
+# `cargo xtask check-layering` requires one of these per layer feature.
+embassy-serde = ["facade", "waymaker-embassy/serde"]
+embassy-postcard = ["embassy-serde", "waymaker-embassy/postcard"]
 
 [lints]
 workspace = true

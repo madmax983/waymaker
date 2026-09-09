@@ -104,6 +104,37 @@ pub const STAGES: &[Stage] = &[
         why: "no behavior ships without a test",
     },
     Stage {
+        name: "codec-lint",
+        job: "check",
+        // Every stage above passes `--no-default-features`, so issue #37's optional codec
+        // helpers are compiled by none of them: they would ship unlinted and untested while
+        // the build stayed green. `--all-targets` so that the tests below are linted too.
+        //
+        // `postcard` enables `serde`, so one selection covers both features.
+        command: "cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings",
+        in_hook: false,
+        why: "issue #37: the optional codec helpers are compiled by no other stage, so nothing else lints them",
+    },
+    Stage {
+        name: "codec-test",
+        job: "check",
+        // Every target, not `--test codec`: the `compile_fail` doctest on `FromPostcard` is
+        // what says a borrowed `T` cannot reach a workflow, and a doctest runs nowhere else.
+        command: "cargo test --locked -p waymaker-embassy --features postcard",
+        in_hook: false,
+        why: "issue #37: no behavior ships without a test, and a feature-gated one needs a stage that enables the feature",
+    },
+    Stage {
+        name: "codec-docs",
+        job: "check",
+        // The `docs` stage passes `--no-default-features`, so the codec module's rustdoc —
+        // its intra-doc links included — is built by nothing. `RUSTDOCFLAGS=-D warnings` is
+        // in the workflow's env block and applies here as it does there.
+        command: "cargo doc --locked -p waymaker-embassy --no-deps --features postcard",
+        in_hook: false,
+        why: "issue #37: the codec module's documentation is built by no other stage, so a broken intra-doc link in it fails nothing",
+    },
+    Stage {
         name: "docs",
         job: "check",
         command: "cargo doc --locked --workspace --no-deps --no-default-features",
@@ -183,6 +214,16 @@ pub const STAGES: &[Stage] = &[
         why: "issue #35: no synchronous-driver module outside the fa\u{e7}ade edge needs the fa\u{e7}ade, as a compile rather than a text search",
     },
     Stage {
+        name: "codec-firmware",
+        job: "firmware",
+        // The claim issue #37 makes is that a codec is optional, not that it is host-only:
+        // a firmware that enables `postcard` still has to link. `--lib` for the reason the
+        // three stages above give — it is the library a board links.
+        command: "cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi",
+        in_hook: false,
+        why: "issue #37: a codec helper that only builds on the host is not an option a firmware has",
+    },
+    Stage {
         name: "probe-lint",
         job: "firmware",
         // The size probe's binary is behind `required-features`, so the `lint` stage above
@@ -194,8 +235,14 @@ pub const STAGES: &[Stage] = &[
         //
         // On the firmware target and with the features on, because that is the only
         // configuration in which a `#![no_main]` crate with a `#[panic_handler]` links at
-        // all. `facade` implies `engine`, so this covers all three layers.
-        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings",
+        // all.
+        //
+        // `embassy-postcard` rather than `facade`, because it is the widest selection the
+        // probe has: it implies `embassy-serde`, which implies `facade`, which implies
+        // `engine`. Under `facade` alone the two codec rows compile to their empty
+        // `#[cfg(not(..))]` stubs, so the bodies the size job links were linted by nothing
+        // — Codex round 1 found that, and a `Vec` in `codec_postcard` passed this stage.
+        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings",
         in_hook: false,
         why: "the probe's crate attributes are checked by the layering gate and by no compiler without this",
     },

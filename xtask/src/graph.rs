@@ -99,6 +99,13 @@ pub struct Package {
     pub source: Option<String>,
     /// Whether the package has a `build.rs`.
     pub has_build_script: bool,
+    /// Whether the package's only library target is a procedural macro.
+    ///
+    /// A proc macro is compiled for the *host* and runs at build time, so none of its code
+    /// is in a firmware image. [`PackageGraph::illegal_reach_paths`] therefore does not
+    /// walk through one: charging a layer for `syn` would be charging it for bytes no
+    /// linker ever sees.
+    pub is_proc_macro: bool,
     /// The package's binary targets.
     pub bins: Vec<BinTarget>,
 }
@@ -115,6 +122,7 @@ impl Package {
             manifest_deps: Vec::new(),
             default_features: Vec::new(),
             features: Vec::new(),
+            is_proc_macro: false,
             resolved_deps: Vec::new(),
             manifest_path: None,
             lib_source_path: None,
@@ -323,6 +331,15 @@ impl PackageGraph {
             let mut path = path;
             path.push(package.name.clone());
 
+            // A procedural macro runs on the build host. It adds no bytes to a firmware
+            // image. The crates it depends on also add none: `thiserror-impl` depends on
+            // `syn`, `quote` and `proc-macro2`, and the linker uses none of them. To report
+            // them makes a layer's allowlist a list of build tooling, which is not what the
+            // column means.
+            if package.is_proc_macro {
+                continue;
+            }
+
             if package.name == name || allowed.contains(package.name.as_str()) {
                 for next in &package.resolved_deps {
                     queue.push_back((next.as_str(), path.clone()));
@@ -423,6 +440,7 @@ impl PackageGraph {
             let lib_source_path = lib_target_source(value);
             let source = string_field(value, "source");
             let has_build_script = has_target_kind(value, "custom-build");
+            let is_proc_macro = has_target_kind(value, "proc-macro");
             let bins = bin_targets(value);
 
             packages.push(Package {
@@ -436,6 +454,7 @@ impl PackageGraph {
                 lib_source_path,
                 source,
                 has_build_script,
+                is_proc_macro,
                 bins,
             });
         }
@@ -1170,6 +1189,75 @@ mod tests {
             "waymaker-core".to_owned(),
             "banned".to_owned()
         ]));
+    }
+
+    #[test]
+    fn a_proc_macro_and_what_it_reaches_are_not_a_layers_dependencies() {
+        // `thiserror` brings `thiserror-impl`, which brings `syn`. None of the last two is
+        // in a firmware image, so neither is a reach this rule is about.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-embassy").with_dependency("thiserror", DepKind::Normal),
+            Package::new("thiserror").with_dependency("thiserror-impl", DepKind::Normal),
+            Package {
+                is_proc_macro: true,
+                ..Package::new("thiserror-impl").with_dependency("syn", DepKind::Normal)
+            },
+            Package::new("syn"),
+        ]);
+
+        let allowed = core::iter::once("thiserror").collect();
+
+        assert!(
+            graph
+                .illegal_reach_paths("waymaker-embassy", &allowed)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_crate_a_proc_macro_also_reaches_is_still_reported_by_its_normal_path() {
+        // The whole weakening rests on the `continue` sitting after the visited-set insert
+        // and before the children are queued. A package reachable both ways must still be
+        // reported, whichever edge the walk meets first.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-embassy")
+                .with_dependency("thiserror-impl", DepKind::Normal)
+                .with_dependency("serde", DepKind::Normal),
+            Package {
+                is_proc_macro: true,
+                ..Package::new("thiserror-impl").with_dependency("smuggled", DepKind::Normal)
+            },
+            Package::new("serde").with_dependency("smuggled", DepKind::Normal),
+            Package::new("smuggled"),
+        ]);
+
+        let allowed = core::iter::once("serde").collect();
+        let paths = graph.illegal_reach_paths("waymaker-embassy", &allowed);
+
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.last() == Some(&"smuggled".to_owned())),
+            "a crate a proc macro also reaches is still linked by its normal path: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_proc_macro_a_layer_depends_on_directly_is_still_not_a_reach() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-embassy").with_dependency("serde_derive", DepKind::Normal),
+            Package {
+                is_proc_macro: true,
+                ..Package::new("serde_derive")
+            },
+        ]);
+
+        assert!(
+            graph
+                .illegal_reach_paths("waymaker-embassy", &BTreeSet::new())
+                .is_empty(),
+            "a direct edge is `dependency-direction`'s, and it reads the manifest"
+        );
     }
 
     #[test]

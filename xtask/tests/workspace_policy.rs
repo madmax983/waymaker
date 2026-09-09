@@ -67,12 +67,35 @@ fn the_three_firmware_crates_exist_and_are_layered() {
         core::iter::once("waymaker-core".to_owned()).collect(),
         "waymaker-flash may only reach waymaker-core"
     );
+    // The façade reaches more than the two crates below it since issue #37, and every
+    // extra name is one of two things: a codec an optional feature enables, or a proc
+    // macro one of those builds with. The proc macros run on the build host and are in no
+    // firmware image, which is why `dependency-direction-transitive` does not walk through
+    // one — but `transitive_dependencies` does, so they are named here. Spelled out rather
+    // than derived from `policy::LAYERS`, so that a dependency arriving from a registry
+    // crate's own update is a line somebody has to write.
     assert_eq!(
         graph.transitive_dependencies("waymaker-embassy"),
-        ["waymaker-core".to_owned(), "waymaker-flash".to_owned()]
-            .into_iter()
-            .collect(),
-        "waymaker-embassy may only reach the two crates below it"
+        [
+            "cobs",
+            "postcard",
+            "proc-macro2",
+            "quote",
+            "serde",
+            "serde_core",
+            "serde_derive",
+            "syn",
+            "thiserror",
+            "thiserror-impl",
+            "unicode-ident",
+            "waymaker-core",
+            "waymaker-flash",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "waymaker-embassy reaches the two crates below it, issue #37's codecs, and the \
+         proc macros those build with"
     );
 }
 

@@ -67,6 +67,17 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --no-default-features
 
+      # Every stage above passes --no-default-features, so issue #37's optional codec
+      # helpers are compiled by none of them.
+      - name: Codec lint
+        run: cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings
+
+      - name: Codec test
+        run: cargo test --locked -p waymaker-embassy --features postcard
+
+      - name: Codec docs
+        run: cargo doc --locked -p waymaker-embassy --no-deps --features postcard
+
       - name: Docs
         run: cargo doc --locked --workspace --no-deps --no-default-features
 
@@ -134,12 +145,21 @@ jobs:
       - name: Build the synchronous driver with the façade removed
         run: cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
 
+      # Issue #37's codec helpers are optional, not host-only: a firmware that enables
+      # `postcard` still has to link for the part.
+      - name: Build the façade's codec helpers for the firmware target
+        run: cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
+
       # The size probe's binary is behind `required-features`, so the `check` job's clippy
       # stage — `--all-targets` on the host — never compiles it. Without this step the
       # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and
       # `#![warn(missing_docs)]` present while no compiler has ever acted on them.
+      #
+      # `embassy-postcard` is the probe's widest selection and implies `facade`. Under
+      # `facade` alone the codec rows compile to their empty stubs and the bodies the size
+      # job links are linted by nothing.
       - name: Lint the size probe on the firmware target
-        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 
   size:
     # Design document §04: "CI records section sizes for every feature combination" and
