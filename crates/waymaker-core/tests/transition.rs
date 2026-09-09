@@ -399,7 +399,14 @@ fn a_matching_request_diverges_from_nothing() {
 /// the same reason it gives: distinct-and-non-empty is satisfied by two messages that have
 /// been swapped, and a swapped message names the wrong refusal in the one place — a firmware
 /// log with no debugger attached — where nobody can go and check.
-const EVERY_DIVERGENCE: [(Divergence, &str); 4] = [
+///
+/// All seven, and the count is the point. This list held four while `Divergence` had six:
+/// issue #33's `BoundaryKind` and `Deadline` were never added, so their strings were pinned
+/// nowhere and a swap between them compiled and passed. Issue #40's `Gate` would have been
+/// the third. The in-crate `EVERY_DIVERGENCE`/`divergence_index` guard forces a new
+/// *variant* to be listed there and says nothing about messages, so it does not backstop
+/// this — which is why the whole set is written out here rather than the new row alone.
+const EVERY_DIVERGENCE: [(Divergence, &str); 7] = [
     (
         Divergence::Sequence,
         "the effect is not the one history recorded here",
@@ -411,6 +418,18 @@ const EVERY_DIVERGENCE: [(Divergence, &str); 4] = [
     (
         Divergence::Digest,
         "a different activity input than history recorded",
+    ),
+    (
+        Divergence::BoundaryKind,
+        "a different kind of boundary than history recorded",
+    ),
+    (
+        Divergence::Gate,
+        "a different version gate than history recorded",
+    ),
+    (
+        Divergence::Deadline,
+        "a different deadline than history recorded",
     ),
     (
         Divergence::Boundary,
@@ -428,7 +447,8 @@ fn every_divergence_carries_the_message_it_was_given() {
 #[test]
 fn every_divergence_message_is_non_empty_ascii_and_distinct() {
     // The postcondition `Divergence::message` states: short enough for a firmware log line,
-    // ASCII so it survives one, and distinct so a log can say which of four causes happened.
+    // ASCII so it survives one, and distinct so a log can say which of seven causes
+    // happened.
     const MESSAGE_LIMIT: usize = 60;
 
     for (left_index, (left, _)) in EVERY_DIVERGENCE.iter().enumerate() {
