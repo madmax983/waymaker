@@ -23,6 +23,7 @@ use waymaker_drive::{
     Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
+use waymaker_embassy::dispatch::Produced;
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};
@@ -143,7 +144,7 @@ impl ActivityDispatcher for Fleet {
         kind: ActivityKind,
         _input: &[u8],
         out: &mut [u8],
-    ) -> Poll<Result<usize, NoNetwork>> {
+    ) -> Poll<Result<Produced, NoNetwork>> {
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
@@ -163,7 +164,7 @@ impl ActivityDispatcher for Fleet {
             return Poll::Ready(Err(NoNetwork));
         };
         into.copy_from_slice(from);
-        Poll::Ready(Ok(answer.len()))
+        Poll::Ready(Ok(Produced::Completed(answer.len())))
     }
 }
 

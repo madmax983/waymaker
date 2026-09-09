@@ -62,6 +62,7 @@ pub const RULES: &[&str] = &[
     "dependency-direction",
     "dependency-direction-transitive",
     "diagrams",
+    "dispatch-wiring",
     "effect-protocol",
     "effect-scheduled-fields",
     "embassy-below-facade",
@@ -317,6 +318,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.layer_sources,
         &inputs.driver_sources,
     ));
+    violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
 
     violations.sort();
@@ -899,6 +901,7 @@ mod tests {
             "dependency-direction",
             "dependency-direction-transitive",
             "diagrams",
+            "dispatch-wiring",
             "effect-protocol",
             "effect-scheduled-fields",
             "embassy-below-facade",
@@ -1091,6 +1094,18 @@ mod tests {
                 crate_name: "waymaker-embassy".to_owned(),
                 path: format!("crates/{}", source::CTX_JOURNAL_PATH),
                 contents: source::tests_support::clean_ctx_journal(),
+            },
+            // And issue #36's dispatcher and its wiring, which `dispatch-wiring` pins in
+            // both halves and which fail closed when either module is absent.
+            size::LayerSource {
+                crate_name: "waymaker-embassy".to_owned(),
+                path: format!("crates/{}", source::DISPATCH_PATH),
+                contents: source::tests_support::clean_dispatch_module(),
+            },
+            size::LayerSource {
+                crate_name: "waymaker-embassy".to_owned(),
+                path: format!("crates/{}", source::WIRING_PATH),
+                contents: source::tests_support::clean_wiring_module(),
             },
             // And the kernel's crate root, which `timer-capability` reads to check that the
             // types its member pin found are the ones the crate re-exports. A pin that only

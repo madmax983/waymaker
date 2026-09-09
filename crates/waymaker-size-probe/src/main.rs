@@ -1768,6 +1768,7 @@ fn ctx_facade() -> usize {
     use waymaker_core::timer::TimerSpec;
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
     use waymaker_embassy::ctx::{Conclusion, Ctx, Failure, TerminalFuture};
+    use waymaker_embassy::dispatch::Produced;
     use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
 
     /// A stand-in durable half. It writes nothing; the probe is never run.
@@ -1786,10 +1787,13 @@ fn ctx_facade() -> usize {
                     self.kept.get(..self.held).unwrap_or_default(),
                 )));
             }
-            Ok(Handoff::Dispatch(EffectId {
-                run: RunId(core::hint::black_box(1)),
-                seq: EffectSeq(core::hint::black_box(0)),
-            }))
+            Ok(Handoff::Dispatch {
+                id: EffectId {
+                    run: RunId(core::hint::black_box(1)),
+                    seq: EffectSeq(core::hint::black_box(0)),
+                },
+                result_bytes: core::hint::black_box(4),
+            })
         }
 
         fn resolve(&mut self, answer: Answer<'_>) -> Result<Outcome<'_>, Halted> {
@@ -1838,7 +1842,7 @@ fn ctx_facade() -> usize {
             _kind: ActivityKind,
             _input: &[u8],
             out: &mut [u8],
-        ) -> Poll<Result<usize, usize>> {
+        ) -> Poll<Result<Produced, usize>> {
             if core::hint::black_box(self.0) == 0 {
                 return Poll::Pending;
             }
@@ -1849,7 +1853,12 @@ fn ctx_facade() -> usize {
                 return Poll::Ready(Err(self.0));
             };
             *first = 7;
-            Poll::Ready(Ok(1))
+            // Both shapes, so neither arm of the façade's bound check folds away.
+            Poll::Ready(Ok(if core::hint::black_box(self.0) == 2 {
+                Produced::Failed(1)
+            } else {
+                Produced::Completed(1)
+            }))
         }
     }
 
@@ -1927,7 +1936,84 @@ fn ctx_facade() -> usize {
         None => 11,
     });
 
+    core::hint::black_box(kept.wrapping_add(dispatch_wiring()))
+}
+
+/// Issue #36's dispatch table, driven once per public function.
+///
+/// It exists here because `waymaker-drive`'s OTA example implements
+/// [`ActivityDispatcher`](waymaker_embassy::ActivityDispatcher) by hand, so nothing else in
+/// the workspace monomorphises the table — and a `facade` row that charged for a generic
+/// nobody names would be charging for nothing. `size-probe-reach` is what makes that a
+/// build failure rather than a habit.
+#[cfg(feature = "facade")]
+#[inline(never)]
+fn dispatch_wiring() -> usize {
+    use core::task::{Context as Task, Poll, Waker};
+
+    use waymaker_core::{ActivityKind, EffectId, EffectSeq, RunId};
+    use waymaker_embassy::ActivityDispatcher;
+    use waymaker_embassy::dispatch::Produced;
+    use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+
+    /// A stand-in world. The probe is never run.
+    struct Fleet(usize);
+
+    fn fetch(
+        world: &mut Fleet,
+        _task: &mut Task<'_>,
+        id: EffectId,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Poll<Result<Produced, usize>> {
+        if core::hint::black_box(world.0) == 0 {
+            return Poll::Pending;
+        }
+        let Some(first) = out.first_mut() else {
+            return Poll::Ready(Err(world.0));
+        };
+        *first = 7;
+        Poll::Ready(Ok(if core::hint::black_box(id.seq.0) == 3 {
+            Produced::Failed(input.len())
+        } else {
+            Produced::Completed(1)
+        }))
+    }
+
+    const ROWS: &[Activity<Fleet, usize>] = &[Activity::new(ActivityKind(1), "fetch", fetch)];
+
+    let mut table = Table::over(Fleet(core::hint::black_box(1)), ROWS);
+    let mut out = [0_u8; 4];
+    let mut task = Task::from_waker(Waker::noop());
+    let asked = ActivityKind(core::hint::black_box(1));
+    let mut kept = match table.poll_dispatch(
+        &mut task,
+        EffectId {
+            run: RunId(core::hint::black_box(1)),
+            seq: EffectSeq(core::hint::black_box(0)),
+        },
+        asked,
+        core::hint::black_box(b"in"),
+        &mut out,
+    ) {
+        Poll::Ready(Ok(Produced::Completed(len) | Produced::Failed(len))) => len,
+        Poll::Ready(Err(Unhandled::Activity(reason))) => reason,
+        Poll::Ready(Err(Unhandled::NoSuchActivity(kind))) => usize::from(kind.0),
+        Poll::Pending => 1,
+    };
+    kept = kept.wrapping_add(table.name_of(asked).map_or(0, str::len));
+    kept = kept.wrapping_add(table.world().0);
+    table.world_mut().0 = core::hint::black_box(2);
+    kept = kept.wrapping_add(ROWS.first().map_or(0, |row| usize::from(row.kind().0)));
+    kept = kept.wrapping_add(ROWS.first().map_or(0, |row| row.name().len()));
     core::hint::black_box(kept)
+}
+
+/// Nothing, in an image built without the façade.
+#[cfg(not(feature = "facade"))]
+#[inline(never)]
+fn dispatch_wiring() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Nothing, in an image built without the façade.

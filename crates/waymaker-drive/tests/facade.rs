@@ -105,7 +105,10 @@ impl Workflow for Misusing {
             }
             Misuse::ScheduleTwice => {
                 let first = boundary.schedule(DOWNLOAD, b"one")?;
-                assert!(matches!(first, Handoff::Dispatch(_)), "the first schedules");
+                assert!(
+                    matches!(first, Handoff::Dispatch { .. }),
+                    "the first schedules"
+                );
                 boundary.schedule(DOWNLOAD, b"two")?;
             }
         }
@@ -170,7 +173,7 @@ fn a_caller_that_ends_the_run_with_an_effect_outstanding_is_refused_by_name() {
         }
 
         fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-            let Ok(Handoff::Dispatch(_)) = boundary.schedule(DOWNLOAD, b"one") else {
+            let Ok(Handoff::Dispatch { .. }) = boundary.schedule(DOWNLOAD, b"one") else {
                 return Ok(Outcome::Failed(b"schedule"));
             };
             // The effect is committed and outstanding, and this says the run is over.
@@ -280,7 +283,8 @@ impl Workflow for Bridging {
             Bridged::FailedEffect | Bridged::ExhaustedEffect => {
                 // Each `else` is a way this could go wrong, named so the test that reads
                 // the outcome says which. A panicking helper is denied here.
-                let Ok(waymaker_embassy::Handoff::Dispatch(_)) = bridge.schedule(DOWNLOAD, b"one")
+                let Ok(waymaker_embassy::Handoff::Dispatch { .. }) =
+                    bridge.schedule(DOWNLOAD, b"one")
                 else {
                     return Ok(Outcome::Failed(b"schedule"));
                 };

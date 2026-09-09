@@ -41,6 +41,7 @@ be superseded.
 | [0030](0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md) | A timer is a boundary, and its clock kind is on media | accepted |
 | [0031](0031-a-persistent-clock-is-two-registers-and-the-board-run-is-a-checked-absence.md) | A persistent clock is two registers, and the board run is a checked absence | accepted |
 | [0032](0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md) | The façade is four futures over a durable half it does not own | accepted |
+| [0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md) | The dispatcher answers in a bound the journal states, and a row is a number | accepted |
 
 ## Reading the numbers
 
@@ -58,7 +59,7 @@ of these are older than their numbers suggest:
 
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
-0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032.
+0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033.
 
 ## Writing one
 

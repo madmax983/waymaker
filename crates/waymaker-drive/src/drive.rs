@@ -1381,7 +1381,11 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         let bound = usize::from(reserve.bounds().effect_result_bytes);
         // An answer over the bound is exhausted rather than refused, for
         // `Context::dispatch`'s reason: the schedule record is committed, and a refusal
-        // strands the run for ever.
+        // strands the run for ever. This is the last line of defence for a caller that
+        // splits §07 itself: the façade narrows before it dispatches, but `Boundary` is
+        // public and another caller need not.
+        // `the_driver_refuses_an_over_bound_answer_a_caller_offers_it_directly` is what
+        // fails when this arm goes.
         let resolution = match answered {
             Answered::Exhausted => Resolution::Exhausted,
             Answered::Completed(bytes) | Answered::Failed(bytes) if bytes.len() > bound => {
@@ -1450,8 +1454,12 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
             }
             Decision::Dispatch(dispatchable) => {
                 let id = dispatchable.intent().id();
+                // The bound travels with the identity. `Boundary::resolve` refuses an
+                // answer over it, and a caller that never learned the figure could only
+                // discover that after the world had already produced one.
+                let result_bytes = usize::from(self.reserve.bounds().effect_result_bytes);
                 self.pending = Some(dispatchable);
-                Ok(Handoff::Dispatch(id))
+                Ok(Handoff::Dispatch { id, result_bytes })
             }
             Decision::Stop => Err(Suspended::NEW),
         }

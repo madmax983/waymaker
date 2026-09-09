@@ -48,7 +48,18 @@ pub enum Handoff<'a> {
     Replayed(Outcome<'a>),
     /// The intent is durable. Perform the effect under `id`, then call
     /// [`Boundary::resolve`].
-    Dispatch(EffectId),
+    Dispatch {
+        /// The stable `(RunId, EffectSeq)` the schedule record committed.
+        id: EffectId,
+        /// How wide an answer this run declared it can record.
+        ///
+        /// §10's `effect_result_bytes`, from the reserve that priced the bank. It travels
+        /// with the identity because the caller that performs the effect is the one that
+        /// must not produce a wider answer, and the driver is the only party that knows
+        /// the figure. Issue
+        /// [#36](https://github.com/madmax983/waymaker/issues/36).
+        result_bytes: usize,
+    },
 }
 
 /// What the world answered for the effect [`Boundary::schedule`] handed out.
@@ -190,7 +201,7 @@ pub trait Boundary {
     /// [`Driver`](crate::Driver) is pointed at a
     /// [`JournalRegion`](waymaker_flash::recovery::JournalRegion) and knows none of them,
     /// so a swap here would be a swap of a bank this driver cannot name. Issue
-    /// [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatcher is where the two
-    /// are joined.
+    /// [#110](https://github.com/madmax983/waymaker/issues/110) is where the two are
+    /// joined.
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended;
 }
