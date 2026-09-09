@@ -111,7 +111,7 @@ impl<F, T> Coded<F, T> {
 // would ask `F: Clone` of a format that is only a type-level tag. These bound `T` alone.
 //
 // There is no `Debug`. It would forward to `T`'s, which pulls `core::fmt` into a firmware
-// that only wanted to decode: 184 B to 3008 B on the `waymaker-embassy/postcard` row of
+// that only wanted to decode: 208 B to 3028 B on the `waymaker-embassy/postcard` row of
 // `cargo xtask size`, measured. A caller that wants to print the value calls `into_inner`
 // and prints the `T`, whose `Debug` is its own.
 #[cfg(feature = "serde")]

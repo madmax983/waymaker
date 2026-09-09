@@ -160,7 +160,7 @@ cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
-cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix

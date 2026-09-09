@@ -68,8 +68,8 @@ record still starts with a legal value, and replay would hand the workflow one o
 with no checksum failing.
 
 **`Coded` has no `Debug`.** It would forward to `T`'s, which pulls `core::fmt` into a
-firmware that only wanted to decode — measured, the `postcard` row goes from 184 B to
-3008 B. `Clone` and `Copy` are there, bounded on `T` alone, because a derive would ask them
+firmware that only wanted to decode — measured, the `postcard` row goes from 208 B to
+3028 B. `Clone` and `Copy` are there, bounded on `T` alone, because a derive would ask them
 of a format that is only a type-level tag. A caller that wants to print calls `into_inner`. A codec type on the crate root is a codec every workflow reads about, and
 the rule below is what keeps it there — it found this during implementation, on a crate root
 that had re-exported all four.
@@ -127,19 +127,18 @@ reads the manifest.
 
 ## Consequences
 
-**Enabling postcard costs 184 B of code flash, and enabling the bridge alone costs 32 B.**
+**Enabling postcard costs 208 B of code flash, and enabling the bridge alone costs 32 B.**
 Measured by `cargo xtask size` on `thumbv6m-none-eabi` with the release-size profile, both
 against the `facade` row. The two are *not* additive: `postcard` enables `serde`, so the
-184 B already contains the bridge's 32 B and the format above it is 152 B. The gated row — §04's "core + flash adapter" — reads 12220 B of
+208 B already contains the bridge's 32 B and the format above it is 176 B. The gated row — §04's "core + flash adapter" — reads 12220 B of
 12288, two below where [ADR 0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md)
 left it. That is not a codec making the engine smaller: it is a larger probe making the
-optimiser choose slightly differently. The feature rows show the same effect in the `layers`
-column — −2 B on the `postcard` row and −4 B on the `serde` row. The codec is above the
-gated row and costs it nothing.
+optimiser choose slightly differently — the `serde` row shows the same effect as −4 B in the
+`layers` column. The codec is above the gated row and costs it nothing.
 
 Where those bytes land is worth reading carefully, because the split does not fall where a
-reader would expect. Of postcard's 184 B, the symbol table attributes **186 B to the probe
-and −2 B to the layers**. That is not the gate failing; it is
+reader would expect. Of postcard's 208 B, the symbol table attributes **198 B to the probe
+and 10 B to the layers**. That is not the gate failing; it is
 [ADR 0029](0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md)'s
 stated limit met for the first time by code that is *entirely* generic: `Coded::decode`,
 `Format::read` and `postcard::from_bytes` are all monomorphised into the probe's call site,
@@ -148,10 +147,10 @@ the whole-image delta is the honest figure for a generic codec and the `layers` 
 not. The report prints `Δflash`, `probe` and `layers` on every row, so the reading is
 available rather than taken on trust.
 
-**The 184 B is per instantiation, not per feature.** `Format::read<T>` is generic, so each
+**The 208 B is per instantiation, not per feature.** `Format::read<T>` is generic, so each
 distinct workflow result type instantiates its own postcard deserializer. The row drives one
-`T`, `(u8, u16)`. Adding a second — `(u32, i64, bool)` — takes the row to 522 B, so the
-second type costs **338 B**, nearly twice what the first one reports. A firmware decoding three answer types
+`T`, `(u8, u16)`. Adding a second — `(u32, i64, bool)` — takes the row to 542 B, so the
+second type costs **334 B**, more than the first one reports. A firmware decoding three answer types
 pays three times, and ADR 0030 left 66 B under the gated budget. The row is a floor and is
 described as one; the alternative, driving two types in the probe, would publish a number
 that overstates the single-type case instead.

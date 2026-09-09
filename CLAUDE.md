@@ -39,7 +39,7 @@ cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
-cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
@@ -1285,14 +1285,14 @@ Stated so that nobody mistakes silence for coverage:
   `dependency-direction`'s, which reads the manifest.
 - **Which column a generic layer's bytes land in.** ADR 0029 already records that fat LTO
   can inline a layer body into a probe symbol. Issue #37's codec is the first code here that
-  is *entirely* generic, so almost all of it lands in `probe`: of postcard's 184 B the
-  symbol table attributes 186 B to the probe and −2 B to the layers. The whole-image
+  is *entirely* generic, so almost all of it lands in `probe`: of postcard's 208 B the
+  symbol table attributes 198 B to the probe and 10 B to the layers. The whole-image
   `Δflash` is the honest figure for a generic codec — a firmware pays the same way, at its
   own call sites — and the `layers` column is not. Deciding it needs a call graph.
 - **What a codec costs a firmware with more than one answer type.** `Format::read<T>` is
   generic, so each distinct result type instantiates its own deserializer. The
-  `waymaker-embassy/postcard` row drives one `T` and reports 184 B; a second type takes the
-  row to 522 B, so the marginal type costs 338 B. The row is a floor, not the figure a
+  `waymaker-embassy/postcard` row drives one `T` and reports 208 B; a second type takes the
+  row to 542 B, so the marginal type costs 334 B. The row is a floor, not the figure a
   firmware with three answer types should plan against.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
@@ -2044,9 +2044,9 @@ asking for `DeserializeOwned` makes every workflow carry the codec whatever the 
 say, with every other rule green because the run still completes.
 Both "done when"s are measured rather than argued. The default feature set pulls in no codec
 — `empty-default-features` and the `firmware` stage are what say so, and §06's OTA example
-still reads its eight-byte handle with `try_into`. And enabling postcard costs **184 B** of
+still reads its eight-byte handle with `try_into`. And enabling postcard costs **208 B** of
 code flash against the `facade` row, with the bridge alone costing 32 B — not additive, since
-`postcard` enables `serde`, so the format above the bridge is 152 B of the 184. The *gated* row —
+`postcard` enables `serde`, so the format above the bridge is 176 B of the 208. The *gated* row —
 §04's "core + flash adapter" — reads 12220 B of 12288, two below where issue #36 left it,
 which is a larger probe making the optimiser choose slightly differently rather than an
 engine that shrank.
@@ -2059,18 +2059,17 @@ tabulated, and `check_probe_mirrors` makes it compulsory three ways — a layer 
 mirror, a mirror that does not enable it, and a mirror the probe never `#[cfg]`s on each fail
 the `size-probe` rule rather than producing a quiet row of zero. `matrix` never falls back to
 the `<layer>/<feature>` spelling either, because `xtask size` runs before `check-layering` and
-a fallback would print `ok` over an unmeasured row. Where the 184 B lands
+a fallback would print `ok` over an unmeasured row. Where the 208 B lands
 is worth reading twice, and is written down rather than smoothed over: the symbol table
-charges 186 B of it to the probe and −2 B to the layers, because this codec is the first
-code here that is *entirely* generic and fat LTO monomorphises it into the probe's call
-site. That is ADR 0029's stated limit met for the first time.
+charges 198 B of it to the probe and 10 B to the layers, because this codec is very nearly
+all generic and fat LTO monomorphises it into the probe's call site. That is ADR 0029's stated limit met for the first time.
 Two decisions came out of review rather than out of writing it, and both are measurements.
 `postcard::from_bytes` reads a *prefix* — it stops at the end of a value and never asks what
 follows — so a firmware that narrowed a result type would read an old record as a plausible
 wrong value on every boot, with no checksum failing; `Format::read` uses `take_from_bytes`
 and refuses a remainder, at 28 B. And `Coded` carries no `Debug`, because one would forward
 to `T`'s and pull `core::fmt` into a firmware that only wanted to decode: the row goes from
-184 B to 3008 B. `Clone` and `Copy` are there, bounded on `T` alone.
+208 B to 3028 B. `Clone` and `Copy` are there, bounded on `T` alone.
 Four CI stages are new, and they exist because every other stage passes
 `--no-default-features`: `codec-lint`, `codec-test`, `codec-docs` and `codec-firmware` are
 what lint this code, test it, build its documentation, and build it for the part. `cargo xtask coverage` runs

@@ -235,8 +235,14 @@ pub const STAGES: &[Stage] = &[
         //
         // On the firmware target and with the features on, because that is the only
         // configuration in which a `#![no_main]` crate with a `#[panic_handler]` links at
-        // all. `facade` implies `engine`, so this covers all three layers.
-        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings",
+        // all.
+        //
+        // `embassy-postcard` rather than `facade`, because it is the widest selection the
+        // probe has: it implies `embassy-serde`, which implies `facade`, which implies
+        // `engine`. Under `facade` alone the two codec rows compile to their empty
+        // `#[cfg(not(..))]` stubs, so the bodies the size job links were linted by nothing
+        // — Codex round 1 found that, and a `Vec` in `codec_postcard` passed this stage.
+        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings",
         in_hook: false,
         why: "the probe's crate attributes are checked by the layering gate and by no compiler without this",
     },

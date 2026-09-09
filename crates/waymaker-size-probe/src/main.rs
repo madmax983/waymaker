@@ -2075,12 +2075,21 @@ fn codec_postcard() -> usize {
     use waymaker_embassy::Decode as _;
     use waymaker_embassy::decode::FromPostcard;
 
+    /// The one answer type this row instantiates. `Format::read` is generic, so a second
+    /// type is a second deserializer: the row is a floor, not a per-feature figure.
+    type Answer = FromPostcard<(u8, u16)>;
+
     let bytes = core::hint::black_box(b"\x07\x2a".as_slice());
-    let kept = match FromPostcard::<(u8, u16)>::decode(bytes) {
+    let kept = match Answer::decode(bytes) {
         Ok(value) => {
             // `clone` is the wrapper's other public function, and `size-probe-reach` asks
-            // for a call to it.
-            let (first, second) = value.clone().into_inner();
+            // for a call to it. Taken as a function pointer, the way the engine row takes
+            // the two `Display::fmt` bodies: `(u8, u16)` is `Copy`, so a `.clone()` here is
+            // `clippy::clone_on_copy` — which the probe-lint stage now sees, because it
+            // selects this row. The pointer keeps the impl body for measurement either way.
+            let duplicate: fn(&Answer) -> Answer = Clone::clone;
+            core::hint::black_box(duplicate);
+            let (first, second) = value.into_inner();
             usize::from(first).wrapping_add(usize::from(second))
         }
         Err(_refused) => 1,

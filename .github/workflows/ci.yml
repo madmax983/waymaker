@@ -154,8 +154,12 @@ jobs:
       # stage — `--all-targets` on the host — never compiles it. Without this step the
       # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and
       # `#![warn(missing_docs)]` present while no compiler has ever acted on them.
+      #
+      # `embassy-postcard` is the probe's widest selection and implies `facade`. Under
+      # `facade` alone the codec rows compile to their empty stubs and the bodies the size
+      # job links are linted by nothing.
       - name: Lint the size probe on the firmware target
-        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
+        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 
   size:
     # Design document §04: "CI records section sizes for every feature combination" and
