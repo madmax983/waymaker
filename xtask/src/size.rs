@@ -1687,7 +1687,7 @@ fn parse_kernel_state(document: &Value) -> Result<Option<KernelState>, SizeError
     if kernel_state.is_null() {
         return Ok(None);
     }
-    Ok(Some(KernelState {
+    let state = KernelState {
         total: number(kernel_state, "total")?,
         types: kernel_state
             .get("types")
@@ -1702,7 +1702,30 @@ fn parse_kernel_state(document: &Value) -> Result<Option<KernelState>, SizeError
                 Ok((name.to_owned(), number(entry, "size")?))
             })
             .collect::<Result<Vec<(String, u64)>, SizeError>>()?,
-    }))
+    };
+
+    // The writer derives the total from the registry, so a document where the two disagree
+    // is one nothing here produced. It is refused rather than recomputed, and the smaller
+    // direction is why: a stale total under the sum is charged to two budgets at once — the
+    // kernel-state gate and the runtime RAM composition — and both would pass on a figure
+    // the document's own entries contradict. `check_row_names_are_unique` refuses a
+    // self-contradicting document for the same reason.
+    let summed = state
+        .types
+        .iter()
+        .try_fold(0_u64, |sum, (_, size)| sum.checked_add(*size))
+        .ok_or_else(|| {
+            SizeError::new("the size report's kernel state types sum to more than a `u64` can hold")
+        })?;
+    if summed != state.total {
+        return Err(SizeError::new(format!(
+            "the size report's kernel state says {} B and its {} registered type(s) sum to {summed} B",
+            state.total,
+            state.types.len(),
+        )));
+    }
+
+    Ok(Some(state))
 }
 
 /// The runtime RAM section of a report, or `None` where the document has none.
@@ -4373,6 +4396,28 @@ mod tests {
         assert!(change.contains("120"), "{change}");
         assert!(change.contains("400"), "{change}");
         assert_eq!(runtime_ram_change(&base, &base), None);
+    }
+
+    #[test]
+    fn a_kernel_state_total_its_own_entries_contradict_is_refused() {
+        // A stale or edited total under the sum is charged to two budgets at once — the
+        // kernel-state gate and the runtime RAM composition — and both would pass on a
+        // figure the document's own registry contradicts.
+        for total in [Value::from(8_u64), Value::from(4_096_u64)] {
+            let mut document: serde_json::Value =
+                serde_json::from_str(&full_report(512, 0, 512, 0).to_json())
+                    .expect("the report should be JSON");
+            document
+                .get_mut("kernel_state")
+                .and_then(Value::as_object_mut)
+                .expect("the report has a kernel state")
+                .insert("total".to_owned(), total.clone());
+            let refusal = SizeReport::from_json(&document.to_string())
+                .expect_err("a self-contradicting registry must not be read");
+            let message = refusal.to_string();
+            assert!(message.contains("104"), "{total}: {message}");
+            assert!(message.contains("sum to"), "{total}: {message}");
+        }
     }
 
     #[test]
