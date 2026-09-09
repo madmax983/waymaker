@@ -2397,8 +2397,14 @@ fn a_marker_carries_its_sequence_in_the_frame_header() {
     // A marker is a boundary in the run's one ordered history, so its position is the
     // header's `effect_seq` — not `EffectSeq::FIRST`, which is what the three run-scoped
     // records are held to.
+    //
+    // The bytes at offset 4..8 are the assertion, not the round trip. An encoder and a
+    // decoder that agreed to put the sequence in the *body* would round-trip perfectly and
+    // put a marker's position where §09 says a payload is; only reading the header can tell
+    // the two apart.
+    let seq = 0xFFFF_FFFE_u32;
     let record = RecordRef::VersionMarker {
-        seq: EffectSeq(0xFFFF_FFFE),
+        seq: EffectSeq(seq),
         gate: GateId(1),
         version: 2,
     };
@@ -2406,6 +2412,12 @@ fn a_marker_carries_its_sequence_in_the_frame_header() {
     let mut page = [0_u8; SCRATCH];
     let written = frame::encode(&record, align, &mut page).expect("room for the frame");
 
+    assert_eq!(&page[4..8], &seq.to_le_bytes());
+    // And the body is the gate and the version alone, at the offset a header ends at.
+    assert_eq!(
+        &page[HEADER_BYTES..HEADER_BYTES + 4],
+        &[0x01, 0x00, 0x02, 0x00]
+    );
     assert_eq!(decoded_record(&page[..written]), Some(record));
 }
 

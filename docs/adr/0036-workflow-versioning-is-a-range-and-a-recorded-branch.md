@@ -79,12 +79,31 @@ it cannot express is a decision taken part way through a run — that is the gat
 
 **§08's fourth rule is an absence, so it is a gate rule.** A new rule id, `version-gate`,
 fails a build over four things: the `VersionMarker` field set in both directions; the
-versioning vocabulary's public surface in both directions; `VersionRange`'s methods at every
-visibility, with no public field on it, because `oldest <= current` is exactly the invariant
-a public field gives back; and any invocation of `file!`, `line!`, `column!` or
-`module_path!` in the three files a source-location hash would have to pass through. A gate
-keyed on `line!()` changes identity when a comment above it moves, so a reformatting would be
-a divergence.
+versioning vocabulary's public surface in both directions; `VersionRange`'s shape — no
+public field, no associated constant, no method at any visibility the pin does not list, no
+submodule, no alias, no free function beside the pinned `impl`, no macro inside it, and a
+crate-root re-export naming it at the source — because `oldest <= current` is exactly the
+invariant every one of those gives back; and, in the kernel's two versioning files, any
+route to a source location, whether a macro, an aliased import of one, or
+`core::panic::Location`. A gate keyed on `line!()` changes identity when a comment above it
+moves, so a reformatting would be a divergence.
+
+The shape half is nine checks rather than three, and the extra six were bought the way
+`timer-capability`'s and `effect-protocol`'s were: review of this change ran each of them
+against a three-check version and watched the gate print `ok`. Two are recorded elsewhere in
+this repository as having already defeated another rule — an associated constant against
+`timer-capability`, a module-scope `pub(crate) fn` against `dispatch-wiring` — and the
+rename-plus-decoy-module is the one `timer-capability` grew a crate-root half for. Meeting
+them here rather than after they are demonstrated again is the whole value of writing the
+defeats down.
+
+What the identity half does **not** cover is where §08's fourth rule actually bites.
+`GateId`'s field is public and the number in it is a *workflow author's*, chosen in a
+workflow module — this crate's three examples, or a user crate no rule here can reach. A
+`GateId(line!() as u16)` in `demo.rs` passes the gate, and review of this change ran that
+too. The ban buys that the *engine* never derives identity from a source location; the rest
+is a review question, and [what is not checked](../../CLAUDE.md#what-is-not-checked) says so
+rather than leaving the list looking exhaustive.
 
 The budget moves, and it is the first raise argued from a corrected figure.
 `INCREMENTAL_CODE_FLASH_BYTES` goes from 12 KiB to **13 KiB** and
@@ -94,13 +113,19 @@ its own:
 | Measured | layers | probe |
 | --- | --- | --- |
 | Before this change | 12220 B | 8460 B |
-| The library change, through the reach the probe already had | 12468 B | 8496 B |
-| With the probe reaching the whole new surface | 12892 B | 9108 B |
+| The library change, through the reach the probe already had | 12396 B | 8496 B |
+| With the probe reaching the whole new surface | 12820 B | 9108 B |
 
-So §08's versioning costs **672 B** of layers, of which **248 B** is the change itself and
+So §08's versioning costs **600 B** of layers, of which **176 B** is the change itself and
 **424 B** is what `size-probe-reach` demands once every public function has to be named and
-both refusals reached. The layers measure 12892 B of 13312, with 420 B left, and the `facade`
-row 13290 B of 14336.
+both refusals reached. The layers measure 12820 B of 13312, with 492 B left, and the `facade`
+row 13218 B of 14336.
+
+The first figure is smaller than it was when this was written, and the reason is worth
+recording rather than smoothing over: `intent` went over clippy's line budget when its
+`BoundaryKind` arm grew a second record kind, so rows 1, 2 and 4 were split out into
+`recorded_effect` — the twin `recorded_timer` already was. That refactor is 72 B, and it is
+the only reason a raise of 1 KiB leaves 492 B rather than 420 B.
 
 ## Consequences
 
@@ -110,9 +135,12 @@ row 13290 B of 14336.
 
 A gate costs a record. §10's reserve prices a marker at a terminal record — it opens nothing,
 so it owes only the run's exit — and `Reserve::for_layout`'s floor does not price gates at
-all, so a run that puts one gate per effect into a nearly full bank meets `HistoryNearCapacity`
-sooner than the same run without them. That is the reserve refusing early, which is the safe
-direction.
+all. That is safe rather than merely cheap, and the reason is arithmetic review supplied: a
+marker is strictly cheaper than a schedule at every alignment, because its body is four bytes
+against a schedule's eight and its exit is `terminal_bytes` against a schedule's
+`outcome + terminal`. So the floor's `start + schedule + tail` term dominates, and a gate can
+never leave a run unable to reach an exit. `crates/waymaker-flash/tests/capacity.rs` holds
+that rather than leaving it argued.
 
 **A rollback that meets a newer recorded branch refuses the run outright.** That is §08's
 second rule doing what it says, and it is worth stating as a cost: a fleet that upgrades,
@@ -130,7 +158,12 @@ so about determinism generally, and this is the same limit met once more.
 under a *different* image it may decide differently. That window is unavoidable — the record
 was never durable — and it is narrower than §07's effect window, because no physical effect
 follows a gate. It is the reason the record is written before the number is returned rather
-than after.
+than after, and it is swept rather than argued:
+`a_recovered_marker_is_whole_or_absent_at_every_crash_point` drives the gated workflow at
+every point `waymaker-fault` enumerates and requires both halves — whole and absent — to be
+reached, with `no_effect_the_branch_caused_survives_a_crash_the_marker_did_not` beside it.
+Until that sweep existed the gate was the one boundary in this workspace with no crash
+window of its own, which review found.
 
 **Two kinds of "which version" now exist.** `recorded_version` and `gate` answer different
 questions and a reader has to know which. Both are documented on `Boundary`, and the

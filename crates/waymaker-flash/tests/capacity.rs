@@ -15,6 +15,7 @@
 //! a state from which it can never write one, because §08's transition table has no edge
 //! from an unresolved effect to a terminal record.
 
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::{AppendError, Journal, WriteAmplification};
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
@@ -1311,4 +1312,78 @@ fn a_bank_at_the_boundary_still_reads_back_as_the_history_it_committed() {
     assert_eq!(seen, effects);
     assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: offset }));
     assert_eq!(recovery.append_offset(), Some(offset));
+}
+
+// ---------------------------------------------------------------------------------------
+// §08's recorded upgrade branch, priced
+// ---------------------------------------------------------------------------------------
+
+/// `RecordRef::VersionMarker` at `seq`.
+const fn marker(seq: u32) -> RecordRef<'static> {
+    RecordRef::VersionMarker {
+        seq: EffectSeq(seq),
+        gate: GateId(1),
+        version: 2,
+    }
+}
+
+#[test]
+fn a_marker_owes_the_runs_exit_and_no_more() {
+    // A gate resolves itself, so §08 has an edge straight from it to a terminal record and
+    // there is no outcome to hold room for. Compared against the two neighbours rather than
+    // against a literal: a schedule owes an outcome *and* the exit, and a resolved effect
+    // owes the exit alone, which is where a marker belongs.
+    let reserve = reserve();
+
+    assert_eq!(
+        reserve.exit_bytes_after(&marker(0)),
+        reserve.exit_bytes_after(&outcome(0)),
+        "a marker owes what a resolved effect owes"
+    );
+    assert!(
+        reserve.exit_bytes_after(&marker(0)) < reserve.exit_bytes_after(&schedule(0)),
+        "a marker owes less than an open boundary"
+    );
+}
+
+#[test]
+fn a_marker_is_never_dearer_than_the_schedule_the_floor_priced() {
+    // What makes `Reserve::for_layout`'s floor safe without a gate term in it. The floor
+    // prices one *scheduled* boundary; a marker is four payload bytes against a schedule's
+    // eight and owes a strictly smaller exit, so a bank that admits the floor admits a gate
+    // at every alignment. Reviewed rather than assumed, and this is the assumption.
+    for alignment in [1_u16, 2, 4, 8, 16, 256] {
+        let Some(align) = ProgramAlign::new(alignment) else {
+            unreachable!("{alignment} is a power of two within the program-size range")
+        };
+        let Ok(marker_len) = frame::encoded_len(&marker(0), align) else {
+            unreachable!("a marker is encodable at every alignment")
+        };
+        let Ok(schedule_len) = frame::encoded_len(&schedule(0), align) else {
+            unreachable!("a schedule is encodable at every alignment")
+        };
+        assert!(
+            marker_len <= schedule_len,
+            "a marker is dearer than a schedule at alignment {alignment}: \
+             {marker_len} > {schedule_len}"
+        );
+    }
+}
+
+#[test]
+fn a_gate_is_refused_before_it_eats_the_exit_it_owes() {
+    // §10's whole decision, asked of a marker: the last thing a bank may hold is the run's
+    // exit, so a gate is refused while a terminal record still fits and never after.
+    let reserve = reserve();
+    let Ok(marker_len) = frame::encoded_len(&marker(0), align()) else {
+        unreachable!("a marker is encodable")
+    };
+    let needed =
+        u32::try_from(marker_len).unwrap_or(u32::MAX) + reserve.exit_bytes_after(&marker(0));
+
+    assert_eq!(reserve.admits(&marker(0), needed), Ok(()));
+    assert!(
+        reserve.admits(&marker(0), needed - 1).is_err(),
+        "one byte short of the marker and its exit must be refused"
+    );
 }

@@ -83,10 +83,10 @@ pub const CONTEXT_RAM_BYTES: usize = ENGINE_RAM_BYTES.saturating_sub(KERNEL_STAT
 /// [ADR 0036](https://github.com/madmax983/waymaker/blob/main/docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md)
 /// then takes it to **13 KiB** for issue
 /// [#40](https://github.com/madmax983/waymaker/issues/40)'s versioning. It is the first
-/// raise argued from a corrected figure: §08's version boundary costs 672 B of layers, of
-/// which 248 B is the library change measured through the reach the probe already had and
-/// 424 B is what `size-probe-reach` then demands. The layers measure 12892 B against this
-/// 13312 B, with 420 B left.
+/// raise argued from a corrected figure: §08's version boundary costs 600 B of layers, of
+/// which 176 B is the library change measured through the reach the probe already had and
+/// 424 B is what `size-probe-reach` then demands. The layers measure 12820 B against this
+/// 13312 B, with 492 B left.
 ///
 /// It is still a gate: `cargo xtask size` fails a build over it, and the number lives here
 /// rather than in the gate so that there is one place to change.

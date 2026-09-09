@@ -15,7 +15,8 @@ use waymaker_drive::demo::{
     Branching, FINISH, PREPARE, UPGRADABLE_BOUNDS, UPGRADE_GATE, Upgradable, V1, V2, VERIFY, World,
 };
 use waymaker_drive::{Conclusion, DriveError, Driver, Identity, Progress, Scratch, Workflow};
-use waymaker_fault::Device;
+use waymaker_fault::{Device, FaultError, Harness, Session};
+use waymaker_flash::append::Journal;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
 use waymaker_flash::frame::ProgramAlign;
@@ -323,7 +324,16 @@ fn a_recorded_gate_replays_the_branch_the_run_took() {
     let mut device = Device::new(geometry());
 
     let first = boot_image(&mut device, &mut fresh(), Upgradable::v1(Branching::Gate));
-    assert!(matches!(first, Ok(Progress::Finished { .. })), "{first:?}");
+    assert!(
+        matches!(
+            first,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
+        "{first:?}"
+    );
     assert_eq!(markers(&mut device), vec![(UPGRADE_GATE, V1)]);
 
     // The v2 image replays it. Nothing is dispatched and nothing is written: the run is
@@ -332,7 +342,13 @@ fn a_recorded_gate_replays_the_branch_the_run_took() {
     let mut replaying = fresh();
     let replayed = boot_image(&mut device, &mut replaying, Upgradable::v2(Branching::Gate));
     assert!(
-        matches!(replayed, Ok(Progress::Finished { .. })),
+        matches!(
+            replayed,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
         "{replayed:?}"
     );
     assert_eq!(replaying.dispatched(), &[]);
@@ -356,7 +372,13 @@ fn a_gate_first_reached_after_an_upgrade_records_the_new_branch() {
     // v2 picks it up, reaches the gate for the first time, and records its own version.
     let second = boot_image(&mut device, &mut fresh(), Upgradable::v2(Branching::Gate));
     assert!(
-        matches!(second, Ok(Progress::Finished { .. })),
+        matches!(
+            second,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
         "{second:?}"
     );
     assert_eq!(markers(&mut device), vec![(UPGRADE_GATE, V2)]);
@@ -378,20 +400,41 @@ fn a_gate_first_reached_after_an_upgrade_records_the_new_branch() {
 }
 
 #[test]
-fn a_branch_recorded_after_an_upgrade_is_kept_by_a_rollback() {
-    // The other half of "replays identically for ever after". The run recorded `2`, so an
-    // image that could still replay v1 must not quietly take the v1 path — and one that
-    // *cannot* replay branch 2 refuses rather than guessing.
+fn a_recorded_branch_a_rollback_cannot_replay_is_refused_by_the_gate() {
+    // §08's second rule met at the *marker* rather than at the run's own record, which is
+    // the case only a gate can produce: a run whose `RunStarted` says V1 — so `begin`
+    // admits it — and whose marker says V2, which this image never had.
+    //
+    // The journal is built the way `a_gate_first_reached_after_an_upgrade_records_the_new_branch`
+    // builds it, and that is load-bearing. Starting the run under the v2 image instead
+    // would put V2 in `RunStarted` and `begin` would refuse before the gate was reached,
+    // so the test would pass with `recorded_gate`'s `admits` deleted. Review of this change
+    // ran that version and watched all nineteen tests here stay green.
     let mut device = Device::new(geometry());
-    let mut world = world_pending_at(1);
-    let _ = boot_image(&mut device, &mut world, Upgradable::v2(Branching::Gate));
+    let mut world = world_pending_at(0);
+    let _ = boot_image(&mut device, &mut world, Upgradable::v1(Branching::Gate));
+    let _ = boot_image(&mut device, &mut fresh(), Upgradable::v2(Branching::Gate));
     assert_eq!(markers(&mut device), vec![(UPGRADE_GATE, V2)]);
 
+    // The rollback. Its range is exactly V1, so the run's own record is fine and the
+    // marker is not.
     let refused = boot_image(&mut device, &mut fresh(), Upgradable::v1(Branching::Gate));
 
     assert_eq!(
         refused,
         Err(DriveError::Kernel(KernelError::IncompatibleWorkflow))
+    );
+    // The refusal came from the gate, so the run's own record was accepted first: a
+    // `NotThisWorkflow` here would mean `begin` had refused and the gate was never reached.
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let first = recovery
+        .next(&mut device, &mut page)
+        .expect("the journal is not empty")
+        .expect("the first record is legal");
+    assert!(
+        matches!(first, RecordRef::RunStarted { workflow_version, .. } if workflow_version == V1),
+        "the run must be one this image admits: {first:?}"
     );
 }
 
@@ -428,9 +471,16 @@ fn an_added_effect_with_no_gate_is_a_divergence() {
 }
 
 #[test]
-fn a_gate_moved_to_another_position_is_a_sequence_divergence() {
+fn a_gate_moved_ahead_of_the_first_effect_is_a_boundary_kind_divergence() {
     // §08's fourth rule as a failure: call-order sequencing is authoritative, so a gate
     // that moved is caught by where it is rather than by what it is called.
+    //
+    // Named for the flavour it really reaches. History holds `EffectScheduled` at the
+    // position the moved gate asks about, so `version_intent` takes its `BoundaryKind` arm
+    // and `recorded_gate` is never entered — review of this change proved it by deleting
+    // the sequence check and watching every test here stay green. `recorded_gate`'s own
+    // `Divergence::Sequence` needs a *marker* at the wrong position, which is
+    // `a_marker_recorded_at_another_position_is_refused` below.
     let mut device = Device::new(geometry());
     let _ = boot_image(&mut device, &mut fresh(), Upgradable::v1(Branching::Gate));
 
@@ -559,11 +609,16 @@ fn a_marker_spends_a_sequence_that_the_effects_after_it_are_numbered_past() {
 }
 
 #[test]
-fn the_branch_is_durable_before_the_workflow_can_act_on_it() {
-    // §02 decision 3's shape at a boundary whose effect is a branch inside the workflow.
-    // The marker crossed both of §07's barriers before `gate` returned, so the effect the
-    // branch leads to cannot reach media before the branch that chose it. Measured by
-    // reading the journal at the moment the run suspends *inside* the branch.
+fn the_marker_reaches_media_before_the_effect_its_branch_caused() {
+    // §02 decision 3's shape at a boundary whose effect is a branch inside the workflow,
+    // read off the journal at the moment the run suspends *inside* the branch.
+    //
+    // What this holds is the *order on media*, and no more. That the marker crossed both of
+    // §07's barriers before `gate` returned is `write`'s, shared with every other record,
+    // and the window a crash leaves is
+    // `a_recovered_marker_is_whole_or_absent_at_every_crash_point` below — an ordering
+    // assertion cannot see it, because an append-only journal and a workflow that calls
+    // `gate` before `call` already entail this order.
     let mut device = Device::new(geometry());
     // Stop at the second dispatch of the boot, which is `VERIFY` — the first effect the
     // v2 branch adds.
@@ -591,9 +646,14 @@ fn the_branch_is_durable_before_the_workflow_can_act_on_it() {
 }
 
 #[test]
-fn replaying_a_recorded_gate_writes_nothing_and_dispatches_nothing() {
+fn a_replayed_gate_records_no_second_marker_and_rewrites_no_prefix() {
     // A gate is not re-decided on the boot that replays it, exactly as a fired timer is not
     // re-armed. The record is the decision.
+    //
+    // This boot legitimately writes and dispatches, because the first one suspended part
+    // way through: what it may not do is decide the gate again. "Writes nothing and
+    // dispatches nothing" is the *completed* run's property, and
+    // `a_recorded_gate_replays_the_branch_the_run_took` is where it is asserted.
     let mut device = Device::new(geometry());
     let mut world = world_pending_at(1);
     let _ = boot_image(&mut device, &mut world, Upgradable::v2(Branching::Gate));
@@ -605,7 +665,13 @@ fn replaying_a_recorded_gate_writes_nothing_and_dispatches_nothing() {
     let second = boot_image(&mut device, &mut answering, Upgradable::v2(Branching::Gate));
 
     assert!(
-        matches!(second, Ok(Progress::Finished { .. })),
+        matches!(
+            second,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
         "{second:?}"
     );
     assert_eq!(markers(&mut device), vec![(UPGRADE_GATE, V2)]);
@@ -755,4 +821,231 @@ fn the_gates_activity_vocabulary_is_the_one_the_journal_records() {
         }
     }
     assert_eq!(called, vec![PREPARE, VERIFY, FINISH]);
+}
+
+/// Appends `record` to the journal as it stands, whatever follows it.
+///
+/// The only way to reach `recorded_gate`'s sequence check from the driver: a correct driver
+/// never writes a marker at a sequence the run would not issue, so history that holds one
+/// has to be written by something that is not this driver.
+fn append_past_the_end(device: &mut Device, record: &RecordRef<'_>) {
+    let mut page = [0_u8; 256];
+    let mut scan = Recovery::new(region());
+    while scan.next(device, &mut page).is_some() {}
+    let Some(mut journal) = Journal::after(scan) else {
+        unreachable!("the fixtures here end in erased media")
+    };
+    let Ok(staged) = journal.stage(device, record, &mut page) else {
+        unreachable!("the record fits the region")
+    };
+    let Ok(sealable) = staged.payload_barrier(device) else {
+        unreachable!("the model's barrier cannot fail")
+    };
+    let Ok(_) = sealable.commit(device) else {
+        unreachable!("the model's program cannot fail here")
+    };
+}
+
+#[test]
+fn a_marker_recorded_at_another_position_is_refused() {
+    // `recorded_gate`'s own sequence check, reached from the driver. The run has committed
+    // nothing, so the sequence it would issue next is 0; the marker on media says 3.
+    //
+    // Review of this change deleted that check and watched every other test in this file
+    // stay green, because the moved-gate test above reaches the `BoundaryKind` arm instead
+    // and never enters `recorded_gate` at all.
+    // A run whose first record is `RunStarted` and whose second is a marker three
+    // sequences ahead of anything the run has issued.
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let mut ahead = Device::new(geometry());
+    append_past_the_end(
+        &mut ahead,
+        &RecordRef::RunStarted {
+            workflow_kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            workflow_version: V1,
+            input: b"seed",
+        },
+    );
+    append_past_the_end(
+        &mut ahead,
+        &RecordRef::VersionMarker {
+            seq: waymaker_core::EffectSeq(3),
+            gate: UPGRADE_GATE,
+            version: V1,
+        },
+    );
+
+    let mut workflow = OnlyAGate;
+    let refused = Driver::new(region(), RUN, reserve()).boot(
+        &mut ahead,
+        &mut fresh(),
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert_eq!(
+        refused,
+        Err(DriveError::Kernel(KernelError::NondeterministicWorkflow))
+    );
+}
+
+/// A workflow whose first boundary is the gate, so nothing precedes the marker.
+struct OnlyAGate;
+
+impl Workflow for OnlyAGate {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            versions: VersionRange::exact(V1),
+            input: b"seed",
+        }
+    }
+
+    fn run(
+        &mut self,
+        boundary: &mut dyn waymaker_drive::Boundary,
+    ) -> Result<waymaker_core::Outcome<'_>, waymaker_drive::Suspended> {
+        let _ = boundary.gate(UPGRADE_GATE)?;
+        Ok(waymaker_core::Outcome::Completed(b""))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The marker's own crash window, at every point the injector lists
+// ---------------------------------------------------------------------------------------
+
+/// One boot of the v2 image over `session`.
+fn drive_gated(session: &mut Session) -> Result<(), DriveError<FaultError>> {
+    let mut workflow = Upgradable::v2(Branching::Gate);
+    let mut world = fresh();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    Driver::new(region(), RUN, reserve())
+        .boot(
+            session,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        )
+        .map(|_| ())
+}
+
+/// Every record kind, and every marker, a crash image recovers to.
+fn recovered(image: &[u8]) -> (Vec<RecordKind>, Vec<(GateId, u16)>) {
+    let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
+        unreachable!("the image is device-sized")
+    };
+    let mut recovery = Recovery::new(region());
+    let mut page = [0_u8; 256];
+    let mut seen = Vec::new();
+    let mut found = Vec::new();
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        let Ok(record) = step else {
+            break;
+        };
+        seen.push(record.kind());
+        if let RecordRef::VersionMarker { gate, version, .. } = record {
+            found.push((gate, version));
+        }
+    }
+    (seen, found)
+}
+
+#[test]
+fn a_recovered_marker_is_whole_or_absent_at_every_crash_point() {
+    // A gate's whole promise is that the branch a run took is on media. A torn marker must
+    // therefore be no marker at all — §09's commit seal is what makes that true — and a
+    // recovered one must be the decision the writer meant, never a half-programmed body
+    // that decodes as some other branch.
+    //
+    // Every other boundary is swept this way: the effect boundary in `tests/crash.rs`, and
+    // both §06 examples in `tests/ota.rs` and `tests/provisioning.rs`. Until this, the gate
+    // was the one that was not.
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(drive_gated)
+        .expect("the fault-free run completes");
+    assert!(
+        runs.len() > 1,
+        "the enumeration found crash points to sweep"
+    );
+
+    let reference = {
+        let mut device = Device::new(geometry());
+        let _ = boot_image(&mut device, &mut fresh(), Upgradable::v2(Branching::Gate));
+        assert_eq!(markers(&mut device), vec![(UPGRADE_GATE, V2)]);
+        kinds(&mut device)
+    };
+
+    let mut whole = 0_usize;
+    let mut absent = 0_usize;
+    for run in &runs {
+        let (seen, found) = recovered(run.image());
+        assert!(
+            reference.starts_with(&seen),
+            "recovery is not a prefix of the fault-free run, at {:?}: {seen:?}",
+            run.injection()
+        );
+        match found.as_slice() {
+            [] => absent += 1,
+            [one] => {
+                assert_eq!(
+                    *one,
+                    (UPGRADE_GATE, V2),
+                    "a recovered marker is not the one the writer meant, at {:?}",
+                    run.injection()
+                );
+                whole += 1;
+            }
+            many => panic!(
+                "one gate recorded {} markers, at {:?}",
+                many.len(),
+                run.injection()
+            ),
+        }
+    }
+    // Both halves have to be reached, or the sweep is asserting about one of them.
+    assert!(whole > 0, "no crash point left the marker whole");
+    assert!(absent > 0, "no crash point landed before the marker");
+}
+
+#[test]
+fn no_effect_the_branch_caused_survives_a_crash_the_marker_did_not() {
+    // §02 decision 3's shape at a version boundary, swept. `VERIFY` exists only on the
+    // branch the marker records, so an image holding its schedule record and no marker
+    // would be a run whose branch the journal cannot account for — the same fault as an
+    // effect with no committed intent.
+    let harness = Harness::new(geometry());
+    let runs = harness
+        .run(drive_gated)
+        .expect("the fault-free run completes");
+
+    let mut before_the_gate = 0_usize;
+    for run in &runs {
+        let (seen, found) = recovered(run.image());
+        if !found.is_empty() {
+            continue;
+        }
+        before_the_gate += 1;
+        let schedules = seen
+            .iter()
+            .filter(|kind| **kind == RecordKind::EFFECT_SCHEDULED)
+            .count();
+        assert!(
+            schedules <= 1,
+            "an effect from the branch survived a crash the marker did not, at {:?}: {seen:?}",
+            run.injection()
+        );
+    }
+    assert!(
+        before_the_gate > 0,
+        "no crash point landed before the marker, so this asserts about nothing"
+    );
 }

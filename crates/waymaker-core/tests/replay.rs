@@ -746,10 +746,29 @@ fn every_position_accepts_exactly_the_records_a_run_could_have_written_next() {
         ],
     ];
 
+    // The sequence a *schedule* would carry from each position, and the one an *outcome*
+    // would. Per row rather than `(0, 0)` for every row, and that is the whole point of the
+    // fixture's own promise above: "anything the position refuses is refused for the
+    // **kind**". At `AwaitingOutcome` and `AwaitingTimer` the run has already committed
+    // sequence 0, so a schedule, a timer or a marker drawn at 0 is refused by the
+    // allocator — the same `MalformedHistory` an illegal kind gives, from a different
+    // check. Review of issue #40 proved it: a cursor given extra marker edges from those
+    // two positions kept the whole crate green, because no cell ever reached the arm.
+    // Drawing them at 1, the sequence each position really would issue next, leaves the
+    // kind as the only thing left to refuse them for.
+    const SEQUENCES: [(u32, u32); 7] = [
+        (0, 0), // BeforeRun: nothing committed.
+        (0, 0), // Replaying: nothing committed.
+        (1, 0), // AwaitingOutcome: 0 is committed and is what an outcome resolves.
+        (1, 0), // AwaitingTimer: the same, for a firing.
+        (0, 0), // RunCompleted, RunFailed and Halted accept nothing at any sequence.
+        (0, 0),
+        (0, 0),
+    ];
+
     for (row, (position, _)) in every_source_position().iter().enumerate() {
-        // A schedule is legal only from `Replaying`, at sequence 0 for these fixtures; an
-        // outcome only from `AwaitingOutcome`, at the pending sequence, which is also 0.
-        let records = every_record(0, 0);
+        let (schedule_seq, outcome_seq) = SEQUENCES[row];
+        let records = every_record(schedule_seq, outcome_seq);
         for (column, record) in records.into_iter().enumerate() {
             // A fresh cursor per cell: a refusal halts, and a halted cursor would answer
             // for every column after it.

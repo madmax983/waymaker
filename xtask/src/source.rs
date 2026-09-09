@@ -3313,13 +3313,38 @@ const VERSION_RANGE: &str = "VersionRange";
 ///
 /// Matched as *invocations* — the identifier and the `!` — rather than as identifiers, so a
 /// local named `line` or a field named `column` is not a violation. A macro is the only way
-/// any of these four produces a value.
+/// any of these four produces a value, so a bare identifier is never one.
+///
+/// The `!` is also why the scan reads the `use` declarations beside it. Review of this
+/// change wrote `use core::line as here;` and then `here!()`: the file contains no `line!`,
+/// and the ban was silent. That is the aliased-import blind spot CLAUDE.md already records
+/// against `timer-capability`, met again, and it is closed by reading the import rather than
+/// by guessing every spelling the alias could take.
 pub const SOURCE_LOCATION_MACROS: &[&str] = &["column", "file", "line", "module_path"];
+
+/// What no module deciding a version may reach for to learn where it is, besides a macro.
+///
+/// A second route to the same value, and review of this change found it: `#[track_caller]`
+/// plus `core::panic::Location::caller()` yields the file, the line and the column with none
+/// of the four macros named. A gate keyed on that is §08's fourth rule given back whole, and
+/// the four-macro ban would have printed `ok`.
+pub const SOURCE_LOCATION_CALLERS: &[&str] = &["track_caller", "Location", "caller"];
 
 /// The files `version-gate` holds to [`SOURCE_LOCATION_MACROS`].
 ///
-/// The kernel's version module, the boundary that decides a gate, and the driver that
-/// writes the record. A hash reaching identity has to pass through one of the three.
+/// The kernel's version module, the boundary that decides a gate, and the driver that writes
+/// the record — the engine's half of §08's fourth rule.
+///
+/// It is **not** every place a source location could become identity, and saying so is
+/// better than a list presented as exhaustive. A `GateId` is a public tuple field and the
+/// number in it is a *workflow author's*, chosen in a workflow module — `waymaker-drive`'s
+/// three examples here, and a user crate anywhere. Review of this change wrote
+/// `pub const UPGRADE_GATE: GateId = GateId(line!() as u16);` in `demo.rs` and the gate
+/// printed `ok`. No rule in this workspace can reach a downstream crate, so what this ban
+/// buys is that the *engine* never derives identity from where a call is written; a workflow
+/// author who does is a review question, and
+/// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked)
+/// says so.
 pub const VERSION_LOCATION_FREE_PATHS: &[&str] = &[VERSION_GATE_PATH, KERNEL_BOUNDARY_PATH];
 
 /// The driver file `version-gate` holds to [`SOURCE_LOCATION_MACROS`].
@@ -3370,6 +3395,7 @@ pub fn check_version_gate(
     if let Some(source) = find_source(sources, VERSION_GATE_PATH) {
         let code = without_test_modules(&code_only(&source.contents));
         violations.extend(check_version_range_shape(&code));
+        violations.extend(check_version_range_identity(&code, sources));
     }
 
     violations.extend(check_no_source_location_identity(
@@ -3408,15 +3434,37 @@ fn check_no_source_location_identity(
         };
         let code = without_test_modules(&code_only(&source.contents));
         for macro_name in SOURCE_LOCATION_MACROS {
-            if code.contains(&format!("{macro_name}!")) {
+            // The invocation, and the aliased import that produces one under another name.
+            // `use core::line as here;` puts no `line!` in the file and `here!()` is the
+            // same value.
+            let aliased = names_identifier(&code, macro_name)
+                && code.contains(" as ")
+                && code
+                    .lines()
+                    .any(|line| line.contains("use ") && names_identifier(line, macro_name));
+            if code.contains(&format!("{macro_name}!")) || aliased {
                 violations.push(Violation::new(
                     RULE,
                     source.crate_name.clone(),
                     format!(
-                        "{path} invokes `{macro_name}!`, and \u{a7}08 says source-location \
+                        "{path} reaches `{macro_name}!`, and \u{a7}08 says source-location \
                          hashes are not stable identity: a value derived from where a call \
                          is written changes when the file is reformatted, so call-order \
                          sequencing is what identifies a boundary"
+                    ),
+                ));
+            }
+        }
+        for reached in SOURCE_LOCATION_CALLERS {
+            if names_identifier(&code, reached) {
+                violations.push(Violation::new(
+                    RULE,
+                    source.crate_name.clone(),
+                    format!(
+                        "{path} names `{reached}`, which is `core::panic::Location`'s route \
+                         to the file, line and column a macro would have given: \u{a7}08's \
+                         fourth rule is about the *value*, not about which spelling produced \
+                         it"
                     ),
                 ));
             }
@@ -3592,7 +3640,164 @@ fn check_version_range_shape(code: &str) -> Vec<Violation> {
             ),
         ));
     }
+    // An associated constant is neither a function nor a member, so both pins above are
+    // blind to it. Review of this change added `pub const ANY: Self = Self { oldest: 0,
+    // current: u16::MAX }` and watched the gate print `ok` — the third of the three defeats
+    // CLAUDE.md records against `timer-capability`'s kernel half, and the one this rule had
+    // not met. There is no honest constant on a range: every value of one is two numbers a
+    // workflow author chose, so the pinned list is empty rather than a list of exceptions.
+    for constant in declared_associated_constants(&body) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{VERSION_RANGE}` declares the associated constant `{constant}`; a range \
+                 nobody built through `new` is a range whose `oldest <= current` nothing \
+                 checked, and a constant adds no function for the pins above to see"
+            ),
+        ));
+    }
     violations
+}
+
+/// The pinned file is one flat module, declares no aliased spelling of the pinned type, and
+/// expands no macro inside the `impl` the method pin reads.
+///
+/// Three doors review of this change walked through with the gate green, and all three are
+/// the same shape: the shape pin is pointed at something that is not what the crate ships.
+///
+/// * a `mod compat { pub struct VersionRange { .. } }` beside a renamed `VersionRangeV2`,
+///   with `pub type VersionRange = VersionRangeV2;` above it. `declaration_count` found the
+///   decoy exactly once, `braced_body` read the decoy's private fields, and
+///   `inherent_impl_bodies` read the decoy's five methods — while the shipped type carried
+///   `pub oldest` and `pub current`, so `VersionRange { oldest: 9, current: 0 }` compiled in
+///   a workflow. Every check passed on a type nothing ships.
+/// * a `pub(crate) const fn admits_any(range: VersionRange) -> bool { true }` at *module*
+///   scope, called from `admits`. On neither the surface pin, which counts `pub ` and not
+///   `pub(`, nor the method pin, which reads only `impl` bodies. That is
+///   `dispatch-wiring`'s recorded defeat, arriving here.
+/// * a `macro_rules!` in a sibling module invoked inside `impl VersionRange`, expanding to
+///   exactly the accessor the method pin is written against. `declared_function_names`
+///   reads `fn` on depth-zero lines and a macro invocation declares none.
+///
+/// The crate-root half is `timer-capability`'s move, made for the same reason: the module
+/// pin reads a header string, so the only thing that says the pinned type is the one the
+/// crate ships is a re-export naming it at the source.
+fn check_version_range_identity(
+    code: &str,
+    sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    const RULE: &str = "version-gate";
+    const KERNEL: &str = "waymaker-core";
+    const ROOT: &str = "waymaker-core/src/lib.rs";
+
+    let mut violations = Vec::new();
+
+    if count_tokens(code, "mod") != 0 {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{VERSION_GATE_PATH} declares a module: \u{a7}08's versioning vocabulary is \
+                 one flat module, because every pin below reads the *first* declaration and \
+                 a submodule is where a decoy carrying the pinned name lives"
+            ),
+        ));
+    }
+    if code.contains(&format!("type {VERSION_RANGE}")) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{VERSION_GATE_PATH} declares `type {VERSION_RANGE}`: an alias is a rename \
+                 that leaves the pinned name behind, so every pin below would read one type \
+                 while the crate shipped another"
+            ),
+        ));
+    }
+    for block in inherent_impl_bodies(code, VERSION_RANGE) {
+        if block.contains('!') {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`impl {VERSION_RANGE}` invokes a macro: the method pin reads `fn` \
+                     declarations, and a macro expanding to one declares nothing it can see"
+                ),
+            ));
+        }
+    }
+    // Every `fn` the file declares outside the pinned `impl`, at every visibility. The
+    // surface pin counts `pub ` and not `pub(`, so a module-scope `pub(crate) fn` reached
+    // from `admits` is a way past every refusal in this module that adds nothing either pin
+    // reads.
+    let inside = inherent_impl_bodies(code, VERSION_RANGE).join("\n");
+    let mut outside = declared_function_names(code);
+    outside.retain(|name| !declared_function_names(&inside).contains(name));
+    for name in outside {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{VERSION_GATE_PATH} declares `fn {name}` outside `impl {VERSION_RANGE}`: a \
+                 free function here is reachable from `admits` and is on neither the surface \
+                 pin nor the method pin"
+            ),
+        ));
+    }
+
+    let Some(root) = find_source(sources, ROOT) else {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {ROOT} in the workspace, so nothing shows that the pinned \
+                 `{VERSION_RANGE}` is the one this crate ships"
+            ),
+        ));
+        return violations;
+    };
+    let root_code = without_test_modules(&code_only(&root.contents));
+    if !reexported_from_version(&root_code).contains(VERSION_RANGE) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{ROOT} does not re-export `version::{VERSION_RANGE}`, so the pinned type is \
+                 not the one the crate ships; a rename that leaves a decoy behind defeats a \
+                 pin that only reads a header string"
+            ),
+        ));
+    }
+    violations
+}
+
+/// The names `pub use version::…` re-exports, as they are spelled *in the module*.
+///
+/// [`reexported_from_timer`]'s twin, and the source name for its reason: a
+/// `pub use version::VersionRangeV2 as VersionRange;` mentions the identifier and re-exports
+/// something the member pin never read.
+fn reexported_from_version(code: &str) -> BTreeSet<&str> {
+    const PREFIX: &str = "pub use version::";
+
+    let mut exported = BTreeSet::new();
+    for (index, _) in code.match_indices(PREFIX) {
+        let rest = code.get(index.saturating_add(PREFIX.len())..).unwrap_or("");
+        let Some(end) = rest.find(';') else { continue };
+        let list = rest.get(..end).unwrap_or("");
+        for entry in list
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+        {
+            let source = entry.split(" as ").next().unwrap_or("").trim();
+            if !source.is_empty() && !source.contains("::") {
+                exported.insert(source);
+            }
+        }
+    }
+    exported
 }
 
 /// The file whose kernel-boundary types [`BOUNDARY_TYPES`] pins.
@@ -13537,8 +13742,8 @@ pub mod tests_support {
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
         SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
         TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
-        VERSION_MARKER_FIELDS, VERSION_RANGE_METHODS, WIRING_SELECTION_BODIES, WIRING_SURFACE,
-        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
+        VERSION_MARKER_FIELDS, VERSION_RANGE, VERSION_RANGE_METHODS, WIRING_SELECTION_BODIES,
+        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -13617,7 +13822,12 @@ pub mod tests_support {
         source
     }
 
-    /// A kernel crate root re-exporting every type `timer-capability` pins.
+    /// A kernel crate root re-exporting every type `timer-capability` and `version-gate`
+    /// pin.
+    ///
+    /// Both rules ask the same question of it and for the same reason: a module pin reads a
+    /// header string, so the only thing that says the pinned type is the one the crate ships
+    /// is a re-export naming it at the source.
     #[must_use]
     pub fn clean_kernel_root() -> String {
         let exported: Vec<&str> = TIMER_TYPES
@@ -13627,7 +13837,8 @@ pub mod tests_support {
             .filter_map(|header| header.rsplit(' ').next())
             .collect();
         format!(
-            "//! A kernel crate root.\npub mod timer;\npub use timer::{{{}}};\n",
+            "//! A kernel crate root.\npub mod timer;\npub use timer::{{{}}};\npub mod \
+             version;\npub use version::{VERSION_RANGE};\n",
             exported.join(", ")
         )
     }
