@@ -146,17 +146,23 @@ pub const BASELINE_ROW: &str = "baseline";
 /// The engine as it ships with no optional cost enabled.
 pub const DEFAULT_ROW: &str = "default";
 
-/// The feature selection each gated row is built from, as [`matrix`] builds it.
+/// The feature selection each load-bearing row is built from, as [`matrix`] builds it.
 ///
-/// A gated row read out of a document is held to this rather than to its name alone.
+/// A row read out of a document is held to this rather than to its name alone.
 /// `code_flash_budget_for` picks the looser ceiling from the name, and the probe binary
 /// carries `required-features = ["probe"]`, so a `facade` row selecting only `facade` names
 /// an image that cannot have been linked — and a `default` row selecting `facade` names one
 /// linked from different code than the ceiling is stated for.
 ///
-/// `the_gated_row_feature_pin_is_what_the_matrix_builds` compares this against [`matrix`],
-/// so the pin cannot drift from the images the gate actually links.
-pub const GATED_ROW_FEATURES: &[(&str, &[&str])] = &[
+/// The baseline is pinned although nothing gates it, and it is the sharpest of the three:
+/// every flash and RAM figure in the report is a delta against that image, so a baseline
+/// that selected `engine` would subtract the shipped code from every row at once. Small
+/// positive residuals then clear the zero-layer check and pass every budget.
+///
+/// `the_row_feature_pin_is_what_the_matrix_builds` compares this against [`matrix`], so the
+/// pin cannot drift from the images the gate actually links.
+pub const PINNED_ROW_FEATURES: &[(&str, &[&str])] = &[
+    (BASELINE_ROW, &[PROBE_FEATURE]),
     (DEFAULT_ROW, &[PROBE_FEATURE, ENGINE_FEATURE]),
     (FACADE_ROW, &[PROBE_FEATURE, FACADE_FEATURE]),
 ];
@@ -1210,10 +1216,10 @@ impl SizeReport {
         }
 
         // `code_flash_budget_for` chooses the looser ceiling from the row's *name*, and
-        // `--report` gates a document this process did not produce. The row carries the
-        // feature selection it was built with, so the ceiling can be checked against the
-        // image rather than against a label.
-        for (name, expected) in GATED_ROW_FEATURES {
+        // `--report` gates a document this process did not produce. Each row carries the
+        // feature selection it was built with, so a ceiling can be checked against the image
+        // rather than against a label — and so can the image every delta is taken from.
+        for (name, expected) in PINNED_ROW_FEATURES {
             for row in self.rows.iter().filter(|row| &row.name == name) {
                 let selects = |feature: &str| row.features.iter().any(|have| have == feature);
                 if row.features.len() != expected.len()
@@ -1221,7 +1227,7 @@ impl SizeReport {
                 {
                     shortfalls.push(BudgetShortfall::Unmeasurable {
                         detail: format!(
-                            "the `{name}` row was built with {:?} rather than {expected:?}, so it is not the image its budgets are stated for",
+                            "the `{name}` row was built with {:?} rather than {expected:?}, so it is not the image the budgets are stated against",
                             row.features
                         ),
                     });
@@ -4270,6 +4276,23 @@ mod tests {
     }
 
     #[test]
+    fn a_baseline_that_already_holds_the_engine_cannot_be_what_deltas_are_taken_from() {
+        // Every flash and RAM figure is a delta against the baseline, so an engine-bearing
+        // one subtracts the shipped code from every row at once — and small positive
+        // residuals clear the zero-layer check and pass every budget.
+        let mut seeded = baseline_row();
+        seeded.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
+        let report = SizeReport::new(
+            vec![seeded, default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains(BASELINE_ROW), "{message}");
+        assert!(message.contains("not the image"), "{message}");
+    }
+
+    #[test]
     fn a_gated_row_built_from_other_features_cannot_claim_its_budgets() {
         // `code_flash_budget_for` reads the row's name, and `--report` gates a document this
         // process did not write. Three ways a name can outrun its image, and each must be
@@ -4305,26 +4328,31 @@ mod tests {
     }
 
     #[test]
-    fn the_gated_row_feature_pin_is_what_the_matrix_builds() {
+    fn the_row_feature_pin_is_what_the_matrix_builds() {
         // The pin is a table and the matrix is derived, so this is what stops the two
         // drifting: a row the gate links from one selection and validates against another
         // would refuse every report the gate itself produces.
         let variants = matrix(&probe_graph());
-        for (name, expected) in GATED_ROW_FEATURES {
-            let built = find(&variants, name);
-            assert!(built.gated, "`{name}` is pinned but not gated");
-            assert_eq!(&built.features, expected, "`{name}`");
+        for (name, expected) in PINNED_ROW_FEATURES {
+            assert_eq!(&find(&variants, name).features, expected, "`{name}`");
         }
-        // And nothing else is gated, or it would be held to no pin at all.
+        // Every gated row is pinned, or it is held to no selection at all. The baseline is
+        // pinned and not gated, which is why this direction is about the gated rows alone.
         for variant in variants.iter().filter(|variant| variant.gated) {
             assert!(
-                GATED_ROW_FEATURES
+                PINNED_ROW_FEATURES
                     .iter()
                     .any(|(name, _)| *name == variant.name),
                 "`{}` is gated and has no feature pin",
                 variant.name
             );
         }
+        // And the image every delta is taken from is one of them.
+        assert!(
+            PINNED_ROW_FEATURES
+                .iter()
+                .any(|(name, _)| *name == BASELINE_ROW)
+        );
     }
 
     #[test]
