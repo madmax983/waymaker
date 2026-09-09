@@ -1202,11 +1202,11 @@ Stated so that nobody mistakes silence for coverage:
   not optional, so the `drive-facadeless` stage still resolves and compiles the façade
   crate — a `compile_error!` inside the façade fails that stage too, which Codex round 3
   measured. What the stage establishes is the weaker and still useful claim: no module
-  outside `facade.rs` and `ota.rs` *needs* the façade, because the crate compiles with those
-  two deleted. Making the dependency optional would take the façade out of the lint, test,
-  docs and coverage stages, which all pass `--no-default-features`; moving the two modules
-  into a crate of their own would say it in the dependency graph, and is issue
-  [#106](https://github.com/madmax983/waymaker/issues/106).
+  outside `facade.rs`, `ota.rs` and `provisioning.rs` *needs* the façade, because the crate
+  compiles with those deleted. Making the dependency optional would take the façade out of
+  the lint, test, docs and coverage stages, which all pass `--no-default-features`; moving
+  the façade-naming modules into a crate of their own would say it in the dependency graph,
+  and is issue [#106](https://github.com/madmax983/waymaker/issues/106).
 - **That a workflow stops at its own ending, for a caller that is not an `async fn`.**
   `TerminalFuture` never resolves and every other future refuses once a conclusion is
   recorded, which is two mechanisms for one rule: a run that ended has no boundaries left.
@@ -2168,9 +2168,9 @@ requires `DriveError::NotThisWorkflow`.
 Both "done when"s already claimed for OTA needed a second look, not just a first one for
 provisioning. The future-size report now names two rows — `ota_update` and `provision` —
 from `waymaker_drive::provisioning::WORKFLOW_FUTURES` read beside `ota`'s own, and
-`cargo xtask size` prints both under one heading. And "exercised by the crash rig" was true
-of neither example before this: each test file had reboot-by-hand tests but no
-`waymaker-fault` sweep. `tests/ota.rs` and `tests/provisioning.rs` each gained one, at every
+`cargo xtask size` prints both under one heading. And "exercised by the crash rig" was not
+true of OTA before this: `tests/ota.rs` had reboot-by-hand tests but no `waymaker-fault`
+sweep. `tests/ota.rs` and the new `tests/provisioning.rs` each carry one now, at every
 crash point the injector lists, over the real façade and the real driver.
 `poll_provisioning` is the concrete path the firmware build monomorphises, the way
 `poll_ota` already was — `drive-firmware` links both. No new ADR: nothing here moves a

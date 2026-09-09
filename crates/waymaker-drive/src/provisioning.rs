@@ -1,25 +1,24 @@
 //! Design document §06's provisioning example, run against the façade.
 //!
 //! Issue [#38](https://github.com/madmax983/waymaker/issues/38)'s second example.
-//! [`ota_update`](crate::ota::ota_update) crosses three activities and ends cleanly. This
-//! crosses the boundaries that one does not: a timer, an activity the workflow retries, and
-//! a terminal failure with a real payload.
+//! [`ota_update`](crate::ota::ota_update) uses three activities and ends cleanly. This
+//! example uses boundaries that one does not: a timer, a retried activity, and a terminal
+//! failure with a real payload.
 //!
 //! # The input gap this closes
 //!
-//! `ota_update` runs on `ota::URL`, a module constant no boot reads back — so `Ota`'s
-//! `Workflow::identity` and the bytes handed to the workflow happen to agree, but nothing
-//! makes them. [`Driver::begin`](crate::Driver) compares the recorded `RunStarted` against
-//! `Workflow::identity` on every boot; [`Provisioning`] is built with its run's input as a
-//! field, and [`provision`] reads that field. A caller that changes the bytes between boots
-//! is refused with `DriveError::NotThisWorkflow`, not silently rewound.
+//! `ota_update` runs on `ota::URL`, a module constant. No boot reads it back, so `Ota`'s
+//! `Workflow::identity` and the input bytes agree by accident, not by design.
+//! [`Driver::begin`](crate::Driver) checks the recorded `RunStarted` against
+//! `Workflow::identity` on every boot. [`Provisioning`] stores its run's input as a field,
+//! and [`provision`] reads that field. A caller that changes the input between boots gets
+//! `DriveError::NotThisWorkflow`, not a silent rewind.
 //!
 //! # Here rather than in `tests/`
 //!
-//! For [`ota`](crate::ota)'s reason. `Provisioning` and [`poll_provisioning`] are generic
-//! and concrete respectively, so the firmware build monomorphises this workflow's future,
-//! [`Bridge`], and the two façade futures this example adds: `TimerFuture` and
-//! `TerminalFuture`'s failure arm.
+//! Same reason as [`ota`](crate::ota). `Provisioning` is generic; [`poll_provisioning`] is
+//! concrete. The firmware build monomorphises this workflow's future, [`Bridge`], and two
+//! façade futures this example adds: `TimerFuture` and `TerminalFuture`'s failure arm.
 //!
 //! [`Bridge`]: crate::Bridge
 
@@ -135,10 +134,11 @@ pub enum ProvisionError {
     NotAToken,
 }
 
-/// Wait for the settle window, then register — retrying on failure, failing on exhaustion.
+/// Wait for the window, then register — retrying on failure, failing on exhaustion.
 ///
-/// Design document §06's second example. Three boundaries [`ota_update`](crate::ota::ota_update)
-/// does not use: a timer, a retried activity, and a terminal failure carrying a payload.
+/// Design document §06's second example. It uses boundaries
+/// [`ota_update`](crate::ota::ota_update) does not: a timer, a retried activity, and a
+/// terminal failure that carries a payload.
 ///
 /// # Errors
 ///
@@ -236,9 +236,8 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
                 let mut future = pin!(provision(&mut ctx, ProvisionInput::at(&self.input)));
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
-            // The recorded ending outranks the poll, for `Ota::run`'s reason: a `Conclusion`
-            // points into `self.out`, and `TerminalFuture` never resolves, so a later
-            // boundary in the same poll cannot have overwritten it.
+            // The recorded ending outranks the poll. See `Ota::run`: `TerminalFuture` never
+            // resolves, so nothing later in this poll can have overwritten `self.out`.
             match (ctx.conclusion(), polled) {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => {
                     Some(Ended::Completed(bytes.len()))
@@ -246,9 +245,8 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
                 (Some(Conclusion::Ended(Outcome::Failed(bytes))), _) => {
                     Some(Ended::Failed(bytes.len()))
                 }
-                // `Refused` is a payload wider than the buffer, which `OUT_BYTES` being the
-                // wider bound makes unreachable here. `Pending` with no ending is a run
-                // still waiting on the timer or an outstanding attempt.
+                // `OUT_BYTES` is the wider bound, so `Refused` cannot happen here. `Pending`
+                // with no ending means the run is still waiting on the timer or an attempt.
                 (Some(Conclusion::Refused), _) | (None, Poll::Pending) => None,
                 (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),
                 (None, Poll::Ready(Err(_))) => Some(Ended::Failed(0)),
@@ -324,8 +322,8 @@ const PROVISION_FUTURE_BYTES: usize = returned_future_bytes(provision);
 
 const _: () = assert!(
     PROVISION_FUTURE_BYTES > 0,
-    "a workflow that holds a context across three boundaries has state; a zero-sized future \
-     means something other than the future was measured",
+    "a workflow that holds a context across a boundary has state; a zero-sized future means \
+     something other than the future was measured",
 );
 
 /// One boot of a provisioning run, with every type fixed.

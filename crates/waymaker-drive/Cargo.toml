@@ -17,12 +17,12 @@ waymaker-core.workspace = true
 # The bytes the boundary is answered from: the recovery scan, the two-barrier writer, and
 # the input digest the kernel may not compute for itself.
 waymaker-flash.workspace = true
-# The façade issue #35 put over this protocol. `facade` and `ota` are the bridge and design
-# document §06's example: they turn "waymaker-embassy is a façade over exactly this protocol"
-# into something that compiles, and `tests/power_loss.rs` drives the two board clocks through
-# `PersistentClock`. The edge goes this way and never the other — nothing in
-# `waymaker-embassy` names this crate — which is what keeps `Boundary` usable with the façade
-# removed.
+# The façade issue #35 put over this protocol. `facade`, `ota` and `provisioning` are the
+# bridge and design document §06's two examples: they turn "waymaker-embassy is a façade
+# over exactly this protocol" into something that compiles, and `tests/power_loss.rs` drives
+# the two board clocks through `PersistentClock`. The edge goes this way and never the
+# other — nothing in `waymaker-embassy` names this crate — which is what keeps `Boundary`
+# usable with the façade removed.
 waymaker-embassy.workspace = true
 
 [dev-dependencies]
@@ -36,8 +36,9 @@ waymaker-rig.workspace = true
 
 [features]
 default = []
-# Build this crate as it would be with the façade deleted: `facade` and `ota` are the two
-# modules that name `waymaker-embassy`, and this removes them. The `drive-facadeless` stage
+# Build this crate as it would be with the façade deleted: `facade`, `ota` and
+# `provisioning` are the modules that name `waymaker-embassy`, and this removes them. The
+# `drive-facadeless` stage
 # builds it, which turns issue #35's "removing the Embassy crate leaves the protocol fully
 # usable through the synchronous driver" into a compile rather than a text search.
 #
@@ -52,10 +53,10 @@ default = []
 #
 # What it does not prove: the manifest entry above is not optional, so `waymaker-embassy` is
 # still resolved and built, and a compile error inside the façade fails the `drive-facadeless`
-# stage too. So the stage says "no module outside those two needs the façade" and not "this
-# crate builds with the façade deleted". Issue #106 is the crate split that would make the
-# dependency graph say the second. That the *source* names the façade in two files and
-# nowhere else is `ctx-facade`'s.
+# stage too. So the stage says "no other module needs the façade" and not "this crate builds
+# with the façade deleted". Issue #106 is the crate split that would make the dependency
+# graph say the second. That the *source* names the façade in no other file is
+# `ctx-facade`'s.
 without-facade = []
 
 [lints]
