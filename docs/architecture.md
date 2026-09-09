@@ -45,11 +45,12 @@ code-flash budget is a delta against, and nothing depends on it. `waymaker-fault
 in-memory storage model and crash injector — is in it for the same reason: it is a
 workspace member, it depends on `waymaker-flash` for the storage contract, and nothing
 depends on it, in any dependency kind. `waymaker-rig` — design document §15's power-cut and
-watchdog-reset rig — is there too. `xtask` is in the picture for the first time because it now
-depends on three of these: the write-amplification figure `cargo xtask size` publishes is
-measured by running the real writer through the rig over the fault harness's media model,
-rather than transcribed from an arithmetic model that would agree with the writer right up
-until the writer changed. Every one of these crates' edges is dashed, and the gate ignores
+watchdog-reset rig — is there too, and so is `waymaker-drive`, the synchronous driver and
+§06's example workflow. `xtask` is in the picture because it depends on all three, and for one
+reason: it measures rather than transcribes. The write-amplification figure `cargo xtask size`
+publishes comes from running the real writer through the rig over the fault harness's media
+model, and §04's context term and generated workflow future sizes come from the types §06's
+example really links. Every one of these crates' edges is dashed, and the gate ignores
 dashed edges — the contract is the solid ones.
 
 <!-- diagram: crate-dependency-flow -->
@@ -62,6 +63,7 @@ graph TD
   waymaker-size-probe["waymaker-size-probe<br/>linked to be measured, never shipped"]
   waymaker-fault["waymaker-fault<br/>storage model · crash injector · never flashed"]
   waymaker-rig["waymaker-rig<br/>power-cut and watchdog rig · durable witness · wear meter · no_std, never flashed here"]
+  waymaker-drive["waymaker-drive<br/>synchronous driver · effect protocol · §06 example · no_std, never flashed here"]
   xtask["xtask<br/>the gate · the size and wear reports"]
 
   waymaker-embassy --> waymaker-core
@@ -75,15 +77,19 @@ graph TD
   waymaker-rig -.-> waymaker-flash
   waymaker-rig -.-> waymaker-embassy
   waymaker-rig -.-> waymaker-core
+  waymaker-drive -.-> waymaker-embassy
+  waymaker-drive -.-> waymaker-flash
+  waymaker-drive -.-> waymaker-core
   xtask -.-> waymaker-rig
   xtask -.-> waymaker-fault
+  xtask -.-> waymaker-drive
   xtask -.-> waymaker-flash
   xtask -.-> waymaker-core
 
   classDef layer fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef tool fill:#f5f5f5,stroke:#999999,color:#333333;
   class waymaker-embassy,waymaker-flash,waymaker-core layer;
-  class waymaker-size-probe,waymaker-fault,waymaker-rig,xtask tool;
+  class waymaker-size-probe,waymaker-fault,waymaker-rig,waymaker-drive,xtask tool;
 ```
 
 What each layer must not own is the other half of the contract, and it lives in

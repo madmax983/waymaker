@@ -303,6 +303,70 @@ impl ActivityDispatcher for Downloader {
     }
 }
 
+/// The context this firmware links, with every type fixed.
+///
+/// [`Ctx`] borrows its journal, its dispatcher and its buffer, so its size is the same for
+/// every `D` and `J`. Naming the pair the firmware really links is what makes
+/// [`CONTEXT_BYTES`] a reading of this image rather than of a fixture.
+pub type OtaContext<'a> = Ctx<'a, Downloader, Bridge<'a>>;
+
+/// Design document §04's context term, in bytes.
+///
+/// §04 states runtime RAM as "cursor, context, record header, and storage scratch". The
+/// cursor and the record header are `waymaker_core::budget`'s registry and the scratch page
+/// is the caller's; this is the fourth term, and until now nothing measured it.
+///
+/// The assertion below is the gate on the target the budget is stated for — the
+/// `drive-firmware` stage compiles this module for `thumbv6m-none-eabi`. `cargo xtask size`
+/// reports the same constant measured on the host, where a pointer is wider, so the
+/// reported figure is an upper bound on this one.
+pub const CONTEXT_BYTES: usize = size_of::<OtaContext<'static>>();
+
+waymaker_core::assert_context_size!(OtaContext<'static>);
+
+// A ceiling alone lets a narrower type stand in for the context and pass every check: the
+// macro above constrains the type, not the constant, and `xtask` gates whatever this holds.
+// `Ctx` is a journal borrow, a dispatcher borrow, a slice borrow, a length and an ending, so
+// five words is a floor no substitute of a scalar or a thinner reference clears.
+const _: () = assert!(
+    CONTEXT_BYTES >= 5 * size_of::<usize>(),
+    "the context measures less than its own borrows; something narrower than `Ctx` was sized",
+);
+
+/// The size of the future `make` returns, without building one.
+///
+/// `make` is never called. An `async fn`'s return type cannot be written down, and building
+/// a value of it would need a journal, a dispatcher and a buffer; the parameter is there so
+/// that inference gives `F` from the signature. A function pointer rather than a closure
+/// because a closure has a destructor, which a `const fn` may not drop.
+const fn returned_future_bytes<F: Future>(
+    _make: fn(&'static mut OtaContext<'static>, OtaInput<'static>) -> F,
+) -> usize {
+    size_of::<F>()
+}
+
+/// Every generated workflow future in this crate, with its size in bytes.
+///
+/// Reported by `cargo xtask size` in a section of its own and summed into nothing. Design
+/// document §04 excludes the user workflow future from the runtime RAM budget, and issue
+/// [#39](https://github.com/madmax983/waymaker/issues/39) asks that the report make it
+/// visible rather than average it away: a small [`CONTEXT_BYTES`] does not pay for a large
+/// state machine.
+///
+/// Sized for whichever target this crate was compiled for, so `xtask` reports host figures
+/// and a firmware build holds the part's. Neither is gated — §04 sets no budget for user
+/// memory, and a future that grew moves no line above this one.
+pub const WORKFLOW_FUTURES: [(&str, usize); 1] = [("ota_update", OTA_FUTURE_BYTES)];
+
+/// [`ota_update`]'s generated state machine, in bytes.
+const OTA_FUTURE_BYTES: usize = returned_future_bytes(ota_update);
+
+const _: () = assert!(
+    OTA_FUTURE_BYTES > 0,
+    "a workflow that holds a context across three boundaries has state; a zero-sized future \
+     means something other than the future was measured",
+);
+
 /// One boot of the OTA run, with every type fixed.
 ///
 /// The whole reason this function exists is that it names no type parameter. It is what the

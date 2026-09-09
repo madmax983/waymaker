@@ -5,7 +5,8 @@
 //!
 //! * the `const` assertions in this module, which fail the build for
 //!   `thumbv6m-none-eabi` — the target the budgets are stated for — the moment kernel
-//!   state outgrows [`KERNEL_STATE_BYTES`];
+//!   state outgrows [`KERNEL_STATE_BYTES`], and [`assert_context_size!`], which a crate
+//!   naming a concrete context invokes for [`CONTEXT_RAM_BYTES`];
 //! * `cargo xtask size`, which links the size probe once per feature, measures the section
 //!   deltas against a firmware that links nothing from Waymaker, and subtracts what each
 //!   image's symbol table attributes to the probe itself.
@@ -44,6 +45,23 @@ pub const ENGINE_RAM_BYTES: usize = RUNTIME_RAM_BYTES - SCRATCH_PAGE_BYTES;
 /// Kernel state budget in bytes: `waymaker-core` state only, no page buffer.
 pub const KERNEL_STATE_BYTES: usize = 128;
 
+/// Runtime RAM the context may occupy: what kernel state leaves of [`ENGINE_RAM_BYTES`].
+///
+/// Design document §04 lists runtime RAM as "cursor, context, record header, and storage
+/// scratch". The cursor and the record header are registered kernel state, the scratch page
+/// is the caller's, and this is the fourth term. It is *what kernel state leaves* rather
+/// than a number of its own, so the two cannot sum to more than the share they are drawn
+/// from. That is by construction; the assertion at the foot of this file guards a later edit
+/// that gives this constant a literal. It says nothing about a third claimant —
+/// [`ENGINE_RAM_BYTES`] is also the ceiling for the engine's statics — and what holds the
+/// three together is `cargo xtask size`, which gates their sum against
+/// [`RUNTIME_RAM_BYTES`].
+///
+/// The context is `waymaker-embassy`'s `Ctx`, which is above this crate. So the type cannot
+/// be registered here; what is here is the share, and the crate that names a concrete `Ctx`
+/// asserts against it with [`assert_context_size!`].
+pub const CONTEXT_RAM_BYTES: usize = ENGINE_RAM_BYTES.saturating_sub(KERNEL_STATE_BYTES);
+
 /// Incremental code-flash budget in bytes for the kernel plus the flash adapter.
 ///
 /// Design document §04: "Measured on `thumbv6m-none-eabi` with release-size settings.
@@ -65,6 +83,20 @@ pub const KERNEL_STATE_BYTES: usize = 128;
 /// It is still a gate: `cargo xtask size` fails a build over it, and the number lives here
 /// rather than in the gate so that there is one place to change.
 pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 12 * 1024;
+
+/// Incremental code-flash budget in bytes for the three layers with the façade linked.
+///
+/// [`INCREMENTAL_CODE_FLASH_BYTES`] is design document §04's number and §04 states it for
+/// "core + flash adapter". The Embassy façade is a third crate, so it gets a ceiling of its
+/// own rather than a raise of the engine's: raising the engine's number to pay for the
+/// façade would widen the kernel's budget for a cost the kernel does not carry.
+///
+/// The engine's ceiling plus 1 KiB. The façade measured 398 B over the engine row at rung
+/// 0.4, so the 1 KiB is room for the rest of the rung rather than a figure fitted to
+/// today's build.
+///
+/// It is a gate: `cargo xtask size` fails a build over the `facade` row.
+pub const FACADE_CODE_FLASH_BYTES: usize = INCREMENTAL_CODE_FLASH_BYTES + 1024;
 
 /// One type that is part of the kernel's live state, and the space it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +123,34 @@ impl TypeSize {
     }
 }
 
+/// Fails the build when `$ty` does not fit the context's share of runtime RAM.
+///
+/// [`CONTEXT_RAM_BYTES`] is stated in this crate and the context is declared above it, so
+/// this is how a crate that names a concrete context is held to §04 on the target the
+/// budget is stated for. `cargo xtask size` reports the same figure measured on the host,
+/// which is an upper bound; this is the exact one.
+///
+/// ```
+/// waymaker_core::assert_context_size!(u32);
+/// ```
+///
+/// Every path and every macro the expansion uses is qualified, for
+/// [`assert_kernel_state_size!`]'s reason.
+#[macro_export]
+macro_rules! assert_context_size {
+    ($ty:ty) => {
+        const _: () = ::core::assert!(
+            ::core::mem::size_of::<$ty>() <= $crate::budget::CONTEXT_RAM_BYTES,
+            ::core::concat!(
+                "`",
+                ::core::stringify!($ty),
+                "` does not fit the context's share of runtime RAM; see design document \
+                 \u{a7}04 and run `cargo xtask size` for the measured figure"
+            ),
+        );
+    };
+}
+
 /// Fails the build when `$ty` does not fit the kernel-state budget.
 ///
 /// The one-argument form uses [`KERNEL_STATE_BYTES`]; the two-argument form takes a
@@ -102,12 +162,14 @@ impl TypeSize {
 /// ```
 ///
 /// That doctest proves the path resolves; it cannot prove the expansion is hygienic,
-/// because a doctest compiles as an ordinary crate with nothing shadowed. The leading `::`
-/// on `::core::mem::size_of` below is what makes it hygienic: an unqualified `core`
-/// resolves at the *call site*, so a firmware crate with a module of its own by that name —
-/// or one that renamed a dependency to it — would be told that `mem` could not be found,
-/// by a macro it did not write. This is the one item of this crate's surface that
-/// downstream firmware touches, and the leading `::` is not optional in it.
+/// because a doctest compiles as an ordinary crate with nothing shadowed. Every path *and
+/// every macro* below is qualified, and both halves matter. An unqualified `core` resolves
+/// at the *call site*, so a firmware crate with a module of its own by that name would be
+/// told that `mem` could not be found by a macro it did not write. And `macro_rules!`
+/// resolves macro names at the call site too, so an unqualified `assert!` is one a caller
+/// can shadow — a `macro_rules! assert { ($($t:tt)*) => { () } }` in the calling crate turns
+/// this budget off and nothing says so. This is the one item of this crate's surface that
+/// downstream firmware touches; the qualification is not optional in it.
 ///
 /// The failure is a compile error rather than a report, which is the point: a regression
 /// that only shows up in a report is a regression somebody has to be looking for.
@@ -117,11 +179,11 @@ macro_rules! assert_kernel_state_size {
         $crate::assert_kernel_state_size!($ty, $crate::budget::KERNEL_STATE_BYTES);
     };
     ($ty:ty, $limit:expr) => {
-        const _: () = assert!(
+        const _: () = ::core::assert!(
             ::core::mem::size_of::<$ty>() <= $limit,
-            concat!(
+            ::core::concat!(
                 "`",
-                stringify!($ty),
+                ::core::stringify!($ty),
                 "` does not fit the kernel-state budget; see design document \u{a7}04 and \
                  run `cargo xtask size` for the measured figure"
             ),
@@ -190,9 +252,24 @@ kernel_state_types! {
 #[doc(inline)]
 pub use crate::assert_kernel_state_size;
 
+/// The context assertion, documented beside the share it is stated against.
+#[doc(inline)]
+pub use crate::assert_context_size;
+
 const _: () = assert!(
     SCRATCH_PAGE_BYTES < RUNTIME_RAM_BYTES,
     "the scratch page must leave the engine some runtime RAM",
+);
+const _: () = assert!(
+    KERNEL_STATE_BYTES + CONTEXT_RAM_BYTES == ENGINE_RAM_BYTES,
+    "the kernel state and the context partition what the scratch page leaves of runtime \
+     RAM; a literal that broke the partition is two budgets that can both pass while their \
+     sum fails",
+);
+const _: () = assert!(
+    FACADE_CODE_FLASH_BYTES >= INCREMENTAL_CODE_FLASH_BYTES,
+    "the facade image contains the engine one, so its ceiling cannot be the lower of the \
+     two",
 );
 const _: () = assert!(
     KERNEL_STATE_BYTES <= ENGINE_RAM_BYTES,

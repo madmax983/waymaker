@@ -90,3 +90,25 @@ fn the_registry_names_each_type_once() {
 // `xtask/tests/size_budgets.rs` proves by building a crate that must not build.
 waymaker_core::assert_kernel_state_size!([u8; 128]);
 waymaker_core::assert_kernel_state_size!(u64, 8);
+
+#[test]
+fn the_context_gets_what_the_kernel_state_leaves_of_engine_ram() {
+    // Design document §04 lists runtime RAM as "cursor, context, record header, and storage
+    // scratch". The cursor and the record header are in the kernel-state registry and the
+    // scratch page is the caller's; the context is the remaining term, so it gets the
+    // remaining share. A partition rather than two independent numbers, because two
+    // independent numbers can sum to more than the budget they are drawn from.
+    const {
+        assert!(budget::KERNEL_STATE_BYTES + budget::CONTEXT_RAM_BYTES == budget::ENGINE_RAM_BYTES);
+    }
+}
+
+#[test]
+fn the_facade_ceiling_is_the_engine_ceiling_and_room_for_the_facade() {
+    assert_eq!(budget::FACADE_CODE_FLASH_BYTES, 13 * 1024);
+    // The façade image strictly contains the engine one, so a ceiling below the engine's
+    // would be a budget no build could satisfy and every build would blame on the façade.
+    const {
+        assert!(budget::FACADE_CODE_FLASH_BYTES >= budget::INCREMENTAL_CODE_FLASH_BYTES);
+    }
+}

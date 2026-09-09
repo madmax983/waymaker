@@ -215,7 +215,11 @@ fn baseline_diff(root: &Path, options: &SizeOptions, report: &xtask::size::SizeR
             // registry has no row to move and would otherwise read "no change".
             let kernel_state = xtask::size::kernel_state_change(&base, report)
                 .map_or_else(String::new, |change| format!("  {change}\n"));
-            format!("{rows}{kernel_state}")
+            // The same, for the two runtime RAM terms that are type sizes rather than
+            // sections: a context or a generated future that grew moves no row.
+            let runtime = xtask::size::runtime_ram_change(&base, report)
+                .map_or_else(String::new, |change| format!("  {change}\n"));
+            format!("{rows}{kernel_state}{runtime}")
         }
         Err(error) => format!("size against the base branch: not compared; {error}\n"),
     }

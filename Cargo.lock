@@ -299,6 +299,7 @@ dependencies = [
  "serde_json",
  "toml",
  "waymaker-core",
+ "waymaker-drive",
  "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",
