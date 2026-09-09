@@ -104,6 +104,25 @@ pub const STAGES: &[Stage] = &[
         why: "no behavior ships without a test",
     },
     Stage {
+        name: "codec-lint",
+        job: "check",
+        // Every stage above passes `--no-default-features`, so issue #37's optional codec
+        // helpers are compiled by none of them: they would ship unlinted and untested while
+        // the build stayed green. `--all-targets` so that the tests below are linted too.
+        //
+        // `postcard` enables `serde`, so one selection covers both features.
+        command: "cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings",
+        in_hook: false,
+        why: "issue #37: the optional codec helpers are compiled by no other stage, so nothing else lints them",
+    },
+    Stage {
+        name: "codec-test",
+        job: "check",
+        command: "cargo test --locked -p waymaker-embassy --features postcard --test codec",
+        in_hook: false,
+        why: "issue #37: no behavior ships without a test, and a feature-gated one needs a stage that enables the feature",
+    },
+    Stage {
         name: "docs",
         job: "check",
         command: "cargo doc --locked --workspace --no-deps --no-default-features",
@@ -181,6 +200,16 @@ pub const STAGES: &[Stage] = &[
         command: "cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi",
         in_hook: false,
         why: "issue #35: no synchronous-driver module outside the fa\u{e7}ade edge needs the fa\u{e7}ade, as a compile rather than a text search",
+    },
+    Stage {
+        name: "codec-firmware",
+        job: "firmware",
+        // The claim issue #37 makes is that a codec is optional, not that it is host-only:
+        // a firmware that enables `postcard` still has to link. `--lib` for the reason the
+        // three stages above give — it is the library a board links.
+        command: "cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi",
+        in_hook: false,
+        why: "issue #37: a codec helper that only builds on the host is not an option a firmware has",
     },
     Stage {
         name: "probe-lint",

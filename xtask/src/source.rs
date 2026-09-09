@@ -5272,6 +5272,242 @@ pub fn check_timer_record_fields(sources: &[crate::size::LayerSource]) -> Vec<Vi
 /// The façade's own module, whose public surface `ctx-facade` pins.
 pub const CTX_FACADE_PATH: &str = "waymaker-embassy/src/ctx.rs";
 
+/// The one façade module a codec may be named in.
+pub const CODEC_PATH: &str = "waymaker-embassy/src/decode.rs";
+
+/// The façade crate, whose codec `codec-is-optional` holds to being optional.
+pub const CODEC_CRATE: &str = "waymaker-embassy";
+
+/// How a codec is spelled, so that no other façade module can name one.
+///
+/// Design document §02 decision 4: records are numeric kinds and borrowed bytes, and Serde
+/// and Postcard are conveniences "never wire-format requirements". The way that is given
+/// back is not a feature — it is a bound: a `Ctx::activity` that asked for
+/// `DeserializeOwned`, or a `Handoff` that named a codec type, makes every workflow carry
+/// the codec whatever the manifest says.
+pub const CODEC_VOCABULARY: &[&str] = &[
+    "Coded",
+    "Deserialize",
+    "DeserializeOwned",
+    "Format",
+    "FromPostcard",
+    "Postcard",
+    "Serialize",
+    "postcard",
+    "serde",
+];
+
+/// The trait every recorded answer goes through, which names no codec.
+///
+/// Declared outside every `cfg`, so a default build still has it.
+pub const CODEC_FREE_TRAIT: &str = "pub trait Decode";
+
+/// The codec features, and what each must enable.
+///
+/// `postcard` enables `serde` rather than `dep:serde` on its own: the bridge is what the
+/// format plugs into, so a `postcard` that skipped it would be a format with nothing to be
+/// a format for.
+pub const CODEC_FEATURES: &[(&str, &[&str])] = &[
+    ("serde", &["dep:serde"]),
+    ("postcard", &["dep:postcard", "serde"]),
+];
+
+/// The dependencies a codec feature is the only thing that enables.
+pub const CODEC_DEPENDENCIES: &[&str] = &["postcard", "serde"];
+
+/// Rule: a codec stays optional, and stays out of the boundary.
+///
+/// Design document §02 decision 4 makes a codec a convenience. Three ways of taking that
+/// back break no other rule and need no new dependency:
+///
+/// * a codec named in another façade module — a `Ctx::activity` bounded on
+///   `DeserializeOwned` makes every workflow carry the codec whatever the manifest says;
+/// * a codec item in [`CODEC_PATH`] that no feature gates, which links the codec into the
+///   default build and stops [`CODEC_FREE_TRAIT`] being free of one;
+/// * a codec dependency that is not `optional`, which links it whatever feature is
+///   selected and makes the size report's per-feature row measure nothing.
+///
+/// # What it cannot see
+///
+/// A codec named from a *sibling* crate, and a bound written without one of
+/// [`CODEC_VOCABULARY`]'s words — a type alias for `DeserializeOwned` declared in
+/// `decode.rs` and used in `ctx.rs` names nothing forbidden. It pins one crate and one
+/// module of it, the way `capacity-reserve`, `recovery-surface` and `storage-contract`
+/// each say of the one file they pin. `crates/waymaker-embassy/tests/codec.rs` holds the
+/// behaviour, and the `codec-test` stage runs it.
+#[must_use]
+pub fn check_codec_is_optional(
+    sources: &[crate::size::LayerSource],
+    manifests: &[(String, String)],
+) -> Vec<Violation> {
+    const RULE: &str = "codec-is-optional";
+
+    let mut violations = Vec::new();
+
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == CODEC_CRATE)
+    {
+        let path = source.path.replace('\\', "/");
+        if path.ends_with(CODEC_PATH) {
+            continue;
+        }
+        let code = without_test_modules(&code_only(&source.contents));
+        for word in CODEC_VOCABULARY {
+            if names_identifier(&code, word) {
+                violations.push(Violation::new(
+                    RULE,
+                    CODEC_CRATE,
+                    format!(
+                        "{path} names `{word}`; only `{CODEC_PATH}` may name a codec, because \
+                         a codec named on the boundary is one every workflow carries whatever \
+                         the manifest says"
+                    ),
+                ));
+            }
+        }
+    }
+
+    match sources
+        .iter()
+        .find(|source| source.path.replace('\\', "/").ends_with(CODEC_PATH))
+    {
+        Some(source) => violations.extend(check_codec_module(RULE, &source.contents)),
+        None => violations.push(Violation::new(
+            RULE,
+            CODEC_CRATE,
+            format!("{CODEC_PATH} is not where the gate looks for it, so the pin checks nothing"),
+        )),
+    }
+
+    violations.extend(check_codec_manifest(
+        RULE,
+        manifests
+            .iter()
+            .find(|(name, _)| name == CODEC_CRATE)
+            .map(|(_, contents)| contents.as_str()),
+    ));
+    violations
+}
+
+/// Every codec item of the codec module is behind a feature, and the trait is not.
+fn check_codec_module(rule: &'static str, contents: &str) -> Vec<Violation> {
+    let code = without_test_modules(&code_only(contents));
+    let mut violations = Vec::new();
+    let mut gated = false;
+    let mut seen_trait = false;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[cfg(feature") {
+            gated = true;
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // An item starts at column zero; anything indented is a member of one, and the
+        // attribute above the item already decided it.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+
+        if trimmed.starts_with(CODEC_FREE_TRAIT) {
+            seen_trait = true;
+            if gated {
+                violations.push(Violation::new(
+                    rule,
+                    CODEC_CRATE,
+                    format!(
+                        "{CODEC_PATH} declares `{CODEC_FREE_TRAIT}` behind a feature; it is \
+                         the trait every recorded answer goes through, so a default build \
+                         has to have it"
+                    ),
+                ));
+            }
+        } else if !gated {
+            for word in CODEC_VOCABULARY {
+                if names_identifier(trimmed, word) {
+                    violations.push(Violation::new(
+                        rule,
+                        CODEC_CRATE,
+                        format!(
+                            "{CODEC_PATH} declares `{trimmed}`, which names `{word}` and no \
+                             `#[cfg(feature = ..)]` gates: a codec in the default build is a \
+                             codec every firmware pays for"
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        gated = false;
+    }
+
+    if !seen_trait {
+        violations.push(Violation::new(
+            rule,
+            CODEC_CRATE,
+            format!("{CODEC_PATH} declares no `{CODEC_FREE_TRAIT}`, so the pin checks nothing"),
+        ));
+    }
+    violations
+}
+
+/// The codec dependencies are optional, and the codec features enable what they must.
+fn check_codec_manifest(rule: &'static str, manifest: Option<&str>) -> Vec<Violation> {
+    let Some(parsed) = manifest.and_then(|manifest| manifest.parse::<toml::Table>().ok()) else {
+        return vec![Violation::new(
+            rule,
+            CODEC_CRATE,
+            "its manifest could not be read, so the rules about what is optional did not run",
+        )];
+    };
+
+    let mut violations = Vec::new();
+    let dependencies = parsed.get("dependencies").and_then(toml::Value::as_table);
+    for name in CODEC_DEPENDENCIES {
+        let optional = dependencies
+            .and_then(|table| table.get(*name))
+            .and_then(toml::Value::as_table)
+            .and_then(|entry| entry.get("optional"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if !optional {
+            violations.push(Violation::new(
+                rule,
+                CODEC_CRATE,
+                format!(
+                    "declares `{name}` without `optional = true`, so every build links it and \
+                     the size report's row for it measures nothing"
+                ),
+            ));
+        }
+    }
+
+    let features = parsed.get("features").and_then(toml::Value::as_table);
+    for (feature, required) in CODEC_FEATURES {
+        let enabled: Vec<&str> = features
+            .and_then(|table| table.get(*feature))
+            .and_then(toml::Value::as_array)
+            .map(|entries| entries.iter().filter_map(toml::Value::as_str).collect())
+            .unwrap_or_default();
+        for wanted in *required {
+            if !enabled.contains(wanted) {
+                violations.push(Violation::new(
+                    rule,
+                    CODEC_CRATE,
+                    format!(
+                        "its `{feature}` feature does not enable `{wanted}`, so the row that \
+                         measures it links less than the feature is supposed to add"
+                    ),
+                ));
+            }
+        }
+    }
+    violations
+}
+
 /// The durable half the façade asks, whose public surface `ctx-facade` pins.
 pub const CTX_JOURNAL_PATH: &str = "waymaker-embassy/src/journal.rs";
 
@@ -7782,6 +8018,161 @@ fn erase_lifetimes(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A façade file set with one codec module and one that is not.
+    fn facade_sources(decode: &str, ctx: &str) -> Vec<crate::size::LayerSource> {
+        vec![
+            crate::size::LayerSource {
+                crate_name: CODEC_CRATE.to_owned(),
+                path: format!("crates/{CODEC_PATH}"),
+                contents: decode.to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: CODEC_CRATE.to_owned(),
+                path: format!("crates/{CTX_FACADE_PATH}"),
+                contents: ctx.to_owned(),
+            },
+        ]
+    }
+
+    fn codec_manifests(contents: &str) -> Vec<(String, String)> {
+        vec![(CODEC_CRATE.to_owned(), contents.to_owned())]
+    }
+
+    #[test]
+    fn a_facade_that_keeps_its_codec_optional_is_accepted() {
+        let violations = check_codec_is_optional(
+            &facade_sources(&tests_support::clean_codec_module(), "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_codec_named_outside_the_codec_module_is_reported() {
+        // The failure §02 decision 4 is actually about: not a dependency, a *bound*. Every
+        // workflow carries the codec whatever the manifest says.
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                &tests_support::clean_codec_module(),
+                "pub fn activity<T: DeserializeOwned>() {}\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "codec-is-optional"
+                    && violation.detail.contains("DeserializeOwned")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_codec_item_that_is_not_behind_a_feature_is_reported() {
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                "pub trait Decode: Sized {}\npub struct Postcard;\n",
+                "pub struct Ctx;\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decode_trait_hidden_behind_a_feature_is_reported() {
+        // The other direction, and the one that breaks the default build: the trait every
+        // workflow names must be there when no feature is.
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                "#[cfg(feature = \"serde\")]\npub trait Decode: Sized {}\n",
+                "pub struct Ctx;\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Decode")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_codec_module_is_reported() {
+        let violations = check_codec_is_optional(
+            &[],
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains(CODEC_PATH)),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_codec_dependency_that_is_not_optional_is_reported() {
+        let manifest = tests_support::clean_codec_manifest().replace(
+            "postcard = { version = \"1\", optional = true, default-features = false }",
+            "postcard = { version = \"1\", default-features = false }",
+        );
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&tests_support::clean_codec_module(), "pub struct Ctx;\n"),
+            &codec_manifests(&manifest),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_codec_feature_that_enables_the_wrong_thing_is_reported() {
+        let manifest = tests_support::clean_codec_manifest()
+            .replace("postcard = [\"dep:postcard\", \"serde\"]", "postcard = []");
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&tests_support::clean_codec_module(), "pub struct Ctx;\n"),
+            &codec_manifests(&manifest),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("dep:postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_facade_manifest_the_gate_cannot_read_is_reported() {
+        let violations = check_codec_is_optional(
+            &facade_sources(&tests_support::clean_codec_module(), "pub struct Ctx;\n"),
+            &[],
+        );
+
+        assert!(
+            !violations.is_empty(),
+            "a manifest nobody read checks nothing"
+        );
+    }
 
     const GOOD: &str = "//! Docs.\n#![no_std]\n#![forbid(unsafe_code)]\n";
 
@@ -12813,6 +13204,34 @@ mod tests {
     }
 }
 ",
+        )
+    }
+
+    /// A codec module every half of the rule accepts.
+    #[must_use]
+    pub fn clean_codec_module() -> String {
+        String::from(
+            "pub trait Decode: Sized {\n    type Error;\n}\n\
+             impl Decode for () {\n    type Error = ();\n}\n\
+             #[cfg(feature = \"serde\")]\npub use serde;\n\
+             #[cfg(feature = \"serde\")]\npub trait Format {}\n\
+             #[cfg(feature = \"serde\")]\npub struct Coded<F, T>(F, T);\n\
+             #[cfg(feature = \"postcard\")]\npub struct Postcard;\n\
+             #[cfg(feature = \"postcard\")]\npub type FromPostcard<T> = Coded<Postcard, T>;\n",
+        )
+    }
+
+    /// A façade manifest every half of the rule accepts.
+    #[must_use]
+    pub fn clean_codec_manifest() -> String {
+        String::from(
+            "[package]\nname = \"waymaker-embassy\"\n\n\
+             [dependencies]\n\
+             serde = { version = \"1\", optional = true, default-features = false }\n\
+             postcard = { version = \"1\", optional = true, default-features = false }\n\n\
+             [features]\ndefault = []\nserde = [\"dep:serde\"]\n\
+             postcard = [\"dep:postcard\", \"serde\"]\n\n\
+             [lints]\nworkspace = true\n",
         )
     }
 

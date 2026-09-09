@@ -170,9 +170,10 @@ pub struct Variant {
 /// rather than measured as zero.
 #[must_use]
 pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
-    if graph.find(PROBE_PACKAGE).is_none() {
+    let Some(probe) = graph.find(PROBE_PACKAGE) else {
         return Vec::new();
-    }
+    };
+    let probe_features = probe.features.clone();
 
     let mut variants = vec![
         Variant {
@@ -220,13 +221,19 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             if feature == "default" {
                 continue;
             }
+            // The probe's own mirror when it declares one, so the probe can `#[cfg]` on
+            // the row and reach the code it exists to measure. `check_probe_mirrors` is
+            // what makes the mirror compulsory; the fallback keeps a workspace whose probe
+            // predates that rule measurable rather than unbuildable.
+            let mirror = mirror_feature(spec.name, feature);
+            let selector = if probe_features.contains(&mirror) {
+                mirror
+            } else {
+                format!("{}/{feature}", spec.name)
+            };
             variants.push(Variant {
                 name: format!("{}/{feature}", spec.name),
-                features: vec![
-                    PROBE_FEATURE.to_owned(),
-                    base.to_owned(),
-                    format!("{}/{feature}", spec.name),
-                ],
+                features: vec![PROBE_FEATURE.to_owned(), base.to_owned(), selector],
                 measured_against: if base == FACADE_FEATURE {
                     FACADE_FEATURE.to_owned()
                 } else {
@@ -1898,6 +1905,7 @@ pub fn check_size_probe(
         }
     }
     violations.extend(check_probe_features(manifest));
+    violations.extend(check_probe_mirrors(graph, manifest));
 
     violations.extend(check_probe_manifest(manifest));
     violations.extend(check_probe_source(source));
@@ -1914,6 +1922,84 @@ const REQUIRED_PROBE_FEATURES: &[(&str, &[&str])] = &[
     (ENGINE_FEATURE, &["dep:waymaker-core", "dep:waymaker-flash"]),
     (FACADE_FEATURE, &[ENGINE_FEATURE, "dep:waymaker-embassy"]),
 ];
+
+/// The probe feature that mirrors `feature` of `layer`.
+///
+/// Derived from both names rather than taken from a table, so a feature added to a layer
+/// has one place to be mirrored and no row to remember. The layer's own prefix is dropped
+/// — every layer carries it — and what is left names the layer, so two layers declaring
+/// one feature name mirror it under two probe features.
+#[must_use]
+fn mirror_feature(layer: &str, feature: &str) -> String {
+    format!(
+        "{}-{feature}",
+        layer.strip_prefix("waymaker-").unwrap_or(layer)
+    )
+}
+
+/// Rule: the probe mirrors every layer feature, so the row for it reaches the code.
+///
+/// `--features waymaker-embassy/postcard` enables the layer's feature and defines no `cfg`
+/// in the probe, so the probe cannot write a call the feature turns on: the row links the
+/// codec and reaches none of it, and reports the delta of an image nobody exercised. A
+/// mirror feature of the probe's own is what the probe can `#[cfg]` on.
+///
+/// Derived rather than tabulated, in both halves: [`mirror_feature`] names the mirror, and
+/// a layer feature that has none fails here rather than producing a quiet row of zero.
+#[must_use]
+fn check_probe_mirrors(graph: &PackageGraph, manifest: Option<&str>) -> Vec<Violation> {
+    let Some(probe) = graph.find(PROBE_PACKAGE) else {
+        // Already reported by `check_size_probe`.
+        return Vec::new();
+    };
+    let parsed = manifest.and_then(|manifest| manifest.parse::<toml::Table>().ok());
+    let features = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.get("features"))
+        .and_then(toml::Value::as_table);
+
+    let mut violations = Vec::new();
+    for spec in policy::LAYERS {
+        let Some(package) = graph.find(spec.name) else {
+            continue;
+        };
+        for feature in &package.features {
+            if feature == "default" {
+                continue;
+            }
+            let mirror = mirror_feature(spec.name, feature);
+            let selector = format!("{}/{feature}", spec.name);
+            if !probe.features.contains(&mirror) {
+                violations.push(Violation::new(
+                    "size-probe",
+                    PROBE_PACKAGE,
+                    format!(
+                        "does not declare `{mirror}`, so the `{selector}` row links that \
+                         feature and can reach none of it: a probe cannot `#[cfg]` on a \
+                         feature of another crate"
+                    ),
+                ));
+                continue;
+            }
+            let enabled: Vec<&str> = features
+                .and_then(|table| table.get(&mirror))
+                .and_then(toml::Value::as_array)
+                .map(|entries| entries.iter().filter_map(toml::Value::as_str).collect())
+                .unwrap_or_default();
+            if !enabled.contains(&selector.as_str()) {
+                violations.push(Violation::new(
+                    "size-probe",
+                    PROBE_PACKAGE,
+                    format!(
+                        "its `{mirror}` feature does not enable `{selector}`, so the row \
+                         named after that feature measures an image without it"
+                    ),
+                ));
+            }
+        }
+    }
+    violations
+}
 
 /// Rule: each probe feature still enables the crates its row is supposed to measure.
 fn check_probe_features(manifest: Option<&str>) -> Vec<Violation> {
@@ -2752,6 +2838,112 @@ mod tests {
             "{:?}",
             variants.iter().map(|v| &v.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_layer_feature_the_probe_mirrors_is_selected_by_the_probes_own_feature() {
+        let mut graph = workspace(&[], &["postcard"]);
+        graph = PackageGraph::new(
+            graph
+                .packages()
+                .iter()
+                .map(|package| {
+                    if package.name == PROBE_PACKAGE {
+                        Package::new(PROBE_PACKAGE).with_features(&[
+                            "probe",
+                            "engine",
+                            "facade",
+                            "embassy-postcard",
+                        ])
+                    } else {
+                        package.clone()
+                    }
+                })
+                .collect(),
+        );
+
+        let variants = matrix(&graph);
+        let row = find(&variants, "waymaker-embassy/postcard");
+        assert_eq!(
+            row.features,
+            [PROBE_FEATURE, FACADE_FEATURE, "embassy-postcard"],
+            "a `<layer>/<feature>` selector enables the layer feature but defines no cfg in \
+             the probe, so the row links the code and reaches none of it"
+        );
+    }
+
+    #[test]
+    fn the_probe_feature_that_mirrors_a_layer_feature_is_derived_from_both_names() {
+        assert_eq!(
+            mirror_feature("waymaker-embassy", "postcard"),
+            "embassy-postcard"
+        );
+        assert_eq!(mirror_feature("waymaker-core", "serde"), "core-serde");
+    }
+
+    #[test]
+    fn a_layer_feature_the_probe_does_not_mirror_is_reported() {
+        let violations = check_probe_mirrors(
+            &workspace(&[], &["postcard"]),
+            Some(&tests_support::clean_probe_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "size-probe"
+                    && violation.detail.contains("embassy-postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_mirror_that_does_not_enable_its_layer_feature_is_reported() {
+        let manifest = format!(
+            "{}embassy-postcard = [\"facade\"]\n",
+            tests_support::clean_probe_manifest()
+        );
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy").with_features(&["postcard"]),
+            Package::new(PROBE_PACKAGE).with_features(&[
+                "probe",
+                "engine",
+                "facade",
+                "embassy-postcard",
+            ]),
+        ]);
+
+        let violations = check_probe_mirrors(&graph, Some(&manifest));
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("waymaker-embassy/postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_mirrored_layer_feature_is_not_reported() {
+        let manifest = format!(
+            "{}embassy-postcard = [\"facade\", \"waymaker-embassy/postcard\"]\n",
+            tests_support::clean_probe_manifest()
+        );
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy").with_features(&["postcard"]),
+            Package::new(PROBE_PACKAGE).with_features(&[
+                "probe",
+                "engine",
+                "facade",
+                "embassy-postcard",
+            ]),
+        ]);
+
+        assert!(check_probe_mirrors(&graph, Some(&manifest)).is_empty());
     }
 
     #[test]

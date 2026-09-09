@@ -20,7 +20,12 @@
 //! * [`dispatch`] — the world's half: what performs design document §07 step 4.
 //! * [`wiring`] — issue [#36](https://github.com/madmax983/waymaker/issues/36)'s table: a
 //!   row per activity, selected by its number, named for a log.
-//! * [`decode`] — how a workflow reads recorded bytes. It names no codec.
+//! * [`decode`] — how a workflow reads recorded bytes. [`Decode`] names no codec, and
+//!   nothing else in this crate does either: issue
+//!   [#37](https://github.com/madmax983/waymaker/issues/37)'s `serde` and `postcard`
+//!   features add a bridge and one format, and both stay inside that one module. They are
+//!   not re-exported here, because a codec type on the crate root is a codec every
+//!   workflow reads about.
 //! * [`clock`] — design document §11's `PersistentClock` capability. It is here rather
 //!   than in the kernel because the kernel's must-not-own cell names a clock, and
 //!   `waymaker-flash`'s names timers.
@@ -34,8 +39,7 @@
 //!
 //! # Status
 //!
-//! Rung 0.4's first two items are here. Still owed: the optional codec helpers (issue
-//! [#37](https://github.com/madmax983/waymaker/issues/37)), the provisioning example (issue
+//! Rung 0.4's first three items are here. Still owed: the provisioning example (issue
 //! [#38](https://github.com/madmax983/waymaker/issues/38)), in-boot sleep and the
 //! `continue_as_new` join (issue
 //! [#110](https://github.com/madmax983/waymaker/issues/110)), and the budgets this rung

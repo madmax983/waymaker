@@ -67,6 +67,14 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --no-default-features
 
+      # Every stage above passes --no-default-features, so issue #37's optional codec
+      # helpers are compiled by none of them.
+      - name: Codec lint
+        run: cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings
+
+      - name: Codec test
+        run: cargo test --locked -p waymaker-embassy --features postcard --test codec
+
       - name: Docs
         run: cargo doc --locked --workspace --no-deps --no-default-features
 
@@ -133,6 +141,11 @@ jobs:
       # through `crate::facade` or a dependency renamed in a manifest; a scanner does not.
       - name: Build the synchronous driver with the façade removed
         run: cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+
+      # Issue #37's codec helpers are optional, not host-only: a firmware that enables
+      # `postcard` still has to link for the part.
+      - name: Build the façade's codec helpers for the firmware target
+        run: cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 
       # The size probe's binary is behind `required-features`, so the `check` job's clippy
       # stage — `--all-targets` on the host — never compiles it. Without this step the

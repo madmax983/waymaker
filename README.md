@@ -150,12 +150,15 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 cargo build  --locked --workspace --no-default-features
 cargo test   --locked --workspace --no-default-features
+cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings
+cargo test   --locked -p waymaker-embassy --features postcard --test codec
 cargo doc    --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,facade --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
@@ -342,6 +345,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `timer-capability` | design document §11's timer semantics gain or lose a public function the pinned list does not have — a `TimerSpec::best_effort`, a `Timer::arm_or_downgrade`, a `PersistentClock::now_or_zero`, an `Rtc::assume_held` — a pinned vocabulary declares a member the pin does not have, the persistent-clock module names the boot clock, or a board clock driver gains a method at any visibility, a public field, or a constant, so a deadline that needs an RTC could be quietly served by a clock that restarts on every reset or by a counter no register vouched for |
 | `ctx-facade` | issue #35's `Ctx` or the durable half it asks gains a public function the pinned list does not have — a `Ctx::record` that appends for itself, a fifth journal method — `Ctx` gains a method at any visibility or an associated constant, or any file of the façade crate declares a fifth future, names a piece of on-media authority (`StableStorage`, `Reserved`, `RecordRef`, `Recovery`, `ReplayMachine`, `BankLayout`, `Swap`), holds a `static`, or declares a `macro_rules!` a scanner cannot expand; or a synchronous-driver module outside the façade edge names the façade crate, one of its two modules, or the `Bridge` they re-export |
 | `dispatch-wiring` | issue #36's dispatcher trait or its table gains or loses a function the pinned list does not have — a `Table::by_name`, a `Table::register`, read anywhere in the file and at every visibility, because a free `pub(crate) fn` at module scope is on neither a surface pin nor a method pin — either type is declared twice, declares a public field or a field set the pin does not have, the file grows a submodule, or one of the two bodies that select a row names a row's label, so an activity could be reached by its name rather than by its number and issue #36's string-addressed-registry non-goal would be a convention rather than a build failure |
+| `codec-is-optional` | issue #37's codec helpers stop being optional — a façade module other than the codec one names a codec, a codec item in that module is gated by no feature, the trait every recorded answer goes through is gated by one, or a codec dependency is not `optional`, so design document §02 decision 4's "never a wire-format requirement" would rest on a manifest nobody reads |
 | `rig-oracle` | the rig's oracle or its census gains a public function the pin does not list — an `Audit::assume_passed`, a `Coverage::force_complete` — so an instrument whose bugs show up as *passing* tests could be turned off without a reviewer writing it down |
 | `storage-contract` | the storage contract's public surface differs from the pinned list, so a host convenience — a `read_all`, a `flush` — could arrive on a trait every port has to implement without a reviewer writing it down |
 | `recovery-surface` | the storage-backed recovery reader's public surface differs from the pinned list, so a `seek`, a `resume_at`, or a second route to an append offset could arrive without a reviewer writing it down |

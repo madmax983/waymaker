@@ -13,9 +13,18 @@ keywords = ["durable", "workflow", "embassy", "no-std"]
 [dependencies]
 waymaker-core.workspace = true
 waymaker-flash.workspace = true
+# Optional, and the only thing that enables either is a codec feature below. Design
+# document §02 decision 4: a codec is a convenience, never a wire-format requirement.
+serde = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
 
 [features]
 default = []
+# Serde's data model and no format: the `Format` bridge a firmware plugs its own codec
+# into. Its cost is its own row of `cargo xtask size`.
+serde = ["dep:serde"]
+# One format for the bridge above.
+postcard = ["dep:postcard", "serde"]
 
 [lints]
 workspace = true
