@@ -2155,9 +2155,30 @@ reading it off the linked image needs an attribute this workspace cannot declare
 size. See
 [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md).
 
+Issue #38 adds design document §06's second example. `waymaker-drive`'s `provisioning`
+module is `provision`: wait for a persistent-time window, register — retrying up to three
+times on failure, each attempt its own effect — then end with a completion carrying a real
+token or a failure carrying a real reason. Three boundaries `ota_update` does not use: a
+timer, a workflow-driven retry, and a terminal payload that is not empty. It also closes a
+gap [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md)
+named: `ota_update`'s input is a module constant no boot reads back, so nothing ties
+`Workflow::identity` to what a run asks for. `Provisioning` carries its input as a field
+instead, and `tests/provisioning.rs`'s sharpest test reboots with a different one and
+requires `DriveError::NotThisWorkflow`.
+Both "done when"s already claimed for OTA needed a second look, not just a first one for
+provisioning. The future-size report now names two rows — `ota_update` and `provision` —
+from `waymaker_drive::provisioning::WORKFLOW_FUTURES` read beside `ota`'s own, and
+`cargo xtask size` prints both under one heading. And "exercised by the crash rig" was true
+of neither example before this: each test file had reboot-by-hand tests but no
+`waymaker-fault` sweep. `tests/ota.rs` and `tests/provisioning.rs` each gained one, at every
+crash point the injector lists, over the real façade and the real driver.
+`poll_provisioning` is the concrete path the firmware build monomorphises, the way
+`poll_ota` already was — `drive-firmware` links both. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
-async `Ctx`, the dispatcher, the codec helpers and rung 0.4's exit criterion are here —
-issues #35, #36, #37 and #39, below — and in-boot sleep is the rest of 0.4. The
-gates went in before the code they govern, which is the point: a gate retrofitted after
-coverage has slipped is a gate that ratifies the slip.
+async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's exit
+criterion are here — issues #35, #36, #37, #38 and #39, above — and in-boot sleep is the
+rest of 0.4. The gates went in before the code they govern, which is the point: a gate
+retrofitted after coverage has slipped is a gate that ratifies the slip.

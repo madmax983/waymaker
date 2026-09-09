@@ -5721,6 +5721,7 @@ pub const FACADE_DRIVER_MODULES: &[&str] = &[
     "waymaker-drive/src/facade.rs",
     "waymaker-drive/src/lib.rs",
     "waymaker-drive/src/ota.rs",
+    "waymaker-drive/src/provisioning.rs",
 ];
 
 /// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
@@ -5743,6 +5744,11 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
         "ota",
         "is design document §06's example over the façade; reaching it is reaching the \
          façade",
+    ),
+    (
+        "provisioning",
+        "is design document §06's second example over the façade; reaching it is reaching \
+         the façade",
     ),
     (
         "Bridge",
