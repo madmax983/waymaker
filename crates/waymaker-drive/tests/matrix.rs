@@ -111,6 +111,8 @@ enum Record {
     Started,
     Schedule(u32),
     Outcome(u32),
+    /// A recorded upgrade branch. This workload reaches no gate, so no run writes one.
+    Marker(u32),
     Terminal,
 }
 
@@ -127,6 +129,7 @@ impl Record {
             RecordRef::EffectCompleted { seq, .. }
             | RecordRef::EffectFailed { seq, .. }
             | RecordRef::TimerFired { seq } => Self::Outcome(seq.0),
+            RecordRef::VersionMarker { seq, .. } => Self::Marker(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }
@@ -302,7 +305,8 @@ fn classify(run: &Run, performed: &[u32]) -> Option<(Row, u32)> {
         "history is not a prefix of the reference run, at {at}: {history:?}"
     );
     match record {
-        Record::Started => None,
+        // This workload reaches no gate, so no run writes a marker.
+        Record::Started | Record::Marker(_) => None,
         Record::Schedule(k) => {
             assert!(
                 !performed.contains(&k),

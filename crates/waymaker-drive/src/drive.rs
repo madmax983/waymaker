@@ -10,9 +10,11 @@ use core::marker::PhantomData;
 use core::mem;
 
 use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
+use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{
     ActivityKind, EffectId, EffectRequest, Intent, KernelError, Next, Outcome, RecordRef,
-    ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve,
+    ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve, VersionIntent,
+    VersionRequest,
 };
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
@@ -307,7 +309,7 @@ impl<C: IntegrityCheck> Driver<C> {
         let mut machine = ReplayMachine::new(self.run);
         let mut source = Source::Scanning(Recovery::<C>::with_integrity(self.region));
 
-        begin(
+        let recorded_version = begin(
             &mut source,
             &mut machine,
             storage,
@@ -326,6 +328,8 @@ impl<C: IntegrityCheck> Driver<C> {
             reserve: self.reserve,
             stop: None,
             pending: None,
+            versions: workflow.identity().versions,
+            recorded_version,
         };
         let ended = workflow.run(&mut context);
         context.conclude(ended)
@@ -333,6 +337,10 @@ impl<C: IntegrityCheck> Driver<C> {
 }
 
 /// Design document §06 steps 1 and 2: the run's own record, from history or newly written.
+///
+/// Answers the version the run is *recorded* at, which is what
+/// [`Boundary::recorded_version`] hands the workflow: the recorded one where history held a
+/// `RunStarted`, and the one this image writes where it did not.
 fn begin<S, C, W>(
     source: &mut Source<C>,
     machine: &mut ReplayMachine,
@@ -340,7 +348,7 @@ fn begin<S, C, W>(
     workflow: &W,
     page: &mut [u8],
     reserve: Reserve,
-) -> Result<(), DriveError<S::Error>>
+) -> Result<u16, DriveError<S::Error>>
 where
     S: StableStorage,
     C: IntegrityCheck,
@@ -364,16 +372,25 @@ where
                     // so here keeps the diagnosis at the record that caused it.
                     return Err(DriveError::Kernel(KernelError::MalformedHistory));
                 };
-                if workflow_kind != identity.kind
-                    || workflow_version != identity.version
-                    || input != identity.input
-                {
+                if workflow_kind != identity.kind || input != identity.input {
                     return Err(DriveError::NotThisWorkflow);
                 }
+                // §08's first two rules. The version is *admitted* rather than compared:
+                // an image that demanded equality would refuse every run in flight the
+                // moment the binary changed, which is the opposite of "existing runs must
+                // continue under compatible code for their recorded version". A version
+                // outside the range is `IncompatibleWorkflow` and never a best-effort
+                // replay — and never `NotThisWorkflow`, which says the journal belongs to
+                // another workflow rather than to another release of this one.
+                identity
+                    .versions
+                    .admits(workflow_version)
+                    .map_err(DriveError::Kernel)?;
                 return machine
                     .advance(record)
                     .map(|_| ())
-                    .map_err(DriveError::Kernel);
+                    .map_err(DriveError::Kernel)
+                    .map(|()| workflow_version);
             }
             Some(Err(error)) => return Err(DriveError::Recovery(error)),
             None => {}
@@ -382,9 +399,10 @@ where
 
     // An erased journal. The run has to be recorded before anything can be scheduled
     // against it, and this is the one record the driver writes without the kernel asking.
+    let version = identity.versions.current();
     let record = RecordRef::RunStarted {
         workflow_kind: identity.kind,
-        workflow_version: identity.version,
+        workflow_version: version,
         input: identity.input,
     };
     open(source, reserve)?;
@@ -393,6 +411,7 @@ where
         .advance(record)
         .map(|_| ())
         .map_err(DriveError::Kernel)
+        .map(|()| version)
 }
 
 /// Where the next record comes from, and where the next one goes.
@@ -597,7 +616,8 @@ const fn recorded(record: RecordRef<'_>) -> Option<Outcome<'_>> {
         | RecordRef::EffectCompleted { .. }
         | RecordRef::EffectFailed { .. }
         | RecordRef::TimerScheduled { .. }
-        | RecordRef::TimerFired { .. } => None,
+        | RecordRef::TimerFired { .. }
+        | RecordRef::VersionMarker { .. } => None,
     }
 }
 
@@ -645,6 +665,10 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     /// the length of one call. This is where it waits when the two halves are split, and
     /// it holds the writer, so a run with an effect in flight still has no appender.
     pending: Option<Dispatchable<C>>,
+    /// The recorded versions this image can replay, from the workflow's own identity.
+    versions: VersionRange,
+    /// The version the run's `RunStarted` record holds. §08's first rule.
+    recorded_version: u16,
 }
 
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
@@ -1253,6 +1277,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             reserve,
             stop,
             pending,
+            ..
         } = self;
 
         if stop.is_some() {
@@ -1423,9 +1448,129 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     }
 }
 
+/// What the version boundary decided, once every borrow of the page has been collapsed.
+///
+/// Two shapes rather than three: a gate has no world to wait for, so there is no
+/// "dispatch". Either the branch is known and durable, or the run stops.
+enum GateDecision {
+    /// The branch to take. Its `VersionMarker` is on media before this value exists.
+    Branch(u16),
+    /// The run stops here; `Context::stop` says why.
+    Stop,
+}
+
+/// What the version boundary's first half decided, with nothing borrowed from the page.
+enum GateHalf<E> {
+    /// Rows 1 and 2. History holds the marker.
+    Recorded(u16),
+    /// Row 3. History ended, so this image's branch is the one to record.
+    Record(EffectId),
+    /// Row 5. History holds a terminal record, already copied into the result buffer.
+    Finished(Conclusion, usize),
+    /// Row 4, and everything else the kernel or the media refused.
+    Failed(DriveError<E>),
+}
+
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
+    /// The kernel's answer for one version gate, with nothing borrowed from it.
+    ///
+    /// [`decide`](Self::decide)'s twin, row for row, minus the world.
+    fn decide_gate(&mut self, gate: GateId) -> GateDecision {
+        let Self {
+            storage,
+            machine,
+            page,
+            result,
+            source,
+            reserve,
+            stop,
+            pending,
+            versions,
+            ..
+        } = self;
+
+        if stop.is_some() {
+            return GateDecision::Stop;
+        }
+        // `decide`'s guard, for the same reason: the writer is inside the outstanding
+        // effect, so a marker here would report `NoAppendPoint`.
+        if pending.is_some() {
+            *stop = Some(Stop::Failed(DriveError::EffectOutstanding));
+            return GateDecision::Stop;
+        }
+
+        let request = VersionRequest {
+            gate,
+            supported: *versions,
+        };
+
+        let half = match peek(source, *storage, page, *reserve) {
+            Err(error) => GateHalf::Failed(error),
+            Ok(next) => match machine.version_intent(request, next) {
+                Ok(VersionIntent::Recorded { version, .. }) => GateHalf::Recorded(version),
+                Ok(VersionIntent::Record { id }) => GateHalf::Record(id),
+                Ok(VersionIntent::Finished { outcome }) => {
+                    match store(outcome, result, reserve.bounds().terminal_bytes) {
+                        Ok((conclusion, len)) => GateHalf::Finished(conclusion, len),
+                        Err(error) => GateHalf::Failed(error),
+                    }
+                }
+                Err(error) => GateHalf::Failed(DriveError::Kernel(error)),
+            },
+        };
+
+        match half {
+            GateHalf::Failed(error) => {
+                *stop = Some(Stop::Failed(error));
+                GateDecision::Stop
+            }
+            GateHalf::Finished(conclusion, result_len) => {
+                *stop = Some(Stop::Finished {
+                    conclusion,
+                    result_len,
+                });
+                GateDecision::Stop
+            }
+            // Row 1. The branch the run took, whatever branch this image would take.
+            GateHalf::Recorded(version) => GateDecision::Branch(version),
+            // Row 3. §02 decision 3's shape, at a boundary whose effect is a branch inside
+            // the workflow: the record crosses both barriers before the number is returned,
+            // so there is no state in which the workflow has branched and media has not.
+            GateHalf::Record(id) => {
+                let version = versions.current();
+                let record = RecordRef::VersionMarker {
+                    seq: id.seq,
+                    gate,
+                    version,
+                };
+                if let Err(error) = write(source, *storage, &record, page) {
+                    *stop = Some(Stop::Failed(error));
+                    return GateDecision::Stop;
+                }
+                if let Err(error) = machine.advance(record) {
+                    *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+                    return GateDecision::Stop;
+                }
+                GateDecision::Branch(version)
+            }
+        }
+    }
+}
+
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     for Context<'_, S, A, C>
 {
+    fn recorded_version(&self) -> u16 {
+        self.recorded_version
+    }
+
+    fn gate(&mut self, gate: GateId) -> Result<u16, Suspended> {
+        match self.decide_gate(gate) {
+            GateDecision::Branch(version) => Ok(version),
+            GateDecision::Stop => Err(Suspended::NEW),
+        }
+    }
+
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),

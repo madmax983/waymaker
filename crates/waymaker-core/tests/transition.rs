@@ -13,8 +13,9 @@ use waymaker_core::replay::{PendingEffect, Position};
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::transition::{
     Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve, TimerIntent,
-    TimerRequest, TimerResolve,
+    TimerRequest, TimerResolve, VersionIntent, VersionRequest,
 };
+use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
 
 /// The run every test below replays, unless it says otherwise.
@@ -1261,4 +1262,283 @@ fn the_capability_is_weighed_against_the_recorded_clock_and_not_the_requested_on
         Err(KernelError::NondeterministicWorkflow)
     );
     assert_eq!(recorded_boot.diverged(), Some(Divergence::Deadline));
+}
+
+// ---------------------------------------------------------------------------------------
+// Design document §08's version boundary, issue #40
+// ---------------------------------------------------------------------------------------
+
+/// The gate every test below reaches.
+const GATE: GateId = GateId(1);
+
+/// What an image that writes version 3 and still replays 1 and 2 declares.
+const SUPPORTED: VersionRange = match VersionRange::new(1, 3) {
+    Some(range) => range,
+    // Unreachable: 1 <= 3. Spelled out because `expect` is not `const`.
+    None => VersionRange::exact(3),
+};
+
+/// What the workflow asks at every version boundary below, unless a test changes a field.
+const VERSION_REQUEST: VersionRequest = VersionRequest {
+    gate: GATE,
+    supported: SUPPORTED,
+};
+
+/// `RecordRef::VersionMarker` for `seq`, at [`GATE`] and `version`.
+const fn recorded_branch(seq: u32, version: u16) -> RecordRef<'static> {
+    RecordRef::VersionMarker {
+        seq: EffectSeq(seq),
+        gate: GATE,
+        version,
+    }
+}
+
+#[test]
+fn a_gate_with_no_history_records_this_images_branch() {
+    // Row 3. Nothing is committed and nothing is minted: the driver writes the marker and
+    // advances the machine over it, exactly as it does for a schedule record.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Ok(VersionIntent::Record { id: effect(0) })
+    );
+    assert_eq!(machine.position(), Position::Replaying);
+}
+
+#[test]
+fn a_recorded_branch_is_replayed_whatever_branch_this_image_would_choose() {
+    // The whole of issue #40's first work item. This image writes version 3; the run took
+    // branch 1 before the upgrade, so branch 1 is what replay is told.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(0, 1))),
+        Ok(VersionIntent::Recorded {
+            id: effect(0),
+            version: 1,
+        })
+    );
+    // Settled, not half-open: a gate owes no second call.
+    assert_eq!(machine.position(), Position::Replaying);
+    assert_eq!(machine.pending(), None);
+    assert_eq!(machine.pending_timer(), None);
+}
+
+#[test]
+fn a_run_that_carries_on_after_a_gate_numbers_its_next_effect_past_the_marker() {
+    let mut machine = started();
+
+    let _ = machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(0, 1)));
+    assert_eq!(
+        machine.intent(REQUEST, Next::Record(schedule(1))),
+        Ok(Intent::Recorded { id: effect(1) })
+    );
+}
+
+#[test]
+fn a_recorded_branch_this_image_cannot_replay_is_an_incompatible_workflow() {
+    // §08's second rule, and the failure it prevents: a rolled-back image meeting a run
+    // that took a branch it never had. Nothing is corrupt and no checksum fails; a
+    // best-effort replay would run whatever branch the binary still holds.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(0, 4))),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+    // Refused before the record was consumed, so a diagnosis can still name it, and not
+    // recorded as a divergence: the workflow did not change, this image did.
+    assert_eq!(machine.position(), Position::Replaying);
+    assert_eq!(machine.diverged(), None);
+}
+
+#[test]
+fn a_recorded_branch_this_image_has_retired_is_an_incompatible_workflow() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(0, 0))),
+        Err(KernelError::IncompatibleWorkflow)
+    );
+    assert_eq!(machine.diverged(), None);
+}
+
+#[test]
+fn a_marker_for_another_gate_is_a_divergence() {
+    // Two gates that swapped places keep every sequence, so the sequence check cannot see
+    // them. This is what does.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(
+            VERSION_REQUEST,
+            Next::Record(RecordRef::VersionMarker {
+                seq: EffectSeq(0),
+                gate: GateId(2),
+                version: 2,
+            })
+        ),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Gate));
+    assert_eq!(machine.position(), Position::Replaying);
+}
+
+#[test]
+fn a_marker_at_another_position_is_a_sequence_divergence() {
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(1, 2))),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Sequence));
+}
+
+#[test]
+fn a_workflow_that_reaches_a_gate_where_history_recorded_another_boundary_diverges() {
+    // §08 row 4 with the flavour that says which. The position is legal and the record is
+    // sound; what changed is the *kind* of thing the workflow asked for.
+    for record in [schedule(0), armed(0)] {
+        let mut machine = started();
+        assert_eq!(
+            machine.version_intent(VERSION_REQUEST, Next::Record(record)),
+            Err(KernelError::NondeterministicWorkflow),
+            "{record:?}"
+        );
+        assert_eq!(machine.diverged(), Some(Divergence::BoundaryKind));
+    }
+}
+
+#[test]
+fn a_workflow_that_reaches_another_boundary_where_history_recorded_a_gate_diverges() {
+    // The mirror image, at both of the other two boundaries. This is what catches issue
+    // #40's third rule from the other side: code that removed a gate and left the effects
+    // after it in place.
+    let mut effect = started();
+    assert_eq!(
+        effect.intent(REQUEST, Next::Record(recorded_branch(0, 2))),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(effect.diverged(), Some(Divergence::BoundaryKind));
+
+    let mut timer = started();
+    assert_eq!(
+        timer.timer_intent(TIMER_REQUEST, Next::Record(recorded_branch(0, 2))),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(timer.diverged(), Some(Divergence::BoundaryKind));
+}
+
+#[test]
+fn a_terminal_record_finishes_a_run_that_reached_a_version_boundary() {
+    // Row 5, at the third boundary.
+    let mut machine = started();
+
+    assert_eq!(
+        machine.version_intent(
+            VERSION_REQUEST,
+            Next::Record(RecordRef::RunCompleted { result: b"done" })
+        ),
+        Ok(VersionIntent::Finished {
+            outcome: Outcome::Completed(b"done")
+        })
+    );
+}
+
+#[test]
+fn a_gate_reached_while_an_effect_is_unresolved_is_a_boundary_divergence() {
+    // The workflow ran past an `.await` without a result. §08 gives no edge from an open
+    // boundary to anything but its own outcome, and a marker committed here would be a
+    // record the journal cannot justify.
+    let mut machine = started();
+    let _ = machine.intent(REQUEST, Next::Record(schedule(0)));
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+}
+
+#[test]
+fn a_gate_reached_after_a_terminal_record_is_a_boundary_divergence() {
+    let mut machine = started();
+    let _ = machine.advance(RecordRef::RunCompleted { result: b"done" });
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+}
+
+#[test]
+fn a_gate_reached_before_the_run_started_is_a_boundary_divergence() {
+    let mut machine = ReplayMachine::new(RUN);
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    assert_eq!(machine.diverged(), Some(Divergence::Boundary));
+}
+
+#[test]
+fn a_diverged_machine_answers_no_gate() {
+    let mut machine = started();
+    let _ = machine.intent(REQUEST, Next::Record(schedule(1)));
+    assert_eq!(machine.diverged(), Some(Divergence::Sequence));
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Err(KernelError::NondeterministicWorkflow)
+    );
+    // The *first* divergence, not the one this call would have produced.
+    assert_eq!(machine.diverged(), Some(Divergence::Sequence));
+}
+
+#[test]
+fn a_halted_cursor_outranks_every_refusal_a_gate_has_of_its_own() {
+    let mut machine = started();
+    let _ = machine.advance(schedule(9));
+    assert_eq!(
+        machine.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+
+    assert_eq!(
+        machine.version_intent(VERSION_REQUEST, Next::EndOfHistory),
+        Err(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn a_gate_never_hands_out_an_identity_it_refused() {
+    // The property the whole module exists to hold, at the third boundary: every refusal
+    // above returns an `Err`, so there is no `EffectId` for a driver to commit a marker
+    // under and nothing can be written.
+    let refusals: [Result<VersionIntent<'_>, KernelError>; 4] = [
+        {
+            let mut machine = started();
+            machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(0, 4)))
+        },
+        {
+            let mut machine = started();
+            machine.version_intent(VERSION_REQUEST, Next::Record(recorded_branch(1, 2)))
+        },
+        {
+            let mut machine = started();
+            machine.version_intent(VERSION_REQUEST, Next::Record(schedule(0)))
+        },
+        {
+            let mut machine = ReplayMachine::new(RUN);
+            machine.version_intent(VERSION_REQUEST, Next::EndOfHistory)
+        },
+    ];
+
+    for refusal in refusals {
+        assert!(refusal.is_err(), "{refusal:?}");
+    }
 }

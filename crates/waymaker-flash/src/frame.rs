@@ -120,6 +120,7 @@
 use core::marker::PhantomData;
 
 use waymaker_core::timer::{ClockKind, TimerSpec};
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 
 use crate::crc::crc32;
@@ -358,6 +359,8 @@ pub const fn permits_unknown_record_skip(version: u8) -> bool {
 /// workflow kind and version, two bytes each.
 pub(crate) const RUN_STARTED_PREFIX_BYTES: usize = 4;
 pub(crate) const EFFECT_SCHEDULED_BODY_BYTES: usize = 8;
+/// A `VersionMarker`'s body: the gate and the version, two bytes each.
+pub(crate) const VERSION_MARKER_BODY_BYTES: usize = 4;
 /// The clock kind, then the deadline and the arming reading as little-endian `u64`s.
 ///
 /// The kind comes first so a reader refuses an unknown policy before it reads sixteen
@@ -703,7 +706,8 @@ pub fn encode_with<C: IntegrityCheck>(
         | RecordRef::EffectCompleted { seq, .. }
         | RecordRef::EffectFailed { seq, .. }
         | RecordRef::TimerScheduled { seq, .. }
-        | RecordRef::TimerFired { seq } => seq.0,
+        | RecordRef::TimerFired { seq }
+        | RecordRef::VersionMarker { seq, .. } => seq.0,
         // A run-scoped record has no effect to number, and the decoder insists on the
         // zero: two byte sequences decoding to one record is a format that cannot be
         // reasoned about by looking at it.
@@ -1078,6 +1082,23 @@ fn decode_body(
             }
             RecordRef::TimerFired { seq }
         }
+        RecordKind::VERSION_MARKER => {
+            if payload.len() != VERSION_MARKER_BODY_BYTES {
+                return Err(DecodeError::MalformedRecord);
+            }
+            let mut reader = Reader::new(payload);
+            let (Some(gate), Some(version)) = (reader.u16(), reader.u16()) else {
+                return Err(DecodeError::MalformedRecord);
+            };
+            // Neither field has a reserved value. Every `u16` is a gate an author may
+            // choose and every `u16` is a version an image may write, so there is nothing
+            // here for a decoder to refuse — unlike a clock kind, whose byte names a policy.
+            RecordRef::VersionMarker {
+                seq,
+                gate: GateId(gate),
+                version,
+            }
+        }
         RecordKind::EFFECT_COMPLETED => RecordRef::EffectCompleted {
             seq,
             result: payload,
@@ -1181,6 +1202,21 @@ fn body<'a>(record: &RecordRef<'a>) -> Body<'a> {
             Body {
                 prefix,
                 prefix_len: EFFECT_SCHEDULED_BODY_BYTES,
+                tail: &[],
+            }
+        }
+        RecordRef::VersionMarker { gate, version, .. } => {
+            for (slot, byte) in prefix.iter_mut().zip(
+                gate.0
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(version.to_le_bytes()),
+            ) {
+                *slot = byte;
+            }
+            Body {
+                prefix,
+                prefix_len: VERSION_MARKER_BODY_BYTES,
                 tail: &[],
             }
         }

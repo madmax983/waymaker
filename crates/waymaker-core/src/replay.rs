@@ -71,6 +71,7 @@ use crate::error::KernelError;
 use crate::id::{EffectId, EffectIdAllocator, EffectSeq, RunId};
 use crate::record::RecordRef;
 use crate::timer::ClockKind;
+use crate::version::GateId;
 
 /// An effect whose durable intent is committed and whose outcome is not.
 ///
@@ -140,6 +141,8 @@ pub struct PendingTimer {
 ///                             |  +-----TimerScheduled--------> AwaitingTimer
 ///                             |                                     |
 ///                             +---------TimerFired------------------+
+///
+///   Replaying --VersionMarker--> Replaying  (self-resolving: no boundary is opened)
 ///
 ///   Replaying --RunCompleted--> RunCompleted (terminal)
 ///   Replaying --RunFailed-----> RunFailed    (terminal)
@@ -264,6 +267,15 @@ pub enum Step<'a> {
     RunFailed {
         /// The recorded failure payload, opaque to the kernel.
         error: &'a [u8],
+    },
+    /// A gate's recorded branch. The run's position is unchanged: a marker resolves itself.
+    VersionMarker {
+        /// The identity this gate was recorded under.
+        id: EffectId,
+        /// Which decision point it is.
+        gate: GateId,
+        /// The workflow version whose branch was taken.
+        version: u16,
     },
 }
 
@@ -653,6 +665,17 @@ impl ReplayCursor {
                         seq,
                     },
                 })
+            }
+            (State::Replaying, RecordRef::VersionMarker { seq, gate, version }) => {
+                // The same allocator an activity and a timer go through, so a gate is a
+                // position in the one ordered history rather than a note beside it. The
+                // state does not move: the record commits the decision and holds the
+                // answer, so nothing is left open.
+                let id = match self.commit(seq) {
+                    Ok(id) => id,
+                    Err(error) => return Err(error),
+                };
+                Ok(Step::VersionMarker { id, gate, version })
             }
             (
                 State::BeforeRun,

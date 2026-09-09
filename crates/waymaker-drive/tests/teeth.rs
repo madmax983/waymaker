@@ -7,6 +7,7 @@
 //! it.
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, Outcome, RunId};
 use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
@@ -105,7 +106,7 @@ impl Workflow for Reordered {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -146,7 +147,7 @@ impl Workflow for Reinput {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"else",
         }
     }
@@ -176,7 +177,7 @@ impl Workflow for Deaf {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -225,7 +226,7 @@ impl Workflow for Impatient {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -324,7 +325,7 @@ impl Workflow for Verbose {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }

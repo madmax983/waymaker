@@ -28,6 +28,7 @@ use core::task::{Context as Task, Poll, Waker};
 
 use waymaker_core::EffectId;
 use waymaker_core::timer::TimerSpec;
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
@@ -223,7 +224,7 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: &self.input,
         }
     }

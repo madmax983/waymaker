@@ -54,7 +54,7 @@
 //! | After | Still owed |
 //! | --- | --- |
 //! | `EffectScheduled`, `TimerScheduled` | an outcome, then a terminal record |
-//! | `RunStarted`, `EffectCompleted`, `EffectFailed`, `TimerFired` | a terminal record |
+//! | `RunStarted`, `EffectCompleted`, `EffectFailed`, `TimerFired`, `VersionMarker` | a terminal record |
 //! | `RunCompleted`, `RunFailed` | nothing |
 //!
 //! A timer is priced at an effect's figure rather than its own. A `TimerFired` has no
@@ -532,7 +532,9 @@ impl Reserve {
             RecordRef::RunStarted { .. }
             | RecordRef::EffectCompleted { .. }
             | RecordRef::EffectFailed { .. }
-            | RecordRef::TimerFired { .. } => self.terminal_bytes,
+            | RecordRef::TimerFired { .. }
+            // A marker resolves itself, so it opens nothing and owes only the run's exit.
+            | RecordRef::VersionMarker { .. } => self.terminal_bytes,
             // A terminal record is the exit. Nothing may follow it.
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => 0,
         }
@@ -592,11 +594,13 @@ impl Reserve {
     const fn within_bounds(&self, record: &RecordRef<'_>) -> bool {
         let (payload, bound) = match record {
             RecordRef::RunStarted { input, .. } => (input.len(), self.bounds.run_input_bytes),
-            // Three records whose bodies are one fixed size, so there is no bound to
-            // exceed: ADR 0011's eight bytes, issue #33's seventeen, and a firing's none.
+            // Four records whose bodies are one fixed size, so there is no bound to
+            // exceed: ADR 0011's eight bytes, issue #33's seventeen, a firing's none, and
+            // issue #40's four.
             RecordRef::EffectScheduled { .. }
             | RecordRef::TimerScheduled { .. }
-            | RecordRef::TimerFired { .. } => return true,
+            | RecordRef::TimerFired { .. }
+            | RecordRef::VersionMarker { .. } => return true,
             RecordRef::EffectCompleted { result, .. } => {
                 (result.len(), self.bounds.effect_result_bytes)
             }

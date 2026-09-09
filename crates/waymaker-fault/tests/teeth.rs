@@ -151,6 +151,7 @@ const fn identify(record: &RecordRef<'_>) -> RecordId {
         RecordRef::EffectFailed { .. }
         | RecordRef::TimerScheduled { .. }
         | RecordRef::TimerFired { .. }
+        | RecordRef::VersionMarker { .. }
         | RecordRef::RunCompleted { .. }
         | RecordRef::RunFailed { .. } => RecordId(u32::MAX),
     }

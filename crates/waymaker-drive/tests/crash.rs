@@ -100,6 +100,8 @@ enum Summary {
     RunStarted,
     EffectScheduled(u32),
     EffectResolved(u32),
+    /// A recorded upgrade branch. This workflow reaches no gate, so no run writes one.
+    Marker(u32),
     Terminal,
 }
 
@@ -117,6 +119,7 @@ impl Summary {
             RecordRef::EffectCompleted { seq, .. }
             | RecordRef::EffectFailed { seq, .. }
             | RecordRef::TimerFired { seq } => Self::EffectResolved(seq.0),
+            RecordRef::VersionMarker { seq, .. } => Self::Marker(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }
@@ -125,7 +128,7 @@ impl Summary {
     const fn scheduled(self) -> Option<u32> {
         match self {
             Self::EffectScheduled(seq) => Some(seq),
-            Self::RunStarted | Self::EffectResolved(_) | Self::Terminal => None,
+            Self::RunStarted | Self::EffectResolved(_) | Self::Marker(_) | Self::Terminal => None,
         }
     }
 }
@@ -134,7 +137,13 @@ impl Summary {
 const fn unresolved(history: &[Summary]) -> Option<u32> {
     match history.last() {
         Some(Summary::EffectScheduled(seq)) => Some(*seq),
-        Some(Summary::RunStarted | Summary::EffectResolved(_) | Summary::Terminal) | None => None,
+        Some(
+            Summary::RunStarted
+            | Summary::EffectResolved(_)
+            | Summary::Marker(_)
+            | Summary::Terminal,
+        )
+        | None => None,
     }
 }
 

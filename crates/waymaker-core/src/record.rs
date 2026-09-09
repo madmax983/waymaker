@@ -26,15 +26,18 @@
 //!
 //! A record kind is a number on a device in the field. §09's forward-compatibility rule —
 //! "unknown record kinds are skippable only when the format version permits" — only means
-//! anything if a number, once spent, stays spent. So [`RecordKind`] names the three records
-//! this rung cannot decode as well as the eight it can. `TimerScheduled` and `TimerFired`
+//! anything if a number, once spent, stays spent. So [`RecordKind`] names the two records
+//! this rung cannot decode as well as the nine it can. `TimerScheduled` and `TimerFired`
 //! were reserved at 5 and 6 before they had bodies, and issue
 //! [#33](https://github.com/madmax983/waymaker/issues/33) filled those bodies in behind the
-//! same two numbers — which is what the reservation was for.
+//! same two numbers; `VersionMarker` was reserved at 9 and issue
+//! [#40](https://github.com/madmax983/waymaker/issues/40) filled that one in — which is
+//! what the reservation was for.
 
 use crate::activity::ActivityKind;
 use crate::id::EffectSeq;
 use crate::timer::ClockKind;
+use crate::version::GateId;
 
 /// Which record this is, as the byte on media says it.
 ///
@@ -72,7 +75,7 @@ impl RecordKind {
     pub const RUN_COMPLETED: Self = Self(7);
     /// Terminal workflow failure. §09: required at v0.1.
     pub const RUN_FAILED: Self = Self(8);
-    /// A recorded upgrade branch. §09: v0.2, and reserved here.
+    /// A recorded upgrade branch. §09: v0.2.
     pub const VERSION_MARKER: Self = Self(9);
     /// Bounded external activation. §09: later, and reserved here.
     pub const SIGNAL_RECEIVED: Self = Self(10);
@@ -184,6 +187,28 @@ pub enum RecordRef<'a> {
         /// The failure payload, opaque to the kernel.
         error: &'a [u8],
     },
+    /// A recorded upgrade branch: which gate, and which version won it.
+    ///
+    /// Design document §08 and issue
+    /// [#40](https://github.com/madmax983/waymaker/issues/40). A branch a run took under
+    /// one firmware image must be taken again under every later one, and no other record
+    /// can say which branch that was: the run's `RunStarted` version says what the run
+    /// *began* under, not what it chose part way through.
+    ///
+    /// It resolves itself. There is no world between the intent and the answer — the
+    /// effect of a gate is a branch inside the workflow — so one record both commits the
+    /// decision and holds it, and the run's position is unchanged after it. That is why
+    /// there is no `VersionMarker` outcome record.
+    VersionMarker {
+        /// Where this gate falls in the run's history. The same sequence space as the
+        /// activities and the timers, which is what makes §08's "call-order sequencing
+        /// remains authoritative" hold for a gate.
+        seq: EffectSeq,
+        /// Which decision point in the workflow this is.
+        gate: GateId,
+        /// The workflow version whose branch was taken.
+        version: u16,
+    },
 }
 
 impl RecordRef<'_> {
@@ -206,6 +231,7 @@ impl RecordRef<'_> {
             Self::TimerFired { .. } => RecordKind::TIMER_FIRED,
             Self::RunCompleted { .. } => RecordKind::RUN_COMPLETED,
             Self::RunFailed { .. } => RecordKind::RUN_FAILED,
+            Self::VersionMarker { .. } => RecordKind::VERSION_MARKER,
         }
     }
 }
@@ -234,11 +260,12 @@ mod tests {
             RecordRef::TimerFired { .. } => 6,
             RecordRef::RunCompleted { .. } => 7,
             RecordRef::RunFailed { .. } => 8,
+            RecordRef::VersionMarker { .. } => 9,
         }
     }
 
     /// One of each variant, for a test that wants to walk them all.
-    const EVERY_VARIANT: [RecordRef<'static>; 8] = [
+    const EVERY_VARIANT: [RecordRef<'static>; 9] = [
         RecordRef::RunStarted {
             workflow_kind: 0x1234,
             workflow_version: 2,
@@ -267,6 +294,11 @@ mod tests {
         RecordRef::TimerFired { seq: EffectSeq(11) },
         RecordRef::RunCompleted { result: b"done" },
         RecordRef::RunFailed { error: b"bad" },
+        RecordRef::VersionMarker {
+            seq: EffectSeq(11),
+            gate: GateId(2),
+            version: 3,
+        },
     ];
 
     #[test]
@@ -283,9 +315,9 @@ mod tests {
 
     #[test]
     fn each_variant_reports_its_own_kind() {
-        // Six distinct kinds over six variants: one arm returning another's constant
+        // Nine distinct kinds over nine variants: one arm returning another's constant
         // shows up as a duplicate rather than as a value nobody looked at.
-        let kinds: [RecordKind; 8] = [
+        let kinds: [RecordKind; 9] = [
             EVERY_VARIANT[0].kind(),
             EVERY_VARIANT[1].kind(),
             EVERY_VARIANT[2].kind(),
@@ -294,6 +326,7 @@ mod tests {
             EVERY_VARIANT[5].kind(),
             EVERY_VARIANT[6].kind(),
             EVERY_VARIANT[7].kind(),
+            EVERY_VARIANT[8].kind(),
         ];
 
         for (left_index, left) in kinds.iter().enumerate() {
@@ -306,7 +339,7 @@ mod tests {
             }
         }
         assert_eq!(kinds[0], RecordKind::RUN_STARTED);
-        assert_eq!(kinds[7], RecordKind::RUN_FAILED);
+        assert_eq!(kinds[8], RecordKind::VERSION_MARKER);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! between boundaries is its own fields, which the replay of committed history refills.
 
 use waymaker_core::Outcome;
+use waymaker_core::version::VersionRange;
 
 use crate::boundary::{Boundary, Suspended};
 
@@ -17,8 +18,16 @@ use crate::boundary::{Boundary, Suspended};
 pub struct Identity<'a> {
     /// The workflow, as the `RunStarted` record records it.
     pub kind: u16,
-    /// Its version. A firmware image may refuse to replay a version it does not know.
-    pub version: u16,
+    /// The recorded versions this image can replay, and the one it writes.
+    ///
+    /// Design document §08's first two rules, and issue
+    /// [#40](https://github.com/madmax983/waymaker/issues/40). A run already on media was
+    /// written at one version, and [`VersionRange::current`] is the version *this* image
+    /// writes into a new one — so a range rather than a number is what keeps existing runs
+    /// going across an upgrade. A recorded version outside the range is
+    /// [`KernelError::IncompatibleWorkflow`](waymaker_core::KernelError::IncompatibleWorkflow),
+    /// never a best-effort replay.
+    pub versions: VersionRange,
     /// The run's input, opaque to the engine.
     pub input: &'a [u8],
 }

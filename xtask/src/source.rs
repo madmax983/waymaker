@@ -863,6 +863,13 @@ pub const TRANSITION_SURFACE_PATH: &str = "waymaker-core/src/transition.rs";
 /// sequence space. A `timer_downgrade`, a `timer_force_elapsed` or a `clear_timer` would be
 /// the same door this list exists to keep shut, arriving on the timer side.
 ///
+/// `version_intent` is issue [#40](https://github.com/madmax983/waymaker/issues/40)'s, and
+/// it is *one* call rather than a pair: a gate has no world between its intent and its
+/// answer, so the marker record both commits the decision and holds it. A
+/// `version_outcome`, a `clear_gate`, a `regate` or a `version_intent_unchecked` would each
+/// break no other rule and turn "an upgrade branch replays identically for ever after" into
+/// a preference.
+///
 /// What it does **not** catch, so that nobody reads more into a green build than is there:
 /// this compares *names*. A `force: bool` added to `intent`, or any other change of
 /// signature or behaviour behind a name already on the list, is invisible to it and is a
@@ -883,6 +890,7 @@ pub const TRANSITION_SURFACE: &[&str] = &[
     "run",
     "timer_intent",
     "timer_outcome",
+    "version_intent",
 ];
 
 /// Rule: the replay cursor's public surface is exactly the one that was reviewed.
@@ -3240,6 +3248,353 @@ pub const TIMER_RECORD_FIELDS: &[(&str, &[&str])] = &[
     ("TimerFired", &["seq"]),
 ];
 
+/// The file whose versioning vocabulary `version-gate` pins.
+pub const VERSION_GATE_PATH: &str = "waymaker-core/src/version.rs";
+
+/// Every field `RecordRef::VersionMarker` is allowed to carry, in sorted order.
+///
+/// [`EFFECT_SCHEDULED_FIELDS`]'s and [`TIMER_RECORD_FIELDS`]'s twin for issue
+/// [#40](https://github.com/madmax983/waymaker/issues/40)'s record body, and it holds the
+/// two things design document §08's versioning rules rest on.
+///
+/// `version` is the branch. Without it the record says a decision was taken and not which
+/// one, which is a marker that cannot be replayed.
+///
+/// `gate` is the field a reviewer is most likely to read as redundant, because the sequence
+/// already says *where* the marker is. It says *which decision point*, and the two are not
+/// the same: two gates that swapped places in a workflow keep every sequence, so the
+/// sequence check cannot see them and a replay would take one gate's branch at the other's
+/// call site. Two bytes, once per gate.
+///
+/// A `taken_at`, a `previous`, a `source_hash` or a payload is the shape the pin stops in
+/// the other direction. The third is the one §08 names outright: "source-location hashes
+/// are **not** stable identity", and a hash on media is how one becomes identity.
+///
+/// The pin fails in both directions. A field removed is a wire-format change on a record
+/// firmware in the field has already written.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const VERSION_MARKER_FIELDS: &[&str] = &["gate", "seq", "version"];
+
+/// Every public function design document §08's versioning vocabulary is allowed to have.
+///
+/// `new` and `exact` are the two constructors, `oldest` and `current` the two ends, and
+/// `admits` the decision. That is the whole of §08's first two rules.
+///
+/// The absence is the point, and every way of giving it back is an *addition*. A
+/// `VersionRange::any()`, a `VersionRange::widen`, an `admits_or_default`, or a
+/// `VersionRange::assume(recorded)` would each break no layering rule, need no dependency,
+/// and turn "a firmware image that cannot replay the recorded version returns
+/// `IncompatibleWorkflow`" into a preference. So would a `GateId::from_location`.
+///
+/// Sorted, so that the comparison can be a set comparison and the list can be read.
+pub const VERSION_GATE_SURFACE: &[&str] = &["admits", "current", "exact", "new", "oldest"];
+
+/// Every method `VersionRange` may declare, at any visibility.
+///
+/// [`VERSION_GATE_SURFACE`] counts `pub ` and not `pub(`, which is not enough here for
+/// [`TIMER_TYPE_METHODS`]'s reason: `waymaker-core` is the crate the kernel boundary lives
+/// in, so a `pub(crate) const fn admits_anything` is reach enough for every refusal in this
+/// module to be routed around.
+const VERSION_RANGE_METHODS: &[&str] = &["admits", "current", "exact", "new", "oldest"];
+
+/// The type whose ends may not become public, and whose methods are pinned above.
+const VERSION_RANGE: &str = "VersionRange";
+
+/// What no module deciding a version may name, and why.
+///
+/// §08's fourth rule: "source-location hashes are **not** stable identity; call-order
+/// sequencing remains authoritative." The four macros below are how a source location
+/// becomes a value, and the failure they cause is the quiet one — a gate keyed on
+/// `line!()` changes its identity when a comment above it moves, so a reformatting is a
+/// divergence and a moved function is a run that can never be replayed. Nothing else in
+/// this workspace has a use for them: the kernel has no logging and the driver's
+/// diagnostics are `&'static str` messages on the error types.
+///
+/// Matched as *invocations* — the identifier and the `!` — rather than as identifiers, so a
+/// local named `line` or a field named `column` is not a violation. A macro is the only way
+/// any of these four produces a value.
+pub const SOURCE_LOCATION_MACROS: &[&str] = &["column", "file", "line", "module_path"];
+
+/// The files `version-gate` holds to [`SOURCE_LOCATION_MACROS`].
+///
+/// The kernel's version module, the boundary that decides a gate, and the driver that
+/// writes the record. A hash reaching identity has to pass through one of the three.
+pub const VERSION_LOCATION_FREE_PATHS: &[&str] = &[VERSION_GATE_PATH, KERNEL_BOUNDARY_PATH];
+
+/// The driver file `version-gate` holds to [`SOURCE_LOCATION_MACROS`].
+///
+/// Separate from [`VERSION_LOCATION_FREE_PATHS`] because it lives in a test-support crate
+/// rather than in a layer, so it arrives through the driver sources — the same split
+/// `kernel-boundary` makes for its routing half.
+pub const VERSION_LOCATION_FREE_DRIVER_PATH: &str = DRIVER_PATH;
+
+/// Rule: design document §08's workflow versioning is the one that was reviewed.
+///
+/// One rule id because it is one decision, the way `integrity-check` is. Four halves:
+///
+/// * the `VersionMarker` record's field set, in both directions;
+/// * the versioning vocabulary's public surface, in both directions;
+/// * `VersionRange`'s methods at *every* visibility, and no public field on it — the two
+///   defeats CLAUDE.md records against `timer-capability`'s kernel half, met here before
+///   they are demonstrated, because the invariant `oldest <= current` is exactly the kind a
+///   public field gives back;
+/// * §08's fourth rule as a ban, over the three files a source-location hash would have to
+///   pass through to become identity.
+///
+/// What it cannot see is a function added from a sibling module, which is the limit
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one
+/// file they pin; and it compares *names*, so an `admits` that stopped consulting its
+/// argument is `crates/waymaker-core/tests/version.rs`'s.
+#[must_use]
+pub fn check_version_gate(
+    sources: &[crate::size::LayerSource],
+    driver_sources: &[crate::size::LayerSource],
+) -> Vec<Violation> {
+    const RULE: &str = "version-gate";
+    const KERNEL: &str = "waymaker-core";
+
+    let mut violations = check_version_marker_fields(sources);
+
+    violations.extend(check_pinned_surface(
+        RULE,
+        KERNEL,
+        VERSION_GATE_PATH,
+        VERSION_GATE_SURFACE,
+        sources,
+        "design document \u{a7}08's versioning rules are where a run that outlived its \
+         firmware is refused rather than guessed at, so a way to admit a version this image \
+         cannot replay cannot be added without a reviewer writing it down",
+    ));
+
+    if let Some(source) = find_source(sources, VERSION_GATE_PATH) {
+        let code = without_test_modules(&code_only(&source.contents));
+        violations.extend(check_version_range_shape(&code));
+    }
+
+    violations.extend(check_no_source_location_identity(
+        sources,
+        VERSION_LOCATION_FREE_PATHS,
+    ));
+    violations.extend(check_no_source_location_identity(
+        driver_sources,
+        &[VERSION_LOCATION_FREE_DRIVER_PATH],
+    ));
+    violations
+}
+
+/// §08's fourth rule, over the three files a source-location hash would pass through.
+///
+/// Fails closed: a file the scan cannot find is a file the ban has stopped covering.
+fn check_no_source_location_identity(
+    sources: &[crate::size::LayerSource],
+    paths: &[&str],
+) -> Vec<Violation> {
+    const RULE: &str = "version-gate";
+    const KERNEL: &str = "waymaker-core";
+
+    let mut violations = Vec::new();
+    for path in paths {
+        let Some(source) = find_source(sources, path) else {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "no {path} in the workspace, so \u{a7}08's rule that source-location \
+                     hashes are not stable identity is checked in one file fewer than it was"
+                ),
+            ));
+            continue;
+        };
+        let code = without_test_modules(&code_only(&source.contents));
+        for macro_name in SOURCE_LOCATION_MACROS {
+            if code.contains(&format!("{macro_name}!")) {
+                violations.push(Violation::new(
+                    RULE,
+                    source.crate_name.clone(),
+                    format!(
+                        "{path} invokes `{macro_name}!`, and \u{a7}08 says source-location \
+                         hashes are not stable identity: a value derived from where a call \
+                         is written changes when the file is reformatted, so call-order \
+                         sequencing is what identifies a boundary"
+                    ),
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// The record body half: `RecordRef::VersionMarker`'s three fields, in both directions.
+fn check_version_marker_fields(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "version-gate";
+    const KERNEL: &str = "waymaker-core";
+    const ENUM: &str = "enum RecordRef";
+    const VARIANT: &str = "VersionMarker";
+
+    let Some(source) = find_source(sources, EFFECT_SCHEDULED_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "no {EFFECT_SCHEDULED_PATH} in the workspace, so the pinned marker body is \
+                 checking nothing; \u{a7}08 puts a recorded upgrade branch on media so that \
+                 a run replays the branch it took"
+            ),
+        )];
+    };
+
+    let code = without_test_modules(&code_only(&source.contents));
+    // Read the *only* declaration, for `timer-record-fields`' reason: `braced_body` takes
+    // the first token-boundary match, so a decoy above the real enum is what every scan
+    // below would check.
+    let declarations = declaration_count(&code, ENUM);
+    if declarations != 1 {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares `{ENUM}` {declarations} times, not once; \
+                 the scan below reads the first, so a decoy above the real one is what it \
+                 would check"
+            ),
+        )];
+    }
+    let Some(body) = braced_body(&code, ENUM) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{EFFECT_SCHEDULED_PATH} declares no `{ENUM}`, so the pinned marker body is \
+                 checking nothing"
+            ),
+        )];
+    };
+    let Some(declared) = braced_body(body, VARIANT) else {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{ENUM}` in {EFFECT_SCHEDULED_PATH} has no `{VARIANT}` variant with a field \
+                 list, so the pinned field set is checking nothing"
+            ),
+        )];
+    };
+
+    let pinned: BTreeSet<&str> = VERSION_MARKER_FIELDS.iter().copied().collect();
+    let names = field_names(declared);
+    let found: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+
+    let mut violations = Vec::new();
+    for added in found.difference(&pinned) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`RecordRef::{VARIANT}` declares `{added}`, which is not in \
+                 VERSION_MARKER_FIELDS; a field added here is paid on every gate for the \
+                 life of the format, and a source location among them is the identity \
+                 \u{a7}08 says a gate may not have"
+            ),
+        ));
+    }
+    for removed in pinned.difference(&found) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`RecordRef::{VARIANT}` no longer declares `{removed}`, which \
+                 VERSION_MARKER_FIELDS pins; a field dropped is a wire-format change on a \
+                 record firmware in the field has already written"
+            ),
+        ));
+    }
+    violations
+}
+
+/// `VersionRange` keeps its ends private and declares only the methods it is pinned for.
+///
+/// The invariant is `oldest <= current`, and a public field is a constructor that gives it
+/// back: `VersionRange { oldest: 9, current: 0 }` admits nothing, so a run declared under it
+/// could never start — a refusal met at the first boot on a device rather than at the line
+/// that wrote it.
+fn check_version_range_shape(code: &str) -> Vec<Violation> {
+    const RULE: &str = "version-gate";
+    const KERNEL: &str = "waymaker-core";
+
+    let header = format!("pub struct {VERSION_RANGE}");
+    let mut violations = Vec::new();
+
+    let declarations = declaration_count(code, &header);
+    if declarations != 1 {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{VERSION_GATE_PATH} declares `{header}` {declarations} times, not once; the \
+                 scans below read the first, so a decoy above the real one is what they \
+                 would check"
+            ),
+        ));
+        return violations;
+    }
+    if !declares_braced_struct(code, &header) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{VERSION_RANGE}` is not a braced struct: the field scan reads the first \
+                 `{{` after the declaration, so a tuple struct would have it reporting on \
+                 whatever follows \u{2014} and a `pub` tuple field is an inverted range \
+                 anybody can build"
+            ),
+        ));
+        return violations;
+    }
+    if braced_body(code, &header).is_some_and(|body| count_tokens(body, "pub") != 0) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{VERSION_RANGE}` declares a public field: `oldest <= current` is the whole \
+                 invariant, and a public field is a way round `new` that adds no function"
+            ),
+        ));
+    }
+
+    let blocks = inherent_impl_bodies(code, VERSION_RANGE);
+    if blocks.is_empty() {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{VERSION_GATE_PATH} declares no inherent `impl` for `{VERSION_RANGE}`, so \
+                 its methods are pinned against nothing"
+            ),
+        ));
+        return violations;
+    }
+    let body = blocks.join("\n");
+    let declared = declared_function_names(&body);
+    let mut expected: Vec<String> = VERSION_RANGE_METHODS
+        .iter()
+        .map(|method| (*method).to_owned())
+        .collect();
+    expected.sort();
+    if declared != expected {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{VERSION_RANGE}` declares {declared:?} rather than {expected:?}: read at \
+                 every visibility, because a surface pin counts `pub ` and not `pub(`, and \
+                 this crate is where the kernel boundary that consults the range lives"
+            ),
+        ));
+    }
+    violations
+}
+
 /// The file whose kernel-boundary types [`BOUNDARY_TYPES`] pins.
 pub const KERNEL_BOUNDARY_PATH: &str = "waymaker-core/src/transition.rs";
 
@@ -3273,6 +3628,14 @@ pub struct BoundaryType {
 /// deadline, and what this firmware can measure. A `TimerRequest::best_effort` flag, a
 /// `TimerIntent::Downgrade` or a `TimerResolve::Assume` would each break no other rule and
 /// turn the refusal into a preference.
+///
+/// Issue [#40](https://github.com/madmax983/waymaker/issues/40) wrote the third body and
+/// the eight types above did not move either. Its two are a third boundary, with one half
+/// rather than two: a gate has no world between its intent and its answer.
+/// `VersionRequest`'s two fields are §08's versioning rules — which decision point, and
+/// what this image can replay — and a third that let a caller propose a branch outside its
+/// own range would let one boot record a run every later boot refuses. `VersionIntent` has
+/// no `Downgrade` and no `Assume` for `TimerIntent`'s reason.
 ///
 /// The pin fails in both directions, and the second matters more: a member the list no
 /// longer finds means the type was renamed or deleted and the pin is checking nothing.
@@ -3316,6 +3679,14 @@ pub const BOUNDARY_TYPES: &[BoundaryType] = &[
     BoundaryType {
         header: "pub enum TimerResolve",
         members: &["Fired", "Rearm"],
+    },
+    BoundaryType {
+        header: "pub struct VersionRequest",
+        members: &["gate", "supported"],
+    },
+    BoundaryType {
+        header: "pub enum VersionIntent",
+        members: &["Finished", "Record", "Recorded"],
     },
 ];
 
@@ -13165,8 +13536,9 @@ pub mod tests_support {
         SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
         SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, WIRING_SELECTION_BODIES,
-        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
+        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
+        VERSION_MARKER_FIELDS, VERSION_RANGE_METHODS, WIRING_SELECTION_BODIES, WIRING_SURFACE,
+        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -13633,7 +14005,27 @@ mod tests {
             }
             let _ = writeln!(variants, "    }},");
         }
+        // And the marker body, because `version-gate` fails closed the same way.
+        let _ = writeln!(variants, "    VersionMarker {{");
+        for field in VERSION_MARKER_FIELDS {
+            let _ = writeln!(variants, "        {field}: u32,");
+        }
+        let _ = writeln!(variants, "    }},");
         format!("//! A record module.\npub enum RecordRef<'a> {{\n{variants}}}\n")
+    }
+
+    /// A versioning module carrying every pinned function and no source-location macro.
+    #[must_use]
+    pub fn clean_version_module() -> String {
+        use std::fmt::Write as _;
+
+        let mut methods = String::new();
+        for method in VERSION_RANGE_METHODS {
+            let _ = writeln!(methods, "    pub const fn {method}() {{}}");
+        }
+        format!(
+            "//! A versioning module.\npub struct VersionRange {{\n    oldest: u16,\n                 current: u16,\n}}\nimpl VersionRange {{\n{methods}}}\n"
+        )
     }
 
     /// A checksum module carrying every pinned parameter and declaring no lookup table.
@@ -13945,6 +14337,7 @@ mod tests {
             .chain(CTX_JOURNAL_SURFACE)
             .chain(DISPATCH_SURFACE)
             .chain(WIRING_SURFACE)
+            .chain(VERSION_GATE_SURFACE)
             .collect();
         let mut source = String::from("\nfn reaches_the_pinned_surfaces() {\n");
         for name in names {

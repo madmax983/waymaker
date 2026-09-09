@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 51 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 52 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -340,7 +340,7 @@ any of them, no default build links one, and `codec-is-optional` is what keeps t
 
 | Crate | Owns | May depend on |
 | --- | --- | --- |
-| `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, timer semantics and the clock-kind vocabulary, capacity errors | nothing |
+| `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, timer semantics and the clock-kind vocabulary, the workflow-version range and gate vocabulary, capacity errors | nothing |
 | `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, the capacity reserve, the seven-step bank swap and `continue_as_new`, compaction transition | waymaker-core |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, the persistent-clock capability, optional typed codec helpers | waymaker-core, waymaker-flash, cobs, postcard, serde, serde_core, thiserror |
 
@@ -453,8 +453,8 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 | Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
-| Incremental code flash | ≤ 12 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic) |
-| Incremental code flash, with the façade | ≤ 13 KiB for the three layers on `thumbv6m-none-eabi`. Not a §04 row either: §04 states the row above for "core + flash adapter", and [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) gives the façade a ceiling of its own rather than raising the kernel's to pay for a crate above it |
+| Incremental code flash | ≤ 13 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic, and [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) takes it to 13 KiB for §08's versioning) |
+| Incremental code flash, with the façade | ≤ 14 KiB for the three layers on `thumbv6m-none-eabi`. Not a §04 row either: §04 states the row above for "core + flash adapter", and [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) gives the façade a ceiling of its own rather than raising the kernel's to pay for a crate above it |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree, and
@@ -495,11 +495,16 @@ layers instead —
 [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md).
 Of rung 0.5's 18386 B, **7534 B is the probe's own arithmetic and 10852 B is the layers'**,
 so the gate comes down from 18 KiB to **12 KiB** — a cut of 6 KiB, not a raise, and 1436 B
-of room for issue #33's record bodies. They cost **1370 B** of it, so the layers now measure
+of room for issue #33's record bodies. They cost **1370 B** of it, so the layers then measured
 **12222 B** of 12288 with 66 B left and no raise asked for —
 [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md), which also
 says plainly that rung 0.4 does not fit under it and needs issue #72's kind of accounting
-rather than a third raise. Every byte no symbol attributes to the probe stays
+rather than a third raise. Rung 1.0's versioning is the first thing that does not fit, and
+[ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) raises the
+gate to **13 KiB** on a figure the corrected accounting produced: §08's version boundary
+costs **672 B** of layers, of which 248 B is the library change measured through the reach
+the probe already had and 424 B is what `size-probe-reach` then demands. The layers measure
+**12892 B** of 13312, with 420 B left. Every byte no symbol attributes to the probe stays
 charged to the layers: `.rodata` strings, `compiler_builtins`, the `__aeabi_*` helpers and
 the padding between functions. The report prints `Δflash`, `probe` and `layers` on every row
 of every run, so the split is legible rather than taken on trust.
@@ -592,7 +597,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 51 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 52 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -606,6 +611,7 @@ this table is how you find out what a red build is telling you.
 | `replay-cursor-surface` | The replay cursor's public function surface differs from `source::REPLAY_SURFACE`, in either direction — a method added that nobody weighed against `replay-is-sequential`, or the module gone so the pin checks nothing. Absence is what issue #14's "no API requires random access by effect ID" asks for, and a method that does not exist cannot be caught by a test that calls it; pinning the surface makes adding `record_at(id)` a line a reviewer writes on purpose. |
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
 | `timer-record-fields` | `RecordRef::TimerScheduled` or `RecordRef::TimerFired` declares a field set other than `source::TIMER_RECORD_FIELDS`, in either direction — or the `enum RecordRef` body is gone, so the pin checks nothing. `effect-scheduled-fields`'s twin, and a rule of its own because the two settle different things: ADR 0011 settled how much metadata a scheduled effect carries, and this settles which facts about *time* reach media. Two fields are the point. §11 says a persistent timer record includes its clock kind "so recovery cannot silently reinterpret one policy as another": a record carrying the deadline alone decodes without error and means something else after a firmware change, and nothing downstream can tell. And `armed_at` is the monotonicity floor a persistent deadline is measured against — it lives in RAM, a power cut takes RAM, and this is what carries it across the reset. In the other direction a `remaining`, a `fired_at` or a payload on the firing is bytes on every timer for the life of the format. What it cannot see is a *width*: it compares names, so a `deadline` narrowed to a `u32` is `crates/waymaker-flash/tests/frame.rs`'s golden bytes. [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md). |
+| `version-gate` | Design document §08's workflow versioning stops being the one that was reviewed, in any of its four halves. The *record* half: `RecordRef::VersionMarker` declares a field set other than `source::VERSION_MARKER_FIELDS`, in either direction, or the `enum RecordRef` body is gone or declared twice so the pin checks nothing. `effect-scheduled-fields`'s and `timer-record-fields`'s third twin. `version` is the branch, and without it the record says a decision was taken and not which one; `gate` is the field that reads as redundant beside the sequence and is not, because two gates that swapped places keep every sequence and the sequence check cannot see them. The *surface* half: `waymaker-core/src/version.rs` gains or loses a public function `source::VERSION_GATE_SURFACE` lists. A `VersionRange::any()`, a `widen`, an `admits_or_default` or a `GateId::from_location` would each break no layering rule, need no dependency, and turn §08's "a firmware image that cannot replay the recorded version returns `IncompatibleWorkflow`" into a preference. The *shape* half: `VersionRange` is declared twice, stops being a braced struct, declares a public field, or declares a method set other than `source::VERSION_RANGE_METHODS` — read at *every* visibility, because a surface pin counts `pub ` and not `pub(`, and `waymaker-core` is the crate the boundary that consults the range lives in. `oldest <= current` is the whole invariant and a public field is a constructor for an inverted range, which is `timer-capability`'s two demonstrated defeats met before they are demonstrated. The *identity* half is §08's fourth rule: `waymaker-core/src/version.rs`, `waymaker-core/src/transition.rs` or `waymaker-drive/src/drive.rs` invokes one of `source::SOURCE_LOCATION_MACROS` — `file!`, `line!`, `column!`, `module_path!`. §08 says source-location hashes are **not** stable identity, and the failure is the quiet one: a gate keyed on `line!()` changes identity when a comment above it moves, so a reformatting is a divergence and a moved function is a run that can never be replayed. Matched as *invocations* rather than as identifiers, so a local named `line` is not a violation. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. Each half fails closed: a file the scan cannot find is a pin that has stopped checking. What it cannot see is a function added from a sibling module — it pins one file, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so an `admits` that stopped consulting its argument is `crates/waymaker-core/tests/version.rs`'s. [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md). |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts, in any of the four files that have one. In `waymaker-flash/src/frame.rs`: a body pinned by `source::SEALING_FUNCTIONS` stops computing the seals its row names exactly once, or the file names `crc16` or `crc32` anywhere outside `input_digest` — the one documented exception, because a `const fn` cannot go through a trait method — or `decode_with` and `frame_len_of_with` stop verifying a header through `verify_header_with`, or the scan's `next` stops walking with `decode_with`. The rows are *derived* rather than whitelisted: a function generic over the check that no row pins is a body that can compute a seal and is pinned by nothing, and the scan that finds them reads joined signatures and generic `impl` blocks, because a `where` clause and a method in `impl<C: IntegrityCheck>` each escaped a one-line scan. The same in `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names. And in `waymaker-flash/src/append.rs`, which is the writer: its `stage` must reach the codec through `frame::encode_with::<C>` — one call covers both the frame and its commit seal, because the seal is derived from the check the codec just computed — and it may name neither a checksum function nor a seal method. Without it, `frame::encode` in place of the generic sibling would seal every appended record with the shipped check whatever the recovery that positioned the writer verified with, which is a journal one half of a firmware can read. And in `waymaker-flash/src/recovery.rs`, which computes no seal at all: its two steps must reach the codec through `frame::decode_with::<C>` and `frame::frame_len_of_with::<C>`, and the file may name neither a checksum function nor a seal method — `Recovery<C>`'s parameter is a promise that a journal is verified with the algorithm that sealed it, and dropping both turbofishes passed every rule and every test before this existed. And in `waymaker-flash/src/swap.rs`, which installs a bank: its `stage` must reach the bank codec through `bank::encode_header_with::<C>`, `bank::seal_for_with::<C>` and `bank::encode_seal_with::<C>`, and the file may name neither a checksum function nor a seal method — a device whose two banks were sealed by two algorithms is a device only half of which boots. A trait nothing is obliged to call is a swap point that selects nothing. A firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
@@ -1321,6 +1327,32 @@ Stated so that nobody mistakes silence for coverage:
   `waymaker-embassy/postcard` row drives one `T` and reports 208 B; a second type takes the
   row to 542 B, so the marginal type costs 334 B. The row is a floor, not the figure a
   firmware with three answer types should plan against.
+- **That a workflow branches on a *recorded* version rather than on an ambient one.**
+  `version-gate` bans the four source-location macros and pins the vocabulary; it cannot see
+  a workflow that reads `identity().versions.current()` and branches on it. That is not a
+  fact about where a call is written, so no scanner reaches it, and it is the same limit §08
+  records about determinism generally. What catches it is the divergence check at the next
+  effect boundary, which is terminal —
+  `crates/waymaker-drive/tests/versioning.rs::an_added_effect_with_no_gate_is_a_divergence`
+  drives `Branching::ImageVersion` and watches it stop the run.
+- **That a version range is one a fleet can actually deploy.** `VersionRange::admits`
+  refuses a recorded branch outside the range, and nothing checks the *order* in which a
+  fleet moves the two ends. An image that narrowed `oldest` past a version still on devices
+  bricks those runs until an image that can replay them is deployed again; ADR 0036 records
+  it as a cost rather than closing it, because the ordering is a release process rather than
+  a property of a binary.
+- **That a version gate is reachable through the façade.** `Boundary::gate` is
+  `waymaker-drive`'s, and `waymaker-embassy`'s `Ctx` has four futures and no fifth. A gate
+  writes a record and waits for nothing, so an async workflow that needs one reaches the
+  synchronous boundary or does without. Issue #40 is `area:core`; joining the two is the same
+  standing as "nothing obliges a future dispatcher to use the gated writer".
+- **What a marker torn by a power cut leaves.** Nothing, which is the right answer and not a
+  free one: the record was never durable, so the next boot re-decides the branch — and under
+  a *different* image it may decide differently. The window is narrower than §07's effect
+  window, because no physical effect follows a gate, and it is why `Boundary::gate` writes
+  before it returns rather than after. `crates/waymaker-drive/tests/versioning.rs` measures
+  the durable half; the torn half is a state no test can assert a branch about, because there
+  is no branch.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -2175,6 +2207,59 @@ crash point the injector lists, over the real façade and the real driver.
 `poll_provisioning` is the concrete path the firmware build monomorphises, the way
 `poll_ota` already was — `drive-firmware` links both. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+
+Issue #40 opens rung 1.0, and what it asks for is design document §08's four versioning
+rules made enforceable. None of them was. `RunStarted` has carried a `workflow_version`
+since issue #13 and the driver compared it for **equality**, so every run in flight was
+refused the moment the binary changed — the opposite of §08's first rule, and the failure a
+durable workflow engine exists to prevent. §09 numbered `VersionMarker` at 9 with no body
+behind it, so the third rule had no mechanism at all.
+Two mechanisms answer the four rules, because they are about two different questions.
+`waymaker_core::version::VersionRange` is what an image declares it can replay — `oldest`,
+the earliest recorded version whose branches this binary still holds, and `current`, the
+version it writes into a new run — and `admits` is §08's second rule as a total function
+with two answers and no third that means "close enough". `Identity::versions` replaces
+`Identity::version`, and `begin` admits rather than compares. `NotThisWorkflow` stays and
+now means only what it says: the journal belongs to some *other* workflow.
+`RecordRef::VersionMarker { seq, gate, version }` is the other, and it is §09's kind 9 at
+four payload bytes. `Boundary::gate` is the API: the first execution to reach a gate records
+`VersionRange::current`, and every later boot is handed that number back whatever branch the
+image running it would have chosen. Three properties make it more than a note beside
+history. It **spends a sequence**, so a gate added, removed or moved shifts every boundary
+after it and §08's third rule is enforced by the sequence check that already exists. It
+**resolves itself** — there is no world between a gate's intent and its answer, because the
+effect of a gate is a branch inside the workflow — so `version_intent` is one call where
+`intent`/`outcome` and `timer_intent`/`timer_outcome` are two, there is no `VersionResolve`,
+and kernel state stays at 104 B. And the **record is durable before the branch is
+observable**: `gate` crosses §07's two barriers and returns the number afterwards, which is
+§02 decision 3's shape at a boundary whose effect is a branch.
+`Boundary::recorded_version` is the smaller companion — the version the run's own
+`RunStarted` holds, written by nothing, and a fact about history rather than about the image.
+§08's fourth rule is an *absence*, so it is a gate rule: `version-gate` fails a build over
+the marker's field set, the versioning surface, `VersionRange`'s methods at every visibility
+with no public field on it, and any invocation of `file!`, `line!`, `column!` or
+`module_path!` in the three files a source-location hash would have to pass through. A gate
+keyed on `line!()` changes identity when a comment above it moves, so a reformatting would
+be a divergence.
+Issue #40's third work item is driven rather than argued.
+`crates/waymaker-drive/tests/versioning.rs` runs a run recorded at version N against firmware
+for N+1, over the real driver, the real codec and `waymaker-fault`'s model of NOR, both with
+a marker at the divergence point and without one: with it the run completes identically, and
+without it the added effect is `NondeterministicWorkflow` with nothing dispatched and nothing
+written. `Branching::ImageVersion` in the reference workflow is that mistake written down, so
+the tooth is a value a test picks rather than a paragraph.
+The budget is the number worth recording, and it is the first raise argued from a corrected
+figure: §08's versioning costs **672 B** of layers — 248 B for the library change through
+the reach the probe already had, and 424 B for what `size-probe-reach` then demands — so the
+gate goes from 12 KiB to **13 KiB** and the layers measure 12892 B of 13312 with 420 B left.
+What is owed is written down: a rollback that meets a newer recorded branch refuses the run
+rather than guessing, and nothing enforces widening `oldest` before narrowing `current`; a
+marker torn by a power cut leaves the branch undecided, so a *different* image may decide it
+differently on the next boot; the façade has no gate future, so a gate is reachable through
+the synchronous driver alone; and `waymaker-spec` does not model markers, because a
+self-resolving record opens no boundary and §14's six guarantees are unchanged by it. See
+[ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The

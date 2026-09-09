@@ -9,6 +9,7 @@
 //! The ordinary path is `crates/waymaker-drive/tests/ota.rs`.
 
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_drive::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_drive::{
@@ -93,7 +94,7 @@ impl Workflow for Misusing {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: URL,
         }
     }
@@ -167,7 +168,7 @@ fn a_caller_that_ends_the_run_with_an_effect_outstanding_is_refused_by_name() {
         fn identity(&self) -> Identity<'_> {
             Identity {
                 kind: WORKFLOW_KIND,
-                version: WORKFLOW_VERSION,
+                versions: VersionRange::exact(WORKFLOW_VERSION),
                 input: URL,
             }
         }
@@ -260,7 +261,7 @@ impl Workflow for Bridging {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: URL,
         }
     }

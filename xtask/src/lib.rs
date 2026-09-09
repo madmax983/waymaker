@@ -97,6 +97,7 @@ pub const RULES: &[&str] = &[
     "timer-record-fields",
     "toolchain-targets",
     "transition-surface",
+    "version-gate",
     "workspace-lints",
     "workspace-membership",
 ];
@@ -303,6 +304,10 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(source::check_recovery_routing(&inputs.layer_sources));
     violations.extend(source::check_effect_scheduled_fields(&inputs.layer_sources));
     violations.extend(source::check_timer_record_fields(&inputs.layer_sources));
+    violations.extend(source::check_version_gate(
+        &inputs.layer_sources,
+        &inputs.driver_sources,
+    ));
     violations.extend(source::check_integrity_check(&inputs.layer_sources));
     violations.extend(source::check_integrity_binding(&inputs.layer_sources));
     violations.extend(source::check_integrity_routing(&inputs.layer_sources));
@@ -940,6 +945,7 @@ mod tests {
             "timer-record-fields",
             "toolchain-targets",
             "transition-surface",
+            "version-gate",
             "workspace-lints",
             "workspace-membership",
         ]
@@ -1049,6 +1055,76 @@ mod tests {
     }
 
     fn clean_layer_sources() -> Vec<size::LayerSource> {
+        clean_kernel_sources()
+            .into_iter()
+            .chain(vec![
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
+                    contents: source::tests_support::clean_storage_contract(),
+                },
+                // And the storage-backed recovery reader of issue #23, pinned for the
+                // reason the other three are: renamed or deleted, the pin checks nothing.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::RECOVERY_SURFACE_PATH),
+                    contents: source::tests_support::clean_recovery_routing(),
+                },
+                // And the two-barrier writer of issue #24: `commit-discipline` pins its
+                // surface and its typestate, and `integrity-check` pins the one call it
+                // makes into the codec. Both fail closed when the module is absent.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::APPEND_SURFACE_PATH),
+                    contents: source::tests_support::clean_append_module(),
+                },
+                // And §10's capacity reserve of issue #25: `capacity-reserve` pins its
+                // surface and the order its one gate is applied in, and fails closed when
+                // the module is absent.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::CAPACITY_SURFACE_PATH),
+                    contents: source::tests_support::clean_capacity_reserve(),
+                },
+                // And §10's bank swap of issue #26: `swap-discipline` pins its surface and the
+                // order §10's seven steps happen in, and `integrity-check` pins its one route to
+                // the bank codec. Both fail closed when the module is absent.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::SWAP_SURFACE_PATH),
+                    contents: source::tests_support::clean_swap_module(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_BINDING_PATH),
+                    contents: source::tests_support::clean_integrity_binding(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_ROUTING_PATH),
+                    contents: source::tests_support::clean_integrity_routing(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::BANK_ROUTING_PATH),
+                    contents: source::tests_support::clean_bank_routing(),
+                },
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: format!("crates/{}", source::INTEGRITY_CHECK_PATH),
+                    contents: source::tests_support::clean_checksum_module(),
+                },
+            ])
+            .chain(clean_facade_sources())
+            .collect()
+    }
+
+    /// The kernel's own files, one per pin the gate holds `waymaker-core` to.
+    ///
+    /// Split out of [`clean_layer_sources`] for [`clean_facade_sources`]'s reason: a pin
+    /// added to the gate is a row added here, and the list is long enough that clippy
+    /// refuses the two crates in one function.
+    fn clean_kernel_sources() -> Vec<size::LayerSource> {
         vec![
             size::LayerSource {
                 crate_name: "waymaker-core".to_owned(),
@@ -1069,6 +1145,13 @@ mod tests {
                 crate_name: "waymaker-core".to_owned(),
                 path: format!("crates/{}", source::EFFECT_SCHEDULED_PATH),
                 contents: source::tests_support::clean_record_module(),
+            },
+            // And §08's versioning vocabulary, which `version-gate` pins and which fails
+            // closed when the module is absent, for the same reason as the rows above.
+            size::LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: format!("crates/{}", source::VERSION_GATE_PATH),
+                contents: source::tests_support::clean_version_module(),
             },
             // And the binding issue #17's answer is held by: the trait the seals go
             // through, and the type the shipped algorithms are bound to. It fails
@@ -1121,66 +1204,7 @@ mod tests {
                 path: "crates/waymaker-core/src/lib.rs".to_owned(),
                 contents: source::tests_support::clean_kernel_root(),
             },
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
-                contents: source::tests_support::clean_storage_contract(),
-            },
-            // And the storage-backed recovery reader of issue #23, pinned for the
-            // reason the other three are: renamed or deleted, the pin checks nothing.
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::RECOVERY_SURFACE_PATH),
-                contents: source::tests_support::clean_recovery_routing(),
-            },
-            // And the two-barrier writer of issue #24: `commit-discipline` pins its
-            // surface and its typestate, and `integrity-check` pins the one call it
-            // makes into the codec. Both fail closed when the module is absent.
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::APPEND_SURFACE_PATH),
-                contents: source::tests_support::clean_append_module(),
-            },
-            // And §10's capacity reserve of issue #25: `capacity-reserve` pins its
-            // surface and the order its one gate is applied in, and fails closed when
-            // the module is absent.
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::CAPACITY_SURFACE_PATH),
-                contents: source::tests_support::clean_capacity_reserve(),
-            },
-            // And §10's bank swap of issue #26: `swap-discipline` pins its surface and the
-            // order §10's seven steps happen in, and `integrity-check` pins its one route to
-            // the bank codec. Both fail closed when the module is absent.
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::SWAP_SURFACE_PATH),
-                contents: source::tests_support::clean_swap_module(),
-            },
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::INTEGRITY_BINDING_PATH),
-                contents: source::tests_support::clean_integrity_binding(),
-            },
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::INTEGRITY_ROUTING_PATH),
-                contents: source::tests_support::clean_integrity_routing(),
-            },
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::BANK_ROUTING_PATH),
-                contents: source::tests_support::clean_bank_routing(),
-            },
-            size::LayerSource {
-                crate_name: "waymaker-flash".to_owned(),
-                path: format!("crates/{}", source::INTEGRITY_CHECK_PATH),
-                contents: source::tests_support::clean_checksum_module(),
-            },
         ]
-        .into_iter()
-        .chain(clean_facade_sources())
-        .collect()
     }
 
     /// The façade's own files, which the layer-source rules read.

@@ -35,6 +35,20 @@
 //! A recorded clock kind this firmware cannot service is
 //! [`KernelError::IncompatibleWorkflow`] and never a substitution — §02 decision 8.
 //!
+//! # The version boundary
+//!
+//! Design document §08's versioning rules and issue
+//! [#40](https://github.com/madmax983/waymaker/issues/40). A workflow that branches on an
+//! upgrade asks [`version_intent`](ReplayMachine::version_intent), and history answers with
+//! the branch it recorded. The same five rows hold, with rows 1 and 2 collapsed into one:
+//! a gate has no world between its intent and its answer, so one record both commits the
+//! decision and holds it. That is why there is no `VersionResolve` beside
+//! [`VersionIntent`].
+//!
+//! It carries a capability too, and [`VersionRange`] is it. A recorded branch this image
+//! cannot replay is [`KernelError::IncompatibleWorkflow`], never a best-effort replay under
+//! whatever branch the binary still holds.
+//!
 //! # What this module must not own
 //!
 //! The digest, and the dispatch. [`EffectRequest`] carries a length and a checksum that
@@ -129,6 +143,7 @@ use crate::id::EffectId;
 use crate::record::RecordRef;
 use crate::replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
 use crate::timer::{ClockCapability, TimerSpec};
+use crate::version::{GateId, VersionRange};
 
 /// What the driver found at the cursor's position.
 ///
@@ -287,6 +302,65 @@ pub enum TimerResolve {
     },
 }
 
+/// What the workflow asked for at a version boundary.
+///
+/// The gate, and what this image can replay. Both are needed at once: §08's second rule is
+/// that a firmware image which cannot replay the recorded version returns
+/// [`KernelError::IncompatibleWorkflow`], and the only place that can be decided is where
+/// the recorded branch and the image's range meet.
+///
+/// # Why there is no proposed version
+///
+/// A gate with no marker on media records [`VersionRange::current`] — the version of the
+/// image that first reached it. A second field a caller could set differently would be a
+/// way to record a branch the same image says it cannot replay, and every later boot would
+/// then refuse a run this one wrote.
+///
+/// # Invariants
+///
+/// None this type enforces; the fields are public so a driver can build one. `supported`
+/// must be what this image really holds, exactly as [`TimerRequest::capability`] must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VersionRequest {
+    /// Which decision point the workflow reached.
+    pub gate: GateId,
+    /// The recorded versions this image can replay.
+    pub supported: VersionRange,
+}
+
+/// What history said at a version boundary.
+///
+/// [`Intent`]'s twin, with rows 1 and 2 as one variant. A gate has no outcome half: the
+/// marker record is both the durable intent and the answer, so there is nothing for a
+/// second call to resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionIntent<'a> {
+    /// Rows 1 and 2. History holds the marker, and `version` is the branch to take.
+    ///
+    /// A run replays the branch it took, whatever branch this image would choose now. That
+    /// is the whole of "an upgrade branch taken during a run replays identically for ever
+    /// after".
+    Recorded {
+        /// The identity history committed the marker under.
+        id: EffectId,
+        /// The workflow version whose branch was taken.
+        version: u16,
+    },
+    /// Row 3. History ended: commit a `VersionMarker` for `id` carrying
+    /// [`VersionRange::current`], and take that branch.
+    ///
+    /// Nothing is spent yet, for [`Intent::Schedule`]'s reason.
+    Record {
+        /// The identity the marker record must carry.
+        id: EffectId,
+    },
+    /// Row 5. History holds a terminal run record: return this and poll no further.
+    Finished {
+        /// The run's recorded outcome.
+        outcome: Outcome<'a>,
+    },
+}
+
 /// The way a workflow disagreed with history.
 ///
 /// §08 names three — "different kind, digest, or sequence" — and there is a fourth here
@@ -332,12 +406,21 @@ pub enum Divergence {
     Kind,
     /// The input digest differs: a different length, a different checksum, or both.
     Digest,
-    /// The workflow asked for a timer where history recorded an activity, or the reverse.
+    /// The workflow reached a boundary of a different kind than history recorded here.
     ///
-    /// Not one of §08's three either. The two boundaries share one sequence space, so a
-    /// record at the right position can still be the wrong *kind of thing*, and reporting
-    /// [`Kind`](Self::Kind) would send a reader to look for a renamed activity.
+    /// Not one of §08's three either. The three boundaries — an activity, a deadline and a
+    /// version gate — share one sequence space, so a record at the right position can still
+    /// be the wrong *kind of thing*, and reporting [`Kind`](Self::Kind) would send a reader
+    /// to look for a renamed activity.
     BoundaryKind,
+    /// The workflow reached a different gate than history recorded here.
+    ///
+    /// [`Kind`](Self::Kind)'s twin at a version boundary, and a flavour of its own for the
+    /// same reason [`BoundaryKind`](Self::BoundaryKind) is: a gate is named by a number the
+    /// author chose, so a marker at the right position can still be the wrong decision
+    /// point. Two gates that swapped places in the workflow are caught by this; a gate that
+    /// moved to another position is caught by [`Sequence`](Self::Sequence).
+    Gate,
     /// The workflow asked for a different deadline, or a different clock, than history
     /// recorded.
     ///
@@ -381,6 +464,7 @@ impl Divergence {
             Self::Kind => "a different activity kind than history recorded",
             Self::Digest => "a different activity input than history recorded",
             Self::BoundaryKind => "a different kind of boundary than history recorded",
+            Self::Gate => "a different version gate than history recorded",
             Self::Deadline => "a different deadline than history recorded",
             Self::Boundary => "an effect boundary history cannot account for",
         }
@@ -756,54 +840,8 @@ impl ReplayMachine {
             Next::Record(record) => match record {
                 // Rows 1, 2 and 4: history holds a schedule, and whether it is *this*
                 // effect's is the whole of the divergence check.
-                RecordRef::EffectScheduled {
-                    seq,
-                    kind,
-                    input_len,
-                    input_crc,
-                } => {
-                    // The recorded schedule has to be compared against the identity the run
-                    // would issue next, so this row needs one too.
-                    let Some(expected) = expected else {
-                        return Err(KernelError::IdExhausted);
-                    };
-                    let recorded = PendingEffect {
-                        id: EffectId {
-                            run: expected.run,
-                            seq,
-                        },
-                        kind,
-                        input_len,
-                        input_crc,
-                    };
-                    // Row 4, and it comes first: the cursor is advanced only past this
-                    // check, so a divergent boundary consumes no record and produces no
-                    // identity. That is what "never dispatches" is made of.
-                    if let Some(divergence) = request.divergence_from(&recorded, expected) {
-                        self.phase = Phase::Diverged(divergence);
-                        return Err(KernelError::NondeterministicWorkflow);
-                    }
-                    match self.cursor.advance(record) {
-                        Ok(Step::EffectScheduled(pending)) => {
-                            self.phase = Phase::AwaitingOutcome;
-                            Ok(Intent::Recorded { id: pending.id })
-                        }
-                        // The cursor answers a schedule record with a schedule step, so
-                        // these arms are unreachable. Written out rather than left to a
-                        // wildcard because a `Step` added later must be a compile error
-                        // here, and refused rather than panicked because this workspace
-                        // denies `panic!` in production code.
-                        Ok(
-                            Step::RunStarted { .. }
-                            | Step::EffectCompleted { .. }
-                            | Step::EffectFailed { .. }
-                            | Step::TimerScheduled(_)
-                            | Step::TimerFired { .. }
-                            | Step::RunCompleted { .. }
-                            | Step::RunFailed { .. },
-                        ) => Err(KernelError::MalformedHistory),
-                        Err(error) => Err(error),
-                    }
+                RecordRef::EffectScheduled { .. } => {
+                    self.recorded_effect(request, expected, record)
                 }
                 // Row 5.
                 RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => {
@@ -820,17 +858,20 @@ impl ReplayMachine {
                             | Step::EffectCompleted { .. }
                             | Step::EffectFailed { .. }
                             | Step::TimerScheduled(_)
-                            | Step::TimerFired { .. },
+                            | Step::TimerFired { .. }
+                            | Step::VersionMarker { .. },
                         ) => Err(KernelError::MalformedHistory),
                         Err(error) => Err(error),
                     }
                 }
-                // History recorded a timer where the workflow called an activity. The
-                // position is legal and the record is sound, so this is the workflow
-                // disagreeing rather than history being impossible: §08 row 4, with the
-                // flavour that says which. Refused before the cursor is advanced, so a
-                // diagnosis can still name the record.
-                RecordRef::TimerScheduled { .. } => Err(self.diverge(Divergence::BoundaryKind)),
+                // History recorded a deadline or a gate where the workflow called an
+                // activity. The position is legal and the record is sound, so this is the
+                // workflow disagreeing rather than history being impossible: §08 row 4,
+                // with the flavour that says which. Refused before the cursor is advanced,
+                // so a diagnosis can still name the record.
+                RecordRef::TimerScheduled { .. } | RecordRef::VersionMarker { .. } => {
+                    Err(self.diverge(Divergence::BoundaryKind))
+                }
                 // No row: a run cannot start twice, and an outcome cannot precede its
                 // schedule. A `TimerFired` here is the second of those — the cursor is at
                 // `Replaying`, so no timer is open for it to resolve — and it is history
@@ -851,7 +892,8 @@ impl ReplayMachine {
                         | Step::TimerScheduled(_)
                         | Step::TimerFired { .. }
                         | Step::RunCompleted { .. }
-                        | Step::RunFailed { .. },
+                        | Step::RunFailed { .. }
+                        | Step::VersionMarker { .. },
                     ) => Err(KernelError::MalformedHistory),
                     Err(error) => Err(error),
                 },
@@ -931,7 +973,8 @@ impl ReplayMachine {
                     | Step::TimerScheduled(_)
                     | Step::TimerFired { .. }
                     | Step::RunCompleted { .. }
-                    | Step::RunFailed { .. },
+                    | Step::RunFailed { .. }
+                    | Step::VersionMarker { .. },
                 ) => Err(KernelError::MalformedHistory),
                 Err(error) => Err(error),
             },
@@ -1021,14 +1064,17 @@ impl ReplayMachine {
                             | Step::EffectCompleted { .. }
                             | Step::EffectFailed { .. }
                             | Step::TimerScheduled(_)
-                            | Step::TimerFired { .. },
+                            | Step::TimerFired { .. }
+                            | Step::VersionMarker { .. },
                         ) => Err(KernelError::MalformedHistory),
                         Err(error) => Err(error),
                     }
                 }
-                // History recorded an activity where the workflow asked to wait. The
-                // position is legal and the record is sound, so it is §08 row 4.
-                RecordRef::EffectScheduled { .. } => Err(self.diverge(Divergence::BoundaryKind)),
+                // History recorded an activity or a gate where the workflow asked to
+                // wait. The position is legal and the record is sound, so it is §08 row 4.
+                RecordRef::EffectScheduled { .. } | RecordRef::VersionMarker { .. } => {
+                    Err(self.diverge(Divergence::BoundaryKind))
+                }
                 // No row. Handed to the cursor so that one type owns "what may follow
                 // what", and so that the refusal is sticky.
                 RecordRef::RunStarted { .. }
@@ -1043,11 +1089,81 @@ impl ReplayMachine {
                         | Step::TimerScheduled(_)
                         | Step::TimerFired { .. }
                         | Step::RunCompleted { .. }
-                        | Step::RunFailed { .. },
+                        | Step::RunFailed { .. }
+                        | Step::VersionMarker { .. },
                     ) => Err(KernelError::MalformedHistory),
                     Err(error) => Err(error),
                 },
             },
+        }
+    }
+
+    /// Rows 1, 2 and 4 for an activity, once history has produced an `EffectScheduled`.
+    ///
+    /// Split out of [`intent`](Self::intent) for clippy's line budget, and because it is
+    /// the half that owns §08's divergence check — the twin of
+    /// [`recorded_timer`](Self::recorded_timer), which owns §11's.
+    ///
+    /// # Errors
+    ///
+    /// As [`intent`](Self::intent), for this row.
+    const fn recorded_effect<'a>(
+        &mut self,
+        request: EffectRequest,
+        expected: Option<EffectId>,
+        record: RecordRef<'a>,
+    ) -> Result<Intent<'a>, KernelError> {
+        let RecordRef::EffectScheduled {
+            seq,
+            kind,
+            input_len,
+            input_crc,
+        } = record
+        else {
+            // Unreachable: the one caller matched this variant. Refused rather than
+            // panicked, because the workspace denies both.
+            return Err(KernelError::MalformedHistory);
+        };
+        // The recorded schedule has to be compared against the identity the run would issue
+        // next, so this row needs one too.
+        let Some(expected) = expected else {
+            return Err(KernelError::IdExhausted);
+        };
+        let recorded = PendingEffect {
+            id: EffectId {
+                run: expected.run,
+                seq,
+            },
+            kind,
+            input_len,
+            input_crc,
+        };
+        // Row 4, and it comes first: the cursor is advanced only past this check, so a
+        // divergent boundary consumes no record and produces no identity. That is what
+        // "never dispatches" is made of.
+        if let Some(divergence) = request.divergence_from(&recorded, expected) {
+            return Err(self.diverge(divergence));
+        }
+        match self.cursor.advance(record) {
+            Ok(Step::EffectScheduled(pending)) => {
+                self.phase = Phase::AwaitingOutcome;
+                Ok(Intent::Recorded { id: pending.id })
+            }
+            // The cursor answers a schedule record with a schedule step, so these arms are
+            // unreachable. Written out rather than left to a wildcard because a `Step`
+            // added later must be a compile error here, and refused rather than panicked
+            // because this workspace denies `panic!` in production code.
+            Ok(
+                Step::RunStarted { .. }
+                | Step::EffectCompleted { .. }
+                | Step::EffectFailed { .. }
+                | Step::TimerScheduled(_)
+                | Step::TimerFired { .. }
+                | Step::RunCompleted { .. }
+                | Step::RunFailed { .. }
+                | Step::VersionMarker { .. },
+            ) => Err(KernelError::MalformedHistory),
+            Err(error) => Err(error),
         }
     }
 
@@ -1117,7 +1233,8 @@ impl ReplayMachine {
                 | Step::EffectFailed { .. }
                 | Step::TimerFired { .. }
                 | Step::RunCompleted { .. }
-                | Step::RunFailed { .. },
+                | Step::RunFailed { .. }
+                | Step::VersionMarker { .. },
             ) => Err(KernelError::MalformedHistory),
             Err(error) => Err(error),
         }
@@ -1189,10 +1306,176 @@ impl ReplayMachine {
                     | Step::EffectFailed { .. }
                     | Step::TimerScheduled(_)
                     | Step::RunCompleted { .. }
-                    | Step::RunFailed { .. },
+                    | Step::RunFailed { .. }
+                    | Step::VersionMarker { .. },
                 ) => Err(KernelError::MalformedHistory),
                 Err(error) => Err(error),
             },
+        }
+    }
+}
+
+impl ReplayMachine {
+    /// The workflow reached a version gate: rows 3, 4 and 5, and rows 1 and 2 as one.
+    ///
+    /// [`intent`](Self::intent)'s twin, minus the outcome half. `next` is the record the
+    /// driver read at the cursor's position, or [`Next::EndOfHistory`].
+    ///
+    /// # Postconditions
+    ///
+    /// * [`VersionIntent::Record`] consumes nothing and mints nothing. The caller writes
+    ///   the marker and advances the machine over it.
+    /// * [`VersionIntent::Recorded`] consumed exactly the marker record, and the machine is
+    ///   settled: a gate opens no boundary, so no second call is owed.
+    /// * [`VersionIntent::Finished`] consumed the terminal record.
+    /// * A refused request consumes nothing.
+    ///
+    /// # Errors
+    ///
+    /// * [`KernelError::IncompatibleWorkflow`] when the recorded branch is outside
+    ///   `request.supported`. §08: never a best-effort replay.
+    /// * [`KernelError::NondeterministicWorkflow`] when the request disagrees with what
+    ///   history recorded — [`diverged`](Self::diverged) says how — and when no boundary can
+    ///   come next at all.
+    /// * [`KernelError::MalformedHistory`] when `next` could not legally follow.
+    /// * [`KernelError::IdExhausted`] when the run's sequence space is spent.
+    pub const fn version_intent<'a>(
+        &mut self,
+        request: VersionRequest,
+        next: Next<'a>,
+    ) -> Result<VersionIntent<'a>, KernelError> {
+        if let Some(error) = self.halted() {
+            return Err(error);
+        }
+        match self.phase {
+            Phase::Diverged(_) => return Err(KernelError::NondeterministicWorkflow),
+            // A boundary already open is not an arm here, for the reason `intent` gives:
+            // the cursor's own gate below refuses, with the same recorded divergence.
+            Phase::Settled | Phase::AwaitingOutcome | Phase::AwaitingFiring => {}
+        }
+
+        let expected = match self.cursor.next_effect_id() {
+            Ok(id) => Some(id),
+            Err(KernelError::NondeterministicWorkflow) => {
+                return Err(self.diverge(Divergence::Boundary));
+            }
+            Err(KernelError::IdExhausted) => None,
+            Err(error) => return Err(error),
+        };
+
+        match next {
+            // Row 3. The branch this image would take, about to become the branch the run
+            // took. Nothing is committed yet.
+            Next::EndOfHistory => match expected {
+                Some(id) => Ok(VersionIntent::Record { id }),
+                None => Err(KernelError::IdExhausted),
+            },
+            Next::Record(record) => match record {
+                // Rows 1, 2 and 4.
+                RecordRef::VersionMarker { .. } => self.recorded_gate(request, expected, record),
+                // Row 5.
+                RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => {
+                    match self.cursor.advance(record) {
+                        Ok(Step::RunCompleted { result }) => Ok(VersionIntent::Finished {
+                            outcome: Outcome::Completed(result),
+                        }),
+                        Ok(Step::RunFailed { error }) => Ok(VersionIntent::Finished {
+                            outcome: Outcome::Failed(error),
+                        }),
+                        Ok(
+                            Step::RunStarted { .. }
+                            | Step::EffectScheduled(_)
+                            | Step::EffectCompleted { .. }
+                            | Step::EffectFailed { .. }
+                            | Step::TimerScheduled(_)
+                            | Step::TimerFired { .. }
+                            | Step::VersionMarker { .. },
+                        ) => Err(KernelError::MalformedHistory),
+                        Err(error) => Err(error),
+                    }
+                }
+                // History recorded a boundary of another kind here. The position is legal
+                // and the record is sound, so it is §08 row 4.
+                RecordRef::EffectScheduled { .. } | RecordRef::TimerScheduled { .. } => {
+                    Err(self.diverge(Divergence::BoundaryKind))
+                }
+                // No row. Handed to the cursor so that one type owns "what may follow
+                // what", and so that the refusal is sticky.
+                RecordRef::RunStarted { .. }
+                | RecordRef::EffectCompleted { .. }
+                | RecordRef::EffectFailed { .. }
+                | RecordRef::TimerFired { .. } => match self.cursor.advance(record) {
+                    Ok(
+                        Step::RunStarted { .. }
+                        | Step::EffectScheduled(_)
+                        | Step::EffectCompleted { .. }
+                        | Step::EffectFailed { .. }
+                        | Step::TimerScheduled(_)
+                        | Step::TimerFired { .. }
+                        | Step::RunCompleted { .. }
+                        | Step::RunFailed { .. }
+                        | Step::VersionMarker { .. },
+                    ) => Err(KernelError::MalformedHistory),
+                    Err(error) => Err(error),
+                },
+            },
+        }
+    }
+
+    /// Rows 1, 2 and 4 for a gate, once history has produced a `VersionMarker` record.
+    ///
+    /// Split out of [`version_intent`](Self::version_intent) for
+    /// [`recorded_timer`](Self::recorded_timer)'s reasons, and because it owns the two
+    /// refusals §08's versioning rules rest on: a branch this image cannot replay, and a
+    /// gate that is not the one history recorded.
+    ///
+    /// # Errors
+    ///
+    /// As [`version_intent`](Self::version_intent), for this row.
+    const fn recorded_gate<'a>(
+        &mut self,
+        request: VersionRequest,
+        expected: Option<EffectId>,
+        record: RecordRef<'a>,
+    ) -> Result<VersionIntent<'a>, KernelError> {
+        let RecordRef::VersionMarker { seq, gate, version } = record else {
+            // Unreachable: the one caller matched this variant. Refused rather than
+            // panicked, because the workspace denies both.
+            return Err(KernelError::MalformedHistory);
+        };
+        let Some(expected) = expected else {
+            return Err(KernelError::IdExhausted);
+        };
+        // Asked before the divergence check, for `recorded_timer`'s reason: an image that
+        // cannot replay this branch cannot honour the record whatever the workflow asks.
+        if request.supported.admits(version).is_err() {
+            return Err(KernelError::IncompatibleWorkflow);
+        }
+        if expected.seq.0 != seq.0 {
+            return Err(self.diverge(Divergence::Sequence));
+        }
+        if gate.0 != request.gate.0 {
+            return Err(self.diverge(Divergence::Gate));
+        }
+        match self.cursor.advance(record) {
+            Ok(Step::VersionMarker { id, version, .. }) => {
+                // No phase change: a marker resolves itself, so the machine is settled the
+                // moment the record is consumed.
+                Ok(VersionIntent::Recorded { id, version })
+            }
+            // Unreachable: the cursor answers a marker record with a marker step. Written
+            // out for the reason `intent`'s twin arms are.
+            Ok(
+                Step::RunStarted { .. }
+                | Step::EffectScheduled(_)
+                | Step::EffectCompleted { .. }
+                | Step::EffectFailed { .. }
+                | Step::TimerScheduled(_)
+                | Step::TimerFired { .. }
+                | Step::RunCompleted { .. }
+                | Step::RunFailed { .. },
+            ) => Err(KernelError::MalformedHistory),
+            Err(error) => Err(error),
         }
     }
 }
@@ -1229,11 +1512,12 @@ mod tests {
     ];
 
     /// Every `Divergence`, in declaration order.
-    const EVERY_DIVERGENCE: [Divergence; 6] = [
+    const EVERY_DIVERGENCE: [Divergence; 7] = [
         Divergence::Sequence,
         Divergence::Kind,
         Divergence::Digest,
         Divergence::BoundaryKind,
+        Divergence::Gate,
         Divergence::Deadline,
         Divergence::Boundary,
     ];
@@ -1250,8 +1534,9 @@ mod tests {
             Divergence::Kind => 1,
             Divergence::Digest => 2,
             Divergence::BoundaryKind => 3,
-            Divergence::Deadline => 4,
-            Divergence::Boundary => 5,
+            Divergence::Gate => 4,
+            Divergence::Deadline => 5,
+            Divergence::Boundary => 6,
         }
     }
 

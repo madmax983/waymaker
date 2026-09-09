@@ -164,6 +164,7 @@ fn recovered(image: &[u8]) -> Vec<RecordId> {
             RecordRef::EffectFailed { .. }
             | RecordRef::TimerScheduled { .. }
             | RecordRef::TimerFired { .. }
+            | RecordRef::VersionMarker { .. }
             | RecordRef::RunCompleted { .. }
             | RecordRef::RunFailed { .. } => None,
         })
