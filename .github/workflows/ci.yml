@@ -73,7 +73,10 @@ jobs:
         run: cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings
 
       - name: Codec test
-        run: cargo test --locked -p waymaker-embassy --features postcard --test codec
+        run: cargo test --locked -p waymaker-embassy --features postcard
+
+      - name: Codec docs
+        run: cargo doc --locked -p waymaker-embassy --no-deps --features postcard
 
       - name: Docs
         run: cargo doc --locked --workspace --no-deps --no-default-features

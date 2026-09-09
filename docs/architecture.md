@@ -31,6 +31,13 @@ drawn here.
 `waymaker-core` points at nothing at all: not at another layer, and not at a registry
 crate. Nothing points down into `waymaker-embassy`.
 
+`waymaker-embassy` is the first layer with a registry dependency, and it is not drawn here.
+Issue [#37](https://github.com/madmax983/waymaker/issues/37)'s `serde` and `postcard` are
+optional, no default build links either, and they are `may_depend_on_external` rather than
+`may_depend_on` — so they are not one of the solid arrows the gate compares. `codec-is-optional`
+is what keeps them optional, and `waymaker-core`'s and `waymaker-flash`'s external lists are
+still empty.
+
 `waymaker-size-probe` is in the picture because it is a real crate CI links on every pull
 request and on every push to `main`, but it is not a layer: it declares all three as
 *optional* dependencies, so that a variant linking none of them gives the baseline the

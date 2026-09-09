@@ -170,10 +170,9 @@ pub struct Variant {
 /// rather than measured as zero.
 #[must_use]
 pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
-    let Some(probe) = graph.find(PROBE_PACKAGE) else {
+    if graph.find(PROBE_PACKAGE).is_none() {
         return Vec::new();
-    };
-    let probe_features = probe.features.clone();
+    }
 
     let mut variants = vec![
         Variant {
@@ -221,16 +220,18 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             if feature == "default" {
                 continue;
             }
-            // The probe's own mirror when it declares one, so the probe can `#[cfg]` on
-            // the row and reach the code it exists to measure. `check_probe_mirrors` is
-            // what makes the mirror compulsory; the fallback keeps a workspace whose probe
-            // predates that rule measurable rather than unbuildable.
-            let mirror = mirror_feature(spec.name, feature);
-            let selector = if probe_features.contains(&mirror) {
-                mirror
-            } else {
-                format!("{}/{feature}", spec.name)
-            };
+            // The probe's own mirror, always. `--features <layer>/<feature>` enables the
+            // layer's feature and defines no `cfg` here, so the probe cannot write a call
+            // the row turns on: the row would link the feature, reach none of it, and
+            // publish a plausible delta of nearly zero.
+            //
+            // No fallback to that spelling. `check_probe_mirrors` makes the mirror
+            // compulsory, but `xtask size` runs *before* `check-layering` in the stage
+            // table, so a fallback would let the size stage print `ok` over an unmeasured
+            // row and leave the last stage to notice. Selecting a feature the probe does
+            // not declare fails the link instead, which is loud and is the direction a
+            // measurement should fail in.
+            let selector = mirror_feature(spec.name, feature);
             variants.push(Variant {
                 name: format!("{}/{feature}", spec.name),
                 features: vec![PROBE_FEATURE.to_owned(), base.to_owned(), selector],
@@ -1905,7 +1906,7 @@ pub fn check_size_probe(
         }
     }
     violations.extend(check_probe_features(manifest));
-    violations.extend(check_probe_mirrors(graph, manifest));
+    violations.extend(check_probe_mirrors(graph, manifest, source));
 
     violations.extend(check_probe_manifest(manifest));
     violations.extend(check_probe_source(source));
@@ -1947,7 +1948,11 @@ fn mirror_feature(layer: &str, feature: &str) -> String {
 /// Derived rather than tabulated, in both halves: [`mirror_feature`] names the mirror, and
 /// a layer feature that has none fails here rather than producing a quiet row of zero.
 #[must_use]
-fn check_probe_mirrors(graph: &PackageGraph, manifest: Option<&str>) -> Vec<Violation> {
+fn check_probe_mirrors(
+    graph: &PackageGraph,
+    manifest: Option<&str>,
+    source: Option<&str>,
+) -> Vec<Violation> {
     let Some(probe) = graph.find(PROBE_PACKAGE) else {
         // Already reported by `check_size_probe`.
         return Vec::new();
@@ -1993,6 +1998,23 @@ fn check_probe_mirrors(graph: &PackageGraph, manifest: Option<&str>) -> Vec<Viol
                     format!(
                         "its `{mirror}` feature does not enable `{selector}`, so the row \
                          named after that feature measures an image without it"
+                    ),
+                ));
+            }
+            // Declaring the mirror is not reaching it. Review of this change added a layer
+            // feature and a mirror that enabled it, wrote no `#[cfg]` in the probe, and
+            // watched the gate stay green on exactly the row of zero this rule exists to
+            // prevent. `size-probe-reach` is only a partial backstop: it fires when a
+            // feature adds a public *function*, and a feature that adds none adds no
+            // obligation.
+            let gate = format!("#[cfg(feature = \"{mirror}\")]");
+            if source.is_some_and(|source| !source.contains(&gate)) {
+                violations.push(Violation::new(
+                    "size-probe",
+                    PROBE_PACKAGE,
+                    format!(
+                        "declares `{mirror}` but its source carries no `{gate}`, so the \
+                         `{selector}` row links that feature and runs none of it"
                     ),
                 ));
             }
@@ -2818,15 +2840,16 @@ mod tests {
     #[test]
     fn a_feature_of_the_facade_is_measured_with_the_facade_linked() {
         let variants = matrix(&workspace(&["serde"], &["defmt"]));
+        // The row keeps its `<layer>/<feature>` name and is selected by the probe's mirror.
         let core_row = find(&variants, "waymaker-core/serde");
         assert_eq!(
             core_row.features,
-            [PROBE_FEATURE, ENGINE_FEATURE, "waymaker-core/serde"]
+            [PROBE_FEATURE, ENGINE_FEATURE, "core-serde"]
         );
         let facade_row = find(&variants, "waymaker-embassy/defmt");
         assert_eq!(
             facade_row.features,
-            [PROBE_FEATURE, FACADE_FEATURE, "waymaker-embassy/defmt"]
+            [PROBE_FEATURE, FACADE_FEATURE, "embassy-defmt"]
         );
     }
 
@@ -2842,27 +2865,7 @@ mod tests {
 
     #[test]
     fn a_layer_feature_the_probe_mirrors_is_selected_by_the_probes_own_feature() {
-        let mut graph = workspace(&[], &["postcard"]);
-        graph = PackageGraph::new(
-            graph
-                .packages()
-                .iter()
-                .map(|package| {
-                    if package.name == PROBE_PACKAGE {
-                        Package::new(PROBE_PACKAGE).with_features(&[
-                            "probe",
-                            "engine",
-                            "facade",
-                            "embassy-postcard",
-                        ])
-                    } else {
-                        package.clone()
-                    }
-                })
-                .collect(),
-        );
-
-        let variants = matrix(&graph);
+        let variants = matrix(&workspace(&[], &["postcard"]));
         let row = find(&variants, "waymaker-embassy/postcard");
         assert_eq!(
             row.features,
@@ -2886,6 +2889,7 @@ mod tests {
         let violations = check_probe_mirrors(
             &workspace(&[], &["postcard"]),
             Some(&tests_support::clean_probe_manifest()),
+            Some(""),
         );
 
         assert!(
@@ -2915,7 +2919,7 @@ mod tests {
             ]),
         ]);
 
-        let violations = check_probe_mirrors(&graph, Some(&manifest));
+        let violations = check_probe_mirrors(&graph, Some(&manifest), Some(""));
 
         assert!(
             violations
@@ -2943,7 +2947,45 @@ mod tests {
             ]),
         ]);
 
-        assert!(check_probe_mirrors(&graph, Some(&manifest)).is_empty());
+        assert!(
+            check_probe_mirrors(
+                &graph,
+                Some(&manifest),
+                Some("#[cfg(feature = \"embassy-postcard\")]\nfn measured() {}\n")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_mirror_the_probe_declares_but_never_reaches_is_reported() {
+        // Declaring the mirror is not reaching it. Review of this change added a layer
+        // feature and a mirror that enabled it, wrote no `#[cfg]` in the probe, and watched
+        // the gate stay green on the row of zero this rule exists to prevent.
+        let manifest = format!(
+            "{}embassy-postcard = [\"facade\", \"waymaker-embassy/postcard\"]\n",
+            tests_support::clean_probe_manifest()
+        );
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy").with_features(&["postcard"]),
+            Package::new(PROBE_PACKAGE).with_features(&[
+                "probe",
+                "engine",
+                "facade",
+                "embassy-postcard",
+            ]),
+        ]);
+
+        let violations = check_probe_mirrors(&graph, Some(&manifest), Some("fn probe() {}\n"));
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("carries no")),
+            "{violations:?}"
+        );
     }
 
     #[test]

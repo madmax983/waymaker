@@ -2034,11 +2034,11 @@ fn facade() -> usize {
 
 /// Issue #37's codec bridge, driven over a format the probe supplies.
 ///
-/// The format is the probe's own rather than a codec's, because the bridge is what this row
-/// measures: `waymaker-embassy/serde` names serde's data model and no format, so the row
-/// that enables it has nothing else to reach. It is a *real* format — one byte through
-/// serde's own value deserializer — because a format that always refused would let the
-/// optimiser fold the success path away, and a folded arm is not a measurement.
+/// The probe supplies the format, because the bridge is what this row measures:
+/// `waymaker-embassy/serde` names serde's data model and no format, so the row has nothing
+/// else to reach. The format is real. It reads one byte through serde's value deserializer.
+/// A format that always fails lets the optimiser remove the success path, and the row then
+/// measures code that does not run.
 #[cfg(feature = "embassy-serde")]
 #[inline(never)]
 fn codec_bridge() -> usize {
@@ -2067,8 +2067,8 @@ fn codec_bridge() -> usize {
 
 /// Issue #37's postcard format, driven over bytes the optimiser cannot see through.
 ///
-/// This is the row §04 asks for by name. The `Δ vs facade` column is what enabling postcard
-/// costs a firmware in code flash.
+/// This is the row §04 asks for by name. The `over base` column, measured against the
+/// `facade` row, is what postcard costs a firmware in code flash.
 #[cfg(feature = "embassy-postcard")]
 #[inline(never)]
 fn codec_postcard() -> usize {
@@ -2078,7 +2078,9 @@ fn codec_postcard() -> usize {
     let bytes = core::hint::black_box(b"\x07\x2a".as_slice());
     let kept = match FromPostcard::<(u8, u16)>::decode(bytes) {
         Ok(value) => {
-            let (first, second) = value.into_inner();
+            // `clone` is the wrapper's other public function, and `size-probe-reach` asks
+            // for a call to it.
+            let (first, second) = value.clone().into_inner();
             usize::from(first).wrapping_add(usize::from(second))
         }
         Err(_refused) => 1,

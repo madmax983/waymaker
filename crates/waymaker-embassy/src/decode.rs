@@ -12,10 +12,11 @@
 /// kept across an effect boundary is workflow RAM for the life of the run. Cross a boundary
 /// with a handle, not with the bytes the handle names.
 ///
-/// # Allocation
+/// # Allocation, and what the caller owns
 ///
-/// None. `bytes` is borrowed from the caller's buffer and is overwritten by the next
-/// boundary, so an implementor copies what it keeps into its own fixed-size storage.
+/// None. The caller owns the storage on both sides. `bytes` borrows the caller's buffer,
+/// which the next boundary overwrites, so an implementor copies what it keeps into its own
+/// fixed-size storage. The value is returned by move, into the caller's frame.
 pub trait Decode: Sized {
     /// Why the bytes are not a value of this type.
     type Error;
@@ -24,9 +25,9 @@ pub trait Decode: Sized {
     ///
     /// # Errors
     ///
-    /// [`Self::Error`] when the bytes are not one. A decode failure is a workflow fault,
-    /// not an effect failure: the effect's outcome is already committed and replay hands
-    /// back the same bytes, so the same call fails the same way on every boot.
+    /// [`Self::Error`] when the bytes are not a value of this type. A decode failure is a
+    /// workflow fault, not an effect failure. The outcome is already committed. Replay
+    /// gives the same bytes, so the call fails the same way on each boot.
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error>;
 }
 
@@ -43,13 +44,22 @@ impl Decode for () {
     }
 }
 
-/// Serde itself, for a [`Format`] implementor's own use.
+/// The serde crate, at the version this façade uses.
+///
+/// A [`Format`] implementor needs more than a bound: `Deserializer`, `Visitor`, `de::Error`
+/// and the `forward_to_deserialize_any!` macro. The whole crate is re-exported so that an
+/// implementor writes against this version and not a second one. `derive` is on in every
+/// configuration that has this module, so `#[serde(crate = "..::decode::serde")]` works
+/// whichever codec feature is enabled.
+///
+/// The cost is that serde is in this crate's public API: a serde 2.0 would be a breaking
+/// change here.
 #[cfg(feature = "serde")]
 pub use serde;
-/// Serde's owned-value bound, re-exported so an implementor need not name the version.
+/// Serde's owned-value bound.
 ///
-/// [`Format`] is written against it, so a firmware writing its own format would otherwise
-/// have to declare a `serde` dependency matching this crate's.
+/// [`Format`] uses this bound. Re-exported here so that a firmware with its own format does
+/// not declare a `serde` dependency at the version this crate uses.
 #[cfg(feature = "serde")]
 pub use serde::de::DeserializeOwned;
 
@@ -60,7 +70,10 @@ pub use serde::de::DeserializeOwned;
 ///
 /// # Allocation
 ///
-/// None. An implementor reads `bytes` and returns an owned value.
+/// None, in this workspace. An implementor reads `bytes` and returns an owned value. The
+/// bound does not carry that claim: a firmware whose graph enables `serde/alloc` can name a
+/// `T` that allocates, and the allocation is inside a dependency where `crate-attributes`
+/// cannot see it.
 #[cfg(feature = "serde")]
 pub trait Format {
     /// Why the bytes are not a value.
@@ -76,12 +89,13 @@ pub trait Format {
 
 /// A `T` that [`Format`] `F` reads: the [`Decode`] a workflow names.
 ///
-/// `T` is owned. `bytes` is the caller's buffer and the next boundary overwrites it, so a
-/// value that borrowed it would be a dangling read one `.await` later.
+/// `T` is owned. `bytes` is the caller's buffer. The next boundary overwrites it, so a
+/// value that borrows `bytes` becomes invalid after the next `.await`.
 #[cfg(feature = "serde")]
 pub struct Coded<F, T> {
     value: T,
-    /// Which format read the value. `fn() -> F` so that `F` constrains nothing else.
+    /// Which format read the value. `fn() -> F` keeps `F` out of the auto traits and the
+    /// variance of `T`.
     format: core::marker::PhantomData<fn() -> F>,
 }
 
@@ -92,6 +106,26 @@ impl<F, T> Coded<F, T> {
         self.value
     }
 }
+
+// Written out rather than derived. A derive bounds every parameter, so `#[derive(Clone)]`
+// would ask `F: Clone` of a format that is only a type-level tag. These bound `T` alone.
+//
+// There is no `Debug`. It would forward to `T`'s, which pulls `core::fmt` into a firmware
+// that only wanted to decode: 184 B to 3008 B on the `waymaker-embassy/postcard` row of
+// `cargo xtask size`, measured. A caller that wants to print the value calls `into_inner`
+// and prints the `T`, whose `Debug` is its own.
+#[cfg(feature = "serde")]
+impl<F, T: Clone> Clone for Coded<F, T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            format: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<F, T: Copy> Copy for Coded<F, T> {}
 
 #[cfg(feature = "serde")]
 impl<F: Format, T: DeserializeOwned> Decode for Coded<F, T> {
@@ -106,20 +140,47 @@ impl<F: Format, T: DeserializeOwned> Decode for Coded<F, T> {
 }
 
 /// The postcard wire format.
+///
+/// A type-level tag. The private field keeps it one: [`Format::read`] takes no `self`, so a
+/// value of this type has nowhere to go.
 #[cfg(feature = "postcard")]
-pub struct Postcard;
+pub struct Postcard(());
 
 #[cfg(feature = "postcard")]
 impl Format for Postcard {
     type Error = postcard::Error;
 
+    /// Read `bytes` as one complete `T`.
+    ///
+    /// # Errors
+    ///
+    /// [`postcard::Error`] when the bytes are not a `T`, and
+    /// [`postcard::Error::DeserializeBadEncoding`] when a `T` is followed by more bytes.
+    ///
+    /// `take_from_bytes` rather than `from_bytes`, because `from_bytes` reads a *prefix*:
+    /// it stops at the end of the value and never asks what follows. A recorded answer is
+    /// one value, so bytes after it mean the record and this type disagree — which is what
+    /// a firmware that narrowed a result type meets on replay. Postcard has no variant for
+    /// it, so this one says the encoding is not a `T`, which is what it is.
     fn read<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
-        postcard::from_bytes(bytes)
+        match postcard::take_from_bytes(bytes)? {
+            (value, []) => Ok(value),
+            (_value, _trailing) => Err(postcard::Error::DeserializeBadEncoding),
+        }
     }
 }
 
 /// A `T` postcard reads.
 ///
 /// `ctx.activity::<FromPostcard<Report>>(kind, input)`, then `into_inner`.
+///
+/// `T` owns what it holds, so a type that borrows the buffer does not compile:
+///
+/// ```compile_fail
+/// use waymaker_embassy::Decode;
+/// use waymaker_embassy::decode::FromPostcard;
+///
+/// let _ = FromPostcard::<&'static str>::decode(&[1]);
+/// ```
 #[cfg(feature = "postcard")]
 pub type FromPostcard<T> = Coded<Postcard, T>;

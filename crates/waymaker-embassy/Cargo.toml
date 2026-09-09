@@ -22,7 +22,11 @@ postcard = { workspace = true, optional = true }
 default = []
 # Serde's data model and no format: the `Format` bridge a firmware plugs its own codec
 # into. Its cost is its own row of `cargo xtask size`.
-serde = ["dep:serde"]
+# `serde/derive` so that the re-exported serde is the same serde in every configuration.
+# Postcard turns it on anyway; without this the `serde` row would re-export a serde with no
+# derive macro and the documented `FromPostcard<Report>` would not compile under it. A proc
+# macro runs on the build host and adds no bytes to an image.
+serde = ["dep:serde", "serde/derive"]
 # One format for the bridge above.
 postcard = ["dep:postcard", "serde"]
 

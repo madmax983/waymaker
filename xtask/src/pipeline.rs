@@ -118,9 +118,21 @@ pub const STAGES: &[Stage] = &[
     Stage {
         name: "codec-test",
         job: "check",
-        command: "cargo test --locked -p waymaker-embassy --features postcard --test codec",
+        // Every target, not `--test codec`: the `compile_fail` doctest on `FromPostcard` is
+        // what says a borrowed `T` cannot reach a workflow, and a doctest runs nowhere else.
+        command: "cargo test --locked -p waymaker-embassy --features postcard",
         in_hook: false,
         why: "issue #37: no behavior ships without a test, and a feature-gated one needs a stage that enables the feature",
+    },
+    Stage {
+        name: "codec-docs",
+        job: "check",
+        // The `docs` stage passes `--no-default-features`, so the codec module's rustdoc —
+        // its intra-doc links included — is built by nothing. `RUSTDOCFLAGS=-D warnings` is
+        // in the workflow's env block and applies here as it does there.
+        command: "cargo doc --locked -p waymaker-embassy --no-deps --features postcard",
+        in_hook: false,
+        why: "issue #37: the codec module's documentation is built by no other stage, so a broken intra-doc link in it fails nothing",
     },
     Stage {
         name: "docs",

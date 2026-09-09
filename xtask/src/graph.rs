@@ -331,11 +331,11 @@ impl PackageGraph {
             let mut path = path;
             path.push(package.name.clone());
 
-            // A procedural macro runs on the build host and contributes no byte to a
-            // firmware image, and neither does anything it reaches: `thiserror-impl` drags
-            // in `syn`, `quote` and `proc-macro2`, none of which are ever linked into the
-            // part. Reporting them would make a layer's allowlist a list of build tooling,
-            // which is the opposite of what the column means.
+            // A procedural macro runs on the build host. It adds no bytes to a firmware
+            // image. The crates it depends on also add none: `thiserror-impl` depends on
+            // `syn`, `quote` and `proc-macro2`, and the linker uses none of them. To report
+            // them makes a layer's allowlist a list of build tooling, which is not what the
+            // column means.
             if package.is_proc_macro {
                 continue;
             }
@@ -1211,6 +1211,34 @@ mod tests {
             graph
                 .illegal_reach_paths("waymaker-embassy", &allowed)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_crate_a_proc_macro_also_reaches_is_still_reported_by_its_normal_path() {
+        // The whole weakening rests on the `continue` sitting after the visited-set insert
+        // and before the children are queued. A package reachable both ways must still be
+        // reported, whichever edge the walk meets first.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-embassy")
+                .with_dependency("thiserror-impl", DepKind::Normal)
+                .with_dependency("serde", DepKind::Normal),
+            Package {
+                is_proc_macro: true,
+                ..Package::new("thiserror-impl").with_dependency("smuggled", DepKind::Normal)
+            },
+            Package::new("serde").with_dependency("smuggled", DepKind::Normal),
+            Package::new("smuggled"),
+        ]);
+
+        let allowed = core::iter::once("serde").collect();
+        let paths = graph.illegal_reach_paths("waymaker-embassy", &allowed);
+
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.last() == Some(&"smuggled".to_owned())),
+            "a crate a proc macro also reaches is still linked by its normal path: {paths:?}"
         );
     }
 

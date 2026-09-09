@@ -5394,54 +5394,53 @@ pub fn check_codec_is_optional(
 fn check_codec_module(rule: &'static str, contents: &str) -> Vec<Violation> {
     let code = without_test_modules(&code_only(contents));
     let mut violations = Vec::new();
-    let mut gated = false;
     let mut seen_trait = false;
 
-    for line in code.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#[cfg(feature") {
-            gated = true;
-            continue;
-        }
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-        // An item starts at column zero; anything indented is a member of one, and the
-        // attribute above the item already decided it.
-        if line.starts_with(char::is_whitespace) {
-            continue;
-        }
-
-        if trimmed.starts_with(CODEC_FREE_TRAIT) {
+    for item in items(&code) {
+        if item.declares_the_codec_free_trait() {
             seen_trait = true;
-            if gated {
+            // `conditional`, not `gated`. A compound `#[cfg(all(feature = "serde"))]` is not
+            // read as gating, so an item behind one is *reported* — but the trait branch
+            // only reported when the item was classified as gated, so the same spelling on
+            // the trait was silent. Review of this change ran it: `Decode` left the default
+            // build with the gate green. The two halves now fail in the same direction.
+            if item.conditional {
                 violations.push(Violation::new(
                     rule,
                     CODEC_CRATE,
                     format!(
-                        "{CODEC_PATH} declares `{CODEC_FREE_TRAIT}` behind a feature; it is \
+                        "{CODEC_PATH} declares `{CODEC_FREE_TRAIT}` behind a `#[cfg]`; it is \
                          the trait every recorded answer goes through, so a default build \
                          has to have it"
                     ),
                 ));
             }
-        } else if !gated {
-            for word in CODEC_VOCABULARY {
-                if names_identifier(trimmed, word) {
-                    violations.push(Violation::new(
-                        rule,
-                        CODEC_CRATE,
-                        format!(
-                            "{CODEC_PATH} declares `{trimmed}`, which names `{word}` and no \
-                             `#[cfg(feature = ..)]` gates: a codec in the default build is a \
-                             codec every firmware pays for"
-                        ),
-                    ));
-                    break;
-                }
-            }
+            continue;
         }
-        gated = false;
+        if item.gated {
+            continue;
+        }
+        // The whole item, not its first line. A declaration can put the codec in its body
+        // — `pub struct Bridge {` followed by `inner: Postcard,` — and review of this
+        // change wrote exactly that. The compiler refuses it in a default build, because
+        // what it names is behind the same feature, but a rule that leans on the compiler
+        // for its own claim is a rule that stops holding the day the codec becomes
+        // reachable another way.
+        if let Some(word) = CODEC_VOCABULARY
+            .iter()
+            .find(|word| names_identifier(&item.text, word))
+        {
+            violations.push(Violation::new(
+                rule,
+                CODEC_CRATE,
+                format!(
+                    "{CODEC_PATH} declares `{}`, which names `{word}` and no \
+                     `#[cfg(feature = ..)]` gates: a codec in the default build is a codec \
+                     every firmware pays for",
+                    item.headline()
+                ),
+            ));
+        }
     }
 
     if !seen_trait {
@@ -5452,6 +5451,119 @@ fn check_codec_module(rule: &'static str, contents: &str) -> Vec<Violation> {
         ));
     }
     violations
+}
+
+/// One top-level item of a module, with the attributes above it.
+struct Item {
+    /// Its attributes, declaration and body, comments already removed.
+    text: String,
+    /// Whether a bare `#[cfg(feature = "..")]` stands above it.
+    gated: bool,
+    /// Whether *any* `#[cfg]` naming a feature stands above it, compound ones included.
+    ///
+    /// [`Self::gated`] is the narrow reading and this is the wide one. An item needs the
+    /// narrow one to be excused; the trait needs the wide one to be reported.
+    conditional: bool,
+}
+
+impl Item {
+    /// The first line, for a violation message.
+    fn headline(&self) -> &str {
+        self.text
+            .lines()
+            .find(|line| !line.starts_with('#'))
+            .unwrap_or_default()
+            .trim_end()
+    }
+
+    /// Whether this item is the pinned trait, as a declaration and not as a prefix.
+    ///
+    /// `starts_with` alone reads `pub trait Decoder` as the pinned trait, so a rename would
+    /// satisfy the "declares no `pub trait Decode`" branch with the trait gone. Review of
+    /// this change ran it.
+    fn declares_the_codec_free_trait(&self) -> bool {
+        self.text
+            .lines()
+            .find(|line| !line.starts_with('#'))
+            .and_then(|line| line.strip_prefix(CODEC_FREE_TRAIT))
+            .is_some_and(|rest| {
+                rest.chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            })
+    }
+}
+
+/// The top-level items of `code`, each with the attributes above it applied.
+///
+/// An item begins at column zero and runs to the next one, so a declaration that spans
+/// lines is one item rather than a first line and some members. Attributes stand above the
+/// item they apply to and are not items themselves.
+///
+/// # What counts as gated
+///
+/// A bare `#[cfg(feature = "<name>")]`, and nothing else. An `all(`, an `any(` or a `not(`
+/// is not read as gating, so an item behind one is reported. That is the conservative
+/// direction — `any(feature = "postcard", unix)` really is present in a default build on a
+/// host — and it costs a contributor a plain `#[cfg]` or a conversation in review, which is
+/// where a codec in the default build belongs.
+///
+/// Which feature it names is *not* read, because [`code_only`] removes string literals
+/// along with comments and this attribute's argument is one. That loses nothing the rule
+/// claims: any single positive feature gate keeps the item out of a default build, which is
+/// what "a codec in the default build is a codec every firmware pays for" is about. Gating
+/// a codec on the *wrong* feature is a compile error the moment that feature is enabled,
+/// because what the item names is behind the codec's.
+fn items(code: &str) -> Vec<Item> {
+    /// `#[cfg(feature = "x")]` with its literal and its spaces gone, which is the shape
+    /// [`code_only`] leaves and the one this compares against.
+    const GATE: &str = "#[cfg(feature=)]";
+
+    let mut items: Vec<Item> = Vec::new();
+    let mut gated = false;
+    let mut conditional = false;
+    // Attributes are part of the item they stand above, so that a codec named in one —
+    // `#[cfg_attr(feature = "serde", derive(serde::Deserialize))]` — is a codec the scan
+    // reads. A scan that skipped them read the derive as no codec at all.
+    let mut attributes: Vec<String> = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact == GATE {
+                gated = true;
+            }
+            if compact.starts_with("#[cfg(") && compact.contains("feature") {
+                conditional = true;
+            }
+            attributes.push(trimmed.to_owned());
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            if let Some(item) = items.last_mut() {
+                item.text.push('\n');
+                item.text.push_str(trimmed);
+            }
+            continue;
+        }
+        let mut text = attributes.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(trimmed);
+        items.push(Item {
+            text,
+            gated,
+            conditional,
+        });
+        attributes.clear();
+        gated = false;
+        conditional = false;
+    }
+    items
 }
 
 /// The codec dependencies are optional, and the codec features enable what they must.
@@ -8089,6 +8201,106 @@ mod tests {
     }
 
     #[test]
+    fn a_codec_in_an_items_body_is_reported_though_its_first_line_is_clean() {
+        // Review of this change wrote exactly this: a declaration line naming no codec
+        // word, with the codec in a field below it. A line-based scan reads the first line
+        // and skips the rest as members of an item the attribute above already decided.
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                "pub trait Decode: Sized {}\npub struct Bridge {\n    inner: Postcard,\n}\n",
+                "pub struct Ctx;\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Postcard")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_gated_item_that_spans_lines_is_accepted() {
+        let module = format!(
+            "{}#[cfg(feature = \"postcard\")]\npub struct Wide {{\n    inner: Postcard,\n}}\n",
+            tests_support::clean_codec_module()
+        );
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&module, "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_codec_behind_a_compound_cfg_is_reported() {
+        // Conservative on purpose: `any(feature = "postcard", unix)` is true in a default
+        // build on a host, so a scan that read every `#[cfg(` as gating would accept an
+        // item that really is in the default build.
+        let module = format!(
+            "{}#[cfg(any(feature = \"postcard\", unix))]\npub struct Loose(Postcard);\n",
+            tests_support::clean_codec_module()
+        );
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&module, "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Loose")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_attribute_between_the_gate_and_the_item_does_not_ungate_it() {
+        let module = format!(
+            "{}#[cfg(feature = \"postcard\")]\n#[derive(Debug)]\npub struct Derived(Postcard);\n",
+            tests_support::clean_codec_module()
+        );
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&module, "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_gate_above_one_item_does_not_carry_to_the_next() {
+        let module = format!(
+            "{}#[cfg(feature = \"postcard\")]\npub struct First(Postcard);\npub struct Second(Postcard);\n",
+            tests_support::clean_codec_module()
+        );
+
+        let violations = check_codec_is_optional(
+            &facade_sources(&module, "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Second")),
+            "{violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("First")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decode_trait_hidden_behind_a_feature_is_reported() {
         // The other direction, and the one that breaks the default build: the trait every
         // workflow names must be there when no feature is.
@@ -8104,6 +8316,66 @@ mod tests {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("Decode")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decode_trait_behind_a_compound_cfg_is_reported() {
+        // Review of this change ran this and watched the gate stay green: the trait branch
+        // reported only when the item was classified as gated, and a compound `cfg` is not.
+        // So `Decode` left the default build with no violation, while the same spelling on
+        // a codec item was reported. The two halves now fail in the same direction.
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                "#[cfg(all(feature = \"serde\"))]\npub trait Decode: Sized {}\n",
+                "pub struct Ctx;\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Decode")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_renamed_trait_does_not_satisfy_the_pin() {
+        // `starts_with` alone reads `pub trait Decoder` as the pinned trait, so the
+        // "declares no `pub trait Decode`" branch was satisfied by a trait that is not it.
+        let violations = check_codec_is_optional(
+            &facade_sources("pub trait Decoder: Sized {}\n", "pub struct Ctx;\n"),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_codec_named_in_an_attribute_is_reported() {
+        // A scan that skipped attribute lines read this as an item naming no codec.
+        let violations = check_codec_is_optional(
+            &facade_sources(
+                "pub trait Decode: Sized {}\n\
+                 #[cfg_attr(feature = \"serde\", derive(serde::Deserialize))]\n\
+                 pub struct Answer(u8);\n",
+                "pub struct Ctx;\n",
+            ),
+            &codec_manifests(&tests_support::clean_codec_manifest()),
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Answer")),
             "{violations:?}"
         );
     }
