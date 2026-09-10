@@ -24,6 +24,10 @@ only that the code agrees with itself.
 
 **A case is added. A case is never regenerated.**
 
+`.gitattributes` marks these files `binary`, so no checkout rewrites a byte of them. An
+end-of-line conversion here would turn a fixture into a different journal, and the test that
+noticed would look like a format break rather than a checkout.
+
 A file here that no longer decodes is a wire-format break, not a stale fixture. Fix the
 code, or bump the format version and write the migration — see
 [ADR 0037](../../../../../docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md).
