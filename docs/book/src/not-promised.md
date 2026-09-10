@@ -1,7 +1,7 @@
 # What is not promised
 
-Read this chapter before you build on Waymaker. Each item below is a decision, not a gap to
-be closed later. Each one is recorded in the engine as well as here.
+Read this chapter before you build on Waymaker. Each item below is a decision rather than a
+gap to be closed later, and each one is recorded in the engine as well as here.
 
 ## `at-least-once-effects` — no exactly-once physical effects
 
@@ -21,7 +21,13 @@ Waymaker writes records. It does not write a suspended `async fn`, a stack, or a
 resumes by re-executing from its beginning, so the code between two effects runs again on
 every boot.
 
-History is reclaimed only at an explicit `continue_as_new` boundary.
+History is reclaimed only at an explicit `continue_as_new` boundary — and neither driver in
+this repository calls it yet, so today history is not reclaimed at all
+(issue [#110](https://github.com/madmax983/waymaker/issues/110)).
+
+This is flat for the `async` façade and will stay flat. Design document §16 leaves open
+whether a future explicit-state, non-`async` API could take a real storage snapshot; that
+question would not relax this promise for `async fn` workflows.
 
 ## `no-distributed-consensus` — no distributed consensus
 
@@ -31,8 +37,11 @@ single global decision needs a service that makes it.
 
 ## `boot-timer-is-not-power-loss-durable` — no AfterBoot timer surviving power loss
 
-A boot clock restarts when the supply does. Waymaker will not claim that time passed while
-the power was away, so an `AfterBoot` interval starts again after a power cut.
+A boot clock restarts when the supply does, and Waymaker will not claim that time passed
+while the power was away. So an `AfterBoot` deadline is measured against a reading from a
+cycle that is gone: after a cut it can wait **longer** than the interval it asked for — up to
+the old arming reading plus the interval, on a clock that restarted at zero. It is never
+shorter.
 
 For a deadline that must survive the cut, ask for `AtPersistentTime` and give the firmware a
 clock that survives it: a backed RTC, or an epoch a network restores. A firmware with no

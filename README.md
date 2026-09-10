@@ -143,6 +143,7 @@ up automatically, including the `thumbv6m-none-eabi` target the firmware build n
 
 ```sh
 cargo xtask install-hooks   # once per clone: generates .githooks/pre-commit and points git at it
+cargo install mdbook --locked   # only to build the book; no other stage needs it
 ```
 
 The pipeline, in order:
@@ -385,8 +386,8 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `settled-decisions` | the ADR recording design document §02 stops recording one of the eight decisions, or its headline |
 | `deferred-questions` | one of design document §16's five open questions loses its row in `CLAUDE.md`, a settled one's ADR is missing, unaccepted or does not claim it, or an ADR settles one the table still calls open |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge |
-| `book` | the book stops being the book issue #42 asks for: a chapter loses its file or its link in `SUMMARY.md`, a chapter appears that `xtask::book::BOOK_CHAPTERS` does not declare, a chapter carries a Rust fence of its own rather than an `include` of a tested sample, an `include` names a file no stage runs or an anchor with no `#[test]` of its name, the wire-format chapter restates the frozen format instead of including it, the failure or non-goal chapter drops a row, or `CLAUDE.md` and `README.md` stop pointing at the book |
-| `hardware-matrix` | the matrix stops covering every part: a `xtask::docs::HARDWARE_TARGETS` board or a `xtask::wear::PARTS` model has no row, a chapter row states a geometry, a power-cut standing or a write-amplification figure other than the one derived from those tables and measured on this run, a row appears that the table does not declare, or the measurement could not be taken |
+| `book` | the book stops being the book issue #42 asks for: a chapter loses its file or its link in `SUMMARY.md`, a file appears under `docs/book/src` that `xtask::book::BOOK_CHAPTERS` does not declare, a fence carries source rather than an `include` of a tested sample, a line carries a directive and something else, a directive that is not `{{#include}}` appears, a line is indented four spaces, an `include` names a file no stage runs or an anchor with no unignored `#[test]` of its name, an anchor does not contain that test and is not a declared fixture, an anchor no chapter shows is declared, the wire-format chapter restates the frozen format instead of including it, the failure or non-goal chapter drops a row, or `CLAUDE.md` and `README.md` stop linking the book's summary |
+| `hardware-matrix` | the matrix stops covering every part: a `xtask::docs::HARDWARE_TARGETS` board or a `xtask::wear::PARTS` model has no row, the chapter's table is not the pinned header followed by every derived row cell for cell, the chapter says `Passed` while no row renders it, or a modelled part's write-amplification figure could not be measured |
 | `missing-docs` | a crate root loses `#![warn(missing_docs)]`, allows it back, or a workspace member has no crate root the rule could run on |
 
 The contract lives in one table, [`xtask/src/policy.rs`](xtask/src/policy.rs), transcribed

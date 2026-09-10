@@ -4055,8 +4055,9 @@ pub mod tests_support {
         let mut body = format!(
             "# CLAUDE.md\n\nSee docs/adr and docs/architecture.md.\n\nThe format is \
              {WIRE_FORMAT_SPEC_PATH} and its corpus is {WIRE_FORMAT_CORPUS_DIR}.\n\nThe book \
-             is {book}.\n\n",
-            book = crate::book::BOOK_DIR
+             is {book}/src/{summary}.\n\n",
+            book = crate::book::BOOK_DIR,
+            summary = crate::book::BOOK_SUMMARY
         );
         for spec in LAYERS {
             line(

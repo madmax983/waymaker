@@ -10,10 +10,11 @@ Read that sentence before you read any API. Everything else in this book follows
 A workflow calls out to the world at named points. Waymaker calls each of those points an
 **effect**. Before the world is asked, Waymaker writes a record that says the effect is
 about to happen. After the world answers, Waymaker writes a record that says what it
-answered. Both records cross a durability barrier.
+answered. Each record crosses two barriers: one after its body is programmed, one after the
+seal that commits it.
 
-The journal is the ordered list of those records. It is the only thing that survives a
-reset.
+The journal is the ordered list of those records. It, the bank header that names the run, and
+the seal over that header are what survive a reset.
 
 ## What is not durable
 
@@ -25,7 +26,9 @@ into. None of that is written to media. Waymaker never snapshots a suspended fut
 After a reset the device re-creates the workflow **from its beginning** and runs it again.
 Each effect the workflow reaches is matched against the journal, in order:
 
-- If the journal holds the outcome, the recorded value is returned. The world is not asked.
+- If the journal holds a matching outcome, the recorded value is returned and the world is
+  not asked. "Matching" means the effect's kind and its input digest agree with what the
+  workflow just asked for; a mismatch is a divergence, not a replay.
 - If the journal holds a schedule record with no outcome, the same effect is delivered
   again, under the identity the schedule record committed.
 - If the journal holds nothing more, this is new work. Waymaker schedules it.

@@ -67,6 +67,35 @@ with no HTML is a failure. A page that shows none of the sample it includes is a
 CI installs a pinned mdBook with `taiki-e/install-action`, which is the same mechanism the
 coverage stage already uses for `cargo-llvm-cov`.
 
+## What review defeated, and what closed it
+
+The first version of both rules was written, then attacked. Every row below is a mutation
+that was *run* against `cargo xtask check-layering` and watched printing `ok`, and each one
+is now a test.
+
+| The mutation | Why it worked | What closed it |
+| --- | --- | --- |
+| A fabricated table of two boards that do not exist, both `Passed`, with the honest rows hidden in HTML comments | each cell was searched for *somewhere* in the chapter, and a comment is somewhere | comments stripped, then whole rows compared cell for cell against `MATRIX_TABLE_HEADER` plus the derived rows in order |
+| `63.37` → `163.37`; `Not run` → `Not run in the lab, Passed on the bench` | `contains` cannot see a superstring | the same positional equality |
+| A duplicate row for a declared id, and rows whose first cell was bold or bare | the id scan read only a backticked first cell | the row sequence must match exactly, so an extra row is an extra row |
+| Prose above the table claiming every board had passed | prose is not checked | the chapter may not say `Passed` while no row renders it |
+| `#[ignore]` written *above* the `ANCHOR` marker | any `#[` line kept the attribute run alive, and a reader of the book never sees it | the whole attribute run is read, and `#[ignore]` or `#[cfg(` refuses the pairing — `failure-matrix`'s standard, met here |
+| An anchor shrunk to two comment lines advertising an API that does not exist, with its test left below | the tie was the anchor's *name* only | an anchor must **contain** its own `#[test] fn`, unless it is named in `BOOK_FIXTURE_ANCHORS` — and a fixture must still declare an item |
+| A bare ` ``` ` fence carrying Rust | the ban asked whether the info string said "rust" | an allowlist of quotable languages; everything else, the empty info string included, must be include-only |
+| `{{#include a}} let x = 1; {{#include b}}` | `starts_with` and `ends_with` both hold, and the middle renders | a line must be exactly one directive |
+| `{{#playground …}}` and `{{#rustdoc_include …:1:40}}` | `includes()` matched only `{{#include` | any directive that is not `{{#include}}` is refused |
+| A four-space indented block | Markdown renders it as code with no fence at all | no chapter may indent a line by four spaces |
+| A chapter named `rogue.MD`, linked from the summary | the collector filtered `extension == "md"` | every *file* under the book's source must be a declared chapter |
+| An anchor renamed so the page renders nothing | `verify_render` took its witness *from the anchor*, so a missing anchor gave it nothing to look for | a missing witness is a problem rather than a skip |
+| `docs/book (deleted; see the archive)` in `CLAUDE.md` | the link check was `contains("docs/book")` | the check is the summary's path |
+
+Two findings were about honesty rather than evasion, and both changed a rendered cell. Every
+crash sweep in this workspace lays the part out at a four-byte program unit, so
+`byte-programmable` and `page-programmable` carry a measured wear figure and no sweep of
+their own; `render_power_cut` derives that from `SWEPT_PROGRAM_BYTES` instead of printing
+"swept" against a row nothing has ever swept. And a modelled part whose measurement produced
+no figure used to render the same `Not measured` a board gets; it is now a violation.
+
 ## Consequences
 
 The book cannot quietly stop being true. A chapter that loses its link, a sample that stops
@@ -88,7 +117,8 @@ the real recovery over the adapter. And `mdbook test` is not run: it compiles a 
 standalone, which proves less than running the sample against the engine, and would need
 every anchor to be a whole program.
 
-**What is still not checked.** Prose. Both rules match ids, file names and rendered cells.
+**What is still not checked.** Prose, except for the one word the matrix chapter may not
+say. Both rules match ids, file names and rendered cells.
 A chapter whose sentences describe another engine passes as long as its includes and its
 tables are right, and a `Passed` row is only ever as true as the bench log behind the ADR
 that flipped it.

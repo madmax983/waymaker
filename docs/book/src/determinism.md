@@ -1,10 +1,14 @@
 # The determinism contract
 
 Waymaker replays a workflow by running it again. The second run must ask for the same
-effects, in the same order, with the same inputs. If it does not, Waymaker stops the run
-with a divergence error. It does not guess.
+effects, in the same order, with the same inputs. This chapter is the contract a workflow
+author works to.
 
-This chapter is the contract a workflow author works to.
+**What Waymaker actually compares is what a replay asks for at a boundary**: the effect's
+position, its kind, its input length and its input digest. A difference there is terminal.
+A difference anywhere else is invisible — including the end of the run, where a replay that
+would conclude differently is answered from history without complaint. Keeping to the
+contract is the author's job; the boundary check is a backstop, not a proof.
 
 ## Do not read these directly
 
@@ -46,11 +50,17 @@ mechanisms.
 
 - A workflow declares a **version range**: the oldest recorded version it can still replay,
   and the version it writes into a new run. A run recorded outside that range is refused
-  rather than replayed wrongly.
+  rather than replayed wrongly. Widen before you narrow: an image that moves `oldest` past a
+  version still on devices bricks those runs until an image that can replay them ships
+  again, and nothing in the engine enforces the order a fleet is upgraded in.
 - A **version gate** records which branch the first execution took. Every later boot is
   given that number back, whatever branch this firmware would have chosen. A gate spends a
   sequence number, so a gate added, removed or moved is caught by the same ordering check
   that catches a moved effect.
+
+To branch on the version the run itself recorded — rather than on the image's own, which is
+the last row of the table above — read it back with `Boundary::recorded_version`. That number
+is a fact about history and is the same on every boot.
 
 Do not key a gate on a source location. A hash of the file and line changes when a comment
 above it moves, so a reformat becomes a divergence.

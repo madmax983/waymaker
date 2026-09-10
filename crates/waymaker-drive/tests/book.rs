@@ -346,6 +346,17 @@ fn a_journal_records_the_intent_before_the_outcome() {
 // ANCHOR_END: a_journal_records_the_intent_before_the_outcome
 
 // ANCHOR: a_storage_adapter_is_four_operations_and_a_barrier
+/// The erased state of a NOR cell.
+const ERASED: u8 = 0xFF;
+
+/// Which of the three units an operation is measured against.
+#[derive(Clone, Copy)]
+enum Operation {
+    Read,
+    Program,
+    Erase,
+}
+
 /// A 4 KiB part addressed directly: 1 KiB erase blocks, four-byte programs, byte reads.
 ///
 /// Design document §12's contract in full. `read`, `program` and `erase` act on exactly
@@ -354,6 +365,36 @@ fn a_journal_records_the_intent_before_the_outcome() {
 /// that is what NOR does.
 struct OneChip {
     cells: [u8; 4096],
+}
+
+impl OneChip {
+    const fn new() -> Self {
+        Self {
+            cells: [ERASED; 4096],
+        }
+    }
+
+    /// The offset as an index, once the geometry has accepted the region.
+    ///
+    /// Every operation goes through this first. A driver that touched media and validated
+    /// afterwards would leave a refused call having changed the part.
+    fn validated(
+        &self,
+        offset: u32,
+        len: usize,
+        operation: Operation,
+    ) -> Result<usize, GeometryError> {
+        let Ok(len) = u32::try_from(len) else {
+            return Err(GeometryError::OutOfBounds);
+        };
+        let geometry = self.geometry();
+        match operation {
+            Operation::Read => geometry.validate_read(offset, len),
+            Operation::Program => geometry.validate_program(offset, len),
+            Operation::Erase => geometry.validate_erase(offset, len),
+        }?;
+        usize::try_from(offset).map_err(|_| GeometryError::OutOfBounds)
+    }
 }
 
 impl StableStorage for OneChip {
@@ -402,44 +443,6 @@ impl StableStorage for OneChip {
     }
 }
 // ANCHOR_END: a_storage_adapter_is_four_operations_and_a_barrier
-
-/// The erased state of a NOR cell.
-const ERASED: u8 = 0xFF;
-
-/// Which of the three units an operation is measured against.
-#[derive(Clone, Copy)]
-enum Operation {
-    Read,
-    Program,
-    Erase,
-}
-
-impl OneChip {
-    const fn new() -> Self {
-        Self {
-            cells: [ERASED; 4096],
-        }
-    }
-
-    /// The offset as an index, once the geometry has accepted the region.
-    fn validated(
-        &self,
-        offset: u32,
-        len: usize,
-        operation: Operation,
-    ) -> Result<usize, GeometryError> {
-        let Ok(len) = u32::try_from(len) else {
-            return Err(GeometryError::OutOfBounds);
-        };
-        let geometry = self.geometry();
-        match operation {
-            Operation::Read => geometry.validate_read(offset, len),
-            Operation::Program => geometry.validate_program(offset, len),
-            Operation::Erase => geometry.validate_erase(offset, len),
-        }?;
-        usize::try_from(offset).map_err(|_| GeometryError::OutOfBounds)
-    }
-}
 
 #[test]
 fn a_storage_adapter_is_four_operations_and_a_barrier() {

@@ -1,7 +1,9 @@
 # Failure semantics
 
 Design document §14 states ten failure points. Each one is a named test. The `matrix` CI
-stage runs them on the in-memory model of NOR and on the power-cut rig.
+stage runs them on the in-memory model of NOR and on the power-cut rig — both on a host, the
+rig included: it drives `waymaker-fault` rather than a part. No board has run either. See
+[the hardware compatibility matrix](hardware-matrix.md).
 
 The **rig** column says whether the rig reaches that row. Four rows are owed: the rig has no
 bank-swap workload, no capacity refusal and no divergent replay. Issue
@@ -27,7 +29,8 @@ append point, so the driver and the rig both refuse the bank rather than write p
 damage — appending there is how a NOR bank stops booting for good.
 
 The two halves that do hold are asserted: the torn completion is ignored, and no partial
-result bytes reach the workflow. The run continues through `continue_as_new`, which starts a
-new run under a new id, so an effect performed before the crash is performed again under a
-different `(RunId, EffectSeq)`. That duplicate is issue
-[#95](https://github.com/madmax983/waymaker/issues/95).
+result bytes reach the workflow. The run's continuation would be `continue_as_new`, which
+starts a new run under a new id — so an effect performed before the crash is performed again
+under a different `(RunId, EffectSeq)`. That duplicate is issue
+[#95](https://github.com/madmax983/waymaker/issues/95). It is a design for now rather than a
+path: neither driver here calls `continue_as_new`, so today the run simply stops.

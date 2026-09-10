@@ -521,7 +521,7 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
     let docs = collect_docs_inputs(root, &graph)?;
 
     Ok(WorkspaceInputs {
-        book: collect_book_inputs(root)?,
+        book: book::collect(root),
         readme: read_optional(&root.join("README.md"))?,
         metadata_json,
         workspace_manifest,
@@ -664,71 +664,6 @@ fn collect_docs_inputs(
         failure_rig_tests: read_optional(&root.join(docs::FAILURE_RIG_TESTS_PATH))?,
         crate_roots,
     })
-}
-
-/// The book, its samples, and the write amplification measured on this run.
-///
-/// The measurement is taken here rather than inside the rule so that every rule stays a
-/// pure function over already-read input. An `Err` travels into the rule and is reported
-/// there: a measurement that did not happen is not a measurement that passed.
-fn collect_book_inputs(root: &Path) -> Result<book::BookInputs, CheckError> {
-    let source_dir = root.join(book::BOOK_SOURCE_DIR);
-    let mut pages = Vec::new();
-    for path in markdown_pages(&source_dir) {
-        let name = path
-            .strip_prefix(&source_dir)
-            .unwrap_or(&path)
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        pages.push((name, read_to_string(&path)?));
-    }
-
-    let mut samples = Vec::new();
-    for path in book::BOOK_SAMPLE_FILES {
-        if let Some(contents) = read_optional(&root.join(path))? {
-            samples.push(((*path).to_owned(), contents));
-        }
-    }
-
-    let documents = book::BOOK_DOCUMENT_INCLUDES
-        .iter()
-        .filter(|path| root.join(path).is_file())
-        .map(|path| (*path).to_owned())
-        .collect();
-
-    Ok(book::BookInputs {
-        manifest: read_optional(&root.join(book::BOOK_MANIFEST))?,
-        pages,
-        samples,
-        documents,
-        wear: wear::measure().map_err(|error| error.to_string()),
-    })
-}
-
-/// Every `.md` file under `directory`, in a stable order.
-///
-/// Recursive, so that a page filed in a subdirectory is a page the orphan check sees rather
-/// than a page no rule covers.
-fn markdown_pages(directory: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "md") {
-                found.push(path);
-            }
-        }
-    }
-    found.sort();
-    found
 }
 
 /// `(package name, crate root)` for every library and binary target of every workspace

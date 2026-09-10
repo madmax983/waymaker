@@ -211,17 +211,27 @@ pub enum MatrixPart {
     Model(&'static str),
 }
 
+/// The program unit every crash sweep in this workspace runs at.
+///
+/// `waymaker-fault`'s and `waymaker-rig`'s sweeps all lay out a part with a four-byte
+/// program unit. So a modelled part with another unit has a *measured* wear figure and no
+/// crash sweep of its own, and [`render_power_cut`] says which — because "swept on the host
+/// model" printed against a row nothing has ever swept is the flattering kind of wrong.
+pub const SWEPT_PROGRAM_BYTES: u32 = 4;
+
 /// One part the matrix covers.
 ///
 /// Every column but [`rtc`](Self::rtc) is derived rather than declared: the geometry comes
-/// from [`PARTS`], the power-cut standing from [`HARDWARE_TARGETS`], and the write
-/// amplification from the measurement this run took. A matrix whose cells were typed is a
-/// matrix that would still say `Passed` after the row it describes stopped being true.
+/// from [`PARTS`], the power-cut standing from [`HARDWARE_TARGETS`] or from
+/// [`SWEPT_PROGRAM_BYTES`], and the write amplification from the measurement this run took.
+/// A matrix whose cells were typed is a matrix that would still say `Passed` after the row
+/// it describes stopped being true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatrixRow {
-    /// Stable id, cited when a change touches this part, and the cell the chapter's row is
-    /// found by.
+    /// Stable id, cited when a change touches this part, and the first cell of its row.
     pub id: &'static str,
+    /// What the part is, in words, as the row's second cell.
+    pub label: &'static str,
     /// What the row is about.
     pub part: MatrixPart,
     /// Whether the part has a clock that outlives the supply. The one declared column,
@@ -234,45 +244,103 @@ pub struct MatrixRow {
 pub const HARDWARE_MATRIX: &[MatrixRow] = &[
     MatrixRow {
         id: "cortex-m0plus",
+        label: "A Cortex-M0+ board",
         part: MatrixPart::Board("cortex-m0plus"),
         rtc: RtcSupport::Unknown,
     },
     MatrixRow {
         id: "cortex-m4",
+        label: "A Cortex-M4 board",
         part: MatrixPart::Board("cortex-m4"),
         rtc: RtcSupport::Unknown,
     },
     MatrixRow {
         id: "rtc-power-loss",
+        label: "A board with a backed RTC",
         part: MatrixPart::Board("rtc-power-loss"),
         rtc: RtcSupport::Backed,
     },
     MatrixRow {
         id: "byte-programmable",
+        label: "Modelled NOR, byte programs",
         part: MatrixPart::Model("byte-programmable"),
         rtc: RtcSupport::Absent,
     },
     MatrixRow {
         id: "word-programmable",
+        label: "Modelled NOR, word programs",
         part: MatrixPart::Model("word-programmable"),
         rtc: RtcSupport::Absent,
     },
     MatrixRow {
         id: "page-programmable",
+        label: "Modelled NOR, 16-byte pages",
         part: MatrixPart::Model("page-programmable"),
         rtc: RtcSupport::Absent,
     },
 ];
 
+/// The matrix table's header, pinned because every cell below it is derived.
+pub const MATRIX_TABLE_HEADER: &[&str] = &[
+    "Id",
+    "Part",
+    "Erase/program/read",
+    "Power cut",
+    "Clock",
+    "Written B per effect",
+];
+
 /// The cell a row with no host-side answer renders.
 pub const NOT_MEASURED: &str = "Not measured";
+
+/// The cell a board that has passed its loops would render.
+///
+/// No row renders it today. It is a constant so that the ban on the *word* elsewhere in the
+/// chapter can be lifted by the same change that earns it.
+pub const PASSED: &str = "Passed";
+
+/// Languages a chapter may quote verbatim.
+///
+/// The ban is on a chapter carrying *source*, and the way to express that is an allowlist
+/// rather than a list of the languages that count as Rust: an info string this list does not
+/// name — the empty one included — must hold include directives and nothing else. Codex's
+/// review of this change reached a bare ` ``` ` fence carrying Rust past a version that
+/// asked whether the info string said "rust".
+pub const QUOTABLE_FENCE_LANGUAGES: &[&str] = &[
+    "text", "sh", "console", "toml", "json", "yaml", "mermaid", "diff",
+];
+
+/// The only mdBook link directive a chapter may use.
+pub const INCLUDE_DIRECTIVE: &str = "{{#include";
+
+/// Anchors that show a fixture rather than the test named after them.
+///
+/// The rule is that an anchor must *contain* the `#[test] fn` of its own name, so that the
+/// bytes on the page are the bytes that run. Three anchors show a type a test uses instead —
+/// a workflow, a storage adapter, a clock driver — and each is a line written on purpose
+/// here, because review of this change shrank an anchor to two comment lines advertising an
+/// API that does not exist and watched the gate stay green.
+pub const BOOK_FIXTURE_ANCHORS: &[&str] = &[
+    "a_workflow_is_a_value_with_a_method",
+    "a_storage_adapter_is_four_operations_and_a_barrier",
+    "a_persistent_clock_is_a_reading_and_a_bit",
+];
+
+/// What a Rust item declaration starts with, for a fixture anchor that must declare one.
+const ITEM_KEYWORDS: &[&str] = &[
+    "struct ", "enum ", "trait ", "impl ", "fn ", "const ", "type ",
+];
 
 /// Everything the two rules read, already collected off disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookInputs {
     /// Contents of [`BOOK_MANIFEST`], when the repository has one.
     pub manifest: Option<String>,
-    /// Every Markdown file under [`BOOK_SOURCE_DIR`], by name relative to it.
+    /// Every file under [`BOOK_SOURCE_DIR`], by name relative to it, with its text.
+    ///
+    /// Every file rather than every `.md` file: review of this change added a chapter named
+    /// `rogue.MD`, linked it from the summary, and watched a case-sensitive collector leave
+    /// it covered by nothing.
     pub pages: Vec<(String, String)>,
     /// Every file of [`BOOK_SAMPLE_FILES`] that exists, by workspace-relative path.
     pub samples: Vec<(String, String)>,
@@ -323,7 +391,8 @@ pub fn render_geometry(row: &MatrixRow) -> String {
 ///
 /// A board's is read from [`HARDWARE_TARGETS`], so a row cannot claim a pass the decision
 /// record does not carry — and flipping that table needs an accepted ADR, which is
-/// `hardware-attestation`'s.
+/// `hardware-attestation`'s. A model's is read from its program unit against
+/// [`SWEPT_PROGRAM_BYTES`], because a part nothing has swept has not been swept.
 #[must_use]
 pub fn render_power_cut(row: &MatrixRow) -> &'static str {
     match row.part {
@@ -332,24 +401,62 @@ pub fn render_power_cut(row: &MatrixRow) -> &'static str {
             .find(|target| target.id == id)
             .map_or(NOT_MEASURED, |target| match target.attestation {
                 Attestation::NotRun => "Not run",
-                Attestation::Passed => "Passed",
+                Attestation::Passed => PASSED,
             }),
-        MatrixPart::Model(_) => "Swept on the host model",
+        MatrixPart::Model(name) => PARTS.iter().find(|(part, ..)| *part == name).map_or(
+            NOT_MEASURED,
+            |(_, _, _, program, _)| {
+                if *program == SWEPT_PROGRAM_BYTES {
+                    "Swept on the host model"
+                } else {
+                    "Not swept at this program unit"
+                }
+            },
+        ),
     }
 }
 
-/// The write-amplification cell a row renders: programmed bytes per effect, or
-/// [`NOT_MEASURED`].
-#[must_use]
-pub fn render_write_amplification(row: &MatrixRow, measured: &[PartWear]) -> String {
+/// The write-amplification cell a row renders, or why it could not be rendered.
+///
+/// A board has no host-side answer and renders [`NOT_MEASURED`]. A modelled part with no
+/// figure is an `Err`: folding "the measurement produced nothing" into the same cell a board
+/// gets would publish a degenerate run as a blank and leave the build green.
+///
+/// # Errors
+///
+/// When a modelled part is missing from the measurement, or measured a run with no effect in
+/// it.
+pub fn render_write_amplification(
+    row: &MatrixRow,
+    measured: &[PartWear],
+) -> Result<String, String> {
     match row.part {
-        MatrixPart::Board(_) => NOT_MEASURED.to_owned(),
+        MatrixPart::Board(_) => Ok(NOT_MEASURED.to_owned()),
         MatrixPart::Model(name) => measured
             .iter()
             .find(|part| part.part == name)
-            .and_then(|part| part.engine.programmed_bytes_per_effect())
-            .map_or_else(|| NOT_MEASURED.to_owned(), |figure| figure.to_string()),
+            .ok_or_else(|| format!("the measurement has no row for `{name}`"))?
+            .engine
+            .programmed_bytes_per_effect()
+            .map(|figure| figure.to_string())
+            .ok_or_else(|| format!("`{name}` measured a run with no completed effect in it")),
     }
+}
+
+/// One matrix row, as every cell of it must appear.
+///
+/// # Errors
+///
+/// When a cell cannot be derived, which is a failure rather than a blank column.
+pub fn derived_cells(row: &MatrixRow, measured: &[PartWear]) -> Result<Vec<String>, String> {
+    Ok(vec![
+        format!("`{}`", row.id),
+        row.label.to_owned(),
+        render_geometry(row),
+        render_power_cut(row).to_owned(),
+        row.rtc.render().to_owned(),
+        render_write_amplification(row, measured)?,
+    ])
 }
 
 /// A `{{#include}}` a chapter carries.
@@ -373,6 +480,37 @@ enum IncludePart {
     Anchor(String),
     /// Anything else mdBook accepts — a line range, or a range of anchors.
     Unsupported,
+}
+
+/// One anchor of a sample file: its name, its text, and the lines it spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Anchor {
+    name: String,
+    body: String,
+    /// Index of the `ANCHOR:` line.
+    start: usize,
+    /// Index of the `ANCHOR_END:` line.
+    end: usize,
+}
+
+/// `contents` with every HTML comment removed.
+///
+/// Comments render as nothing, so text inside one satisfies a reader of the source and no
+/// reader of the page. Review of this change hid an honest matrix in comments under a
+/// fabricated table and watched the gate stay green.
+fn without_html_comments(contents: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = contents;
+    while let Some((before, after)) = rest.split_once("<!--") {
+        kept.push_str(before);
+        kept.push('\n');
+        let Some((_, resumed)) = after.split_once("-->") else {
+            return kept;
+        };
+        rest = resumed;
+    }
+    kept.push_str(rest);
+    kept
 }
 
 /// The fence marker and its info string, for a line that opens or closes a fenced block.
@@ -417,29 +555,54 @@ fn fenced_blocks(page: &str) -> Vec<(String, String)> {
     found
 }
 
-/// Whether a fence body is nothing but include directives and blank lines.
-///
-/// A Rust fence is how mdBook renders an included sample as code, so the ban below cannot
-/// be a ban on the fence. It is a ban on a fence that carries *source*: the body may hold
-/// `{{#include}}` directives and nothing else.
-fn is_only_includes(body: &str) -> bool {
-    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
-    lines.clone().count() > 0
-        && lines.all(|line| line.starts_with("{{#include") && line.ends_with("}}"))
+/// Every line of `page` that is outside a fenced block, with its index.
+fn unfenced_lines(page: &str) -> Vec<(usize, &str)> {
+    let mut kept = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    for (at, line) in page.lines().enumerate() {
+        if let Some((marker, length, info)) = fence_of(line.trim()) {
+            match open {
+                Some((open_marker, open_length))
+                    if marker == open_marker && length >= open_length && info.trim().is_empty() =>
+                {
+                    open = None;
+                }
+                Some(_) => {}
+                None => open = Some((marker, length)),
+            }
+            continue;
+        }
+        if open.is_none() {
+            kept.push((at, line));
+        }
+    }
+    kept
 }
 
-/// Whether an info string names Rust.
-///
-/// The first token, because mdBook's attributes follow it: `rust,no_run` and `rust,ignore`
-/// are Rust, and so is a bare `rs`.
-fn is_rust_fence(info: &str) -> bool {
+/// Whether a fence's info string names a language a chapter may quote verbatim.
+fn is_quotable(info: &str) -> bool {
     let language = info
         .trim()
         .split([',', ' ', '\t', '{'])
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    language == "rust" || language == "rs"
+    QUOTABLE_FENCE_LANGUAGES.contains(&language.as_str())
+}
+
+/// Whether a line is exactly one `{{#include}}` directive and nothing else.
+///
+/// `starts_with` and `ends_with` are not enough: `{{#include a}} let x = 1; {{#include b}}`
+/// satisfies both, renders the source between them, and is the mutation review of this
+/// change ran.
+fn is_one_include(line: &str) -> bool {
+    line.starts_with(INCLUDE_DIRECTIVE) && line.find("}}").is_some_and(|at| at + 2 == line.len())
+}
+
+/// Whether a fence body is nothing but include directives and blank lines.
+fn is_only_includes(body: &str) -> bool {
+    let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines.clone().count() > 0 && lines.all(is_one_include)
 }
 
 /// `relative`, resolved against [`BOOK_SOURCE_DIR`], as a workspace-relative path.
@@ -464,7 +627,7 @@ fn resolve(relative: &str) -> Option<String> {
 fn includes(page: &str) -> Vec<Include> {
     let mut found = Vec::new();
     let mut rest = page;
-    while let Some((_, after)) = rest.split_once("{{#include") {
+    while let Some((_, after)) = rest.split_once(INCLUDE_DIRECTIVE) {
         let Some((argument, resumed)) = after.split_once("}}") else {
             break;
         };
@@ -492,80 +655,104 @@ fn includes(page: &str) -> Vec<Include> {
     found
 }
 
-/// Every anchor a sample file declares, with the text between its two markers.
-fn anchors(sample: &str) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    let mut open: Option<(String, Vec<&str>)> = None;
-    for line in sample.lines() {
+/// Every mdBook directive a page carries that is not an `{{#include}}`.
+///
+/// `{{#playground}}` renders an arbitrary source file as a runnable Rust block with no fence
+/// at all, and `{{#rustdoc_include}}` takes the line ranges the include rule refuses. Both
+/// were reached past an earlier version of this module.
+fn foreign_directives(page: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = page;
+    while let Some((_, after)) = rest.split_once("{{#") {
+        let name: String = after
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect();
+        rest = after;
+        if format!("{{{{#{name}") != INCLUDE_DIRECTIVE {
+            found.push(name);
+        }
+    }
+    found
+}
+
+/// Every anchor a sample file declares, with its text and the lines it spans.
+///
+/// A stack rather than one slot, because mdBook allows anchors to overlap and a single slot
+/// drops the outer one.
+fn anchors(sample: &str) -> Vec<Anchor> {
+    let mut found: Vec<Anchor> = Vec::new();
+    let mut open: Vec<(String, usize, Vec<&str>)> = Vec::new();
+    for (at, line) in sample.lines().enumerate() {
         let trimmed = line.trim();
-        if let Some(name) = trimmed
+        let marker = trimmed
             .strip_prefix("//")
             .map(str::trim)
-            .and_then(|rest| rest.strip_prefix("ANCHOR_END:"))
-        {
-            if let Some((open_name, body)) = open.take() {
-                if open_name == name.trim() {
-                    found.push((open_name, body.join("\n")));
-                } else {
-                    open = Some((open_name, body));
+            .and_then(|rest| rest.strip_prefix("ANCHOR"));
+        match marker.map(|rest| rest.split_once(':')) {
+            Some(Some((tag, name))) if tag.trim() == "_END" => {
+                let name = name.trim();
+                if let Some(index) = open.iter().rposition(|(open_name, ..)| open_name == name) {
+                    let (name, start, body) = open.remove(index);
+                    found.push(Anchor {
+                        name,
+                        body: body.join("\n"),
+                        start,
+                        end: at,
+                    });
                 }
+                continue;
             }
-            continue;
+            Some(Some((tag, name))) if tag.trim().is_empty() => {
+                open.push((name.trim().to_owned(), at, Vec::new()));
+                continue;
+            }
+            _ => {}
         }
-        if let Some(name) = trimmed
-            .strip_prefix("//")
-            .map(str::trim)
-            .and_then(|rest| rest.strip_prefix("ANCHOR:"))
-        {
-            open = Some((name.trim().to_owned(), Vec::new()));
-            continue;
-        }
-        if let Some((_, body)) = open.as_mut() {
+        for (_, _, body) in &mut open {
             body.push(line);
         }
     }
     found
 }
 
-/// Whether `sample` declares `#[test] fn name(`.
+/// Where `sample` declares `#[test] fn name(`, or why it does not.
 ///
-/// The tie issue #42's second "done when" rests on. An anchor whose name is not a test is a
-/// fragment the book shows and no stage runs, which is the state this whole module exists
-/// to make impossible.
-fn declares_test(sample: &str, name: &str) -> bool {
+/// The whole contiguous attribute run before the function is read, in both directions:
+/// attribute order is free, and review of this change put `#[ignore]` *above* the anchor
+/// marker, where a reader of the book never sees it and the test never runs.
+fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
     let opening = format!("fn {name}(");
-    let mut attributed = false;
-    for line in sample.lines() {
+    let mut run: Vec<&str> = Vec::new();
+    for (at, line) in sample.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "#[test]" {
-            attributed = true;
-            continue;
-        }
         if trimmed.starts_with(&opening) {
-            if attributed {
-                return true;
+            if !run.contains(&"#[test]") {
+                run.clear();
+                continue;
             }
-            attributed = false;
-            continue;
+            if let Some(refused) = run.iter().find(|attribute| {
+                attribute.starts_with("#[ignore")
+                    || attribute.starts_with("#[cfg(")
+                    || attribute.starts_with("#[cfg_attr(")
+            }) {
+                return Err(format!(
+                    "carries `{refused}`, so the test does not run and the sample the book \
+                     shows is compiled or executed by nothing"
+                ));
+            }
+            return Ok(at);
         }
-        // Attributes, comments and blank lines may sit between `#[test]` and the function
-        // it applies to; anything else ends the run.
-        if !(trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//")) {
-            attributed = false;
+        if trimmed.starts_with("#[") {
+            run.push(trimmed);
+        } else if !(trimmed.is_empty() || trimmed.starts_with("//")) {
+            run.clear();
         }
     }
-    false
+    Err(format!("declares no `#[test] fn {name}`"))
 }
 
-/// Every chapter file a summary links, in the order it links them.
-///
-/// `.md`, lowercase, on purpose: mdBook's own chapter files are, and treating `README.MD`
-/// as a chapter would be a bug rather than a courtesy — which is the reason
-/// `docs::adr_number` gives for the same comparison.
-#[expect(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "the book's file names are lowercase by policy"
-)]
+/// Every link target a summary names that is not an absolute URL.
 fn summary_links(summary: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut rest = summary;
@@ -575,7 +762,7 @@ fn summary_links(summary: &str) -> Vec<String> {
         };
         rest = resumed;
         let target = target.trim();
-        if target.ends_with(".md") {
+        if !target.contains("://") && !target.is_empty() {
             found.push(target.to_owned());
         }
     }
@@ -587,6 +774,30 @@ fn a_line_carries(contents: &str, cells: &[&str]) -> bool {
     contents
         .lines()
         .any(|line| cells.iter().all(|cell| line.contains(cell)))
+}
+
+/// Every Markdown table row of `chapter`, as its trimmed cells.
+fn table_rows(chapter: &str) -> Vec<Vec<String>> {
+    chapter
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|'))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// Whether a table row is the `| --- | --- |` rule under a header.
+fn is_separator(row: &[String]) -> bool {
+    !row.is_empty()
+        && row.iter().all(|cell| {
+            let body = cell.trim_matches(':');
+            !body.is_empty() && body.bytes().all(|byte| byte == b'-')
+        })
 }
 
 /// Rule: the book is the book issue #42 asks for, and its samples are tested.
@@ -623,12 +834,13 @@ pub fn check_book(
     violations.extend(check_samples(inputs, RULE));
     violations.extend(check_chapter_contents(inputs, RULE));
 
+    let target = format!("{BOOK_DIR}/src/{BOOK_SUMMARY}");
     for (subject, contents) in [("CLAUDE.md", claude_md), ("README.md", readme)] {
-        if !contents.is_some_and(|text| text.contains(BOOK_DIR)) {
+        if !contents.is_some_and(|text| text.contains(&target)) {
             violations.push(Violation::new(
                 RULE,
                 subject,
-                format!("does not name {BOOK_DIR}; a book nothing links is a book nobody finds"),
+                format!("does not link {target}; a book nothing links is a book nobody finds"),
             ));
         }
     }
@@ -685,7 +897,7 @@ fn check_summary(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
     violations
 }
 
-/// Every chapter is a file, and no file is a chapter nobody declared.
+/// Every chapter is a file, and no file under the book's source is anything else.
 fn check_chapters(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
     let mut violations = Vec::new();
     for chapter in BOOK_CHAPTERS {
@@ -712,7 +924,7 @@ fn check_chapters(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
                 rule,
                 name.clone(),
                 format!(
-                    "is a page of {BOOK_SOURCE_DIR} that `book::BOOK_CHAPTERS` does not declare, \
+                    "is a file of {BOOK_SOURCE_DIR} that `book::BOOK_CHAPTERS` does not declare, \
                      so no rule covers what it says"
                 ),
             ));
@@ -748,10 +960,56 @@ fn check_samples(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
     }
 
     let mut shown: Vec<(String, String)> = Vec::new();
+    violations.extend(check_chapter_includes(inputs, rule, &mut shown));
+
+    for (path, sample) in &inputs.samples {
+        for anchor in anchors(sample) {
+            if !shown
+                .iter()
+                .any(|(file, shown)| file == path && *shown == anchor.name)
+            {
+                violations.push(Violation::new(
+                    rule,
+                    path.clone(),
+                    format!(
+                        "declares the anchor `{}` that no chapter shows; a sample nobody quotes \
+                         is a test wearing documentation's name",
+                        anchor.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+/// Every directive every chapter carries, and what it names.
+///
+/// `shown` collects the `(file, anchor)` pairs the book displays, so the caller can report
+/// an anchor nobody quotes.
+fn check_chapter_includes(
+    inputs: &BookInputs,
+    rule: &'static str,
+    shown: &mut Vec<(String, String)>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
     for chapter in BOOK_CHAPTERS {
         let Some(page) = inputs.page(chapter.file) else {
             continue;
         };
+        for directive in foreign_directives(page) {
+            violations.push(Violation::new(
+                rule,
+                chapter.id,
+                format!(
+                    "carries `{{{{#{directive}}}}}`; the only directive a chapter may use is \
+                     `{INCLUDE_DIRECTIVE}}}}}`. `{{{{#playground}}}}` renders an arbitrary source \
+                     file as a Rust block with no fence at all, and `{{{{#rustdoc_include}}}}` \
+                     takes the line ranges this rule refuses"
+                ),
+            ));
+        }
         for include in includes(page) {
             let Some(path) = include.path.clone() else {
                 violations.push(Violation::new(
@@ -802,28 +1060,10 @@ fn check_samples(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
         }
     }
 
-    for (path, sample) in &inputs.samples {
-        for (anchor, _) in anchors(sample) {
-            if !shown
-                .iter()
-                .any(|(file, shown)| file == path && *shown == anchor)
-            {
-                violations.push(Violation::new(
-                    rule,
-                    path.clone(),
-                    format!(
-                        "declares the anchor `{anchor}` that no chapter shows; a sample nobody \
-                         quotes is a test wearing documentation's name"
-                    ),
-                ));
-            }
-        }
-    }
-
     violations
 }
 
-/// One anchor exists in the file it is taken from, and is the name of a test.
+/// One anchor exists, is the name of a test that runs, and is the text of that test.
 fn check_anchor(
     inputs: &BookInputs,
     rule: &'static str,
@@ -836,7 +1076,10 @@ fn check_anchor(
         return Vec::new();
     };
     let mut violations = Vec::new();
-    if !anchors(sample).iter().any(|(name, _)| name == anchor) {
+    let Some(declared) = anchors(sample)
+        .into_iter()
+        .find(|found| found.name == anchor)
+    else {
         violations.push(Violation::new(
             rule,
             chapter,
@@ -846,43 +1089,118 @@ fn check_anchor(
             ),
         ));
         return violations;
+    };
+
+    let at = match declares_test(sample, anchor) {
+        Ok(at) => Some(at),
+        Err(why) => {
+            violations.push(Violation::new(
+                rule,
+                chapter,
+                format!(
+                    "shows `{anchor}` from `{path}`, which {why}; issue #42 asks for samples \
+                     that are tested rather than quoted, and the tie is the name"
+                ),
+            ));
+            None
+        }
+    };
+
+    if BOOK_FIXTURE_ANCHORS.contains(&anchor) {
+        if !declared.body.lines().map(str::trim_start).any(|line| {
+            ITEM_KEYWORDS
+                .iter()
+                .any(|keyword| line.starts_with(keyword))
+        }) {
+            violations.push(Violation::new(
+                rule,
+                chapter,
+                format!(
+                    "shows `{anchor}`, which `book::BOOK_FIXTURE_ANCHORS` allows to be a fixture \
+                     rather than its own test, and which declares no item at all. An anchor \
+                     shrunk to commentary publishes prose as a tested sample"
+                ),
+            ));
+        }
+    } else if let Some(at) = at {
+        if at < declared.start || at > declared.end {
+            violations.push(Violation::new(
+                rule,
+                chapter,
+                format!(
+                    "shows `{anchor}` from `{path}`, whose `#[test] fn {anchor}` is outside the \
+                     anchor, so the bytes on the page are not the bytes that run. Either move \
+                     the anchor around the test, or name it in `book::BOOK_FIXTURE_ANCHORS`"
+                ),
+            ));
+        }
     }
-    if !declares_test(sample, anchor) {
-        violations.push(Violation::new(
-            rule,
-            chapter,
-            format!(
-                "shows `{anchor}` from `{path}`, which declares no `#[test] fn {anchor}`; issue \
-                 #42 asks for samples that are tested rather than quoted, and the tie is the \
-                 name"
-            ),
-        ));
-    }
+
     violations
 }
 
-/// The three chapters whose contents another table owns.
-fn check_chapter_contents(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
+/// No chapter carries a sample of its own: not in a fence this rule cannot read the
+/// language of, and not as an indented block with no fence at all.
+fn check_chapter_fences(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
     let mut violations = Vec::new();
-
     for chapter in BOOK_CHAPTERS {
         let Some(page) = inputs.page(chapter.file) else {
             continue;
         };
         for (info, body) in fenced_blocks(page) {
-            if is_rust_fence(&info) && !is_only_includes(&body) {
+            if !is_quotable(&info) && !is_only_includes(&body) {
+                let named = if info.is_empty() {
+                    "an unlabelled".to_owned()
+                } else {
+                    format!("a ```{info}")
+                };
                 violations.push(Violation::new(
                     rule,
                     chapter.id,
                     format!(
-                        "carries a ```{info} fence of its own; a quoted sample compiles nowhere \
-                         and runs nowhere, and issue #42 asks for samples that are tested. Put \
-                         it in a `book::BOOK_SAMPLE_FILES` file and show it with `{{{{#include}}}}`"
+                        "carries {named} fence of its own; a quoted sample compiles nowhere and \
+                         runs nowhere, and issue #42 asks for samples that are tested. Put it in \
+                         a `book::BOOK_SAMPLE_FILES` file and show it with `{INCLUDE_DIRECTIVE}}}}}`, \
+                         or label the fence with a language `book::QUOTABLE_FENCE_LANGUAGES` names"
+                    ),
+                ));
+            }
+        }
+        for (at, line) in unfenced_lines(page) {
+            let trimmed = line.trim();
+            if trimmed.contains(INCLUDE_DIRECTIVE) && !is_one_include(trimmed) {
+                violations.push(Violation::new(
+                    rule,
+                    chapter.id,
+                    format!(
+                        "line {} carries an `{INCLUDE_DIRECTIVE}}}}}` and something else. \
+                         `starts_with` and `ends_with` both hold for a directive with source \
+                         between two of them, and everything between renders",
+                        at + 1
+                    ),
+                ));
+            }
+            if line.starts_with("    ") || line.starts_with('\t') {
+                violations.push(Violation::new(
+                    rule,
+                    chapter.id,
+                    format!(
+                        "indents line {} by four spaces, which Markdown renders as a code block \
+                         with no fence and no language — a quoted sample this rule cannot see \
+                         the language of",
+                        at + 1
                     ),
                 ));
             }
         }
     }
+
+    violations
+}
+
+/// The three chapters whose contents another table owns.
+fn check_chapter_contents(inputs: &BookInputs, rule: &'static str) -> Vec<Violation> {
+    let mut violations = check_chapter_fences(inputs, rule);
 
     let (wire_chapter, wire_document) = WIRE_FORMAT_CHAPTER;
     if let Some(page) = BOOK_CHAPTERS
@@ -900,6 +1218,17 @@ fn check_chapter_contents(inputs: &BookInputs, rule: &'static str) -> Vec<Violat
                 format!(
                     "does not include `{wire_document}`; a second copy of the frozen format \
                      passes every rule that reads the first and says something else"
+                ),
+            ));
+        }
+        if !table_rows(page).is_empty() {
+            violations.push(Violation::new(
+                rule,
+                wire_chapter,
+                format!(
+                    "states a table of its own beside the include of `{wire_document}`; the \
+                     format's tables are that document's, and a second copy of one is the thing \
+                     the include exists to prevent"
                 ),
             ));
         }
@@ -944,6 +1273,65 @@ fn check_chapter_contents(inputs: &BookInputs, rule: &'static str) -> Vec<Violat
                 ));
             }
         }
+    }
+
+    violations
+}
+
+/// Rule: the hardware compatibility matrix covers every part, and claims nothing.
+#[must_use]
+pub fn check_hardware_matrix(inputs: &BookInputs) -> Vec<Violation> {
+    const RULE: &str = "hardware-matrix";
+    let mut violations = check_matrix_covers_every_part(RULE);
+
+    let measured = match &inputs.wear {
+        Ok(measured) => measured.as_slice(),
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                "write amplification",
+                format!(
+                    "could not be measured ({error}); a measurement that did not happen is not a \
+                     measurement that passed, and a matrix with a blank column is a matrix that \
+                     published nothing"
+                ),
+            ));
+            return violations;
+        }
+    };
+
+    let chapter = BOOK_CHAPTERS
+        .iter()
+        .find(|chapter| chapter.id == "hardware-matrix")
+        .and_then(|chapter| inputs.page(chapter.file));
+    let Some(chapter) = chapter else {
+        violations.push(Violation::new(
+            RULE,
+            "hardware-matrix",
+            "the matrix chapter could not be read, so the matrix is published nowhere",
+        ));
+        return violations;
+    };
+    // Comments render as nothing, so honest cells hidden in one satisfy a reader of the
+    // source and no reader of the page.
+    let chapter = without_html_comments(chapter);
+
+    violations.extend(check_matrix_table(RULE, &chapter, measured));
+
+    if !HARDWARE_MATRIX
+        .iter()
+        .any(|row| render_power_cut(row) == PASSED)
+        && chapter.contains(PASSED)
+    {
+        violations.push(Violation::new(
+            RULE,
+            "hardware-matrix",
+            format!(
+                "says `{PASSED}` while no row of `book::HARDWARE_MATRIX` renders it. Every board \
+                 is `Not run` in `docs::HARDWARE_TARGETS`, and a chapter that says otherwise in \
+                 prose is a chapter that says otherwise"
+            ),
+        ));
     }
 
     violations
@@ -995,98 +1383,78 @@ fn check_matrix_covers_every_part(rule: &'static str) -> Vec<Violation> {
             _ => {}
         }
     }
-
     violations
 }
 
-/// Rule: the hardware compatibility matrix covers every part, and claims nothing.
-#[must_use]
-pub fn check_hardware_matrix(inputs: &BookInputs) -> Vec<Violation> {
-    const RULE: &str = "hardware-matrix";
-    let mut violations = check_matrix_covers_every_part(RULE);
-
-    let measured = match &inputs.wear {
-        Ok(measured) => measured.as_slice(),
-        Err(error) => {
-            violations.push(Violation::new(
-                RULE,
-                "write amplification",
-                format!(
-                    "could not be measured ({error}); a measurement that did not happen is not a \
-                     measurement that passed, and a matrix with a blank column is a matrix that \
-                     published nothing"
-                ),
-            ));
-            return violations;
-        }
-    };
-
-    let chapter = BOOK_CHAPTERS
-        .iter()
-        .find(|chapter| chapter.id == "hardware-matrix")
-        .and_then(|chapter| inputs.page(chapter.file));
-    let Some(chapter) = chapter else {
-        violations.push(Violation::new(
-            RULE,
-            "hardware-matrix",
-            "the matrix chapter could not be read, so the matrix is published nowhere",
-        ));
-        return violations;
-    };
-
+/// The chapter's one table is the header, its rule, and every derived row in order.
+///
+/// Whole rows compared cell by cell rather than a search for each cell somewhere in the
+/// page. Review of this change fabricated a table of two boards that do not exist, both
+/// `Passed`, hid the honest rows in HTML comments, and watched a substring version stay
+/// green — and separately took a wear figure from `63.37` to `163.37`, which no `contains`
+/// can see.
+fn check_matrix_table(rule: &'static str, chapter: &str, measured: &[PartWear]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut expected: Vec<Vec<String>> = vec![
+        MATRIX_TABLE_HEADER
+            .iter()
+            .map(|cell| (*cell).to_owned())
+            .collect(),
+    ];
     for row in HARDWARE_MATRIX {
-        let geometry = render_geometry(row);
-        let wear = render_write_amplification(row, measured);
-        let cells = [
-            &format!("`{}`", row.id),
-            &geometry,
-            &render_power_cut(row).to_owned(),
-            &row.rtc.render().to_owned(),
-            &wear,
-        ];
-        let cells: Vec<&str> = cells.iter().map(|cell| cell.as_str()).collect();
-        if !a_line_carries(chapter, &cells) {
-            violations.push(Violation::new(
-                RULE,
+        match derived_cells(row, measured) {
+            Ok(cells) => expected.push(cells),
+            Err(why) => violations.push(Violation::new(
+                rule,
                 row.id,
+                format!("has no cell to publish: {why}"),
+            )),
+        }
+    }
+    if !violations.is_empty() {
+        return violations;
+    }
+
+    let found: Vec<Vec<String>> = table_rows(chapter)
+        .into_iter()
+        .filter(|row| !is_separator(row))
+        .collect();
+    if found == expected {
+        return violations;
+    }
+
+    for (at, row) in expected.iter().enumerate() {
+        match found.get(at) {
+            Some(actual) if actual == row => {}
+            Some(actual) => violations.push(Violation::new(
+                rule,
+                row.first().map_or("hardware-matrix", String::as_str),
                 format!(
-                    "has no row of the matrix chapter carrying every derived cell: geometry \
-                     `{geometry}`, power cut `{}`, clock `{}`, written bytes per effect `{wear}`. \
-                     Every one of those is read from a table or measured on this run, so a row \
+                    "row {} of the matrix chapter is {actual:?} and every derived cell says \
+                     {row:?}. Each cell is read from a table or measured on this run, so a row \
                      that states another is a row that is wrong",
-                    render_power_cut(row),
-                    row.rtc.render(),
+                    at + 1
                 ),
-            ));
+            )),
+            None => violations.push(Violation::new(
+                rule,
+                row.first().map_or("hardware-matrix", String::as_str),
+                format!("row {} of the matrix chapter is missing: {row:?}", at + 1),
+            )),
         }
     }
-
-    for id in table_row_ids(chapter) {
-        if !HARDWARE_MATRIX.iter().any(|row| row.id == id) {
-            violations.push(Violation::new(
-                RULE,
-                id.clone(),
-                "is a row of the matrix chapter that `book::HARDWARE_MATRIX` does not declare, \
-                 so nothing derives its cells",
-            ));
-        }
+    for (at, row) in found.iter().enumerate().skip(expected.len()) {
+        violations.push(Violation::new(
+            rule,
+            row.first().map_or("hardware-matrix", String::as_str),
+            format!(
+                "row {} of the matrix chapter is {row:?}, which `book::HARDWARE_MATRIX` does not \
+                 declare, so nothing derives its cells",
+                at + 1
+            ),
+        ));
     }
-
     violations
-}
-
-/// The backticked first cell of every Markdown table row in `chapter`.
-fn table_row_ids(chapter: &str) -> Vec<String> {
-    chapter
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix('|'))
-        .filter_map(|rest| rest.split('|').next())
-        .map(str::trim)
-        .filter_map(|cell| cell.strip_prefix('`'))
-        .filter_map(|cell| cell.strip_suffix('`'))
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Where mdBook writes the rendered book, relative to the workspace root.
@@ -1185,17 +1553,26 @@ pub fn verify_render(inputs: &BookInputs, rendered: &[(String, String)]) -> Vec<
             let IncludePart::Anchor(anchor) = &include.part else {
                 continue;
             };
-            let witness = include
+            let sample = include
                 .path
                 .as_deref()
-                .and_then(|path| inputs.samples.iter().find(|(name, _)| name == path))
-                .and_then(|(_, sample)| {
-                    anchors(sample)
-                        .into_iter()
-                        .find(|(name, _)| name == anchor)
-                        .and_then(|(_, body)| anchor_witness(&body))
-                });
+                .and_then(|path| inputs.samples.iter().find(|(name, _)| name == path));
+            let witness = sample.and_then(|(_, sample)| {
+                anchors(sample)
+                    .into_iter()
+                    .find(|found| found.name == *anchor)
+                    .and_then(|found| anchor_witness(&found.body))
+            });
+            // A missing anchor is the case this whole check exists for, so it may not be
+            // the case it skips: mdBook renders one as nothing at all and exits zero, and
+            // an earlier version of this function looked the witness up *in the anchor* and
+            // so had nothing to look for exactly when there was nothing on the page.
             let Some(witness) = witness else {
+                problems.push(format!(
+                    "{BOOK_BUILD_DIR}/{page}.html shows `{anchor}`, and no witness for it could \
+                     be read out of the sample file; mdBook renders an anchor it cannot find as \
+                     nothing at all, reports no error, and exits zero"
+                ));
                 continue;
             };
             if !html.contains(&witness) {
@@ -1263,20 +1640,9 @@ pub fn render(root: &std::path::Path) -> Result<String, BookError> {
         }
     }
 
-    let inputs = BookInputs {
-        manifest: std::fs::read_to_string(root.join(BOOK_MANIFEST)).ok(),
-        pages: collect_pages(&root.join(BOOK_SOURCE_DIR)),
-        samples: BOOK_SAMPLE_FILES
-            .iter()
-            .filter_map(|path| {
-                std::fs::read_to_string(root.join(path))
-                    .ok()
-                    .map(|contents| ((*path).to_owned(), contents))
-            })
-            .collect(),
-        documents: Vec::new(),
-        wear: Err("not measured by the render".to_owned()),
-    };
+    // The same collector the gate uses, so the two readers cannot disagree about which
+    // files the book has.
+    let inputs = collect(root);
 
     let problems = verify_render(&inputs, &pages);
     if !problems.is_empty() {
@@ -1293,28 +1659,76 @@ pub fn render(root: &std::path::Path) -> Result<String, BookError> {
     ))
 }
 
-/// Every Markdown page under `directory`, named relative to it.
-fn collect_pages(directory: &std::path::Path) -> Vec<(String, String)> {
-    let mut pages = Vec::new();
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return pages;
-    };
-    let mut paths: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|kind| kind == "md"))
+/// Everything the two rules read, collected off disk.
+///
+/// Lossy rather than fallible on a file that is not UTF-8: a binary under the book's source
+/// is a file `check_chapters` reports by name, and failing the whole gate with an encoding
+/// error would report nothing else.
+#[must_use]
+pub fn collect(root: &std::path::Path) -> BookInputs {
+    let source_dir = root.join(BOOK_SOURCE_DIR);
+    let pages = book_files(&source_dir)
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(&source_dir)
+                .unwrap_or(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            (name, String::from_utf8_lossy(&bytes).into_owned())
+        })
         .collect();
-    paths.sort();
-    for path in paths {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            pages.push((name, contents));
+
+    BookInputs {
+        manifest: std::fs::read_to_string(root.join(BOOK_MANIFEST)).ok(),
+        pages,
+        samples: BOOK_SAMPLE_FILES
+            .iter()
+            .filter_map(|path| {
+                std::fs::read_to_string(root.join(path))
+                    .ok()
+                    .map(|contents| ((*path).to_owned(), contents))
+            })
+            .collect(),
+        documents: BOOK_DOCUMENT_INCLUDES
+            .iter()
+            .filter(|path| root.join(path).is_file())
+            .map(|path| (*path).to_owned())
+            .collect(),
+        wear: crate::wear::measure().map_err(|error| error.to_string()),
+    }
+}
+
+/// Every file under `directory`, in a stable order.
+///
+/// Every file rather than every `.md` file, because a chapter named `rogue.MD` is a chapter
+/// mdBook renders and a case-sensitive filter leaves covered by nothing. Bounded in depth
+/// rather than guarded by a visited set: a symlink cycle under the book's source would
+/// otherwise walk for ever, and no book needs eight levels of directory.
+fn book_files(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const MAX_DEPTH: usize = 8;
+    let mut found = Vec::new();
+    let mut pending = vec![(directory.to_path_buf(), 0_usize)];
+    while let Some((next, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < MAX_DEPTH {
+                    pending.push((path, depth + 1));
+                }
+            } else {
+                found.push(path);
+            }
         }
     }
-    pages
+    found.sort();
+    found
 }
 
 /// Fixtures describing a book that does not exist on disk.
@@ -1324,7 +1738,7 @@ pub mod tests_support {
 
     use super::{
         BOOK_CHAPTERS, BOOK_DIR, BOOK_SAMPLE_FILES, BOOK_SUMMARY, BookInputs, HARDWARE_MATRIX,
-        NON_GOALS, render_geometry, render_power_cut, render_write_amplification,
+        MATRIX_TABLE_HEADER, NON_GOALS, derived_cells,
     };
     use crate::docs::FAILURE_ROWS;
     use crate::wear::PartWear;
@@ -1376,20 +1790,28 @@ pub mod tests_support {
     /// The matrix chapter, rendered from the same derivations the rule reads.
     #[must_use]
     pub fn clean_matrix_chapter(measured: &[PartWear]) -> String {
-        let mut chapter = String::from(
-            "# The hardware compatibility matrix\n\n             | Id | Erase/program/read | Power cut | Clock | Written B per effect |\n             | --- | --- | --- | --- | --- |\n",
-        );
+        let mut chapter = String::from("# The hardware compatibility matrix\n\n");
+        let _ = writeln!(chapter, "| {} |", MATRIX_TABLE_HEADER.join(" | "));
+        let _ = writeln!(chapter, "|{}", " --- |".repeat(MATRIX_TABLE_HEADER.len()));
         for row in HARDWARE_MATRIX {
-            let _ = writeln!(
-                chapter,
-                "| `{}` | {} | {} | {} | {} |",
-                row.id,
-                render_geometry(row),
-                render_power_cut(row),
-                row.rtc.render(),
-                render_write_amplification(row, measured),
-            );
+            let Ok(cells) = derived_cells(row, measured) else {
+                continue;
+            };
+            let _ = writeln!(chapter, "| {} |", cells.join(" | "));
         }
+        chapter
+    }
+
+    /// A chapter that shows one sample.
+    #[must_use]
+    pub fn clean_sample_chapter(title: &str, anchor: &str) -> String {
+        let mut chapter = format!("# {title}\n\n```rust,ignore\n");
+        let _ = writeln!(
+            chapter,
+            "{{{{#include ../../../{}:{anchor}}}}}",
+            BOOK_SAMPLE_FILES[0]
+        );
+        chapter.push_str("```\n");
         chapter
     }
 
@@ -1405,12 +1827,10 @@ pub mod tests_support {
         let mut pages = vec![(BOOK_SUMMARY.to_owned(), summary)];
         for chapter in BOOK_CHAPTERS {
             let body = match chapter.id {
-                "design-centre" => String::from(
-                    "# The design centre\n\n                     {{#include ../../../crates/waymaker-drive/tests/book.rs:a_first_sample}}\n",
-                ),
-                "determinism" => String::from(
-                    "# The determinism contract\n\n                     {{#include ../../../crates/waymaker-drive/tests/book.rs:a_second_sample}}\n",
-                ),
+                "design-centre" => clean_sample_chapter("The design centre", "a_first_sample"),
+                "determinism" => {
+                    clean_sample_chapter("The determinism contract", "a_second_sample")
+                }
                 "failure-semantics" => clean_failure_chapter(),
                 "wire-format" => String::from(
                     "# The wire format\n\n{{#include ../../format/wire-format-v1.md}}\n",
@@ -1434,7 +1854,7 @@ pub mod tests_support {
     /// A line pointing a reader at the book, for the two documents that must carry one.
     #[must_use]
     pub fn book_link() -> String {
-        format!("The book: [{BOOK_DIR}]({BOOK_DIR}/src/SUMMARY.md)\n")
+        format!("The book: [{BOOK_DIR}]({BOOK_DIR}/src/{BOOK_SUMMARY})\n")
     }
 }
 
@@ -1444,9 +1864,9 @@ mod tests {
 
     use super::tests_support::{book_link, clean_book};
     use super::{
-        BOOK_CHAPTERS, BOOK_MANIFEST, BOOK_SOURCE_DIR, BOOK_SUMMARY, BookInputs, HARDWARE_MATRIX,
-        MatrixPart, NON_GOALS, NOT_MEASURED, check_book, check_hardware_matrix, render_geometry,
-        render_power_cut, render_write_amplification,
+        BOOK_CHAPTERS, BOOK_FIXTURE_ANCHORS, BOOK_MANIFEST, BOOK_SOURCE_DIR, BOOK_SUMMARY,
+        BookInputs, HARDWARE_MATRIX, MatrixPart, NON_GOALS, NOT_MEASURED, check_book,
+        check_hardware_matrix, render_geometry, render_power_cut, render_write_amplification,
     };
     use crate::Violation;
     use crate::docs::{FAILURE_ROWS, HARDWARE_TARGETS};
@@ -1580,19 +2000,23 @@ mod tests {
     #[test]
     fn a_rust_fence_carrying_nothing_but_an_include_is_allowed() {
         // A Rust fence is how mdBook renders an included sample as code, so the ban is on
-        // a fence that carries source rather than on the fence.
-        let mut inputs = good_book();
-        let chapter = inputs
-            .pages
-            .iter_mut()
-            .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
-            .expect("the fixture has the first chapter");
-        chapter.1 = chapter.1.replace(
-            "{{#include ../../../crates/waymaker-drive/tests/book.rs:a_first_sample}}",
-            "```rust\n{{#include ../../../crates/waymaker-drive/tests/book.rs:a_first_sample}}\n```",
-        );
-        let violations = check(&inputs);
-        assert!(!fired(&violations, BOOK), "{}", render(&violations));
+        // a fence that carries source rather than on the fence. The fixture's chapters
+        // already show their samples that way, in every info-string spelling.
+        for info in ["rust,ignore", "rust", "rs"] {
+            let mut inputs = good_book();
+            let chapter = inputs
+                .pages
+                .iter_mut()
+                .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+                .expect("the fixture has the first chapter");
+            chapter.1 = chapter.1.replace("```rust,ignore", &format!("```{info}"));
+            let violations = check(&inputs);
+            assert!(
+                !fired(&violations, BOOK),
+                "```{info}: {}",
+                render(&violations)
+            );
+        }
     }
 
     #[test]
@@ -1605,10 +2029,7 @@ mod tests {
             .iter_mut()
             .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
             .expect("the fixture has the first chapter");
-        chapter.1 = chapter.1.replace(
-            "{{#include ../../../crates/waymaker-drive/tests/book.rs:a_first_sample}}",
-            "```rust\n{{#include ../../../crates/waymaker-drive/tests/book.rs:a_first_sample}}\nlet x = 1;\n```",
-        );
+        chapter.1 = chapter.1.replace("```\n", "let x = 1;\n```\n");
         assert!(fired(&check(&inputs), BOOK));
     }
 
@@ -1890,7 +2311,10 @@ mod tests {
                 continue;
             };
             assert_eq!(render_geometry(row), NOT_MEASURED);
-            assert_eq!(render_write_amplification(row, &[]), NOT_MEASURED);
+            assert_eq!(
+                render_write_amplification(row, &[]),
+                Ok(NOT_MEASURED.to_owned())
+            );
             assert_eq!(render_power_cut(row), "Not run");
         }
     }
@@ -1961,6 +2385,345 @@ mod tests {
             .expect("the body has an identifier");
         assert_eq!(witness, "a_long_identifier");
         assert!(super::anchor_witness("a + b").is_none());
+    }
+
+    #[test]
+    fn an_unlabelled_fence_carrying_source_is_refused() {
+        // Codex-style review of this change reached a bare fence past a version of this
+        // rule that asked whether the info string said "rust". The ban is on a fence that
+        // carries source, so the allowlist is of languages a chapter may quote.
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+            .expect("the fixture has the first chapter");
+        chapter.1.push_str("\n```\nfn quoted() {}\n```\n");
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_quotable_language_is_allowed_and_an_invented_one_is_not() {
+        for (language, allowed) in [("sh", true), ("text", true), ("python", false)] {
+            let mut inputs = good_book();
+            let chapter = inputs
+                .pages
+                .iter_mut()
+                .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+                .expect("the fixture has the first chapter");
+            let _ = write!(chapter.1, "\n```{language}\necho hello\n```\n");
+            assert_eq!(
+                !fired(&check(&inputs), BOOK),
+                allowed,
+                "a ```{language} fence"
+            );
+        }
+    }
+
+    #[test]
+    fn source_beside_an_include_on_one_line_is_refused() {
+        // `starts_with` and `ends_with` both hold for
+        // `{{#include a}} let x = 1; {{#include b}}`, and everything between the two
+        // renders. Review of this change ran exactly that.
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+            .expect("the fixture has the first chapter");
+        chapter.1 = chapter.1.replace(
+            "a_first_sample}}",
+            "a_first_sample}} let stolen = 1; fn main() {}}",
+        );
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_directive_that_is_not_an_include_is_refused() {
+        // `{{#playground}}` renders an arbitrary source file as a Rust block with no fence
+        // at all, and `{{#rustdoc_include}}` takes the line ranges the include rule
+        // refuses. Both were reached past an earlier version of this module.
+        for directive in [
+            "{{#playground ../../../src/drive.rs}}",
+            "{{#rustdoc_include ../x.rs:1:40}}",
+        ] {
+            let mut inputs = good_book();
+            let chapter = inputs
+                .pages
+                .iter_mut()
+                .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+                .expect("the fixture has the first chapter");
+            let _ = write!(chapter.1, "\n{directive}\n");
+            assert!(
+                fired(&check(&inputs), BOOK),
+                "`{directive}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_indented_code_block_is_refused() {
+        // Four spaces is a code block with no fence and no language, which is a quoted
+        // sample this rule could not otherwise see.
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+            .expect("the fixture has the first chapter");
+        chapter.1.push_str("\n    let quoted = 1;\n");
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_page_whose_extension_is_not_lowercase_is_still_covered() {
+        // A `.MD` chapter is one mdBook renders and a case-sensitive collector leaves
+        // covered by nothing.
+        let mut inputs = good_book();
+        inputs
+            .pages
+            .push(("rogue.MD".to_owned(), "# Production readiness\n".to_owned()));
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_test_that_does_not_run_is_not_a_test() {
+        // CLAUDE.md already states this standard for `failure-matrix`. Attribute order is
+        // free, and review of this change put `#[ignore]` *above* the anchor marker, where
+        // a reader of the book never sees it.
+        for attribute in [
+            "#[ignore]",
+            "#[ignore = \"why\"]",
+            "#[cfg(feature = \"never\")]",
+        ] {
+            let mut inputs = good_book();
+            inputs.samples[0].1 = inputs.samples[0].1.replace(
+                "// ANCHOR: a_first_sample",
+                &format!("{attribute}\n// ANCHOR: a_first_sample"),
+            );
+            assert!(
+                fired(&check(&inputs), BOOK),
+                "`{attribute}` above the anchor must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anchor_that_does_not_contain_its_own_test_is_refused() {
+        // The load-bearing claim: the bytes on the page are the bytes that run. Review of
+        // this change shrank an anchor to two comment lines advertising an API that does
+        // not exist and watched a name-only tie stay green.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replace(
+            "// ANCHOR: a_first_sample\n#[test]",
+            "// ANCHOR: a_first_sample\n// Waymaker guarantees exactly-once delivery.\n// ANCHOR_END: a_first_sample\n#[test]",
+        );
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_fixture_anchor_shrunk_to_commentary_is_refused() {
+        // The escape hatch for an anchor that shows a type rather than its own test is a
+        // row somebody writes. It still may not be prose.
+        let anchor = BOOK_FIXTURE_ANCHORS
+            .first()
+            .expect("the table names at least one fixture");
+        let mut inputs = good_book();
+        inputs.samples[0].1 = format!(
+            "// ANCHOR: {anchor}\n// Just a sentence.\n// ANCHOR_END: {anchor}\n#[test]\nfn {anchor}() {{}}\n"
+        );
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
+            .expect("the fixture has the first chapter");
+        *chapter = (
+            chapter.0.clone(),
+            super::tests_support::clean_sample_chapter("Fixture", anchor),
+        );
+        inputs
+            .pages
+            .retain(|(name, _)| name != BOOK_CHAPTERS[1].file);
+        inputs.pages.push((
+            BOOK_CHAPTERS[1].file.to_owned(),
+            "# Prose only\n".to_owned(),
+        ));
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn overlapping_anchors_are_both_seen() {
+        // mdBook allows them, and a single open slot drops the outer one — which reports a
+        // bogus "declares no such anchor" and blinds the orphan check at the same time.
+        let found = super::anchors(
+            "// ANCHOR: outer\nlet a = 1;\n// ANCHOR: inner\nlet b = 2;\n// ANCHOR_END: inner\nlet c = 3;\n// ANCHOR_END: outer\n",
+        );
+        let names: Vec<&str> = found.iter().map(|anchor| anchor.name.as_str()).collect();
+        assert_eq!(names, ["inner", "outer"]);
+    }
+
+    #[test]
+    fn a_repository_that_links_the_book_only_by_name_is_reported() {
+        // `contains("docs/book")` is satisfied by "docs/book (deleted; see the archive)".
+        let inputs = good_book();
+        assert!(fired(
+            &check_book(&inputs, Some("docs/book (deleted)"), Some(&readme())),
+            BOOK
+        ));
+    }
+
+    #[test]
+    fn a_wire_format_chapter_that_states_a_table_of_its_own_is_refused() {
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == "wire-format.md")
+            .expect("the fixture has the wire-format chapter");
+        chapter
+            .1
+            .push_str("\n| Field | Bytes |\n| --- | --- |\n| header | 12 |\n");
+        assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_fabricated_matrix_row_is_refused_however_it_is_spelled() {
+        // Review of this change added rows whose first cell was bold, or bare, or a
+        // duplicate of a declared id, and hid the honest rows in HTML comments. A
+        // substring search saw none of it.
+        for row in [
+            "| **`nrf52840-dk`** | A board | 4096 / 4 / 1 | Passed | Backed RTC | 41.00 |",
+            "| stm32f407 | A board | 4096 / 4 / 1 | Passed | Backed RTC | 39.00 |",
+            "| `cortex-m0plus` | A Cortex-M0+ board (bench) | 4096 / 1 / 1 | Passed | Backed RTC | 63.37 |",
+        ] {
+            let mut inputs = good_book();
+            let chapter = inputs
+                .pages
+                .iter_mut()
+                .find(|(name, _)| name == "hardware-matrix.md")
+                .expect("the fixture has the matrix chapter");
+            let _ = writeln!(chapter.1, "{row}");
+            assert!(
+                fired(&check_hardware_matrix(&inputs), MATRIX),
+                "the row `{row}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_honest_row_hidden_in_a_comment_does_not_satisfy_the_matrix() {
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == "hardware-matrix.md")
+            .expect("the fixture has the matrix chapter");
+        let honest = chapter.1.clone();
+        chapter.1 = format!(
+            "# The hardware compatibility matrix\n\n| Id | Part |\n| --- | --- |\n| nRF52840 | Passed |\n\n<!--\n{honest}\n-->\n"
+        );
+        assert!(fired(&check_hardware_matrix(&inputs), MATRIX));
+    }
+
+    #[test]
+    fn a_cell_that_merely_contains_the_derived_value_is_refused() {
+        // `63.37` is a substring of `163.37`, and `Not run` of `Not run in the lab, Passed
+        // on the bench`. Both were run against a version that asked only whether a line
+        // contained each cell.
+        for (from, to) in [
+            ("| 63.37 |", "| 163.37 |"),
+            ("| Not run |", "| Not run in the lab, Passed on the bench |"),
+            ("| 4096 / 16 / 1 |", "| 14096 / 16 / 1 |"),
+        ] {
+            let mut inputs = good_book();
+            let chapter = inputs
+                .pages
+                .iter_mut()
+                .find(|(name, _)| name == "hardware-matrix.md")
+                .expect("the fixture has the matrix chapter");
+            assert!(
+                chapter.1.contains(from),
+                "the fixture should carry `{from}`"
+            );
+            chapter.1 = chapter.1.replace(from, to);
+            assert!(
+                fired(&check_hardware_matrix(&inputs), MATRIX),
+                "`{from}` -> `{to}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_that_claims_a_board_passed_is_refused() {
+        let mut inputs = good_book();
+        let chapter = inputs
+            .pages
+            .iter_mut()
+            .find(|(name, _)| name == "hardware-matrix.md")
+            .expect("the fixture has the matrix chapter");
+        chapter
+            .1
+            .push_str("\nAll three boards have Passed their power-cut loops.\n");
+        assert!(fired(&check_hardware_matrix(&inputs), MATRIX));
+    }
+
+    #[test]
+    fn a_modelled_part_with_no_figure_is_a_failure_rather_than_a_blank_column() {
+        // Folding "the measurement produced nothing" into the cell a board gets would
+        // publish a degenerate run as a blank and leave the build green.
+        let mut inputs = good_book();
+        inputs.wear = Ok(Vec::new());
+        assert!(fired(&check_hardware_matrix(&inputs), MATRIX));
+    }
+
+    #[test]
+    fn a_rendered_page_missing_the_anchor_it_shows_is_reported() {
+        // The case the whole `book` stage exists for: mdBook renders an anchor it cannot
+        // find as nothing at all and exits zero. An earlier version looked the witness up
+        // *inside* the anchor, so it had nothing to look for exactly when there was
+        // nothing on the page.
+        let mut inputs = clean_book();
+        inputs.samples[0].1 = inputs.samples[0]
+            .1
+            .replace("a_first_sample", "a_renamed_sample");
+        let rendered: Vec<(String, String)> = BOOK_CHAPTERS
+            .iter()
+            .map(|chapter| {
+                (
+                    chapter.file.replace(".md", ".html"),
+                    format!("<h1>{}</h1><pre>a_second_sample</pre>", chapter.title),
+                )
+            })
+            .collect();
+        let problems = super::verify_render(&inputs, &rendered);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("a_first_sample")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_row_is_only_swept_at_the_program_unit_the_sweeps_use() {
+        // Every crash sweep in this workspace lays the part out with a four-byte program
+        // unit, so the other two modelled rows carry a measured figure and no sweep.
+        for row in HARDWARE_MATRIX {
+            let MatrixPart::Model(name) = row.part else {
+                continue;
+            };
+            let program = PARTS
+                .iter()
+                .find(|(part, ..)| *part == name)
+                .map(|(_, _, _, program, _)| *program)
+                .expect("every model row names a measured part");
+            let expected = if program == super::SWEPT_PROGRAM_BYTES {
+                "Swept on the host model"
+            } else {
+                "Not swept at this program unit"
+            };
+            assert_eq!(render_power_cut(row), expected, "{name}");
+        }
     }
 
     #[test]

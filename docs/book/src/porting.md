@@ -1,10 +1,13 @@
 # Porting to a new part
 
-A port is two traits. Neither needs an allocator, and neither needs `unsafe`.
+A port is a small set of traits. None needs an allocator, and none needs `unsafe`.
 
-- `StableStorage`, in `waymaker-flash`. Four operations and a barrier.
-- `PersistentClock`, in `waymaker-embassy`. One reading. Write it only if the board has a
-  clock that survives power loss.
+- `StableStorage`, in `waymaker-flash`. Four operations and a barrier. Every port needs it.
+- `Activities` and `Clocks`, in `waymaker-drive`. What the world can do, and what time it is.
+  These are the synchronous driver's two ports.
+- `PersistentClock`, in `waymaker-embassy`. One reading. It is the façade's compile-time
+  witness that a durable deadline has a clock behind it, so write it only if the board really
+  has one. A board with a backed RTC usually implements it and `Clocks` both.
 
 ## Storage
 
@@ -36,8 +39,12 @@ four operations and a barrier because every port must implement all of it. The
 ### Check the port
 
 `waymaker-conformance` is the suite. It is `#![no_std]` and allocation-free, so you can run
-it on the target the driver is for. Two of design document §12's clauses need a real reset
-and cannot be checked in one process: arm the witness, reset the board, then verify.
+it on the target the driver is for.
+
+It covers four of design document §12's six clauses. Two need a real reset and are the
+across-reset witness's: arm it, reset the board, then verify. Of the remaining four, one is
+the crash injector's rather than the suite's, and one — the part's own rules for programming
+a cell twice — is yours and is in no suite at all.
 
 ## The persistent clock
 
@@ -61,8 +68,8 @@ Implement `PersistentClock` only if the reading really survives power loss.
 
 ### If the board has no such clock
 
-Declare `ClockCapability::BootOnly`. A workflow that asks for `AtPersistentTime` is then
-refused with `NoPersistentClock`, which is the honest answer. Do not declare `Persistent`
+Have `Clocks::capability` answer `ClockCapability::BootOnly`. A workflow that asks for
+`AtPersistentTime` is then refused with `NoPersistentClock`, which is the honest answer. Do not declare `Persistent`
 and hope; no code below the board can catch that.
 
 ## Then measure it
