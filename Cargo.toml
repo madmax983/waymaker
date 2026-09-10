@@ -10,6 +10,7 @@ members = [
     "crates/waymaker-rig",
     "crates/waymaker-drive",
     "crates/waymaker-size-probe",
+    "crates/waymaker-emu",
     "xtask",
 ]
 # `xtask` is a host tool. Firmware-target builds select the default members so that its
@@ -32,6 +33,9 @@ members = [
 # image the code-flash budget is measured against.
 # `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
 # selecting it by default would add a member the firmware build has nothing to build.
+# `waymaker-emu` is excluded for the size probe's reason and one more: it carries
+# `cortex-m-rt` and `cortex-m-semihosting`, so selecting it by default would put a runtime
+# and a semihosting channel into the image the code-flash budget is measured against.
 default-members = [
     "crates/waymaker-core",
     "crates/waymaker-flash",
@@ -55,6 +59,7 @@ waymaker-spec = { path = "crates/waymaker-spec", version = "0.0.0", default-feat
 waymaker-conformance = { path = "crates/waymaker-conformance", version = "0.0.0", default-features = false }
 waymaker-rig = { path = "crates/waymaker-rig", version = "0.0.0", default-features = false }
 waymaker-drive = { path = "crates/waymaker-drive", version = "0.0.0", default-features = false }
+waymaker-emu = { path = "crates/waymaker-emu", version = "0.0.0", default-features = false }
 # The optional codec helpers of issue #37. `default-features = false` so that neither
 # reaches `std`: they are enabled inside a `#![no_std]` layer.
 serde = { version = "1", default-features = false }

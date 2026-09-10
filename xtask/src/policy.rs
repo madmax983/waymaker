@@ -71,6 +71,28 @@ pub const HOST_TOOLS: &[&str] = &["xtask"];
 /// to it.
 pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 
+/// Crates that are built to be *executed* rather than measured or shipped.
+///
+/// One member, and it is deliberately not [`MEASUREMENT_CRATES`]: nothing about
+/// `waymaker-emu` is measured. It is a linked firmware image with a reset vector, a vector
+/// table and a memory map, started under QEMU on a Cortex-M0 and a Cortex-M4 so that
+/// `waymaker-rig` *runs* on the two instruction sets Waymaker is built for. The
+/// `rig-firmware` stage builds that crate's library for the part, and `CLAUDE.md` has always
+/// said what that does not buy: "`cargo build --lib` produces an rlib and never links, so no
+/// global allocator is required and an `extern crate alloc` under any of them compiles
+/// clean". A crate that compiles for a target is not a crate that runs on one.
+///
+/// It is also the one crate in this workspace that carries `#![allow(unsafe_code)]`, which
+/// is the other reason it is a category of its own rather than a row in one of the four
+/// above: every one of those is a category whose members are held to forbidding the
+/// attribute, and a reset vector cannot be spelled without it. The workspace manifest names
+/// this exact escape — "`deny` keeps a documented exception a reviewable one-line
+/// `#![allow(unsafe_code)]` plus an ADR" — and
+/// [`crate::emulate::check_emulation_boot`] is what keeps the exception scoped to the two
+/// macro expansions that need it rather than to the crate. See
+/// [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+pub const EMULATION_CRATES: &[&str] = &["waymaker-emu"];
+
 /// Crates that exist to test the layers, and are never linked into firmware.
 ///
 /// Not host tooling — [`HOST_TOOLS`] is the gate itself — and not a measurement crate: a

@@ -5,11 +5,16 @@
 #
 # `targets` is pinned here rather than installed by a CI step so that a local checkout can
 # run the firmware build too. `cargo xtask check-layering` fails if it is removed.
+#
+# `thumbv7em-none-eabi` is the second one, and it is the `emulate` stage's: `cargo xtask
+# emulate` links the rig into an image for each of the two architectures Waymaker is built
+# for and starts both under QEMU. `emulation-boot` fails a build in which a machine's target
+# is not pinned here, so the two lists cannot drift.
 [toolchain]
 channel = "1.97"
 # `llvm-tools-preview` is what `cargo llvm-cov` needs; without it here the tool installs it
 # itself, mid-pipeline, over the network. Pinned so the coverage stage has no hidden
 # download in it.
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
-targets = ["thumbv6m-none-eabi"]
+targets = ["thumbv6m-none-eabi", "thumbv7em-none-eabi"]
 profile = "minimal"

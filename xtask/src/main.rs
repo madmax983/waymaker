@@ -17,6 +17,7 @@ const USAGE: &str = "usage: cargo xtask <check-layering \
     | size [--report FILE] [--json FILE] [--baseline-ref REF] [--no-baseline] \
     | profile [--report FILE] [--json FILE] \
     | profile-workload NAME \
+    | emulate \
     | install-hooks>";
 
 fn main() -> ExitCode {
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
         Some("coverage") => run_coverage(&rest),
         Some("size") => run_size(&rest),
         Some("profile") => run_profile(&rest),
+        Some("emulate") => run_emulate(&rest),
         // The inner half of `profile`: the process valgrind is pointed at. A subcommand
         // rather than a binary of its own, because a second target is a second thing to
         // keep in the manifest, in `default-members` and out of the firmware build, and
@@ -45,6 +47,37 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Links the emulated image for both cores, starts both, and gates what they said.
+///
+/// Takes no arguments: the machines are [`xtask::emulate::MACHINES`] and the run is either
+/// taken or failed. A `--skip-if-missing` here would be the one flag that turns this gate
+/// into a command that exits zero having measured nothing.
+fn run_emulate(args: &[String]) -> ExitCode {
+    if let Some(argument) = args.first() {
+        eprintln!("xtask: unknown argument `{argument}`\n{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    let root = workspace_root();
+    let report = match xtask::emulate::measure(&root) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("xtask: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", report.render());
+    report.shortfall().map_or_else(
+        || {
+            println!("emulated boot: ok");
+            ExitCode::SUCCESS
+        },
+        |shortfall| {
+            eprintln!("emulated boot: {shortfall}");
+            ExitCode::FAILURE
+        },
+    )
 }
 
 fn run_check() -> ExitCode {

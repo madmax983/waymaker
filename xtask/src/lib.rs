@@ -31,6 +31,7 @@ pub mod book;
 pub mod coverage;
 pub mod docs;
 pub mod elf;
+pub mod emulate;
 pub mod graph;
 pub mod manifest;
 pub mod pipeline;
@@ -71,6 +72,7 @@ pub const RULES: &[&str] = &[
     "effect-scheduled-fields",
     "embassy-below-facade",
     "empty-default-features",
+    "emulation-boot",
     "failure-matrix",
     "gate-broken",
     "hardware-attestation",
@@ -206,6 +208,16 @@ pub struct WorkspaceInputs {
     pub probe_manifest: Option<String>,
     /// Contents of the size probe's crate root, when the workspace has one.
     pub probe_source: Option<String>,
+    /// Contents of the emulated image's manifest, when the workspace has one.
+    pub emu_manifest: Option<String>,
+    /// Every Rust source file of `waymaker-emu`, in path order.
+    ///
+    /// Kept apart from [`layer_sources`](Self::layer_sources) for
+    /// [`rig_sources`](Self::rig_sources)'s reason, and for a sharper one: this is the one
+    /// crate in the workspace that carries `#![allow(unsafe_code)]`, so a rule that iterated
+    /// the layer sources and met it would be a rule about crates that forbid the attribute
+    /// meeting the one crate that cannot.
+    pub emu_sources: Vec<size::LayerSource>,
     /// Every source file of every firmware layer, for the probe-reach rule.
     ///
     /// Every file, not just the crate root: a public function in a submodule costs exactly
@@ -241,48 +253,15 @@ pub struct WorkspaceInputs {
     pub readme: Option<String>,
 }
 
-/// Runs every rule against already-collected inputs.
+/// Every rule that reads a crate's own source, in one place.
 ///
-/// Returns the violations sorted and deduplicated, so the output is stable enough to diff
-/// between runs.
-///
-/// # Errors
-///
-/// Returns [`CheckError`] if the `cargo metadata` output cannot be parsed.
-pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckError> {
-    let graph = graph::PackageGraph::from_cargo_metadata(&inputs.metadata_json)
-        .map_err(|err| CheckError::new(format!("could not parse cargo metadata: {err}")))?;
-
+/// Split out of [`check_inputs`] rather than inlined there, because that function has a
+/// line ceiling and this workspace keeps adding rules to it: two arrived in one week and
+/// the second one is what crossed the line. The seam is the input rather than a count —
+/// everything here reads Rust source, and everything left behind reads a manifest, the
+/// package graph, the pipeline or a document.
+fn check_source_rules(inputs: &WorkspaceInputs) -> Vec<Violation> {
     let mut violations = Vec::new();
-    violations.extend(graph::check_dependency_direction(&graph));
-    violations.extend(graph::check_kernel_has_no_dependencies(&graph));
-    violations.extend(graph::check_embassy_stays_above_flash(&graph));
-    violations.extend(graph::check_empty_default_features(&graph));
-    violations.extend(graph::check_workspace_membership(&graph));
-    violations.extend(graph::check_layers_are_local(&graph));
-    violations.extend(graph::check_no_build_scripts(&graph));
-    violations.extend(check_inputs_are_complete(&graph, inputs));
-    violations.extend(manifest::check_release_profile(&inputs.workspace_manifest));
-    violations.extend(manifest::check_workspace_lints(&inputs.workspace_manifest));
-    violations.extend(manifest::check_cargo_config(inputs.cargo_config.as_deref()));
-    violations.extend(pipeline::check_workflow(inputs.workflow.as_deref()));
-    violations.extend(pipeline::check_pre_commit_hook(
-        inputs.pre_commit_hook.as_deref(),
-        inputs.pre_commit_hook_is_executable,
-    ));
-    violations.extend(pipeline::check_toolchain(inputs.toolchain.as_deref()));
-    violations.extend(size::check_size_probe(
-        &graph,
-        inputs.probe_manifest.as_deref(),
-        inputs.probe_source.as_deref(),
-    ));
-    violations.extend(size::check_probe_reach(
-        &inputs.layer_sources,
-        inputs.probe_source.as_deref(),
-    ));
-    for (name, contents) in &inputs.member_manifests {
-        violations.extend(manifest::check_member_manifest(name, contents));
-    }
     let sources: Vec<source::CrateSource<'_>> = inputs
         .crate_sources
         .iter()
@@ -339,6 +318,58 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.layer_sources,
         &inputs.member_manifests,
     ));
+    violations
+}
+
+/// Runs every rule against already-collected inputs.
+///
+/// Returns the violations sorted and deduplicated, so the output is stable enough to diff
+/// between runs.
+///
+/// # Errors
+///
+/// Returns [`CheckError`] if the `cargo metadata` output cannot be parsed.
+pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckError> {
+    let graph = graph::PackageGraph::from_cargo_metadata(&inputs.metadata_json)
+        .map_err(|err| CheckError::new(format!("could not parse cargo metadata: {err}")))?;
+
+    let mut violations = Vec::new();
+    violations.extend(graph::check_dependency_direction(&graph));
+    violations.extend(graph::check_kernel_has_no_dependencies(&graph));
+    violations.extend(graph::check_embassy_stays_above_flash(&graph));
+    violations.extend(graph::check_empty_default_features(&graph));
+    violations.extend(graph::check_workspace_membership(&graph));
+    violations.extend(graph::check_layers_are_local(&graph));
+    violations.extend(graph::check_no_build_scripts(&graph));
+    violations.extend(check_inputs_are_complete(&graph, inputs));
+    violations.extend(manifest::check_release_profile(&inputs.workspace_manifest));
+    violations.extend(manifest::check_workspace_lints(&inputs.workspace_manifest));
+    violations.extend(manifest::check_cargo_config(inputs.cargo_config.as_deref()));
+    violations.extend(pipeline::check_workflow(inputs.workflow.as_deref()));
+    violations.extend(pipeline::check_pre_commit_hook(
+        inputs.pre_commit_hook.as_deref(),
+        inputs.pre_commit_hook_is_executable,
+    ));
+    violations.extend(pipeline::check_toolchain(inputs.toolchain.as_deref()));
+    violations.extend(size::check_size_probe(
+        &graph,
+        inputs.probe_manifest.as_deref(),
+        inputs.probe_source.as_deref(),
+    ));
+    violations.extend(size::check_probe_reach(
+        &inputs.layer_sources,
+        inputs.probe_source.as_deref(),
+    ));
+    violations.extend(emulate::check_emulation_boot(
+        inputs.emu_manifest.as_deref(),
+        &inputs.emu_sources,
+        inputs.toolchain.as_deref(),
+        pipeline::STAGES,
+    ));
+    for (name, contents) in &inputs.member_manifests {
+        violations.extend(manifest::check_member_manifest(name, contents));
+    }
+    violations.extend(check_source_rules(inputs));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
     violations.extend(book::check_book(
         &inputs.book,
@@ -519,6 +550,13 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         .map(|path| read_to_string(path))
         .transpose()?;
 
+    let emu_manifest = graph
+        .find(emulate::PACKAGE)
+        .and_then(|package| package.manifest_path.as_ref())
+        .map(|path| read_to_string(path))
+        .transpose()?;
+    let emu_sources = package_sources(&graph, emulate::PACKAGE, root)?;
+
     let docs = collect_docs_inputs(root, &graph)?;
 
     Ok(WorkspaceInputs {
@@ -535,6 +573,8 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
         toolchain,
         probe_manifest,
         probe_source,
+        emu_manifest,
+        emu_sources,
         layer_sources,
         rig_sources,
         no_std_support_sources,
@@ -554,10 +594,16 @@ fn package_sources(
     root: &Path,
 ) -> Result<Vec<size::LayerSource>, CheckError> {
     let mut sources = Vec::new();
+    // The library's directory, or — for a crate that has no library — the binary's.
+    // `waymaker-emu` is the second kind: its only target is a `#![no_main]` binary behind
+    // `required-features`, and a collector that read `lib_source_path` alone would hand
+    // `emulation-boot` an empty list and let it report "the crate is not in the workspace"
+    // about a crate that is.
     if let Some(package) = graph.find(name)
         && let Some(source_root) = package
             .lib_source_path
             .as_ref()
+            .or_else(|| package.bins.first().and_then(|bin| bin.src_path.as_ref()))
             .and_then(|path| path.parent())
     {
         for path in rust_sources(source_root) {
@@ -883,6 +929,8 @@ mod tests {
             // a budget nothing links cannot be measured.
             probe_manifest: None,
             probe_source: None,
+            emu_manifest: None,
+            emu_sources: Vec::new(),
             // No rig sources at all: `rig-oracle` fires, because a pin whose file is gone
             // is a pin checking nothing — which is the failure mode the rule exists for.
             rig_sources: Vec::new(),
@@ -968,6 +1016,7 @@ mod tests {
             "effect-scheduled-fields",
             "embassy-below-facade",
             "empty-default-features",
+            "emulation-boot",
             "failure-matrix",
             "hardware-attestation",
             "hardware-matrix",
@@ -1324,6 +1373,8 @@ mod tests {
             pre_commit_hook: Some(pipeline::render_pre_commit_hook()),
             pre_commit_hook_is_executable: Some(true),
             toolchain: Some(pipeline::tests_support::clean_toolchain()),
+            emu_manifest: Some(emulate::tests_support::clean_manifest()),
+            emu_sources: emulate::tests_support::clean_sources(),
             probe_manifest: Some(size::tests_support::clean_probe_manifest()),
             probe_source: Some(format!(
                 "{}{}",

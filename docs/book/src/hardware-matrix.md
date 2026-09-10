@@ -74,4 +74,13 @@ A board cannot complete the failure matrix, and nothing asks it to. The rig reac
 its ten rows by design. To tell three of those six apart, you must know whether the
 dispatcher ran and returned. A harness knows that. A reset takes it with the RAM.
 
-`waymaker-rig` links on the target. It has never run on one.
+`waymaker-rig` links on the target. Since the `emulate` stage it also *runs* on two of
+them, under QEMU: a Cortex-M0 and a Cortex-M4. That is the two architectures Waymaker is
+built for, executing the rig's own code — and it is not two parts.
+
+An emulated core has no NOR flash, no supply to remove, no reset-cause register and no
+backup domain. QEMU has no Cortex-M0+ at all. So every row above stays `Not run`, and the
+emulated boot may not be cited to move one. See
+[ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+
+`waymaker-rig` has never run on a board.

@@ -48,6 +48,7 @@ be superseded.
 | [0037](0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md) | The wire format is frozen at v1, and migration is a new bank | accepted |
 | [0038](0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md) | `no_alloc` is a measurement, and the instruction figure is a comparison | accepted |
 | [0039](0039-the-book-quotes-tests-and-the-matrix-is-derived.md) | The book quotes tests, and the matrix is derived | accepted |
+| [0040](0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) | The emulator runs the rig, and attests to no board | accepted |
 
 ## Reading the numbers
 
@@ -66,7 +67,7 @@ of these are older than their numbers suggest:
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
-0035 → 0036 → 0037 → 0038 → 0039.
+0035 → 0036 → 0037 → 0038 → 0039 → 0040.
 
 ## Writing one
 
