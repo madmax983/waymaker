@@ -46,6 +46,7 @@ be superseded.
 | [0035](0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) | The façade row is gated, and runtime RAM is composed rather than sampled | accepted |
 | [0036](0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) | Workflow versioning is a range, and an upgrade branch is a recorded record | accepted |
 | [0037](0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md) | The wire format is frozen at v1, and migration is a new bank | accepted |
+| [0038](0038-the-book-quotes-tests-and-the-matrix-is-derived.md) | The book quotes tests, and the matrix is derived | accepted |
 
 ## Reading the numbers
 
@@ -64,7 +65,7 @@ of these are older than their numbers suggest:
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
-0035 → 0036 → 0037.
+0035 → 0036 → 0037 → 0038.
 
 ## Writing one
 

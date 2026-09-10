@@ -10,11 +10,12 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 53 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 55 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
 - The architecture, drawn: [`docs/architecture.md`](docs/architecture.md)
+- The book, for a reader rather than a contributor: [`docs/book`](docs/book/src/SUMMARY.md)
 - Why things are the way they are: [`docs/adr`](docs/adr/README.md)
 - The design document this is all taken from: [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html)
 
@@ -44,6 +45,7 @@ cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
+cargo --locked xtask book
 cargo --locked xtask check-layering
 ```
 
@@ -373,6 +375,42 @@ rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned ga
 same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
 dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
 
+## The book
+
+Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s mdBook is
+[`docs/book`](docs/book/src/SUMMARY.md), and it is written for a *reader* — a workflow
+author, or somebody porting to a part — where this file is written for a contributor. Eight
+chapters, one per bullet of the issue, held as a table in `xtask::book::BOOK_CHAPTERS`.
+`cargo xtask book` renders it; the `book` and `hardware-matrix` rules say what it must
+contain.
+
+Two things about it are worth reading before changing it, because both are decisions rather
+than conveniences.
+
+**A chapter may not carry a Rust sample of its own.** Every sample is an `{{#include}}` of an
+anchor in [`crates/waymaker-drive/tests/book.rs`](crates/waymaker-drive/tests/book.rs), and
+the anchor's name must be the name of a `#[test]` in that file. So the bytes the book shows
+are the bytes of something the `test` stage compiles and runs against `waymaker-fault`'s
+model of NOR, the real driver and the real codec. A Rust fence is still how mdBook renders an
+included sample as code, so the ban is on a fence carrying *source*, not on the fence: the
+body may hold include directives and nothing else.
+
+**The stage runs `cargo xtask book` rather than `mdbook build`, and that is the whole reason
+the rule exists.** mdBook exits `0` for an `{{#include}}` whose file is missing — it renders
+the directive into the page and logs an `ERROR` — and for an anchor a file does not declare,
+which it renders as *nothing at all*, with no log line. Both were reproduced against mdBook
+0.5.4 before [ADR 0038](docs/adr/0038-the-book-quotes-tests-and-the-matrix-is-derived.md) was
+written. So the command fails closed on a missing renderer, on an `ERROR` beside a zero exit,
+on a chapter with no HTML, and on a page that shows none of the sample it includes.
+
+The hardware compatibility matrix is [one chapter](docs/book/src/hardware-matrix.md) and
+every cell of it but one is *derived*: the geometry from `xtask::wear::PARTS`, the power-cut
+standing from `xtask::docs::HARDWARE_TARGETS`, and the write amplification from a measurement
+the gate takes on every run. Only the clock column is declared, because no table here holds
+it. The book therefore cannot say `Passed` where
+[the attestation record](#what-the-boards-still-owe) says `Not run`, and a wear figure that
+drifted fails a build rather than going on being published.
+
 ## The layering
 
 `waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way. The table
@@ -644,7 +682,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 53 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 55 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -719,6 +757,8 @@ this table is how you find out what a red build is telling you.
 | `deferred-questions` | A question in `docs::DEFERRED_QUESTIONS` is missing from this file, its row does not carry the headline and the status the table renders, the count is wrong, a settled one's ADR is absent, unaccepted or does not carry its `Settles deferred question:` marker, two ADRs claim one question, an open one is already claimed by an ADR, or an ADR claims a question the table never declared. |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
 | `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
+| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a page or a summary link appears that the table does not declare — both directions, because a chapter nobody can reach and a chapter no rule covers are the same failure from two ends. The *samples*: a chapter carries a Rust fence that holds anything but an `{{#include}}`; an include names a file `book::BOOK_SAMPLE_FILES` does not, or an anchor that file does not declare, or an anchor with no `#[test]` of its name; an anchor is declared and no chapter shows it; or an include takes a line *range*, which is a citation that stops being the right lines the first time somebody inserts one above it. Issue #42's second "done when" is that the samples be "tested, not merely quoted", and the tie is the anchor's name: the bytes the book shows are the bytes of a file the `test` stage runs. A fence is not banned outright because a fence is how mdBook renders an included sample as code; a fence carrying *source* is. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) rather than restate it, because a second copy passes every rule that reads the first and says something else; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter must carry every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both name `docs/book`. What it cannot see is prose — it matches ids and file names, so a chapter whose sentences describe another engine passes as long as its includes and its tables are right. Nor can a scanner say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
+| `hardware-matrix` | The matrix stops covering every part, or starts claiming something. A board in `docs::HARDWARE_TARGETS` or a modelled part in `wear::PARTS` has no row in `book::HARDWARE_MATRIX`; a row names a board or a part neither table declares; the matrix chapter has no line carrying a row's id beside *every* derived cell — its geometry from `wear::PARTS`, its power-cut standing from `HARDWARE_TARGETS`, its clock, and its written bytes per effect as measured on this run; a line of the chapter's table names an id the matrix does not declare; or the measurement could not be taken, which is a failure rather than a blank column. The power-cut cell is the sharp one: it is *read* from the attestation table, so the book cannot say `Passed` where the record says `Not run` — and moving that record needs an accepted ADR, which is `hardware-attestation`'s. The write-amplification cell is the other: it is measured rather than transcribed, so a figure that drifted fails a build instead of going on being published. What it cannot see is whether a `Passed` row is *true*; that is a log from a bench, and [what the boards still owe](#what-the-boards-still-owe) is where its absence is recorded. |
 
 ## What is not checked
 
@@ -1470,6 +1510,29 @@ Stated so that nobody mistakes silence for coverage:
   the same standing ADR 0036 records for widening `oldest` before narrowing `current`.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
+- **What the book's sentences say.** `book` matches chapter ids, file names, include targets
+  and anchor names; `hardware-matrix` matches rendered cells. A chapter whose prose describes
+  another engine passes both as long as its includes and its tables are right. It is the same
+  limit the first bullet of this list states, met in a document a reader is more likely to
+  believe than this one.
+- **That a book sample is the sample the chapter needed.** The tie is the anchor's *name*: an
+  anchor must be a `#[test]` of that name, and the test must be in a file
+  `book::BOOK_SAMPLE_FILES` names. Nothing says the test *asserts* what the surrounding
+  paragraph claims — that is `crates/waymaker-drive/tests/book.rs` being read by a person,
+  the same standing `failure-matrix` records for a row-named test.
+- **That the rendered page shows the right sample.** `cargo xtask book` looks for one
+  identifier out of each anchor's body in the page that includes it, because mdBook renders a
+  missing anchor as nothing at all and exits zero. A body whose longest identifier also
+  appears in the chapter's prose would satisfy it. The tie that matters is the `book` rule's,
+  which resolves every anchor against the file it is taken from.
+- **A book page filed outside `docs/book/src`.** The gate reads that directory, recursively,
+  and `book.toml`. A chapter sourced from somewhere else through an mdBook preprocessor is a
+  page no rule covers — the same shape of limit `capacity-reserve`, `recovery-surface` and
+  `storage-contract` each record for the one file they pin.
+- **That a board's matrix row is true.** `hardware-matrix` reads the power-cut cell out of
+  `docs::HARDWARE_TARGETS`, so the book cannot claim more than the decision record does. What
+  makes a `Passed` row true is a log from a bench, which is `hardware-attestation`'s limit and
+  is stated there.
 
 ## Status
 

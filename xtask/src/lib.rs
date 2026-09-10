@@ -27,6 +27,7 @@
 
 #![warn(missing_docs)]
 
+pub mod book;
 pub mod coverage;
 pub mod docs;
 pub mod elf;
@@ -51,6 +52,7 @@ pub const RULES: &[&str] = &[
     "adr-index",
     "adr-numbering",
     "adr-structure",
+    "book",
     "capacity-reserve",
     "cargo-config-profile",
     "ci-pipeline",
@@ -71,6 +73,7 @@ pub const RULES: &[&str] = &[
     "failure-matrix",
     "gate-broken",
     "hardware-attestation",
+    "hardware-matrix",
     "inputs-incomplete",
     "integrity-check",
     "kernel-boundary",
@@ -231,6 +234,10 @@ pub struct WorkspaceInputs {
     pub driver_sources: Vec<size::LayerSource>,
     /// `CLAUDE.md`, the decision record, the diagrams, and every crate root.
     pub docs: docs::DocsInputs,
+    /// The book, its samples, and the write amplification measured on this run.
+    pub book: book::BookInputs,
+    /// Contents of `README.md`, which is where a reader is pointed at the book.
+    pub readme: Option<String>,
 }
 
 /// Runs every rule against already-collected inputs.
@@ -332,6 +339,12 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.member_manifests,
     ));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
+    violations.extend(book::check_book(
+        &inputs.book,
+        inputs.docs.claude_md.as_deref(),
+        inputs.readme.as_deref(),
+    ));
+    violations.extend(book::check_hardware_matrix(&inputs.book));
 
     violations.sort();
     violations.dedup();
@@ -508,6 +521,8 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
     let docs = collect_docs_inputs(root, &graph)?;
 
     Ok(WorkspaceInputs {
+        book: collect_book_inputs(root)?,
+        readme: read_optional(&root.join("README.md"))?,
         metadata_json,
         workspace_manifest,
         member_manifests,
@@ -649,6 +664,71 @@ fn collect_docs_inputs(
         failure_rig_tests: read_optional(&root.join(docs::FAILURE_RIG_TESTS_PATH))?,
         crate_roots,
     })
+}
+
+/// The book, its samples, and the write amplification measured on this run.
+///
+/// The measurement is taken here rather than inside the rule so that every rule stays a
+/// pure function over already-read input. An `Err` travels into the rule and is reported
+/// there: a measurement that did not happen is not a measurement that passed.
+fn collect_book_inputs(root: &Path) -> Result<book::BookInputs, CheckError> {
+    let source_dir = root.join(book::BOOK_SOURCE_DIR);
+    let mut pages = Vec::new();
+    for path in markdown_pages(&source_dir) {
+        let name = path
+            .strip_prefix(&source_dir)
+            .unwrap_or(&path)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        pages.push((name, read_to_string(&path)?));
+    }
+
+    let mut samples = Vec::new();
+    for path in book::BOOK_SAMPLE_FILES {
+        if let Some(contents) = read_optional(&root.join(path))? {
+            samples.push(((*path).to_owned(), contents));
+        }
+    }
+
+    let documents = book::BOOK_DOCUMENT_INCLUDES
+        .iter()
+        .filter(|path| root.join(path).is_file())
+        .map(|path| (*path).to_owned())
+        .collect();
+
+    Ok(book::BookInputs {
+        manifest: read_optional(&root.join(book::BOOK_MANIFEST))?,
+        pages,
+        samples,
+        documents,
+        wear: wear::measure().map_err(|error| error.to_string()),
+    })
+}
+
+/// Every `.md` file under `directory`, in a stable order.
+///
+/// Recursive, so that a page filed in a subdirectory is a page the orphan check sees rather
+/// than a page no rule covers.
+fn markdown_pages(directory: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "md") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// `(package name, crate root)` for every library and binary target of every workspace
@@ -842,6 +922,9 @@ mod tests {
 
     fn broken_inputs() -> WorkspaceInputs {
         WorkspaceInputs {
+            // No book at all, and no measurement, so `book` and `hardware-matrix` fire.
+            book: book::BookInputs::absent(),
+            readme: None,
             metadata_json: BROKEN_METADATA.to_owned(),
             // No [profile.release], no [workspace.lints].
             workspace_manifest: "[workspace]\nmembers = []\n".to_owned(),
@@ -931,6 +1014,7 @@ mod tests {
             "adr-index",
             "adr-numbering",
             "adr-structure",
+            "book",
             "capacity-reserve",
             "cargo-config-profile",
             "ci-pipeline",
@@ -950,6 +1034,7 @@ mod tests {
             "empty-default-features",
             "failure-matrix",
             "hardware-attestation",
+            "hardware-matrix",
             "inputs-incomplete",
             "integrity-check",
             "kernel-boundary",
@@ -1267,6 +1352,8 @@ mod tests {
     /// prove a rule is wired into `check_inputs` when its id is already fired by a sibling.
     fn clean_inputs() -> WorkspaceInputs {
         WorkspaceInputs {
+            book: book::tests_support::clean_book(),
+            readme: Some(book::tests_support::book_link()),
             metadata_json: CLEAN_METADATA.to_owned(),
             workspace_manifest: CLEAN_WORKSPACE_MANIFEST.to_owned(),
             // Every crate the manifest and crate-root rules cover, not only the layers:
