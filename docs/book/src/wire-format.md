@@ -6,8 +6,8 @@ than restating it, because a second copy would pass every check that reads the f
 still say something else.
 
 Twenty-one files of frozen bytes hold the format. The `corpus` CI stage decodes them on
-every push, and the `wire-format` gate rule pins their lengths and digests, so a case is
-added and never regenerated.
+every push. The `wire-format` gate rule pins their lengths and digests. You add a case; you
+never regenerate one.
 
 ---
 

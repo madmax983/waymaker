@@ -5,10 +5,11 @@ effects, in the same order, with the same inputs. This chapter is the contract a
 author works to.
 
 **What Waymaker actually compares is what a replay asks for at a boundary**: the effect's
-position, its kind, its input length and its input digest. A difference there is terminal.
-A difference anywhere else is invisible — including the end of the run, where a replay that
-would conclude differently is answered from history without complaint. Keeping to the
-contract is the author's job; the boundary check is a backstop, not a proof.
+position, its kind, its input length and its input digest. A difference there stops the run.
+
+Waymaker cannot see a difference anywhere else. This includes the end of the run: if a
+replay concludes differently, Waymaker answers from history and reports nothing. The author
+keeps to the contract. The boundary check is a backstop, not a proof.
 
 ## Do not read these directly
 
@@ -49,18 +50,19 @@ Shipping new firmware changes the code between the effects. Waymaker handles tha
 mechanisms.
 
 - A workflow declares a **version range**: the oldest recorded version it can still replay,
-  and the version it writes into a new run. A run recorded outside that range is refused
-  rather than replayed wrongly. Widen before you narrow: an image that moves `oldest` past a
-  version still on devices bricks those runs until an image that can replay them ships
-  again, and nothing in the engine enforces the order a fleet is upgraded in.
-- A **version gate** records which branch the first execution took. Every later boot is
-  given that number back, whatever branch this firmware would have chosen. A gate spends a
-  sequence number, so a gate added, removed or moved is caught by the same ordering check
-  that catches a moved effect.
+  and the version it writes into a new run. Waymaker refuses a run recorded outside that
+  range. It does not replay that run incorrectly.
+- **Widen before you narrow.** Move `oldest` past a version that devices still hold and you
+  brick those runs. They stay bricked until you ship an image that can replay them. The
+  engine does not enforce the order in which you upgrade a fleet.
+- A **version gate** records which branch the first execution took. Every later boot gets
+  that number back. The branch this firmware would choose does not matter. A gate also
+  spends a sequence number, so the ordering check that catches a moved effect also catches a
+  gate you add, remove or move.
 
-To branch on the version the run itself recorded — rather than on the image's own, which is
-the last row of the table above — read it back with `Boundary::recorded_version`. That number
-is a fact about history and is the same on every boot.
+The last row of the table above forbids reading the image's own version. To branch on the
+version the *run* recorded, read it back with `Boundary::recorded_version`. That number is a
+fact about history. It is the same on every boot.
 
 Do not key a gate on a source location. A hash of the file and line changes when a comment
 above it moves, so a reformat becomes a divergence.

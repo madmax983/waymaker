@@ -41,10 +41,11 @@ four operations and a barrier because every port must implement all of it. The
 `waymaker-conformance` is the suite. It is `#![no_std]` and allocation-free, so you can run
 it on the target the driver is for.
 
-It covers four of design document §12's six clauses. Two need a real reset and are the
-across-reset witness's: arm it, reset the board, then verify. Of the remaining four, one is
-the crash injector's rather than the suite's, and one — the part's own rules for programming
-a cell twice — is yours and is in no suite at all.
+The suite covers four of design document §12's six clauses. The other two need a real reset,
+and the across-reset witness holds them: arm the witness, reset the board, then verify.
+
+Two more clauses sit outside the suite. The crash injector holds one. You hold the other: it
+is your part's own rules for programming a cell twice, and no suite checks it.
 
 ## The persistent clock
 
@@ -68,8 +69,9 @@ Implement `PersistentClock` only if the reading really survives power loss.
 
 ### If the board has no such clock
 
-Have `Clocks::capability` answer `ClockCapability::BootOnly`. A workflow that asks for
-`AtPersistentTime` is then refused with `NoPersistentClock`, which is the honest answer. Do not declare `Persistent`
+Have `Clocks::capability` answer `ClockCapability::BootOnly`. Waymaker then refuses a
+workflow that asks for `AtPersistentTime`, and answers `NoPersistentClock`. That is the
+honest answer. Do not declare `Persistent`
 and hope; no code below the board can catch that.
 
 ## Then measure it

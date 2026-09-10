@@ -8,10 +8,12 @@ Read that sentence before you read any API. Everything else in this book follows
 ## What is durable
 
 A workflow calls out to the world at named points. Waymaker calls each of those points an
-**effect**. Before the world is asked, Waymaker writes a record that says the effect is
-about to happen. After the world answers, Waymaker writes a record that says what it
-answered. Each record crosses two barriers: one after its body is programmed, one after the
-seal that commits it.
+**effect**. Waymaker writes a record before it asks the world. That record says the effect will
+happen. After the world answers, Waymaker writes a second record. That record says what the
+world answered.
+
+Each record crosses two barriers. The first barrier comes after the device programs the
+record body. The second comes after the device programs the seal that commits it.
 
 The journal is the ordered list of those records. It, the bank header that names the run, and
 the seal over that header are what survive a reset.
@@ -19,18 +21,19 @@ the seal over that header are what survive a reset.
 ## What is not durable
 
 The workflow's stack, its local variables, and the state machine an `async fn` compiles
-into. None of that is written to media. Waymaker never snapshots a suspended future.
+into. Waymaker writes none of that to media. Waymaker never snapshots a suspended
+future.
 
 ## How a run resumes
 
 After a reset the device re-creates the workflow **from its beginning** and runs it again.
-Each effect the workflow reaches is matched against the journal, in order:
+Waymaker then matches each effect the workflow reaches against the journal, in order:
 
-- If the journal holds a matching outcome, the recorded value is returned and the world is
-  not asked. "Matching" means the effect's kind and its input digest agree with what the
-  workflow just asked for; a mismatch is a divergence, not a replay.
-- If the journal holds a schedule record with no outcome, the same effect is delivered
-  again, under the identity the schedule record committed.
+- If the journal holds a matching outcome, Waymaker returns the recorded value and asks the
+  world nothing. A match means that the effect's kind and its input digest agree with what
+  the workflow just asked for. A mismatch is a divergence, not a replay.
+- If the journal holds a schedule record with no outcome, Waymaker delivers the same effect
+  again. It uses the identity that the schedule record committed.
 - If the journal holds nothing more, this is new work. Waymaker schedules it.
 
 Replay is therefore fast-forward through recorded history. It is not a restoration of a
@@ -47,7 +50,7 @@ each effect in turn.
 
 ## What that buys
 
-Re-run the same workflow over the same journal and the world is asked nothing.
+Run the same workflow again over the same journal. Waymaker asks the world nothing.
 
 ```rust,ignore
 {{#include ../../../crates/waymaker-drive/tests/book.rs:a_replayed_run_asks_the_world_nothing}}
