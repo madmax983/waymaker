@@ -143,6 +143,7 @@ up automatically, including the `thumbv6m-none-eabi` target the firmware build n
 
 ```sh
 cargo xtask install-hooks   # once per clone: generates .githooks/pre-commit and points git at it
+cargo install mdbook --locked   # only to build the book; no other stage needs it
 ```
 
 The pipeline, in order:
@@ -168,6 +169,7 @@ cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
+cargo --locked xtask book
 cargo --locked xtask check-layering
 ```
 
@@ -429,6 +431,8 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `settled-decisions` | the ADR recording design document §02 stops recording one of the eight decisions, or its headline |
 | `deferred-questions` | one of design document §16's five open questions loses its row in `CLAUDE.md`, a settled one's ADR is missing, unaccepted or does not claim it, or an ADR settles one the table still calls open |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge |
+| `book` | the book stops being the book issue #42 asks for: a chapter loses its file or its link in `SUMMARY.md`, a file appears under `docs/book/src` that `xtask::book::BOOK_CHAPTERS` does not declare, a fence carries source rather than an `include` of a tested sample, a line carries a directive and something else, a directive that is not `{{#include}}` appears, a line is indented four spaces, an `include` names a file no stage runs or an anchor with no unignored `#[test]` of its name, an anchor does not contain that test and is not a declared fixture, an anchor no chapter shows is declared, the wire-format chapter restates the frozen format instead of including it, the failure or non-goal chapter drops a row, or `CLAUDE.md` and `README.md` stop linking the book's summary |
+| `hardware-matrix` | the matrix stops covering every part: a `xtask::docs::HARDWARE_TARGETS` board or a `xtask::wear::PARTS` model has no row, the chapter's table is not the pinned header followed by every derived row cell for cell, the chapter says `Passed` while no row renders it, or a modelled part's write-amplification figure could not be measured |
 | `missing-docs` | a crate root loses `#![warn(missing_docs)]`, allows it back, or a workspace member has no crate root the rule could run on |
 
 The contract lives in one table, [`xtask/src/policy.rs`](xtask/src/policy.rs), transcribed
@@ -444,6 +448,7 @@ decision record and the architecture diagrams from drifting away from the other 
 | --- | --- |
 | [`CLAUDE.md`](CLAUDE.md) | The invariants, the layering rules, the must-not-own table, and every rule the gate can fail you over. Start here. |
 | [`docs/architecture.md`](docs/architecture.md) | The crate dependency flow, the seven-step durable effect protocol, and the two-bank swap, as Mermaid diagrams. |
+| [`docs/book/`](docs/book/src/SUMMARY.md) | The book: the design centre, the determinism contract, the effect protocol, the failure semantics, the wire format, what is not promised, the porting guide, and the hardware compatibility matrix. Rendered by `cargo xtask book`. |
 | [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) | The frozen v1 wire format, byte by byte. What a porter implements from, and what the `corpus` stage holds. |
 | [`docs/adr/`](docs/adr/README.md) | The decision record: why each settled decision is the way it is, and what it costs. |
 | [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html) | The design document everything above is taken from. |

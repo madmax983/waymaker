@@ -1,0 +1,24 @@
+# The Waymaker book.
+#
+# `cargo xtask book` renders it. The stage runs that rather than `mdbook build` because
+# mdBook exits zero for an include it cannot resolve and for an anchor it cannot find, so a
+# stage that ran the renderer alone would pass on a book with holes in it.
+#
+# What the chapters must say is the `book` and `hardware-matrix` rules of
+# `cargo xtask check-layering`.
+
+[book]
+title = "Waymaker"
+description = "A firmware-first durable workflow engine for Rust."
+authors = ["Waymaker contributors"]
+language = "en"
+src = "src"
+
+[build]
+# Under `target/`, so the rendered HTML is ignored by the line that ignores every other
+# build product.
+build-dir = "../../target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/madmax983/waymaker"

@@ -27,6 +27,7 @@
 
 #![warn(missing_docs)]
 
+pub mod book;
 pub mod coverage;
 pub mod docs;
 pub mod elf;
@@ -52,6 +53,7 @@ pub const RULES: &[&str] = &[
     "adr-index",
     "adr-numbering",
     "adr-structure",
+    "book",
     "capacity-reserve",
     "cargo-config-profile",
     "ci-pipeline",
@@ -72,6 +74,7 @@ pub const RULES: &[&str] = &[
     "failure-matrix",
     "gate-broken",
     "hardware-attestation",
+    "hardware-matrix",
     "inputs-incomplete",
     "integrity-check",
     "kernel-boundary",
@@ -232,6 +235,10 @@ pub struct WorkspaceInputs {
     pub driver_sources: Vec<size::LayerSource>,
     /// `CLAUDE.md`, the decision record, the diagrams, and every crate root.
     pub docs: docs::DocsInputs,
+    /// The book, its samples, and the write amplification measured on this run.
+    pub book: book::BookInputs,
+    /// Contents of `README.md`, which is where a reader is pointed at the book.
+    pub readme: Option<String>,
 }
 
 /// Runs every rule against already-collected inputs.
@@ -333,6 +340,12 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.member_manifests,
     ));
     violations.extend(docs::check_documentation(&inputs.docs, RULES));
+    violations.extend(book::check_book(
+        &inputs.book,
+        inputs.docs.claude_md.as_deref(),
+        inputs.readme.as_deref(),
+    ));
+    violations.extend(book::check_hardware_matrix(&inputs.book));
 
     violations.sort();
     violations.dedup();
@@ -509,6 +522,8 @@ pub fn collect_inputs(root: &Path) -> Result<WorkspaceInputs, CheckError> {
     let docs = collect_docs_inputs(root, &graph)?;
 
     Ok(WorkspaceInputs {
+        book: book::collect(root),
+        readme: read_optional(&root.join("README.md"))?,
         metadata_json,
         workspace_manifest,
         member_manifests,
@@ -843,6 +858,9 @@ mod tests {
 
     fn broken_inputs() -> WorkspaceInputs {
         WorkspaceInputs {
+            // No book at all, and no measurement, so `book` and `hardware-matrix` fire.
+            book: book::BookInputs::absent(),
+            readme: None,
             metadata_json: BROKEN_METADATA.to_owned(),
             // No [profile.release], no [workspace.lints].
             workspace_manifest: "[workspace]\nmembers = []\n".to_owned(),
@@ -932,6 +950,7 @@ mod tests {
             "adr-index",
             "adr-numbering",
             "adr-structure",
+            "book",
             "capacity-reserve",
             "cargo-config-profile",
             "ci-pipeline",
@@ -951,6 +970,7 @@ mod tests {
             "empty-default-features",
             "failure-matrix",
             "hardware-attestation",
+            "hardware-matrix",
             "inputs-incomplete",
             "integrity-check",
             "kernel-boundary",
@@ -1268,6 +1288,8 @@ mod tests {
     /// prove a rule is wired into `check_inputs` when its id is already fired by a sibling.
     fn clean_inputs() -> WorkspaceInputs {
         WorkspaceInputs {
+            book: book::tests_support::clean_book(),
+            readme: Some(book::tests_support::book_link()),
             metadata_json: CLEAN_METADATA.to_owned(),
             workspace_manifest: CLEAN_WORKSPACE_MANIFEST.to_owned(),
             // Every crate the manifest and crate-root rules cover, not only the layers:
