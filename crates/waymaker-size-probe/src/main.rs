@@ -962,6 +962,9 @@ fn record_codec() -> usize {
     kept = kept.wrapping_add(usize::from(frame::permits_unknown_record_skip(
         core::hint::black_box(1),
     )));
+    kept = kept.wrapping_add(usize::from(frame::reads_format_version(
+        core::hint::black_box(1),
+    )));
     kept = kept.wrapping_add(align.round_up(core::hint::black_box(21)).unwrap_or(0));
 
     let mut page = [0_u8; 64];

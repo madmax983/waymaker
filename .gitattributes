@@ -1,0 +1,4 @@
+# The v1 format conformance corpus is frozen bytes. Git must never rewrite a byte of it:
+# an end-of-line conversion on a checkout would turn a wire-format fixture into a different
+# journal, and the test that noticed would look like a format break rather than a checkout.
+crates/waymaker-flash/tests/corpus/**/*.bin binary

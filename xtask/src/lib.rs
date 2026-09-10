@@ -98,6 +98,7 @@ pub const RULES: &[&str] = &[
     "toolchain-targets",
     "transition-surface",
     "version-gate",
+    "wire-format",
     "workspace-lints",
     "workspace-membership",
 ];
@@ -325,6 +326,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
         &inputs.driver_sources,
     ));
     violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));
+    violations.extend(source::check_wire_format(&inputs.layer_sources));
     violations.extend(source::check_codec_is_optional(
         &inputs.layer_sources,
         &inputs.member_manifests,
@@ -641,6 +643,8 @@ fn collect_docs_inputs(
         spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
         failure_rows: read_optional(&root.join(docs::FAILURE_ROWS_PATH))?,
+        wire_format_spec: read_optional(&root.join(docs::WIRE_FORMAT_SPEC_PATH))?,
+        wire_format_corpus: read_corpus(&root.join(docs::WIRE_FORMAT_CORPUS_DIR))?,
         failure_model_tests: read_optional(&root.join(docs::FAILURE_MODEL_TESTS_PATH))?,
         failure_rig_tests: read_optional(&root.join(docs::FAILURE_RIG_TESTS_PATH))?,
         crate_roots,
@@ -722,6 +726,30 @@ fn is_executable(_path: &Path) -> Option<bool> {
 fn read_to_string(path: &Path) -> Result<String, CheckError> {
     std::fs::read_to_string(path)
         .map_err(|err| CheckError::new(format!("could not read {}: {err}", path.display())))
+}
+
+/// Every `.bin` file in `dir`, by name, with its bytes, in name order.
+///
+/// A directory that is not there reads as no files, which `wire-format` reports rather than
+/// skips: a corpus that cannot be read is a freeze nothing is enforcing.
+fn read_corpus(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, CheckError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| CheckError::new(format!("could not list {}: {err}", dir.display())))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "bin") {
+            let bytes = std::fs::read(&path).map_err(|err| {
+                CheckError::new(format!("could not read {}: {err}", path.display()))
+            })?;
+            files.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
 }
 
 pub(crate) fn run_cargo_metadata(root: &Path) -> Result<String, CheckError> {
@@ -872,6 +900,9 @@ mod tests {
                 storage_clauses: None,
                 // Nor the failure matrix's three files, so `failure-matrix` fires.
                 failure_rows: None,
+                // Nor the byte-by-byte format document, so `wire-format` fires.
+                wire_format_spec: None,
+                wire_format_corpus: Vec::new(),
                 failure_model_tests: None,
                 failure_rig_tests: None,
                 crate_roots: vec![docs::CrateRoot {
@@ -946,6 +977,7 @@ mod tests {
             "toolchain-targets",
             "transition-surface",
             "version-gate",
+            "wire-format",
             "workspace-lints",
             "workspace-membership",
         ]
@@ -1102,12 +1134,21 @@ mod tests {
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::INTEGRITY_ROUTING_PATH),
-                    contents: source::tests_support::clean_integrity_routing(),
+                    // Plus the frozen constants `wire-format` reads out of the same file.
+                    // Appended rather than given a row of their own: two rows for one path
+                    // would make every pin on it read whichever came first.
+                    contents: source::tests_support::clean_integrity_routing()
+                        + &source::tests_support::clean_frozen_format_module(
+                            source::INTEGRITY_ROUTING_PATH,
+                        ),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::BANK_ROUTING_PATH),
-                    contents: source::tests_support::clean_bank_routing(),
+                    contents: source::tests_support::clean_bank_routing()
+                        + &source::tests_support::clean_frozen_format_module(
+                            source::BANK_ROUTING_PATH,
+                        ),
                 },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),

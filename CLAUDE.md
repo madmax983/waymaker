@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 52 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 53 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -43,6 +43,7 @@ cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --featu
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask check-layering
 ```
 
@@ -96,7 +97,7 @@ All 5 deferred questions, with the id to cite when a change touches one:
 | `retry-policy-placement` | Whether retry policy belongs in the Embassy façade or remains workflow code. | Open, owned by rung 0.4 · embassy. Settles when the dispatcher exists and the cost of a recorded retry representation can be measured against reimplementing backoff in every workflow. |
 | `effect-scheduled-metadata` | How much input metadata an EffectScheduled record stores beyond length and digest. | [Settled by 0011-a-scheduled-effect-records-a-length-and-a-digest.md](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md): `seq`, `kind`, `input_len`, `input_crc`, and nothing else. |
 | `explicit-state-snapshots` | Whether a future explicit-state workflow API may support true storage snapshots. | Open, owned by after rung 1.0. Settles when a non-async, explicit-state API has been designed far enough that the snapshot it would take can be described in records, without relaxing the no-snapshotted-futures decision for the async façade. |
-| `wire-format-migration` | How stable wire-format migration is performed after a deployed fleet outlives v1. | Open, owned by rung 1.0. Settles when the version-marker record of §09 is implemented and a fleet with two format versions in it can be described end to end. |
+| `wire-format-migration` | How stable wire-format migration is performed after a deployed fleet outlives v1. | [Settled by 0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md): the format is frozen byte by byte with a committed corpus, the read side is a set and the write side one number, and migration is a new bank at a `continue_as_new` boundary. |
 
 An ADR that answers one carries `Settles deferred question:` and the id; the row in
 `DEFERRED_QUESTIONS` moves from `Open` to `Settled` in the same change. Writing the ADR
@@ -200,6 +201,52 @@ where no such operation exists the case says so rather than reaching somewhere u
 `xtask::policy::LAYERS` are empty — only `waymaker-embassy` has entries, and only for issue
 #37's optional codecs — so the kernel growing that dependency fails
 `kernel-zero-dependencies` and `waymaker-flash` growing it fails `dependency-direction`.
+
+## The frozen wire format
+
+Design document §09 states the journal and the wire format, and issue
+[#41](https://github.com/madmax983/waymaker/issues/41) freezes it at v1. The promise is
+one-directional and worth stating in those words: **records a shipped device wrote stay
+readable by every later 1.x firmware.** An earlier firmware meeting a later record kind
+stops, so downgrade is not supported —
+[ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md) is
+the policy and settles §16's fifth deferred question.
+
+The format is stated byte by byte in
+[`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md): the frame, the commit
+seal, the record table, the bank header, the generation seal, and both check algorithms with
+their parameters. That document is what a porter implements from, and the `wire-format` rule
+is what stops it drifting from the code.
+
+Three things hold the freeze, and they hold different halves of it:
+
+- **The corpus** — [`crates/waymaker-flash/tests/corpus/v1`](crates/waymaker-flash/tests/corpus/v1/README.md),
+  twenty-one files of frozen bytes, run by `crates/waymaker-flash/tests/corpus.rs` as the
+  `corpus` CI stage. It and the `wire-format` rule are the two things here that notice a
+  *renumbering*, and they notice differently — the rule names the constant, the corpus holds
+  the byte. Nothing else can: the encoder takes a kind's number from `RecordRef::kind` and
+  the decoder matches the same constants, so swapping two leaves every round trip, every
+  property test and every crash sweep green. The
+  bytes were produced by an encoder written from the field list rather than from `frame.rs`,
+  and that encoder reproduces `tests/frame.rs`'s golden frames byte for byte. A case is
+  added, never regenerated.
+- **The `wire-format` rule** — the frozen numbers, the record numbering in both directions,
+  the specification document, and the corpus's own lengths and digests. That last one is what
+  makes "a case is added, never regenerated" a build failure: regenerating a case means
+  editing a digest a reviewer can see.
+- **The read set** — `frame::reads_format_version` is the format versions this firmware
+  reads and `FORMAT_VERSION` is the one it writes. Both decoders take their answer from the
+  predicate, and `tests/frame.rs` and `tests/bank.rs` each hold theirs to it over all 256
+  values a version byte can hold. At v1 the set is a single value, so the mechanism costs
+  nothing and reads as an equality; it stops reading as one the day a transition firmware
+  widens it, which is the day a range that reached one decoder and not the other would be
+  found by a fleet rather than by a test.
+
+Migration is §10's swap and nothing new: a bank is single-version by construction, so the
+retiring bank is read at its own version and the installing bank written at the new one, and
+steps 5 and 6 of the swap are the format transition — the seal programmed at 5 and durable
+at 6. ADR 0037 states the fleet end to end, and says plainly that the rollout is one-way
+while it runs.
 
 ## What the boards still owe
 
@@ -597,7 +644,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 52 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 53 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -612,6 +659,7 @@ this table is how you find out what a red build is telling you.
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than `source::EFFECT_SCHEDULED_FIELDS`, in either direction — or the module is gone, so the pin checks nothing. [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) settles §16's third deferred question at four fields and 24 bytes on media; a fifth is 17% more journal on every effect for the life of the format, and a fourth removed is a wire-format change on a record firmware in the field has already written. |
 | `timer-record-fields` | `RecordRef::TimerScheduled` or `RecordRef::TimerFired` declares a field set other than `source::TIMER_RECORD_FIELDS`, in either direction — or the `enum RecordRef` body is gone, so the pin checks nothing. `effect-scheduled-fields`'s twin, and a rule of its own because the two settle different things: ADR 0011 settled how much metadata a scheduled effect carries, and this settles which facts about *time* reach media. Two fields are the point. §11 says a persistent timer record includes its clock kind "so recovery cannot silently reinterpret one policy as another": a record carrying the deadline alone decodes without error and means something else after a firmware change, and nothing downstream can tell. And `armed_at` is the monotonicity floor a persistent deadline is measured against — it lives in RAM, a power cut takes RAM, and this is what carries it across the reset. In the other direction a `remaining`, a `fired_at` or a payload on the firing is bytes on every timer for the life of the format. What it cannot see is a *width*: it compares names, so a `deadline` narrowed to a `u32` is `crates/waymaker-flash/tests/frame.rs`'s golden bytes. [ADR 0030](docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md). |
 | `version-gate` | Design document §08's workflow versioning stops being the one that was reviewed, in any of its four halves. The *record* half: `RecordRef::VersionMarker` declares a field set other than `source::VERSION_MARKER_FIELDS`, in either direction, or the `enum RecordRef` body is gone or declared twice so the pin checks nothing. `effect-scheduled-fields`'s and `timer-record-fields`'s third twin. `version` is the branch, and without it the record says a decision was taken and not which one; `gate` is the field that reads as redundant beside the sequence and is not, because two gates that swapped places keep every sequence and the sequence check cannot see them. In practice the *compiler* is the first line of defence here — a field added or renamed breaks four exhaustive matches across three crates — and the pin is the second. The *surface* half: `waymaker-core/src/version.rs` gains or loses a public function `source::VERSION_GATE_SURFACE` lists. A `VersionRange::any()`, a `widen`, an `admits_or_default` or a `GateId::from_location` would each break no layering rule, need no dependency, and turn §08's "a firmware image that cannot replay the recorded version returns `IncompatibleWorkflow`" into a preference. The *shape* half: `VersionRange` is declared twice, stops being a braced struct, declares a public field, declares an associated constant, or declares a method set other than `source::VERSION_RANGE_METHODS` — read at *every* visibility; or the module declares a submodule, a `type VersionRange` alias, a `fn` outside the pinned `impl`, or a macro invocation inside it; or `waymaker-core/src/lib.rs` stops re-exporting `version::VersionRange` by that *source* name. `oldest <= current` is the whole invariant and every one of those is a way to give it back: review of this change ran all six and watched a three-check version print `ok` on each. The associated constant is `timer-capability`'s third recorded defeat, the module-scope `fn` is `dispatch-wiring`'s, the macro is the board half's, and the rename-plus-decoy is the one `timer-capability` grew a crate-root half for — met here rather than inherited. The *identity* half is §08's fourth rule: `waymaker-core/src/version.rs` or `waymaker-core/src/transition.rs` invokes one of `source::SOURCE_LOCATION_MACROS` — `file!`, `line!`, `column!`, `module_path!` — imports one under an alias, or names one of `source::SOURCE_LOCATION_CALLERS`, which is `core::panic::Location`'s route to the same three numbers with none of the macros spelled. §08 says source-location hashes are **not** stable identity, and the failure is the quiet one: a gate keyed on `line!()` changes identity when a comment above it moves, so a reformatting is a divergence and a moved function is a run that can never be replayed. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is a function added from a *sibling* module — an `impl VersionRange` in `activity.rs` is invisible, the limit `capacity-reserve`, `recovery-surface` and `storage-contract` each record — and it cannot reach the modules where a `GateId` is *chosen*, which is where §08's fourth rule actually bites; [what is not checked](#what-is-not-checked) says so rather than leaving the ban looking exhaustive. It compares *names*, so an `admits` that stopped consulting its argument is `crates/waymaker-core/tests/version.rs`'s. [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md). |
+| `wire-format` | Design document §09's frozen v1 format stops being the one that was reviewed, in any of its three halves. The *numbers* half: a row of `docs::WIRE_FORMAT_CONSTANTS` — twenty of them: the three magics, the two format-version numbers, the frame's header, trailer and check widths, the seal's pattern width and its mask, the erased byte, the widest payload, the four record-body widths, and the bank header's prefix, trailer and seal widths — is not declared, is declared twice, or is declared with another literal, in the file its row names. The literal rather than the value, because a rule that evaluated `HEADER_BYTES + TRAILER_BYTES` would be a second implementation of the arithmetic it checks. The *numbering* half: `waymaker-core`'s record module numbers a `RecordKind` differently from `docs::WIRE_FORMAT_RECORD_KINDS`, declares none of them, or declares one the table does not name — both directions, because a kind renumbered and a kind added are the same failure from two ends. A renumbering is the format break nothing else here can see: the encoder takes a kind's number from `RecordRef::kind` and the decoder matches the same constants, so swapping two leaves every round trip, every property test and every crash sweep green and makes every journal a shipped device wrote unreadable. The *specification* half: [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) is missing, or no line of it states a frozen constant beside its value or a record beside its number — one line rather than the whole document, because a bare `contains("1")` cannot fail for any document and `contains("4")` cannot fail for this one; or `CLAUDE.md` stops linking it or stops naming the corpus, or [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md) is missing or unaccepted. The *corpus* half: [`crates/waymaker-flash/tests/corpus/v1`](crates/waymaker-flash/tests/corpus/v1/README.md) is empty, or a file of it is missing, is another length, carries another digest, or is not named by `docs::WIRE_FORMAT_CORPUS_FILES` — which is what makes "a case is added, never regenerated" a build failure rather than a sentence in a README. What it cannot see is a *width* behind a name already on the list — a `deadline` narrowed to a `u32` changes no constant and no kind number — which is the corpus's and `crates/waymaker-flash/tests/frame.rs`'s golden frames'; and it pins three files — `frame.rs`, `bank.rs` and `record.rs` — which is the limit `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one they pin, met three times. [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md). |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts, in any of the four files that have one. In `waymaker-flash/src/frame.rs`: a body pinned by `source::SEALING_FUNCTIONS` stops computing the seals its row names exactly once, or the file names `crc16` or `crc32` anywhere outside `input_digest` — the one documented exception, because a `const fn` cannot go through a trait method — or `decode_with` and `frame_len_of_with` stop verifying a header through `verify_header_with`, or the scan's `next` stops walking with `decode_with`. The rows are *derived* rather than whitelisted: a function generic over the check that no row pins is a body that can compute a seal and is pinned by nothing, and the scan that finds them reads joined signatures and generic `impl` blocks, because a `where` clause and a method in `impl<C: IntegrityCheck>` each escaped a one-line scan. The same in `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names. And in `waymaker-flash/src/append.rs`, which is the writer: its `stage` must reach the codec through `frame::encode_with::<C>` — one call covers both the frame and its commit seal, because the seal is derived from the check the codec just computed — and it may name neither a checksum function nor a seal method. Without it, `frame::encode` in place of the generic sibling would seal every appended record with the shipped check whatever the recovery that positioned the writer verified with, which is a journal one half of a firmware can read. And in `waymaker-flash/src/recovery.rs`, which computes no seal at all: its two steps must reach the codec through `frame::decode_with::<C>` and `frame::frame_len_of_with::<C>`, and the file may name neither a checksum function nor a seal method — `Recovery<C>`'s parameter is a promise that a journal is verified with the algorithm that sealed it, and dropping both turbofishes passed every rule and every test before this existed. And in `waymaker-flash/src/swap.rs`, which installs a bank: its `stage` must reach the bank codec through `bank::encode_header_with::<C>`, `bank::seal_for_with::<C>` and `bank::encode_seal_with::<C>`, and the file may name neither a checksum function nor a seal method — a device whose two banks were sealed by two algorithms is a device only half of which boots. A trait nothing is obliged to call is a swap point that selects nothing. A firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
 | `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
@@ -1370,6 +1418,56 @@ Stated so that nobody mistakes silence for coverage:
   before it returns rather than after. `crates/waymaker-drive/tests/versioning.rs` measures
   the durable half; the torn half is a state no test can assert a branch about, because there
   is no branch.
+- **That a corpus file is the byte sequence a v1 device really wrote.** The corpus was
+  produced by an encoder written from the field list rather than from `frame.rs`, which is a
+  cross-check between two independent implementations and not a reading off a device. One
+  case is the artifact of that cross-check — `record-08-run-failed.bin` against
+  `golden::RUN_FAILED` — and the rest of it left nothing behind. No board has written a
+  journal, which is the same absence
+  [what the boards still owe](#what-the-boards-still-owe) records for everything else.
+- **That a record kind added later joins the corpus, if it is added without a `RecordRef`
+  variant.** The census derives what a writer produces from `RecordRef`'s variants through an
+  exhaustive `match`, so a reserved kind given a body is a compile error in
+  `crates/waymaker-flash/tests/corpus.rs` and then a census failure. A number written to
+  media by something that is not a `RecordRef` is outside it — and so is a macro-generated
+  `pub const` in `record.rs`, which `wire-format`'s numbering scan cannot see either.
+- **That `reads_format_version` is the *right* set, only that it is the range its two
+  constants name.** Three `const` assertions in `frame.rs` pin the predicate's ends and
+  `wire-format` freezes both literals, so the body cannot quietly lose a bound — review of
+  this change deleted the lower one and watched the whole workspace stay green before they
+  existed. What no rule can say is whether a version belongs in the set: that is
+  [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md)'s
+  reasoning about bodies, not a number.
+- **A width behind a name the frozen table already carries.** `wire-format` compares
+  *literals* against constant declarations and *numbers* against record kinds, exactly as
+  `effect-scheduled-fields` compares names: a `deadline` narrowed from a `u64` to a `u32`
+  changes no constant and no kind number. The corpus and `crates/waymaker-flash/tests/frame.rs`'s
+  golden frames are what hold the layout.
+- **A frozen constant declared in a sibling module.** `wire-format` reads
+  `waymaker-flash/src/frame.rs`, `waymaker-flash/src/bank.rs` and
+  `waymaker-core/src/record.rs`. A `const MAGIC` declared elsewhere and imported is a
+  declaration the rule is silent about — the limit `capacity-reserve`, `recovery-surface`
+  and `storage-contract` each record for the one file they pin.
+- **That widening the read set is sound.** `frame::reads_format_version` is a range, and it
+  is sound only while a later format version adds record kinds and changes none of the ones
+  below it. A version that changed an existing body would have to be refused rather than
+  admitted, and nothing mechanical can tell the two apart: the constant is one line and the
+  reasoning is
+  [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md)'s.
+  It is a decision somebody takes, not a number somebody moves.
+- **A downgrade that reclaims a run.** An image meeting a record kind newer than itself stops
+  with `UnknownRecordKind`, recovery ends `Damaged`, and a damaged recovery is exactly the
+  input §10 says to recycle — so `Swap::beginning` accepts it and the old image may
+  `continue_as_new` over a run a newer image could have finished. Recovery is doing the right
+  thing with the information it has; what it does not have is that the damage is a record
+  from the future. `Ending` does not distinguish the two, and separating them is a variant
+  and four exhaustive matches that would change no decision the driver takes. Rolling a fleet
+  back past a record kind is a data-loss operation, and ADR 0037 is where that is written
+  down rather than implied.
+- **That the ordering of a format migration's two images was respected.** ADR 0037 ships the
+  reading image before the writing one. A device that meets a `v+1` bank with a `v`-only
+  reader has no authority at all, and no binary can check the order a fleet was upgraded in —
+  the same standing ADR 0036 records for widening `oldest` before narrowing `current`.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise.
 
@@ -2277,6 +2375,45 @@ differently on the next boot; the façade has no gate future, so a gate is reach
 the synchronous driver alone; and `waymaker-spec` does not model markers, because a
 self-resolving record opens no boundary and §14's six guarantees are unchanged by it. See
 [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md).
+
+Issue #41 is the second thing rung 1.0 owed, and it is a promise rather than a feature:
+after it, records a shipped device wrote stay readable by every later 1.x firmware. Three
+things stood in the way of writing it down. The format was frozen in prose and nowhere else —
+every test in `waymaker-flash` drives the encoder and the decoder together, so a kind
+renumbered or a field reordered moves both sides at once and every round trip still passes.
+A reader's obligation on a record kind it does not know was a *behaviour* rather than a
+rule, and "stop" is only half of it: a reader that stopped and then appended, or stopped and
+then truncated, loses a committed record while obeying the half that was written down. And
+the read side was an **equality** — `decode` refused any version but `FORMAT_VERSION`, and so
+did the bank header reader, so a fleet in a format transition could not be described in the
+code at all. That last one is §08's `workflow_version` defect met one layer down, in the
+bytes rather than in the workflow, and ADR 0036 had already fixed it above.
+[`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) is the format byte by byte;
+the corpus is twenty-one files of frozen bytes produced by an encoder written from that
+field list rather than from `frame.rs` — six of them wide, carrying a distinct non-zero byte
+in every position of every multi-byte field, because the rest cannot say a width narrowed —
+run as a CI stage of its own, because a red `corpus` says a byte a shipped device wrote is no
+longer a byte this firmware reads, which is the one failure here whose blast radius is a
+fleet rather than a branch. `frame::reads_format_version` is the
+read set, both decoders take their answer from it, and each is held to it over all 256 values
+a version byte can hold. It costs **0 B** of code flash: the layers measure 12820 B of 13312,
+exactly where ADR 0036 left them. The `wire-format` rule is the third holder — the frozen
+numbers, the record numbering in both directions, the specification document read a line at a
+time, and the corpus's own lengths and digests — and it
+was watched failing on every mutation its own test modules name, the sharpest being a
+renumbered `RUN_STARTED`, a kind added to the kernel that nothing wrote down, a regenerated
+corpus file, and the bank header reader reverted to the equality the predicate replaced —
+which review of this change ran with the whole workspace green before the routing pin
+existed. Migration is §10's swap
+and nothing new: a bank is single-version by construction, so read-old/write-new is what two
+banks already are, and steps 5 and 6 are the format transition. What is owed is written
+down: the
+corpus is a cross-check between two implementations rather than a reading off a board;
+widening the read set is sound only while a version adds kinds and changes none, which no
+rule can tell; and a downgrade past a new record kind may reclaim a run, because recovery
+reads a record from the future as damage and §10 recycles a damaged bank. Issue #42's book is
+where this document becomes a chapter. See
+[ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The

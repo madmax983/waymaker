@@ -248,6 +248,9 @@ jobs:
       - name: Run the failure matrix
         run: cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 
+      - name: Run the v1 format conformance corpus
+        run: cargo test --locked -p waymaker-flash --no-default-features --test corpus
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash

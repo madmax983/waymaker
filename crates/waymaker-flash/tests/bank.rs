@@ -672,6 +672,44 @@ fn a_header_from_another_format_version_is_refused_before_its_body_is_read() {
 }
 
 #[test]
+fn the_header_reader_reads_exactly_the_format_versions_the_range_declares() {
+    // The bank header's half of issue #41's promise. A fleet in a format transition boots an
+    // image that reads both banks and writes one, so the header reader and the frame reader
+    // have to answer the same question the same way — and they do, because both ask
+    // `reads_format_version`. This is what fails if one of them stops asking.
+    let mut read = 0_usize;
+    let mut refused = 0_usize;
+    for version in 0..=u8::MAX {
+        let mut media = [0_u8; 64];
+        bank::encode_header(&header(b"in"), &mut media).expect("it fits");
+        media[2] = version;
+        let resealed = Catalogued::header_check(&media[..20]).to_le_bytes();
+        media[20] = resealed[0];
+        media[21] = resealed[1];
+        let frame_crc = Catalogued::frame_check(&media[..24]).to_le_bytes();
+        media[24..28].copy_from_slice(&frame_crc);
+
+        let decoded = bank::decode_header(&media);
+        if frame::reads_format_version(version) {
+            assert!(
+                decoded.is_ok(),
+                "version {version} is declared readable and the header reader refused it"
+            );
+            read += 1;
+        } else {
+            assert_eq!(decoded, Err(DecodeError::UnsupportedFormatVersion));
+            refused += 1;
+        }
+    }
+    assert_eq!(read + refused, 256);
+    assert!(read > 0, "the range declares no readable version at all");
+    assert!(
+        refused > 0,
+        "every version is readable, so the version byte decides nothing"
+    );
+}
+
+#[test]
 fn a_program_shift_no_device_has_is_refused() {
     // `ProgramAlign` is a `u16`, so the largest granularity is `1 << 15`. A shift of 16 or
     // more describes a device that cannot exist, and a reader that accepted it would stride
