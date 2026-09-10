@@ -581,17 +581,29 @@ anybody writing the words are exactly the routes nobody is watching.
 
 `cargo xtask profile` is the measurement. Valgrind intercepts `malloc` in the binary, below
 anything Rust can express, so it needs no global allocator and none of the `unsafe` this
-workspace denies — which is what the argument against measuring this had always been. Two
-workloads drive real library code over `waymaker-fault`'s model of NOR: `journal`, which is
-§09's frame codec and commit seal, §10's reserve and the recovery scan under the rig, and
-`driver`, which is §06's boundary and §07's effect protocol run to a terminal record. Two
-rather than one because the engine has two halves that meet nowhere else, and a single
-workload would publish a zero about whichever half it happened to drive.
+workspace denies — which is what the argument against measuring this had always been. Four
+workloads drive real library code over `waymaker-fault`'s model of NOR, one per part of the
+engine the others do not reach:
+
+| Workload | Drives | Reaches |
+| --- | --- | --- |
+| `journal` | §09's frame codec and commit seal, §10's reserve and the recovery scan, under the rig | core, flash, rig |
+| `driver` | §06's boundary and §07's effect protocol, run to a terminal record | core, flash, drive |
+| `facade` | §06's OTA example through `poll_ota` — `Ctx` and its four futures | core, flash, drive, embassy |
+| `conformance` | §12's storage contract, as `waymaker-conformance` runs it | flash, conformance |
+
+The "Reaches" column is measured rather than declared, and a run in which the four together
+do not reach every gated crate fails. That is not a hypothetical: the first version of this
+gate had two workloads and six gated crates, so `waymaker-embassy` — linked through
+`waymaker-drive` and executed by nothing — and `waymaker-conformance` — not in the dependency
+graph at all — were held to zero blocks in name while nothing looked at either. A crate no
+workload executes scores the zero a deleted crate would score.
 
 | Measured | Gate | Where it stands |
 | --- | --- | --- |
-| Heap blocks allocated by an engine crate | 0, by `profile::ENGINE_HEAP_BLOCKS` | 0 on both workloads, against 16 blocks the harness and the runtime allocated in the same process |
-| Instructions executed in engine code | none — §04 states no target | `journal` 544 281 Ir over 8 effects; `driver` 41 709 over 2 |
+| Heap blocks allocated by an engine crate | 0, by `profile::ENGINE_HEAP_BLOCKS` | 0 on all four workloads, against 16 blocks the harness and the runtime allocated in the same process |
+| Every gated crate reached by some workload | all 6, or the run fails naming the gap | all 6 |
+| Instructions executed in engine code | none — §04 states no target | `journal` 545 096 Ir over 8 effects; `driver` 41 788 over 2; `facade` 50 842 over 3; `conformance` 486 292 over 22 cases |
 
 The engine is the three layers plus `policy::NO_STD_TEST_SUPPORT_CRATES`, derived from the
 layering table rather than listed again, so a crate joining either category is gated without
@@ -1535,10 +1547,12 @@ Stated so that nobody mistakes silence for coverage:
   reading image before the writing one. A device that meets a `v+1` bank with a `v`-only
   reader has no authority at all, and no binary can check the order a fleet was upgraded in —
   the same standing ADR 0036 records for widening `oldest` before narrowing `current`.
-- **A path through the engine that no workload takes.** `cargo xtask profile` measures two
-  runs. `WORKLOADS` reaches §09's codec, §10's reserve, the recovery scan, §06's boundary and
-  §07's protocol; it reaches no bank swap, no `continue_as_new`, no capacity refusal, no
-  divergent replay and no timer — the same four rows
+- **A path through the engine that no workload takes.** `cargo xtask profile` measures four
+  runs, and every *crate* it gates is reached by one of them — that much is checked, and a
+  run where it stops being true fails. What is not checked is every *path*. `WORKLOADS`
+  reaches §09's codec, §10's reserve, the recovery scan, §06's boundary, §07's protocol,
+  §12's contract and the façade's four futures; it reaches no bank swap, no
+  `continue_as_new`, no capacity refusal, no divergent replay and no timer — the same four rows
   [the failure matrix](#the-failure-matrix-row-by-row) calls `Owed` on the rig, met again one
   gate over. An allocation on one of those paths is an allocation nothing has watched for. It
   is a *sampled* gate where the specification's proofs are exhaustive, and saying so is better

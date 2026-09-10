@@ -60,7 +60,7 @@
 
 pub mod workload;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -105,7 +105,7 @@ pub const WORKLOAD_COMMAND: &str = "profile-workload";
 /// publish a cost per effect over a number nothing measured, and the error would *flatter*
 /// the engine — the direction [`crate::wear`] avoids by counting what the device was asked
 /// for rather than deriving it.
-const EFFECTS_MARKER: &str = "waymaker-profile-workload: effects=";
+const UNITS_MARKER: &str = "waymaker-profile-workload: units=";
 
 /// One thing the tools are run over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,28 +114,51 @@ pub struct Workload {
     pub name: &'static str,
     /// What it drives, in one line, carried into the report.
     pub what: &'static str,
-    /// How many effects it is expected to complete.
+    /// What one unit of this workload's work is: an effect, or a conformance case.
+    ///
+    /// Not every workload has effects. The published figure is a cost *per* something, and a
+    /// report whose column meant an effect on three rows and a case on the fourth would be a
+    /// column nobody can read.
+    pub unit: &'static str,
+    /// How many units it is expected to complete.
     ///
     /// Checked against what the run reports rather than trusted: the two disagreeing is a
     /// workload that changed and a table that did not, and the table is not the measurement.
-    pub effects: u16,
+    pub units: u16,
 }
 
 /// The workloads, in report order.
 ///
-/// Two, because the engine has two halves that meet nowhere else — the writer below §07 and
-/// the boundary above it. A single workload would publish a zero about whichever half it
-/// happened to drive, and the other half's first allocation would pass this gate.
+/// One per part of the engine that the others do not reach. A single workload would publish
+/// a zero about whichever part it happened to drive, and every other part's first allocation
+/// would pass this gate — which is not a hypothetical: the first version of this table had
+/// two rows, and `waymaker-embassy` and `waymaker-conformance` were gated in name while
+/// nothing executed a line of either. [`ProfileReport::shortfall_report`] is what stops that
+/// returning, and these are what make it pass.
 pub const WORKLOADS: &[Workload] = &[
     Workload {
         name: "journal",
         what: "§09's frame codec and commit seal, §10's reserve, and the recovery scan, driven by the rig",
-        effects: crate::wear::EFFECTS,
+        unit: "effect",
+        units: crate::wear::EFFECTS,
     },
     Workload {
         name: "driver",
         what: "§06's kernel boundary and §07's effect protocol, driven to a terminal record",
-        effects: 2,
+        unit: "effect",
+        units: 2,
+    },
+    Workload {
+        name: "facade",
+        what: "§06's OTA example through `poll_ota`: `waymaker-embassy`'s Ctx and its four futures",
+        unit: "effect",
+        units: 3,
+    },
+    Workload {
+        name: "conformance",
+        what: "§12's storage contract, as `waymaker-conformance` runs it against the fault model",
+        unit: "case",
+        units: 22,
     },
 ];
 
@@ -268,17 +291,43 @@ impl Cost {
             .saturating_add(self.runtime)
     }
 
-    /// The engine's instructions per effect, in hundredths.
+    /// The engine's instructions per unit of work, in hundredths, rounded **up**.
     ///
-    /// Hundredths for [`waymaker_rig::wear::PerEffect`]'s reason: an integer quotient publishes less
-    /// than was measured, and a cost figure that understates is worse than no figure because
-    /// it is believed.
+    /// Hundredths for [`waymaker_rig::wear::PerEffect`]'s reason: an integer quotient
+    /// publishes 68 035 where 68 035.125 was measured. Rounded up rather than truncated for
+    /// the same reason one step further down — 544 281 over 8 is 68 035.125, and truncating
+    /// at the hundredth publishes 68 035.12, which is *still* less than was measured. A cost
+    /// figure that understates is worse than no figure, because it is believed; Codex found
+    /// the truncating version on the first review of this gate.
+    ///
+    /// `wear`'s own figure truncates and its test states the tolerance it accepts. This one
+    /// does not need a tolerance, so it does not have one.
     #[must_use]
-    pub fn engine_per_effect_hundredths(&self, effects: u32) -> Option<u64> {
-        self.engine
-            .checked_mul(100)
-            .and_then(|scaled| scaled.checked_div(u64::from(effects)))
+    pub fn engine_per_unit_hundredths(&self, units: u32) -> Option<u64> {
+        let divisor = u64::from(units);
+        let scaled = self.engine.checked_mul(100)?;
+        let quotient = scaled.checked_div(divisor)?;
+        // Ceiling without a second multiply: add one when anything was lost.
+        Some(match scaled.checked_rem(divisor) {
+            Some(0) | None => quotient,
+            Some(_) => quotient.saturating_add(1),
+        })
     }
+}
+
+/// What callgrind said, and which engine crates it said it about.
+///
+/// The second half is not decoration. This gate names six crates and holds each to zero heap
+/// blocks, and a crate the workloads never execute scores that zero for the wrong reason —
+/// it is the score a crate that had been deleted would get. Reach is measured in
+/// *instructions* rather than allocations for the obvious reason: every crate that ran has
+/// instructions, and a crate that ran correctly has no allocations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Attribution {
+    /// What the run cost.
+    pub cost: Cost,
+    /// Engine crates that executed at least one instruction.
+    pub reached: BTreeSet<String>,
 }
 
 /// One workload, measured.
@@ -288,8 +337,17 @@ pub struct WorkloadProfile {
     pub workload: String,
     /// What it drives.
     pub what: String,
-    /// Effects the run reported completing.
-    pub effects: u32,
+    /// What one unit of this workload's work is, from its row.
+    pub unit: String,
+    /// Units the run reported completing.
+    pub units: u32,
+    /// Engine crates that executed at least one instruction in this run.
+    ///
+    /// The half that makes the gate's list of gated crates mean something. A crate the
+    /// workloads never execute can never be attributed an allocation, so a zero for it is
+    /// the zero a crate that is not there would score — which is what
+    /// [`ProfileReport::shortfall_report`] refuses.
+    pub reached: BTreeSet<String>,
     /// What it allocated.
     pub heap: Heap,
     /// What it cost.
@@ -332,11 +390,11 @@ impl WorkloadProfile {
     /// What this row is, gate-wise.
     #[must_use]
     pub fn verdict(&self) -> Verdict {
-        if self.effects == 0 {
-            return Verdict::Unmeasurable(
-                "the workload completed no effect, so there is nothing the figures are per"
-                    .to_owned(),
-            );
+        if self.units == 0 {
+            return Verdict::Unmeasurable(format!(
+                "the workload completed no {}, so there is nothing the figures are per",
+                self.unit
+            ));
         }
         if self.heap.total_blocks() == 0 {
             return Verdict::Unmeasurable(
@@ -398,28 +456,28 @@ impl ProfileReport {
             .unwrap_or(0)
             .max("workload".len());
         let mut table = vec![format!(
-            "\nheap and instructions, measured under valgrind on the host, cargo profile `{PROFILE}`\n  {:<width$}  {:>7} {:>13} {:>9} {:>12} {:>13} {:>12}  {}\n",
+            "\nheap and instructions, measured under valgrind on the host, cargo profile `{PROFILE}`\n  {:<width$}  {:>11} {:>13} {:>9} {:>12} {:>13} {:>12}  {}\n",
             "workload",
-            "effects",
+            "units",
             "engine blks",
             "engine B",
             "other blks",
             "engine Ir",
-            "Ir/effect",
+            "Ir/unit",
             "verdict",
         )];
         for row in &self.rows {
             table.push(format!(
-                "  {:<width$}  {:>7} {:>13} {:>9} {:>12} {:>13} {:>12}  {}\n",
+                "  {:<width$}  {:>11} {:>13} {:>9} {:>12} {:>13} {:>12}  {}\n",
                 row.workload,
-                row.effects,
+                format!("{} {}s", row.units, row.unit),
                 row.heap.engine_blocks,
                 row.heap.engine_bytes,
                 row.heap
                     .harness_blocks
                     .saturating_add(row.heap.runtime_blocks),
                 row.cost.engine,
-                render_hundredths(row.cost.engine_per_effect_hundredths(row.effects)),
+                render_hundredths(row.cost.engine_per_unit_hundredths(row.units)),
                 row.verdict(),
             ));
         }
@@ -436,6 +494,24 @@ impl ProfileReport {
                 .to_owned(),
         );
         table.concat()
+    }
+
+    /// Engine crates no row of this report reached, in name order.
+    ///
+    /// Empty is what a complete run looks like. Anything in it is a crate this gate claims
+    /// to hold at [`ENGINE_HEAP_BLOCKS`] and has not looked at.
+    #[must_use]
+    pub fn unreached_engine_crates(&self) -> Vec<String> {
+        let reached: BTreeSet<&str> = self
+            .rows
+            .iter()
+            .flat_map(|row| row.reached.iter().map(String::as_str))
+            .collect();
+        engine_crates()
+            .into_iter()
+            .filter(|name| !reached.contains(name))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Every row that is not a pass, or `None` when they all are.
@@ -464,6 +540,16 @@ impl ProfileReport {
                     workload.name
                 ));
             }
+        }
+        // And the check that gives the gated list its meaning. A crate no workload executes
+        // cannot be attributed an allocation, so its zero is the score a deleted crate would
+        // get — the gate would cover it in name and not in fact. Codex found exactly that on
+        // the first review of this gate, with `waymaker-embassy` linked and unexecuted and
+        // `waymaker-conformance` not in the dependency graph at all.
+        for unreached in self.unreached_engine_crates() {
+            lines.push(format!(
+                "  {unreached}: no workload executed an instruction of this crate, so holding it to {ENGINE_HEAP_BLOCKS} heap blocks measured nothing. Give it a workload, or stop calling it engine code."
+            ));
         }
         if lines.is_empty() {
             return None;
@@ -693,7 +779,10 @@ pub fn parse_dhat(json: &str, workspace: &[WorkspaceCrate]) -> Result<Heap, Prof
 ///
 /// [`ProfileError`] when the file declares no `events:` line, does not count `Ir` among
 /// them, declares no total, or the per-function costs do not add up to that total.
-pub fn parse_callgrind(text: &str, workspace: &[WorkspaceCrate]) -> Result<Cost, ProfileError> {
+pub fn parse_callgrind(
+    text: &str,
+    workspace: &[WorkspaceCrate],
+) -> Result<Attribution, ProfileError> {
     let events = text
         .lines()
         .find_map(|line| line.strip_prefix("events:"))
@@ -719,6 +808,7 @@ pub fn parse_callgrind(text: &str, workspace: &[WorkspaceCrate]) -> Result<Cost,
     // cost. Summed as self cost it counts every callee again at every level.
     let mut inclusive_next = false;
     let mut cost = Cost::default();
+    let mut reached: BTreeSet<String> = BTreeSet::new();
 
     for line in text.lines() {
         if let Some(rest) = line
@@ -768,6 +858,9 @@ pub fn parse_callgrind(text: &str, workspace: &[WorkspaceCrate]) -> Result<Cost,
             match owner {
                 Some(entry) if entry.engine => {
                     cost.engine = cost.engine.saturating_add(instructions);
+                    if instructions > 0 {
+                        reached.insert(entry.name.clone());
+                    }
                 }
                 Some(_) => cost.harness = cost.harness.saturating_add(instructions),
                 None => cost.runtime = cost.runtime.saturating_add(instructions),
@@ -795,7 +888,7 @@ pub fn parse_callgrind(text: &str, workspace: &[WorkspaceCrate]) -> Result<Cost,
             cost.total()
         )));
     }
-    Ok(cost)
+    Ok(Attribution { cost, reached })
 }
 
 /// Resolves callgrind's name compression: `(7) some::name` declares, `(7)` refers back.
@@ -887,7 +980,7 @@ fn measure_workload(
 ) -> Result<WorkloadProfile, ProfileError> {
     let dhat_out = output.join(format!("dhat-{}.json", workload.name));
     let callgrind_out = output.join(format!("callgrind-{}.out", workload.name));
-    let effects = run_tool(
+    let units = run_tool(
         binary,
         workload,
         &[
@@ -912,33 +1005,35 @@ fn measure_workload(
     )?;
     // The two runs are the same deterministic workload, so a disagreement is a workload that
     // is not deterministic — which would make every figure here a figure about one run of it.
-    if effects != again {
+    if units != again {
         return Err(ProfileError::new(format!(
-            "{}: the DHAT run completed {effects} effects and the callgrind run {again}; the workload is not deterministic, so neither figure is about it",
-            workload.name
+            "{}: the DHAT run completed {units} {}s and the callgrind run {again}; the workload is not deterministic, so neither figure is about it",
+            workload.name, workload.unit
         )));
     }
-    if effects != u32::from(workload.effects) {
+    if units != u32::from(workload.units) {
         return Err(ProfileError::new(format!(
-            "{}: the workload completed {effects} effects and WORKLOADS declares {}; the table and the workload disagree, and the table is not the measurement",
-            workload.name, workload.effects
+            "{}: the workload completed {units} {}s and WORKLOADS declares {}; the table and the workload disagree, and the table is not the measurement",
+            workload.name, workload.unit, workload.units
         )));
     }
 
     let heap = parse_dhat(&read(&dhat_out)?, workspace)
         .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))?;
-    let cost = parse_callgrind(&read(&callgrind_out)?, workspace)
+    let attribution = parse_callgrind(&read(&callgrind_out)?, workspace)
         .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))?;
     Ok(WorkloadProfile {
         workload: workload.name.to_owned(),
         what: workload.what.to_owned(),
-        effects,
+        unit: workload.unit.to_owned(),
+        units,
+        reached: attribution.reached,
         heap,
-        cost,
+        cost: attribution.cost,
     })
 }
 
-/// Runs `binary` under valgrind with `arguments`, and answers the effects it reported.
+/// Runs `binary` under valgrind with `arguments`, and answers the units it reported.
 fn run_tool(binary: &Path, workload: Workload, arguments: &[String]) -> Result<u32, ProfileError> {
     let output = Command::new("valgrind")
         .args(arguments)
@@ -960,20 +1055,20 @@ fn run_tool(binary: &Path, workload: Workload, arguments: &[String]) -> Result<u
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    read_effects(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+    read_units(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         ProfileError::new(format!(
-            "{}: the workload printed no effect count, so there is no denominator the figures are per",
+            "{}: the workload printed no unit count, so there is no denominator the figures are per",
             workload.name
         ))
     })
 }
 
-/// The effect count a workload printed, from its standard output.
+/// The unit count a workload printed, from its standard output.
 #[must_use]
-pub fn read_effects(stdout: &str) -> Option<u32> {
+pub fn read_units(stdout: &str) -> Option<u32> {
     stdout
         .lines()
-        .find_map(|line| line.trim().strip_prefix(EFFECTS_MARKER))
+        .find_map(|line| line.trim().strip_prefix(UNITS_MARKER))
         .and_then(|count| count.trim().parse::<u32>().ok())
 }
 
@@ -996,9 +1091,9 @@ fn read(path: &Path) -> Result<String, ProfileError> {
 /// [`workload::WorkloadError`] when the name is not a workload, or the workload does not run
 /// to its declared end.
 pub fn run_workload(name: &str) -> Result<u32, workload::WorkloadError> {
-    let effects = workload::run(name)?;
-    println!("{EFFECTS_MARKER}{effects}");
-    Ok(effects)
+    let units = workload::run(name)?;
+    println!("{UNITS_MARKER}{units}");
+    Ok(units)
 }
 
 /// Writes the report as JSON, for the CI artifact.
@@ -1029,7 +1124,9 @@ pub fn to_json(report: &ProfileReport) -> String {
             serde_json::json!({
                 "workload": row.workload,
                 "what": row.what,
-                "effects": row.effects,
+                "unit": row.unit,
+                "units": row.units,
+                "reached": row.reached,
                 "engine_heap_bytes": row.heap.engine_bytes,
                 "engine_heap_blocks": row.heap.engine_blocks,
                 "harness_heap_bytes": row.heap.harness_bytes,
@@ -1041,8 +1138,8 @@ pub fn to_json(report: &ProfileReport) -> String {
                 "runtime_instructions": row.cost.runtime,
                 // Hundredths rather than a quotient, for the reason `wear` gives: a consumer
                 // handed an integer quotient is handed less than was measured.
-                "engine_instructions_per_effect_hundredths":
-                    row.cost.engine_per_effect_hundredths(row.effects),
+                "engine_instructions_per_unit_hundredths":
+                    row.cost.engine_per_unit_hundredths(row.units),
                 "verdict": row.verdict().to_string(),
             })
         })
@@ -1100,7 +1197,19 @@ pub fn parse_report(text: &str) -> Result<ProfileReport, ProfileError> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
-                effects: u32::try_from(number("effects")?).unwrap_or(u32::MAX),
+                unit: row
+                    .get("unit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unit")
+                    .to_owned(),
+                units: u32::try_from(number("units")?).unwrap_or(u32::MAX),
+                reached: row
+                    .get("reached")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| ProfileError::new("a profile report row has no `reached`"))?
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect(),
                 heap: Heap {
                     engine_bytes: number("engine_heap_bytes")?,
                     engine_blocks: number("engine_heap_blocks")?,
@@ -1300,7 +1409,9 @@ mod tests {
         let row = WorkloadProfile {
             workload: "journal".to_owned(),
             what: String::new(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap,
             cost: Cost {
                 engine: 1,
@@ -1334,7 +1445,9 @@ mod tests {
         let row = WorkloadProfile {
             workload: "journal".to_owned(),
             what: String::new(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap,
             cost: Cost {
                 engine: 1,
@@ -1356,7 +1469,9 @@ mod tests {
         let row = WorkloadProfile {
             workload: "journal".to_owned(),
             what: String::new(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap: Heap::default(),
             cost: Cost {
                 engine: 1,
@@ -1374,7 +1489,9 @@ mod tests {
         let row = WorkloadProfile {
             workload: "journal".to_owned(),
             what: String::new(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap: Heap {
                 runtime_blocks: 16,
                 runtime_bytes: 28435,
@@ -1394,7 +1511,9 @@ mod tests {
         let row = WorkloadProfile {
             workload: "driver".to_owned(),
             what: String::new(),
-            effects: 0,
+            unit: "effect".to_owned(),
+            units: 0,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap: Heap {
                 runtime_blocks: 16,
                 ..Heap::default()
@@ -1418,7 +1537,9 @@ mod tests {
                 .first()
                 .map_or_else(String::new, |workload| workload.name.to_owned()),
             what: String::new(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap: Heap {
                 runtime_blocks: 16,
                 ..Heap::default()
@@ -1488,7 +1609,9 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         // at every level, so the figure grows with call depth. Here it is 1000 against a
         // 330-instruction process — an error nobody would notice as a plausible number.
         let workspace = workspace();
-        let cost = parse_callgrind(CALLGRIND, &workspace).expect("real callgrind output");
+        let cost = parse_callgrind(CALLGRIND, &workspace)
+            .expect("real callgrind output")
+            .cost;
         assert_eq!(cost.engine, 230, "the call's inclusive cost was counted");
         assert_eq!(cost.harness, 100);
         assert_eq!(cost.runtime, 0);
@@ -1503,7 +1626,9 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         // `runtime` — the totals still add up, which is what makes it worth a test of its
         // own rather than a line in the one above.
         let workspace = workspace();
-        let cost = parse_callgrind(CALLGRIND, &workspace).expect("real callgrind output");
+        let cost = parse_callgrind(CALLGRIND, &workspace)
+            .expect("real callgrind output")
+            .cost;
         assert_eq!(
             cost.harness, 100,
             "the second block's file resolved to something other than waymaker-fault"
@@ -1574,7 +1699,9 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         let report = ProfileReport::new(vec![WorkloadProfile {
             workload: "journal".to_owned(),
             what: "the writer".to_owned(),
-            effects: 8,
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
             heap: Heap {
                 harness_blocks: 1,
                 harness_bytes: 24576,
@@ -1598,34 +1725,155 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
     }
 
     #[test]
-    fn a_per_effect_figure_is_never_less_than_what_was_measured() {
-        // `wear`'s rule, met again: 544_281 over 8 effects is 68_035.125, and an integer
-        // quotient publishes 68_035 — a cost figure that understates is worse than none.
+    fn a_per_unit_figure_is_never_less_than_what_was_measured() {
+        // The invariant, asserted as an invariant rather than as a literal — which is how
+        // the truncating version passed its own test. Codex found it: 544_281 over 8 is
+        // 68_035.125, and truncating at the hundredth publishes 68_035.12, which is still
+        // less than was measured. A cost figure that understates is worse than none.
         let cost = Cost {
             engine: 544_281,
             harness: 0,
             runtime: 0,
         };
         let hundredths = cost
-            .engine_per_effect_hundredths(8)
-            .expect("a run with effects in it");
-        assert_eq!(hundredths, 6_803_512);
-        assert_eq!(render_hundredths(Some(hundredths)), "68035.12");
-        assert_eq!(cost.engine_per_effect_hundredths(0), None);
+            .engine_per_unit_hundredths(8)
+            .expect("a run with units in it");
+        assert_eq!(hundredths, 6_803_513);
+        assert_eq!(render_hundredths(Some(hundredths)), "68035.13");
+        assert!(
+            u128::from(hundredths) * 8 >= u128::from(cost.engine) * 100,
+            "{hundredths} per unit over 8 units understates {}",
+            cost.engine
+        );
+        // Over a range of divisors, not the one the report happens to use: the defect was
+        // invisible at every divisor that divides exactly.
+        for units in 1_u32..=64 {
+            let figure = cost
+                .engine_per_unit_hundredths(units)
+                .expect("a run with units in it");
+            assert!(
+                u128::from(figure) * u128::from(units) >= u128::from(cost.engine) * 100,
+                "{figure} per unit over {units} units understates {}",
+                cost.engine
+            );
+        }
+        // An exact division must not be inflated by the rounding either.
+        assert_eq!(
+            Cost {
+                engine: 800,
+                harness: 0,
+                runtime: 0
+            }
+            .engine_per_unit_hundredths(8),
+            Some(10_000)
+        );
+        assert_eq!(cost.engine_per_unit_hundredths(0), None);
         assert_eq!(render_hundredths(None), "-");
     }
 
     #[test]
-    fn the_effect_count_is_read_from_the_workload_rather_than_assumed() {
-        assert_eq!(
-            read_effects("waymaker-profile-workload: effects=8\n"),
-            Some(8)
+    fn an_engine_crate_no_workload_executes_fails_the_gate() {
+        // The hole Codex found on the first review, as a test. `engine_crates()` had six
+        // names; the workloads linked and executed four. An allocation in either of the
+        // other two produced no frame, so both rows stayed clean and the gate covered them
+        // in name only.
+        let short: BTreeSet<String> = engine_crates()
+            .into_iter()
+            .take(2)
+            .map(str::to_owned)
+            .collect();
+        let rows: Vec<WorkloadProfile> = WORKLOADS
+            .iter()
+            .map(|workload| WorkloadProfile {
+                workload: workload.name.to_owned(),
+                what: String::new(),
+                unit: workload.unit.to_owned(),
+                units: u32::from(workload.units),
+                reached: short.clone(),
+                heap: Heap {
+                    runtime_blocks: 16,
+                    ..Heap::default()
+                },
+                cost: Cost {
+                    engine: 1,
+                    harness: 0,
+                    runtime: 0,
+                },
+            })
+            .collect();
+        let report = ProfileReport::new(rows);
+        let unreached = report.unreached_engine_crates();
+        assert_eq!(unreached.len(), engine_crates().len() - 2);
+        let shortfall = report
+            .shortfall_report()
+            .expect("a report that measured four of six gated crates is not a pass");
+        for name in &unreached {
+            assert!(
+                shortfall.contains(name.as_str()),
+                "the gate did not name {name} as unreached"
+            );
+        }
+        assert!(shortfall.contains("measured nothing"));
+    }
+
+    #[test]
+    fn a_run_that_reaches_every_engine_crate_has_nothing_unreached() {
+        // The other direction, so the check above cannot pass by always reporting something.
+        let rows: Vec<WorkloadProfile> = WORKLOADS
+            .iter()
+            .map(|workload| WorkloadProfile {
+                workload: workload.name.to_owned(),
+                what: String::new(),
+                unit: workload.unit.to_owned(),
+                units: u32::from(workload.units),
+                reached: engine_crates().into_iter().map(str::to_owned).collect(),
+                heap: Heap {
+                    runtime_blocks: 16,
+                    ..Heap::default()
+                },
+                cost: Cost {
+                    engine: 1,
+                    harness: 0,
+                    runtime: 0,
+                },
+            })
+            .collect();
+        let report = ProfileReport::new(rows);
+        assert!(report.unreached_engine_crates().is_empty());
+        assert!(report.shortfall_report().is_none());
+    }
+
+    #[test]
+    fn reach_is_read_out_of_the_callgrind_costs() {
+        // Not declared beside the row: a crate is reached because instructions were
+        // attributed to it, which is the same reading the cost column comes from.
+        let workspace = workspace();
+        let attribution = parse_callgrind(CALLGRIND, &workspace).expect("real callgrind output");
+        assert!(attribution.reached.contains("waymaker-flash"));
+        // The harness is not the engine, so it is not reach even though it ran.
+        assert!(!attribution.reached.contains("waymaker-fault"));
+        // And a crate with a cost line of zero is not reached by it.
+        let zeroed = CALLGRIND
+            .replace("100 200", "100 0")
+            .replace("+2 30", "+2 0");
+        let zeroed = zeroed.replace("summary: 330", "summary: 100");
+        assert!(
+            !parse_callgrind(&zeroed, &workspace)
+                .expect("real callgrind output")
+                .reached
+                .contains("waymaker-flash"),
+            "a crate that executed no instruction was counted as reached"
         );
+    }
+
+    #[test]
+    fn the_unit_count_is_read_from_the_workload_rather_than_assumed() {
+        assert_eq!(read_units("waymaker-profile-workload: units=8\n"), Some(8));
         assert_eq!(
-            read_effects("noise\nwaymaker-profile-workload: effects=2"),
+            read_units("noise\nwaymaker-profile-workload: units=2"),
             Some(2)
         );
-        assert_eq!(read_effects("nothing the outer run can use"), None);
+        assert_eq!(read_units("nothing the outer run can use"), None);
     }
 
     #[test]
@@ -1643,13 +1891,13 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
     }
 
     #[test]
-    fn a_workload_completes_the_effects_the_table_declares() {
+    fn a_workload_completes_the_units_the_table_declares() {
         // The check `measure` makes against a live run, made here too so that a workload and
         // its row drifting apart is a red `cargo test` rather than a red pipeline.
         for workload in WORKLOADS {
             assert_eq!(
                 workload::run(workload.name).ok(),
-                Some(u32::from(workload.effects)),
+                Some(u32::from(workload.units)),
                 "{} does not complete what WORKLOADS declares",
                 workload.name
             );
@@ -1664,7 +1912,9 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
                 .map(|workload| WorkloadProfile {
                     workload: workload.name.to_owned(),
                     what: workload.what.to_owned(),
-                    effects: u32::from(workload.effects),
+                    unit: workload.unit.to_owned(),
+                    units: u32::from(workload.units),
+                    reached: engine_crates().into_iter().map(str::to_owned).collect(),
                     heap: Heap {
                         runtime_blocks: 16,
                         ..Heap::default()

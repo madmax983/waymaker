@@ -234,11 +234,14 @@ firmware pays for is what the linked image does.
 
 This is the measurement. [DHAT](https://valgrind.org/docs/manual/dh-manual.html) intercepts
 `malloc` in the binary, so it needs no global allocator and none of the `unsafe` this
-workspace denies — which is what the argument against measuring this had always been. Two
-workloads drive real library code over `waymaker-fault`'s model of NOR, and every heap block
-is attributed to the crate whose frame is nearest the allocation. **An engine crate is allowed
+workspace denies — which is what the argument against measuring this had always been. Four
+workloads drive real library code over `waymaker-fault`'s model of NOR — the journal writer,
+the synchronous driver, the async façade and §12's conformance suite — and every heap block is
+attributed to the crate whose frame is nearest the allocation. **An engine crate is allowed
 zero**, in blocks rather than bytes, because `malloc(0)` returns a pointer and a firmware that
-reached it has an allocator linked whatever the byte count says.
+reached it has an allocator linked whatever the byte count says. Every gated crate must also
+be *reached* by some workload: a crate nothing executes cannot be attributed an allocation, so
+its zero would be the zero a deleted crate scores.
 
 Callgrind runs beside it and counts instructions. That figure is **published and not gated**,
 for the reason the write-amplification figure is: §04 states no instruction target, and a
@@ -254,8 +257,9 @@ sudo apt-get install valgrind
 
 It fails with that hint rather than passing when the tool is absent, and it fails the same way
 when DHAT saw no allocation anywhere in the process, when callgrind attributed no instruction
-to any engine crate, when a workload completed no effect, when a declared workload has no row,
-or when the per-function costs do not add up to callgrind's own total. A profile that did not
+to any engine crate, when a workload completed no unit of work, when a declared workload has
+no row, when a gated crate is reached by no workload, or when the per-function costs do not add
+up to callgrind's own total. A profile that did not
 happen is not a profile that passed. The reasoning, and the two attribution defects that
 writing it turned up, are in
 [ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).

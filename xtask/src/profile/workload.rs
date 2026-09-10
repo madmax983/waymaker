@@ -21,9 +21,11 @@
 //! wrong in silently. So every step is checked and the count is returned rather than
 //! assumed.
 
-use waymaker_core::RunId;
+use waymaker_core::{Outcome as DriveOutcome, RunId};
 use waymaker_drive::demo::{BOUNDS, DOWNLOAD, HASH, Pipeline, World};
+use waymaker_drive::ota::{self, Downloader, Ota, poll_ota};
 use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
+use waymaker_drive::{Identity, Suspended, Workflow};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -35,6 +37,10 @@ use waymaker_rig::log::Outcome;
 use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Rig, Verdict};
 use waymaker_rig::wear::Metered;
+
+use waymaker_conformance::case::Outcome as CaseOutcome;
+use waymaker_conformance::region::Region;
+use waymaker_conformance::suite;
 
 /// Why a workload could not be run to the end.
 ///
@@ -84,7 +90,12 @@ impl Dispatcher for Inert {
     }
 }
 
-/// Runs the workload named `name` and answers how many effects it completed.
+/// Runs the workload named `name` and answers how many units of work it completed.
+///
+/// What a unit *is* differs per workload — an effect for the three that drive a run, a case
+/// for the one that drives design document §12's conformance suite — and
+/// [`super::Workload::unit`] is where each says which. The count is what the published cost
+/// figure is per, so it is measured here and never taken from that table.
 ///
 /// # Errors
 ///
@@ -94,6 +105,8 @@ pub fn run(name: &str) -> Result<u32, WorkloadError> {
     match name {
         "journal" => journal(),
         "driver" => driver(),
+        "facade" => facade(),
+        "conformance" => conformance(),
         other => Err(WorkloadError::new(format!(
             "unknown workload `{other}`; the workloads are {}",
             super::WORKLOADS
@@ -141,6 +154,131 @@ fn journal() -> Result<u32, WorkloadError> {
             "wrote a run its own oracle rejects: {breach}"
         ))),
     }
+}
+
+/// §06's OTA example, driven through the concrete path a firmware links.
+///
+/// [`poll_ota`] names no type parameter, which is the whole reason it exists: it is what the
+/// firmware target monomorphises, so `Ota<Downloader>`'s future and the four façade futures
+/// are code on the part rather than code the part type-checked. Delegating to it here means
+/// this workload measures that path rather than a generic sibling of it.
+struct Concrete(Ota<Downloader>);
+
+impl Workflow for Concrete {
+    fn identity(&self) -> Identity<'_> {
+        self.0.identity()
+    }
+
+    fn run(
+        &mut self,
+        boundary: &mut dyn waymaker_drive::Boundary,
+    ) -> Result<DriveOutcome<'_>, Suspended> {
+        poll_ota(&mut self.0, boundary)
+    }
+}
+
+/// `waymaker-embassy`'s `Ctx` and its four futures, over the same driver and the same media.
+///
+/// Design document §06's OTA example is an `async fn` whose boundaries are the façade's.
+/// Driving it is what makes `waymaker-embassy` a crate this gate has *measured* rather than
+/// one it names: the façade is reached through `waymaker-drive`'s dependency either way, and
+/// until this workload existed nothing executed a line of it, so an allocation in `Ctx` would
+/// have produced no frame and left every row clean. Codex found that on the first review of
+/// this gate.
+fn facade() -> Result<u32, WorkloadError> {
+    let geometry = Geometry::new(4096, 1024, 4, 1)
+        .map_err(|error| WorkloadError::new(format!("not a geometry ({})", error.message())))?;
+    let align =
+        ProgramAlign::new(4).ok_or_else(|| WorkloadError::new("4 is not a program alignment"))?;
+    let region = JournalRegion::spanning(geometry, 0, 1024, align)
+        .map_err(|error| WorkloadError::new(format!("not a region ({error:?})")))?;
+    let layout = BankLayout::new(geometry)
+        .map_err(|error| WorkloadError::new(format!("not a bank layout ({error:?})")))?;
+    let reserve = Reserve::for_layout(ota::BOUNDS, layout)
+        .map_err(|error| WorkloadError::new(format!("not a reserve ({error:?})")))?;
+
+    let mut device = Device::new(geometry);
+    let mut workflow = Concrete(Ota::new(Downloader));
+    // The synchronous world, which this run must never reach: the façade dispatches through
+    // `Downloader`, and `Driver::boot` asks for an `Activities` because every run needs one.
+    let mut world = World::new();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region, RUN, reserve)
+        .boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        )
+        .map_err(|error| WorkloadError::new(format!("the OTA run did not complete ({error:?})")))?;
+
+    match progress {
+        Progress::Finished {
+            conclusion: Conclusion::Completed,
+            ..
+        } => {}
+        other => {
+            return Err(WorkloadError::new(format!(
+                "the OTA run did not complete: {other:?}"
+            )));
+        }
+    }
+    if world.offers() != 0 {
+        return Err(WorkloadError::new(
+            "the synchronous world was asked to perform an effect, so this is not the façade path",
+        ));
+    }
+    Ok(OTA_ACTIVITIES)
+}
+
+/// How many activities design document §06's OTA example performs.
+///
+/// A constant rather than a count of what the dispatcher saw, because `Downloader` keeps no
+/// tally — the journal does, and `Driver::boot` refusing anything but `Completed` above is
+/// what says all three ran.
+const OTA_ACTIVITIES: u32 = 3;
+
+/// Design document §12's storage contract, run as `waymaker-conformance` runs it.
+///
+/// The one engine crate no other workload can reach: nothing in this workspace depends on it,
+/// because it exists for an adapter author to build against their own driver. It is
+/// `#![no_std]` and allocation-free for a sharper reason than the others — it may only be
+/// runnable on the target the driver is for — and until this workload existed the gate named
+/// it and measured nothing about it.
+///
+/// A *unit* here is a conformance case rather than an effect, which is what
+/// [`super::Workload::unit`] exists to say.
+fn conformance() -> Result<u32, WorkloadError> {
+    // Three erase blocks is `waymaker_conformance::region::REQUIRED_ERASE_BLOCKS`, and the
+    // suite refuses a region smaller than that rather than running a thinner sweep.
+    let geometry = Geometry::new(4 * 1024, 1024, 4, 1)
+        .map_err(|error| WorkloadError::new(format!("not a geometry ({})", error.message())))?;
+    let region = Region::whole_device(geometry)
+        .map_err(|error| WorkloadError::new(format!("not a conformance region ({error:?})")))?;
+    let mut device = Device::new(geometry);
+    let mut buffer = [0_u8; 256];
+    let report = suite::run(&mut device, region, &mut buffer)
+        .map_err(|error| WorkloadError::new(format!("the suite could not start ({error:?})")))?;
+    // The verdict rather than the count alone: a suite that ran every case and failed one is
+    // a suite whose figures are about a broken adapter.
+    report.verdict().map_err(|verdict| {
+        WorkloadError::new(format!("waymaker-fault is not conformant: {verdict}"))
+    })?;
+    let ran = report
+        .entries()
+        .filter(|(_, outcome)| matches!(outcome, CaseOutcome::Passed))
+        .count();
+    if ran == 0 {
+        return Err(WorkloadError::new(
+            "every conformance case was exempted by the geometry, so nothing was measured",
+        ));
+    }
+    u32::try_from(ran).map_err(|_| WorkloadError::new("more cases than a u32 can count"))
 }
 
 /// §06's boundary and §07's effect protocol, driven to a terminal record.

@@ -47,7 +47,7 @@ the same commit measures the same, so a figure that moved is a change rather tha
 
 ## Decision
 
-`cargo xtask profile` runs both tools over two workloads and answers in one report. It is a
+`cargo xtask profile` runs both tools over four workloads and answers in one report. It is a
 stage of its own, in a `profiling` job, for the reason the `verification` and `layering` jobs
 are: a red one says a §02 decision no longer holds, and that belongs in the checks list under
 a name that says so.
@@ -66,6 +66,28 @@ each claim to be allocation-free — so a crate joining either category is gated
 remembering a row. `waymaker-fault` is deliberately outside it: it models media in a `Vec`, so
 engine code calling `program` reaches an allocation on every workload, through the model rather
 than through anything a real driver links.
+
+**And every gated crate must be reached, or the run fails naming the gap.** Deriving the list
+is half a mechanism; a crate no workload *executes* cannot be attributed an allocation, so it
+scores the zero a deleted crate would score. The first version of this decision had two
+workloads against six gated crates, and Codex found the consequence on the first review:
+`waymaker-embassy` was linked through `waymaker-drive` and executed by nothing, and
+`waymaker-conformance` was not in the dependency graph at all. Both were held to zero blocks
+in name while nothing looked at either. `ProfileReport::unreached_engine_crates` is the check,
+reach is read out of the callgrind costs rather than declared beside a row — a crate that ran
+has instructions, and a crate that ran correctly has no allocations — and the `facade` and
+`conformance` workloads are what make it pass. It is `size-probe-reach`'s argument met one
+gate over: a budget nothing is charged against is not a budget.
+
+**The per-unit figure rounds up.** 545 096 instructions over 8 effects divides exactly; most
+divisions do not, and truncating at the hundredth publishes less than was measured. Codex
+found the truncating version, and it had passed a test asserting the truncated literal — which
+is why the test now asserts the invariant over a range of divisors instead. `wear`'s figure
+truncates and documents the tolerance it accepts; this one needs no tolerance.
+
+**A unit is not always an effect.** Three workloads count effects and `conformance` counts
+cases, so the column is `units` with each row naming its own — a column meaning an effect on
+three rows and a case on the fourth is a column nobody can read.
 
 **Attribution reads the source path first, then the symbol's root, then the mangled name.**
 Each of the three is a decision:
@@ -107,10 +129,11 @@ by counting what the device was asked for.
 
 ## Consequences
 
-The claim is now a number, and the number is zero: both workloads allocate nothing in an engine
-crate, against sixteen blocks the harness and the runtime allocate in the same process. The
-instruction figures are `journal` at 544 281 Ir over eight effects and `driver` at 41 709 over
-two.
+The claim is now a number, and the number is zero: all four workloads allocate nothing in an
+engine crate, against sixteen blocks the harness and the runtime allocate in the same process,
+and between them they execute all six gated crates. The instruction figures are `journal` at
+545 096 Ir over eight effects, `driver` at 41 788 over two, `facade` at 50 842 over three, and
+`conformance` at 486 292 over twenty-two cases.
 
 What got worse, in the order it will be noticed.
 
@@ -127,11 +150,12 @@ code-flash budget is measured against cannot drift — but it does mean the inst
 are a reading of one optimiser's output at a setting no board is flashed with. That is the
 standing ADR 0029 already records for the corrected code-flash figure, met once more.
 
-**It is a sampled gate where the specification's proofs are exhaustive.** Two workloads reach
-§09's codec, §10's reserve, the recovery scan, §06's boundary and §07's protocol. They reach no
-bank swap, no `continue_as_new`, no capacity refusal, no divergent replay and no timer — the
-same four rows the failure matrix calls `Owed` on the rig, met again one gate over. An
-allocation on one of those paths is an allocation nothing watches for, and
+**It is a sampled gate where the specification's proofs are exhaustive.** Every gated *crate*
+is reached, and that is checked; every *path* is not. Four workloads reach §09's codec, §10's
+reserve, the recovery scan, §06's boundary, §07's protocol, §12's contract and the façade's
+four futures. They reach no bank swap, no `continue_as_new`, no capacity refusal, no divergent
+replay and no timer — the same four rows the failure matrix calls `Owed` on the rig, met again
+one gate over. An allocation on one of those paths is an allocation nothing watches for, and
 [what is not checked](../../CLAUDE.md#what-is-not-checked) says so rather than letting a zero
 read as a proof.
 
@@ -144,6 +168,12 @@ than in a document somebody has to find, and the boards owe the real figure exac
 
 **`xtask` grew a subcommand nothing else calls.** `profile-workload` is the process the tools
 are pointed at, and it exists only for the length of one measurement.
+
+**`xtask` also grew two dependencies.** `waymaker-embassy` and `waymaker-conformance`, so that
+the `facade` and `conformance` workloads can execute the crates this gate names. No layering
+rule is affected — every one of them iterates `policy::LAYERS`, and `xtask` is
+`policy::HOST_TOOLS` — but it is two more edges in the host tool's graph, and the reason they
+are there is a check that would otherwise fail.
 
 ## Alternatives considered
 
@@ -166,6 +196,13 @@ An instruction count is deterministic, which is the entire reason callgrind is h
 here would be a number nobody agreed to, and the first pull request to exceed it would raise
 it — which is how a budget stops meaning anything. `xtask::wear` publishes an ungated figure
 for the same reason, and says so.
+
+**Dropping `waymaker-embassy` and `waymaker-conformance` from the engine list instead.** It
+would have made the reach check pass by narrowing the claim, and it is the wrong direction
+twice over: both crates really are `#![no_std]` and allocation-free, and both say so as a
+promise to somebody — the façade to every firmware that links it, the conformance suite to the
+adapter author who may only be able to run it on their target. Narrowing would also have meant
+hand-maintaining the list that `policy` already derives.
 
 **Charging an allocation to the outermost workspace frame.** It would make `waymaker-fault`'s
 media `Vec` the engine's on every workload, so the gate could never pass and would be turned
