@@ -20,6 +20,7 @@
 use waymaker_core::budget::SCRATCH_PAGE_BYTES;
 use waymaker_core::replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
 use waymaker_core::timer::ClockKind;
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, RecordRef, RunId};
 
 /// The run every test below replays, unless it says otherwise.
@@ -676,7 +677,7 @@ fn every_source_position() -> [(Position, ReplayCursor); 7] {
 /// unissued sequence, and an outcome at the pending one — so the caller passes the sequence
 /// each of those should carry from that position. Anything the position refuses is refused
 /// for the *kind*, not because the test picked an unlucky number.
-const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 8] {
+const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static>; 9] {
     [
         RecordRef::RunStarted {
             workflow_kind: 1,
@@ -698,43 +699,76 @@ const fn every_record(schedule_seq: u32, outcome_seq: u32) -> [RecordRef<'static
         },
         RecordRef::RunCompleted { result: b"done" },
         RecordRef::RunFailed { error: b"gone" },
+        RecordRef::VersionMarker {
+            seq: EffectSeq(schedule_seq),
+            gate: GateId(1),
+            version: 2,
+        },
     ]
 }
 
 #[test]
 fn every_position_accepts_exactly_the_records_a_run_could_have_written_next() {
-    // All fifty-six cells, stated as a table rather than reached by whichever tests
-    // happened to be written. Eight of them are legal — the eight edges of the transition
-    // diagram on `Position` — and the other forty-eight are histories no execution could
+    // All sixty-three cells, stated as a table rather than reached by whichever tests
+    // happened to be written. Nine of them are legal — the nine edges of the transition
+    // diagram on `Position` — and the other fifty-four are histories no execution could
     // have produced. Before this table existed, twenty-one cells were never exercised, and
     // a mutation that let a *failed* run carry on running passed the whole suite; issue
-    // #33 added a position and two records, and the twenty cells they bring are the same
-    // argument again.
+    // #33 added a position and two records, and issue #40 a ninth record, and the cells
+    // each brings are the same argument again.
     //
     // Columns are the record variants in §09's order: RunStarted, EffectScheduled,
-    // EffectCompleted, EffectFailed, TimerScheduled, TimerFired, RunCompleted, RunFailed.
-    const LEGAL: [[bool; 8]; 7] = [
+    // EffectCompleted, EffectFailed, TimerScheduled, TimerFired, RunCompleted, RunFailed,
+    // VersionMarker.
+    const LEGAL: [[bool; 9]; 7] = [
         // BeforeRun: only the record that starts the run.
-        [true, false, false, false, false, false, false, false],
-        // Replaying: the next boundary of either kind, or either terminal record.
-        [false, true, false, false, true, false, true, true],
+        [true, false, false, false, false, false, false, false, false],
+        // Replaying: the next boundary of any kind, or either terminal record. A marker is
+        // a boundary that resolves itself, so it is legal here and leaves the cursor here.
+        [false, true, false, false, true, false, true, true, true],
         // AwaitingOutcome: only this effect's outcome. A run cannot end mid-effect,
-        // because §07 commits an outcome frame before the workflow can observe anything.
-        [false, false, true, true, false, false, false, false],
+        // because §07 commits an outcome frame before the workflow can observe anything,
+        // and a gate cannot be recorded while one is open either.
+        [false, false, true, true, false, false, false, false, false],
         // AwaitingTimer: only this timer's firing. A timer is a boundary like an effect,
         // so the same rule holds and for the same reason.
-        [false, false, false, false, false, true, false, false],
+        [false, false, false, false, false, true, false, false, false],
         // RunCompleted, RunFailed: terminal. Nothing may follow either of them.
-        [false, false, false, false, false, false, false, false],
-        [false, false, false, false, false, false, false, false],
+        [
+            false, false, false, false, false, false, false, false, false,
+        ],
+        [
+            false, false, false, false, false, false, false, false, false,
+        ],
         // Halted: recovery stopped, and stays stopped.
-        [false, false, false, false, false, false, false, false],
+        [
+            false, false, false, false, false, false, false, false, false,
+        ],
+    ];
+
+    // The sequence a *schedule* would carry from each position, and the one an *outcome*
+    // would. Per row rather than `(0, 0)` for every row, and that is the whole point of the
+    // fixture's own promise above: "anything the position refuses is refused for the
+    // **kind**". At `AwaitingOutcome` and `AwaitingTimer` the run has already committed
+    // sequence 0, so a schedule, a timer or a marker drawn at 0 is refused by the
+    // allocator — the same `MalformedHistory` an illegal kind gives, from a different
+    // check. Review of issue #40 proved it: a cursor given extra marker edges from those
+    // two positions kept the whole crate green, because no cell ever reached the arm.
+    // Drawing them at 1, the sequence each position really would issue next, leaves the
+    // kind as the only thing left to refuse them for.
+    const SEQUENCES: [(u32, u32); 7] = [
+        (0, 0), // BeforeRun: nothing committed.
+        (0, 0), // Replaying: nothing committed.
+        (1, 0), // AwaitingOutcome: 0 is committed and is what an outcome resolves.
+        (1, 0), // AwaitingTimer: the same, for a firing.
+        (0, 0), // RunCompleted, RunFailed and Halted accept nothing at any sequence.
+        (0, 0),
+        (0, 0),
     ];
 
     for (row, (position, _)) in every_source_position().iter().enumerate() {
-        // A schedule is legal only from `Replaying`, at sequence 0 for these fixtures; an
-        // outcome only from `AwaitingOutcome`, at the pending sequence, which is also 0.
-        let records = every_record(0, 0);
+        let (schedule_seq, outcome_seq) = SEQUENCES[row];
+        let records = every_record(schedule_seq, outcome_seq);
         for (column, record) in records.into_iter().enumerate() {
             // A fresh cursor per cell: a refusal halts, and a halted cursor would answer
             // for every column after it.
@@ -989,4 +1023,108 @@ fn a_boundary_of_either_kind_refuses_the_other_kind_while_it_is_open() {
         awaiting_timer.position(),
         Position::Halted(KernelError::MalformedHistory)
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Design document §08's recorded upgrade branch, issue #40
+// ---------------------------------------------------------------------------------------
+
+/// `RecordRef::VersionMarker` for `seq`, at gate 1 and version 2.
+const fn marker(seq: u32) -> RecordRef<'static> {
+    RecordRef::VersionMarker {
+        seq: EffectSeq(seq),
+        gate: GateId(1),
+        version: 2,
+    }
+}
+
+#[test]
+fn a_marker_resolves_itself_and_leaves_the_run_replaying() {
+    // The property that makes a gate one record rather than two: there is no world between
+    // the decision and its answer, so nothing is left open.
+    let mut cursor = started();
+
+    assert_eq!(
+        cursor.advance(marker(0)),
+        Ok(Step::VersionMarker {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0),
+            },
+            gate: GateId(1),
+            version: 2,
+        })
+    );
+    assert_eq!(cursor.position(), Position::Replaying);
+    assert_eq!(cursor.pending(), None);
+    assert_eq!(cursor.pending_timer(), None);
+}
+
+#[test]
+fn a_marker_spends_a_sequence_in_the_runs_one_ordered_history() {
+    // §08's fourth rule: call-order sequencing is authoritative. A gate that spent no
+    // sequence could be added, removed or moved with every effect after it keeping its
+    // number, and no replay would notice.
+    let mut cursor = started();
+
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(0)));
+    let _ = cursor.advance(marker(0));
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
+    let _ = cursor.advance(schedule(1));
+    assert_eq!(
+        cursor.pending().map(|pending| pending.id.seq),
+        Some(EffectSeq(1))
+    );
+}
+
+#[test]
+fn a_marker_that_skips_a_sequence_is_refused() {
+    let mut cursor = started();
+
+    assert_eq!(
+        cursor.advance(marker(1)),
+        Err(KernelError::MalformedHistory)
+    );
+    assert_eq!(
+        cursor.position(),
+        Position::Halted(KernelError::MalformedHistory)
+    );
+}
+
+#[test]
+fn markers_share_the_sequence_space_with_activities_and_timers() {
+    // Three boundary kinds, one order. A run that interleaves them numbers them 0, 1, 2, 3
+    // — which is what makes a `(RunId, EffectSeq)` name exactly one boundary of any kind.
+    let mut cursor = started();
+
+    let _ = cursor.advance(marker(0));
+    let _ = cursor.advance(arm(1));
+    let _ = cursor.advance(RecordRef::TimerFired { seq: EffectSeq(1) });
+    let _ = cursor.advance(schedule(2));
+    let _ = cursor.advance(RecordRef::EffectCompleted {
+        seq: EffectSeq(2),
+        result: b"out",
+    });
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(3)));
+    assert_eq!(cursor.position(), Position::Replaying);
+}
+
+#[test]
+fn a_marker_borrows_nothing_from_the_page_it_was_decoded_in() {
+    // The cursor's whole discipline, met once more: a marker's two fields are numbers, so
+    // the step outlives the page — but the *cursor* must still hold nothing, and a run
+    // that carries on after the page is scribbled over is what says so.
+    let mut page = [0_u8; SCRATCH_PAGE_BYTES];
+    let mut cursor = started();
+
+    {
+        let record = marker(0);
+        let step = cursor
+            .advance(record)
+            .expect("a marker follows `RunStarted`");
+        assert!(matches!(step, Step::VersionMarker { version: 2, .. }));
+    }
+    page.fill(0xA5);
+    assert_eq!(cursor.next_seq(), Some(EffectSeq(1)));
+    assert_eq!(page[0], 0xA5);
 }

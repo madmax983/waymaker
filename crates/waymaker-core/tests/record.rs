@@ -10,13 +10,14 @@
 //! as a literal rather than derived from the constant it checks.
 
 use waymaker_core::timer::ClockKind;
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, EffectSeq, RecordKind, RecordRef};
 
 /// Every record kind this firmware can decode, beside the number it occupies on media.
 ///
 /// The literals are the point. Comparing `RecordKind::RUN_STARTED` with itself would pass
 /// under any renumbering; comparing it with `1` fails the moment the wire format moves.
-const DECODABLE_KINDS: [(RecordKind, u8); 8] = [
+const DECODABLE_KINDS: [(RecordKind, u8); 9] = [
     (RecordKind::RUN_STARTED, 1),
     (RecordKind::EFFECT_SCHEDULED, 2),
     (RecordKind::EFFECT_COMPLETED, 3),
@@ -25,6 +26,7 @@ const DECODABLE_KINDS: [(RecordKind, u8); 8] = [
     (RecordKind::TIMER_FIRED, 6),
     (RecordKind::RUN_COMPLETED, 7),
     (RecordKind::RUN_FAILED, 8),
+    (RecordKind::VERSION_MARKER, 9),
 ];
 
 /// Numbers §09's record table claims that this rung does not yet decode.
@@ -32,8 +34,7 @@ const DECODABLE_KINDS: [(RecordKind, u8); 8] = [
 /// Reserved rather than free: a later issue fills the body in behind the same number, so
 /// the format never has to renumber a record that firmware in the field has already
 /// written.
-const RESERVED_KINDS: [(RecordKind, u8); 3] = [
-    (RecordKind::VERSION_MARKER, 9),
+const RESERVED_KINDS: [(RecordKind, u8); 2] = [
     (RecordKind::SIGNAL_RECEIVED, 10),
     (RecordKind::CHILD_STARTED, 11),
 ];
@@ -76,9 +77,9 @@ fn no_two_record_kinds_share_a_number() {
         DECODABLE_KINDS[5],
         DECODABLE_KINDS[6],
         DECODABLE_KINDS[7],
+        DECODABLE_KINDS[8],
         RESERVED_KINDS[0],
         RESERVED_KINDS[1],
-        RESERVED_KINDS[2],
     ];
 
     for (left_index, (left, _)) in all.iter().enumerate() {
@@ -98,7 +99,15 @@ fn a_record_reports_the_kind_it_is() {
     // The encoder asks a record which number to write, and a mismatch here would put a
     // completion on media wearing a failure's kind byte — decodable, self-consistent, and
     // wrong.
-    let cases: [(RecordRef<'_>, RecordKind); 8] = [
+    let cases: [(RecordRef<'_>, RecordKind); 9] = [
+        (
+            RecordRef::VersionMarker {
+                seq: EffectSeq(3),
+                gate: GateId(4),
+                version: 2,
+            },
+            RecordKind::VERSION_MARKER,
+        ),
         (
             RecordRef::RunStarted {
                 workflow_kind: 7,

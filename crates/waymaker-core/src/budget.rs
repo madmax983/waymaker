@@ -74,15 +74,23 @@ pub const CONTEXT_RAM_BYTES: usize = ENGINE_RAM_BYTES.saturating_sub(KERNEL_STAT
 /// [ADR 0020](https://github.com/madmax983/waymaker/blob/main/docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md)
 /// to 18 KiB for §10's capacity reserve, and
 /// [ADR 0029](https://github.com/madmax983/waymaker/blob/main/docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md)
-/// back to **12 KiB**. Both raises were argued from a figure that charged the layers for
-/// the size probe's own arithmetic — 7534 B of the 18386 B measured at rung 0.5, which is
-/// issue [#72](https://github.com/madmax983/waymaker/issues/72). `cargo xtask size` now
-/// gates what the symbol table attributes to the layers, which is 10852 B, so the ceiling
-/// is set against that instead.
+/// back to **12 KiB**. Those two raises were argued from a figure that charged the layers
+/// for the size probe's own arithmetic — 7534 B of the 18386 B measured at rung 0.5, which
+/// is issue [#72](https://github.com/madmax983/waymaker/issues/72). `cargo xtask size` now
+/// gates what the symbol table attributes to the layers, which was 10852 B, so the ceiling
+/// was set against that instead.
+///
+/// [ADR 0036](https://github.com/madmax983/waymaker/blob/main/docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md)
+/// then takes it to **13 KiB** for issue
+/// [#40](https://github.com/madmax983/waymaker/issues/40)'s versioning. It is the first
+/// raise argued from a corrected figure: §08's version boundary costs 600 B of layers, of
+/// which 176 B is the library change measured through the reach the probe already had and
+/// 424 B is what `size-probe-reach` then demands. The layers measure 12820 B against this
+/// 13312 B, with 492 B left.
 ///
 /// It is still a gate: `cargo xtask size` fails a build over it, and the number lives here
 /// rather than in the gate so that there is one place to change.
-pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 12 * 1024;
+pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 13 * 1024;
 
 /// Incremental code-flash budget in bytes for the three layers with the façade linked.
 ///
@@ -92,8 +100,8 @@ pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 12 * 1024;
 /// façade would widen the kernel's budget for a cost the kernel does not carry.
 ///
 /// The engine's ceiling plus 1 KiB. The façade measured 398 B over the engine row at rung
-/// 0.4, so the 1 KiB is room for the rest of the rung rather than a figure fitted to
-/// today's build.
+/// 0.4 and 398 B over it again at rung 1.0, so the 1 KiB is room for the rest of the rung
+/// rather than a figure fitted to today's build.
 ///
 /// It is a gate: `cargo xtask size` fails a build over the `facade` row.
 pub const FACADE_CODE_FLASH_BYTES: usize = INCREMENTAL_CODE_FLASH_BYTES + 1024;

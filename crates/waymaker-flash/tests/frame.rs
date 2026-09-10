@@ -13,7 +13,7 @@
 //! * numeric kinds and borrowed bytes — the decoded record borrows the caller's page,
 //!   which [`a_decoded_record_borrows_the_callers_page`] pins.
 //!
-//! Every one of the eight [`RecordRef`] variants has a golden frame: two of them would
+//! Every one of the nine [`RecordRef`] variants has a golden frame: two of them would
 //! otherwise be pinned only by the encoder and the decoder agreeing with each other, which
 //! is the one comparison a golden vector exists to avoid.
 //!
@@ -27,6 +27,7 @@
 //! than the implementation, which is what makes the round-trip tests below mean anything.
 
 use waymaker_core::timer::ClockKind;
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef};
 use waymaker_flash::frame::{
     self, Decoded, ERASED_BYTE, FORMAT_VERSION, FRAME_OVERHEAD_BYTES, HEADER_BYTES, MAGIC,
@@ -111,6 +112,15 @@ mod golden {
         0x1F, 0x2C, 0x01, 0x29, // commit seal: 1F AC 81 29 masked
     ];
 
+    /// `VersionMarker { seq: 3, gate: 0x1234, version: 5 }` at alignment 4: a four-byte
+    /// body — the gate and the version as little-endian `u16`s — a twenty-byte frame that
+    /// is already aligned, and a four-byte commit seal.
+    pub const VERSION_MARKER_ALIGNED: [u8; 24] = [
+        0x57, 0x4D, 0x01, 0x09, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x9E, 0x74, 0x34, 0x12, 0x05,
+        0x00, 0x30, 0x98, 0x02, 0x30, //
+        0x30, 0x18, 0x02, 0x30, // commit seal: 30 98 02 30 masked
+    ];
+
     /// `RunCompleted { result: &[] }`, alignment 1: the shortest record there is.
     pub const RUN_COMPLETED_EMPTY: [u8; 17] = [
         0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x44, 0x0B, 0xF6, 0x88,
@@ -172,7 +182,7 @@ const SCRATCH: usize = 2_048;
 ///
 /// Proven equal to the number of variants there are by
 /// [`the_sweep_draws_every_record_variant`], which maps each through an exhaustive `match`.
-const SAMPLED_VARIANTS: usize = 8;
+const SAMPLED_VARIANTS: usize = 9;
 
 /// Builds one of the eight records from a generator and a borrowed payload.
 ///
@@ -221,7 +231,12 @@ fn sample_record<'a>(rng: &mut Rng, payload: &'a [u8]) -> RecordRef<'a> {
             seq: EffectSeq(u32::try_from(rng.next_u64() >> 32).unwrap_or(0)),
         },
         6 => RecordRef::RunCompleted { result: payload },
-        _ => RecordRef::RunFailed { error: payload },
+        7 => RecordRef::RunFailed { error: payload },
+        _ => RecordRef::VersionMarker {
+            seq: EffectSeq(u32::try_from(rng.next_u64() >> 32).unwrap_or(0)),
+            gate: GateId(u16::try_from(rng.below(0x1_0000)).unwrap_or(0)),
+            version: u16::try_from(rng.below(0x1_0000)).unwrap_or(0),
+        },
     }
 }
 
@@ -261,7 +276,16 @@ fn the_encoder_writes_the_golden_frames_byte_for_byte() {
     // The one test that can catch a wrong constant, a swapped field or a checksum over the
     // wrong range: the expected bytes came from a reference implementation written from
     // §09 rather than from this crate.
-    let cases: [(RecordRef<'_>, u16, &[u8]); 8] = [
+    let cases: [(RecordRef<'_>, u16, &[u8]); 9] = [
+        (
+            RecordRef::VersionMarker {
+                seq: EffectSeq(3),
+                gate: GateId(0x1234),
+                version: 5,
+            },
+            4,
+            &golden::VERSION_MARKER_ALIGNED,
+        ),
         (
             RecordRef::RunStarted {
                 workflow_kind: 0xBEEF,
@@ -396,6 +420,14 @@ fn the_golden_frames_decode_to_the_records_they_were_built_from() {
         decoded_record(&golden::TIMER_FIRED_ALIGNED),
         Some(RecordRef::TimerFired { seq: EffectSeq(5) })
     );
+    assert_eq!(
+        decoded_record(&golden::VERSION_MARKER_ALIGNED),
+        Some(RecordRef::VersionMarker {
+            seq: EffectSeq(3),
+            gate: GateId(0x1234),
+            version: 5,
+        })
+    );
 }
 
 #[test]
@@ -414,6 +446,7 @@ fn the_sweep_draws_every_record_variant() {
             RecordRef::TimerFired { .. } => 5,
             RecordRef::RunCompleted { .. } => 6,
             RecordRef::RunFailed { .. } => 7,
+            RecordRef::VersionMarker { .. } => 8,
         }
     }
 
@@ -510,6 +543,7 @@ const fn payload_len_of(record: &RecordRef<'_>) -> usize {
         RecordRef::EffectScheduled { .. } => 8,
         RecordRef::TimerScheduled { .. } => 17,
         RecordRef::TimerFired { .. } => 0,
+        RecordRef::VersionMarker { .. } => 4,
         RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
             result.len()
         }
@@ -1031,7 +1065,7 @@ fn every_decodable_record_kind_decodes_to_a_record() {
     // wrong for one it forgot: a decode arm left out when a variant is added produces a
     // green build with a record type that can be written and never read. Coverage cannot
     // see it — the wildcard is exercised either way — so the completeness is asserted here.
-    let cases: [(RecordKind, RecordRef<'_>); 8] = [
+    let cases: [(RecordKind, RecordRef<'_>); 9] = [
         (
             RecordKind::RUN_STARTED,
             RecordRef::RunStarted {
@@ -1081,6 +1115,14 @@ fn every_decodable_record_kind_decodes_to_a_record() {
             RecordRef::RunCompleted { result: b"r" },
         ),
         (RecordKind::RUN_FAILED, RecordRef::RunFailed { error: b"e" }),
+        (
+            RecordKind::VERSION_MARKER,
+            RecordRef::VersionMarker {
+                seq: EffectSeq(1),
+                gate: GateId(5),
+                version: 2,
+            },
+        ),
     ];
 
     for (kind, record) in cases {
@@ -1096,11 +1138,7 @@ fn every_decodable_record_kind_decodes_to_a_record() {
 
     // The reserved kinds are the complement: known numbers this firmware deliberately
     // cannot read, so a decoder that grew an arm for one of them by accident shows up here.
-    for reserved in [
-        RecordKind::VERSION_MARKER,
-        RecordKind::SIGNAL_RECEIVED,
-        RecordKind::CHILD_STARTED,
-    ] {
+    for reserved in [RecordKind::SIGNAL_RECEIVED, RecordKind::CHILD_STARTED] {
         let mut page = [0_u8; SCRATCH];
         let written = frame::encode(
             &RecordRef::RunCompleted { result: b"body" },
@@ -1207,9 +1245,10 @@ fn a_body_that_does_not_fit_its_kind_is_refused() {
 fn an_unknown_kind_is_self_delimiting() {
     // The property that makes forward compatibility possible at all: a reader that cannot
     // interpret a record can still say where it ends, because the length is in the header
-    // and the header is checksummed on its own. `VersionMarker` is the real case — §09
-    // numbers it at v0.2 and no body exists yet — so this is what a firmware built before
-    // that issue sees when a later one writes the record.
+    // and the header is checksummed on its own. `SignalReceived` is the real case — §09
+    // numbers it and no body exists yet — so this is what a firmware built before that
+    // issue sees when a later one writes the record. `VersionMarker` used to stand here,
+    // and issue #40 gave it a body: a reserved number is only reserved until it is spent.
     let mut page = [0_u8; SCRATCH];
     let written = frame::encode(
         &RecordRef::RunCompleted { result: b"body" },
@@ -1218,7 +1257,7 @@ fn an_unknown_kind_is_self_delimiting() {
     )
     .expect("room");
 
-    page[3] = RecordKind::VERSION_MARKER.0;
+    page[3] = RecordKind::SIGNAL_RECEIVED.0;
     reseal(&mut page[..written], ProgramAlign::BYTE);
 
     // `written` is the whole record — body, padding and commit seal — and the frame the
@@ -1229,7 +1268,7 @@ fn an_unknown_kind_is_self_delimiting() {
         frame::decode(&page[..written]),
         Ok(frame::Frame {
             format_version: FORMAT_VERSION,
-            decoded: Decoded::UnknownKind(RecordKind::VERSION_MARKER),
+            decoded: Decoded::UnknownKind(RecordKind::SIGNAL_RECEIVED),
             frame_len: body,
             frame_crc: crc32(&page[..body - frame::FRAME_CRC_BYTES]),
         })
@@ -2322,6 +2361,84 @@ fn a_clock_kind_the_decoder_refuses_is_a_clock_kind_the_encoder_refuses() {
             )
             .is_ok(),
             "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_version_marker_body_is_refused_at_every_other_length() {
+    // Four bytes, exactly. §09 gives a marker a gate and a version and nothing else, so a
+    // body of any other length is a record from another format — and reading a shorter one
+    // would take the version from whatever followed it on media.
+    for length in 0..=16_usize {
+        let body = vec![0; length];
+        let framed = reframed(RecordKind::VERSION_MARKER, 3, &body);
+        let decoded = frame::decode(&framed);
+        if length == 4 {
+            assert!(
+                matches!(
+                    decoded.map(|read| read.decoded),
+                    Ok(Decoded::Record(RecordRef::VersionMarker { .. }))
+                ),
+                "a four-byte body is the marker"
+            );
+        } else {
+            assert_eq!(
+                decoded.map(|read| read.decoded),
+                Err(DecodeError::MalformedRecord),
+                "a {length}-byte body is not a marker"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_marker_carries_its_sequence_in_the_frame_header() {
+    // A marker is a boundary in the run's one ordered history, so its position is the
+    // header's `effect_seq` — not `EffectSeq::FIRST`, which is what the three run-scoped
+    // records are held to.
+    //
+    // The bytes at offset 4..8 are the assertion, not the round trip. An encoder and a
+    // decoder that agreed to put the sequence in the *body* would round-trip perfectly and
+    // put a marker's position where §09 says a payload is; only reading the header can tell
+    // the two apart.
+    let seq = 0xFFFF_FFFE_u32;
+    let record = RecordRef::VersionMarker {
+        seq: EffectSeq(seq),
+        gate: GateId(1),
+        version: 2,
+    };
+    let align = ProgramAlign::new(1).expect("a non-zero alignment");
+    let mut page = [0_u8; SCRATCH];
+    let written = frame::encode(&record, align, &mut page).expect("room for the frame");
+
+    assert_eq!(&page[4..8], &seq.to_le_bytes());
+    // And the body is the gate and the version alone, at the offset a header ends at.
+    assert_eq!(
+        &page[HEADER_BYTES..HEADER_BYTES + 4],
+        &[0x01, 0x00, 0x02, 0x00]
+    );
+    assert_eq!(decoded_record(&page[..written]), Some(record));
+}
+
+#[test]
+fn every_gate_and_every_version_a_u16_can_hold_round_trips() {
+    // The two fields are numbers with no reserved values, unlike a clock kind: zero is a
+    // gate and zero is a version, so nothing here may be refused.
+    let align = ProgramAlign::new(1).expect("a non-zero alignment");
+    let mut page = [0_u8; SCRATCH];
+
+    for value in [0_u16, 1, 0x00FF, 0x0100, 0x7FFF, 0x8000, u16::MAX] {
+        let record = RecordRef::VersionMarker {
+            seq: EffectSeq(7),
+            gate: GateId(value),
+            version: value.wrapping_add(1),
+        };
+        let written = frame::encode(&record, align, &mut page).expect("room for the frame");
+        assert_eq!(
+            decoded_record(&page[..written]),
+            Some(record),
+            "{value:#06X}"
         );
     }
 }

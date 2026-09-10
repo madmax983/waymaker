@@ -137,7 +137,8 @@ fn borrows<'a>(record: &RecordRef<'a>) -> Vec<&'a [u8]> {
         // is no borrow to check.
         RecordRef::EffectScheduled { .. }
         | RecordRef::TimerScheduled { .. }
-        | RecordRef::TimerFired { .. } => Vec::new(),
+        | RecordRef::TimerFired { .. }
+        | RecordRef::VersionMarker { .. } => Vec::new(),
     }
 }
 

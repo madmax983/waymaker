@@ -19,9 +19,11 @@ fn the_budgets_are_the_numbers_from_the_design_document() {
     // 0020 to 18 KiB for §10's capacity reserve, neither of which §04's row scopes. ADR 0020
     // argued that the next change should be issue #72 correcting what the figure measures
     // rather than a third raise, and ADR 0029 is that correction: the gate now charges the
-    // layers rather than the linked image, and the ceiling comes down to 12 KiB against a
-    // measured 10852 B. Changing it again is changing this line, which is the point.
-    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 12 * 1024);
+    // layers rather than the linked image, and the ceiling came down to 12 KiB against a
+    // measured 10852 B. ADR 0036 then takes it to 13 KiB for issue #40's versioning, which
+    // costs 672 B of layers — the first raise argued from a corrected figure. Changing it
+    // again is changing this line, which is the point.
+    assert_eq!(budget::INCREMENTAL_CODE_FLASH_BYTES, 13 * 1024);
     // A relation between two constants is a compile-time fact, so it is asserted at compile
     // time — see the note below the next test.
     const {
@@ -105,7 +107,7 @@ fn the_context_gets_what_the_kernel_state_leaves_of_engine_ram() {
 
 #[test]
 fn the_facade_ceiling_is_the_engine_ceiling_and_room_for_the_facade() {
-    assert_eq!(budget::FACADE_CODE_FLASH_BYTES, 13 * 1024);
+    assert_eq!(budget::FACADE_CODE_FLASH_BYTES, 14 * 1024);
     // The façade image strictly contains the engine one, so a ceiling below the engine's
     // would be a budget no build could satisfy and every build would blame on the façade.
     const {

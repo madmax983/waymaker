@@ -12,6 +12,7 @@
 
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
@@ -398,7 +399,7 @@ impl Workflow for Napping {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: 9,
-            version: 1,
+            versions: VersionRange::exact(1),
             input: &self.input,
         }
     }

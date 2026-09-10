@@ -14,6 +14,8 @@
 //! and then performs one effect, so a test can watch the two share one sequence space.
 
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
+use waymaker_core::version::GateId;
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 use crate::effect::DurableIntent;
@@ -114,7 +116,7 @@ impl Workflow for Pipeline {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: &self.input,
         }
     }
@@ -210,7 +212,7 @@ impl Workflow for Delayed {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: DELAYED_KIND,
-            version: DELAYED_VERSION,
+            versions: VersionRange::exact(DELAYED_VERSION),
             input: &self.input,
         }
     }
@@ -523,7 +525,15 @@ impl Activities for World {
             self.interrupted_once_seq = None;
             return Performed::Pending;
         }
-        let answer = if kind == DOWNLOAD { DOWNLOADED } else { HASHED };
+        // One byte per activity for issue #40's three, so a journal read back names which
+        // step wrote which record. The two original kinds keep their own answers.
+        let answer: &[u8] = match kind {
+            DOWNLOAD => DOWNLOADED,
+            PREPARE => b"prepared",
+            VERIFY => b"verified",
+            FINISH => b"finished",
+            _ => HASHED,
+        };
         let taken = copy(answer, out);
         // §07 step 5 takes bounded result bytes. An answer wider than the bound is reported
         // as exhausted rather than truncated, so no part of it reaches the workflow.
@@ -538,5 +548,144 @@ impl Activities for World {
         } else {
             Performed::Completed(taken)
         }
+    }
+}
+
+/// [`Upgradable`]'s kind, as its `RunStarted` record records it.
+pub const UPGRADABLE_KIND: u16 = 9;
+/// The version this workflow shipped at first.
+pub const V1: u16 = 1;
+/// The version that added [`VERIFY`].
+pub const V2: u16 = 2;
+/// The decision point [`Branching::Gate`] records a branch at.
+pub const UPGRADE_GATE: GateId = GateId(1);
+
+/// The first step, in every version.
+pub const PREPARE: ActivityKind = ActivityKind(3);
+/// The step [`V2`] added between [`PREPARE`] and [`FINISH`].
+pub const VERIFY: ActivityKind = ActivityKind(4);
+/// The last step, in every version.
+pub const FINISH: ActivityKind = ActivityKind(5);
+
+/// What [`Upgradable`]'s records may be worth, for §10's reserve.
+pub const UPGRADABLE_BOUNDS: Bounds = Bounds {
+    run_input_bytes: 4,
+    effect_result_bytes: 16,
+    terminal_bytes: 16,
+};
+
+/// How [`Upgradable`] decides whether to run [`VERIFY`].
+///
+/// Design document §08's third rule is that "code changes that add, remove, or reorder
+/// effects require a new version or an explicit recorded version gate". [`V2`] adds an
+/// effect, so all three of these are code that has to make that choice — and only two of
+/// them are right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Branching {
+    /// Ask [`Boundary::gate`]: the branch is recorded the first time it is reached.
+    ///
+    /// The only one of the three that can apply new code to a run already in flight. A run
+    /// that started under [`V1`] and reaches this gate for the first time under [`V2`]
+    /// records `2` and takes the new path from there on — and every boot after that takes
+    /// it too, whatever version is running.
+    Gate,
+    /// Ask [`Boundary::recorded_version`]: the branch follows the run's start version.
+    ///
+    /// Right, and cheaper — it writes no record — whenever the whole run should behave as
+    /// the version it began under. It cannot express a branch decided part way through.
+    RecordedVersion,
+    /// Ask the *image*: `identity().versions.current()`.
+    ///
+    /// Wrong, and here so that a test can watch it be wrong. It is not a fact about the
+    /// run, so the boot after an upgrade takes a different path than the boot before it and
+    /// §08's divergence check stops the run at the next effect. This is the mistake the
+    /// other two variants exist to prevent, and issue
+    /// [#40](https://github.com/madmax983/waymaker/issues/40) is where it is caught.
+    ImageVersion,
+}
+
+/// Prepare, then — from [`V2`] — verify, then finish.
+///
+/// One effect added in the middle by an upgrade, which is the smallest change §08's third
+/// rule is about: every effect after it shifts by one sequence, so a replay that takes the
+/// wrong branch diverges at the very next boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Upgradable {
+    versions: VersionRange,
+    branching: Branching,
+    input: [u8; 4],
+    finished: [u8; 16],
+    finished_len: usize,
+}
+
+impl Upgradable {
+    /// A workflow for an image that replays `versions`, branching by `branching`.
+    #[must_use]
+    pub const fn new(versions: VersionRange, branching: Branching) -> Self {
+        Self {
+            versions,
+            branching,
+            input: *b"seed",
+            finished: [0; 16],
+            finished_len: 0,
+        }
+    }
+
+    /// An image that only knows [`V1`].
+    #[must_use]
+    pub const fn v1(branching: Branching) -> Self {
+        Self::new(VersionRange::exact(V1), branching)
+    }
+
+    /// An image that writes [`V2`] and still replays [`V1`].
+    #[must_use]
+    pub const fn v2(branching: Branching) -> Self {
+        Self::new(
+            match VersionRange::new(V1, V2) {
+                Some(range) => range,
+                // Unreachable: `V1 <= V2`. Spelled out because `expect` is not `const`.
+                None => VersionRange::exact(V2),
+            },
+            branching,
+        )
+    }
+
+    /// What [`FINISH`] answered, as this run observed it.
+    #[must_use]
+    pub fn finished(&self) -> &[u8] {
+        self.finished.get(..self.finished_len).unwrap_or_default()
+    }
+}
+
+impl Workflow for Upgradable {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: UPGRADABLE_KIND,
+            versions: self.versions,
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        boundary.call(PREPARE, b"go")?;
+
+        let branch = match self.branching {
+            Branching::Gate => boundary.gate(UPGRADE_GATE)?,
+            Branching::RecordedVersion => boundary.recorded_version(),
+            Branching::ImageVersion => self.versions.current(),
+        };
+        if branch >= V2 {
+            boundary.call(VERIFY, b"check")?;
+        }
+
+        let finished = match boundary.call(FINISH, b"end")? {
+            Outcome::Completed(bytes) => bytes,
+            Outcome::Failed(_) => return Ok(Outcome::Failed(b"finish")),
+        };
+        let taken = copy(finished, &mut self.finished);
+        self.finished_len = taken;
+        Ok(Outcome::Completed(
+            self.finished.get(..taken).unwrap_or_default(),
+        ))
     }
 }

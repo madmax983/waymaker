@@ -530,6 +530,8 @@ fn payload_of(record: &RecordRef<'_>) -> u32 {
         RecordRef::TimerScheduled { .. } => 17,
         // A firing is a header and nothing else.
         RecordRef::TimerFired { .. } => 0,
+        // A gate and the version whose branch it recorded.
+        RecordRef::VersionMarker { .. } => 4,
     }
 }
 

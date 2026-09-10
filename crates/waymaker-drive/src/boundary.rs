@@ -6,6 +6,7 @@
 //! [`Suspended`] with `?`, which is what `.await` does in the façade one layer up.
 
 use waymaker_core::timer::TimerSpec;
+use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 /// The run cannot continue now. Return it.
@@ -188,6 +189,53 @@ pub trait Boundary {
     /// outstanding — a `resolve` with no `schedule` before it is a caller that never
     /// committed the intent.
     fn resolve(&mut self, answered: Answered<'_>) -> Result<Outcome<'_>, Suspended>;
+
+    /// The workflow version this run's `RunStarted` record holds.
+    ///
+    /// Design document §08's first rule — "existing runs must continue under compatible
+    /// code for their recorded version" — as the one call a workflow needs to obey it. A
+    /// run started before an upgrade replays under the code its recorded version asks for,
+    /// whatever version this image writes.
+    ///
+    /// It is history, not ambient state: the number comes from the run's own record, so
+    /// every boot of one run sees the same value and a workflow that branches on it is
+    /// deterministic. A workflow that branched on a *firmware* constant instead would take
+    /// the new path on the boot after an upgrade and diverge at its next effect.
+    ///
+    /// # When this is not enough
+    ///
+    /// It answers "what did this run begin under", and no more. A branch chosen part way
+    /// through a run — a new step that applies from here on, for runs that have not passed
+    /// this point — is not derivable from the start version, and [`gate`](Self::gate) is
+    /// what records it.
+    fn recorded_version(&self) -> u16;
+
+    /// Take the branch this run recorded at `gate`, recording one if it has none.
+    ///
+    /// Design document §08's third rule and issue
+    /// [#40](https://github.com/madmax983/waymaker/issues/40). "Code changes that add,
+    /// remove, or reorder effects require a new version or an explicit recorded version
+    /// gate" — this is that gate.
+    ///
+    /// The first execution to reach it records
+    /// [`VersionRange::current`](waymaker_core::version::VersionRange::current) in a
+    /// `VersionMarker`; every later boot is handed that number back. So a branch a run took
+    /// under one image is taken again under every later one, whatever branch the later one
+    /// would have chosen.
+    ///
+    /// # Postconditions
+    ///
+    /// On [`Ok`] the branch survives a reset: the marker record crossed both of §07's
+    /// barriers before the number was returned. There is no window in which a workflow has
+    /// taken a branch that media does not hold.
+    ///
+    /// # Errors
+    ///
+    /// [`Suspended`] whenever the run must stop here — a recorded branch this image cannot
+    /// replay, a gate history recorded under another number, or a journal with no room for
+    /// the marker. Nothing about *why* travels in it;
+    /// [`DriveError`](crate::DriveError) is the driver's answer.
+    fn gate(&mut self, gate: GateId) -> Result<u16, Suspended>;
 
     /// §10's `continue_as_new`: retire this run and install a new one over `input`.
     ///

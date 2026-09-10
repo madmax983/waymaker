@@ -42,6 +42,7 @@ pub mod record;
 pub mod replay;
 pub mod timer;
 pub mod transition;
+pub mod version;
 
 pub use activity::{ActivityKind, ActivityName};
 pub use error::{DecodeError, KernelError};
@@ -51,5 +52,6 @@ pub use replay::{PendingEffect, PendingTimer, Position, ReplayCursor, Step};
 pub use timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 pub use transition::{
     Divergence, EffectRequest, Intent, Next, Outcome, ReplayMachine, Resolve, TimerIntent,
-    TimerRequest, TimerResolve,
+    TimerRequest, TimerResolve, VersionIntent, VersionRequest,
 };
+pub use version::{GateId, VersionRange};

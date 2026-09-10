@@ -262,15 +262,16 @@ const fn align_or_byte(bytes: u16) -> ProgramAlign {
 ///
 /// §09's field list, transcribed: four bytes of workflow identity plus the input for a
 /// `RunStarted`, eight fixed bytes for an `EffectScheduled`, seventeen for a
-/// `TimerScheduled`, none for a `TimerFired`, and the caller's bytes alone for the other
-/// four. Written out here so that a test asking "where does the frame end and the padding
-/// begin" is not asking the code under test.
+/// `TimerScheduled`, none for a `TimerFired`, four for a `VersionMarker`, and the caller's
+/// bytes alone for the other four. Written out here so that a test asking "where does the
+/// frame end and the padding begin" is not asking the code under test.
 const fn payload_len(record: &RecordRef<'_>) -> usize {
     match *record {
         RecordRef::RunStarted { input, .. } => 4 + input.len(),
         RecordRef::EffectScheduled { .. } => 8,
         RecordRef::TimerScheduled { .. } => 17,
         RecordRef::TimerFired { .. } => 0,
+        RecordRef::VersionMarker { .. } => 4,
         RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
             result.len()
         }

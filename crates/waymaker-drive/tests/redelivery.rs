@@ -32,6 +32,7 @@
 //! row — because there the wrong answer is not a wrong record but a physical effect
 //! performed with an input nobody recorded.
 
+use waymaker_core::version::VersionRange;
 use waymaker_core::{
     ActivityKind, EffectId, EffectIdAllocator, EffectSeq, KernelError, Outcome, RecordRef, RunId,
 };
@@ -130,6 +131,7 @@ enum Shape {
     RunStarted,
     EffectScheduled(u32),
     EffectResolved(u32),
+    Marker(u32),
     Terminal,
 }
 
@@ -146,6 +148,8 @@ impl Shape {
             RecordRef::EffectCompleted { seq, .. }
             | RecordRef::EffectFailed { seq, .. }
             | RecordRef::TimerFired { seq } => Self::EffectResolved(seq.0),
+            // A gate is a boundary that resolves itself. This workflow reaches none.
+            RecordRef::VersionMarker { seq, .. } => Self::Marker(seq.0),
             RecordRef::RunCompleted { .. } | RecordRef::RunFailed { .. } => Self::Terminal,
         }
     }
@@ -351,7 +355,7 @@ impl Workflow for Tampered {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -469,7 +473,7 @@ fn a_changed_activity_kind_on_an_outstanding_effect_stops_the_run_too() {
         fn identity(&self) -> Identity<'_> {
             Identity {
                 kind: WORKFLOW_KIND,
-                version: WORKFLOW_VERSION,
+                versions: VersionRange::exact(WORKFLOW_VERSION),
                 input: b"seed",
             }
         }

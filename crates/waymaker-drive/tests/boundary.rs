@@ -6,6 +6,7 @@
 //! history. It is here rather than in `drive.rs` because reaching it takes a workflow that
 //! asks for one more effect than the run it is replaying.
 
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome, RunId};
 use waymaker_core::{EffectSeq, KernelError, RecordRef};
 use waymaker_drive::demo::{
@@ -96,7 +97,7 @@ impl Workflow for Persistent {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -328,7 +329,7 @@ impl Workflow for Unknown {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -384,7 +385,7 @@ impl Workflow for Verbose {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: b"seed",
         }
     }
@@ -412,6 +413,7 @@ fn kinds(device: &mut Device) -> Vec<&'static str> {
             RecordRef::TimerFired { .. } => "timer-fired",
             RecordRef::RunCompleted { .. } => "run-completed",
             RecordRef::RunFailed { .. } => "run-failed",
+            RecordRef::VersionMarker { .. } => "version-marker",
         });
     }
     out
@@ -638,6 +640,7 @@ fn payloads(device: &mut Device) -> Vec<usize> {
             RecordRef::RunStarted { input, .. } => input.len(),
             RecordRef::EffectScheduled { .. } | RecordRef::TimerFired { .. } => 0,
             RecordRef::TimerScheduled { .. } => 17,
+            RecordRef::VersionMarker { .. } => 4,
             RecordRef::EffectCompleted { result, .. } | RecordRef::RunCompleted { result } => {
                 result.len()
             }

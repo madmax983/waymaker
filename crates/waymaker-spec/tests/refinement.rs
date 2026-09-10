@@ -137,6 +137,7 @@ const fn record_id(record: &RecordRef<'_>) -> Option<RecordId> {
         | RecordRef::EffectFailed { .. }
         | RecordRef::TimerScheduled { .. }
         | RecordRef::TimerFired { .. }
+        | RecordRef::VersionMarker { .. }
         | RecordRef::RunCompleted { .. }
         | RecordRef::RunFailed { .. } => None,
     }

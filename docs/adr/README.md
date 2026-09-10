@@ -44,6 +44,7 @@ be superseded.
 | [0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md) | The dispatcher answers in a bound the journal states, and a row is a number | accepted |
 | [0034](0034-a-codec-is-a-bridge-behind-a-feature-and-the-probe-mirrors-it.md) | A codec is a bridge behind a feature, and the probe mirrors it | accepted |
 | [0035](0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) | The façade row is gated, and runtime RAM is composed rather than sampled | accepted |
+| [0036](0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) | Workflow versioning is a range, and an upgrade branch is a recorded record | accepted |
 
 ## Reading the numbers
 
@@ -62,7 +63,7 @@ of these are older than their numbers suggest:
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
-0035.
+0035 → 0036.
 
 ## Writing one
 

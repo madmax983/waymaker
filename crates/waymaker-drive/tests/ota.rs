@@ -14,6 +14,7 @@ use core::cell::RefCell;
 use core::task::{Context as Task, Poll};
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
 use waymaker_drive::ota::{
@@ -81,6 +82,7 @@ fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
             RecordRef::TimerFired { .. } => (5, Vec::new()),
             RecordRef::RunCompleted { result } => (6, result.to_vec()),
             RecordRef::RunFailed { error } => (7, error.to_vec()),
+            RecordRef::VersionMarker { version, .. } => (8, version.to_le_bytes().to_vec()),
         });
     }
     out
@@ -379,7 +381,7 @@ fn continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank() {
         fn identity(&self) -> Identity<'_> {
             Identity {
                 kind: WORKFLOW_KIND,
-                version: WORKFLOW_VERSION,
+                versions: VersionRange::exact(WORKFLOW_VERSION),
                 input: URL,
             }
         }

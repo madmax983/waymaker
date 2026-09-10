@@ -97,6 +97,7 @@ fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
             RecordRef::TimerFired { .. } => (5, Vec::new()),
             RecordRef::RunCompleted { result } => (6, result.to_vec()),
             RecordRef::RunFailed { error } => (7, error.to_vec()),
+            RecordRef::VersionMarker { version, .. } => (8, version.to_le_bytes().to_vec()),
         });
     }
     out

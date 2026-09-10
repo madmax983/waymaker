@@ -22,6 +22,7 @@ use core::pin::pin;
 use core::task::{Context as Task, Poll, Waker};
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
+use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::{
     Activities, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Identity, Performed,
@@ -179,7 +180,7 @@ impl Workflow for Wired {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: URL,
         }
     }
@@ -276,6 +277,7 @@ fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
             RecordRef::TimerFired { .. } => (5, Vec::new()),
             RecordRef::RunCompleted { result } => (6, result.to_vec()),
             RecordRef::RunFailed { error } => (7, error.to_vec()),
+            RecordRef::VersionMarker { version, .. } => (8, version.to_le_bytes().to_vec()),
         });
     }
     out
@@ -466,7 +468,7 @@ impl Workflow for OverBound {
     fn identity(&self) -> Identity<'_> {
         Identity {
             kind: WORKFLOW_KIND,
-            version: WORKFLOW_VERSION,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: URL,
         }
     }

@@ -210,8 +210,53 @@ fn engine() -> usize {
     kept = kept.wrapping_add(transition_table());
     kept = kept.wrapping_add(transition_timers());
     kept = kept.wrapping_add(timers());
+    kept = kept.wrapping_add(transition_versions());
+    kept = kept.wrapping_add(workflow_versions());
 
     core::hint::black_box(kept)
+}
+
+/// Design document §08's versioning vocabulary: a range, and both of its refusals.
+///
+/// `#[inline(never)]` on both arms, like every sibling. Both ends of the range are refused
+/// as well as admitted, so the row charges for the decision rather than for the happy path:
+/// a firmware that only linked `Ok(())` would understate the cost of the thing that makes
+/// §08's second rule hold.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn workflow_versions() -> usize {
+    use waymaker_core::version::{GateId, VersionRange};
+
+    // The whole range through `black_box`, for the reason `timers` gives: with the ends
+    // opaque, `admits` cannot fold and both refusals stay alive.
+    let range = core::hint::black_box(VersionRange::new(2, 5)).unwrap_or(VersionRange::exact(1));
+    let mut kept = usize::from(range.oldest()).wrapping_add(usize::from(range.current()));
+
+    // Admitted, retired and rolled back — the three answers, all reached.
+    for recorded in [3_u16, 1, 9] {
+        kept = kept.wrapping_add(match range.admits(core::hint::black_box(recorded)) {
+            Ok(()) => 1,
+            Err(error) => error.message().len(),
+        });
+    }
+    // The inverted range, which is the one input `new` refuses.
+    kept = kept.wrapping_add(
+        VersionRange::new(core::hint::black_box(6), 5)
+            .map_or(1, |range| usize::from(range.oldest())),
+    );
+    kept = kept.wrapping_add(usize::from(
+        core::hint::black_box(VersionRange::exact(4)).current(),
+    ));
+    kept = kept.wrapping_add(usize::from(core::hint::black_box(GateId(3)).0));
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn workflow_versions() -> usize {
+    core::hint::black_box(0)
 }
 
 /// Design document §11's timer semantics: both specs, both capabilities, both verdicts.
@@ -576,6 +621,93 @@ fn transition_recovery() -> usize {
     );
 
     core::hint::black_box(kept)
+}
+
+/// The version boundary of design document §08: the same five rows, asked of a gate.
+///
+/// A function of its own for [`transition_divergence`]'s reason. Every arm the boundary can
+/// take is reached — a gate history has not seen, a recorded branch, and the refusal an
+/// image gives for a branch it cannot replay — so the delta charges for the whole of issue
+/// [#40](https://github.com/madmax983/waymaker/issues/40) rather than for its happy path.
+#[cfg(feature = "engine")]
+#[inline(never)]
+fn transition_versions() -> usize {
+    use waymaker_core::transition::{Next, ReplayMachine, VersionIntent, VersionRequest};
+    use waymaker_core::version::{GateId, VersionRange};
+    use waymaker_core::{EffectSeq, RecordRef, RunId};
+
+    let request = VersionRequest {
+        gate: GateId(core::hint::black_box(1)),
+        supported: core::hint::black_box(VersionRange::new(1, 3)).unwrap_or(VersionRange::exact(1)),
+    };
+    let mut machine = ReplayMachine::new(RunId(core::hint::black_box(11)));
+    let mut kept = match machine.advance(RecordRef::RunStarted {
+        workflow_kind: core::hint::black_box(1),
+        workflow_version: core::hint::black_box(1),
+        input: core::hint::black_box(b"in"),
+    }) {
+        Ok(_) => 0,
+        Err(error) => error.message().len(),
+    };
+
+    // Row 3: a gate history has not seen.
+    kept = kept.wrapping_add(match machine.version_intent(request, Next::EndOfHistory) {
+        Ok(VersionIntent::Record { id }) => usize::try_from(id.seq.0).unwrap_or(0),
+        Ok(VersionIntent::Recorded { .. } | VersionIntent::Finished { .. }) => 0,
+        Err(error) => error.message().len(),
+    });
+
+    // Rows 1 and 2: the marker is on media, so replay is handed the branch it recorded.
+    let recorded = RecordRef::VersionMarker {
+        seq: core::hint::black_box(EffectSeq::FIRST),
+        gate: GateId(core::hint::black_box(1)),
+        version: core::hint::black_box(2),
+    };
+    kept = kept.wrapping_add(
+        match machine.version_intent(request, Next::Record(recorded)) {
+            Ok(VersionIntent::Recorded { id, version }) => usize::try_from(id.seq.0)
+                .unwrap_or(0)
+                .wrapping_add(usize::from(version)),
+            Ok(VersionIntent::Record { .. } | VersionIntent::Finished { .. }) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
+    // The refusal §08's second rule rests on: a recorded branch outside the image's range.
+    // On a machine of its own, because the one above has consumed the marker.
+    let mut rolled_back = ReplayMachine::new(RunId(core::hint::black_box(13)));
+    kept = kept.wrapping_add(
+        match rolled_back.advance(RecordRef::RunStarted {
+            workflow_kind: core::hint::black_box(1),
+            workflow_version: core::hint::black_box(1),
+            input: core::hint::black_box(b"in"),
+        }) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+    kept = kept.wrapping_add(
+        match rolled_back.version_intent(
+            request,
+            Next::Record(RecordRef::VersionMarker {
+                seq: core::hint::black_box(EffectSeq::FIRST),
+                gate: GateId(core::hint::black_box(1)),
+                version: core::hint::black_box(9),
+            }),
+        ) {
+            Ok(_) => 0,
+            Err(error) => error.message().len(),
+        },
+    );
+
+    core::hint::black_box(kept)
+}
+
+/// Nothing, in the baseline image that measures a firmware without Waymaker in it.
+#[cfg(not(feature = "engine"))]
+#[inline(never)]
+fn transition_versions() -> usize {
+    core::hint::black_box(0)
 }
 
 /// The timer boundary of design document §11: the same five rows, asked of a deadline.
