@@ -44,8 +44,13 @@ cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
+cargo --locked xtask profile
 cargo --locked xtask check-layering
 ```
+
+`cargo xtask profile` needs valgrind, which no rustup profile carries — the pipeline
+installs it in the `profiling` job, and the command fails closed rather than passing when it
+is absent, because a measurement that did not happen is not a measurement that passed.
 
 `cargo doc` needs `RUSTDOCFLAGS=-D warnings` to mean what it says — that is in the
 workflow's `env:` block, and the `ci-pipeline` rule fails a build without it.
@@ -564,6 +569,75 @@ report that names no future at all is `Unmeasurable` rather than a pass. A kerne
 added to `kernel_state_types!` is asserted at compile time, registered in the size report,
 and counted in the total — it cannot be in one without being in the others.
 
+## What the engine does not allocate
+
+Design document §02 decision 1 says the kernel is `no_std`, `no_alloc` and dependency-free.
+Two of those three have been build failures since rung 0.0 — `crate-attributes` fails a crate
+that drops `#![no_std]` or declares `extern crate alloc`, and `kernel-zero-dependencies` fails
+one that grows a dependency of any kind. The third was an argument, and this file said so:
+`no_alloc` rested on a crate having no way to *spell* an allocation, which is a fact about a
+crate rather than about a linked image, and the routes by which `alloc` arrives without
+anybody writing the words are exactly the routes nobody is watching.
+
+`cargo xtask profile` is the measurement. Valgrind intercepts `malloc` in the binary, below
+anything Rust can express, so it needs no global allocator and none of the `unsafe` this
+workspace denies — which is what the argument against measuring this had always been. Four
+workloads drive real library code over `waymaker-fault`'s model of NOR, one per part of the
+engine the others do not reach:
+
+| Workload | Drives | Reaches |
+| --- | --- | --- |
+| `journal` | §09's frame codec and commit seal, §10's reserve and the recovery scan, under the rig | core, flash, rig |
+| `driver` | §06's boundary and §07's effect protocol, run to a terminal record | core, flash, drive |
+| `facade` | §06's OTA example through `poll_ota` — `Ctx` and its four futures | core, flash, drive, embassy |
+| `conformance` | §12's storage contract, as `waymaker-conformance` runs it | flash, conformance |
+
+The "Reaches" column is measured rather than declared, and a run in which the four together
+do not reach every gated crate fails. That is not a hypothetical: the first version of this
+gate had two workloads and six gated crates, so `waymaker-embassy` — linked through
+`waymaker-drive` and executed by nothing — and `waymaker-conformance` — not in the dependency
+graph at all — were held to zero blocks in name while nothing looked at either. A crate no
+workload executes scores the zero a deleted crate would score.
+
+| Measured | Gate | Where it stands |
+| --- | --- | --- |
+| Heap blocks allocated by an engine crate | 0, by `profile::ENGINE_HEAP_BLOCKS` | 0 on all four workloads, against 16 blocks the harness and the runtime allocated in the same process |
+| Every gated crate reached by some workload | all 6, or the run fails naming the gap | all 6 |
+| Instructions executed in engine code | none — §04 states no target | `journal` 545 096 Ir over 8 effects; `driver` 41 788 over 2; `facade` 50 842 over 3; `conformance` 486 292 over 22 cases |
+
+The engine is the three layers plus `policy::NO_STD_TEST_SUPPORT_CRATES`, derived from the
+layering table rather than listed again, so a crate joining either category is gated without
+anybody remembering a row. `waymaker-fault` is deliberately *not* in it: it models media in a
+`Vec`, so engine code calling `program` on it reaches an allocation on every workload, through
+the model rather than through anything a real driver would link. The innermost workspace frame
+of a stack is what decides, and that column is printed rather than hidden, because "the engine
+allocated nothing" is worth nothing beside a process that allocated nothing at all — a DHAT
+run that saw no allocation anywhere is `Unmeasurable` rather than a pass, and so is a
+callgrind run that attributed no instruction to any engine crate.
+
+The instruction figures are **published and not gated**, for the reason the write
+amplification is: §04 states no instruction target, and a ceiling invented here would be a
+number nobody agreed to. They are also not a fact about a part. They are host instructions,
+on the host's instruction set, under a cargo profile that is not the one a board is flashed
+with, so nothing here converts into a cycle count on the hardware §04's budgets are stated
+for — what they are good for is the comparison, because an instruction count is deterministic
+where a wall clock is not. The boards owe the real figure exactly as
+[the hardware table](#what-the-boards-still-owe) records for everything else.
+
+Two decisions in the attribution are worth reading twice, and both were bought rather than
+designed. A crate named in a *generic argument* is not the crate that wrote the code:
+`with_capacity_in<waymaker_core::activity::ActivityKind, ..>` is `alloc`'s body with a kernel
+type passed to it, and the first run of this gate failed a row over a four-byte `Vec` in the
+harness beside it. And attribution reads the *source path* before the symbol, because a
+function inlined into another crate keeps its own file in the debug info and loses its crate
+from the printed name —
+[ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md)
+records name-only attribution mistaking an inlined body for its caller as an accepted limit of
+the code-flash gate, and here that would be this gate passing for the reason it exists to
+catch. Both tools are therefore run with `--fullpath-after=`, and the profile the workload is
+linked under turns fat LTO off. See
+[ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).
+
 ## Writing code here
 
 - `#![no_std]`, `#![forbid(unsafe_code)]` and `#![warn(missing_docs)]` in every firmware
@@ -848,11 +922,17 @@ Stated so that nobody mistakes silence for coverage:
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
   order of edits inside one commit is not a thing a rule can read.
-- **Allocation, as a measurement.** `bounded-decoding` proves the decoder is total and stays
-  inside its input; the allocation half is structural — a `no_std` crate with no dependencies
-  and no `extern crate alloc` cannot allocate, and `crate-attributes` and
-  `kernel-zero-dependencies` fail a build over each of those. A global allocator that counted
-  allocations would need the `unsafe` this workspace denies.
+- **Allocation, as a measurement — no longer.** This bullet used to end "a global allocator
+  that counted allocations would need the `unsafe` this workspace denies", and that was true
+  of the only mechanism it considered. `cargo xtask profile` needs no allocator at all:
+  Valgrind intercepts `malloc` in the binary, and
+  [what the engine does not allocate](#what-the-engine-does-not-allocate) is the number. What
+  is still structural is the *reasoning* — `bounded-decoding` proves the decoder is total and
+  stays inside its input, and `crate-attributes` and `kernel-zero-dependencies` fail a build
+  over `extern crate alloc` and over a dependency of any kind. What is measured is four
+  workloads on a host, between them reaching every crate the gate holds at zero. A path
+  through engine code that none of them takes is a path nothing has watched allocate, which
+  is the honest scope and is the next bullet.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
@@ -1468,8 +1548,30 @@ Stated so that nobody mistakes silence for coverage:
   reading image before the writing one. A device that meets a `v+1` bank with a `v`-only
   reader has no authority at all, and no binary can check the order a fleet was upgraded in —
   the same standing ADR 0036 records for widening `oldest` before narrowing `current`.
+- **A path through the engine that no workload takes.** `cargo xtask profile` measures four
+  runs, and every *crate* it gates is reached by one of them — that much is checked, and a
+  run where it stops being true fails. What is not checked is every *path*. `WORKLOADS`
+  reaches §09's codec, §10's reserve, the recovery scan, §06's boundary, §07's protocol,
+  §12's contract and the façade's four futures; it reaches no bank swap, no
+  `continue_as_new`, no capacity refusal, no divergent replay and no timer — the same four rows
+  [the failure matrix](#the-failure-matrix-row-by-row) calls `Owed` on the rig, met again one
+  gate over. An allocation on one of those paths is an allocation nothing has watched for. It
+  is a *sampled* gate where the specification's proofs are exhaustive, and saying so is better
+  than a zero that reads as a proof.
+- **That the profile the figures are measured under is the profile a board is flashed with.**
+  It is not, and deliberately: `[profile.profiling]` turns fat LTO off so that a crate
+  boundary survives for the attribution to read. `release-profile` still fails a build in
+  which `[profile.release]` moves at all, so the two cannot drift into each other — but every
+  instruction figure here is a reading of one optimiser's output at one setting, which is the
+  standing ADR 0029 already records for the corrected code-flash figure.
+- **What an allocation would cost, as opposed to that there is none.** The gate is a block
+  count at zero. It says nothing about a firmware that links an allocator for its *own*
+  reasons and passes Waymaker a buffer from it, which is a firmware author's decision and one
+  this engine is written to allow.
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
-  the size report says so rather than implying otherwise.
+  the size report says so rather than implying otherwise. Neither can either tool here: DHAT
+  is a heap profiler and callgrind counts instructions, so the depth of the chain
+  [the budgets](#budgets) already say is unaccounted stays unaccounted.
 
 ## Status
 
@@ -2414,6 +2516,46 @@ rule can tell; and a downgrade past a new record kind may reclaim a run, because
 reads a record from the future as damage and §10 recycles a damaged bank. Issue #42's book is
 where this document becomes a chapter. See
 [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md).
+
+`cargo xtask profile` then closes a limit this file had recorded about *itself*. §02 decision
+1 is that the kernel is `no_std`, `no_alloc` and dependency-free; `crate-attributes` and
+`kernel-zero-dependencies` had held the first and the third since rung 0.0, and the second was
+an argument from crate attributes — which is a fact about a crate rather than about a linked
+image, and this workspace accepts that shape of argument nowhere else. The bullet that said so
+ended "a global allocator that counted allocations would need the `unsafe` this workspace
+denies", and that considered one mechanism: DHAT intercepts `malloc` in the *binary*, so it
+needs no allocator, no attribute and no exception to `unsafe_code = "deny"`. Four workloads
+drive real library code over `waymaker-fault`'s model of NOR — §09's codec and commit seal and
+§10's reserve under the rig, §06's boundary and §07's protocol run to a terminal record, §06's
+OTA example through the façade's four futures, and §12's contract as `waymaker-conformance`
+runs it — and the engine's heap is gated at **zero blocks**, in blocks rather than bytes
+because `malloc(0)` returns a pointer. It measures zero on all four, against sixteen blocks the
+harness and the runtime allocate in the same process, which is the column that says the tool
+was watching. Callgrind runs beside it and is *published* rather than gated, for the reason the
+write-amplification figure is: §04 states no instruction target. Everything fails closed — a
+DHAT run that saw nothing, a callgrind run that attributed nothing to the engine, a workload
+that completed no unit of work, a declared workload with no row, a gated crate no workload
+reached, and per-function costs that do not add up to callgrind's own total, which is one check
+that catches three different ways of misreading that format.
+Four findings came out of writing it and reviewing it rather than out of reading the code, and
+every one had produced a *plausible* number. Two are attribution: a crate named in a generic
+argument is not the crate that wrote the body — the first run failed a row over a four-byte
+`Vec` in the harness beside it, through
+`with_capacity_in<waymaker_core::activity::ActivityKind, ..>` — and a body inlined into another
+crate loses its crate from the printed symbol and keeps its source file, which is why the path
+is read first and why the workload's profile turns fat LTO off. The third is the one that
+matters most, and Codex found it: the gate named six crates and two workloads executed four, so
+`waymaker-embassy` — linked and never run — and `waymaker-conformance` — not in the dependency
+graph at all — each scored the zero a *deleted* crate would score. Deriving the gated list was
+half a mechanism; the other half is that a gated crate nothing reaches now fails the run, and
+the `facade` and `conformance` workloads are what make it pass. The fourth is that the
+per-unit cost truncated below what was measured, contradicting its own doc comment — it ceils
+now, and its test asserts the invariant across divisors rather than the literal it used to
+assert, which is how the truncating version passed. What is owed is written down: every gated
+*crate* is reached and that is checked, every *path* is not, and the paths it does not reach
+are the four rows the failure matrix already calls `Owed`. See
+[ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).
+
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The

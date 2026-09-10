@@ -298,8 +298,10 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "toml",
+ "waymaker-conformance",
  "waymaker-core",
  "waymaker-drive",
+ "waymaker-embassy",
  "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",
