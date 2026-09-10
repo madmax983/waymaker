@@ -132,8 +132,44 @@ use crate::integrity::{Catalogued, IntegrityCheck};
 /// rejected by the very first check rather than by a checksum further in.
 pub const MAGIC: u16 = 0x4D57;
 
-/// The only format version this firmware writes, and the only one it reads.
+/// The format version this firmware writes.
+///
+/// One number, always: a bank is written by one image at one version, and a writer that
+/// could choose would be a writer whose choice is not on media.
 pub const FORMAT_VERSION: u8 = 1;
+
+/// The oldest format version this firmware reads.
+///
+/// The read side is a **range** where the write side is a number, and the two are equal
+/// today. Issue [#41](https://github.com/madmax983/waymaker/issues/41) is what makes the
+/// distinction: a fleet that outlives v1 has two format versions in it at once, and the
+/// image that carries it through reads both banks and writes one. An equality check cannot
+/// describe that fleet — it is the same defect §08's `workflow_version` had before
+/// [ADR 0036](https://github.com/madmax983/waymaker/blob/main/docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md)
+/// replaced its comparison with [`VersionRange`](waymaker_core::version::VersionRange),
+/// met one layer down.
+///
+/// Widening it is sound only because the frame header is frozen and a version may add
+/// record kinds without changing the ones below it — see the module documentation. A
+/// version that changed an existing body would have to be refused rather than admitted, and
+/// that is a decision an ADR takes, not a constant somebody moves.
+pub const OLDEST_READABLE_FORMAT_VERSION: u8 = 1;
+
+/// Whether this firmware reads a journal written at `version`.
+///
+/// The migration policy as a function rather than as a paragraph, so a reader can be asked
+/// over all 256 values a version byte can hold rather than at the one this firmware writes.
+/// [`decode`] and [`crate::bank::decode_header`] both take their answer from here, which is
+/// what stops a widened range reaching one decoder and not the other.
+///
+/// # Postconditions
+///
+/// `true` for exactly the versions from [`OLDEST_READABLE_FORMAT_VERSION`] to
+/// [`FORMAT_VERSION`] inclusive, which is the single value `1` today.
+#[must_use]
+pub const fn reads_format_version(version: u8) -> bool {
+    OLDEST_READABLE_FORMAT_VERSION <= version && version <= FORMAT_VERSION
+}
 
 /// Bytes before the payload: magic, version, kind, sequence, length and the header
 /// checksum.
@@ -941,7 +977,7 @@ fn verify_header_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<VerifiedHeader,
     // Only now is the length a number the writer wrote rather than a number that was
     // found, and only now is the version worth reading: the header layout is frozen across
     // format versions, so its checksum is meaningful before its version is known.
-    if version != FORMAT_VERSION {
+    if !reads_format_version(version) {
         return Err(DecodeError::UnsupportedFormatVersion);
     }
 
@@ -1592,6 +1628,9 @@ const _: () = assert!(HEADER_BYTES == 10 + HEADER_CRC_BYTES);
 const _: () = assert!(FRAME_OVERHEAD_BYTES == 16);
 const _: () = assert!(MAX_FRAME_BYTES == 65_551);
 const _: () = assert!(MAGIC != 0x0000 && MAGIC != 0xFFFF);
+// The read range is a range: an oldest above the written version is a firmware that reads
+// nothing it writes, which every round trip in this crate would still pass.
+const _: () = assert!(OLDEST_READABLE_FORMAT_VERSION <= FORMAT_VERSION);
 const _: () = assert!(RUN_STARTED_PREFIX_BYTES <= EFFECT_SCHEDULED_BODY_BYTES);
 // `Body::prefix` is one array for every record's fixed head, so it has to be the widest.
 const _: () = assert!(EFFECT_SCHEDULED_BODY_BYTES <= TIMER_SCHEDULED_BODY_BYTES);

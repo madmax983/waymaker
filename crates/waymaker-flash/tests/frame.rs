@@ -932,6 +932,61 @@ fn resealing_a_damaged_frame_reaches_every_check_past_the_checksums() {
 }
 
 #[test]
+fn the_decoder_reads_exactly_the_format_versions_the_range_declares() {
+    // Issue #41 freezes the format and states the promise as a range: this firmware writes
+    // one version and reads a set of them. The predicate is the migration policy made
+    // mechanical, and this is what stops it drifting from the decoder that has to obey it —
+    // over all 256 values a version byte can hold, not at the one this firmware writes.
+    //
+    // At v1 the range is a single value, so this reads as an equality. It stops reading as
+    // one the day a transition firmware widens it, which is exactly when a range that only
+    // reached one of the two decoders would be found by a fleet rather than by a test.
+    let mut page = [0_u8; SCRATCH];
+    let written = frame::encode(
+        &RecordRef::RunFailed { error: b"x" },
+        ProgramAlign::BYTE,
+        &mut page,
+    )
+    .expect("room");
+
+    let mut read = 0_usize;
+    let mut refused = 0_usize;
+    for version in 0..=u8::MAX {
+        let mut candidate = page;
+        candidate[2] = version;
+        reseal(&mut candidate[..written], ProgramAlign::BYTE);
+        let decoded = frame::decode(&candidate[..written]);
+        if frame::reads_format_version(version) {
+            let frame = decoded.expect("a version the range declares readable decodes");
+            assert_eq!(frame.format_version, version);
+            read += 1;
+        } else {
+            assert_eq!(decoded, Err(DecodeError::UnsupportedFormatVersion));
+            refused += 1;
+        }
+    }
+    assert_eq!(read + refused, 256);
+    assert!(read > 0, "the range declares no readable version at all");
+    assert!(
+        refused > 0,
+        "every version is readable, so the version byte decides nothing"
+    );
+}
+
+#[test]
+fn the_written_version_is_one_the_range_reads() {
+    // A firmware that wrote a version it does not read is one whose own journals are
+    // unreadable after the reset that follows the first record. The `const` assertion in
+    // `frame.rs` says `oldest <= current`; this says the written version is inside it, which
+    // is the same statement from the other end and the one a reader would look for.
+    assert!(frame::reads_format_version(FORMAT_VERSION));
+    assert!(frame::reads_format_version(
+        frame::OLDEST_READABLE_FORMAT_VERSION
+    ));
+    const { assert!(frame::OLDEST_READABLE_FORMAT_VERSION <= FORMAT_VERSION) };
+}
+
+#[test]
 fn an_unsupported_format_version_is_refused() {
     // The version is checked after the header checksum and before anything the version
     // could have changed the meaning of. A firmware that cannot read a journal has to say

@@ -291,6 +291,18 @@ pub const STAGES: &[Stage] = &[
         why: "issue #31: design document \u{a7}14's failure-semantics table runs in CI as a check of its own, on the model and on the rig",
     },
     Stage {
+        name: "corpus",
+        job: "verification",
+        // Issue #41's second "done when". The `test` stage runs this file too, and that is
+        // not a reason to leave it out: a red `corpus` says a byte a shipped device wrote is
+        // no longer a byte this firmware reads, which is the one failure in this workspace
+        // whose blast radius is a fleet rather than a branch. It belongs in the checks list
+        // under a name that says so.
+        command: "cargo test --locked -p waymaker-flash --no-default-features --test corpus",
+        in_hook: false,
+        why: "issue #41: the frozen v1 bytes are a check of their own, because a format break is invisible to every test that drives the encoder and the decoder together",
+    },
+    Stage {
         name: "layering",
         job: "layering",
         command: "cargo --locked xtask check-layering",

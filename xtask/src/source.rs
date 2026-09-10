@@ -5891,6 +5891,248 @@ pub const CODEC_FEATURES: &[(&str, &[&str])] = &[
 /// The dependencies a codec feature is the only thing that enables.
 pub const CODEC_DEPENDENCIES: &[&str] = &["postcard", "serde"];
 
+/// Design document §09's frozen v1 wire format, held where a change to it would otherwise be
+/// invisible.
+///
+/// Issue [#41](https://github.com/madmax983/waymaker/issues/41) makes a promise: records a
+/// shipped device wrote stay readable by every later 1.x firmware. Every other check in this
+/// workspace drives the encoder and the decoder together, so the two ways of breaking that
+/// promise both pass everything — a frozen constant given another value, and a record kind
+/// given another number. This rule reads the declarations; the corpus at
+/// [`crate::docs::WIRE_FORMAT_CORPUS_DIR`] holds the bytes.
+/// Neither replaces the other: the corpus cannot say which constant a byte belongs to, and
+/// this cannot say what a writer really wrote.
+///
+/// Three halves, and each is a way the freeze comes undone on its own.
+///
+/// The **constants**: every row of [`crate::docs::WIRE_FORMAT_CONSTANTS`] must be declared, exactly
+/// once, in the file its row names, with the literal its row names. The literal rather than
+/// the value, because a rule that evaluated `HEADER_BYTES + TRAILER_BYTES` would be a second
+/// implementation of the arithmetic it checks.
+///
+/// The **numbering**: every row of [`crate::docs::WIRE_FORMAT_RECORD_KINDS`] must be declared in
+/// `waymaker-core`'s record module as `pub const NAME: Self = Self(N);` with that `N`, and
+/// the module must declare no `RecordKind` constant the table does not name. Both
+/// directions, because both rot: a kind renumbered and a kind added are the same failure
+/// from two ends.
+///
+/// The **specification**: [`crate::docs::WIRE_FORMAT_SPEC_PATH`] must exist and must carry every
+/// constant's value and every record's number, so the document a porter reads is the one the
+/// gate reads.
+///
+/// # What it cannot see
+///
+/// A *width* behind a name already on the list — `deadline` narrowed from a `u64` to a
+/// `u32` changes no constant and no kind number, and is `crates/waymaker-flash/tests/frame.rs`'s
+/// golden frames and the corpus. And it reads the two files it pins, exactly as
+/// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
+/// pin: a `const MAGIC` declared in a sibling module and imported is a declaration this rule
+/// is silent about.
+#[must_use]
+pub fn check_wire_format(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "wire-format";
+
+    let mut violations = check_frozen_constants(sources, RULE);
+    violations.extend(check_record_numbering(sources, RULE));
+    violations
+}
+
+/// Every frozen constant is declared once, in its own file, with its own literal.
+fn check_frozen_constants(
+    sources: &[crate::size::LayerSource],
+    rule: &'static str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for frozen in crate::docs::WIRE_FORMAT_CONSTANTS {
+        let Some(source) = find_source(sources, frozen.file) else {
+            violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "no {} in the workspace, so the frozen value of `{}` is checking nothing",
+                    frozen.file, frozen.name
+                ),
+            ));
+            continue;
+        };
+        // Production code only, and comments stripped: a constant named in a doc comment or
+        // declared under `#[cfg(test)]` discharges nothing about what a device writes. The
+        // same reason `integrity-check` reads its files this way.
+        let code = without_test_modules(&code_only(&source.contents));
+        let declared = declared_constant_values(&code, frozen.name);
+        match declared.len() {
+            0 => violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "{} declares no `{}`, so the frozen format has a number nothing holds",
+                    frozen.file, frozen.name
+                ),
+            )),
+            1 => {
+                let found = declared.first().map(String::as_str).unwrap_or_default();
+                if found != frozen.value {
+                    violations.push(Violation::new(
+                        rule,
+                        "waymaker-flash",
+                        format!(
+                            "{} declares `{}` as `{found}` and docs::WIRE_FORMAT_CONSTANTS \
+                             freezes it at `{}`; a value on media that moved is unreadable to \
+                             every device that already wrote it",
+                            frozen.file, frozen.name, frozen.value
+                        ),
+                    ));
+                }
+            }
+            count => violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "{} declares `{}` {count} times, not once; the scan reads the first, so a \
+                     decoy above the real one is what it would check",
+                    frozen.file, frozen.name
+                ),
+            )),
+        }
+    }
+    violations
+}
+
+/// The record numbering agrees with the table, in both directions.
+fn check_record_numbering(
+    sources: &[crate::size::LayerSource],
+    rule: &'static str,
+) -> Vec<Violation> {
+    const KERNEL: &str = "waymaker-core";
+    let path = EFFECT_SCHEDULED_PATH;
+
+    let Some(source) = find_source(sources, path) else {
+        return vec![Violation::new(
+            rule,
+            KERNEL,
+            format!("no {path} in the workspace, so §09's record numbering is checking nothing"),
+        )];
+    };
+    let code = without_test_modules(&code_only(&source.contents));
+    let declared = declared_record_numbers(&code);
+    if declared.is_empty() {
+        return vec![Violation::new(
+            rule,
+            KERNEL,
+            format!(
+                "{path} declares no `RecordKind` number at all, so §09's numbering is checking \
+                 nothing"
+            ),
+        )];
+    }
+
+    let mut violations = Vec::new();
+    for record in crate::docs::WIRE_FORMAT_RECORD_KINDS {
+        match declared.iter().find(|(name, _)| name == record.name) {
+            None => violations.push(Violation::new(
+                rule,
+                KERNEL,
+                format!(
+                    "{path} declares no `RecordKind::{}`, and §09 numbers it {}",
+                    record.name, record.number
+                ),
+            )),
+            Some((_, number)) if *number != record.number => violations.push(Violation::new(
+                rule,
+                KERNEL,
+                format!(
+                    "{path} numbers `RecordKind::{}` {number} and §09 numbers it {}; a \
+                     renumbering passes every round trip in this workspace and makes every \
+                     journal a shipped device wrote unreadable",
+                    record.name, record.number
+                ),
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, number) in &declared {
+        if !crate::docs::WIRE_FORMAT_RECORD_KINDS
+            .iter()
+            .any(|record| record.name == name)
+        {
+            violations.push(Violation::new(
+                rule,
+                KERNEL,
+                format!(
+                    "{path} declares `RecordKind::{name}` at {number}, which \
+                     docs::WIRE_FORMAT_RECORD_KINDS does not name; a record kind the frozen \
+                     format does not know is one the corpus does not cover"
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// Every literal a `const NAME` in `code` is declared with, in source order.
+///
+/// Matched on the declaration rather than on the name alone, so a use of the constant is not
+/// read as a second declaration. The value is everything between `=` and the `;`, trimmed —
+/// a literal, whatever shape it has.
+#[must_use]
+fn declared_constant_values(code: &str, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix("pub const ")
+            .or_else(|| trimmed.strip_prefix("const "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) const "))
+        else {
+            continue;
+        };
+        let Some((declared, tail)) = rest.split_once(':') else {
+            continue;
+        };
+        if declared.trim() != name {
+            continue;
+        }
+        let Some((_, value)) = tail.split_once('=') else {
+            continue;
+        };
+        values.push(value.trim().trim_end_matches(';').trim().to_owned());
+    }
+    values
+}
+
+/// Every `pub const NAME: Self = Self(N);` in `code`, as a name and a number.
+///
+/// The shape §09's numbering is declared in. A declaration whose number is not a plain
+/// integer literal is skipped rather than guessed at, and that shows up as a missing row
+/// rather than as a wrong one — the direction to be wrong in.
+#[must_use]
+fn declared_record_numbers(code: &str) -> Vec<(String, u8)> {
+    let mut numbers = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((_, value)) = tail.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_end_matches(';').trim();
+        let Some(inner) = value
+            .strip_prefix("Self(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        if let Ok(number) = inner.trim().parse::<u8>() {
+            numbers.push((name.trim().to_owned(), number));
+        }
+    }
+    numbers
+}
+
 /// Rule: a codec stays optional, and stays out of the boundary.
 ///
 /// Design document §02 decision 4 makes a codec a convenience. Three ways of taking that
@@ -10007,6 +10249,134 @@ mod deferred_answer_pins {
             path: format!("crates/{path}"),
             contents: contents.to_owned(),
         }
+    }
+
+    // `wire-format`: design document §09's frozen v1 format, pinned.
+
+    /// The two files `wire-format` reads its constants out of, and the record module.
+    fn frozen_format_sources() -> Vec<crate::size::LayerSource> {
+        vec![
+            layer(
+                INTEGRITY_ROUTING_PATH,
+                &tests_support::clean_frozen_format_module(INTEGRITY_ROUTING_PATH),
+            ),
+            layer(
+                BANK_ROUTING_PATH,
+                &tests_support::clean_frozen_format_module(BANK_ROUTING_PATH),
+            ),
+            layer(EFFECT_SCHEDULED_PATH, &tests_support::clean_record_module()),
+        ]
+    }
+
+    #[test]
+    fn a_frozen_format_that_agrees_with_the_table_passes() {
+        assert_eq!(check_wire_format(&frozen_format_sources()), Vec::new());
+    }
+
+    #[test]
+    fn a_frozen_constant_given_another_value_is_reported() {
+        // The whole point. A magic that moved changes the encoder and the decoder together,
+        // so every round trip in the workspace still passes.
+        let mut sources = frozen_format_sources();
+        let source = sources.first_mut().expect("the frame source is there");
+        source.contents = source.contents.replace("0x4D57", "0x4D58");
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("MAGIC") && v.detail.contains("0x4D58")),
+            "a moved magic went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_frozen_constant_declared_twice_is_reported() {
+        // `declared_constant_values` would otherwise read whichever came first, which is the
+        // decoy every other pin in this module already refuses.
+        let mut sources = frozen_format_sources();
+        let source = sources.first_mut().expect("the frame source is there");
+        source
+            .contents
+            .push_str("pub const MAGIC: usize = 0x4D57;\n");
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("MAGIC") && v.detail.contains("2 times")),
+            "a second declaration went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_frozen_constant_declared_only_under_cfg_test_is_reported() {
+        // A constant a fixture declares discharges nothing about the code on a device.
+        let mut sources = frozen_format_sources();
+        let source = sources.first_mut().expect("the frame source is there");
+        source.contents = source.contents.replace(
+            "pub const MAGIC: usize = 0x4D57;",
+            "#[cfg(test)]\nmod tests {\n    pub const MAGIC: usize = 0x4D57;\n}",
+        );
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("MAGIC") && v.detail.contains("declares no")),
+            "a test-only constant satisfied the pin: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_renumbered_record_kind_is_reported() {
+        // The format break nothing else in this workspace can see: the encoder takes a
+        // kind's number from `RecordRef::kind` and the decoder matches the same constants.
+        let mut sources = frozen_format_sources();
+        let source = sources.last_mut().expect("the record source is there");
+        source.contents = source.contents.replace(
+            "pub const RUN_STARTED: Self = Self(1);",
+            "pub const RUN_STARTED: Self = Self(12);",
+        );
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("RUN_STARTED") && v.detail.contains("12")),
+            "a renumbered record kind went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_kind_the_table_does_not_name_is_reported() {
+        // The other direction: a kind added to the kernel is a kind the corpus does not
+        // cover and the specification does not describe.
+        let mut sources = frozen_format_sources();
+        let source = sources.last_mut().expect("the record source is there");
+        source
+            .contents
+            .push_str("impl RecordKind {\n    pub const BATCH_STARTED: Self = Self(12);\n}\n");
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("BATCH_STARTED")),
+            "a record kind nobody wrote down went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_record_module_is_reported() {
+        // Fail closed: a numbering pinned against a file that is not there is a pin that
+        // checks nothing.
+        let sources: Vec<crate::size::LayerSource> = frozen_format_sources()
+            .into_iter()
+            .filter(|source| !source.path.ends_with(EFFECT_SCHEDULED_PATH))
+            .collect();
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("checking nothing")),
+            "a missing record module passed: {violations:?}"
+        );
     }
 
     // `effect-protocol`: design document §07's seven steps, pinned.
@@ -14222,7 +14592,40 @@ mod tests {
             let _ = writeln!(variants, "        {field}: u32,");
         }
         let _ = writeln!(variants, "    }},");
-        format!("//! A record module.\npub enum RecordRef<'a> {{\n{variants}}}\n")
+        // And §09's numbering, because `wire-format` fails closed when the module declares
+        // none of it: a fixture without these describes a workspace the gate rejects for a
+        // reason no test here is about.
+        let mut numbers = String::new();
+        for record in crate::docs::WIRE_FORMAT_RECORD_KINDS {
+            let _ = writeln!(
+                numbers,
+                "    pub const {}: Self = Self({});",
+                record.name, record.number
+            );
+        }
+        format!(
+            "//! A record module.\npub enum RecordRef<'a> {{\n{variants}}}\n\
+             impl RecordKind {{\n{numbers}}}\n"
+        )
+    }
+
+    /// A module declaring every frozen constant `wire-format` pins in `file`.
+    ///
+    /// One function for both files, because the table is what says which constant lives
+    /// where — a fixture with the split written into it a second time is a fixture that can
+    /// disagree with the rule it feeds.
+    #[must_use]
+    pub fn clean_frozen_format_module(file: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut body = String::from("//! A module of frozen format constants.\n");
+        for frozen in crate::docs::WIRE_FORMAT_CONSTANTS {
+            if frozen.file != file {
+                continue;
+            }
+            let _ = writeln!(body, "pub const {}: usize = {};", frozen.name, frozen.value);
+        }
+        body
     }
 
     /// A versioning module carrying every pinned function and no source-location macro.

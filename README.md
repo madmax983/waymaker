@@ -166,6 +166,7 @@ cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --featu
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask check-layering
 ```
 
@@ -368,6 +369,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `effect-scheduled-fields` | `RecordRef::EffectScheduled` declares a field set other than the pinned one, in either direction — a fifth field is 17% more journal on every effect, and a field removed is a wire-format change on a record already written in the field |
 | `timer-record-fields` | `RecordRef::TimerScheduled` or `RecordRef::TimerFired` declares a field set other than the pinned one, in either direction — the clock kind is what stops recovery reading a persistent instant as a boot interval, and the arming reading is the monotonicity floor a power cut takes out of RAM |
 | `version-gate` | Design document §08's workflow versioning stops being the one that was reviewed: `RecordRef::VersionMarker`'s field set moves in either direction, the versioning vocabulary's surface moves, `VersionRange` gains a public field, an associated constant, a method at any visibility the pin does not list, a submodule, an alias or a free function beside it, the crate root stops re-exporting it by source name, or the kernel's two versioning files reach a source location — §08 says a source-location hash is not stable identity, so a reformatting must not be a divergence |
+| `wire-format` | Design document §09's frozen v1 format drifts: a frozen constant is declared with another literal or declared twice, a `RecordKind` is renumbered or added without a row, or the byte-by-byte specification, its corpus or the ADR that freezes it goes missing — a renumbering passes every round trip in the workspace and makes every journal a shipped device wrote unreadable |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using a catalogued polynomial or initial value inside the function that owns it, or grows a lookup table outside `#[cfg(test)]`; or the binding drifts — the integrity trait or its shipped implementation is gone, renamed or declared twice, a seal changes width, or the shipped implementation stops being one unqualified call to the algorithm ADR 0010 settled on; or one of the four files with a route — the record codec, the bank codec, the recovery reader, the two-barrier writer — stops reaching its seals through the trait, names a checksum function where it may not, or grows a function generic over the check that no table pins |
 | `inputs-incomplete` | a crate is in the workspace but a rule could not be run against it |
 | `gate-broken` | the gate's own expected value is malformed, so a rule could not check what it claims to |

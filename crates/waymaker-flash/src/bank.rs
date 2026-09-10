@@ -104,7 +104,7 @@ use core::fmt;
 
 use waymaker_core::{DecodeError, RunId};
 
-use crate::frame::{ERASED_BYTE, FORMAT_VERSION, ProgramAlign};
+use crate::frame::{ERASED_BYTE, FORMAT_VERSION, ProgramAlign, reads_format_version};
 use crate::integrity::{Catalogued, IntegrityCheck};
 use crate::storage::Geometry;
 
@@ -890,7 +890,7 @@ pub fn decode_header_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<BankHeader<
     // Only now is the length a number the writer wrote rather than a number that was found,
     // and only now is the version worth reading: the prefix layout is frozen across format
     // versions, so its checksum is meaningful before its version is known.
-    if version != FORMAT_VERSION {
+    if !reads_format_version(version) {
         return Err(DecodeError::UnsupportedFormatVersion);
     }
 
