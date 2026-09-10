@@ -28,9 +28,9 @@
 //! It establishes nothing about a board. There is no NOR part here, no supply to remove, no
 //! reset-cause register and no backup domain; the "cut" is the host cut — the iteration stops
 //! where it stands — and the RAM survives it. `docs::HARDWARE_TARGETS` stays `Not run`, and
-//! [ADR 0039] is where that is argued rather than assumed.
+//! [ADR 0040] is where that is argued rather than assumed.
 //!
-//! [ADR 0039]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md
+//! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
 
 use waymaker_conformance::nor::NorFlashStorage;
 use waymaker_conformance::{CASE_COUNT, REQUIRED_ERASE_BLOCKS, Region};

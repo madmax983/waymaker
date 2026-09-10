@@ -5,7 +5,7 @@
 //! Neither QEMU machine this image is started on has a flash part a driver can program.
 //! `-machine microbit` models an nRF51822's CPU and a handful of its peripherals; its NVMC
 //! is not a device this code can write a journal through. So the media is an array, and the
-//! honest reading of that is in [ADR 0039]: what the emulator adds is *execution* — the
+//! honest reading of that is in [ADR 0040]: what the emulator adds is *execution* — the
 //! rig's arithmetic, its branches and its `u64` work running on ARMv6-M and ARMv7E-M rather
 //! than being compiled for them — and not a part.
 //!
@@ -31,7 +31,7 @@
 //! does the translation, exactly as `waymaker-rig/tests/port.rs` does on the host.
 //!
 //! [`StableStorage`]: waymaker_flash::storage::StableStorage
-//! [ADR 0039]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md
+//! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
 
 use embedded_storage::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use waymaker_flash::storage::{Geometry, GeometryError};

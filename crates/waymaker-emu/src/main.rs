@@ -28,7 +28,7 @@
 //! register, no backup domain and no retained-RAM question, so the two power-cut rows and the
 //! RTC row of `docs::HARDWARE_TARGETS` stay `Not run` and this image may not be cited to move
 //! them. The Cortex-M0 is also not a Cortex-M0+: the architecture is the same and the core is
-//! not. [ADR 0039] argues all of that rather than leaving a green check to imply otherwise.
+//! not. [ADR 0040] argues all of that rather than leaving a green check to imply otherwise.
 //!
 //! # Why there is `unsafe` here, and nowhere else
 //!
@@ -40,18 +40,18 @@
 //! crate nothing depends on, that is never published, and that no layer, test-support crate
 //! or firmware image links.
 //!
-//! [ADR 0039]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md
+//! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
 
 #![no_std]
 #![no_main]
 #![warn(missing_docs)]
 // The one exception in the workspace, argued in the module documentation above and in
-// ADR 0039. `allow` rather than the `forbid` every other crate carries, because a reset
+// ADR 0040. `allow` rather than the `forbid` every other crate carries, because a reset
 // vector and a semihosting exit cannot be spelled without it — and scoped to a crate nothing
 // depends on and no image links.
 #![allow(
     unsafe_code,
-    reason = "the reset vector and the semihosting exit; see ADR 0039"
+    reason = "the reset vector and the semihosting exit; see ADR 0040"
 )]
 
 pub mod boot;

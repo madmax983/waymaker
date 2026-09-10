@@ -4054,7 +4054,10 @@ pub mod tests_support {
     pub fn clean_claude_md(rules: &[&str]) -> String {
         let mut body = format!(
             "# CLAUDE.md\n\nSee docs/adr and docs/architecture.md.\n\nThe format is \
-             {WIRE_FORMAT_SPEC_PATH} and its corpus is {WIRE_FORMAT_CORPUS_DIR}.\n\n"
+             {WIRE_FORMAT_SPEC_PATH} and its corpus is {WIRE_FORMAT_CORPUS_DIR}.\n\nThe book \
+             is {book}/src/{summary}.\n\n",
+            book = crate::book::BOOK_DIR,
+            summary = crate::book::BOOK_SUMMARY
         );
         for spec in LAYERS {
             line(

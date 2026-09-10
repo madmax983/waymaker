@@ -7,10 +7,10 @@ Design document §09 is what it implements; issue
 **The promise.** Records written by a shipped device stay readable by every later 1.x
 firmware. Nothing in this document changes inside 1.x except by the rules in
 [Changing the format](#changing-the-format), and the migration policy is
-[ADR 0037](../adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md).
+[ADR 0037](https://github.com/madmax983/waymaker/blob/main/docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md).
 
 **What holds it.** The frozen bytes in
-[`crates/waymaker-flash/tests/corpus/v1`](../../crates/waymaker-flash/tests/corpus/v1/README.md),
+[`crates/waymaker-flash/tests/corpus/v1`](https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/tests/corpus/v1/README.md),
 run by `crates/waymaker-flash/tests/corpus.rs` as the `corpus` CI stage, and the
 `wire-format` gate rule. A field width or a record number that moves fails a build.
 
@@ -56,7 +56,7 @@ table and the code cannot drift apart.
 ## Integrity checks
 
 Two, and both are frozen by
-[ADR 0012](../adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md).
+[ADR 0012](https://github.com/madmax983/waymaker/blob/main/docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md).
 The algorithm is swappable behind a trait; the widths are positions in the frame and are
 not.
 
@@ -164,8 +164,8 @@ malformed record, and a reader that accepted one would read journals this firmwa
 Kinds 3, 4, 7 and 8 carry opaque bytes and refuse nothing beyond the frame's own checks.
 
 Which fields kinds 2, 5, 6 and 9 carry is settled rather than incidental — see
-[ADR 0011](../adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) and
-[ADR 0030](../adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md).
+[ADR 0011](https://github.com/madmax983/waymaker/blob/main/docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) and
+[ADR 0030](https://github.com/madmax983/waymaker/blob/main/docs/adr/0030-a-timer-is-a-boundary-and-its-clock-kind-is-on-media.md).
 
 ## The bank header
 

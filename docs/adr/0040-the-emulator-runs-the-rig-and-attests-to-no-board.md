@@ -1,4 +1,4 @@
-# ADR 0039: the emulator runs the rig, and attests to no board
+# ADR 0040: the emulator runs the rig, and attests to no board
 
 - Status: accepted
 - Date: 2026-09-10

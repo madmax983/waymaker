@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "usage: cargo xtask <check-layering \
+    | book \
     | coverage [--report FILE] \
     | size [--report FILE] [--json FILE] [--baseline-ref REF] [--no-baseline] \
     | profile [--report FILE] [--json FILE] \
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
 
     match command.as_deref() {
         Some("check-layering" | "check") | None => run_check(),
+        Some("book") => run_book(),
         Some("coverage") => run_coverage(&rest),
         Some("size") => run_size(&rest),
         Some("profile") => run_profile(&rest),
@@ -97,6 +99,26 @@ fn run_check() -> ExitCode {
             eprintln!(
                 "\nThe layering contract is design document §05: waymaker-embassy -> waymaker-flash -> waymaker-core."
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Renders the book, and fails closed on everything mdBook does not.
+///
+/// The renderer exits zero for an `{{#include}}` it cannot resolve and for an anchor it
+/// cannot find, so a stage that only ran it would pass on a book with holes in it. What the
+/// *contents* of the book must say is `cargo xtask check-layering`'s `book` and
+/// `hardware-matrix` rules.
+fn run_book() -> ExitCode {
+    let root = workspace_root();
+    match xtask::book::render(&root) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("xtask: {error}");
             ExitCode::FAILURE
         }
     }

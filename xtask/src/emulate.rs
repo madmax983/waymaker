@@ -41,7 +41,7 @@
 //! A board. Neither machine has a NOR part, a supply that can be removed, a reset-cause
 //! register or a backup domain, so `docs::HARDWARE_TARGETS` stays `Not run` and this stage
 //! may not be cited to move a row of it. See
-//! [ADR 0039](https://github.com/madmax983/waymaker/blob/main/docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+//! [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -326,7 +326,7 @@ impl Report {
             "\nWhat this establishes is that the rig executes on both instruction sets, and that both\n\
              agree about what it did. What it does not establish is a board: neither machine has a NOR\n\
              part, a supply to remove, a reset-cause register or a backup domain, so every row of the\n\
-             hardware table stays `Not run`. See ADR 0039.\n",
+             hardware table stays `Not run`. See ADR 0040.\n",
         );
         out
     }

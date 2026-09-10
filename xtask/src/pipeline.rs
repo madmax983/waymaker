@@ -351,13 +351,28 @@ pub const STAGES: &[Stage] = &[
         // What it is not is a board. Neither QEMU machine has a NOR part, a supply that can
         // be removed, a reset-cause register or a backup domain, so every row of
         // `docs::HARDWARE_TARGETS` stays `Not run` and a green check here may not be cited
-        // to move one. ADR 0039 is where that is argued rather than left to a reader.
+        // to move one. ADR 0040 is where that is argued rather than left to a reader.
         //
         // The command takes no arguments so that this table can compare it against the
         // workflow byte for byte, which is `size`'s and `profile`'s reason.
         command: "cargo --locked xtask emulate",
         in_hook: false,
         why: "a crate that compiles for the part is not a crate that runs on one: `cargo build --lib` never links",
+    },
+    Stage {
+        name: "book",
+        job: "book",
+        // Its own job because it needs a tool no rustup profile carries, installed by a
+        // step of its own. Issue #42's first "done when" is that the book builds in CI.
+        //
+        // The command is `xtask book` rather than `mdbook build` because mdBook exits zero
+        // for an `{{#include}}` whose file is missing and for an anchor it cannot find --
+        // the first renders the directive into the page, the second renders nothing at all.
+        // A stage that ran the renderer alone would be a stage that passes on a book with
+        // holes in it, which is the one shape of rot a book has.
+        command: "cargo --locked xtask book",
+        in_hook: false,
+        why: "issue #42: the book builds in CI, and the renderer exits zero on a book with holes in it",
     },
     Stage {
         name: "layering",

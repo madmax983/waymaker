@@ -10,11 +10,12 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 54 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 56 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
 - The architecture, drawn: [`docs/architecture.md`](docs/architecture.md)
+- The book, for a reader rather than a contributor: [`docs/book`](docs/book/src/SUMMARY.md)
 - Why things are the way they are: [`docs/adr`](docs/adr/README.md)
 - The design document this is all taken from: [`docs/design/waymaker-design-v0.2.html`](docs/design/waymaker-design-v0.2.html)
 
@@ -47,6 +48,7 @@ cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --te
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
 cargo --locked xtask emulate
+cargo --locked xtask book
 cargo --locked xtask check-layering
 ```
 
@@ -381,7 +383,7 @@ and QEMU has no Cortex-M0+ machine at all — a Cortex-M0 implements the same in
 and is a different core. So the emulated boot covers the *architecture* of two rows of
 [the hardware table](#what-the-boards-still-owe) and the part of none of them, all three stay
 `Not run`, and
-[ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md) carries no
+[ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) carries no
 attestation marker — so `hardware-attestation` fails a build in which somebody moves a row and
 cites it.
 
@@ -436,6 +438,42 @@ divergent replay are things this rig does not do — issue
 rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned gap test. The
 same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
 dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
+
+## The book
+
+Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s mdBook is
+[`docs/book`](docs/book/src/SUMMARY.md), and it is written for a *reader* — a workflow
+author, or somebody porting to a part — where this file is written for a contributor. Eight
+chapters, one per bullet of the issue, held as a table in `xtask::book::BOOK_CHAPTERS`.
+`cargo xtask book` renders it; the `book` and `hardware-matrix` rules say what it must
+contain.
+
+Two things about it are worth reading before changing it, because both are decisions rather
+than conveniences.
+
+**A chapter may not carry a Rust sample of its own.** Every sample is an `{{#include}}` of an
+anchor in [`crates/waymaker-drive/tests/book.rs`](crates/waymaker-drive/tests/book.rs), and
+the anchor's name must be the name of a `#[test]` in that file. So the bytes the book shows
+are the bytes of something the `test` stage compiles and runs against `waymaker-fault`'s
+model of NOR, the real driver and the real codec. A Rust fence is still how mdBook renders an
+included sample as code, so the ban is on a fence carrying *source*, not on the fence: the
+body may hold include directives and nothing else.
+
+**The stage runs `cargo xtask book` rather than `mdbook build`, and that is the whole reason
+the rule exists.** mdBook exits `0` for an `{{#include}}` whose file is missing — it renders
+the directive into the page and logs an `ERROR` — and for an anchor a file does not declare,
+which it renders as *nothing at all*, with no log line. Both were reproduced against mdBook
+0.5.4 before [ADR 0039](docs/adr/0039-the-book-quotes-tests-and-the-matrix-is-derived.md) was
+written. So the command fails closed on a missing renderer, on an `ERROR` beside a zero exit,
+on a chapter with no HTML, and on a page that shows none of the sample it includes.
+
+The hardware compatibility matrix is [one chapter](docs/book/src/hardware-matrix.md) and
+every cell of it but one is *derived*: the geometry from `xtask::wear::PARTS`, the power-cut
+standing from `xtask::docs::HARDWARE_TARGETS`, and the write amplification from a measurement
+the gate takes on every run. Only the clock column is declared, because no table here holds
+it. The book therefore cannot say `Passed` where
+[the attestation record](#what-the-boards-still-owe) says `Not run`, and a wear figure that
+drifted fails a build rather than going on being published.
 
 ## The layering
 
@@ -493,7 +531,7 @@ Eight crates are in the workspace and are *not* layers:
   *keyword* appearing anywhere in the crate. It carries the workspace's only two firmware
   runtime dependencies, `cortex-m-rt` and `cortex-m-semihosting`, and no layer, test-support
   crate or shipped image links either. See
-  [ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+  [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 - `waymaker-fault` — the in-memory storage model and crash injector, `policy::TEST_SUPPORT_CRATES`.
   Host-side, `std`, no third-party dependencies, and outside `default-members`. It depends on
   `waymaker-flash` for the storage contract; no layer depends on it, in any dependency kind,
@@ -791,7 +829,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 54 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 56 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -848,7 +886,7 @@ this table is how you find out what a red build is telling you.
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. The emulated boot's own targets are `emulation-boot`'s, which reads the same file: a rule about which cores the rig is started on belongs with the rest of that subject rather than here. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links — or it stops mirroring a layer feature under a feature of its own, so the row named after that feature links code the probe can reach none of. A probe cannot `#[cfg]` on another crate's feature, so `--features waymaker-embassy/postcard` would report the delta of an image nobody exercised, and no other rule would notice: the row is not identical to its base, because the probe's own constants already differ. |
 | `size-probe-reach` | A layer grows a public function the probe does not reach, so no budget charges for it. |
-| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword**, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call. Without this half the exception would be a licence for a crate rather than for two expansions, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md). |
+| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword**, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call. Without this half the exception would be a licence for a crate rather than for two expansions, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md). |
 | `gate-broken` | The gate's own expected values do not parse. A gate must not be able to silently uncheck one of its rules. |
 
 ### Documentation
@@ -867,6 +905,8 @@ this table is how you find out what a red build is telling you.
 | `deferred-questions` | A question in `docs::DEFERRED_QUESTIONS` is missing from this file, its row does not carry the headline and the status the table renders, the count is wrong, a settled one's ADR is absent, unaccepted or does not carry its `Settles deferred question:` marker, two ADRs claim one question, an open one is already claimed by an ADR, or an ADR claims a question the table never declared. |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
 | `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
+| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a **file** appears under that directory that the table does not declare — every file rather than every `.md` file, because review of this change added a chapter named `rogue.MD`, linked it, and watched a case-sensitive collector leave it covered by nothing. The *samples*: a fence whose language `book::QUOTABLE_FENCE_LANGUAGES` does not name — the *unlabelled* one included — carries anything but `{{#include}}` directives; a line carries a directive and something else; a directive that is not `{{#include}}` appears at all; a line is indented four spaces; an include names a file `book::BOOK_SAMPLE_FILES` does not, an anchor that file does not declare, an anchor with no `#[test]` of its name, or a line *range*; an anchor is declared and no chapter shows it; or an anchor does not **contain** the `#[test] fn` of its own name and is not named in `book::BOOK_FIXTURE_ANCHORS` — a fixture anchor being one that shows a type a test uses, which must still declare an item rather than commentary. A `#[test]` under `#[ignore]` or `#[cfg(` is not a test, which is `failure-matrix`'s standard met here. Five of those are things review demonstrated rather than predicted, each watched passing on a mutation before it was closed: a bare ` ``` ` fence carrying Rust, past a version that asked whether the info string said "rust"; `{{#include a}} let x = 1; {{#include b}}`, which satisfies `starts_with` and `ends_with` and renders the source between them; `{{#playground}}`, which renders an arbitrary source file as a Rust block with no fence at all; `#[ignore]` written *above* the anchor marker, where a reader of the book never sees it and the test never runs; and an anchor shrunk to two comment lines advertising an API that does not exist, which a name-only tie accepted. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) and state no table of its own; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both link `docs/book/src/SUMMARY.md` — the path rather than the directory, because `docs/book (deleted; see the archive)` satisfied the looser check. What it cannot see is prose, and it cannot say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
+| `hardware-matrix` | The matrix stops covering every part, or starts claiming something. A board in `docs::HARDWARE_TARGETS` or a modelled part in `wear::PARTS` has no row in `book::HARDWARE_MATRIX`; a row names a board or a part neither table declares; the matrix chapter's table is not, cell for cell and row for row, `book::MATRIX_TABLE_HEADER` followed by every derived row in order; the chapter says `Passed` while no row renders it; or a modelled part's figure could not be measured, which is a failure rather than a blank column. Whole rows compared by equality rather than each cell searched for somewhere in the page, because review of this change fabricated a table of two boards that do not exist — both `Passed`, with invented geometry and invented wear — hid the honest rows in HTML comments, and watched a substring version print `ok`; it separately took a wear figure from `63.37` to `163.37`, which no `contains` can see, and duplicated a declared id with `Passed` in it. Every cell but the clock column is derived: the geometry from `wear::PARTS`, the power-cut standing from `HARDWARE_TARGETS` for a board and from `book::SWEPT_PROGRAM_BYTES` for a model — every crash sweep in this workspace lays the part out at a four-byte program unit, so the other two modelled rows say so rather than borrowing a sweep that never ran — and the written bytes per effect from the measurement this run took. So the book cannot say `Passed` where the record says `Not run`, and moving that record needs an accepted ADR, which is `hardware-attestation`'s. What it cannot see is whether a `Passed` row is *true*; that is a log from a bench, and [what the boards still owe](#what-the-boards-still-owe) is where its absence is recorded. |
 
 ## What is not checked
 
@@ -1648,7 +1688,7 @@ Stated so that nobody mistakes silence for coverage:
   [the budgets](#budgets) already say is unaccounted stays unaccounted. The `emulate` stage is
   the first thing in this workspace that *could* measure it — paint the region, run, read the
   high-water mark — and it does not. Doing it needs a second `unsafe` expansion and a
-  memory-map symbol, and ADR 0039 records it as the obvious next thing that image is good for
+  memory-map symbol, and ADR 0040 records it as the obvious next thing that image is good for
   rather than attaching a half-argued number to it.
 - **That an emulated core is the part a row of the hardware table names.** It is not, in four
   ways, and each one is a whole class of failure. QEMU's `microbit` is a Cortex-M0 and
@@ -1682,6 +1722,41 @@ Stated so that nobody mistakes silence for coverage:
   `Owed` on the rig, met again one gate over. An instruction-set difference on a path the
   workload does not take is a difference nothing here has watched for. It is a *sampled* gate,
   and saying so is better than a green check that reads as a proof.
+- **What the book's sentences say.** `book` matches chapter ids, file names, include targets
+  and anchor names; `hardware-matrix` matches rendered cells. A chapter whose prose describes
+  another engine passes both as long as its includes and its tables are right. It is the same
+  limit the first bullet of this list states, met in a document a reader is more likely to
+  believe than this one.
+- **That a book sample is the sample the chapter needed.** The tie is the anchor's *name*: an
+  anchor must be a `#[test]` of that name, and the test must be in a file
+  `book::BOOK_SAMPLE_FILES` names. Nothing says the test *asserts* what the surrounding
+  paragraph claims — that is `crates/waymaker-drive/tests/book.rs` being read by a person,
+  the same standing `failure-matrix` records for a row-named test.
+- **That the rendered page shows the right sample.** `cargo xtask book` looks for one
+  identifier out of each anchor's body in the page that includes it, and reports the anchor
+  when it can find no witness at all — which is the case that matters, because mdBook renders
+  a missing anchor as nothing and exits zero, and an earlier version of that function looked
+  the witness up *inside* the anchor and so had nothing to look for exactly when there was
+  nothing on the page. What is left is a body whose longest identifier also appears in the
+  chapter's prose. The tie that matters is the `book` rule's, which resolves every anchor
+  against the file it is taken from and requires it to contain its own test.
+- **A book page filed outside `docs/book/src`.** The gate reads every file of that directory,
+  to a depth of eight, and `book.toml`. A chapter sourced from somewhere else through an
+  mdBook preprocessor is a page no rule covers — the same shape of limit `capacity-reserve`,
+  `recovery-surface` and `storage-contract` each record for the one file they pin. The depth
+  bound is what stops a symlink cycle under the book's source walking for ever.
+- **That a fixture anchor shows the type its chapter is about.** `book::BOOK_FIXTURE_ANCHORS`
+  is the escape hatch for an anchor that shows a type a test uses rather than the test
+  itself, and the rule asks only that such an anchor declare an item. Which item, and whether
+  the paragraph beside it describes that item, is a reviewer's. Three anchors use it today.
+- **That the modelled rows of the matrix were swept at their own program unit.** Two of them
+  were not, and `render_power_cut` says so rather than printing a sweep that never ran. What
+  no rule can say is whether a four-byte sweep generalises to a part that programs one byte
+  or sixteen; that is what [the boards](#what-the-boards-still-owe) are for.
+- **That a board's matrix row is true.** `hardware-matrix` reads the power-cut cell out of
+  `docs::HARDWARE_TARGETS`, so the book cannot claim more than the decision record does. What
+  makes a `Passed` row true is a log from a bench, which is `hardware-attestation`'s limit and
+  is stated there.
 
 ## Status
 
@@ -2692,9 +2767,9 @@ rule fails a build over the *keyword* appearing anywhere in the crate. What is *
 discharged is the thing a reader will reach for first, and it is a row rather than a claim:
 all three of [the hardware table](#what-the-boards-still-owe)'s rows stay `Not run`, because
 neither machine has a NOR part, a supply to remove, a reset-cause register or a backup domain,
-and a Cortex-M0 is not a Cortex-M0+. ADR 0039 carries no attestation marker, so
+and a Cortex-M0 is not a Cortex-M0+. ADR 0040 carries no attestation marker, so
 `hardware-attestation` fails a build in which somebody moves a row and cites it. See
-[ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+[ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The

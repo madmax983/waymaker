@@ -322,7 +322,7 @@ jobs:
     # What it is NOT is a board. Neither machine has a NOR part, a supply that can be
     # removed, a reset-cause register or a backup domain, so every row of the hardware
     # table in CLAUDE.md stays `Not run` and a green check here may not be cited to move
-    # one. See docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md.
+    # one. See docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md.
     name: emulated boot
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -349,6 +349,49 @@ jobs:
 
       - name: Boot the rig on both cores
         run: cargo --locked xtask emulate
+
+  book:
+    # Issue #42: the book builds in CI. Its own job because it needs a renderer no rustup
+    # profile carries, installed by a step of its own.
+    #
+    # The stage is `cargo xtask book` rather than `mdbook build`. mdBook exits zero for an
+    # `{{#include}}` whose file is missing — it renders the directive into the page — and
+    # for an anchor it cannot find, which it renders as nothing at all. A job that ran the
+    # renderer alone would pass on a book with holes in it. What the chapters must *say* is
+    # the `book` and `hardware-matrix` rules in the `layering` job.
+    name: the book
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block above explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Pinned, and installed before the stage, so that a missing renderer is an install
+      # failure rather than a book that quietly did not build.
+      - name: Install mdBook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+
+      - name: Build the book
+        run: cargo --locked xtask book
+
+      - name: Upload the rendered book
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: book
+          path: target/book
+          # `warn` rather than `ignore`: the run where the book is missing is the run where
+          # someone wants to know why.
+          if-no-files-found: warn
 
   layering:
     # The dependency direction is a contract (design document §05), not a convention.

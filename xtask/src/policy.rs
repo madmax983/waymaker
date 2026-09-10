@@ -90,7 +90,7 @@ pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
 /// `#![allow(unsafe_code)]` plus an ADR" — and
 /// [`crate::emulate::check_emulation_boot`] is what keeps the exception scoped to the two
 /// macro expansions that need it rather than to the crate. See
-/// [ADR 0039](https://github.com/madmax983/waymaker/blob/main/docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+/// [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 pub const EMULATION_CRATES: &[&str] = &["waymaker-emu"];
 
 /// Crates that exist to test the layers, and are never linked into firmware.
