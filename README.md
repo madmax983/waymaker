@@ -139,7 +139,8 @@ behavior requires an idempotent activity or downstream deduplication of that ID.
 ## Development
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it
-up automatically, including the `thumbv6m-none-eabi` target the firmware build needs.
+up automatically, including the `thumbv6m-none-eabi` target the firmware build needs and the
+`thumbv7em-none-eabi` target the emulated boot's second core needs.
 
 ```sh
 cargo xtask install-hooks   # once per clone: generates .githooks/pre-commit and points git at it
@@ -163,11 +164,13 @@ cargo build --locked -p waymaker-drive --no-default-features --lib --target thum
 cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
+cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
+cargo --locked xtask emulate
 cargo --locked xtask check-layering
 ```
 
@@ -384,7 +387,8 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `kernel-owns-no-encoding` | a `waymaker-core` source converts between bytes and a value — `from_le_bytes` and its siblings, or an `impl From<&[u8]>`/`TryFrom<&[u8]>` — which needs no dependency for the previous rule to catch |
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
-| `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, nor declared test support |
+| `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, an emulation image, nor declared test support |
+| `emulation-boot` | the emulated image stops being firmware, writes hand-written `unsafe`, loses the reasoned `allow` its one exception rests on, disagrees with the harness about the prefix it prints, declares a binary that is not behind its feature, or names a core the toolchain does not pin and no stage runs |
 | `no-build-scripts` | a layer or a test-support crate has a `build.rs` |
 | `empty-default-features` | a layer or a test-support crate has a non-empty `default` feature |
 | `crate-attributes` | a firmware crate root drops `#![no_std]` or declares `extern crate std`/`alloc`, or any crate the layering covers drops `#![forbid(unsafe_code)]` or allows unsafe code |

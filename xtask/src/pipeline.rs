@@ -247,6 +247,26 @@ pub const STAGES: &[Stage] = &[
         why: "the probe's crate attributes are checked by the layering gate and by no compiler without this",
     },
     Stage {
+        name: "emu-lint",
+        job: "firmware",
+        // `probe-lint`'s argument, met a second time. The emulated image's binary is behind
+        // `required-features`, so the `lint` stage — `--all-targets --no-default-features`
+        // on the host — never compiles it, and `cargo xtask emulate` builds it rather than
+        // linting it. Without this stage the one crate in the workspace that carries
+        // `#![allow(unsafe_code)]` is the one crate no clippy run ever reads.
+        //
+        // It earned its place on the run that added it: four denials in code that had
+        // already built and already booted on both machines.
+        //
+        // On the firmware target and with the feature on, because that is the only
+        // configuration in which a `#![no_main]` crate with a `#[panic_handler]` compiles at
+        // all. One of the two machine targets rather than both: clippy does not link, and the
+        // difference between them is a linker's.
+        command: "cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings",
+        in_hook: false,
+        why: "the emulated image is behind `required-features`, so no other stage lints the one crate that allows unsafe code",
+    },
+    Stage {
         name: "size",
         job: "size",
         // Its own job because it links every feature combination on the firmware target
@@ -317,6 +337,27 @@ pub const STAGES: &[Stage] = &[
         command: "cargo --locked xtask profile",
         in_hook: false,
         why: "\u{a7}02 decision 1: `no_alloc` is a measurement rather than an attribute, and the instruction cost is published beside it",
+    },
+    Stage {
+        name: "emulate",
+        job: "emulation",
+        // Its own job because it needs an emulator no rustup profile carries, and because of
+        // what a red one says. Every firmware stage above builds a *library* — `cargo build
+        // --lib` produces an rlib and never links — so until this existed nothing in this
+        // repository had executed a Waymaker instruction outside an x86 test binary. This
+        // links an image with a reset vector, starts it on a Cortex-M0 and a Cortex-M4, and
+        // requires the rig to have run and to have said what it did.
+        //
+        // What it is not is a board. Neither QEMU machine has a NOR part, a supply that can
+        // be removed, a reset-cause register or a backup domain, so every row of
+        // `docs::HARDWARE_TARGETS` stays `Not run` and a green check here may not be cited
+        // to move one. ADR 0039 is where that is argued rather than left to a reader.
+        //
+        // The command takes no arguments so that this table can compare it against the
+        // workflow byte for byte, which is `size`'s and `profile`'s reason.
+        command: "cargo --locked xtask emulate",
+        in_hook: false,
+        why: "a crate that compiles for the part is not a crate that runs on one: `cargo build --lib` never links",
     },
     Stage {
         name: "layering",
@@ -1050,8 +1091,17 @@ pub mod tests_support {
     /// A toolchain file that pins the firmware target and every required component.
     #[must_use]
     pub fn clean_toolchain() -> String {
+        // Every emulation target as well as the firmware one: `emulation-boot` requires each
+        // machine's target to be pinned, so a fixture with only the firmware target would
+        // describe a workspace that rule refuses.
+        let mut targets = vec![FIRMWARE_TARGET.to_owned()];
+        for machine in crate::emulate::MACHINES {
+            if !targets.iter().any(|target| target == machine.target) {
+                targets.push(machine.target.to_owned());
+            }
+        }
         format!(
-            "[toolchain]\nchannel = \"1.97\"\ntargets = [\"{FIRMWARE_TARGET}\"]\ncomponents = {REQUIRED_COMPONENTS:?}\n"
+            "[toolchain]\nchannel = \"1.97\"\ntargets = {targets:?}\ncomponents = {REQUIRED_COMPONENTS:?}\n"
         )
     }
 }

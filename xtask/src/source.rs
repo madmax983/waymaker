@@ -8842,7 +8842,7 @@ fn implements_trait(line: &str, needle: &str) -> bool {
 /// * `'"'` — a character literal holding a quote, which opened a string that never closed.
 /// * `/* /* */ */` — Rust block comments nest, and a scan that stopped at the first `*/`
 ///   would treat the tail as code.
-fn code_only(contents: &str) -> String {
+pub(crate) fn code_only(contents: &str) -> String {
     let source: Vec<char> = contents.chars().collect();
     let mut code = String::with_capacity(contents.len());
     let mut at = 0;

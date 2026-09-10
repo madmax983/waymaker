@@ -725,12 +725,13 @@ pub fn check_workspace_membership(graph: &PackageGraph) -> Vec<Violation> {
             let known = policy::layer(&package.name).is_some()
                 || policy::HOST_TOOLS.contains(&package.name.as_str())
                 || policy::MEASUREMENT_CRATES.contains(&package.name.as_str())
-                || policy::TEST_SUPPORT_CRATES.contains(&package.name.as_str());
+                || policy::TEST_SUPPORT_CRATES.contains(&package.name.as_str())
+                || policy::EMULATION_CRATES.contains(&package.name.as_str());
             (!known).then(|| {
                 Violation::new(
                     "workspace-membership",
                     package.name.clone(),
-                    "is a workspace member but is neither a layer, declared host tooling, a measurement fixture, nor declared test support; add a row to policy::LAYERS, policy::HOST_TOOLS, policy::MEASUREMENT_CRATES or policy::TEST_SUPPORT_CRATES",
+                    "is a workspace member but is neither a layer, declared host tooling, a measurement fixture, an emulation image, nor declared test support; add a row to policy::LAYERS, policy::HOST_TOOLS, policy::MEASUREMENT_CRATES, policy::EMULATION_CRATES or policy::TEST_SUPPORT_CRATES",
                 )
             })
         })

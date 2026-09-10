@@ -1,0 +1,51 @@
+[package]
+name = "waymaker-emu"
+description = "Firmware linked, started and *run* under an emulator so that the rig executes on the instruction set it is written for. Never published, never shipped, and never a substitute for a board."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# An execution fixture, not a library. Publishing it would put a crate on crates.io whose
+# only reason to exist is to be flashed into an emulator and thrown away.
+publish = false
+
+# Behind `required-features` for the size probe's reason: without it `cargo build
+# --workspace` and `cargo clippy --all-targets` would try to link a `#![no_main]` firmware
+# binary for the host, where there is no reset vector to place and no `#[entry]` to call.
+[[bin]]
+name = "waymaker-emu"
+path = "src/main.rs"
+required-features = ["emu"]
+
+[dependencies]
+# The subject. Everything below exists to get this crate's `Rig::prepare`, `iterate` and
+# `verify` executed on an ARM core rather than compiled for one.
+waymaker-rig = { workspace = true, optional = true }
+# §12's storage contract, and the `embedded-storage` port the media model is presented
+# through. Reused rather than reimplemented: an emulator boot that wrote its own
+# `StableStorage` would be exercising a second adapter nobody ships.
+waymaker-flash = { workspace = true, optional = true }
+waymaker-conformance = { workspace = true, optional = true }
+embedded-storage = { version = "0.3.1", optional = true }
+# The reset vector, the vector table and the semihosting channel the harness reads. Both
+# are firmware runtime rather than Waymaker: no layer names either, and nothing depends on
+# this crate.
+cortex-m-rt = { version = "0.7.6", optional = true }
+cortex-m-semihosting = { version = "0.5.0", optional = true }
+
+[features]
+default = []
+# Builds the binary at all. `cargo xtask emulate` always passes it.
+emu = [
+    "dep:waymaker-rig",
+    "dep:waymaker-flash",
+    "dep:waymaker-conformance",
+    "dep:embedded-storage",
+    "dep:cortex-m-rt",
+    "dep:cortex-m-semihosting",
+]
+
+[lints]
+workspace = true

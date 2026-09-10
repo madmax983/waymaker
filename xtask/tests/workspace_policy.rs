@@ -756,14 +756,20 @@ fn a_toolchain_that_stops_pinning_the_firmware_target_is_rejected() {
     let scratch = scratch_workspace("toolchain-drift");
     let toolchain = scratch.root.join(xtask::pipeline::TOOLCHAIN_PATH);
     let existing = std::fs::read_to_string(&toolchain).expect("the toolchain should be readable");
-    std::fs::write(
-        &toolchain,
-        existing.replace(
-            &format!("targets = [\"{}\"]\n", xtask::pipeline::FIRMWARE_TARGET),
-            "",
-        ),
-    )
-    .expect("the toolchain should be writable");
+    // Drop the whole `targets = [..]` line rather than one spelling of it. The file pins two
+    // targets since the `emulate` stage arrived — the firmware one and the second core's —
+    // and a test that replaced the one-element literal quietly stopped changing anything, so
+    // the assertion below passed against a workspace it had not broken.
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("targets ="))
+        .collect();
+    let thinned = format!("{}\n", kept.join("\n"));
+    assert!(
+        kept.len() < existing.lines().count(),
+        "the toolchain should pin some target"
+    );
+    std::fs::write(&toolchain, thinned).expect("the toolchain should be writable");
 
     let violations =
         xtask::check_workspace(&scratch.root).expect("the policy check should be runnable");

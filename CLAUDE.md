@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 53 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 54 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -40,17 +40,20 @@ cargo build --locked -p waymaker-drive --no-default-features --lib --target thum
 cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
+cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
+cargo --locked xtask emulate
 cargo --locked xtask check-layering
 ```
 
-`cargo xtask profile` needs valgrind, which no rustup profile carries — the pipeline
-installs it in the `profiling` job, and the command fails closed rather than passing when it
-is absent, because a measurement that did not happen is not a measurement that passed.
+`cargo xtask profile` needs valgrind and `cargo xtask emulate` needs `qemu-system-arm`, and
+no rustup profile carries either — the pipeline installs them in the `profiling` and
+`emulation` jobs, and both commands fail closed rather than passing when their tool is
+absent, because a measurement that did not happen is not a measurement that passed.
 
 `cargo doc` needs `RUSTDOCFLAGS=-D warnings` to mean what it says — that is in the
 workflow's `env:` block, and the `ci-pipeline` rule fails a build without it.
@@ -264,7 +267,10 @@ elapsed on the first replay after it. Nothing in this repository has ever run on
 
 That is a sentence a green CI would otherwise contradict, so it is a table.
 `xtask::docs::HARDWARE_TARGETS` holds it and the `hardware-attestation` rule compares it
-against this section in both directions — the same move
+against this section in both directions. The `emulate` stage is the green check most likely
+to be mistaken for one of these rows and is not one:
+[the emulated boot](#the-emulated-boot-and-what-it-is-not) says what it covers, which is two
+architectures and no part — the same move
 [the guarantees table](#the-guarantees-and-what-holds-each-up) makes for what
 `waymaker-spec` still owes.
 
@@ -325,6 +331,59 @@ the *cost* of trusting it, in
 it, which is the half of it that can fail. §12's
 `barrier-is-durable` and `barrier-orders-what-follows` are still `waymaker-conformance`'s
 across-reset witness's, and still owed against a real driver.
+
+## The emulated boot, and what it is not
+
+Every firmware stage above builds a **library**, and `cargo build --lib` produces an rlib and
+never links. That is stated twice already — once for `crate-attributes`, which exists because
+of it, and once in [what is not checked](#what-is-not-checked) — and the consequence is
+larger than the allocation half it is usually quoted for: nothing places a reset vector,
+nothing resolves a `#[panic_handler]`, nothing links `compiler_builtins`, and no instruction
+is ever retired. Until the `emulate` stage existed, every claim about the rig on ARM rested on
+a compiler's willingness to *emit* code nothing had executed, and every test in this workspace
+ran on x86-64 under `std` with a 64-bit ALU and an allocator present.
+
+`waymaker-emu` is a linked image — reset vector, vector table, memory map — and
+`cargo xtask emulate` starts it on two QEMU machines and gates what it says it did. It is
+`policy::EMULATION_CRATES`, a category of its own, and `emulation-boot` is the rule.
+
+| Machine | Core | Architecture | Why |
+| --- | --- | --- | --- |
+| `microbit` | Cortex-M0 | ARMv6-M | the architecture §04's budgets are stated for, and the target every firmware stage builds |
+| `mps2-an386` | Cortex-M4 | ARMv7E-M | a second encoding, because a rig that only ever ran on one has measured that one |
+
+Three things hold it, and they hold different halves.
+
+- **The two censuses must be equal.** The plan is deterministic, so a difference is not a
+  tolerance — it is the rig behaving differently on two instruction sets. A `u64` shift
+  lowered through `compiler_builtins` on one core and an instruction on the other, an
+  alignment assumption, a `usize` narrowing: none of those shows up as anything else here,
+  and none of them shows up on a host at all.
+- **The media model is interrogated before the rig is run over it.** Neither machine has a
+  flash part a driver can program, so the media is NOR modelled in RAM — erased is `0xFF`,
+  a program only clears bits — presented through `waymaker-conformance`'s own
+  `NorFlashStorage` rather than through a second `StableStorage` written for the occasion. And
+  §12's suite is run over it first, which is the crate that is `#![no_std]` and
+  allocation-free *precisely* so an adapter author can run it on the target the driver is for.
+  A rig run over a model nobody had asked whether it obeys the storage contract would be a rig
+  run over an unknown quantity.
+- **The census is the gate, not the exit code.** An image whose `main` returned before it
+  reached the rig exits exactly the way a complete one does. So the image prints what it
+  counted and the run is failed when no conformance case passed, no iteration ran, no
+  iteration was *cut* — without which only clean runs were driven and recovery answered
+  nothing — a cut run was left unaccounted for, or a run reached no verdict. Both sides check
+  it: the image refuses its own census and exits non-zero, and the harness checks again,
+  because a gate that trusted the subject's own verdict would be reading a claim.
+
+**It attests to no board, and that is the point of saying it here.** Neither machine has a NOR
+part, a supply that can be removed, a reset-cause register, retained RAM or a backup domain,
+and QEMU has no Cortex-M0+ machine at all — a Cortex-M0 implements the same instruction set
+and is a different core. So the emulated boot covers the *architecture* of two rows of
+[the hardware table](#what-the-boards-still-owe) and the part of none of them, all three stay
+`Not run`, and
+[ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md) carries no
+attestation marker — so `hardware-attestation` fails a build in which somebody moves a row and
+cites it.
 
 ## The failure matrix, row by row
 
@@ -413,7 +472,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Seven crates are in the workspace and are *not* layers:
+Eight crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes and its symbols can be
@@ -421,6 +480,20 @@ Seven crates are in the workspace and are *not* layers:
   declares all three layers as *optional* dependencies, on purpose — the baseline variant
   links none of them, which is what makes the code-flash budget a delta rather than an
   absolute — and nothing depends on it.
+- `waymaker-emu` — firmware linked, started and *executed*, `policy::EMULATION_CRATES`. A
+  category of its own rather than a second measurement crate, because nothing about it is
+  measured: it is the image `cargo xtask emulate` starts on a Cortex-M0 and a Cortex-M4 so
+  that `waymaker-rig` **runs** on the two instruction sets Waymaker is built for. Outside
+  `default-members`, its binary behind `required-features`, and nothing depends on it. It is
+  also the one crate in this workspace carrying `#![allow(unsafe_code)]`, which is the other
+  reason it is not a row in one of the categories above: every one of those holds its members
+  to `#![forbid(unsafe_code)]`, and a reset vector cannot be spelled without the attribute.
+  The exception is scoped to the two macro expansions that need it — `#[cortex_m_rt::entry]`
+  and the semihosting exit — by `emulation-boot`, which fails a build over the `unsafe`
+  *keyword* appearing anywhere in the crate. It carries the workspace's only two firmware
+  runtime dependencies, `cortex-m-rt` and `cortex-m-semihosting`, and no layer, test-support
+  crate or shipped image links either. See
+  [ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 - `waymaker-fault` — the in-memory storage model and crash injector, `policy::TEST_SUPPORT_CRATES`.
   Host-side, `std`, no third-party dependencies, and outside `default-members`. It depends on
   `waymaker-flash` for the storage contract; no layer depends on it, in any dependency kind,
@@ -718,7 +791,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 53 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 54 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -751,7 +824,7 @@ this table is how you find out what a red build is telling you.
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
-| `workspace-membership` | A workspace member is neither a layer, declared host tooling, a measurement crate, nor declared test support. |
+| `workspace-membership` | A workspace member is neither a layer, declared host tooling, a measurement crate, an emulation image, nor declared test support. |
 | `inputs-incomplete` | A crate is in the graph but contributed no manifest, or a workspace member contributed no crate root, so rules silently skipped it. |
 
 ### Crates and manifests
@@ -772,9 +845,10 @@ this table is how you find out what a red build is telling you.
 | --- | --- |
 | `ci-pipeline` | The workflow drops a stage, reorders one within a job, or makes one unable to fail — an `if:`, a `continue-on-error:`, a missing `RUSTDOCFLAGS`, an `on:` block no pull request triggers, a job with no `runs-on:`, or a tab in the indentation. |
 | `pre-commit-hook` | `.githooks/pre-commit` is missing, not executable, or not byte-for-byte what the stage table renders. |
-| `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. |
+| `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. The emulated boot's own targets are `emulation-boot`'s, which reads the same file: a rule about which cores the rig is started on belongs with the rest of that subject rather than here. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links — or it stops mirroring a layer feature under a feature of its own, so the row named after that feature links code the probe can reach none of. A probe cannot `#[cfg]` on another crate's feature, so `--features waymaker-embassy/postcard` would report the delta of an image nobody exercised, and no other rule would notice: the row is not identical to its base, because the probe's own constants already differ. |
 | `size-probe-reach` | A layer grows a public function the probe does not reach, so no budget charges for it. |
+| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword**, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call. Without this half the exception would be a licence for a crate rather than for two expansions, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md). |
 | `gate-broken` | The gate's own expected values do not parse. A gate must not be able to silently uncheck one of its rules. |
 
 ### Documentation
@@ -1571,7 +1645,43 @@ Stated so that nobody mistakes silence for coverage:
 - **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
   the size report says so rather than implying otherwise. Neither can either tool here: DHAT
   is a heap profiler and callgrind counts instructions, so the depth of the chain
-  [the budgets](#budgets) already say is unaccounted stays unaccounted.
+  [the budgets](#budgets) already say is unaccounted stays unaccounted. The `emulate` stage is
+  the first thing in this workspace that *could* measure it — paint the region, run, read the
+  high-water mark — and it does not. Doing it needs a second `unsafe` expansion and a
+  memory-map symbol, and ADR 0039 records it as the obvious next thing that image is good for
+  rather than attaching a half-argued number to it.
+- **That an emulated core is the part a row of the hardware table names.** It is not, in four
+  ways, and each one is a whole class of failure. QEMU's `microbit` is a Cortex-M0 and
+  `cortex-m0plus` names a **Cortex-M0+** — the same instruction set and a different core, with
+  a different pipeline, an optional MPU and a different fast-I/O port. Neither machine has a
+  **NOR part**, so the media is an array in RAM and program-disturb, weak bits and a unit the
+  controller aborts in flight are all outside it, exactly as this file already records for
+  `waymaker-fault`. Neither has a **supply that can be removed**, so the rig's cut is the host
+  cut — the iteration stops where it stands and the RAM survives it. And neither has a
+  **reset-cause register, retained RAM or a backup domain**, so the `rtc-power-loss` row is
+  untouched and `BackedRtc`'s continuity bit is still a board's word. What the stage does
+  establish is [above](#the-emulated-boot-and-what-it-is-not); what it does not is why all
+  three rows stay `Not run`.
+- **That the emulated boot's media model is a model of a part.** `waymaker_emu::nor::Nor`
+  clears bits and validates against a `Geometry`, and §12's conformance suite is run over it in
+  the same boot rather than a doc comment claiming it — which is a stronger check than
+  `waymaker-fault`'s model gets, and it is still the same limit: a model wrong in the same
+  direction as the code it tests would agree with it, and no suite written against the
+  contract can see a behaviour the contract does not describe.
+- **The emulated image, by a coverage denominator.** `waymaker-emu`'s binary is behind
+  `required-features`, so `cargo xtask coverage` reports "no coverable lines" for it — the
+  size probe's standing, and the same answer: `emu-lint` is what a compiler says about it and
+  the `emulate` stage is what a run says. Those two are stronger than a line percentage here,
+  because the thing being checked is that the code *executes on a core*, which no host
+  instrumentation can observe — but the number in the coverage table is not evidence of
+  anything and should not be read as any.
+- **A path through the rig that the emulated workload does not take.** `boot::run` drives a
+  fixed seed for a fixed number of iterations, so it reaches the layout, the journal writer,
+  the recovery scan, the resume and the audit — and no bank swap, no capacity refusal and no
+  timer, which are the rows [the failure matrix](#the-failure-matrix-row-by-row) already calls
+  `Owed` on the rig, met again one gate over. An instruction-set difference on a path the
+  workload does not take is a difference nothing here has watched for. It is a *sampled* gate,
+  and saying so is better than a green check that reads as a proof.
 
 ## Status
 
@@ -2556,6 +2666,35 @@ assert, which is how the truncating version passed. What is owed is written down
 are the four rows the failure matrix already calls `Owed`. See
 [ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).
 
+
+`cargo xtask emulate` then closes a limit this file had recorded about its own firmware
+stages. `crate-attributes` exists because "`cargo build --lib` produces an rlib and never
+links, so no global allocator is required and an `extern crate alloc` under any of them
+compiles clean" — and that sentence is larger than the allocation half it is quoted for.
+Nothing placed a reset vector, nothing resolved a `#[panic_handler]`, nothing linked
+`compiler_builtins`, and no Waymaker instruction had ever been retired outside an x86 test
+binary. `waymaker-emu` is a linked image, started on a Cortex-M0 and a Cortex-M4 — **ARMv6-M**
+and **ARMv7E-M**, the two architectures this workspace builds for — and required to lay a part
+out, run twelve iterations into a cut, resume each and judge every one. Three things hold it,
+and [the section above](#the-emulated-boot-and-what-it-is-not) has them: the two cores'
+censuses must be *equal*, because the plan is deterministic and a difference is the rig
+behaving differently on two instruction sets; the RAM-backed NOR model is put through §12's
+conformance suite in the same boot, which is the first time in this workspace that
+`waymaker-conformance`'s `#![no_std]`-so-a-driver-author-can-run-it-on-the-part claim has been
+taken up; and the *census* is the gate rather than the exit code, because an image whose
+`main` returned early exits exactly the way a complete one does. Both cores measure the same
+thing — 21 conformance cases passed and 2 exempt, 12 iterations, 12 cuts, 12 resumes, 8
+redeliveries, 24 verdicts and 42 effects — which is the result worth recording, because the
+two agreeing is the check a single-core stage could not make. `emulation-boot` is what stops
+the image drifting, and its sharpest half is the `unsafe` one: this is the workspace's only
+`#![allow(unsafe_code)]`, the whole of what it is carried for is two macro expansions, and the
+rule fails a build over the *keyword* appearing anywhere in the crate. What is *not*
+discharged is the thing a reader will reach for first, and it is a row rather than a claim:
+all three of [the hardware table](#what-the-boards-still-owe)'s rows stay `Not run`, because
+neither machine has a NOR part, a supply to remove, a reset-cause register or a backup domain,
+and a Cortex-M0 is not a Cortex-M0+. ADR 0039 carries no attestation marker, so
+`hardware-attestation` fails a build in which somebody moves a row and cites it. See
+[ADR 0039](docs/adr/0039-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
