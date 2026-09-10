@@ -2523,26 +2523,36 @@ an argument from crate attributes — which is a fact about a crate rather than 
 image, and this workspace accepts that shape of argument nowhere else. The bullet that said so
 ended "a global allocator that counted allocations would need the `unsafe` this workspace
 denies", and that considered one mechanism: DHAT intercepts `malloc` in the *binary*, so it
-needs no allocator, no attribute and no exception to `unsafe_code = "deny"`. Two workloads
-drive real library code over `waymaker-fault`'s model of NOR — §09's codec and commit seal,
-§10's reserve and the recovery scan under the rig, and §06's boundary and §07's protocol run
-to a terminal record — and the engine's heap is gated at **zero blocks**, in blocks rather
-than bytes because `malloc(0)` returns a pointer. It measures zero on both, against sixteen
-blocks the harness and the runtime allocate in the same process, which is the column that says
-the tool was watching. Callgrind runs beside it and is *published* rather than gated, for the
-reason the write-amplification figure is: §04 states no instruction target. Everything fails
-closed — a DHAT run that saw nothing, a callgrind run that attributed nothing to the engine, a
-workload that completed no effect, a declared workload with no row, and per-function costs that
-do not add up to callgrind's own total, which is one check that catches three different ways of
-misreading that format. Two findings came out of writing it rather than out of reading the
-code, and both are attribution defects that had produced a *plausible* number: a crate named in
-a generic argument is not the crate that wrote the body — the first run failed a row over a
-four-byte `Vec` in the harness beside it, through
+needs no allocator, no attribute and no exception to `unsafe_code = "deny"`. Four workloads
+drive real library code over `waymaker-fault`'s model of NOR — §09's codec and commit seal and
+§10's reserve under the rig, §06's boundary and §07's protocol run to a terminal record, §06's
+OTA example through the façade's four futures, and §12's contract as `waymaker-conformance`
+runs it — and the engine's heap is gated at **zero blocks**, in blocks rather than bytes
+because `malloc(0)` returns a pointer. It measures zero on all four, against sixteen blocks the
+harness and the runtime allocate in the same process, which is the column that says the tool
+was watching. Callgrind runs beside it and is *published* rather than gated, for the reason the
+write-amplification figure is: §04 states no instruction target. Everything fails closed — a
+DHAT run that saw nothing, a callgrind run that attributed nothing to the engine, a workload
+that completed no unit of work, a declared workload with no row, a gated crate no workload
+reached, and per-function costs that do not add up to callgrind's own total, which is one check
+that catches three different ways of misreading that format.
+Four findings came out of writing it and reviewing it rather than out of reading the code, and
+every one had produced a *plausible* number. Two are attribution: a crate named in a generic
+argument is not the crate that wrote the body — the first run failed a row over a four-byte
+`Vec` in the harness beside it, through
 `with_capacity_in<waymaker_core::activity::ActivityKind, ..>` — and a body inlined into another
 crate loses its crate from the printed symbol and keeps its source file, which is why the path
-is read first and why the workload's profile turns fat LTO off. What is owed is written down:
-it is a *sampled* gate where `waymaker-spec`'s proofs are exhaustive, and the paths it does not
-reach are the four rows the failure matrix already calls `Owed`. See
+is read first and why the workload's profile turns fat LTO off. The third is the one that
+matters most, and Codex found it: the gate named six crates and two workloads executed four, so
+`waymaker-embassy` — linked and never run — and `waymaker-conformance` — not in the dependency
+graph at all — each scored the zero a *deleted* crate would score. Deriving the gated list was
+half a mechanism; the other half is that a gated crate nothing reaches now fails the run, and
+the `facade` and `conformance` workloads are what make it pass. The fourth is that the
+per-unit cost truncated below what was measured, contradicting its own doc comment — it ceils
+now, and its test asserts the invariant across divisors rather than the literal it used to
+assert, which is how the truncating version passed. What is owed is written down: every gated
+*crate* is reached and that is checked, every *path* is not, and the paths it does not reach
+are the four rows the failure matrix already calls `Owed`. See
 [ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).
 
 
