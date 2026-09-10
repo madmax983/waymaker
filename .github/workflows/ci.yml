@@ -251,6 +251,53 @@ jobs:
       - name: Run the v1 format conformance corpus
         run: cargo test --locked -p waymaker-flash --no-default-features --test corpus
 
+  profiling:
+    # §02 decision 1: the kernel is `no_std`, `no_alloc` and dependency-free. Two of those
+    # three are checked by the layering gate; the third was an argument about crate
+    # attributes until this job existed, because what a firmware pays for is what the linked
+    # image does. DHAT intercepts malloc in the binary, so the claim is a number.
+    #
+    # Its own job because it needs a tool no rustup profile carries and runs every workload
+    # twice under an instrumented CPU, and because a red one says a §02 decision no longer
+    # holds — which belongs in the checks list under a name that says so.
+    name: heap and instruction profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustflags: ""` because this action's default is to put `-D warnings` into
+      # RUSTFLAGS, which is exactly the decision the env block above explains not making:
+      # RUSTFLAGS reaches every registry dependency too.
+      - name: Install toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # The stage shells out to a tool no rustup profile carries, installed before the stage
+      # runs for the reason cargo-llvm-cov is: a missing tool must be an install failure
+      # rather than a measurement that quietly did not happen. `cargo xtask profile` fails
+      # closed if valgrind is absent, and failing here says why in one line.
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y valgrind
+
+      - name: Measure the heap and instruction profile
+        run: cargo --locked xtask profile
+
+      - name: Upload the profile report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-report
+          # The tools' own output beside the report: a row that failed names a block count,
+          # and the stack that allocated it is in the DHAT export rather than in the table.
+          path: |
+            target/waymaker-profile.json
+            target/profile/
+          # `warn` rather than `ignore`: the run where a report is missing is the run where
+          # someone wants to know why.
+          if-no-files-found: warn
+
   layering:
     # The dependency direction is a contract (design document §05), not a convention.
     # This job fails if waymaker-core grows a dependency of any kind, if waymaker-flash

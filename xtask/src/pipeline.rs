@@ -303,6 +303,22 @@ pub const STAGES: &[Stage] = &[
         why: "issue #41: the frozen v1 bytes are a check of their own, because a format break is invisible to every test that drives the encoder and the decoder together",
     },
     Stage {
+        name: "profile",
+        job: "profiling",
+        // Its own job because it needs a tool no rustup profile carries, and because it runs
+        // every workload twice under an instrumented CPU — minutes of work nothing else in
+        // the pipeline is waiting for. And because of what a red one says: the kernel is
+        // `no_std`, `no_alloc` and dependency-free, and an allocation in an engine crate is
+        // that decision no longer holding. That belongs in the checks list under a name that
+        // says so, which is the argument the `verification` and `layering` jobs already made.
+        //
+        // The command takes no arguments so that this table can compare it against the
+        // workflow byte for byte.
+        command: "cargo --locked xtask profile",
+        in_hook: false,
+        why: "\u{a7}02 decision 1: `no_alloc` is a measurement rather than an attribute, and the instruction cost is published beside it",
+    },
+    Stage {
         name: "layering",
         job: "layering",
         command: "cargo --locked xtask check-layering",

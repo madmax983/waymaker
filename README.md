@@ -167,6 +167,7 @@ cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
 cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
+cargo --locked xtask profile
 cargo --locked xtask check-layering
 ```
 
@@ -218,6 +219,46 @@ run that passed, and "not measured" is not "covered".
 The reported percentage includes each crate's inline `#[cfg(test)]` module bodies, which are
 covered by construction. The gate is therefore a floor on a number that test code dilutes;
 see the ADR for why that is stated rather than worked around.
+
+### Heap and instruction profile
+
+```sh
+cargo --locked xtask profile                  # runs both tools, gates the heap, publishes the cost
+cargo --locked xtask profile --report r.json  # gates a report produced earlier
+```
+
+Design document §02 decision 1 says the kernel is `no_std`, `no_alloc` and dependency-free.
+The first and third have been build failures since rung 0.0 — `crate-attributes` and
+`kernel-zero-dependencies`. The second was an argument from crate attributes, and what a
+firmware pays for is what the linked image does.
+
+This is the measurement. [DHAT](https://valgrind.org/docs/manual/dh-manual.html) intercepts
+`malloc` in the binary, so it needs no global allocator and none of the `unsafe` this
+workspace denies — which is what the argument against measuring this had always been. Two
+workloads drive real library code over `waymaker-fault`'s model of NOR, and every heap block
+is attributed to the crate whose frame is nearest the allocation. **An engine crate is allowed
+zero**, in blocks rather than bytes, because `malloc(0)` returns a pointer and a firmware that
+reached it has an allocator linked whatever the byte count says.
+
+Callgrind runs beside it and counts instructions. That figure is **published and not gated**,
+for the reason the write-amplification figure is: §04 states no instruction target, and a
+ceiling invented here would be a number nobody agreed to. It is also not a fact about a part —
+it is host instructions under a host profile, useful for comparing two commits, because an
+instruction count is deterministic where a wall clock is not.
+
+The command needs valgrind, which no rustup profile carries:
+
+```sh
+sudo apt-get install valgrind
+```
+
+It fails with that hint rather than passing when the tool is absent, and it fails the same way
+when DHAT saw no allocation anywhere in the process, when callgrind attributed no instruction
+to any engine crate, when a workload completed no effect, when a declared workload has no row,
+or when the per-function costs do not add up to callgrind's own total. A profile that did not
+happen is not a profile that passed. The reasoning, and the two attribution defects that
+writing it turned up, are in
+[ADR 0038](docs/adr/0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md).
 
 ### Size budgets
 
