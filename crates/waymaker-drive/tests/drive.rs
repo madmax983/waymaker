@@ -5,7 +5,7 @@
 //! media is `waymaker-fault`'s model of NOR — so the bytes below are bytes this workspace
 //! really writes rather than a fixture that agrees with it.
 
-use waymaker_core::{EffectId, EffectSeq, RecordRef, RunId};
+use waymaker_core::{EffectId, EffectSeq, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASH, HASHED, Pipeline, World};
 use waymaker_drive::{Conclusion, DriveError, Driver, Progress, Scratch};
 use waymaker_fault::Device;
@@ -323,6 +323,190 @@ fn a_reboot_redelivers_the_effect_under_the_identity_it_was_scheduled_with() {
             RecordKindAndBytes::RunCompleted(HASHED.to_vec()),
         ]
     );
+}
+
+#[test]
+fn a_record_kind_from_the_future_stops_the_driver_rather_than_being_skipped() {
+    // Issue #41's third reader obligation, at the layer that has to obey it. §09 permits
+    // skipping an unknown record kind at no format version, so a reader that meets one must
+    // stop, expose the prefix before it as the whole of history, and offer no append point.
+    // The first two are `waymaker-flash`'s and are tested there; this is the third, and it
+    // is the one a *driver* can get wrong, because a driver that appended after the frame it
+    // could not read would overwrite a record a shipped device committed.
+    //
+    // It is also what makes downgrade a data-loss operation rather than a refusal: the run
+    // is not resumable by this image, and ADR 0037 says so.
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    {
+        let mut workflow = Pipeline::new();
+        let mut world = World::pending_at(0);
+        Driver::new(region(), RUN, reserve())
+            .boot(
+                &mut device,
+                &mut world,
+                &mut workflow,
+                Scratch {
+                    page: &mut page,
+                    result: &mut result,
+                },
+            )
+            .expect("a pending activity is not a failure");
+    }
+
+    // A frame this firmware cannot read, wearing `UNNUMBERED_KIND`.
+    let mut image = device.into_image();
+    let end = image
+        .iter()
+        .rposition(|byte| *byte != 0xFF)
+        .expect("the journal holds records")
+        + 1;
+    let at = ProgramAlign::new(4)
+        .and_then(|align| align.round_up(end))
+        .expect("the journal is written at a four-byte granularity");
+    let frame = future_frame(UNNUMBERED_KIND);
+    image
+        .get_mut(at..at + frame.len())
+        .expect("the region holds one more frame")
+        .copy_from_slice(&frame);
+    let mut device = Device::restored(geometry(), image).expect("the image is device-sized");
+
+    // The cause is asserted rather than assumed. Without this the test would pass on a
+    // frame that was merely damaged, which is a different refusal reached the same way —
+    // and the version of this test in `waymaker-flash` was exactly that for two rungs.
+    {
+        let mut recovery = Recovery::new(region());
+        let mut seen = 0_usize;
+        let mut refusal = None;
+        while let Some(step) = recovery.next(&mut device, &mut page) {
+            match step {
+                Ok(_) => seen += 1,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(seen > 0, "the prefix before the unknown frame is history");
+        assert!(
+            matches!(
+                refusal,
+                Some(waymaker_flash::recovery::RecoveryError::Decode(
+                    waymaker_core::DecodeError::UnknownRecordKind
+                ))
+            ),
+            "recovery stopped for some other reason than the kind it could not read: {refusal:?}"
+        );
+        assert_eq!(recovery.append_offset(), None);
+    }
+
+    let mut workflow = Pipeline::new();
+    let mut world = World::new();
+    let error = Driver::new(region(), RUN, reserve())
+        .boot(
+            &mut device,
+            &mut world,
+            &mut workflow,
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        )
+        .expect_err("a record this firmware cannot read has no append point after it");
+    assert!(
+        matches!(error, DriveError::NoAppendPoint | DriveError::Recovery(_)),
+        "{error:?}"
+    );
+    assert!(
+        world.dispatched().is_empty(),
+        "nothing is dispatched from a journal this firmware cannot finish reading"
+    );
+}
+
+/// A record kind no version of this format numbers.
+///
+/// Past the last number the format names, so it cannot rot: a kind added later takes the
+/// next unused number, not this one. The assertion is what says so if that stops being true.
+const UNNUMBERED_KIND: u8 = 0xFE;
+const _: () = assert!(RecordKind::CHILD_STARTED.0 < UNNUMBERED_KIND);
+
+/// A structurally sound frame wearing `kind`, at the four-byte granularity these tests use.
+///
+/// Built by encoding a real record and re-sealing it, so every check but the kind holds —
+/// which is what makes the driver's refusal a statement about the kind rather than about
+/// damage.
+fn future_frame(kind: u8) -> Vec<u8> {
+    let Some(align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a power of two within the program-size range")
+    };
+    let mut page = [0_u8; 64];
+    let Ok(written) =
+        waymaker_flash::frame::encode(&RecordRef::RunFailed { error: b"x" }, align, &mut page)
+    else {
+        unreachable!("a 64-byte page holds a three-byte record")
+    };
+    let mut bytes = page.get(..written).unwrap_or_default().to_vec();
+    if let Some(slot) = bytes.get_mut(3) {
+        *slot = kind;
+    }
+
+    let header = crc16(bytes.get(..10).unwrap_or_default());
+    if let Some(seal) = bytes.get_mut(10..12) {
+        seal.copy_from_slice(&header.to_le_bytes());
+    }
+    let payload_len = bytes
+        .get(8..10)
+        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+        .map_or(0, |declared| usize::from(u16::from_le_bytes(declared)));
+    let covered = 12 + payload_len;
+    let frame = crc32(bytes.get(..covered).unwrap_or_default());
+    if let Some(trailer) = bytes.get_mut(covered..covered + 4) {
+        trailer.copy_from_slice(&frame.to_le_bytes());
+    }
+    let Some(body) = align.round_up(covered + 4) else {
+        unreachable!("a record that encoded has a body length")
+    };
+    let pattern = waymaker_flash::frame::commit_seal(frame);
+    for (index, slot) in bytes.iter_mut().skip(body).enumerate() {
+        if let Some(byte) = pattern.get(index % pattern.len()) {
+            *slot = *byte;
+        }
+    }
+    bytes
+}
+
+/// CRC-16/CCITT-FALSE, bit by bit, written here rather than borrowed from the crate.
+fn crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0xFFFF_u16;
+    for byte in bytes {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 == 0 {
+                crc << 1
+            } else {
+                (crc << 1) ^ 0x1021
+            };
+        }
+    }
+    crc
+}
+
+/// CRC-32/ISO-HDLC, bit by bit.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xEDB8_8320
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
 }
 
 #[test]

@@ -27,7 +27,7 @@
 
 use std::vec::Vec;
 
-use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordRef, RunId};
+use waymaker_core::{ActivityKind, DecodeError, EffectSeq, RecordKind, RecordRef, RunId};
 use waymaker_flash::bank::{BankHeader, BankId, BankLayout};
 use waymaker_flash::frame::{self, ERASED_BYTE, HEADER_BYTES, ProgramAlign, Scan};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
@@ -396,6 +396,13 @@ fn a_short_tail_that_is_not_erased_is_a_torn_header() {
     assert_eq!(ending, Some(Ending::Damaged { at: 24 }));
 }
 
+/// A record kind no version of this format numbers.
+///
+/// Past the last number the format names, so it cannot rot: a kind added later takes the
+/// next unused number, not this one. The assertion is what says so if that stops being true.
+const UNNUMBERED_KIND: u8 = 0xFE;
+const _: () = assert!(RecordKind::CHILD_STARTED.0 < UNNUMBERED_KIND);
+
 #[test]
 fn an_unknown_record_kind_stops_recovery() {
     // §09 makes skipping a property of the format version, and version 1 permits none. A
@@ -415,8 +422,16 @@ fn an_unknown_record_kind_stops_recovery() {
         }],
     );
 
-    // A structurally sound frame wearing record kind 9, which this firmware reserves and
-    // does not decode. Built by re-sealing a real frame, so only the kind is wrong.
+    // A structurally sound frame wearing a record kind no version of this format numbers.
+    // Built by re-sealing a real frame, so only the kind is wrong.
+    //
+    // The number matters, and getting it wrong is how this test stopped testing its own name
+    // once already: it wore kind 9, which issue #40 gave to `VersionMarker` and a body of
+    // four bytes. This frame's one payload byte then made it a `MalformedRecord` rather than
+    // an unknown kind, so the arm the test exists to reach went untested with the test still
+    // green. A number past the last one §09 names cannot rot that way -- a kind added later
+    // takes the next unused number, not this one -- and the assertion below is what says so
+    // if that ever stops being true.
     let mut staging = [0_u8; PAGE];
     let written = frame::encode(
         &RecordRef::RunCompleted { result: b"x" },
@@ -425,15 +440,35 @@ fn an_unknown_record_kind_stops_recovery() {
     )
     .expect("a page holds this frame");
     let mut bytes = staging[..written].to_vec();
-    bytes[3] = 9;
-    reseal(&mut bytes);
+    bytes[3] = UNNUMBERED_KIND;
+    reseal(&mut bytes, journal.align());
     device.put(end, &bytes);
 
     let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut seen = Vec::new();
+    let mut refusal = None;
+    let mut page = [0_u8; PAGE];
+    while let Some(step) = recovery.next(&mut device, &mut page) {
+        match step {
+            Ok(record) => seen.push(record.kind()),
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
 
-    assert_eq!(seen.len(), 1);
-    assert_eq!(ending, Some(Ending::Damaged { at: end }));
+    // The three obligations a reader that may not skip is under, each asserted rather than
+    // left to the ending: it stops *for this reason*, the prefix before the unknown frame is
+    // the whole of history, and there is nowhere safe to append.
+    assert_eq!(
+        refusal,
+        Some(RecoveryError::Decode(DecodeError::UnknownRecordKind)),
+        "recovery stopped for some other reason than the kind it could not read"
+    );
+    assert_eq!(seen, [RecordKind::RUN_STARTED]);
+    assert_eq!(recovery.ending(), Some(Ending::Damaged { at: end }));
+    assert_eq!(recovery.append_offset(), None);
 }
 
 #[test]
@@ -1294,13 +1329,18 @@ fn every_region_error_says_something_different() {
 // Helpers.
 // ---------------------------------------------------------------------------------------
 
-/// Re-computes both of a frame's checksums in place, with an implementation of §09's
-/// polynomials written for these tests rather than borrowed from the crate.
-fn reseal(bytes: &mut [u8]) {
+/// Re-computes a record's two checksums and its commit seal in place, with an
+/// implementation of the polynomials written for these tests rather than borrowed from the
+/// crate.
+///
+/// `bytes` is a whole record as [`frame::encode`] wrote it -- body, padding and seal -- and
+/// `align` is the granularity it was encoded at. Both are needed and an earlier version had
+/// neither: it took the last four bytes for the frame check, which on a padded record are
+/// four bytes of the *seal*. Every record it produced failed integrity, so the one test that
+/// used it reached its stop condition by damage rather than by the record kind it had
+/// edited, and passed either way because it only asserted the ending.
+fn reseal(bytes: &mut [u8], align: ProgramAlign) {
     let sealed = HEADER_BYTES - 2;
-    let Some(end) = bytes.len().checked_sub(4) else {
-        unreachable!("a frame is at least sixteen bytes long")
-    };
     let Some(header) = bytes.get(..sealed).map(crc16) else {
         unreachable!("a frame is at least sixteen bytes long")
     };
@@ -1309,13 +1349,32 @@ fn reseal(bytes: &mut [u8]) {
     };
     header_seal.copy_from_slice(&header.to_le_bytes());
 
-    let Some(frame) = bytes.get(..end).map(crc32) else {
-        unreachable!("a frame is at least sixteen bytes long")
+    // The covered range comes from the `payload_len` in the header, never from the length of
+    // the slice: deriving it from the slice is right only where there is no padding, which
+    // is the mistake above.
+    let payload_len = bytes
+        .get(HEADER_BYTES - 4..HEADER_BYTES - 2)
+        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+        .map_or(0, |bytes| usize::from(u16::from_le_bytes(bytes)));
+    let covered = HEADER_BYTES + payload_len;
+    let Some(frame) = bytes.get(..covered).map(crc32) else {
+        unreachable!("the header declares a payload the slice holds")
     };
-    let Some(trailer) = bytes.get_mut(end..) else {
-        unreachable!("a frame is at least sixteen bytes long")
+    let Some(trailer) = bytes.get_mut(covered..covered + 4) else {
+        unreachable!("the header declares a payload the slice holds")
     };
     trailer.copy_from_slice(&frame.to_le_bytes());
+
+    // And the seal that says the record was committed, over the check just written.
+    let Some(body) = align.round_up(covered + 4) else {
+        unreachable!("a record that encoded has a body length")
+    };
+    let pattern = frame::commit_seal(frame);
+    for (index, slot) in bytes.iter_mut().skip(body).enumerate() {
+        if let Some(byte) = pattern.get(index % pattern.len()) {
+            *slot = *byte;
+        }
+    }
 }
 
 /// CRC-16/CCITT-FALSE, bit by bit.

@@ -5891,6 +5891,27 @@ pub const CODEC_FEATURES: &[(&str, &[&str])] = &[
 /// The dependencies a codec feature is the only thing that enables.
 pub const CODEC_DEPENDENCIES: &[&str] = &["postcard", "serde"];
 
+/// The two bodies that decide whether this firmware reads a journal's format version, and
+/// the file each lives in.
+///
+/// Both must reach `reads_format_version`, and neither may compare a version against
+/// `FORMAT_VERSION` for itself. Issue #41 makes the predicate the one place the read set
+/// lives, and the reason is a fleet rather than tidiness: a range widened for v2 that
+/// reached the frame reader and not the bank header reader leaves `bank::select` finding no
+/// authority on a v2 bank, and §10 recycling a bank it reads as damaged.
+///
+/// Review of this change reverted the bank header's call to the equality it replaced and
+/// watched the whole workspace stay green — every test compares a decoder against the
+/// predicate, and while the read set has one member the two expressions are the same
+/// function.
+pub const VERSION_ROUTING_BODIES: &[(&str, &str)] = &[
+    ("waymaker-flash/src/frame.rs", "verify_header_with"),
+    ("waymaker-flash/src/bank.rs", "decode_header_with"),
+];
+
+/// The predicate every version decision goes through.
+pub const VERSION_PREDICATE: &str = "reads_format_version";
+
 /// Design document §09's frozen v1 wire format, held where a change to it would otherwise be
 /// invisible.
 ///
@@ -5934,6 +5955,7 @@ pub fn check_wire_format(sources: &[crate::size::LayerSource]) -> Vec<Violation>
 
     let mut violations = check_frozen_constants(sources, RULE);
     violations.extend(check_record_numbering(sources, RULE));
+    violations.extend(check_version_routing(sources, RULE));
     violations
 }
 
@@ -6028,6 +6050,26 @@ fn check_record_numbering(
 
     let mut violations = Vec::new();
     for record in crate::docs::WIRE_FORMAT_RECORD_KINDS {
+        // Counted before it is read, for `check_frozen_constants`'s reason: a `find` takes
+        // the first match, so a second declaration of the same name -- in a second
+        // `impl RecordKind` block further down -- is one the scan never looks at.
+        let declarations = declared
+            .iter()
+            .filter(|(name, _)| name == record.name)
+            .count();
+        if declarations > 1 {
+            violations.push(Violation::new(
+                rule,
+                KERNEL,
+                format!(
+                    "{path} declares `RecordKind::{}` {declarations} times, not once; the \
+                     scan reads the first, so a decoy above the real one is what it would \
+                     check",
+                    record.name
+                ),
+            ));
+            continue;
+        }
         match declared.iter().find(|(name, _)| name == record.name) {
             None => violations.push(Violation::new(
                 rule,
@@ -6069,6 +6111,61 @@ fn check_record_numbering(
     violations
 }
 
+/// Both version decisions go through the one predicate, and neither takes its own.
+fn check_version_routing(
+    sources: &[crate::size::LayerSource],
+    rule: &'static str,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (file, body) in VERSION_ROUTING_BODIES {
+        let Some(source) = find_source(sources, file) else {
+            violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "no {file} in the workspace, so the route from `{body}` to \
+                     `{VERSION_PREDICATE}` is pinned against nothing"
+                ),
+            ));
+            continue;
+        };
+        let code = without_test_modules(&code_only(&source.contents));
+        let Some(declared) = braced_body(&code, &format!("fn {body}")) else {
+            violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!("{file} declares no `fn {body}`, so the version route checks nothing"),
+            ));
+            continue;
+        };
+        if !names_identifier(declared, VERSION_PREDICATE) {
+            violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "`{body}` in {file} does not reach `{VERSION_PREDICATE}`; the read set \
+                     lives in one place, and a decoder that decides for itself is one a \
+                     widened range can miss"
+                ),
+            ));
+        }
+        // And it may not decide for itself beside the call. `FORMAT_VERSION` is what the
+        // predicate is written in terms of, so naming it here is a second decision.
+        if names_identifier(declared, "FORMAT_VERSION") {
+            violations.push(Violation::new(
+                rule,
+                "waymaker-flash",
+                format!(
+                    "`{body}` in {file} names `FORMAT_VERSION`; a version compared here is a \
+                     second read set, and the two can disagree without either being wrong on \
+                     its own"
+                ),
+            ));
+        }
+    }
+    violations
+}
+
 /// Every literal a `const NAME` in `code` is declared with, in source order.
 ///
 /// Matched on the declaration rather than on the name alone, so a use of the constant is not
@@ -6100,34 +6197,43 @@ fn declared_constant_values(code: &str, name: &str) -> Vec<String> {
     values
 }
 
-/// Every `pub const NAME: Self = Self(N);` in `code`, as a name and a number.
+/// Every record-kind number `code` declares, as a name and a number.
 ///
-/// The shape §09's numbering is declared in. A declaration whose number is not a plain
-/// integer literal is skipped rather than guessed at, and that shows up as a missing row
-/// rather than as a wrong one — the direction to be wrong in.
+/// Read out of `RecordKind`'s own inherent `impl` blocks rather than out of the whole file,
+/// so that a `pub const` of the same shape on another type in the same module is not read as
+/// a record kind. `ClockKind::AFTER_BOOT` is exactly that shape one file away.
+///
+/// Both spellings a declaration can take are accepted -- `Self(1)` and `RecordKind(1)` --
+/// because the rule promises both directions and a spelling it cannot read is a kind added
+/// with the gate silent. A declaration whose number is not a plain integer literal is
+/// skipped rather than guessed at, which shows up as a missing row rather than as a wrong
+/// one; a macro-generated one is invisible, which is the limit every scanner here records.
 #[must_use]
 fn declared_record_numbers(code: &str) -> Vec<(String, u8)> {
     let mut numbers = Vec::new();
-    for line in code.lines() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("pub const ") else {
-            continue;
-        };
-        let Some((name, tail)) = rest.split_once(':') else {
-            continue;
-        };
-        let Some((_, value)) = tail.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_end_matches(';').trim();
-        let Some(inner) = value
-            .strip_prefix("Self(")
-            .and_then(|rest| rest.strip_suffix(')'))
-        else {
-            continue;
-        };
-        if let Ok(number) = inner.trim().parse::<u8>() {
-            numbers.push((name.trim().to_owned(), number));
+    for body in inherent_impl_bodies(code, "RecordKind") {
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let Some((_, value)) = tail.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_end_matches(';').trim();
+            let Some(inner) = value
+                .strip_prefix("Self(")
+                .or_else(|| value.strip_prefix("RecordKind("))
+                .and_then(|rest| rest.strip_suffix(')'))
+            else {
+                continue;
+            };
+            if let Ok(number) = inner.trim().parse::<u8>() {
+                numbers.push((name.trim().to_owned(), number));
+            }
         }
     }
     numbers
@@ -10253,16 +10359,18 @@ mod deferred_answer_pins {
 
     // `wire-format`: design document §09's frozen v1 format, pinned.
 
-    /// The two files `wire-format` reads its constants out of, and the record module.
+    /// The three files `wire-format` reads, as a clean workspace has them.
     fn frozen_format_sources() -> Vec<crate::size::LayerSource> {
         vec![
             layer(
                 INTEGRITY_ROUTING_PATH,
-                &tests_support::clean_frozen_format_module(INTEGRITY_ROUTING_PATH),
+                &(tests_support::clean_integrity_routing()
+                    + &tests_support::clean_frozen_format_module(INTEGRITY_ROUTING_PATH)),
             ),
             layer(
                 BANK_ROUTING_PATH,
-                &tests_support::clean_frozen_format_module(BANK_ROUTING_PATH),
+                &(tests_support::clean_bank_routing()
+                    + &tests_support::clean_frozen_format_module(BANK_ROUTING_PATH)),
             ),
             layer(EFFECT_SCHEDULED_PATH, &tests_support::clean_record_module()),
         ]
@@ -10360,6 +10468,121 @@ mod deferred_answer_pins {
                 .any(|v| v.detail.contains("BATCH_STARTED")),
             "a record kind nobody wrote down went unseen: {violations:?}"
         );
+    }
+
+    #[test]
+    fn a_decoder_that_takes_its_own_version_decision_is_reported() {
+        // The sharpest of these. Review of this change reverted the bank header reader to
+        // the equality the predicate replaced and watched the whole workspace stay green:
+        // every test compares a decoder against the predicate, and while the read set has
+        // one member the two expressions are the same function.
+        let mut sources = frozen_format_sources();
+        for source in &mut sources {
+            if source.path.ends_with(BANK_ROUTING_PATH) {
+                source.contents = source.contents.replace(
+                    "let reads = reads_format_version(version);",
+                    "if version != FORMAT_VERSION {}",
+                );
+            }
+        }
+        let violations = check_version_routing(&sources, "wire-format");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("decode_header_with")
+                    && v.detail.contains("does not reach")),
+            "a decoder that stopped asking went unseen: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("names `FORMAT_VERSION`")),
+            "a second read set beside the call went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_routing_body_that_is_gone_is_reported() {
+        // Fail closed: a route pinned against a body that is not there is a pin that checks
+        // nothing.
+        let mut sources = frozen_format_sources();
+        for source in &mut sources {
+            if source.path.ends_with(INTEGRITY_ROUTING_PATH) {
+                source.contents = "//! No decoder here.\n".to_owned();
+            }
+        }
+        let violations = check_version_routing(&sources, "wire-format");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("declares no `fn verify_header_with`")),
+            "a missing decoder passed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_constants_file_is_reported() {
+        // The other fail-closed branch, which only the record module had a test for.
+        let sources: Vec<crate::size::LayerSource> = frozen_format_sources()
+            .into_iter()
+            .filter(|source| !source.path.ends_with(INTEGRITY_ROUTING_PATH))
+            .collect();
+        let violations = check_frozen_constants(&sources, "wire-format");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("checking nothing")),
+            "a missing constants file passed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_kind_declared_twice_is_reported() {
+        // `check_frozen_constants` already refuses a decoy; this is the same defence for the
+        // numbering, which took the first match and never counted.
+        let mut sources = frozen_format_sources();
+        let source = sources.last_mut().expect("the record source is there");
+        source
+            .contents
+            .push_str("impl RecordKind {\n    pub const RUN_STARTED: Self = Self(1);\n}\n");
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("RUN_STARTED") && v.detail.contains("2 times")),
+            "a second declaration went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_kind_added_in_the_other_spelling_is_reported() {
+        // `RecordKind` is a tuple struct with a public field, so `RecordKind(13)` is ordinary
+        // code and an earlier version of this scan read only `Self(13)`.
+        let mut sources = frozen_format_sources();
+        let source = sources.last_mut().expect("the record source is there");
+        source.contents.push_str(
+            "impl RecordKind {\n    pub const SHARD_STARTED: RecordKind = RecordKind(13);\n}\n",
+        );
+        let violations = check_wire_format(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("SHARD_STARTED")),
+            "a kind added in the other spelling went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_kind_on_another_type_is_not_read_as_one() {
+        // The scan is scoped to `RecordKind`'s own blocks, so a `pub const X: Self = Self(0)`
+        // on a sibling type is not a record kind the table failed to name. `ClockKind` is
+        // exactly that shape one file away.
+        let mut sources = frozen_format_sources();
+        let source = sources.last_mut().expect("the record source is there");
+        source
+            .contents
+            .push_str("impl ActivityKind {\n    pub const NONE: Self = Self(0);\n}\n");
+        assert_eq!(check_wire_format(&sources), Vec::new());
     }
 
     #[test]
@@ -14102,18 +14325,20 @@ pub mod tests_support {
 
     use super::{
         APPEND_BARRIER_CALL, APPEND_BARRIER_STEP, APPEND_COMMIT_CALL, APPEND_COMMIT_STEP,
-        APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_SEALING_FUNCTIONS,
-        BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL, CAPACITY_DELEGATION,
-        CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE,
-        CTX_FUTURES, CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE,
-        DIGEST_FUNCTION, DISPATCH_SURFACE, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
-        INTEGRITY_CHECK_PARAMETERS, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
+        APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_ROUTING_PATH,
+        BANK_SEALING_FUNCTIONS, BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL,
+        CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE,
+        CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES, CTX_JOURNAL_SURFACE,
+        CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION, DISPATCH_SURFACE,
+        EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
+        INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
         SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
         SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
         SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
         TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
-        VERSION_MARKER_FIELDS, VERSION_RANGE, VERSION_RANGE_METHODS, WIRING_SELECTION_BODIES,
-        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
+        VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE, VERSION_RANGE_METHODS,
+        VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE, WIRING_TYPE_FIELDS,
+        WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -14734,6 +14959,15 @@ mod tests {
                     let _ = writeln!(source, "    let routed = {callee}::<C>(bytes);");
                 }
             }
+            // And the version decision, for the body that takes it — `wire-format` requires
+            // it here, and a fixture without it describes a workspace the gate rejects for a
+            // reason no test about the codec is written for.
+            if VERSION_ROUTING_BODIES
+                .iter()
+                .any(|(file, body)| *file == INTEGRITY_ROUTING_PATH && body == function)
+            {
+                let _ = writeln!(source, "    let reads = {VERSION_PREDICATE}(version);");
+            }
             source.push_str("    0\n}\n");
         }
         let _ = writeln!(
@@ -14839,6 +15073,12 @@ mod tests {
             let _ = writeln!(source, "pub fn {function}<C: IntegrityCheck>() -> u32 {{");
             for method in *methods {
                 let _ = writeln!(source, "    let seal_{method} = C::{method}(bytes);");
+            }
+            if VERSION_ROUTING_BODIES
+                .iter()
+                .any(|(file, body)| *file == BANK_ROUTING_PATH && body == function)
+            {
+                let _ = writeln!(source, "    let reads = {VERSION_PREDICATE}(version);");
             }
             source.push_str("    0\n}\n");
         }

@@ -19,10 +19,39 @@ run by `crates/waymaker-flash/tests/corpus.rs` as the `corpus` CI stage, and the
 | Rule | Value |
 | --- | --- |
 | Byte order | Little-endian, every multi-byte integer, everywhere. |
-| Alignment | None. Fields are packed at the offsets stated. |
+| Field alignment | None. Fields are packed at the offsets stated. A *record* is padded to the device's program unit, which is a property of the device rather than of the format. |
 | Erased byte | `0xFF`. A constant, never learned from the device. |
 | Padding | Written `0xFF`, never read. |
 | Signed integers | None. Every field is unsigned. |
+
+## The frozen numbers
+
+Every number below fixes a byte on media and none of them may move inside 1.x. The
+`wire-format` gate rule compares each row against the declaration that carries it, so this
+table and the code cannot drift apart.
+
+| Constant | Value | Fixes |
+| --- | --- | --- |
+| `MAGIC` | `0x4D57` | the two bytes a record frame begins with |
+| `FORMAT_VERSION` | `1` | the version a v1 writer stamps on every frame |
+| `OLDEST_READABLE_FORMAT_VERSION` | `1` | the oldest version a v1 reader accepts |
+| `HEADER_BYTES` | `12` | the frame header |
+| `TRAILER_BYTES` | `4` | the frame trailer |
+| `HEADER_CRC_BYTES` | `2` | the header check on media |
+| `FRAME_CRC_BYTES` | `4` | the frame check on media |
+| `SEAL_PATTERN_BYTES` | `4` | the commit seal's repeating pattern |
+| `MAX_PAYLOAD_BYTES` | `65535` | the widest payload `payload_len` can describe |
+| `ERASED_BYTE` | `0xFF` | erased media, and every byte of padding |
+| `SEAL_BYTE_MASK` | `0x7F` | the bit a commit seal clears, so no seal byte is erased |
+| `RUN_STARTED_PREFIX_BYTES` | `4` | `RunStarted`'s fixed head, before the run input |
+| `EFFECT_SCHEDULED_BODY_BYTES` | `8` | `EffectScheduled`'s whole body |
+| `VERSION_MARKER_BODY_BYTES` | `4` | `VersionMarker`'s whole body |
+| `TIMER_SCHEDULED_BODY_BYTES` | `17` | `TimerScheduled`'s whole body |
+| `BANK_MAGIC` | `0x4B42` | the two bytes a bank header begins with |
+| `SEAL_MAGIC` | `0x5347` | the two bytes a generation seal begins with |
+| `HEADER_PREFIX_BYTES` | `22` | the bank header before the run input |
+| `HEADER_TRAILER_BYTES` | `4` | the bank header trailer |
+| `SEAL_BYTES` | `12` | the generation seal |
 
 ## Integrity checks
 
@@ -63,9 +92,10 @@ longest frame is `16 + 65535 = 65551` bytes before padding.
 before it, so a reader knows where the frame ends before it uses a length it found on
 media. A single check over the whole frame could not do that.
 
-`frame_crc` covers the header **and** the payload. §09 names the field `payload_crc`; it
-covers strictly more, so a payload cannot be transplanted onto another header, and a record
-with an empty payload still gets a check that depends on which record it is.
+`frame_crc` covers the header **and** the payload. §09 names the field `payload_crc`. The
+check covers more than the name says, and that buys two things: a payload cannot be
+transplanted onto another header, and a record with an empty payload still gets a check that
+depends on which record it is.
 
 ### The commit seal
 
@@ -107,12 +137,31 @@ kind is never renumbered.
 | 10 | `SignalReceived` | reserved; no v1 writer produces one | — |
 | 11 | `ChildStarted` | reserved; no v1 writer produces one | — |
 
-`effect_seq` is the record's own sequence for kinds 2 to 6 and 9, and zero for kinds 1, 7
-and 8, which are run-scoped.
+`effect_seq` is the record's own sequence for kinds 2 to 6 and 9. It **must** be zero on
+kinds 1, 7 and 8, which are run-scoped: a reader refuses a non-zero one rather than ignoring
+it.
 
 `clock_kind` is `1` for a boot clock and `2` for a persistent one. Any other value is a
-malformed record, not an unknown policy: a decoder that passed one on would leave the
-reinterpretation §11 forbids to whoever read it next.
+malformed record, not an unknown policy. A decoder that accepted one would let the next
+reader guess which clock it meant, and §11 forbids that.
+
+### What a reader must refuse
+
+A body is not opaque because it is a payload. A conforming reader refuses each of these as a
+malformed record, and a reader that accepted one would read journals this firmware does not.
+
+| Refusal | Why |
+| --- | --- |
+| `effect_seq` is not zero on kind 1, 7 or 8 | those three are run-scoped and have no sequence of their own |
+| kind 1's payload is shorter than 4 bytes | the workflow kind and version are its fixed head |
+| kind 2's payload is not exactly 8 bytes | the body is four fields and no more |
+| kind 5's payload is not exactly 17 bytes | a clock kind and two `u64`s |
+| kind 5's `clock_kind` is not 1 or 2 | an unknown byte names no policy, and guessing is what §11 forbids |
+| kind 6's payload is not empty | a firing carries the fact and nothing else |
+| kind 9's payload is not exactly 4 bytes | a gate and a version |
+| a bank header's `program_shift` is above 15 | a program unit is a `u16`, so a wider shift describes a device that cannot exist |
+
+Kinds 3, 4, 7 and 8 carry opaque bytes and refuse nothing beyond the frame's own checks.
 
 Which fields kinds 2, 5, 6 and 9 carry is settled rather than incidental — see
 [ADR 0011](../adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md) and
@@ -197,23 +246,25 @@ When skipping is not permitted, a reader must:
 It must **not** skip the frame, must **not** truncate history at it, and must **not**
 overwrite it. Each of those loses a record a writer committed.
 
-The empty skip list is a decision rather than an oversight. Skipping a record asserts that
-the rest of history means the same thing without it, and that is false for every record in
-the table above: a skipped `TimerFired` is a timer replay believes never fired, and a
-skipped `EffectCompleted` is an effect replay performs again.
+The empty skip list is a decision rather than an oversight. To skip a record is to assert
+that the rest of history means the same thing without it. That is false for every record in
+the table above. If a reader skips a `TimerFired`, replay believes the timer never fired. If
+it skips an `EffectCompleted`, replay performs the effect again.
 
-A version that granted skipping would need three things in one change — the version
-accepted by `reads_format_version`, the version listed by `permits_unknown_record_skip`, and
-the arm in the scan that advances past an unknown frame. A `const` assertion in
-`frame.rs` fails a build in which one of the three arrives alone.
+A version that granted skipping needs three things in one change: the version accepted by
+`reads_format_version`, the version listed by `permits_unknown_record_skip`, and the arm in
+the scan that advances past an unknown frame. One of the three announces itself — a `const`
+assertion in `frame.rs` refuses a non-empty skip list, and its message names the other two.
+Nothing fails a build over the other two arriving alone.
 
 ## Changing the format
 
 Inside 1.x, without a version bump:
 
 - **May**: add a record kind, using the next unused number, with a body of its own.
-- **May not**: renumber a kind, reuse a retired number, move or resize a header field,
-  change the meaning of an existing body, or change either check's algorithm or width.
+- **May not**: renumber a kind, reuse a retired number, move or resize *any* field — in the
+  frame header, a record body, the bank header or the generation seal — change the meaning
+  of an existing body, or change either check's algorithm or width.
 
 Adding a kind is safe in the direction the promise runs — a later firmware reads what an
 earlier one wrote — and unsafe in the other. An earlier image meeting the new kind stops,
@@ -227,9 +278,10 @@ release. ADR 0037 is the policy.
 
 | Claim | Held by |
 | --- | --- |
-| The frame and bank layouts are these bytes | the corpus, and `tests/frame.rs`'s golden frames |
+| The frame layout is these bytes | the corpus, and `tests/frame.rs`'s golden frames |
+| The bank header and seal layouts are these bytes | the corpus alone; there is no golden bank frame |
 | The record numbers are these numbers | the corpus, and the `wire-format` gate rule |
 | The frozen constants are these constants | the `wire-format` gate rule, and `const` assertions in `frame.rs` |
 | The read set reaches both decoders | `tests/frame.rs` and `tests/bank.rs`, over all 256 version bytes |
 | A scan stops at an unknown kind | `tests/frame.rs::a_scan_will_not_skip_an_unknown_kind` |
-| Malformed bytes are refused, never read past | `waymaker-spec`'s `bounded-decoding` guarantee |
+| Malformed bytes cause no out-of-bounds read | `waymaker-spec`'s `bounded-decoding` guarantee, over the domain it states |

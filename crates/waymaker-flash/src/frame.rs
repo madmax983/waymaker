@@ -335,11 +335,11 @@ pub const fn seal_bytes(align: ProgramAlign) -> usize {
 /// §09's table: a skipped `TimerFired` is a timer replay believes never fired.
 ///
 /// Three things have to change together for a version to grant skipping, and they are in
-/// three different places: [`decode`] must accept the version at all — it refuses anything
-/// but [`FORMAT_VERSION`], so a version named here that `decode` rejects can never be
-/// reached — this list must name it, and [`Scan`] must grow the arm that advances past the
-/// frame. The `const` assertion below is what stops one of the three happening on its own: a
-/// version added here is a compile error that names the other two.
+/// three different places: [`reads_format_version`] must accept the version at all, so a
+/// version named here that the decoders reject can never be reached; this list must name it;
+/// and [`Scan`] must grow the arm that advances past the frame. The `const` assertion below
+/// is what stops the *second* happening on its own — a version added here is a compile error
+/// that names the other two. Nothing fails a build over the other two arriving alone.
 const VERSIONS_PERMITTING_UNKNOWN_RECORD_SKIP: &[u8] = &[];
 
 // A rule that can be half-enabled is a rule that gets half-enabled. `Scan` deliberately has
@@ -500,8 +500,9 @@ pub enum Decoded<'a> {
 /// One decoded frame, and how much of the input it occupied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
-    /// The version byte the frame declared. Always [`FORMAT_VERSION`] today, because
-    /// [`decode`] refuses anything else.
+    /// The version byte the frame declared. One of the versions
+    /// [`reads_format_version`] accepts, because [`decode`] refuses the rest — which is the
+    /// single value [`FORMAT_VERSION`] while the read set has one member.
     pub format_version: u8,
     /// What the frame held.
     pub decoded: Decoded<'a>,
@@ -1631,6 +1632,16 @@ const _: () = assert!(MAGIC != 0x0000 && MAGIC != 0xFFFF);
 // The read range is a range: an oldest above the written version is a firmware that reads
 // nothing it writes, which every round trip in this crate would still pass.
 const _: () = assert!(OLDEST_READABLE_FORMAT_VERSION <= FORMAT_VERSION);
+// And the set is *that* range and no other. Without these two the predicate's body is held
+// by nothing: review of this change deleted its lower bound entirely -- leaving
+// `version <= FORMAT_VERSION`, which accepts version zero on both decoders -- and watched
+// the whole workspace stay green, because every test compares a decoder against the
+// predicate rather than the predicate against the constants the gate freezes.
+const _: () = assert!(!reads_format_version(FORMAT_VERSION.wrapping_add(1)));
+const _: () = assert!(
+    OLDEST_READABLE_FORMAT_VERSION == 0
+        || !reads_format_version(OLDEST_READABLE_FORMAT_VERSION - 1)
+);
 const _: () = assert!(RUN_STARTED_PREFIX_BYTES <= EFFECT_SCHEDULED_BODY_BYTES);
 // `Body::prefix` is one array for every record's fixed head, so it has to be the widest.
 const _: () = assert!(EFFECT_SCHEDULED_BODY_BYTES <= TIMER_SCHEDULED_BODY_BYTES);

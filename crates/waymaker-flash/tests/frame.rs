@@ -932,6 +932,23 @@ fn resealing_a_damaged_frame_reaches_every_check_past_the_checksums() {
 }
 
 #[test]
+fn the_corpus_agrees_with_the_golden_frame_it_overlaps() {
+    // Issue #41's corpus was produced by an encoder written from the field list rather than
+    // from this crate, and its README says that encoder reproduces the golden frames here
+    // byte for byte. That cross-check happened while the corpus was being built and would
+    // otherwise have left nothing behind: `mod golden` is private to this binary and the
+    // corpus cases were given different field values.
+    //
+    // One case was given `RunFailed { error: b"why" }` at alignment 1 on purpose, so the
+    // claim has an artifact. This is it.
+    assert_eq!(
+        include_bytes!("corpus/v1/record-08-run-failed.bin").as_slice(),
+        golden::RUN_FAILED.as_slice(),
+        "the corpus and the golden frame disagree about the same record"
+    );
+}
+
+#[test]
 fn the_decoder_reads_exactly_the_format_versions_the_range_declares() {
     // Issue #41 freezes the format and states the promise as a range: this firmware writes
     // one version and reads a set of them. The predicate is the migration policy made

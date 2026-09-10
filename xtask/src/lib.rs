@@ -644,6 +644,7 @@ fn collect_docs_inputs(
         storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
         failure_rows: read_optional(&root.join(docs::FAILURE_ROWS_PATH))?,
         wire_format_spec: read_optional(&root.join(docs::WIRE_FORMAT_SPEC_PATH))?,
+        wire_format_corpus: read_corpus(&root.join(docs::WIRE_FORMAT_CORPUS_DIR))?,
         failure_model_tests: read_optional(&root.join(docs::FAILURE_MODEL_TESTS_PATH))?,
         failure_rig_tests: read_optional(&root.join(docs::FAILURE_RIG_TESTS_PATH))?,
         crate_roots,
@@ -725,6 +726,30 @@ fn is_executable(_path: &Path) -> Option<bool> {
 fn read_to_string(path: &Path) -> Result<String, CheckError> {
     std::fs::read_to_string(path)
         .map_err(|err| CheckError::new(format!("could not read {}: {err}", path.display())))
+}
+
+/// Every `.bin` file in `dir`, by name, with its bytes, in name order.
+///
+/// A directory that is not there reads as no files, which `wire-format` reports rather than
+/// skips: a corpus that cannot be read is a freeze nothing is enforcing.
+fn read_corpus(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, CheckError> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| CheckError::new(format!("could not list {}: {err}", dir.display())))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "bin") {
+            let bytes = std::fs::read(&path).map_err(|err| {
+                CheckError::new(format!("could not read {}: {err}", path.display()))
+            })?;
+            files.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
 }
 
 pub(crate) fn run_cargo_metadata(root: &Path) -> Result<String, CheckError> {
@@ -877,6 +902,7 @@ mod tests {
                 failure_rows: None,
                 // Nor the byte-by-byte format document, so `wire-format` fires.
                 wire_format_spec: None,
+                wire_format_corpus: Vec::new(),
                 failure_model_tests: None,
                 failure_rig_tests: None,
                 crate_roots: vec![docs::CrateRoot {

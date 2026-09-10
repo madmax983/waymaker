@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use waymaker_core::timer::ClockKind;
 use waymaker_core::version::GateId;
-use waymaker_core::{ActivityKind, EffectSeq, RecordKind, RecordRef, RunId};
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::bank::{self, BankHeader, Generation};
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 
@@ -196,6 +196,78 @@ fn cases() -> Vec<Case> {
             expected: Expected::Record {
                 record: RecordRef::RunCompleted { result: &[] },
                 align: 16,
+            },
+        },
+        // Six cases whose every multi-byte field carries a distinct non-zero byte in every
+        // position. Without them the corpus cannot say a width narrowed: a `version` read as
+        // a `u8` decodes every other case here to exactly the record it expects, and
+        // re-encodes byte-identically, because none of them has a high byte to lose.
+        Case {
+            file: "record-01-run-started-wide.bin",
+            expected: Expected::Record {
+                record: RecordRef::RunStarted {
+                    workflow_kind: 0xA1B2,
+                    workflow_version: 0xC3D4,
+                    input: b"wide",
+                },
+                align: 1,
+            },
+        },
+        Case {
+            file: "record-02-effect-scheduled-wide.bin",
+            expected: Expected::Record {
+                record: RecordRef::EffectScheduled {
+                    seq: EffectSeq(0xFEDC_BA98),
+                    kind: ActivityKind(0x1A2B),
+                    input_len: 0x3C4D,
+                    input_crc: 0x5E6F_7081,
+                },
+                align: 1,
+            },
+        },
+        Case {
+            file: "record-09-version-marker-wide.bin",
+            expected: Expected::Record {
+                record: RecordRef::VersionMarker {
+                    seq: EffectSeq(0x0102_0304),
+                    gate: GateId(0xF1E2),
+                    version: 0xD3C4,
+                },
+                align: 1,
+            },
+        },
+        // And one record whose unpadded length is not already a multiple of its program
+        // unit, so the padding half of the tooth has more than a single byte of a single
+        // file to work with.
+        Case {
+            file: "record-03-effect-completed-align-8.bin",
+            expected: Expected::Record {
+                record: RecordRef::EffectCompleted {
+                    seq: EffectSeq(0x1122_3344),
+                    result: &[1, 2, 3],
+                },
+                align: 8,
+            },
+        },
+        Case {
+            file: "bank-header-wide-align-8.bin",
+            expected: Expected::BankHeader {
+                header: BankHeader {
+                    run: RunId(0x8899_AABB_CCDD_EEFF),
+                    align: align_of(8),
+                    workflow_kind: 0xA1B2,
+                    workflow_version: 0xC3D4,
+                    input_schema: 0xE5F6,
+                    input: b"wide",
+                },
+            },
+        },
+        Case {
+            file: "generation-seal-wide-align-8.bin",
+            expected: Expected::GenerationSeal {
+                generation: Generation(0x91A2_B3C4),
+                header_file: "bank-header-wide-align-8.bin",
+                align: 8,
             },
         },
         Case {
@@ -415,21 +487,16 @@ fn the_corpus_directory_holds_exactly_the_cases_the_table_names() {
 
 #[test]
 fn every_record_kind_this_firmware_writes_has_a_corpus_case() {
-    // The census. §09 numbers eleven kinds; the two with no body yet — `SIGNAL_RECEIVED`
-    // and `CHILD_STARTED` — are reserved rather than written, so a corpus case for either
-    // would be bytes no writer produces. Every other kind is one a shipped device puts on
-    // media, and a kind added to that set with no case is a kind the freeze does not cover.
-    let written = [
-        RecordKind::RUN_STARTED,
-        RecordKind::EFFECT_SCHEDULED,
-        RecordKind::EFFECT_COMPLETED,
-        RecordKind::EFFECT_FAILED,
-        RecordKind::TIMER_SCHEDULED,
-        RecordKind::TIMER_FIRED,
-        RecordKind::RUN_COMPLETED,
-        RecordKind::RUN_FAILED,
-        RecordKind::VERSION_MARKER,
-    ];
+    // The census. §09 numbers eleven kinds; the two with no body yet — `SIGNAL_RECEIVED` and
+    // `CHILD_STARTED` — are reserved rather than written, and they are not `RecordRef`
+    // variants at all, so a corpus case for either would be bytes no writer produces.
+    //
+    // `written` is derived from `SAMPLES` rather than listed, and `SAMPLES` is held to
+    // `variant_index`'s exhaustive `match` by the test below. So giving a reserved kind a
+    // body — which makes it a `RecordRef` variant — is a compile error in `variant_index`,
+    // then a failure here until it has a corpus case. A hardcoded list would have been a
+    // list that stops growing.
+    let written: BTreeSet<u8> = samples().iter().map(|record| record.kind().0).collect();
     let covered: BTreeSet<u8> = cases()
         .iter()
         .flat_map(|case| match &case.expected {
@@ -440,79 +507,224 @@ fn every_record_kind_this_firmware_writes_has_a_corpus_case() {
             Expected::BankHeader { .. } | Expected::GenerationSeal { .. } => Vec::new(),
         })
         .collect();
-    for kind in written {
+    for kind in &written {
         assert!(
-            covered.contains(&kind.0),
-            "record kind {} is written to media and has no corpus case",
-            kind.0
+            covered.contains(kind),
+            "record kind {kind} is written to media and has no corpus case"
         );
     }
     assert_eq!(
-        covered.len(),
-        written.len(),
+        covered, written,
         "the corpus covers a kind no writer produces"
     );
 }
 
 #[test]
+fn the_sample_list_holds_one_record_of_every_variant() {
+    // What makes the census above grow. `variant_index` has no wildcard arm, so a variant
+    // added to `RecordRef` does not compile until it is answered here; this then fails until
+    // `samples` carries one.
+    let mut seen = BTreeSet::new();
+    for record in samples() {
+        seen.insert(variant_index(&record));
+    }
+    assert_eq!(
+        seen,
+        (0..VARIANTS).collect::<BTreeSet<usize>>(),
+        "the sample list has gained or lost a variant"
+    );
+}
+
+/// How many variants `RecordRef` has.
+const VARIANTS: usize = 9;
+
+/// Which variant a record is, as an exhaustive match with no wildcard.
+const fn variant_index(record: &RecordRef<'_>) -> usize {
+    match record {
+        RecordRef::RunStarted { .. } => 0,
+        RecordRef::EffectScheduled { .. } => 1,
+        RecordRef::EffectCompleted { .. } => 2,
+        RecordRef::EffectFailed { .. } => 3,
+        RecordRef::TimerScheduled { .. } => 4,
+        RecordRef::TimerFired { .. } => 5,
+        RecordRef::RunCompleted { .. } => 6,
+        RecordRef::RunFailed { .. } => 7,
+        RecordRef::VersionMarker { .. } => 8,
+    }
+}
+
+/// One record of every variant a v1 writer produces.
+fn samples() -> Vec<RecordRef<'static>> {
+    vec![
+        RecordRef::RunStarted {
+            workflow_kind: 0,
+            workflow_version: 0,
+            input: &[],
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq(0),
+            kind: ActivityKind(0),
+            input_len: 0,
+            input_crc: 0,
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: &[],
+        },
+        RecordRef::EffectFailed {
+            seq: EffectSeq(0),
+            error: &[],
+        },
+        RecordRef::TimerScheduled {
+            seq: EffectSeq(0),
+            clock_kind: ClockKind::AFTER_BOOT,
+            deadline: 0,
+            armed_at: 0,
+        },
+        RecordRef::TimerFired { seq: EffectSeq(0) },
+        RecordRef::RunCompleted { result: &[] },
+        RecordRef::RunFailed { error: &[] },
+        RecordRef::VersionMarker {
+            seq: EffectSeq(0),
+            gate: GateId(0),
+            version: 0,
+        },
+    ]
+}
+
+#[test]
 fn every_byte_a_reader_reads_is_covered_by_a_check() {
     // The tooth. A corpus is an instrument, and an instrument that cannot fail is
-    // decoration: this drives every single-byte mutation of every record case and requires
-    // the decoder to refuse each one it reads — and to ignore each pad byte, which is §09's
+    // decoration: this drives every single-byte mutation of every case and requires the
+    // reader to refuse each byte it reads — and to ignore each pad byte, which is §09's
     // "padding to the device's program alignment with stale tail bytes never interpreted".
-    let mut checked = 0_usize;
+    //
+    // Every case, not the record ones alone. An earlier version skipped the journal, the
+    // bank header and the generation seal, which left the whole bank codec — its own magic,
+    // its own prefix width, its own two checks — with no tooth at all, under a test whose
+    // name said otherwise.
+    // Counted per shape rather than in total, because a total is exactly how three of the
+    // four shapes go untested behind a number the record cases alone make large.
+    let mut checked = [0_usize; 4];
     let mut ignored = 0_usize;
     for case in &cases() {
-        let (record, align) = match &case.expected {
-            Expected::Record { record, align } => (record, *align),
-            _ => continue,
-        };
         let bytes = read(case.file);
-        let body = frame::body_len(record, align_of(align)).expect("the case encodes");
-        let unpadded = frame::FRAME_OVERHEAD_BYTES + payload_len_of(record);
+        let pads = pad_ranges(&case.expected);
+        let shape = match case.expected {
+            Expected::Record { .. } => 0,
+            Expected::Journal { .. } => 1,
+            Expected::BankHeader { .. } => 2,
+            Expected::GenerationSeal { .. } => 3,
+        };
 
         for index in 0..bytes.len() {
             let mut mutated = bytes.clone();
             let slot = mutated.get_mut(index).expect("in range");
             *slot = slot.wrapping_add(1);
 
-            // A pad byte lies between the frame's last checksum byte and the seal. No
-            // reader reads one, so the record must decode unchanged.
-            if (unpadded..body).contains(&index) {
-                let decoded = frame::decode(&mutated).expect("padding is not read");
-                assert_eq!(
-                    decoded.decoded,
-                    frame::Decoded::Record(*record),
-                    "`{}` byte {index} is padding and changed what the frame says",
+            if pads.iter().any(|pad| pad.contains(&index)) {
+                assert!(
+                    reads_back(&mutated, case),
+                    "`{}` byte {index} is padding and changed what the bytes say",
                     case.file
                 );
                 ignored += 1;
-                continue;
+            } else {
+                assert!(
+                    !reads_back(&mutated, case),
+                    "`{}` byte {index} is read and the mutation was not caught",
+                    case.file
+                );
+                if let Some(count) = checked.get_mut(shape) {
+                    *count += 1;
+                }
             }
-
-            // Everything else is read, so a scan over the case must stop rather than hand
-            // back a record. `Scan` rather than `decode`, because the seal is past the
-            // frame and only a scan looks at it.
-            let mut scan = Scan::new(&mutated, align_of(align));
-            let first = scan
-                .next()
-                .expect("a scan over a whole record answers once");
-            assert!(
-                first.is_err() || first != Ok(*record),
-                "`{}` byte {index} is read and the mutation was not caught",
-                case.file
-            );
-            checked += 1;
         }
     }
-    assert!(
-        checked > 0,
-        "no read byte was mutated, so the tooth is blunt"
-    );
+    for (shape, count) in checked.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "shape {shape} had no read byte mutated, so the tooth is blunt for it"
+        );
+    }
     assert!(
         ignored > 0,
         "no pad byte was mutated, so the padding half of the claim is untested"
     );
+}
+
+/// Whether `bytes` still reads back as the case expects.
+///
+/// One predicate for all four shapes, so the tooth above says the same thing about each.
+fn reads_back(bytes: &[u8], case: &Case) -> bool {
+    match &case.expected {
+        Expected::Record { record, align } => {
+            let mut scan = Scan::new(bytes, align_of(*align));
+            scan.next() == Some(Ok(*record))
+        }
+        Expected::Journal { records, align } => {
+            let walked: Vec<RecordRef<'_>> = Scan::new(bytes, align_of(*align))
+                .take_while(Result::is_ok)
+                .flatten()
+                .collect();
+            walked.as_slice() == *records
+        }
+        Expected::BankHeader { header } => bank::decode_header(bytes) == Ok(*header),
+        Expected::GenerationSeal {
+            generation,
+            header_file,
+            ..
+        } => bank::sealed_generation(&read(header_file), bytes) == Some(*generation),
+    }
+}
+
+/// The byte ranges of `expected` that no reader reads: the pad between a frame's last
+/// checksum byte and whatever follows it.
+///
+/// Derived from the record rather than from the file, because a range taken from the file's
+/// own length would be a range the file agrees with however wrong it is.
+fn pad_ranges(expected: &Expected) -> Vec<core::ops::Range<usize>> {
+    match expected {
+        Expected::Record { record, align } => pad_ranges_of(&[*record], align_of(*align), 0),
+        Expected::Journal { records, align } => pad_ranges_of(records, align_of(*align), 0),
+        Expected::BankHeader { header } => {
+            // A bank header's frame is its prefix, its input and its trailer; everything
+            // after that, up to the program unit, is pad.
+            let unpadded =
+                bank::HEADER_PREFIX_BYTES + header.input.len() + bank::HEADER_TRAILER_BYTES;
+            let padded = header.align.round_up(unpadded).unwrap_or(unpadded);
+            core::iter::once(unpadded..padded).collect()
+        }
+        Expected::GenerationSeal { align, .. } => {
+            // Twelve bytes, rounded up. At a granularity that divides twelve there is no
+            // pad at all, and the empty range is the honest answer rather than a skip.
+            let padded = align_of(*align)
+                .round_up(bank::SEAL_BYTES)
+                .unwrap_or(bank::SEAL_BYTES);
+            core::iter::once(bank::SEAL_BYTES..padded).collect()
+        }
+    }
+}
+
+/// The pad ranges of a run of records laid out back to back from `at`.
+fn pad_ranges_of(
+    records: &[RecordRef<'_>],
+    align: ProgramAlign,
+    mut at: usize,
+) -> Vec<core::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    for record in records {
+        let unpadded = frame::FRAME_OVERHEAD_BYTES + payload_len_of(record);
+        let (Ok(body), Ok(total)) = (
+            frame::body_len(record, align),
+            frame::encoded_len(record, align),
+        ) else {
+            unreachable!("every case in the table encodes")
+        };
+        ranges.push(at + unpadded..at + body);
+        at += total;
+    }
+    ranges
 }
 
 /// How many payload bytes a record spends, for the padding arithmetic above.

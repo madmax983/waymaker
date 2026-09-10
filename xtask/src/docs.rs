@@ -133,6 +133,156 @@ pub const WIRE_FORMAT_ADR: &str =
 /// Where the v1 conformance corpus lives, relative to the workspace root.
 pub const WIRE_FORMAT_CORPUS_DIR: &str = "crates/waymaker-flash/tests/corpus/v1";
 
+/// One file of the v1 conformance corpus, frozen at the bytes it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorpusCase {
+    /// The file name, inside [`WIRE_FORMAT_CORPUS_DIR`].
+    pub name: &'static str,
+    /// How long the file is.
+    pub bytes: usize,
+    /// CRC-32/ISO-HDLC over the whole file -- the check the format itself spends.
+    pub digest: u32,
+}
+
+/// Every file of the v1 corpus, with its length and its digest.
+///
+/// The corpus README says "a case is added, never regenerated", and this is what makes that
+/// a build failure rather than a sentence. Without it the freeze's load-bearing artifact can
+/// be regenerated in place: `re_encoding_every_corpus_case_reproduces_its_bytes` passes
+/// again the moment both sides move together, and a same-length binary edit renders in a
+/// diff as `Bin` with no content -- invisible to the reviewer it was written for.
+///
+/// With it, regenerating a case means editing a digest here too, which is a line somebody
+/// writes on purpose. That is the standard every other pin in this workspace is held to.
+pub const WIRE_FORMAT_CORPUS_FILES: &[CorpusCase] = &[
+    CorpusCase {
+        name: "bank-header-align-4.bin",
+        bytes: 32,
+        digest: 0xEB20_1890,
+    },
+    CorpusCase {
+        name: "generation-seal-align-4.bin",
+        bytes: 12,
+        digest: 0x0E99_F899,
+    },
+    CorpusCase {
+        name: "journal-align-4.bin",
+        bytes: 84,
+        digest: 0x135C_3BB0,
+    },
+    CorpusCase {
+        name: "bank-header-wide-align-8.bin",
+        bytes: 32,
+        digest: 0x0FE4_B35C,
+    },
+    CorpusCase {
+        name: "generation-seal-wide-align-8.bin",
+        bytes: 16,
+        digest: 0x7424_9B2F,
+    },
+    CorpusCase {
+        name: "record-01-run-started-wide.bin",
+        bytes: 25,
+        digest: 0xDB95_E779,
+    },
+    CorpusCase {
+        name: "record-02-effect-scheduled-wide.bin",
+        bytes: 25,
+        digest: 0x5746_9B8A,
+    },
+    CorpusCase {
+        name: "record-03-effect-completed-align-8.bin",
+        bytes: 32,
+        digest: 0x22CD_735A,
+    },
+    CorpusCase {
+        name: "record-09-version-marker-wide.bin",
+        bytes: 21,
+        digest: 0x0998_6284,
+    },
+    CorpusCase {
+        name: "record-01-run-started.bin",
+        bytes: 26,
+        digest: 0x142F_72E0,
+    },
+    CorpusCase {
+        name: "record-02-effect-scheduled.bin",
+        bytes: 25,
+        digest: 0x442A_03DC,
+    },
+    CorpusCase {
+        name: "record-03-effect-completed-align-4.bin",
+        bytes: 24,
+        digest: 0x3946_4624,
+    },
+    CorpusCase {
+        name: "record-03-effect-completed.bin",
+        bytes: 20,
+        digest: 0x6DF3_CA44,
+    },
+    CorpusCase {
+        name: "record-04-effect-failed.bin",
+        bytes: 19,
+        digest: 0xF4FA_9BFE,
+    },
+    CorpusCase {
+        name: "record-05-timer-scheduled.bin",
+        bytes: 34,
+        digest: 0xB893_8BA0,
+    },
+    CorpusCase {
+        name: "record-06-timer-fired-align-8.bin",
+        bytes: 24,
+        digest: 0x32C5_2E00,
+    },
+    CorpusCase {
+        name: "record-06-timer-fired.bin",
+        bytes: 17,
+        digest: 0x0843_1382,
+    },
+    CorpusCase {
+        name: "record-07-run-completed-empty-align-16.bin",
+        bytes: 32,
+        digest: 0xB64C_7D62,
+    },
+    CorpusCase {
+        name: "record-07-run-completed.bin",
+        bytes: 19,
+        digest: 0xE94D_8B9A,
+    },
+    CorpusCase {
+        name: "record-08-run-failed.bin",
+        bytes: 20,
+        digest: 0x45F1_72DA,
+    },
+    CorpusCase {
+        name: "record-09-version-marker.bin",
+        bytes: 21,
+        digest: 0x429C_B6C3,
+    },
+];
+
+/// CRC-32/ISO-HDLC, bit by bit.
+///
+/// The check the format itself spends, written here rather than reached for in
+/// `waymaker-flash`: the gate may not depend on a layer, and a digest computed by the crate
+/// whose fixtures it is pinning would be a digest that moves with them.
+#[must_use]
+pub fn corpus_digest(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xEDB8_8320
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 /// One number the v1 wire format spends, frozen at the value on media.
 ///
 /// The `value` is the *literal* the declaration carries, not a computed one: a rule that
@@ -147,6 +297,13 @@ pub struct FrozenConstant {
     pub name: &'static str,
     /// The literal it is declared with.
     pub value: &'static str,
+    /// The number the specification document states for it.
+    ///
+    /// Usually [`FrozenConstant::value`] again, and different wherever the declaration
+    /// carries an expression instead of a number: `size_of::<u32>()` is the literal in the
+    /// code and `4` is the number on media, and a specification stating the first would be
+    /// telling a porter to implement Rust rather than a format.
+    pub documented: &'static str,
 }
 
 /// Every constant the frozen format fixes, and the literal each is declared with.
@@ -165,61 +322,121 @@ pub const WIRE_FORMAT_CONSTANTS: &[FrozenConstant] = &[
         file: "waymaker-flash/src/frame.rs",
         name: "MAGIC",
         value: "0x4D57",
+        documented: "0x4D57",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "FORMAT_VERSION",
         value: "1",
+        documented: "1",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "OLDEST_READABLE_FORMAT_VERSION",
         value: "1",
+        documented: "1",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "HEADER_BYTES",
         value: "12",
+        documented: "12",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "TRAILER_BYTES",
         value: "4",
+        documented: "4",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "ERASED_BYTE",
         value: "0xFF",
+        documented: "0xFF",
     },
     FrozenConstant {
         file: "waymaker-flash/src/frame.rs",
         name: "SEAL_BYTE_MASK",
         value: "0x7F",
+        documented: "0x7F",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "HEADER_CRC_BYTES",
+        value: "size_of::<u16>()",
+        documented: "2",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "FRAME_CRC_BYTES",
+        value: "size_of::<u32>()",
+        documented: "4",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "SEAL_PATTERN_BYTES",
+        value: "size_of::<u32>()",
+        documented: "4",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "MAX_PAYLOAD_BYTES",
+        value: "u16::MAX as usize",
+        documented: "65535",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "RUN_STARTED_PREFIX_BYTES",
+        value: "4",
+        documented: "4",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "EFFECT_SCHEDULED_BODY_BYTES",
+        value: "8",
+        documented: "8",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "VERSION_MARKER_BODY_BYTES",
+        value: "4",
+        documented: "4",
+    },
+    FrozenConstant {
+        file: "waymaker-flash/src/frame.rs",
+        name: "TIMER_SCHEDULED_BODY_BYTES",
+        value: "1 + 8 + 8",
+        documented: "17",
     },
     FrozenConstant {
         file: "waymaker-flash/src/bank.rs",
         name: "BANK_MAGIC",
         value: "0x4B42",
+        documented: "0x4B42",
     },
     FrozenConstant {
         file: "waymaker-flash/src/bank.rs",
         name: "SEAL_MAGIC",
         value: "0x5347",
+        documented: "0x5347",
     },
     FrozenConstant {
         file: "waymaker-flash/src/bank.rs",
         name: "HEADER_PREFIX_BYTES",
         value: "22",
+        documented: "22",
     },
     FrozenConstant {
         file: "waymaker-flash/src/bank.rs",
         name: "HEADER_TRAILER_BYTES",
         value: "4",
+        documented: "4",
     },
     FrozenConstant {
         file: "waymaker-flash/src/bank.rs",
         name: "SEAL_BYTES",
         value: "12",
+        documented: "12",
     },
 ];
 
@@ -959,6 +1176,11 @@ pub struct DocsInputs {
     pub storage_clauses: Option<String>,
     /// Contents of [`FAILURE_ROWS_PATH`], when the workspace has it. `None` is a violation.
     pub failure_rows: Option<String>,
+    /// Every `.bin` file under [`WIRE_FORMAT_CORPUS_DIR`], by name, with its bytes.
+    ///
+    /// Empty is a violation rather than a skip: the corpus is what holds the freeze, and a
+    /// corpus that cannot be read is a freeze nothing is enforcing.
+    pub wire_format_corpus: Vec<(String, Vec<u8>)>,
     /// Contents of [`WIRE_FORMAT_SPEC_PATH`], when the repository has it.
     ///
     /// `None` is a violation rather than a skip, for the reason [`DocsInputs::storage_clauses`]
@@ -3530,71 +3752,92 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         inputs.claude_md.as_deref(),
         &inputs.adrs,
         inputs.wire_format_spec.as_deref(),
+        &inputs.wire_format_corpus,
     ));
     violations.extend(check_diagrams(inputs.architecture.as_deref()));
     violations.extend(check_missing_docs(&inputs.crate_roots));
     violations
 }
 
-/// The frozen v1 wire format and the three places it lives stop agreeing.
+/// The frozen v1 wire format and the places it lives stop agreeing.
 ///
 /// Issue [#41](https://github.com/madmax983/waymaker/issues/41)'s first "done when" is that
-/// the format be documented byte by byte. This is what stops that document drifting from
-/// the tables the gate reads: every constant's value and every record's number must appear
-/// in [`WIRE_FORMAT_SPEC_PATH`], `CLAUDE.md` must link the document, and
-/// [`WIRE_FORMAT_ADR`] must exist and be accepted.
+/// the format be documented byte by byte, and its fourth is a corpus every future version
+/// must still decode. This half holds both against the tables the gate reads.
 ///
-/// The code half is `source::check_wire_format`, which reads the declarations, and the byte
-/// half is the corpus. One rule id, because it is one decision.
+/// The **specification**: every row of [`WIRE_FORMAT_CONSTANTS`] must have a line of
+/// [`WIRE_FORMAT_SPEC_PATH`] naming the constant *and* its documented value, and every row of
+/// [`WIRE_FORMAT_RECORD_KINDS`] a line naming the record *and* its number. One line rather
+/// than the whole document, which is the difference between a check and a formality: a bare
+/// `contains("1")` cannot fail for any document, and `contains("4")` cannot fail for this
+/// one. Review of this change rewrote the frame header to sixteen bytes and watched a
+/// document-wide version stay green.
+///
+/// The **corpus**: every row of [`WIRE_FORMAT_CORPUS_FILES`] must be a file of that length
+/// and that digest, and every file present must be a row. Without it the freeze's
+/// load-bearing artifact can be regenerated in place -- the round-trip test passes again the
+/// moment both sides move together, and a same-length binary edit renders in a diff as `Bin`
+/// with no content.
+///
+/// And `CLAUDE.md` must link the document and name the corpus, and [`WIRE_FORMAT_ADR`] must
+/// exist and be accepted.
+///
+/// The code half is `source::check_wire_format`, which reads the declarations. One rule id,
+/// because it is one decision.
 ///
 /// # What it cannot see
 ///
-/// Prose. It matches values and numbers, so a document whose *sentences* describe another
-/// format passes as long as the numbers are in it — the limit `CLAUDE.md`'s own
-/// [what is not checked] section states for every rule in this module.
+/// Prose. It matches names against values on a line, so a document whose *sentences*
+/// describe another format passes as long as its tables are right -- the limit `CLAUDE.md`'s
+/// own [what is not checked] section states for every rule in this module.
 ///
 /// [what is not checked]: https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked
 fn check_wire_format_is_documented(
     claude_md: Option<&str>,
     adrs: &[AdrFile],
     spec: Option<&str>,
+    corpus: &[(String, Vec<u8>)],
 ) -> Vec<Violation> {
     const RULE: &str = "wire-format";
 
+    let mut violations = check_wire_format_corpus(corpus, RULE);
+
     let Some(spec) = spec else {
-        return vec![Violation::new(
+        violations.push(Violation::new(
             RULE,
             WIRE_FORMAT_SPEC_PATH,
             format!(
                 "{WIRE_FORMAT_SPEC_PATH} is missing, so the frozen format is documented \
                  nowhere and issue #41's first `done when` is unmet"
             ),
-        )];
+        ));
+        return violations;
     };
     let spec = without_html_comments(spec);
 
-    let mut violations = Vec::new();
     for frozen in WIRE_FORMAT_CONSTANTS {
-        if !spec.contains(frozen.value) {
+        if !states_on_one_line(&spec, frozen.name, frozen.documented) {
             violations.push(Violation::new(
                 RULE,
                 WIRE_FORMAT_SPEC_PATH,
                 format!(
-                    "{WIRE_FORMAT_SPEC_PATH} does not state `{}`, which the format freezes at \
-                     `{}`; a number the specification omits is a number a porter cannot \
-                     implement",
-                    frozen.name, frozen.value
+                    "no line of {WIRE_FORMAT_SPEC_PATH} states `{}` as `{}`; a number the \
+                     specification omits -- or states somewhere other than beside its name -- \
+                     is a number a porter cannot implement",
+                    frozen.name, frozen.documented
                 ),
             ));
         }
     }
     for record in WIRE_FORMAT_RECORD_KINDS {
-        if !spec.contains(record.spelling) {
+        if !states_on_one_line(&spec, record.spelling, &record.number.to_string()) {
             violations.push(Violation::new(
                 RULE,
                 WIRE_FORMAT_SPEC_PATH,
                 format!(
-                    "{WIRE_FORMAT_SPEC_PATH} does not name `{}`, which §09 numbers {}",
+                    "no line of {WIRE_FORMAT_SPEC_PATH} numbers `{}` {}; two rows of the \
+                     record table with their numbers swapped keep every spelling in the \
+                     document and make a porter write the wrong kind byte on every record",
                     record.spelling, record.number
                 ),
             ));
@@ -3602,7 +3845,7 @@ fn check_wire_format_is_documented(
     }
 
     if let Some(claude_md) = claude_md {
-        let claude_md = without_html_comments(claude_md);
+        let claude_md = without_fenced_code(&without_html_comments(claude_md));
         if !claude_md.contains(WIRE_FORMAT_SPEC_PATH) {
             violations.push(Violation::new(
                 RULE,
@@ -3647,6 +3890,84 @@ fn check_wire_format_is_documented(
         Some(_) => {}
     }
 
+    violations
+}
+
+/// Whether some line of `contents` names `subject` and states `value` on it.
+///
+/// `value` is matched as a whole token so that a `1` in the table's `v1` column, or the `4`
+/// inside `0x4D57`, is not read as the number a row states.
+#[must_use]
+fn states_on_one_line(contents: &str, subject: &str, value: &str) -> bool {
+    contents.lines().any(|line| {
+        line.contains(subject)
+            && line
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|token| token == value)
+    })
+}
+
+/// The corpus is exactly the files the table names, at the lengths and digests it names.
+fn check_wire_format_corpus(corpus: &[(String, Vec<u8>)], rule: &'static str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    if corpus.is_empty() {
+        return vec![Violation::new(
+            rule,
+            WIRE_FORMAT_CORPUS_DIR,
+            format!(
+                "{WIRE_FORMAT_CORPUS_DIR} holds no frozen bytes, so the format is frozen by \
+                 nothing that a later firmware has to decode"
+            ),
+        )];
+    }
+
+    for case in WIRE_FORMAT_CORPUS_FILES {
+        match corpus.iter().find(|(name, _)| name == case.name) {
+            None => violations.push(Violation::new(
+                rule,
+                WIRE_FORMAT_CORPUS_DIR,
+                format!(
+                    "the corpus has no `{}`, which the frozen table names; a case is added, \
+                     never removed -- a device that wrote those bytes is still in the field",
+                    case.name
+                ),
+            )),
+            Some((_, bytes)) => {
+                let digest = corpus_digest(bytes);
+                if bytes.len() != case.bytes || digest != case.digest {
+                    violations.push(Violation::new(
+                        rule,
+                        WIRE_FORMAT_CORPUS_DIR,
+                        format!(
+                            "`{}` is {} bytes with digest {:#010X}, and the frozen table says \
+                             {} bytes with digest {:#010X}; a corpus case is added, never \
+                             regenerated",
+                            case.name,
+                            bytes.len(),
+                            digest,
+                            case.bytes,
+                            case.digest
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for (name, _) in corpus {
+        if !WIRE_FORMAT_CORPUS_FILES
+            .iter()
+            .any(|case| case.name == name)
+        {
+            violations.push(Violation::new(
+                rule,
+                WIRE_FORMAT_CORPUS_DIR,
+                format!(
+                    "the corpus holds `{name}`, which docs::WIRE_FORMAT_CORPUS_FILES does not \
+                     name; a file nothing pins is a file that can be regenerated"
+                ),
+            ));
+        }
+    }
     violations
 }
 
@@ -4062,7 +4383,7 @@ pub mod tests_support {
         for frozen in WIRE_FORMAT_CONSTANTS {
             line(
                 &mut body,
-                format_args!("| {} | {} |", frozen.name, frozen.value),
+                format_args!("| `{}` | `{}` |", frozen.name, frozen.documented),
             );
         }
         for record in WIRE_FORMAT_RECORD_KINDS {
@@ -4072,6 +4393,152 @@ pub mod tests_support {
             );
         }
         body
+    }
+
+    /// The corpus itself, included at compile time.
+    ///
+    /// The real bytes rather than a rendering of the table, because the table pins a
+    /// **digest**: no fixture can invent a file with a given CRC-32 without implementing the
+    /// arithmetic that undoes one, and a fixture carrying that much machinery is a second
+    /// implementation to keep honest. Including the files makes the clean fixture the thing
+    /// itself, and it fails closed the hard way -- a corpus file deleted is a `cargo test`
+    /// that does not compile.
+    #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one `include_bytes!` per corpus file; a loop cannot take a path at run time"
+    )]
+    pub fn clean_wire_format_corpus() -> Vec<(String, Vec<u8>)> {
+        const CORPUS: &[(&str, &[u8])] = &[
+            (
+                "bank-header-align-4.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/bank-header-align-4.bin"
+                ),
+            ),
+            (
+                "generation-seal-align-4.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/generation-seal-align-4.bin"
+                ),
+            ),
+            (
+                "journal-align-4.bin",
+                include_bytes!("../../crates/waymaker-flash/tests/corpus/v1/journal-align-4.bin"),
+            ),
+            (
+                "bank-header-wide-align-8.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/bank-header-wide-align-8.bin"
+                ),
+            ),
+            (
+                "generation-seal-wide-align-8.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/generation-seal-wide-align-8.bin"
+                ),
+            ),
+            (
+                "record-01-run-started-wide.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-01-run-started-wide.bin"
+                ),
+            ),
+            (
+                "record-02-effect-scheduled-wide.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-02-effect-scheduled-wide.bin"
+                ),
+            ),
+            (
+                "record-03-effect-completed-align-8.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-03-effect-completed-align-8.bin"
+                ),
+            ),
+            (
+                "record-09-version-marker-wide.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-09-version-marker-wide.bin"
+                ),
+            ),
+            (
+                "record-01-run-started.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-01-run-started.bin"
+                ),
+            ),
+            (
+                "record-02-effect-scheduled.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-02-effect-scheduled.bin"
+                ),
+            ),
+            (
+                "record-03-effect-completed-align-4.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-03-effect-completed-align-4.bin"
+                ),
+            ),
+            (
+                "record-03-effect-completed.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-03-effect-completed.bin"
+                ),
+            ),
+            (
+                "record-04-effect-failed.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-04-effect-failed.bin"
+                ),
+            ),
+            (
+                "record-05-timer-scheduled.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-05-timer-scheduled.bin"
+                ),
+            ),
+            (
+                "record-06-timer-fired-align-8.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-06-timer-fired-align-8.bin"
+                ),
+            ),
+            (
+                "record-06-timer-fired.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-06-timer-fired.bin"
+                ),
+            ),
+            (
+                "record-07-run-completed-empty-align-16.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-07-run-completed-empty-align-16.bin"
+                ),
+            ),
+            (
+                "record-07-run-completed.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-07-run-completed.bin"
+                ),
+            ),
+            (
+                "record-08-run-failed.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-08-run-failed.bin"
+                ),
+            ),
+            (
+                "record-09-version-marker.bin",
+                include_bytes!(
+                    "../../crates/waymaker-flash/tests/corpus/v1/record-09-version-marker.bin"
+                ),
+            ),
+        ];
+        CORPUS
+            .iter()
+            .map(|(name, bytes)| ((*name).to_owned(), (*bytes).to_vec()))
+            .collect()
     }
 
     /// Documentation inputs that every rule passes.
@@ -4094,6 +4561,7 @@ pub mod tests_support {
             failure_model_tests: Some(clean_failure_model_tests()),
             failure_rig_tests: Some(clean_failure_rig_tests()),
             wire_format_spec: Some(clean_wire_format_spec()),
+            wire_format_corpus: clean_wire_format_corpus(),
             // One root per crate the layering covers, so that a fixture describing a clean
             // workspace really has one for every member `inputs-incomplete` looks for.
             crate_roots: crate::policy::checked_members()
@@ -6361,6 +6829,7 @@ mod tests {
                 inputs.claude_md.as_deref(),
                 &inputs.adrs,
                 inputs.wire_format_spec.as_deref(),
+                &inputs.wire_format_corpus,
             ),
             Vec::new()
         );
@@ -6371,8 +6840,12 @@ mod tests {
         // Fail closed: issue #41's first `done when` is that the format be documented byte
         // by byte, and a document that is not there documents nothing.
         let inputs = wire_format_inputs();
-        let violations =
-            check_wire_format_is_documented(inputs.claude_md.as_deref(), &inputs.adrs, None);
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            None,
+            &inputs.wire_format_corpus,
+        );
         assert!(
             violations
                 .iter()
@@ -6392,8 +6865,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .replace(frozen.value, "elsewhere");
-        let violations =
-            check_wire_format_is_documented(inputs.claude_md.as_deref(), &inputs.adrs, Some(&spec));
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            Some(&spec),
+            &inputs.wire_format_corpus,
+        );
         assert!(
             violations
                 .iter()
@@ -6413,8 +6890,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .replace(record.spelling, "SomethingElse");
-        let violations =
-            check_wire_format_is_documented(inputs.claude_md.as_deref(), &inputs.adrs, Some(&spec));
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            Some(&spec),
+            &inputs.wire_format_corpus,
+        );
         assert!(
             violations
                 .iter()
@@ -6439,6 +6920,7 @@ mod tests {
             Some(&claude_md),
             &inputs.adrs,
             inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
         );
         assert!(
             violations
@@ -6474,6 +6956,7 @@ mod tests {
             inputs.claude_md.as_deref(),
             &adrs,
             inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
         );
         assert!(
             violations
