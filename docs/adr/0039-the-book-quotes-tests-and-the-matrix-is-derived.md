@@ -1,4 +1,4 @@
-# ADR 0038: The book quotes tests, and the matrix is derived
+# ADR 0039: The book quotes tests, and the matrix is derived
 
 - Status: accepted
 - Date: 2026-09-10

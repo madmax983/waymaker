@@ -92,3 +92,24 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# The profile `cargo xtask profile` links its workload under. Not `release`, and not a
+# tweak of it: the row above is what §04's code-flash budget is measured against, and a
+# gate that changed it to make a second measurement possible would move the number the
+# first one publishes.
+#
+# Three overrides, each buying something the measurement cannot be taken without.
+# `strip` and `debug`, because both tools attribute by symbol — DHAT reads a stack frame
+# per allocation and callgrind a function per cost line, and a stripped image attributes
+# every byte and every instruction to nobody. And `lto`, because fat LTO inlines a layer's
+# body into its caller: ADR 0029 records that as the one direction in which the code-flash
+# gate *understates* the layers, and here it would be worse than an understatement — an
+# allocation from inlined engine code would be charged to the harness, which is the gate
+# passing for the reason it exists to catch.
+#
+# `opt-level`, `codegen-units` and `panic` are release's, inherited rather than restated.
+[profile.profiling]
+inherits = "release"
+lto = false
+strip = "none"
+debug = true

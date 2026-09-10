@@ -31,6 +31,15 @@ waymaker-rig.workspace = true
 # a concrete `Ctx` and §06's example workflow are named; issue #39 asks the report to make
 # both visible. Host-only, and it grants no layer anything, for the reason above.
 waymaker-drive.workspace = true
+# Issue: `cargo xtask profile` gates six crates at zero heap blocks, and a crate the
+# workload never links can never be attributed one — so the gate would cover it in name and
+# not in fact. Codex found exactly that on the first review of the profiling gate:
+# `waymaker-conformance` was not in this graph at all, and `waymaker-embassy` was linked
+# through `waymaker-drive` and executed by nothing. These two are what the `facade` and
+# `conformance` workloads drive, and `profile::ProfileReport::shortfall_report` fails a run
+# in which any declared engine crate is still reached by neither.
+waymaker-embassy.workspace = true
+waymaker-conformance.workspace = true
 serde_json = "1"
 toml = "1"
 

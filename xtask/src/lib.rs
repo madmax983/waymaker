@@ -35,6 +35,7 @@ pub mod graph;
 pub mod manifest;
 pub mod pipeline;
 pub mod policy;
+pub mod profile;
 pub mod size;
 pub mod source;
 pub mod wear;

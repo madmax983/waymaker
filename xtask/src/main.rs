@@ -15,6 +15,8 @@ const USAGE: &str = "usage: cargo xtask <check-layering \
     | book \
     | coverage [--report FILE] \
     | size [--report FILE] [--json FILE] [--baseline-ref REF] [--no-baseline] \
+    | profile [--report FILE] [--json FILE] \
+    | profile-workload NAME \
     | install-hooks>";
 
 fn main() -> ExitCode {
@@ -27,6 +29,12 @@ fn main() -> ExitCode {
         Some("book") => run_book(),
         Some("coverage") => run_coverage(&rest),
         Some("size") => run_size(&rest),
+        Some("profile") => run_profile(&rest),
+        // The inner half of `profile`: the process valgrind is pointed at. A subcommand
+        // rather than a binary of its own, because a second target is a second thing to
+        // keep in the manifest, in `default-members` and out of the firmware build, and
+        // this is code nothing links — it runs for the length of one measurement.
+        Some(command) if command == xtask::profile::WORKLOAD_COMMAND => run_profile_workload(&rest),
         Some("install-hooks") => run_install_hooks(),
         Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
@@ -277,6 +285,110 @@ fn parse_size_flags(args: &[String]) -> Result<SizeOptions, String> {
         }
     }
     Ok(options)
+}
+
+/// Measures the engine's heap use and instruction cost under valgrind.
+///
+/// The heap half is a gate at [`xtask::profile::ENGINE_HEAP_BLOCKS`]; the instruction half
+/// is published, because §04 states no instruction target and a ceiling invented here would
+/// be a number nobody agreed to.
+///
+/// `--report FILE` gates a report produced earlier instead of running the tools again,
+/// which is what makes this command testable on a machine with no valgrind on it.
+fn run_profile(args: &[String]) -> ExitCode {
+    let options = match parse_profile_flags(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("xtask: {message}\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let root = workspace_root();
+    let measured = options.report.as_deref().map_or_else(
+        || xtask::profile::measure(&root),
+        xtask::profile::read_report,
+    );
+    let Ok(report) = measured.inspect_err(|error| eprintln!("xtask: {error}")) else {
+        return ExitCode::FAILURE;
+    };
+
+    print!("{}", report.render());
+
+    // Written before the gate is applied, for the reason `size` writes its report first:
+    // the run that fails is the run whose numbers somebody wants to look at.
+    let json = options
+        .json
+        .unwrap_or_else(|| root.join(xtask::profile::REPORT_PATH));
+    if let Err(error) = xtask::profile::write_report(&json, &report) {
+        eprintln!("xtask: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("wrote {}", json.display());
+
+    report.shortfall_report().map_or_else(
+        || {
+            println!("profile: ok");
+            ExitCode::SUCCESS
+        },
+        |shortfall| {
+            eprintln!("{shortfall}");
+            ExitCode::FAILURE
+        },
+    )
+}
+
+/// Options for `cargo xtask profile`.
+#[derive(Debug, Default)]
+struct ProfileOptions {
+    /// Gate a report produced earlier instead of running the tools again.
+    report: Option<PathBuf>,
+    /// Where to write the report this run produces.
+    json: Option<PathBuf>,
+}
+
+/// Reads the arguments of `cargo xtask profile`.
+fn parse_profile_flags(args: &[String]) -> Result<ProfileOptions, String> {
+    let mut args = args.iter();
+    let mut options = ProfileOptions::default();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--report" => {
+                options.report = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "`--report` needs a path".to_owned())?,
+                ));
+            }
+            "--json" => {
+                options.json = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "`--json` needs a path".to_owned())?,
+                ));
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(options)
+}
+
+/// Runs one profiling workload in this process, and prints what it completed.
+///
+/// Nothing calls this but the tools, and nothing measures anything without it.
+fn run_profile_workload(args: &[String]) -> ExitCode {
+    let Some(name) = args.first() else {
+        eprintln!(
+            "xtask: `{} needs a workload name`\n{USAGE}",
+            xtask::profile::WORKLOAD_COMMAND
+        );
+        return ExitCode::FAILURE;
+    };
+    match xtask::profile::run_workload(name) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("xtask: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Generates the pre-commit hook and points git at the directory holding it.
