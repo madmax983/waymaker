@@ -929,9 +929,10 @@ Stated so that nobody mistakes silence for coverage:
   [what the engine does not allocate](#what-the-engine-does-not-allocate) is the number. What
   is still structural is the *reasoning* — `bounded-decoding` proves the decoder is total and
   stays inside its input, and `crate-attributes` and `kernel-zero-dependencies` fail a build
-  over `extern crate alloc` and over a dependency of any kind. What is measured is two
-  workloads on a host. A path through engine code that neither workload takes is a path
-  nothing has watched allocate, which is the honest scope and is the next bullet.
+  over `extern crate alloc` and over a dependency of any kind. What is measured is four
+  workloads on a host, between them reaching every crate the gate holds at zero. A path
+  through engine code that none of them takes is a path nothing has watched allocate, which
+  is the honest scope and is the next bullet.
 - **Coverage of non-test code specifically.** llvm-cov instruments the test binary, so the
   85% floor is a floor on a diluted number. See
   [ADR 0001](docs/adr/0001-one-pipeline-table-and-a-per-crate-coverage-gate.md).
