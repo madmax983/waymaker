@@ -5,14 +5,15 @@
 //! identically". [`corpus/v1`](../tests/corpus/v1/README.md) is that corpus, and this file
 //! is what runs it.
 //!
-//! # What a corpus catches that nothing else here does
+//! # What a corpus catches that almost nothing else here does
 //!
 //! Every other test in this crate drives the encoder and the decoder together. A record
 //! kind renumbered, a field reordered, a checksum taken over the wrong range: each changes
 //! both sides at once, so every round trip still passes and every property still holds. The
 //! change is invisible until a device that shipped last year is asked to read a journal
-//! this firmware wrote. Bytes committed to the repository are the only thing that can
-//! notice, because they were written before the change.
+//! this firmware wrote. Bytes committed to the repository notice, because they were written
+//! before the change — and so does the `wire-format` gate rule, differently: the rule names
+//! the constant, these files hold the byte.
 //!
 //! `tests/frame.rs`'s golden frames make the same argument for nine records at one
 //! alignment each. This corpus is the wider claim: every record kind, four program

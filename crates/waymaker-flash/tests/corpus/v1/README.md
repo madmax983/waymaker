@@ -9,8 +9,9 @@ same bytes.
 Every other test in this crate drives the encoder and the decoder together, so a record kind
 renumbered or a field reordered changes both sides at once and every round trip still
 passes. The change is invisible until a device that shipped last year is asked to read a
-journal this firmware wrote. These bytes were written before the change, which is the only
-thing that can notice.
+journal this firmware wrote. These bytes were written before the change. They and the
+`wire-format` gate rule are the two things here that notice it, and they notice differently:
+the rule names the constant, the corpus holds the byte.
 
 ## How they were derived
 
