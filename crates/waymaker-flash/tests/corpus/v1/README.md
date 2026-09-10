@@ -16,9 +16,12 @@ thing that can notice.
 
 By an encoder written from the field list in
 [`docs/format/wire-format-v1.md`](../../../../../docs/format/wire-format-v1.md), separately
-from `waymaker-flash`, and cross-checked against `tests/frame.rs`'s golden frames — which
-that encoder reproduces byte for byte. A corpus produced by the code under test would prove
-only that the code agrees with itself.
+from `waymaker-flash`, and cross-checked against `tests/frame.rs`'s golden frames. One case
+is the artifact of that cross-check: `record-08-run-failed.bin` is byte-identical to
+`golden::RUN_FAILED`, and `the_corpus_agrees_with_the_golden_frame_it_overlaps` is what says
+so. The rest of the cross-check happened off-repo and left nothing behind, which is stated
+rather than implied. A corpus produced by the code under test would prove only that the code
+agrees with itself.
 
 ## The rule
 

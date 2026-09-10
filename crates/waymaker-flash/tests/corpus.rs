@@ -16,16 +16,20 @@
 //!
 //! `tests/frame.rs`'s golden frames make the same argument for nine records at one
 //! alignment each. This corpus is the wider claim: every record kind, four program
-//! granularities, a multi-record journal, the bank header and the generation seal — the
-//! whole of what a v1 device puts on media.
+//! granularities, a multi-record journal, the bank header and the generation seal, and six
+//! wide cases carrying a distinct non-zero byte in every position of every multi-byte field
+//! — the whole of what a v1 device puts on media, at widths the narrow cases cannot pin.
 //!
 //! # How the bytes were derived
 //!
 //! By an encoder written from the field list in
 //! [`docs/format/wire-format-v1.md`](../../../docs/format/wire-format-v1.md), separately
-//! from this crate, and cross-checked against `tests/frame.rs`'s golden frames — which the
-//! same encoder reproduces byte for byte. They are **frozen**: a case is added, never
-//! regenerated. See the corpus's own README.
+//! from this crate, and cross-checked against `tests/frame.rs`'s golden frames. One case is
+//! the artifact of that cross-check — `record-08-run-failed.bin` against
+//! `golden::RUN_FAILED` — and the rest of it left nothing behind. They are **frozen**: a
+//! case is added, never regenerated, and `docs::WIRE_FORMAT_CORPUS_FILES` pins every one by
+//! length and digest so that regenerating one is a line a reviewer sees. See the corpus's
+//! own README.
 //!
 //! # Every claim here is falsifiable
 //!

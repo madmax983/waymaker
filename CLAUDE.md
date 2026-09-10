@@ -2389,22 +2389,25 @@ did the bank header reader, so a fleet in a format transition could not be descr
 code at all. That last one is §08's `workflow_version` defect met one layer down, in the
 bytes rather than in the workflow, and ADR 0036 had already fixed it above.
 [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) is the format byte by byte;
-the corpus is fifteen files of frozen bytes produced by an encoder written from that field
-list rather than from `frame.rs` — cross-checked against `tests/frame.rs`'s golden frames,
-which it reproduces exactly — run as a CI stage of its own, because a red `corpus` says a
-byte a shipped device wrote is no longer a byte this firmware reads, which is the one failure
-here whose blast radius is a fleet rather than a branch. `frame::reads_format_version` is the
+the corpus is twenty-one files of frozen bytes produced by an encoder written from that
+field list rather than from `frame.rs` — six of them wide, carrying a distinct non-zero byte
+in every position of every multi-byte field, because the rest cannot say a width narrowed —
+run as a CI stage of its own, because a red `corpus` says a byte a shipped device wrote is no
+longer a byte this firmware reads, which is the one failure here whose blast radius is a
+fleet rather than a branch. `frame::reads_format_version` is the
 read set, both decoders take their answer from it, and each is held to it over all 256 values
 a version byte can hold. It costs **0 B** of code flash: the layers measure 12820 B of 13312,
 exactly where ADR 0036 left them. The `wire-format` rule is the third holder — the frozen
-constants, the record numbering in both directions, and the specification document — and it
+numbers, the record numbering in both directions, the specification document read a line at a
+time, and the corpus's own lengths and digests — and it
 was watched failing on every mutation its own test modules name, the sharpest being a
 renumbered `RUN_STARTED`, a kind added to the kernel that nothing wrote down, a regenerated
 corpus file, and the bank header reader reverted to the equality the predicate replaced —
 which review of this change ran with the whole workspace green before the routing pin
 existed. Migration is §10's swap
 and nothing new: a bank is single-version by construction, so read-old/write-new is what two
-banks already are, and step 5 is the format transition. What is owed is written down: the
+banks already are, and steps 5 and 6 are the format transition. What is owed is written
+down: the
 corpus is a cross-check between two implementations rather than a reading off a board;
 widening the read set is sound only while a version adds kinds and changes none, which no
 rule can tell; and a downgrade past a new record kind may reclaim a run, because recovery
