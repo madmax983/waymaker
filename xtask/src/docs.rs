@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use crate::Violation;
 use crate::policy::LAYERS;
-use crate::source::{enables_lint, inner_attributes, silences_lint};
+use crate::source::{enables_lint, silences_lint};
 
 /// Where the contributor-facing invariants live, relative to the workspace root.
 pub const CLAUDE_MD_PATH: &str = "CLAUDE.md";
@@ -2283,6 +2283,12 @@ fn check_adr_numbering(adrs: &[AdrFile]) -> Vec<Violation> {
 
 /// Rule: every ADR carries a title, a recognised status, a date, and the required
 /// sections.
+///
+/// Read through the Markdown parser (issues #51, #82): the title, fields, and headings
+/// are what renders, so a `# ` title, a `- Status:` line, or a `## Context` heading that
+/// only exists inside a fenced example satisfies nothing. HTML comments are stripped
+/// first — a title in a comment renders nothing — and the required fields keep their
+/// list-item shape through the parser.
 #[must_use]
 fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -2290,8 +2296,14 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
     for adr in adrs {
         // An ADR whose `- Status:` and `- Date:` sit inside an HTML comment renders with no
         // metadata at all, and every check below would otherwise find them.
-        let contents = without_html_comments(&adr.contents);
-        if !contents.lines().any(|line| line.starts_with("# ")) {
+        let prose = crate::parse::markdown_prose(
+            &without_html_comments(&adr.contents),
+            crate::parse::InlineCode::Drop,
+        );
+        // Any rendered line, as before: the rule is "every ADR carries a title", not
+        // "the title is the first thing in the file". A `# ` title inside a fenced
+        // example still satisfies nothing, because fences never reach the prose.
+        if !prose.lines().any(|line| line.starts_with("# ")) {
             violations.push(Violation::new(
                 "adr-structure",
                 adr.name.clone(),
@@ -2300,10 +2312,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for field in ADR_REQUIRED_FIELDS {
-            if !contents
-                .lines()
-                .any(|line| line.trim_start().starts_with(field))
-            {
+            if !prose.lines().any(|line| line.starts_with(field)) {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -2312,10 +2321,10 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
             }
         }
 
-        if let Some(status) = adr_status(&contents) {
-            // The template's placeholder is the one status that is allowed to be
-            // unrecognised, because the template records no decision.
-            let is_template = adr_number(&adr.name) == Some(0);
+        // The template's placeholder is the one status that is allowed to be
+        // unrecognised, because the template records no decision.
+        let is_template = adr_number(&adr.name) == Some(0);
+        if let Some(status) = adr_status(&prose) {
             if !is_template && !ADR_STATUSES.contains(&status.as_str()) {
                 violations.push(Violation::new(
                     "adr-structure",
@@ -2328,8 +2337,29 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
             }
         }
 
+        // A non-template ADR's date has to be a `YYYY-MM-DD` the index can sort, not just
+        // a non-empty line (issue #51e): `- Date:` with no value used to pass the
+        // `starts_with` presence check above, and `- Date: yesterday` passed it too.
+        if !is_template && prose.lines().any(|line| line.starts_with("- Date:")) {
+            let date = prose
+                .lines()
+                .find_map(|line| line.strip_prefix("- Date:"))
+                .unwrap_or_default()
+                .trim();
+            if !is_adr_date(date) {
+                violations.push(Violation::new(
+                    "adr-structure",
+                    adr.name.clone(),
+                    format!(
+                        "has no usable `- Date:`: `{date}` is not a `YYYY-MM-DD` the index \
+                         can sort"
+                    ),
+                ));
+            }
+        }
+
         for heading in ADR_REQUIRED_HEADINGS {
-            if !contents.lines().any(|line| line.trim_end() == *heading) {
+            if !prose.lines().any(|line| line.trim_end() == *heading) {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -2349,6 +2379,40 @@ fn adr_status(contents: &str) -> Option<String> {
         .map(str::trim_start)
         .find_map(|line| line.strip_prefix("- Status:"))
         .map(|status| status.trim().to_lowercase())
+}
+
+/// Whether `date` is a `YYYY-MM-DD` the ADR index can sort on.
+///
+/// Four digits, two digits, two digits, and a day that exists in that month — the index
+/// sorts dates as strings, so `2026-9-1` would order after `2026-10-01`, and `2026-02-30`
+/// would sort fine while naming no day at all.
+fn is_adr_date(date: &str) -> bool {
+    let mut parts = date.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    if !matches!(month, 1..=12) {
+        return false;
+    }
+    let days_in_month = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 /// Rule: the ADR index links every ADR, and links nothing that is not one.
@@ -2499,19 +2563,15 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
 
 /// Every `Settles deferred question:` claim in `contents`, in source order.
 ///
-/// `contents` is expected to have had its HTML comments and its fenced code blocks stripped
-/// already: a marker a reader cannot see claims nothing, and a marker inside a fence is an
-/// example of the syntax rather than a use of it — `docs/adr/README.md` contains exactly
-/// such an example. The id is the rest of the line, trimmed of whitespace and of the
+/// Parsed (issues #51, #82): [`crate::parse::claims_in`] reads the rendered prose, so a
+/// marker a reader cannot see claims nothing — neither the fenced example in
+/// `docs/adr/README.md` nor a marker inside an HTML comment, which the Markdown parser
+/// drops before prose is read. The call site strips HTML comments as well, from when the
+/// reader was textual; the id is the rest of the line, trimmed of whitespace and of the
 /// backticks a Markdown author naturally puts round an identifier.
 #[must_use]
-fn deferred_question_claims(contents: &str) -> Vec<&str> {
-    contents
-        .lines()
-        .filter_map(|line| line.split_once(DEFERRED_QUESTION_MARKER))
-        .map(|(_, rest)| rest.trim().trim_matches('`').trim())
-        .filter(|id| !id.is_empty())
-        .collect()
+fn deferred_question_claims(contents: &str) -> Vec<String> {
+    crate::parse::claims_in(contents, DEFERRED_QUESTION_MARKER)
 }
 
 /// The line an ADR carries when a board run has actually happened.
@@ -2608,13 +2668,13 @@ pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
 ];
 
 /// Every hardware target an ADR claims to have attested.
-fn hardware_attestation_claims(contents: &str) -> Vec<&str> {
-    contents
-        .lines()
-        .filter_map(|line| line.split_once(HARDWARE_ATTESTATION_MARKER))
-        .map(|(_, rest)| rest.trim().trim_matches('`').trim())
-        .filter(|id| !id.is_empty())
-        .collect()
+///
+/// Parsed (issues #51, #82): [`crate::parse::claims_in`] reads the rendered prose, so the
+/// marker syntax shown in a fenced example claims nothing, and neither does a marker
+/// inside an HTML comment — the Markdown parser drops HTML before prose is read, so the
+/// call sites pass raw ADR contents.
+fn hardware_attestation_claims(contents: &str) -> Vec<String> {
+    crate::parse::claims_in(contents, HARDWARE_ATTESTATION_MARKER)
 }
 
 /// Rule: the board runs rung 0.2 owes are written down, and none is claimed without evidence.
@@ -2639,7 +2699,11 @@ fn check_hardware_attestation(claude_md: Option<&str>, adrs: &[AdrFile]) -> Vec<
     for target in HARDWARE_TARGETS {
         let claiming: Vec<&AdrFile> = adrs
             .iter()
-            .filter(|adr| hardware_attestation_claims(&adr.contents).contains(&target.id))
+            .filter(|adr| {
+                hardware_attestation_claims(&adr.contents)
+                    .iter()
+                    .any(|claim| claim == target.id)
+            })
             .collect();
         match (target.attestation, claiming.as_slice()) {
             (Attestation::NotRun, []) | (Attestation::Passed, [_]) => {}
@@ -2968,31 +3032,14 @@ fn id_arms(source: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// Whether `source` declares a `fn name(` whose attribute block carries `#[test]` and
-/// neither `#[ignore` nor `#[cfg(`.
+/// Whether `contents` declares a `fn name` that is a test nothing can skip.
 ///
-/// The whole contiguous block of attributes above the `fn`, not the one line: `#[ignore]`
-/// above `#[test]` is a test nothing runs, and `#[cfg(any())]` above it is one nothing
-/// compiles.
-fn declares_test(source: &str, name: &str) -> bool {
-    let lines: Vec<&str> = source.lines().map(str::trim).collect();
-    lines.iter().enumerate().any(|(index, line)| {
-        if !line.starts_with(&format!("fn {name}(")) {
-            return false;
-        }
-        let attributes: Vec<&str> = lines
-            .get(..index)
-            .unwrap_or_default()
-            .iter()
-            .rev()
-            .take_while(|above| above.starts_with("#["))
-            .copied()
-            .collect();
-        attributes.contains(&"#[test]")
-            && !attributes
-                .iter()
-                .any(|above| above.starts_with("#[ignore") || above.starts_with("#[cfg("))
-    })
+/// Parsed with `syn` (issues #51, #97): [`crate::parse::declares_test`] reads the fn's
+/// own attributes, so `#[cfg_attr(.., ignore)]` disqualifies the way `#[cfg(..)]` does,
+/// and no comment, blank line, or doc attribute between the attributes and the `fn` can
+/// break the "attribute block" the old line scan reconstructed.
+fn declares_test(contents: &str, name: &str) -> bool {
+    crate::parse::declares_test(contents, name)
 }
 
 /// Whether the body of `fn name(` in `source` names `Row::variant`, as an identifier.
@@ -3100,7 +3147,10 @@ fn check_failure_rows_are_tested(
         Some(contents) => {
             let source = strip_rust_comments(contents);
             for row in FAILURE_ROWS {
-                if !declares_test(&source, row.model_test) {
+                // The test declaration is read from the raw file: `syn` sees comments
+                // and strings as what they are, so the comment stripping the old scan
+                // needed does not apply.
+                if !declares_test(contents, row.model_test) {
                     violations.push(Violation::new(
                         "failure-matrix",
                         row.id,
@@ -3137,7 +3187,7 @@ fn check_failure_rows_are_tested(
                 let Some(rig_test) = row.rig_test else {
                     continue;
                 };
-                if !declares_test(&source, rig_test) {
+                if !declares_test(contents, rig_test) {
                     violations.push(Violation::new(
                         "failure-matrix",
                         row.id,
@@ -3269,19 +3319,15 @@ fn check_failure_rows_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
 fn check_deferred_questions(claude_md: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
     // Every claim in the record, with the ADR that made it, so both directions below can be
     // answered from one pass.
-    let mut claims: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut claims: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     // Comments *and* fences. Codex raised the second on PR #58: an ADR that documents the
     // marker syntax in a fenced example would otherwise be read as claiming the question,
     // and — worse — an ADR that kept the example while losing its real marker would still
-    // satisfy the settled check. `check_adr_index` already reads documents this way.
+    // satisfy the settled check. The fences are dropped by the Markdown parser inside
+    // `deferred_question_claims`, which is the fix for issue #82.
     let stripped: Vec<(&str, String)> = adrs
         .iter()
-        .map(|adr| {
-            (
-                adr.name.as_str(),
-                without_fenced_code(&without_html_comments(&adr.contents)),
-            )
-        })
+        .map(|adr| (adr.name.as_str(), without_html_comments(&adr.contents)))
         .collect();
     for (name, contents) in &stripped {
         for id in deferred_question_claims(contents) {
@@ -3411,7 +3457,7 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
 #[must_use]
 fn check_questions_match_the_record(
     adrs: &[AdrFile],
-    claims: &BTreeMap<&str, Vec<&str>>,
+    claims: &BTreeMap<String, Vec<&str>>,
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
 
@@ -3684,7 +3730,13 @@ fn check_missing_docs(roots: &[CrateRoot]) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for root in roots {
-        let attributes = inner_attributes(&root.contents);
+        let attributes = crate::source::inner_attributes_or_violation(
+            &root.contents,
+            "missing-docs",
+            &root.package,
+            &root.path,
+            &mut violations,
+        );
         if !enables_lint(&attributes, MISSING_DOCS_LINT) {
             violations.push(Violation::new(
                 "missing-docs",
@@ -5448,6 +5500,102 @@ mod tests {
         assert!(
             violations.iter().any(|v| v.detail.contains("title")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn adr_structure_ignores_fenced_code() {
+        // Issue #51c: the structure scan read the raw file, so a `# ` title, a field
+        // line, or a `## ` heading that only existed inside a fenced example satisfied
+        // the rule while the document itself had none.
+        for fence in ["```", "~~~"] {
+            let contents = clean_adr("one")
+                .replace("# ADR: one\n", "")
+                .replace("- Status: accepted\n", "")
+                + &format!("\n{fence}text\n# ADR: one\n- Status: accepted\n{fence}\n");
+            let adrs = vec![AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents,
+            }];
+            let violations = check_adr_structure(&adrs);
+            assert!(
+                violations.iter().any(|v| v.detail.contains("title")),
+                "{fence}: a fenced title satisfied the rule: {violations:?}"
+            );
+            assert!(
+                violations.iter().any(|v| v.detail.contains("- Status:")),
+                "{fence}: a fenced field satisfied the rule: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_adr_date_is_reported() {
+        // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: clean_adr("one").replace("- Date: 2026-09-01", "- Date:"),
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("- Date:")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_adr_date_is_reported() {
+        // Issue #51e: a non-template ADR's date has to be a `YYYY-MM-DD` the index can
+        // sort, not just a non-empty line.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: clean_adr("one").replace("- Date: 2026-09-01", "- Date: yesterday"),
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("- Date:")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_attestation_marker_in_a_fenced_example_claims_nothing() {
+        // Issue #82: `hardware_attestation_claims` read raw lines, so the marker syntax
+        // shown in a fenced example counted as a claim.
+        let contents = format!(
+            "{}\n```text\n{HARDWARE_ATTESTATION_MARKER} `cortex-m0plus`\n```\n",
+            clean_adr("one")
+        );
+        assert!(
+            hardware_attestation_claims(&contents).is_empty(),
+            "a fenced example was read as a claim"
+        );
+    }
+
+    #[test]
+    fn an_attestation_marker_inside_an_html_comment_claims_nothing() {
+        // The call sites pass raw ADR contents: the Markdown parser drops HTML comments
+        // rather than rendering them, so a marker a reader cannot see is not a claim.
+        // This pins that rather than leaving it implied by the parser's `_ => {}` arm.
+        let contents = format!(
+            "{}\n<!--\n{HARDWARE_ATTESTATION_MARKER} `cortex-m0plus`\n-->\n",
+            clean_adr("one")
+        );
+        assert!(
+            hardware_attestation_claims(&contents).is_empty(),
+            "an HTML comment was read as a claim"
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_ignored_test_cannot_vouch_for_a_failure_matrix_row() {
+        // Issue #97: `declares_test` refused a test under a direct `#[ignore]` or
+        // `#[cfg(..)]` but not under `#[cfg_attr(.., ignore)]` — a test the compiler
+        // can skip vouched for a failure-matrix row.
+        let source = "#[test]\n#[cfg_attr(not(feature = \"x\"), ignore)]\nfn some_row_test() {}\n";
+        assert!(
+            !declares_test(source, "some_row_test"),
+            "a skippable test vouched for a row"
         );
     }
 

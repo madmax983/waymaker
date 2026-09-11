@@ -2562,19 +2562,28 @@ fn check_probe_source(source: Option<&str>) -> Vec<Violation> {
         )];
     };
 
-    let attributes = crate::source::inner_attributes(source);
+    let mut violations = Vec::new();
+    let attributes = crate::source::inner_attributes_or_violation(
+        source,
+        "size-probe",
+        PROBE_PACKAGE,
+        "src/main.rs",
+        &mut violations,
+    );
 
-    PROBE_REQUIRED_ATTRIBUTES
-        .iter()
-        .filter(|required| !attributes.iter().any(|line| line == *required))
-        .map(|required| {
-            Violation::new(
-                "size-probe",
-                PROBE_PACKAGE,
-                format!("src/main.rs is missing `{required}`"),
-            )
-        })
-        .collect()
+    violations.extend(
+        PROBE_REQUIRED_ATTRIBUTES
+            .iter()
+            .filter(|required| !attributes.iter().any(|line| line == *required))
+            .map(|required| {
+                Violation::new(
+                    "size-probe",
+                    PROBE_PACKAGE,
+                    format!("src/main.rs is missing `{required}`"),
+                )
+            }),
+    );
+    violations
 }
 
 /// One source file of a firmware layer, for the reach rule.
