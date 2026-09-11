@@ -34,6 +34,7 @@ pub mod elf;
 pub mod emulate;
 pub mod graph;
 pub mod manifest;
+pub mod parse;
 pub mod pipeline;
 pub mod policy;
 pub mod profile;

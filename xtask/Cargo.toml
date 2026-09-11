@@ -42,6 +42,19 @@ waymaker-embassy.workspace = true
 waymaker-conformance.workspace = true
 serde_json = "1"
 toml = "1"
+# Issue #51: the gate answers syntax questions, so it parses syntax. `syn` reads Rust
+# (attributes, `extern crate`, `use` aliases, item structure) and `pulldown-cmark` reads
+# Markdown (fenced code, claims), replacing the hand-rolled lexers that review kept
+# defeating with another spelling. Both are host-only: `default-members` keeps `xtask`
+# out of firmware-target builds, which cannot compile them.
+syn = { version = "2.0.119", features = ["full", "visit", "visit-mut"] }
+pulldown-cmark = { version = "0.13.3", default-features = false }
+# Only the Markdown parser is used (no HTML rendering, no CLI): default features would
+# pull `getopts` for the command-line binary, which this gate never runs.
+# Rendering a parsed attribute back to the whitespace-free text the old line scanner
+# produced (`#![forbid(unsafe_code)]`). Comes along with `syn`'s `printing` feature;
+# named here so the `use` is a direct dependency rather than a transitive accident.
+quote = "1"
 
 # The compile-fail test for the kernel-state assertion reads the budget from the crate
 # that declares it rather than restating the number it expects to be rejected.

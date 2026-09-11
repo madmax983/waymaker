@@ -48,12 +48,43 @@ pub const FORBIDDEN_EXTERN_CRATES: &[&str] = &["std", "alloc"];
 /// not — nothing about modelling media in a `Vec<u8>` needs it, and a harness the layers are
 /// tested against is the last place an unreviewed `unsafe` block should be able to appear.
 ///
+/// Reports every forbidden `extern crate` in `contents`.
+///
+/// `detail` is appended to the violation message: the firmware-target crates need the
+/// extra sentence about `--lib` never linking, the layer crates do not.
+fn check_forbidden_extern_crates(
+    contents: &str,
+    member: &str,
+    detail: &str,
+    violations: &mut Vec<Violation>,
+) {
+    for name in extern_crates_or_violation(
+        contents,
+        "crate-attributes",
+        member,
+        "src/lib.rs",
+        violations,
+    ) {
+        if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
+            violations.push(Violation::new(
+                "crate-attributes",
+                member,
+                format!(
+                    "src/lib.rs declares `extern crate {name};`, which puts back what \
+                     #![no_std] excludes{detail}"
+                ),
+            ));
+        }
+    }
+}
+
 /// The three in [`NO_STD_TEST_SUPPORT_CRATES`](crate::policy::NO_STD_TEST_SUPPORT_CRATES) do
-/// make the `#![no_std]` claim, and are held to it here. The firmware-target build stages
-/// cannot: `cargo build --lib` produces an rlib and never links, so no global allocator is
-/// required and an `extern crate alloc` under any of the three compiles clean. Issue #28's
-/// "no allocation" would otherwise be an inspection, which is the one thing this workspace
-/// says an invariant must never be.
+/// make the `#![no_std]` claim, and are held to it here.
+///
+/// The firmware-target build stages cannot: `cargo build --lib` produces an rlib and never
+/// links, so no global allocator is required and an `extern crate alloc` under any of the
+/// three compiles clean. Issue #28's "no allocation" would otherwise be an inspection,
+/// which is the one thing this workspace says an invariant must never be.
 #[must_use]
 pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -63,7 +94,13 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
             continue;
         };
 
-        let attributes = inner_attributes(source.contents);
+        let attributes = inner_attributes_or_violation(
+            source.contents,
+            "crate-attributes",
+            spec.name,
+            "src/lib.rs",
+            &mut violations,
+        );
         for required in REQUIRED_INNER_ATTRIBUTES {
             if !attributes.iter().any(|line| line == required) {
                 violations.push(Violation::new(
@@ -74,24 +111,20 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
             }
         }
 
-        for name in extern_crates(source.contents) {
-            if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
-                violations.push(Violation::new(
-                    "crate-attributes",
-                    spec.name,
-                    format!(
-                        "src/lib.rs declares `extern crate {name};`, which puts back what #![no_std] excludes"
-                    ),
-                ));
-            }
-        }
+        check_forbidden_extern_crates(source.contents, spec.name, "", &mut violations);
     }
 
     for member in crate::policy::NO_STD_TEST_SUPPORT_CRATES {
         let Some(source) = sources.iter().find(|source| &source.name == member) else {
             continue;
         };
-        let attributes = inner_attributes(source.contents);
+        let attributes = inner_attributes_or_violation(
+            source.contents,
+            "crate-attributes",
+            member,
+            "src/lib.rs",
+            &mut violations,
+        );
         if !attributes.iter().any(|line| line == "#![no_std]") {
             violations.push(Violation::new(
                 "crate-attributes",
@@ -100,26 +133,26 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
                  claims",
             ));
         }
-        for name in extern_crates(source.contents) {
-            if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
-                violations.push(Violation::new(
-                    "crate-attributes",
-                    *member,
-                    format!(
-                        "src/lib.rs declares `extern crate {name};`, which puts back what \
-                         #![no_std] excludes; the firmware-target build stage cannot catch \
-                         this, because `--lib` produces an rlib and never links"
-                    ),
-                ));
-            }
-        }
+        check_forbidden_extern_crates(
+            source.contents,
+            member,
+            "; the firmware-target build stage cannot catch this, because `--lib` produces \
+             an rlib and never links",
+            &mut violations,
+        );
     }
 
     for member in crate::policy::checked_members() {
         let Some(source) = sources.iter().find(|source| source.name == member) else {
             continue;
         };
-        let attributes = inner_attributes(source.contents);
+        let attributes = inner_attributes_or_violation(
+            source.contents,
+            "crate-attributes",
+            member,
+            "src/lib.rs",
+            &mut violations,
+        );
         if !attributes
             .iter()
             .any(|line| line == "#![forbid(unsafe_code)]")
@@ -142,87 +175,62 @@ pub fn check_crate_attributes(sources: &[CrateSource<'_>]) -> Vec<Violation> {
     violations
 }
 
-/// Collects the crate names in `extern crate <name>;` declarations, ignoring comments.
-fn extern_crates(contents: &str) -> Vec<String> {
-    contents.lines().filter_map(declared_extern_crate).collect()
+/// Collects the crate names in `extern crate <name>;` declarations.
+///
+/// Parsed with `syn` (issues #68/#90): `extern crate r#alloc;` reports `alloc` — a raw
+/// identifier is the same crate under a different hat — and visibility or attributes on
+/// the item ride on the item, not the name, so neither can hide the declaration.
+///
+/// A source the parser cannot read is an error, not an empty list: the callers fail
+/// closed on it.
+fn extern_crates(contents: &str) -> Result<Vec<String>, syn::Error> {
+    crate::parse::extern_crate_names(contents)
 }
 
-/// The crate `line` declares with `extern crate`, if it declares one.
-///
-/// Not `strip_prefix("extern crate ")` on the trimmed line, which is what this was and which
-/// Codex caught on pull request #66: `pub extern crate alloc;` is valid Rust — visibility on
-/// an `extern crate` re-exports the name — and rustfmt leaves it alone, so the scan read
-/// nothing and the decoder could allocate. `pub(crate)`, `pub(super)`, `pub(in path)` and a
-/// same-line `#[macro_use]` are the same evasion in four more spellings, and arbitrary
-/// whitespace between the keywords is a fifth.
-///
-/// So the line is tokenised rather than prefix-matched: attributes and visibility are
-/// stripped, then the first two tokens must be exactly `extern` and `crate`. A comment or a
-/// doc line keeps its marker as the first token and is therefore never mistaken for a
-/// declaration.
-fn declared_extern_crate(line: &str) -> Option<String> {
-    let rest = strip_visibility(strip_leading_attributes(line.trim()));
-    let mut tokens = rest.split_whitespace();
-    if tokens.next() != Some("extern") || tokens.next() != Some("crate") {
-        return None;
-    }
-    let name = tokens.next()?.trim_end_matches(';');
-    (!name.is_empty()).then(|| name.to_owned())
-}
-
-/// `line` with any `#[..]` or `#![..]` attributes at its start removed.
-fn strip_leading_attributes(line: &str) -> &str {
-    let mut rest = line;
-    loop {
-        let Some(after_hash) = rest.strip_prefix('#') else {
-            return rest;
-        };
-        let after_bang = after_hash.strip_prefix('!').unwrap_or(after_hash);
-        let Some(body) = after_bang.strip_prefix('[') else {
-            return rest;
-        };
-        // Nested brackets are possible — `#[cfg(all(a, b))]` has none, but `#[doc = "[x]"]`
-        // does — so the close is found by depth rather than by the first `]`.
-        let mut depth = 1_usize;
-        let mut end = None;
-        for (index, character) in body.char_indices() {
-            match character {
-                '[' => depth = depth.saturating_add(1),
-                ']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(index);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+/// [`crate::parse::struct_literal_counts`], failing closed: an unreadable file is reported
+/// rather than counted as zero, because a construction pin that cannot see is a pin that
+/// approves.
+fn struct_literal_counts_or_violation(
+    contents: &str,
+    name: &str,
+    inside: crate::parse::FnScope<'_>,
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    violations: &mut Vec<Violation>,
+) -> Option<crate::parse::LiteralCounts> {
+    match crate::parse::struct_literal_counts(contents, name, inside) {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            violations.push(Violation::new(
+                rule,
+                subject,
+                format!("{path} could not be parsed ({error}); an unreadable source fails closed"),
+            ));
+            None
         }
-        let Some(end) = end else { return rest };
-        let Some(after) = body.get(end.saturating_add(1)..) else {
-            return rest;
-        };
-        rest = after.trim_start();
     }
 }
 
-/// `line` with a leading visibility modifier removed.
-fn strip_visibility(line: &str) -> &str {
-    let Some(after_pub) = line.strip_prefix("pub") else {
-        return line;
-    };
-    // `pub` has to be a whole token: `public_thing` is not a visibility modifier.
-    match after_pub.chars().next() {
-        Some('(') => {
-            let Some(close) = after_pub.find(')') else {
-                return line;
-            };
-            after_pub
-                .get(close.saturating_add(1)..)
-                .map_or(line, str::trim_start)
+/// [`extern_crates`], failing closed: a source the parser cannot read is reported rather
+/// than treated as declaring nothing.
+fn extern_crates_or_violation(
+    contents: &str,
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    violations: &mut Vec<Violation>,
+) -> Vec<String> {
+    match extern_crates(contents) {
+        Ok(declared) => declared,
+        Err(error) => {
+            violations.push(Violation::new(
+                rule,
+                subject,
+                format!("{path} could not be parsed ({error}); an unreadable source fails closed"),
+            ));
+            Vec::new()
         }
-        Some(character) if character.is_whitespace() => after_pub.trim_start(),
-        _ => line,
     }
 }
 
@@ -253,7 +261,13 @@ pub fn check_layer_sources_are_bare_metal(sources: &[crate::size::LayerSource]) 
         if !covered {
             continue;
         }
-        for name in extern_crates(&source.contents) {
+        for name in extern_crates_or_violation(
+            &source.contents,
+            "crate-attributes",
+            &source.crate_name,
+            &source.path,
+            &mut violations,
+        ) {
             if FORBIDDEN_EXTERN_CRATES.contains(&name.as_str()) {
                 violations.push(Violation::new(
                     "crate-attributes",
@@ -362,23 +376,27 @@ mod bare_metal_tests {
 
     #[test]
     fn a_line_that_only_looks_like_a_declaration_is_not_one() {
-        for line in [
-            "/// extern crate alloc;",
-            "//! extern crate alloc;",
-            "// pub extern crate alloc;",
-            "/// `pub extern crate alloc;` is what this rule refuses",
-            "pub_extern_crate_alloc();",
-            "unsafe extern \"C\" { fn f(); }",
-            "let extern_crate_alloc = 1;",
+        // Each is a whole file now: `syn` fails closed on unreadable input, so a bare
+        // fragment would be reported as unparseable rather than as declaring nothing.
+        // The wrapping keeps what the test is about — none of these declares
+        // `extern crate` — while letting the parser read them.
+        for file in [
+            "/// extern crate alloc;\nfn f() {}\n",
+            "//! extern crate alloc;\nfn f() {}\n",
+            "// pub extern crate alloc;\n",
+            "/// `pub extern crate alloc;` is what this rule refuses\nfn f() {}\n",
+            "fn f() { pub_extern_crate_alloc(); }\n",
+            "unsafe extern \"C\" { fn f(); }\n",
+            "fn f() { let extern_crate_alloc = 1; }\n",
         ] {
             assert!(
                 check_layer_sources_are_bare_metal(&[source(
                     "waymaker-core",
                     "crates/waymaker-core/src/replay.rs",
-                    line,
+                    file,
                 )])
                 .is_empty(),
-                "`{line}` was mistaken for a declaration"
+                "`{file}` was mistaken for a declaration"
             );
         }
     }
@@ -457,142 +475,51 @@ pub const EVERY_WARNING: &str = "warnings";
 /// Formatting must not decide whether a rule passes, and the multi-line form is the
 /// interesting case rather than a tidiness one: `rustfmt` writes any attribute with a
 /// `reason =` across three lines, and a scanner that reads only the first of them sees
-/// `#![allow(` — a fragment that names no lint, so a crate can silence the very lint a
-/// rule is watching for while the rule reports nothing.
+/// The crate-root inner attributes of `contents`, in source order, as whitespace-free
+/// text (`#![forbid(unsafe_code)]`).
+///
+/// Parsed with `syn` (issue #51): only [`syn::File::attrs`] is read, so an attribute on a
+/// nested module cannot satisfy a crate-root rule, and strings are strings — a
+/// `reason = "/*"` cannot swallow the attribute that follows it (issue #108). The
+/// hand-written comment stripper this replaces is deleted with it.
 ///
 /// `pub(crate)` because [`crate::size::check_size_probe`] and [`crate::docs`] ask the same
-/// question of other crate roots. One scanner, so that the tests here — a commented-out
+/// question of other crate roots. One parser, so that the tests here — a commented-out
 /// attribute does not count, extra whitespace is tolerated, a bracket inside a string is
 /// not a bracket — are load-bearing for every rule rather than for whichever copy they
 /// happen to sit beside.
-pub(crate) fn inner_attributes(contents: &str) -> Vec<String> {
-    let mut attributes = Vec::new();
-    let mut open: Option<String> = None;
-    let mut comment_depth = 0u32;
-
-    for raw in contents.lines() {
-        let uncommented = strip_block_comments(raw, &mut comment_depth);
-        let line = uncommented.trim();
-        let code = strip_line_comment(line);
-        match open.as_mut() {
-            Some(buffer) => buffer.push_str(code),
-            None if code.starts_with("#![") => open = Some(code.to_owned()),
-            None => continue,
-        }
-        if open.as_deref().is_some_and(is_balanced) {
-            if let Some(buffer) = open.take() {
-                attributes.push(buffer.split_whitespace().collect());
-            }
-        }
-    }
-
-    // An attribute whose brackets never balance is scanned anyway rather than dropped: a
-    // rule that quietly forgot an attribute is a rule with a hole exactly where someone
-    // would put one.
-    if let Some(buffer) = open {
-        attributes.push(buffer.split_whitespace().collect());
-    }
-
-    attributes
-}
-
-/// `line` with any `/* ... */` comment removed, carrying the open depth across lines.
 ///
-/// A commented-out attribute must not count as present. `//` was already handled; a block
-/// comment was not, and commenting an attribute out with `/* */` is the more natural thing
-/// to do to three lines of it — which would leave the gate reading an attribute the
-/// compiler never sees.
+/// A root the parser cannot read is an error, not an empty list: the callers fail closed
+/// on it, because a rule that quietly forgot an attribute is a rule with a hole exactly
+/// where someone would put one.
+pub(crate) fn inner_attributes(contents: &str) -> Result<Vec<String>, syn::Error> {
+    crate::parse::inner_attributes(contents)
+}
+
+/// [`inner_attributes`], failing closed.
 ///
-/// A *depth*, not a flag: Rust nests block comments, so the `*/` that closes an inner one
-/// leaves the outer one open. A scanner that reopened there would read everything after the
-/// inner close as live code — which is where an attribute would most plausibly sit.
-fn strip_block_comments(line: &str, depth: &mut u32) -> String {
-    let mut kept = String::new();
-    let mut rest = line;
-    loop {
-        if *depth > 0 {
-            let open = rest.find("/*");
-            let close = rest.find("*/");
-            match (open, close) {
-                (Some(open), Some(close)) if open < close => {
-                    *depth = depth.saturating_add(1);
-                    rest = rest.get(open.saturating_add(2)..).unwrap_or_default();
-                }
-                (_, Some(close)) => {
-                    *depth = depth.saturating_sub(1);
-                    rest = rest.get(close.saturating_add(2)..).unwrap_or_default();
-                }
-                (Some(open), None) => {
-                    *depth = depth.saturating_add(1);
-                    rest = rest.get(open.saturating_add(2)..).unwrap_or_default();
-                }
-                (None, None) => return kept,
-            }
-            continue;
-        }
-        let Some((before, after)) = rest.split_once("/*") else {
-            kept.push_str(rest);
-            return kept;
-        };
-        kept.push_str(before);
-        // A space so that `a/*x*/b` does not become the identifier `ab`.
-        kept.push(' ');
-        rest = after;
-        *depth = 1;
-    }
-}
-
-/// `line` up to a `//` that is not inside a string literal.
-fn strip_line_comment(line: &str) -> &str {
-    let mut in_string = false;
-    let mut escaped = false;
-    let bytes = line.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                return line.get(..index).unwrap_or(line).trim_end();
-            }
-            _ => {}
+/// A crate root the parser cannot read is a crate root the gate cannot see: the failure
+/// is reported as its own violation and the attributes are treated as absent, so every
+/// "missing" check downstream fires too. `rule` and `subject` identify the check, `path`
+/// the root file.
+pub(crate) fn inner_attributes_or_violation(
+    contents: &str,
+    rule: &'static str,
+    subject: &str,
+    path: &str,
+    violations: &mut Vec<Violation>,
+) -> Vec<String> {
+    match inner_attributes(contents) {
+        Ok(attributes) => attributes,
+        Err(error) => {
+            violations.push(Violation::new(
+                rule,
+                subject,
+                format!("{path} could not be parsed ({error}); an unreadable root fails closed"),
+            ));
+            Vec::new()
         }
     }
-    line
-}
-
-/// Whether every bracket in `fragment` outside a string literal is closed.
-fn is_balanced(fragment: &str) -> bool {
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for byte in fragment.bytes() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'[' | b'(' => depth = depth.saturating_add(1),
-            b']' | b')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 /// Whether any of `attributes` turns `lint` on, unconditionally.
@@ -782,21 +709,41 @@ pub fn check_kernel_owns_no_encoding(sources: &[crate::size::LayerSource]) -> Ve
                 ));
             }
         }
-        let headers = impl_headers(&code);
-        for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
-            let needle = marker.replace(' ', "");
-            let implemented = headers.iter().any(|header| {
-                let header = erase_lifetimes(header).replace(' ', "");
-                implements_trait(&header, &needle)
-            });
-            if implemented {
+        // Trait implementations are read with `syn` (issues #51, #108): the trait path's
+        // final segment is the name whatever the qualifiers, and a `const C: char = 'a'`
+        // generic is a const argument — never a lifetime — because the parser reads the
+        // syntax instead of scanning for quotes.
+        match crate::parse::trait_impls(&source.contents) {
+            Ok(impls) => {
+                for marker in KERNEL_FORBIDDEN_IMPL_MARKERS {
+                    let needle = marker.replace(' ', "");
+                    let implemented = impls.iter().any(|implementation| {
+                        let Some(name) = implementation.trait_segments.last() else {
+                            return false;
+                        };
+                        format!("{name}{}", implementation.trait_generics) == needle
+                    });
+                    if implemented {
+                        violations.push(Violation::new(
+                            "kernel-owns-no-encoding",
+                            KERNEL,
+                            format!(
+                                "{} implements `{marker}`: a decoder needs no `pub fn` and no \
+                                 dependency, so this is how a serialization framework arrives in the \
+                                 kernel unnoticed",
+                                source.path
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
                 violations.push(Violation::new(
                     "kernel-owns-no-encoding",
                     KERNEL,
                     format!(
-                        "{} implements `{marker}`: a decoder needs no `pub fn` and no \
-                         dependency, so this is how a serialization framework arrives in the \
-                         kernel unnoticed",
+                        "{} does not parse ({error}): the encoding pin fails closed on \
+                         unreadable code",
                         source.path
                     ),
                 ));
@@ -1261,7 +1208,7 @@ pub fn check_timer_capability(
                 ));
             }
         }
-        violations.extend(check_clock_spec_construction(&code));
+        violations.extend(check_clock_spec_construction(&source.contents));
     }
 
     violations.extend(check_board_clocks(rig_sources));
@@ -1469,53 +1416,67 @@ fn module_constants(code: &str) -> Vec<String> {
 ///
 /// Both halves matter. A module that names none has a pin checking nothing; a module that
 /// names another has a downgrade in the file whose whole purpose is that there is not one.
-fn check_clock_spec_construction(code: &str) -> Vec<Violation> {
+/// Rule: the persistent-clock module builds exactly [`CLOCK_SPEC_CONSTRUCTION`].
+///
+/// `contents` is the raw file: `syn` reads comments and strings as what they are, and
+/// `#[cfg(test)]` items are skipped structurally, so the textual preprocessing the old
+/// scan needed does not apply.
+fn check_clock_spec_construction(contents: &str) -> Vec<Violation> {
     const RULE: &str = "timer-capability";
     const FACADE: &str = "waymaker-embassy";
     const SPEC: &str = "TimerSpec";
 
-    // Without the `use` declarations. An import names the type and constructs nothing, and a
-    // module that may name exactly one spec still has to import it.
-    let code: String = code
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("use "))
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let code = code.as_str();
+    // Alias-resolved (issue #99): `use TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;` followed
+    // by a construction through `PERSISTENT_SPEC` resolves to `TimerSpec::BEST_EFFORT`, so
+    // the pin sees the disallowed spec instead of reporting "names no `TimerSpec`".
+    // Import items themselves never count: an import names the type and constructs
+    // nothing, and a module that may name exactly one spec still has to import it.
+    let paths = match crate::parse::resolved_path_uses(contents) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                FACADE,
+                format!(
+                    "{CLOCK_CAPABILITY_PATH} could not be parsed ({error}); an unreadable \
+                     module fails closed"
+                ),
+            )];
+        }
+    };
 
     let mut violations = Vec::new();
     let mut named = 0_usize;
-    let continues = |character: char| character.is_alphanumeric() || character == '_';
 
-    for (index, _) in code.match_indices(SPEC) {
-        let is_identifier = code
-            .get(..index)
-            .and_then(|before| before.chars().next_back())
-            .is_none_or(|character| !continues(character));
-        if !is_identifier {
+    for path in &paths {
+        let segments = &path.segments;
+        if !segments.iter().any(|segment| segment == SPEC) {
             continue;
         }
         named = named.saturating_add(1);
-        let rest = code.get(index..).unwrap_or_default();
         // A prefix is not a match. Codex found `TimerSpec::AtPersistentTimeFallback`, which
         // `starts_with` accepts and which an associated constant in the kernel — invisible to
         // a method pin that reads `fn` — can define as the boot spec. The boundary is what
         // makes the pin a name rather than a prefix, exactly as `names_identifier` does.
-        let is_the_pinned_spec = rest.starts_with(CLOCK_SPEC_CONSTRUCTION)
-            && rest
-                .get(CLOCK_SPEC_CONSTRUCTION.len()..)
-                .and_then(|tail| tail.chars().next())
-                .is_none_or(|character| !continues(character));
+        // The boundary is what makes the pin a name rather than a prefix: the final
+        // two segments must be exactly `TimerSpec::AtPersistentTime`.
+        let is_the_pinned_spec = segments.len() >= 2
+            && segments
+                .get(segments.len().saturating_sub(2))
+                .is_some_and(|segment| segment == SPEC)
+            && segments
+                .get(segments.len().saturating_sub(1))
+                .is_some_and(|segment| segment == "AtPersistentTime");
         if !is_the_pinned_spec {
-            let quoted: String = rest.chars().take(48).collect();
             violations.push(Violation::new(
                 RULE,
                 FACADE,
                 format!(
                     "{CLOCK_CAPABILITY_PATH} names a `{SPEC}` other than \
-                     `{CLOCK_SPEC_CONSTRUCTION}`, at `{quoted}`; the persistent-clock module \
+                     `{CLOCK_SPEC_CONSTRUCTION}`, at `{}`; the persistent-clock module \
                      may reach exactly one spec, so an associated constant or any other \
-                     spelling cannot stand in for a boot deadline"
+                     spelling cannot stand in for a boot deadline",
+                    segments.join("::"),
                 ),
             ));
         }
@@ -2163,15 +2124,20 @@ pub fn check_commit_discipline(sources: &[crate::size::LayerSource]) -> Vec<Viol
 /// Split out because clippy's line budget refuses the two together, and because the surface
 /// half is a set comparison and this half is a shape: they fail for different reasons and a
 /// reader chasing one does not have to read the other.
-fn check_append_typestate(contents: &str) -> Vec<Violation> {
+/// The `staged` half of the append typestate: exactly one inherent `impl`, declaring
+/// only the barrier step, naming no `program`.
+///
+/// Returns the joined impl bodies for the caller, or `None` when there is no impl to
+/// check further (the violation is already recorded).
+fn check_staged_typestate(
+    code: &str,
+    staged: &str,
+    violations: &mut Vec<Violation>,
+) -> Option<String> {
     const RULE: &str = "commit-discipline";
     const ADAPTER: &str = "waymaker-flash";
 
-    let mut violations = Vec::new();
-    let code = without_test_modules(&code_only(contents));
-
-    let [staged, sealable] = APPEND_TYPESTATE;
-    let staged_impls = inherent_impl_bodies(&code, staged);
+    let staged_impls = inherent_impl_bodies(code, staged);
     if staged_impls.is_empty() {
         violations.push(Violation::new(
             RULE,
@@ -2181,7 +2147,7 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
                  state a frame body waits in is pinned against nothing"
             ),
         ));
-        return violations;
+        return None;
     }
     let staged_impl = staged_impls.join("\n");
 
@@ -2208,6 +2174,20 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
             ),
         ));
     }
+    Some(staged_impl)
+}
+
+fn check_append_typestate(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "commit-discipline";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    let code = without_test_modules(&code_only(contents));
+
+    let [staged, sealable] = APPEND_TYPESTATE;
+    let Some(_staged_impl) = check_staged_typestate(&code, staged, &mut violations) else {
+        return violations;
+    };
 
     let sealable_impls = inherent_impl_bodies(&code, sealable);
     if sealable_impls.is_empty() {
@@ -2236,21 +2216,35 @@ fn check_append_typestate(contents: &str) -> Vec<Violation> {
 
     // One construction, and it is the barrier's. A `Sealable { .. }` anywhere else is a
     // second route to the type that programs seals, and the `compile_fail` doctest in the
-    // crate would keep passing beside it.
-    let constructions = struct_literals(&code, sealable);
-    let barrier_body = braced_body(&code, &format!("fn {APPEND_BARRIER_STEP}"));
-    let in_barrier = barrier_body.map_or(0, |body| struct_literals(body, sealable));
-    if constructions == 0 || in_barrier == 0 || constructions != in_barrier {
-        violations.push(Violation::new(
-            RULE,
-            ADAPTER,
-            format!(
-                "`{sealable}` is constructed {constructions} time(s), {in_barrier} of them \
-                 inside `{APPEND_BARRIER_STEP}`: the only value that can program a commit \
-                 seal must come from the barrier and from nowhere else"
-            ),
-        ));
+    // crate would keep passing beside it. Counted structurally (issues #51, #99): a
+    // `use Sealable as S;` followed by `S { .. }` is still a construction of `Sealable`.
+    if let Some(counts) = struct_literal_counts_or_violation(
+        contents,
+        sealable,
+        crate::parse::FnScope::FirstFn(APPEND_BARRIER_STEP),
+        RULE,
+        ADAPTER,
+        APPEND_SURFACE_PATH,
+        &mut violations,
+    ) {
+        if counts.total == 0 || counts.inside == 0 || counts.total != counts.inside {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{sealable}` is constructed {total} time(s), {inside} of them \
+                     inside `{APPEND_BARRIER_STEP}`: the only value that can program a commit \
+                     seal must come from the barrier and from nowhere else",
+                    total = counts.total,
+                    inside = counts.inside,
+                ),
+            ));
+        }
     }
+    // The barrier call itself is still read textually: this is not a construction pin,
+    // and the family #51 closes is about syntax the text scans misread, not about
+    // whether a body calls a method.
+    let barrier_body = braced_body(&code, &format!("fn {APPEND_BARRIER_STEP}"));
     let takes_the_barrier = barrier_body.is_some_and(|body| {
         invocation(body, "storage.barrier") == Invocation::Once
             && squeezed(body).contains(&squeezed(APPEND_BARRIER_CALL))
@@ -2693,19 +2687,28 @@ fn check_swap_typestate(contents: &str) -> Vec<Violation> {
     }
 
     for (value, from) in SWAP_CONSTRUCTIONS {
-        let constructions = struct_literals(&code, value);
-        let inside = braced_body(&code, &format!("fn {from}"))
-            .map_or(0, |body| struct_literals(body, value));
-        if constructions == 0 || inside == 0 || constructions != inside {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "`{value}` is constructed {constructions} time(s), {inside} of them \
-                     inside `{from}`: the value that may take the step after a barrier has \
-                     to come from that barrier's own body and from nowhere else"
-                ),
-            ));
+        if let Some(counts) = struct_literal_counts_or_violation(
+            contents,
+            value,
+            crate::parse::FnScope::FirstFn(from),
+            RULE,
+            ADAPTER,
+            SWAP_SURFACE_PATH,
+            &mut violations,
+        ) {
+            if counts.total == 0 || counts.inside == 0 || counts.total != counts.inside {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{value}` is constructed {total} time(s), {inside} of them \
+                         inside `{from}`: the value that may take the step after a barrier has \
+                         to come from that barrier's own body and from nowhere else",
+                        total = counts.total,
+                        inside = counts.inside,
+                    ),
+                ));
+            }
         }
     }
 
@@ -3000,55 +3003,6 @@ fn implemented_type(header: &str) -> Option<String> {
         .take_while(|character| character.is_alphanumeric() || *character == '_')
         .collect();
     (!name.is_empty()).then_some(name)
-}
-
-/// How many times `code` builds a `name { .. }` struct literal.
-///
-/// A declaration is not one: `pub struct Sealable<..> {` and `impl<..> Sealable<..> {` both
-/// put an angle bracket between the name and the brace, and a return type puts a comma or a
-/// closing bracket there. Only a literal puts a brace directly after the name.
-fn struct_literal_positions(code: &str, name: &str) -> Vec<usize> {
-    let continues = |character: char| character.is_alphanumeric() || character == '_';
-
-    code.match_indices(name)
-        .filter(|(index, _)| {
-            let before = code.get(..*index).unwrap_or_default();
-            // A `:` *is* allowed to precede a construction, unlike in `invocation`:
-            // `self::Sealable { .. }` and `crate::append::Sealable { .. }` build the same
-            // value the bare name does, and review of this change found that rejecting them
-            // let a second construction be added by writing one extra path segment.
-            let before_is_boundary = before
-                .chars()
-                .next_back()
-                .is_none_or(|character| !continues(character));
-            // A declaration is not a construction, and a type with no generics puts the
-            // brace in the same place a literal does: `impl Sealable {` and
-            // `pub struct Sealable {` both have to be skipped by what line they are on.
-            let line = before.rsplit_once('\n').map_or(before, |(_, last)| last);
-            let declares = {
-                let start = line.trim_start();
-                start.starts_with("impl")
-                    || start.starts_with("struct")
-                    || start.starts_with("pub struct")
-                    || start.starts_with("pub(crate) struct")
-                    // `fn barrier(self) -> Sealable {` puts the brace exactly where a
-                    // literal does. What tells them apart is the arrow.
-                    || before.trim_end().ends_with("->")
-            };
-            let after_is_literal = code
-                .get(index.saturating_add(name.len())..)
-                .unwrap_or_default()
-                .trim_start()
-                .starts_with('{');
-            before_is_boundary && after_is_literal && !declares
-        })
-        .map(|(index, _)| index)
-        .collect()
-}
-
-/// How many times `name` is constructed in `code`.
-fn struct_literals(code: &str, name: &str) -> usize {
-    struct_literal_positions(code, name).len()
 }
 
 /// Whether `code` declares `header` as a struct with a braced body.
@@ -4849,7 +4803,7 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
     // default check whatever its caller asked for.
     let (digest, computed_with) = DIGEST_FUNCTION;
     violations.extend(used_call(
-        &code,
+        &source.contents,
         digest,
         computed_with,
         "so ADR 0011's digest is no longer the frame's own seal, and a scheduled effect \
@@ -4858,18 +4812,22 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
 
     let (step, walks_with) = SCAN_STEP;
     violations.extend(used_call(
-        &code,
+        &source.contents,
         step,
         walks_with,
         "so a scan verifies with whichever check the codec defaults to rather than the one \
          its caller asked for",
     ));
 
-    violations.extend(checksums_named_outside_the_digest(&code, &checksums));
+    violations.extend(checksums_named_outside_the_digest(
+        &code,
+        &source.contents,
+        &checksums,
+    ));
 
     for (function, verified_with) in [HEADER_STEP, FRAME_LEN_STEP] {
         violations.extend(used_call(
-            &code,
+            &source.contents,
             function,
             verified_with,
             "so a header's `payload_len` decides where a frame ends without the seal over it \
@@ -4891,7 +4849,13 @@ pub fn check_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec<Viol
 /// `input_digest` is the exception, and a named one rather than a habit: [`DIGEST_FUNCTION`]
 /// says which function it is and which checksum it may call, because a `const fn` cannot go
 /// through a trait method. `bank.rs` and `recovery.rs` have no exception at all.
-fn checksums_named_outside_the_digest(code: &str, checksums: &[&str]) -> Vec<Violation> {
+/// `code` is the comment-stripped file the file-wide scan reads; `contents` is the raw
+/// file the digest body's exemption is resolved from.
+fn checksums_named_outside_the_digest(
+    code: &str,
+    contents: &str,
+    checksums: &[&str],
+) -> Vec<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
@@ -4902,13 +4866,19 @@ fn checksums_named_outside_the_digest(code: &str, checksums: &[&str]) -> Vec<Vio
         .filter(|line| !line.trim_start().starts_with("use "))
         .collect::<Vec<&str>>()
         .join("\n");
-    let exempt = braced_body(&callable, &format!("fn {}", DIGEST_FUNCTION.0)).unwrap_or_default();
+    // The exemption is the resolved declaration's body, not the first textual match
+    // (issue #62): a decoy above the real `input_digest` would otherwise exempt the wrong
+    // body while `used_call` reports the duplication.
+    let exempt = crate::parse::fns_named(contents, DIGEST_FUNCTION.0)
+        .first()
+        .map(|function| function.body.clone())
+        .unwrap_or_default();
 
     checksums
         .iter()
         .filter_map(|checksum| {
             let outside =
-                count_tokens(&callable, checksum).saturating_sub(count_tokens(exempt, checksum));
+                count_tokens(&callable, checksum).saturating_sub(count_tokens(&exempt, checksum));
             (outside != 0).then(|| {
                 Violation::new(
                     RULE,
@@ -5308,36 +5278,48 @@ pub fn check_bank_integrity_routing(sources: &[crate::size::LayerSource]) -> Vec
     violations
 }
 
-/// Violations unless `function`'s body calls `callee` exactly once and uses the answer.
+/// Violations unless `name`'s body calls `callee` exactly once and uses the answer.
 ///
 /// The shape three of this rule's checks share, factored out after the third round of review
 /// found the same hole in each of them separately: a token count is satisfied by a mention,
 /// and counting calls is satisfied by a call whose answer is thrown away.
-fn used_call(code: &str, function: &str, callee: &str, consequence: &str) -> Vec<Violation> {
+///
+/// `contents` is the raw file: the declaration is resolved with `syn` (issue #62) — the
+/// old `braced_body` read the FIRST `fn name` the text scan found, so a decoy declaration
+/// above the real one decided the verdict while the real body drifted unexamined. No
+/// declaration and more than one are both reported; the one declaration's body is what the
+/// call check inspects.
+fn used_call(contents: &str, name: &str, callee: &str, consequence: &str) -> Vec<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
-    let Some(body) = braced_body(code, &format!("fn {function}")) else {
-        return vec![Violation::new(
-            RULE,
-            ADAPTER,
-            format!("{INTEGRITY_ROUTING_PATH} declares no `fn {function}`"),
-        )];
+    let found = crate::parse::fns_named(contents, name);
+    let [item] = found.as_slice() else {
+        let detail = if found.is_empty() {
+            format!("{INTEGRITY_ROUTING_PATH} declares no `fn {name}`")
+        } else {
+            format!(
+                "{INTEGRITY_ROUTING_PATH} declares `fn {name}` {} times, so a scan that reads \
+                 the first one is reading whichever a contributor put first; one declaration, \
+                 or the pin is a decoy away from meaning nothing",
+                found.len()
+            )
+        };
+        return vec![Violation::new(RULE, ADAPTER, detail)];
     };
 
-    match invocation(body, callee) {
+    match invocation(&item.body, callee) {
         Invocation::Once => Vec::new(),
         Invocation::Discarded => vec![Violation::new(
             RULE,
             ADAPTER,
-            format!("`{function}` calls `{callee}` and throws the answer away, {consequence}"),
+            format!("`{name}` calls `{callee}` and throws the answer away, {consequence}"),
         )],
         Invocation::Missing | Invocation::Repeated => vec![Violation::new(
             RULE,
             ADAPTER,
             format!(
-                "`{function}` does not call `{callee}` exactly once and use the answer, \
-                 {consequence}"
+                "`{name}` does not call `{callee}` exactly once and use the answer, {consequence}"
             ),
         )],
     }
@@ -6761,18 +6743,36 @@ pub fn check_ctx_facade(
         // And the future set, for the same reason: a fifth future whose `impl Future` lives
         // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
         // cannot see. Review of this change declared one in `dispatch.rs`.
-        for future in future_implementors(&code) {
-            if !CTX_FUTURES.contains(&future.as_str()) {
-                violations.push(Violation::new(
-                    RULE,
-                    FACADE,
-                    format!(
-                        "{path} implements `Future` for `{future}`, which `CTX_FUTURES` does \
-                         not name: a fifth thing a workflow can `.await` is a reviewer's \
-                         decision rather than a commit"
-                    ),
-                ));
+        //
+        // Parsed (issues #51, #109): the old line scan looked for `Future` in the `impl`
+        // header, so `use core::future::Future as Pollable; impl Pollable for Sneaky`
+        // never matched and a fifth awaitable went unreported. The trait resolves through
+        // `use` aliases; a file the parser cannot read is reported rather than skipped,
+        // because a fifth future in a file the gate cannot read is exactly what this pin
+        // is for.
+        match crate::parse::future_trait_implementors(&source.contents) {
+            Ok(implementors) => {
+                for future in implementors {
+                    if !CTX_FUTURES.contains(&future.as_str()) {
+                        violations.push(Violation::new(
+                            RULE,
+                            FACADE,
+                            format!(
+                                "{path} implements `Future` for `{future}`, which `CTX_FUTURES` \
+                                 does not name: a fifth thing a workflow can `.await` is a \
+                                 reviewer's decision rather than a commit"
+                            ),
+                        ));
+                    }
+                }
             }
+            Err(error) => violations.push(Violation::new(
+                RULE,
+                FACADE,
+                format!(
+                    "{path} does not parse, so its `Future` implementors cannot be checked: {error}"
+                ),
+            )),
         }
         // A scanner cannot expand a macro, so it refuses the construct — the answer
         // `effect-protocol` gives to a closure and a short-circuit.
@@ -7456,41 +7456,6 @@ fn check_facade_futures(
     violations
 }
 
-/// Every type the file implements `Future` for.
-///
-/// A line scan, like every other rule here: the header may be spelled `impl Future for X`,
-/// `impl core::future::Future for X` or with generics in between, and what is wanted is the
-/// self type. Generics on the type itself are dropped, so `ActivityFuture<'_, T, D, J>` is
-/// `ActivityFuture`.
-fn future_implementors(code: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    for line in code.lines() {
-        // Leading attributes first, for the reason every other classifier here sets them
-        // aside: `#[rustfmt::skip] impl Future for SignalFuture { .. }` is one line that
-        // `cargo fmt` preserves, and this was the third reader still reading past it. The
-        // `fn poll` count is `ctx.rs`'s alone, so a fifth future declared anywhere else in
-        // the crate rested on this scan. Codex round 4.
-        let trimmed = crate::size::without_leading_attributes(line.trim());
-        if !trimmed.starts_with("impl") {
-            continue;
-        }
-        let Some((before, after)) = trimmed.split_once(" for ") else {
-            continue;
-        };
-        if !names_identifier(before, "Future") {
-            continue;
-        }
-        let name: String = after
-            .chars()
-            .take_while(|character| character.is_alphanumeric() || *character == '_')
-            .collect();
-        if !name.is_empty() {
-            found.push(name);
-        }
-    }
-    found
-}
-
 /// A module that declares no `static`.
 ///
 /// `waymaker-embassy`'s must-not-own cell names hidden global state, and a `static` is what
@@ -7572,14 +7537,14 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
         return violations;
     };
     let code = without_test_modules(&code_only(&source.contents));
-    violations.extend(check_effect_types(&code));
-    violations.extend(check_effect_constructions(&code));
+    violations.extend(check_effect_types(&code, &source.contents));
+    violations.extend(check_effect_constructions(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
 
 /// The three types §07's protocol is made of, over one file's text.
-fn check_effect_types(code: &str) -> Vec<Violation> {
+fn check_effect_types(code: &str, contents: &str) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
     const DRIVER: &str = "waymaker-drive";
 
@@ -7655,14 +7620,22 @@ fn check_effect_types(code: &str) -> Vec<Violation> {
             ));
         }
 
-        violations.extend(check_effect_methods(code, type_name, methods));
+        violations.extend(check_effect_methods(code, contents, type_name, methods));
     }
 
     violations
 }
 
 /// One type's method set, read at every visibility, over one file's text.
-fn check_effect_methods(code: &str, type_name: &str, methods: &[&str]) -> Vec<Violation> {
+///
+/// `code` is the preprocessed text the textual scans read; `contents` is the raw file the
+/// structural scans parse.
+fn check_effect_methods(
+    code: &str,
+    contents: &str,
+    type_name: &str,
+    methods: &[&str],
+) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
     const DRIVER: &str = "waymaker-drive";
 
@@ -7707,37 +7680,68 @@ fn check_effect_methods(code: &str, type_name: &str, methods: &[&str]) -> Vec<Vi
             ),
         ));
     }
-    if EFFECT_NO_SELF_LITERAL.contains(&type_name) && struct_literals(&joined, "Self") != 0 {
-        violations.push(Violation::new(
+    if EFFECT_NO_SELF_LITERAL.contains(&type_name) {
+        // `Self { .. }` in the type's own `impl` blocks, counted structurally (issues
+        // #51, #99): the construction pin counts the type's name, so a `Self` literal is
+        // a proof of durable intent built where nothing can see it.
+        if let Some(counts) = struct_literal_counts_or_violation(
+            contents,
+            "Self",
+            crate::parse::FnScope::InherentImpls(type_name),
             RULE,
             DRIVER,
-            format!(
+            EFFECT_PROTOCOL_PATH,
+            &mut violations,
+        ) {
+            if counts.inside != 0 {
+                violations.push(Violation::new(
+                    RULE,
+                    DRIVER,
+                    format!(
                 "`{type_name}`'s own `impl` builds a `Self`: the construction pin counts the \
                  type's name, so a `Self {{ .. }}` is a proof of durable intent built where \
                  nothing can see it"
             ),
         ));
+            }
+        }
     }
     violations
 }
 
 /// Where a durable intent may be built, over one file's text.
-fn check_effect_constructions(code: &str) -> Vec<Violation> {
+fn check_effect_constructions(contents: &str) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
     const DRIVER: &str = "waymaker-drive";
 
     let mut violations = Vec::new();
     // Both bodies belong to `Effect`, and they are read out of its own `impl` blocks for
     // `EFFECT_STEP_BODIES`' reason: a free `fn schedule` above the real one is the body a
-    // first-match scan reads.
-    let owner = inherent_impl_bodies(code, "Effect").join("\n");
+    // first-match scan reads. The scope is structural now — inherent `impl Effect` blocks
+    // — but the reason is the same. Counted with `use` aliases resolved (issues #51, #99).
     for (value, bodies) in EFFECT_CONSTRUCTIONS {
-        let total = struct_literals(code, value);
+        let mut total = 0_usize;
         let mut inside = 0_usize;
+        let mut unreadable = false;
         for body in bodies {
-            let built = braced_body(&owner, &format!("fn {body}"))
-                .map_or(0, |text| struct_literals(text, value));
-            if built == 0 {
+            let Some(counts) = struct_literal_counts_or_violation(
+                contents,
+                value,
+                crate::parse::FnScope::InherentFns {
+                    ty: "Effect",
+                    name: body,
+                },
+                RULE,
+                DRIVER,
+                EFFECT_PROTOCOL_PATH,
+                &mut violations,
+            ) else {
+                unreadable = true;
+                break;
+            };
+            total = counts.total;
+            inside = inside.saturating_add(counts.inside);
+            if counts.inside == 0 {
                 violations.push(Violation::new(
                     RULE,
                     DRIVER,
@@ -7747,9 +7751,8 @@ fn check_effect_constructions(code: &str) -> Vec<Violation> {
                     ),
                 ));
             }
-            inside = inside.saturating_add(built);
         }
-        if total != inside {
+        if !unreadable && total != inside {
             violations.push(Violation::new(
                 RULE,
                 DRIVER,
@@ -8018,15 +8021,30 @@ pub fn check_kernel_boundary(
         return violations;
     };
 
-    // Without the test modules, for `integrity-check`'s reason: a decision named only under
-    // `#[cfg(test)]` discharges nothing about the code that ships.
-    let code = without_test_modules(&code_only(&source.contents));
+    // Parsed once (issues #51, #99): decisions match by path suffix with `use` aliases
+    // resolved, and the forbidden vocabulary matches any identifier — a binding, a
+    // declaration, or an import names the word as much as a path does. `#[cfg(test)]`
+    // items are skipped structurally, for `integrity-check`'s reason: a decision named
+    // only under `#[cfg(test)]` discharges nothing about the code that ships.
+    let uses = match crate::parse::name_uses(&source.contents) {
+        Ok(uses) => uses,
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{DRIVER_PATH} could not be parsed ({error}); an unreadable driver fails closed"
+                ),
+            ));
+            return violations;
+        }
+    };
     for decision in BOUNDARY_DECISIONS {
         // At a path boundary, like the forbidden half below. A `contains` is satisfied by a
         // longer path that ends in the same segments — a `SomeIntent::Finished` would vouch
         // for an `Intent::Finished` arm that is not there, and a pin that cannot fail is
         // worse than no pin because the report says it checked.
-        if !names_identifier(&code, decision) {
+        if !uses.names_decision(decision) {
             violations.push(Violation::new(
                 RULE,
                 DRIVER,
@@ -8038,7 +8056,7 @@ pub fn check_kernel_boundary(
         }
     }
     for (forbidden, why) in DRIVER_FORBIDDEN_VOCABULARY {
-        if names_identifier(&code, forbidden) {
+        if uses.names_word(forbidden) {
             violations.push(Violation::new(
                 RULE,
                 DRIVER,
@@ -8201,7 +8219,23 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     // The checksum module and anything it is split into. Codex asked for this on PR #58:
     // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
     // rule that read one file would have called it absent.
-    for scanned in checksum_sources(sources, &source.contents) {
+    let scanned_sources = match checksum_sources(sources, source) {
+        Ok(sources) => sources,
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH}'s module tree {error}: the table scan fails \
+                     closed on a tree it cannot walk honestly"
+                ),
+            ));
+            // The parent file's contents are known even when the tree is not: a
+            // missing child must not hide a table in the file that declares it.
+            vec![source]
+        }
+    };
+    for scanned in scanned_sources {
         let scanned_code = without_test_modules(&code_only(&scanned.contents));
         for name in array_items(&scanned_code) {
             violations.push(Violation::new(
@@ -8221,81 +8255,207 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     violations
 }
 
-/// The checksum module, plus every source under a `crc/` directory beside it, minus the
-/// ones the parent declares behind `#[cfg(test)]`.
+/// The checksum module, every file its module tree reaches, and every source under a
+/// `crc/` directory beside it — minus the ones the tree declares behind `#[cfg(test)]`.
 ///
 /// Splitting `crc.rs` into `crc/mod.rs` and `crc/table.rs` is an ordinary refactor and it is
 /// how a lookup table would arrive without this rule seeing it, so the scan follows the
-/// module rather than the file.
+/// module rather than the file — including production submodules the old `crc/` directory
+/// filter cannot see, like a table behind `#[path = "../tables/nibble.rs"]` (issue #59).
+/// The directory filter stays as well: a table introduced under `crc/` without a `mod`
+/// declaration pointing at it is still scanned.
 ///
 /// Moving the tests out to `crc/tests.rs` behind `#[cfg(test)] mod tests;` is an ordinary
 /// refactor too, and Codex pointed out on PR #58 that the first version of this punished it:
 /// the child file arrives without its parent's attribute, so the bit-flip sweep's
 /// `const MESSAGE: [u8; 12]` would have been reported as a production lookup table. A rule
 /// that rejects a test-only refactor is a rule contributors learn to work around.
-#[must_use]
 fn checksum_sources<'a>(
     sources: &'a [crate::size::LayerSource],
-    parent: &str,
-) -> Vec<&'a crate::size::LayerSource> {
+    parent: &'a crate::size::LayerSource,
+) -> Result<Vec<&'a crate::size::LayerSource>, ModuleTreeError> {
     let directory = INTEGRITY_CHECK_PATH.trim_end_matches(".rs");
-    let test_only = test_gated_modules(parent);
+    let (reachable, test_only) = module_tree(sources, parent)?;
 
-    sources
+    Ok(sources
         .iter()
         .filter(|source| {
             let path = source.path.replace('\\', "/");
+            if test_only.contains(&path) {
+                return false;
+            }
             if path.ends_with(INTEGRITY_CHECK_PATH) {
                 return true;
             }
-            if !path.contains(&format!("{directory}/")) {
-                return false;
+            // Recursively reachable through `mod` declarations (issue #59): a table in a
+            // production submodule the old directory filter cannot see.
+            if reachable.contains(&path) {
+                return true;
             }
-            // `crc/tests.rs` and `crc/tests/mod.rs` both belong to the module `tests`.
-            let stem = path
-                .rsplit_once(&format!("{directory}/"))
-                .map(|(_, tail)| tail)
-                .unwrap_or_default()
-                .trim_end_matches(".rs")
-                .trim_end_matches("/mod");
-            !test_only.iter().any(|name| name == stem)
+            // The old broad protection: a table introduced under `crc/` without a `mod`
+            // declaration pointing at it is still scanned.
+            path.contains(&format!("{directory}/"))
         })
-        .collect()
+        .collect::<Vec<_>>())
 }
 
-/// The names of modules `parent` declares out of line behind `#[cfg(test)]`.
+/// A module tree the walk cannot follow honestly (issue #59).
 ///
-/// Read from the raw text rather than from `code_only` output, because the attribute is what
-/// is being looked for and stripping comments cannot help with that: a `// #[cfg(test)]`
-/// line is prose, so the scan skips comment lines itself.
-#[must_use]
-fn test_gated_modules(parent: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut pending = false;
+/// Every variant fails the scan closed: a checksum that cannot see a file is a
+/// checksum that approves it unseen.
+#[derive(Debug)]
+enum ModuleTreeError {
+    /// A file in the tree does not parse as Rust.
+    Unparseable(syn::Error),
+    /// A `mod` declaration whose file is not among the scanned sources. The walk
+    /// cannot follow it, so it cannot claim to have scanned the tree.
+    Missing {
+        parent: String,
+        module: String,
+        candidates: Vec<String>,
+    },
+    /// A plain `mod name;` matching both `name.rs` and `name/mod.rs` among the
+    /// scanned sources. `rustc` rejects this, and the walk will not guess which file
+    /// the declaration meant.
+    Ambiguous {
+        parent: String,
+        module: String,
+        candidates: Vec<String>,
+    },
+}
 
-    for line in parent.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        if trimmed.contains("#[cfg(test)]") {
-            pending = true;
-        }
-        if !pending {
-            continue;
-        }
-        if let Some(rest) = trimmed.split_once("mod ").map(|(_, rest)| rest)
-            && let Some(name) = rest.strip_suffix(';')
-        {
-            names.push(name.trim().to_owned());
-            pending = false;
-        } else if trimmed.contains('{') || trimmed.ends_with(';') {
-            // Some other item took the attribute.
-            pending = false;
+impl std::fmt::Display for ModuleTreeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparseable(error) => write!(formatter, "does not parse ({error})"),
+            Self::Missing {
+                parent,
+                module,
+                candidates,
+            } => write!(
+                formatter,
+                "declares `mod {module};` in {parent} but none of {candidates:?} is \
+                 among the scanned sources"
+            ),
+            Self::Ambiguous {
+                parent,
+                module,
+                candidates,
+            } => write!(
+                formatter,
+                "declares `mod {module};` in {parent} matching more than one scanned \
+                 file ({candidates:?}); rustc rejects this, and the scan will not guess"
+            ),
         }
     }
+}
 
-    names
+impl From<syn::Error> for ModuleTreeError {
+    fn from(error: syn::Error) -> Self {
+        Self::Unparseable(error)
+    }
+}
+
+/// The scanned file `child` — declared in `parent_path` — resolves to (issue #59).
+///
+/// A `#[path]` attribute names exactly the file `rustc` reads: no natural-directory
+/// fallback is offered, because a fallback would scan a file the compiler never reads.
+/// A plain `mod name;` probes `name.rs` then `name/mod.rs`, in `rustc`'s order.
+///
+/// Both directions fail closed. A declaration with no matching scanned file is a module
+/// the walk cannot see, and a checksum that cannot see a file approves it unseen; a
+/// declaration matching two files is a tree `rustc` itself rejects, and silently taking
+/// the first would scan a tree the compiler never builds.
+///
+/// # Errors
+///
+/// Returns [`ModuleTreeError::Missing`] when no candidate is among `sources`, and
+/// [`ModuleTreeError::Ambiguous`] when more than one is.
+fn resolve_child(
+    sources: &[crate::size::LayerSource],
+    parent_path: &str,
+    child: &crate::parse::ChildModule,
+) -> Result<String, ModuleTreeError> {
+    let present: Vec<&str> = child
+        .candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|candidate| {
+            sources
+                .iter()
+                .any(|source| source.path.replace('\\', "/") == *candidate)
+        })
+        .collect();
+    match present.as_slice() {
+        [single] => Ok((*single).to_owned()),
+        [] => Err(ModuleTreeError::Missing {
+            parent: parent_path.to_owned(),
+            module: child.name.clone(),
+            candidates: child.candidates.clone(),
+        }),
+        _ => Err(ModuleTreeError::Ambiguous {
+            parent: parent_path.to_owned(),
+            module: child.name.clone(),
+            candidates: present.iter().map(ToString::to_string).collect(),
+        }),
+    }
+}
+
+/// The module tree rooted at `root`: every file it reaches at production gating through
+/// out-of-line `mod` declarations, and which of the reached files are test-only.
+///
+/// Walks the tree from `root`: a `mod` declaration carrying exactly `#[cfg(test)]` marks
+/// the file it resolves to test-only — honouring `#[path = "..."]` — and the marking is
+/// inherited by everything the test-only file declares in turn, because `rustc` compiles
+/// the whole subtree under the gate. The marking comes from each declaration (issue
+/// #59): the old code guessed the file name from the module name, so `#[cfg(test)]
+/// #[path = "tbl.rs"] mod table;` never matched `tbl.rs` and the test-only file's arrays
+/// were scanned as shipped lookup tables.
+///
+/// A file reached both through a test gate and through production counts as production:
+/// test-only is test-reachable minus production-reachable, computed from both visits,
+/// so the answer does not depend on which route the walk happens to take first.
+///
+/// Resolution fails closed (see [`resolve_child`]): a declaration the walk cannot match
+/// to exactly one scanned file is a tree the scan cannot honestly claim to have walked.
+///
+/// Paths use `/` separators, the way the scan compares them.
+fn module_tree(
+    sources: &[crate::size::LayerSource],
+    root: &crate::size::LayerSource,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), ModuleTreeError> {
+    let mut production_reachable = BTreeSet::new();
+    let mut test_reachable = BTreeSet::new();
+    // `(path, test_gated)`: each file is walked once per gating, so a file reached
+    // both ways is walked both ways and the set difference below decides.
+    let mut visited: BTreeSet<(String, bool)> = BTreeSet::new();
+    let mut stack = vec![(root.path.replace('\\', "/"), false)];
+    while let Some((path, test_gated)) = stack.pop() {
+        if !visited.insert((path.clone(), test_gated)) {
+            continue;
+        }
+        if test_gated {
+            test_reachable.insert(path.clone());
+        } else {
+            production_reachable.insert(path.clone());
+        }
+        let Some(contents) = sources
+            .iter()
+            .find(|source| source.path.replace('\\', "/") == path)
+            .map(|source| source.contents.as_str())
+        else {
+            continue;
+        };
+        for child in crate::parse::child_modules(&path, contents)? {
+            let resolved = resolve_child(sources, &path, &child)?;
+            stack.push((resolved, test_gated || child.test_gated));
+        }
+    }
+    let test_only: BTreeSet<String> = test_reachable
+        .difference(&production_reachable)
+        .cloned()
+        .collect();
+    Ok((production_reachable, test_only))
 }
 
 /// How many times `code` contains `token` as a whole token.
@@ -8342,8 +8502,8 @@ fn find_source<'a>(
 /// `split_once("EffectScheduled")` was satisfied by an `EffectScheduledV1` variant declared
 /// above it, so the pin read the decoy's field list and the real variant grew a fifth field
 /// unseen. The same held one level up for an `enum RecordRefV2`. This module had already
-/// settled the convention — `impl_headers` checks a boundary, with a test that says so —
-/// and the pin was not following it.
+/// settled the convention — trait implementations are read with `syn`, which checks a
+/// boundary by construction, with a test that says so — and the pin was not following it.
 ///
 /// Returns `None` when `header` is absent at a boundary, or opens no brace that closes
 /// before the end of the input, so a caller that cannot find what it pins reports that
@@ -8778,48 +8938,6 @@ fn check_pinned_surface(
     }
     violations
 }
-
-/// Whether `line` — an `impl` header with its whitespace and lifetimes already removed —
-/// implements exactly the trait `needle`.
-///
-/// Matched against the *start* of the trait position rather than anywhere in the line, for
-/// two reasons. `TryFrom<&[u8]>` contains `From<&[u8]>`, so a substring test reports one
-/// `impl` as two violations and tells a reader that a single line broke two rules — which is
-/// the kind of noise that gets a gate switched off. And a trait named in a `where` clause or
-/// a doc link is not an implementation of it.
-fn implements_trait(line: &str, needle: &str) -> bool {
-    let Some(rest) = line.strip_prefix("impl") else {
-        return false;
-    };
-    // An optional generic parameter list sits between `impl` and the trait. Skipped by
-    // depth rather than by finding the first `>`, so that `impl<T:Into<u8>>` does not stop
-    // at the inner one.
-    let after_generics = if rest.starts_with('<') {
-        let mut depth = 0_usize;
-        let mut end = None;
-        for (index, character) in rest.char_indices() {
-            match character {
-                '<' => depth = depth.saturating_add(1),
-                '>' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(index.saturating_add(1));
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match end.and_then(|at| rest.get(at..)) {
-            Some(after) => after,
-            None => return false,
-        }
-    } else {
-        rest
-    };
-    strip_path_qualifiers(after_generics).starts_with(needle)
-}
-
 /// The code in `contents`, with every comment and every literal's contents blanked out.
 ///
 /// One pass, character by character, tracking whether it is inside a line comment, a block
@@ -8991,71 +9109,6 @@ fn character_literal_end(source: &[char], mut at: usize) -> usize {
         }
     }
     at
-}
-
-/// Every `impl` header in `code`, flattened to one line each.
-///
-/// `rustfmt` breaks a long header across lines — `impl<'a>` on one and
-/// `TryFrom<&'a [u8]> for RecordRef<'a>` on the next — and a scan that looked at lines
-/// individually would find no line carrying both `impl` and the trait. So the whole file is
-/// flattened first and each header is taken from its `impl` token to the `{` or `;` that
-/// ends it. Ordinary formatting cannot hide a header from this.
-fn impl_headers(code: &str) -> Vec<String> {
-    let flattened = code.split_whitespace().collect::<Vec<&str>>().join(" ");
-    let mut headers = Vec::new();
-    let mut rest = flattened.as_str();
-
-    while let Some(at) = rest.find("impl") {
-        let preceded_by_identifier = rest
-            .get(..at)
-            .and_then(|before| before.chars().next_back())
-            .is_some_and(|character| character.is_alphanumeric() || character == '_');
-        let from_impl = rest.get(at..).unwrap_or_default();
-        if !preceded_by_identifier {
-            let brace = from_impl.find('{').unwrap_or(from_impl.len());
-            let end = from_impl.find(';').map_or(brace, |semi| semi.min(brace));
-            headers.push(from_impl.get(..end).unwrap_or_default().to_owned());
-        }
-        rest = from_impl.get("impl".len()..).unwrap_or_default();
-    }
-    headers
-}
-
-/// Path qualifiers that a trait may be written with and that mean nothing to this scan.
-///
-/// `impl core::convert::TryFrom<&[u8]> for RecordRef<'_>` is the ordinary fully qualified
-/// spelling of the very thing the rule rejects, and a bare `starts_with` would not see it.
-const TRAIT_PATH_PREFIXES: &[&str] = &["::", "core::", "std::", "convert::"];
-
-/// Drops leading path qualification from a whitespace-free trait position.
-fn strip_path_qualifiers(mut trait_position: &str) -> &str {
-    let mut stripped = true;
-    while stripped {
-        stripped = false;
-        for prefix in TRAIT_PATH_PREFIXES {
-            if let Some(rest) = trait_position.strip_prefix(prefix) {
-                trait_position = rest;
-                stripped = true;
-            }
-        }
-    }
-    trait_position
-}
-
-/// Removes `'a`-style lifetimes so an `impl` header can be matched without them.
-fn erase_lifetimes(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(at) = rest.find('\'') {
-        out.push_str(rest.get(..at).unwrap_or_default());
-        let after = rest.get(at.saturating_add(1)..).unwrap_or_default();
-        let end = after
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(after.len());
-        rest = after.get(end..).unwrap_or_default();
-    }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
@@ -9426,13 +9479,81 @@ mod tests {
     }
 
     #[test]
+    fn an_attribute_on_a_nested_module_does_not_satisfy_the_crate_rule() {
+        // Issue #51: the line scan read every line starting with `#![`, so a
+        // `#![forbid(unsafe_code)]` on a nested module satisfied the crate-root rule
+        // while the crate itself allowed unsafe code.
+        let nested = "#![no_std]\nmod inner {\n    #![forbid(unsafe_code)]\n}\n";
+        let violations = check_crate_attributes(&sources("waymaker-core", nested));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("missing") && v.detail.contains("forbid(unsafe_code)")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_reason_string_containing_a_comment_opener_does_not_hide_an_allow() {
+        // Issue #108: the hand-written block-comment stripper saw the `/*` inside
+        // `reason = "/*"` and swallowed the rest of the attribute, so the `allow`
+        // vanished from the gate's view instead of being reported.
+        let sneaky =
+            "#![no_std]\n#![forbid(unsafe_code)]\n#![allow(unsafe_code, reason = \"/*\")]\n";
+        let violations = check_crate_attributes(&sources("waymaker-core", sneaky));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("allows unsafe")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn raw_strings_in_an_attribute_do_not_swallow_the_next_one() {
+        // Issue #108: the old stripper toggled "in string" on every `"`, so a raw string
+        // holding an odd number of quotes left it inside the string, `is_balanced` never
+        // saw the closing `]`, and the `allow` merged into the attribute before it and
+        // vanished from the gate's view. `r"/*"` broke the same way through the
+        // block-comment stripper, which had no string awareness at all.
+        let mut blind = Vec::new();
+        for reason in ["r\"/*\"", "r#\"a\"b\"#", "r##\"a\"b\"##"] {
+            let sneaky = format!(
+                "#![no_std]\n#![forbid(unsafe_code)]\n#![allow(unsafe_code, reason = {reason})]\n"
+            );
+            let violations = check_crate_attributes(&sources("waymaker-core", &sneaky));
+            if !violations
+                .iter()
+                .any(|v| v.detail.contains("allows unsafe"))
+            {
+                blind.push(reason);
+            }
+        }
+        assert!(blind.is_empty(), "the gate went blind on: {blind:?}");
+    }
+
+    #[test]
+    fn a_raw_identifier_extern_crate_is_detected() {
+        // Issues #68/#90: `extern crate r#alloc;` is the same crate under a raw
+        // identifier, and the line tokenizer never learned that spelling.
+        let source = "#![no_std]\n#![forbid(unsafe_code)]\nextern crate r#alloc;\n";
+        let violations = check_crate_attributes(&sources("waymaker-core", source));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("extern crate alloc")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_multiline_attribute_is_read_as_one_attribute() {
         // Rust accepts an attribute split over several lines, and a line-oriented scan
         // reads only `#![allow(` — which is how a crate silences a lint the gate is
         // watching for while the gate reports nothing.
         let split = "#![no_std]\n#![forbid(\n    unsafe_code\n)]\n";
         assert_eq!(
-            inner_attributes(split),
+            inner_attributes(split).expect("the fixture parses"),
             ["#![no_std]", "#![forbid(unsafe_code)]"]
         );
     }
@@ -9457,44 +9578,52 @@ mod tests {
 
     #[test]
     fn expecting_a_lint_silences_it_just_as_allowing_it_does() {
-        let attributes = inner_attributes("#![expect(missing_docs)]\n");
+        let attributes =
+            inner_attributes("#![expect(missing_docs)]\n").expect("the fixture parses");
         assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn allowing_every_warning_silences_a_lint_by_name() {
-        let attributes = inner_attributes("#![allow(warnings)]\n");
+        let attributes = inner_attributes("#![allow(warnings)]\n").expect("the fixture parses");
         assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn a_lint_whose_name_merely_starts_with_another_is_not_confused_for_it() {
-        let attributes = inner_attributes("#![allow(missing_docs_in_private_items)]\n");
+        let attributes = inner_attributes("#![allow(missing_docs_in_private_items)]\n")
+            .expect("the fixture parses");
         assert!(!silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn a_lint_named_inside_a_nested_group_is_found() {
-        let attributes = inner_attributes("#![allow(unused, clippy::pedantic, missing_docs)]\n");
+        let attributes = inner_attributes("#![allow(unused, clippy::pedantic, missing_docs)]\n")
+            .expect("the fixture parses");
         assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn warning_on_a_lint_does_not_silence_it() {
-        let attributes = inner_attributes("#![warn(missing_docs)]\n");
+        let attributes = inner_attributes("#![warn(missing_docs)]\n").expect("the fixture parses");
         assert!(!silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn a_lint_name_ending_in_allow_is_not_a_silencing_level() {
-        let attributes = inner_attributes("#![deny(clippy::disallow(missing_docs))]\n");
+        let attributes = inner_attributes("#![deny(clippy::disallow(missing_docs))]\n")
+            .expect("the fixture parses");
         assert!(!silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn a_bracket_inside_a_string_does_not_swallow_the_next_attribute() {
         let quoted = "#![allow(dead_code, reason = \"a ) in a string\")]\n#![no_std]\n";
-        assert!(inner_attributes(quoted).contains(&"#![no_std]".to_owned()));
+        assert!(
+            inner_attributes(quoted)
+                .expect("the fixture parses")
+                .contains(&"#![no_std]".to_owned())
+        );
     }
 
     #[test]
@@ -9515,7 +9644,10 @@ mod tests {
         // Rust nests block comments. A scanner tracking a boolean rather than a depth
         // reopens at the inner `*/`, and reads the attribute below it as live code.
         let nested = "/* off:\n/* note */\n#![warn(missing_docs)]\n*/\n#![no_std]\n";
-        assert_eq!(inner_attributes(nested), ["#![no_std]"]);
+        assert_eq!(
+            inner_attributes(nested).expect("the fixture parses"),
+            ["#![no_std]"]
+        );
     }
 
     #[test]
@@ -9526,20 +9658,23 @@ mod tests {
 
     #[test]
     fn a_lint_silenced_through_cfg_attr_is_found() {
-        let attributes = inner_attributes("#![cfg_attr(all(), allow(missing_docs))]\n");
+        let attributes = inner_attributes("#![cfg_attr(all(), allow(missing_docs))]\n")
+            .expect("the fixture parses");
         assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn a_lint_enabled_alongside_another_in_one_attribute_is_found() {
-        let attributes = inner_attributes("#![warn(missing_docs, unreachable_pub)]\n");
+        let attributes = inner_attributes("#![warn(missing_docs, unreachable_pub)]\n")
+            .expect("the fixture parses");
         assert!(enables_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn denying_and_forbidding_also_enable_a_lint() {
         for level in ["deny", "forbid"] {
-            let attributes = inner_attributes(&format!("#![{level}(missing_docs)]\n"));
+            let attributes = inner_attributes(&format!("#![{level}(missing_docs)]\n"))
+                .expect("the fixture parses");
             assert!(enables_lint(&attributes, "missing_docs"), "{level}");
         }
     }
@@ -9547,7 +9682,7 @@ mod tests {
     #[test]
     fn warning_on_every_warning_does_not_enable_an_allow_by_default_lint() {
         // `missing_docs` is allow-by-default, so it is not one of the `warnings`.
-        let attributes = inner_attributes("#![warn(warnings)]\n");
+        let attributes = inner_attributes("#![warn(warnings)]\n").expect("the fixture parses");
         assert!(!enables_lint(&attributes, "missing_docs"));
     }
 
@@ -9555,7 +9690,8 @@ mod tests {
     fn a_lint_enabled_only_under_a_cfg_predicate_does_not_count_as_enabled() {
         // `any()` is false, so rustc applies no attribute at all — but the lint name is
         // right there in the file for a scanner that flattens `cfg_attr`.
-        let attributes = inner_attributes("#![cfg_attr(any(), warn(missing_docs))]\n");
+        let attributes = inner_attributes("#![cfg_attr(any(), warn(missing_docs))]\n")
+            .expect("the fixture parses");
         assert!(!enables_lint(&attributes, "missing_docs"));
     }
 
@@ -9563,13 +9699,14 @@ mod tests {
     fn a_lint_silenced_only_under_a_cfg_predicate_still_counts_as_silenced() {
         // The opposite answer to the test above, on purpose: each direction takes the one
         // that fails closed.
-        let attributes = inner_attributes("#![cfg_attr(any(), allow(missing_docs))]\n");
+        let attributes = inner_attributes("#![cfg_attr(any(), allow(missing_docs))]\n")
+            .expect("the fixture parses");
         assert!(silences_lint(&attributes, "missing_docs"));
     }
 
     #[test]
     fn allowing_a_lint_does_not_enable_it() {
-        let attributes = inner_attributes("#![allow(missing_docs)]\n");
+        let attributes = inner_attributes("#![allow(missing_docs)]\n").expect("the fixture parses");
         assert!(!enables_lint(&attributes, "missing_docs"));
     }
 
@@ -10261,21 +10398,6 @@ mod tests {
     }
 
     #[test]
-    fn an_impl_that_is_not_at_a_token_boundary_is_not_an_impl() {
-        // `impl_headers` scans a flattened file, so it has to tell the keyword from a word
-        // that ends in it.
-        let headers = impl_headers("fn reimpl() {} impl Foo for Bar {}");
-        assert_eq!(headers, ["impl Foo for Bar "]);
-        assert!(impl_headers("struct NoImplHere;").is_empty());
-        // A header ended by `;` rather than `{` — a trait impl cannot be written that way,
-        // but the scan must not swallow the rest of the file looking for a brace.
-        assert_eq!(
-            impl_headers("impl Foo for Bar; fn f() {}"),
-            ["impl Foo for Bar"]
-        );
-    }
-
-    #[test]
     fn a_conversion_outside_the_kernel_is_not_the_kernels_problem() {
         // `waymaker-flash` owns the wire format, so `from_le_bytes` is what it is *for*.
         let adapter = vec![crate::size::LayerSource {
@@ -10307,36 +10429,31 @@ mod tests {
         // switched off.
         let source = kernel_source("impl TryFrom<&[u8]> for RecordKind {}\n");
         assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
-        assert!(implements_trait("implTryFrom<&[u8]>forT", "TryFrom<&[u8]>"));
-        assert!(!implements_trait("implTryFrom<&[u8]>forT", "From<&[u8]>"));
-        assert!(implements_trait("implFrom<&[u8]>forT", "From<&[u8]>"));
-        // A generic parameter list is skipped by depth, so a nested `>` does not end it.
-        assert!(implements_trait(
-            "impl<T:Into<u8>>From<&[u8]>forT",
-            "From<&[u8]>"
-        ));
-        assert!(implements_trait(
-            "impl<>TryFrom<&[u8]>forT",
-            "TryFrom<&[u8]>"
-        ));
-        // A trait named anywhere but the trait position is not an implementation of it.
-        assert!(!implements_trait(
-            "implTforUwhereT:From<&[u8]>",
-            "From<&[u8]>"
-        ));
-        assert!(!implements_trait("fnf()->From<&[u8]>", "From<&[u8]>"));
-        // An unbalanced header is not credited as an impl of anything.
-        assert!(!implements_trait("impl<T", "From<&[u8]>"));
+        // A from-impl is still exactly one violation, not two.
+        let source = kernel_source("impl From<&[u8]> for RecordKind {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
     }
 
     #[test]
-    fn lifetimes_are_erased_without_losing_the_rest_of_the_line() {
-        assert_eq!(
-            erase_lifetimes("impl<'a> Foo<&'a [u8]> for Bar"),
-            "impl<> Foo<& [u8]> for Bar"
-        );
-        assert_eq!(erase_lifetimes("no lifetimes here"), "no lifetimes here");
-        assert_eq!(erase_lifetimes(""), "");
+    fn a_char_literal_is_not_a_lifetime() {
+        // Issue #108: the textual scan ate the `'a` of the char literal and left its
+        // closing quote behind, mangling the header. `syn` reads a const generic's
+        // default as syntax, so `'a'` never confuses the trait position.
+        let source = kernel_source("impl<const C: char = 'a'> From<&[u8]> for Foo {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
+        let impls = crate::parse::trait_impls("impl<const C: char = 'a'> From<&[u8]> for Foo {}")
+            .expect("the fixture parses");
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].trait_segments, ["From"]);
+        assert_eq!(impls[0].trait_generics, "<&[u8]>");
+    }
+
+    #[test]
+    fn a_qualified_trait_path_is_still_the_trait_it_names() {
+        // `syn` hands over the full path; the check reads the final segment, so no
+        // textual prefix list decides what `core::convert::From` means.
+        let source = kernel_source("impl core::convert::From<&[u8]> for Foo {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
     }
 }
 
@@ -11362,6 +11479,22 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_future_imported_under_an_alias_is_still_a_fifth_future() {
+        // Issue #109: `use core::future::Future as Pollable; impl Pollable for Sneaky` —
+        // the textual scan looked for `Future` in the `impl` header and never saw it, so
+        // a fifth thing a workflow could `.await` went unreported.
+        let sneaky = format!(
+            "{}\nuse core::future::Future as Pollable;\nimpl Pollable for Sneaky {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &sneaky);
+        assert!(
+            details.iter().any(|detail| detail.contains("Sneaky")),
+            "an aliased `Future` impl went unreported: {details:?}"
+        );
+    }
+
+    #[test]
     fn a_driver_module_that_routes_through_the_bridge_is_reported() {
         // Naming no crate and reaching the façade anyway. Review of this change added
         // exactly this line to `drive.rs` and watched a ban on the crate name stay green.
@@ -11456,6 +11589,29 @@ mod deferred_answer_pins {
                 .iter()
                 .any(|detail| detail.contains("names no `TimerSpec`")),
             "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_aliased_associated_item_does_not_evade_the_construction_pin() {
+        // Issue #99: `use TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;` followed by a
+        // construction through `PERSISTENT_SPEC` — the textual scan counted `TimerSpec`
+        // spellings, saw none at the construction site, and reported "names no
+        // `TimerSpec`" while a disallowed spec was being built.
+        //
+        // The `use` goes after the module's `//!` doc comment: an inner attribute after
+        // an item is not Rust, and the parser fails closed on it.
+        let module =
+            tests_support::clean_clock_module().replace(CLOCK_SPEC_CONSTRUCTION, "PERSISTENT_SPEC");
+        let module = module.replacen(
+            "//! A persistent-clock module.\n",
+            "//! A persistent-clock module.\nuse TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;\n",
+            1,
+        );
+        let details = timer_details(CLOCK_CAPABILITY_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("BEST_EFFORT")),
+            "an aliased disallowed spec went unreported: {details:?}"
         );
     }
 
@@ -11698,6 +11854,24 @@ mod deferred_answer_pins {
     #[test]
     fn the_clean_effect_protocol_passes() {
         assert!(effect_details(&tests_support::clean_effect_module()).is_empty());
+    }
+
+    #[test]
+    fn an_aliased_proof_type_does_not_evade_the_construction_pin() {
+        // Issue #99, the effect-protocol end: `use crate::DurableIntent as Proof;`
+        // followed by `Proof { .. }` inside `schedule` and `redelivering` — the textual
+        // scan counted `DurableIntent {` spellings, saw none, and reported the proof
+        // unbuilt while it was being minted under another name.
+        let source = tests_support::clean_effect_module()
+            .replace("intent: DurableIntent {", "intent: Proof {");
+        let source = format!("use crate::DurableIntent as Proof;\n{source}");
+        let details = effect_details(&source);
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("is not built inside")),
+            "an aliased proof construction went unseen: {details:?}"
+        );
     }
 
     #[test]
@@ -12418,6 +12592,34 @@ mod deferred_answer_pins {
                 "a second `{header}` went unreported: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_decoy_routing_function_is_reported_rather_than_shadowing_the_real_one() {
+        // Issue #62: `used_call` read the body of the FIRST `fn input_digest` the text scan
+        // found, so a decoy declaration above the real one decided the verdict while the
+        // real body drifted unexamined.
+        //
+        // `clean_integrity_routing` starts with its `//!` doc comment, which is only valid
+        // at the top of the file; it is stripped here so the decoy-plus-clean composition
+        // parses.
+        let clean = tests_support::clean_integrity_routing();
+        let clean = clean
+            .strip_prefix("//! The codec.\n")
+            .expect("the routing fixture starts with its doc comment");
+        let decoy = format!(
+            "//! d\npub const fn {}(input: &[u8]) -> u32 {{ 0 }}\n{clean}",
+            DIGEST_FUNCTION.0
+        );
+        let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &decoy)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains(&format!("`fn {}`", DIGEST_FUNCTION.0))
+                && violation.detail.contains("2 times")),
+            "a second `fn {}` went unreported: {violations:?}",
+            DIGEST_FUNCTION.0
+        );
     }
 
     #[test]
@@ -13203,6 +13405,23 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_aliased_decision_does_not_evade_the_boundary_pin() {
+        // Issue #99, the kernel-boundary end: `use kernel::Intent as I;` followed by
+        // `I::Finished` — the textual scan looked for the `Intent::Finished` spelling
+        // and reported the row undecided while the driver decided it under another name.
+        let driver =
+            tests_support::clean_driver_module().replace("Intent::Finished", "I::Finished");
+        let driver = format!("use kernel::Intent as I;\n{driver}");
+        let violations = boundary_violations(&real_transition_module(), &driver);
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.detail.contains("names no `Intent::Finished`")),
+            "an aliased decision went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_variant_added_to_the_boundary_is_rejected() {
         // The shape issue #28's second "done when" forbids: §09's first reserved record kind
         // arriving as a boundary variant rather than as a record.
@@ -13697,25 +13916,21 @@ mod deferred_answer_pins {
 
     #[test]
     fn a_declaration_and_a_return_type_are_not_constructions() {
-        // The three shapes that put a brace where a literal does, and the two that are one.
-        assert_eq!(
-            struct_literals("pub struct Seal {\n    a: u8,\n}\n", "Seal"),
-            0
-        );
-        assert_eq!(
-            struct_literals("impl Seal {\n    fn f() {}\n}\n", "Seal"),
-            0
-        );
-        assert_eq!(
-            struct_literals("fn f(self) -> Seal {\n    x\n}\n", "Seal"),
-            0
-        );
-        assert_eq!(struct_literals("fn f() { Seal { a: 1 } }\n", "Seal"), 1);
-        assert_eq!(
-            struct_literals("fn f() { self::Seal { a: 1 } }\n", "Seal"),
-            1
-        );
-        assert_eq!(struct_literals("fn f() { Sealed { a: 1 } }\n", "Seal"), 0);
+        // The three shapes that put a brace where a literal does, and the three that are
+        // one — the last through a `use` alias (issue #99), which the old textual scan
+        // could not see at all.
+        let total = |code: &str| {
+            crate::parse::struct_literal_counts(code, "Seal", crate::parse::FnScope::None)
+                .expect("the fixture parses")
+                .total
+        };
+        assert_eq!(total("pub struct Seal {\n    a: u8,\n}\n"), 0);
+        assert_eq!(total("impl Seal {\n    fn f() {}\n}\n"), 0);
+        assert_eq!(total("fn f(self) -> Seal {\n    x\n}\n"), 0);
+        assert_eq!(total("fn f() { Seal { a: 1 } }\n"), 1);
+        assert_eq!(total("fn f() { self::Seal { a: 1 } }\n"), 1);
+        assert_eq!(total("fn f() { Sealed { a: 1 } }\n"), 0);
+        assert_eq!(total("use crate::Seal as S;\nfn f() { S { a: 1 } }\n"), 1);
     }
 
     #[test]
@@ -13808,6 +14023,169 @@ mod deferred_answer_pins {
                 &tests_support::clean_checksum_module()
             )])
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_test_module_is_excluded_from_the_table_scan() {
+        // Issue #59: `#[cfg(test)] #[path = "crc/tbl.rs"] mod table;` — the stem guesser
+        // looked for `table.rs` and never found `tbl.rs`, so the test-only file's arrays
+        // were scanned as shipped lookup tables. The exemption has to come from the
+        // child's own declaration, not from guessing its file name. (`#[path]` resolves
+        // against the declaring file's directory, so the `crc/` prefix is required.)
+        let parent = format!(
+            "{}\n#[cfg(test)]\n#[path = \"crc/tbl.rs\"]\nmod table;\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "//! Test tables.\nstatic TABLE: [u32; 256] = [0; 256];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/tbl.rs", child),
+        ]);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("TABLE")),
+            "a test-only child resolved by #[path] was scanned: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_production_submodule_outside_crc_is_scanned() {
+        // Issue #59: the old `crc/` directory filter could not see a production submodule
+        // outside `crc/`. The module tree follows `mod` declarations, so a table in
+        // `waymaker-flash/tables.rs` — reachable from `crc.rs` via `#[path]` — is
+        // still a lookup table.
+        let parent = format!(
+            "{}\n#[path = \"../tables.rs\"]\nmod tables;\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/tables.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a production table outside crc/ was not scanned: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_with_dotdot_is_normalized() {
+        // Issue #59: `#[path = "../shared.rs"]` in `src/crc.rs` means `src/shared.rs`.
+        // Without lexical normalization the candidate `src/../shared.rs` never matches a
+        // `LayerSource` path and the module is silently unscanned.
+        let parent = format!(
+            "{}\n#[path = \"../shared.rs\"]\nmod shared;\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static SHARED_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/shared.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("SHARED_TABLE")),
+            "a #[path] with .. was not normalized: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_module_tree_fails_closed() {
+        // Issue #59: a module tree that does not parse is a violation, not an empty tree.
+        // A checksum that cannot see a file is a checksum that approves it unseen.
+        let parent = "not rust at all {{{";
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, parent)]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("does not parse")),
+            "an unparseable module tree was not reported: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_reached_as_production_and_test_only_counts_as_production() {
+        // Issue #59: the same file reachable through a production `mod` and through a
+        // `#[cfg(test)] mod` is production — a table the firmware ships. Test-only is
+        // test-reachable minus production-reachable, computed from both visits, so the
+        // answer does not depend on which route the walk takes first. The test-gated
+        // declaration comes first here, so the walk visits the file as production and
+        // only afterwards as test-only — the order the old last-visit-wins walk got
+        // wrong, re-exempting a file production had already reached.
+        let parent = format!(
+            "{}\n#[cfg(test)]\nmod tests;\n#[path = \"shared.rs\"]\nmod shared;\n",
+            tests_support::clean_checksum_module()
+        );
+        let sources = vec![
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer(
+                "waymaker-flash/src/crc/tests.rs",
+                "//! Checksum tests.\n#[path = \"../shared.rs\"]\nmod shared;\n",
+            ),
+            layer(
+                "waymaker-flash/src/shared.rs",
+                "static SHARED_TABLE: [u8; 16] = [0; 16];\n",
+            ),
+        ];
+        let violations = check_integrity_check(&sources);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("SHARED_TABLE")),
+            "a file reached as production was exempted by a test-only route: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_path_module_fails_closed() {
+        // Issue #59: a `#[path]` naming a file that is not among the scanned sources is
+        // a module the walk cannot see. Silently skipping it would approve the tree
+        // unseen; the scan fails closed instead.
+        let parent = format!(
+            "{}\n#[path = \"crc/missing.rs\"]\nmod missing;\n",
+            tests_support::clean_checksum_module()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &parent)]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("among the scanned sources")),
+            "a #[path] to a missing file was silently skipped: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_plain_module_fails_closed() {
+        // Issue #59: a plain `mod missing;` with neither `missing.rs` nor
+        // `missing/mod.rs` among the scanned sources is the same unseen module, and
+        // fails closed the same way.
+        let parent = format!("{}\nmod missing;\n", tests_support::clean_checksum_module());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &parent)]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("among the scanned sources")),
+            "a mod with no file was silently skipped: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_module_fails_closed() {
+        // Issue #59: `mod table;` with both `table.rs` and `table/mod.rs` present is a
+        // tree `rustc` itself rejects. Silently taking the first would scan a tree the
+        // compiler never builds; the scan fails closed instead.
+        let parent = format!("{}\nmod table;\n", tests_support::clean_checksum_module());
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/table.rs", "//! Nibble tables.\n"),
+            layer(
+                "waymaker-flash/src/crc/table/mod.rs",
+                "//! Nibble tables.\n",
+            ),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("more than one")),
+            "an ambiguous module was silently resolved to the first file: {violations:?}"
         );
     }
 
@@ -13990,9 +14368,17 @@ mod deferred_answer_pins {
         // `#[cfg(test)] use` at the top — swallowed every line after it, lookup table
         // included, and the rule reported success having read almost nothing.
         for braceless in ["#[cfg(test)]\nmod tests;", "#[cfg(test)]\nuse core::fmt;"] {
+            // `clean_checksum_module` starts with its `//!` doc comment, which is only
+            // valid at the top of the file; it is hoisted here so the composed fixture
+            // parses. The `mod tests;` case then fails closed on the missing child
+            // module, which the assertions below tolerate: the test is about the
+            // braceless item not hiding the table, not about the module resolving.
+            let checksum = tests_support::clean_checksum_module();
+            let checksum = checksum
+                .strip_prefix("//! Two checksums.\n")
+                .expect("the checksum fixture starts with its doc comment");
             let source = format!(
-                "{braceless}\n{}static TABLE: [u32; 16] = [0; 16];\n",
-                tests_support::clean_checksum_module()
+                "//! Two checksums.\n{braceless}\n{checksum}static TABLE: [u32; 16] = [0; 16];\n"
             );
             let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
             assert!(
@@ -14121,8 +14507,9 @@ mod deferred_answer_pins {
         // Internal review of PR #58: `split_once("EffectScheduled")` matched
         // `EffectScheduledV1` declared before it, so the pin read the decoy's field list
         // and the real variant grew a fifth field unseen. The same held for
-        // `enum RecordRefV2`. This module already settled the convention — `impl_headers`
-        // checks a token boundary — and the pin was not following it.
+        // `enum RecordRefV2`. This module already settled the convention — the
+        // parser-backed trait-impl check reads a token boundary — and the pin was not
+        // following it.
         let decoyed = format!(
             "pub enum RecordRef<'a> {{\n    EffectScheduledV1 {{{}}},\n    \
              EffectScheduled {{{} deadline_ms: u32,}},\n}}\n",
@@ -14288,6 +14675,71 @@ mod deferred_answer_pins {
         assert!(
             !violations.iter().any(|v| v.detail.contains("MESSAGE")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_on_a_test_module_exempts_the_file_it_names() {
+        // Issue #59: the old scan guessed the child file from the module name, so
+        // `#[cfg(test)] #[path = "crc/tbl.rs"] mod table;` never matched `crc/tbl.rs`
+        // and the test-only file's arrays were scanned as shipped lookup tables.
+        // (`#[path]` resolves against the declaring file's directory — verified by
+        // compiling a nested probe — so the `crc/` component is what lands the file
+        // under `crc/`.)
+        let sources = vec![
+            layer(
+                INTEGRITY_CHECK_PATH,
+                &format!(
+                    "{}\n#[cfg(test)]\n#[path = \"crc/tbl.rs\"]\nmod table;\n",
+                    tests_support::clean_checksum_module()
+                ),
+            ),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/tbl.rs".to_owned(),
+                contents: "//! Test tables.\nstatic TABLE: [u32; 256] = [0; 256];\n".to_owned(),
+            },
+        ];
+        let violations = check_integrity_check(&sources);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("TABLE")),
+            "a test-only table behind #[path] was scanned as a shipped lookup table: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_only_grandchild_module_is_exempt_by_inheritance() {
+        // Issue #59: a `mod data;` inside `crc/tests.rs` carries no `#[cfg(test)]` of
+        // its own — it is test-only because its parent is. A walk that forgets the
+        // gating when it enters the child file scans the grandchild's arrays as
+        // shipped lookup tables, punishing the ordinary refactor of moving test
+        // helpers into their own file.
+        let sources = vec![
+            layer(
+                INTEGRITY_CHECK_PATH,
+                &format!(
+                    "{}\n#[cfg(test)]\nmod tests;\n",
+                    tests_support::clean_checksum_module()
+                ),
+            ),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/tests.rs".to_owned(),
+                contents: "//! Checksum tests.\nmod data;\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/crc/tests/data.rs".to_owned(),
+                contents: "//! Test helpers.\nstatic HELPER_TABLE: [u32; 16] = [0; 16];\n"
+                    .to_owned(),
+            },
+        ];
+        let violations = check_integrity_check(&sources);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("HELPER_TABLE")),
+            "a test-only grandchild module was scanned as a shipped lookup table: \
+             {violations:?}"
         );
     }
 
@@ -14834,7 +15286,13 @@ mod tests {
         )
     }
 
-    /// A module declaring every frozen constant `wire-format` pins in `file`.
+    /// The frozen constants `wire-format` pins in `file`, as a fragment to append to the
+    /// module that declares them.
+    ///
+    /// A fragment and not a module: every caller concatenates it onto another fixture,
+    /// and a `//!` inner attribute after the first item is not Rust — the parser fails
+    /// closed on it, which is what `check_inputs_reports_nothing_for_a_clean_workspace`
+    /// tripped over.
     ///
     /// One function for both files, because the table is what says which constant lives
     /// where — a fixture with the split written into it a second time is a fixture that can
@@ -14843,7 +15301,7 @@ mod tests {
     pub fn clean_frozen_format_module(file: &str) -> String {
         use std::fmt::Write as _;
 
-        let mut body = String::from("//! A module of frozen format constants.\n");
+        let mut body = String::new();
         for frozen in crate::docs::WIRE_FORMAT_CONSTANTS {
             if frozen.file != file {
                 continue;
@@ -14878,10 +15336,17 @@ mod tests {
 
         // Grouped by function and repeated as many times as the pin expects, because the
         // pin is now a count inside one body rather than a presence check over the file.
+        // Literals are `;`-separated statements, not space-separated tokens: the module
+        // tree walk parses this fixture (issues #51, #59), and `{ 0x1021 0xFFFF }` is not
+        // Rust. The leading space is kept — `replace(" 0xFFFF ", ...)` in the token-boundary
+        // tests below depends on it.
         let mut bodies: BTreeMap<&str, String> = BTreeMap::new();
         for parameter in INTEGRITY_CHECK_PARAMETERS {
             let body = bodies.entry(parameter.function).or_default();
             for _ in 0..parameter.occurrences {
+                if !body.is_empty() {
+                    body.push(';');
+                }
                 let _ = write!(body, " {}", parameter.literal);
             }
         }

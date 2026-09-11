@@ -959,7 +959,10 @@ Stated so that nobody mistakes silence for coverage:
   [ADR 0023](docs/adr/0023-a-watchdog-reset-is-modelled-and-its-difference-is-one-return.md).
 - **A lookup table outside the checksum module.** `integrity-check`'s table scan reads
   `waymaker-flash/src/crc.rs` and the modules it is split into, so a table in a sibling
-  module that `crc.rs` calls is out of its scope.
+  module that `crc.rs` calls is out of its scope. A `mod` declaration the walk cannot
+  resolve to exactly one scanned file — a missing file, or both `name.rs` and
+  `name/mod.rs` present — fails the scan closed rather than silently scanning a tree
+  the compiler would not build.
 - **That a seal a body computes is the seal it stores.** `integrity-check`'s binding and
   routing halves are scanners, and three rounds of review on pull request #60 spent
   themselves on the same seam: a scanner cannot resolve a name or trace a value. What they
@@ -1098,6 +1101,18 @@ Stated so that nobody mistakes silence for coverage:
   *stale* generation. Reaching it needs a writer that carries on past a failed erase, which no
   writer in the sweep does. Feeding the generation into the header would close it and is a
   wire-format change; ADR 0017 records it as considered rather than taken.
+- **What the parsed scanners cannot resolve.** Issue #51 moved the evadable half of the
+  scanners — crate attributes, `extern crate`, `Future` implementors, associated-item
+  uses, struct-literal construction counts, test declarations, module trees, ADR prose —
+  from text patterns to real parsing (`syn` for Rust, `pulldown-cmark` for Markdown), so
+  comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
+  them. Parsing is not name resolution: glob imports are not followed, macros are not
+  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Markdown
+  parsing does not check that a rendered claim is true, only that it is rendered prose
+  rather than a code fence. The scanners that stayed textual are the ones whose rule is
+  about *spelling* — a forbidden vocabulary item, a handwritten `unsafe` keyword — and they
+  read comment- and string-stripped text, because there a mention in prose is a false
+  positive, not an evasion.
 - **That the two-barrier writer is a refinement of the ghost model.** `waymaker-spec`
   imports `frame` and `storage` and never `append`, and `tests/refinement.rs` writes each
   record with one `frame::encode` and one program — the one-shot writer the model describes.
