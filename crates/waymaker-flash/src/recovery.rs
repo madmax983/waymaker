@@ -983,8 +983,20 @@ impl<C: IntegrityCheck> Recovery<C> {
 /// constant, and never something learned from the device: an adapter whose `erase` does
 /// nothing on media reading `0x00` would teach a learning reader that nothing is programmable
 /// and that it had no questions to ask.
+///
+/// This is the erased-tail walk's own inner loop, and the module doc above named it "owed a
+/// cheaper answer": every byte of `ERASED_BYTE` is `0xFF`, so a whole word of them reads as
+/// [`usize::MAX`] regardless of endianness, and comparing a page one word at a time costs one
+/// comparison per word rather than one per byte. The tail that does not fill a whole word
+/// falls back to the byte-at-a-time check, which is also what a page shorter than one word
+/// runs entirely.
 fn is_erased(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == ERASED_BYTE)
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|byte| *byte == ERASED_BYTE)
 }
 
 /// `len` rounded up to a whole number of `unit`s, or [`None`] on overflow.
