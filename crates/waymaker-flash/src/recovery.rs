@@ -983,8 +983,20 @@ impl<C: IntegrityCheck> Recovery<C> {
 /// constant, and never something learned from the device: an adapter whose `erase` does
 /// nothing on media reading `0x00` would teach a learning reader that nothing is programmable
 /// and that it had no questions to ask.
+///
+/// This is the erased-tail walk's own inner loop, and the module doc above named it "owed a
+/// cheaper answer": every byte of `ERASED_BYTE` is `0xFF`, so a whole word of them reads as
+/// [`usize::MAX`] regardless of endianness, and comparing a page one word at a time costs one
+/// comparison per word rather than one per byte. The tail that does not fill a whole word
+/// falls back to the byte-at-a-time check, which is also what a page shorter than one word
+/// runs entirely.
 fn is_erased(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == ERASED_BYTE)
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|byte| *byte == ERASED_BYTE)
 }
 
 /// `len` rounded up to a whole number of `unit`s, or [`None`] on overflow.
@@ -1015,6 +1027,34 @@ const _: () = assert!(size_of::<Recovery>() == size_of::<JournalRegion>() + 4 + 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_erased_agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        // The word-at-a-time walk must answer exactly what `iter().all(|b| *b ==
+        // ERASED_BYTE)` would, at every length around a word boundary and with the one
+        // non-erased byte at every position — including inside the word-sized chunks and
+        // inside the remainder the chunking leaves over. Fixed-size rather than a `Vec`:
+        // this crate is `#![no_std]` with no allocator anywhere in it, tests included.
+        const MAX_LEN: usize = 32;
+        let word = size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [ERASED_BYTE; MAX_LEN];
+            assert!(
+                is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !is_erased(&bytes[..len]),
+                    "length {len} with byte {spoiled} programmed"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rounding_up_lands_on_the_next_unit() {
