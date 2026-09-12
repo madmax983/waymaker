@@ -30,6 +30,7 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 cargo build --locked --workspace --no-default-features
 cargo test --locked --workspace --no-default-features
+cargo test --locked --workspace --no-default-features --release
 cargo clippy --locked -p waymaker-embassy --all-targets --features postcard -- -D warnings
 cargo test --locked -p waymaker-embassy --features postcard
 cargo doc --locked -p waymaker-embassy --no-deps --features postcard

@@ -652,11 +652,6 @@ fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
     };
     let rig = rig();
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let never = Injection {
-        op: usize::MAX,
-        progress: Progress::None,
-        interruption: Interruption::PowerLoss,
-    };
     let mut images = std::collections::HashSet::new();
     let mut cuts = 0_usize;
     let mut torn_marks = 0_usize;
@@ -689,11 +684,22 @@ fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
             }
         }
         let image = run.image();
-        let Ok(clean) = harness.run_one(never, |session| restore_and_resume(&rig, image, session))
+        // The control: the resume with nothing armed. `run_one` refuses a crash point
+        // that never fires, so a past-the-end `op` can no longer stand in for "no
+        // crash" — the fault-free run says it plainly.
+        let Ok(clean) = harness.run_fault_free(|session| restore_and_resume(&rig, image, session))
         else {
             unreachable!("a resume nothing cuts completes, after {landed:?}")
         };
         let resume_ops = clean.ops().get(1..).unwrap_or_default();
+        // A resume that writes nothing has no point to cut. The empty sequence's
+        // sentinels are "before the first resume op", but there is no first resume
+        // op — and `run_one` refuses a crash point the writer never reaches, so
+        // they cannot be run. Skipping is honest: a reset at any point of a resume
+        // that does nothing is a reset of the restored image, already judged above.
+        if resume_ops.is_empty() {
+            continue;
+        }
         for point in waymaker_fault::injections(resume_ops, geometry()) {
             if point.interruption == Interruption::Failure {
                 continue;
@@ -730,9 +736,11 @@ fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
     }
     // Pinned, so a sweep that thinned fails closed: the parts cut before the bank was
     // sealed, the distinct images resumed, the resets taken, and those inside a mark.
+    // 180 of the 389 images resume to a part that needs no writes, so they contribute
+    // no cuts: a resume that writes nothing has no point to cut.
     assert_eq!(
         (uninstalled, images.len(), cuts, torn_marks),
-        (47, 389, 47_157, 15_990),
+        (47, 389, 46_797, 15_990),
         "the resume sweep changed size"
     );
 }

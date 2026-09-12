@@ -104,6 +104,15 @@ pub const STAGES: &[Stage] = &[
         why: "no behavior ships without a test",
     },
     Stage {
+        name: "test-release",
+        job: "check",
+        command: "cargo test --locked --workspace --no-default-features --release",
+        in_hook: false,
+        why: "firmware ships release, where overflow checks and debug assertions are off: \
+              a wrapping `+` or a `debug_assert!` holding up logic passes the dev test and \
+              fails in the field",
+    },
+    Stage {
         name: "codec-lint",
         job: "check",
         // Every stage above passes `--no-default-features`, so issue #37's optional codec

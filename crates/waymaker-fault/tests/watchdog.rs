@@ -183,9 +183,11 @@ fn a_watchdog_reset_leaves_a_whole_number_of_erase_blocks() {
     // The erase half of the same rule. The controller finishes the block the core stopped
     // believing in, so a reset one byte into a block leaves the whole block erased.
     //
-    // Reachable only through a crash point a caller builds by hand, because the enumeration
-    // offers a watchdog reset at whole operations only — which is where this branch and the
-    // power-cut branch agree, and therefore where a wrong one would be invisible.
+    // Reachable only through a crash point a caller builds by hand: an erase's reset
+    // points are its block boundaries, so every enumerated watchdog point on an erase is
+    // already block-aligned and `unit_completed` is the identity there. The round-up
+    // branch runs only for a reset that lands inside a block, which takes a hand-built
+    // `Progress::Bytes` — which is what this test does.
     for (stopped, erased) in [
         (1, 64),
         (63, 64),
