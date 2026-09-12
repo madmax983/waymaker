@@ -1017,6 +1017,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_erased_agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        // The word-at-a-time walk must answer exactly what `iter().all(|b| *b ==
+        // ERASED_BYTE)` would, at every length around a word boundary and with the one
+        // non-erased byte at every position — including inside the word-sized chunks and
+        // inside the remainder the chunking leaves over. Fixed-size rather than a `Vec`:
+        // this crate is `#![no_std]` with no allocator anywhere in it, tests included.
+        const MAX_LEN: usize = 32;
+        let word = size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [ERASED_BYTE; MAX_LEN];
+            assert!(
+                is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !is_erased(&bytes[..len]),
+                    "length {len} with byte {spoiled} programmed"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rounding_up_lands_on_the_next_unit() {
         assert_eq!(round_up(0, 4), Some(0));
         assert_eq!(round_up(1, 4), Some(4));
