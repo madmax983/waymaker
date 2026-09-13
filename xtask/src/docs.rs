@@ -6034,6 +6034,27 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_that_outlives_its_blockquote_still_hides_what_follows() {
+        // Codex, pull request #138, round 17: a comment opened inside a one-line
+        // blockquote and never closed reaches past the blockquote's own (shorter)
+        // span. The two hidden ranges then overlap without one containing the other,
+        // and the assembly loop used to just skip the second — discarding its real,
+        // farther-reaching end and letting the blockquote's own end stand in as the
+        // cursor, which exposed the real link between the two ends as visible again.
+        let index = "> <!-- comment\nstill going\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "0001-one.md"
+                && v.detail.contains("no link in the index points at it")),
+            "an overlapping hidden span did not reach the real link after it: {violations:?}"
+        );
+    }
+
+    #[test]
     fn an_inline_comment_does_not_vouch_for_the_link_inside_it() {
         // Codex, pull request #138: an HTML comment sitting on its own line is
         // `Event::Html`, but one mid-paragraph — `text <!-- ... --> text` — is

@@ -1155,8 +1155,15 @@ pub fn visible_source(contents: &str) -> String {
     let mut cursor = 0usize;
     for (start, end) in hidden {
         if start < cursor {
-            // Nested inside a span already cut out (a fence inside a blockquote, or
-            // the reverse): already covered, nothing new to remove.
+            // Overlapping, not necessarily nested (Codex, pull request #138, round 17):
+            // a comment opened inside a blockquote and closed after it — or never
+            // closed at all — reaches past the blockquote's own span, and merely
+            // skipping it here would forget that reach and let the quote's own
+            // (shorter) end stand in as the cursor, exposing everything from there to
+            // this span's real end. The two are merged instead: the span itself is
+            // already covered, so nothing new is cut out of `out`, but the end still
+            // advances the cursor if it reaches further.
+            cursor = end.max(cursor);
             continue;
         }
         out.push_str(&contents[cursor..start]);
