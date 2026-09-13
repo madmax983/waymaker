@@ -1163,16 +1163,15 @@ impl<S: StableStorage> Run<'_, S> {
         // `read` is the one operation with nothing to check afterwards, which is exactly why
         // an adapter that corrupts the bytes it just handed back can pass every other case:
         // each of them compares what the *first* read returned. Reading twice is what makes
-        // the second read a witness for the first.
+        // the second read a witness for the first — and reading the *whole block* both
+        // times, not just the unit, catches a read that corrupts bytes adjacent to what it
+        // returned rather than the returned bytes themselves.
         if !self.program_a_unit(case, self.block_a()) {
             return;
         }
         let base = self.block_a();
-        let unit = self.program_size();
         for _ in 0..2 {
-            match self.media_matches(base, unit, |position| {
-                pattern(usize::try_from(position).unwrap_or(0))
-            }) {
+            match self.block_holds_the_pattern(base) {
                 Some(true) => {}
                 Some(false) => {
                     self.record(case, Outcome::Failed(Failure::ReadBackDiffers));

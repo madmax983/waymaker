@@ -76,6 +76,13 @@ enum Flaw {
     RejectsAMultiBlockErase,
     /// A read hands back the right bytes and then corrupts the media it read.
     ReadCorruptsWhatItReturned,
+    /// A read hands back the right bytes and then corrupts the unit right after them.
+    ///
+    /// Distinct from [`Flaw::ReadCorruptsWhatItReturned`]: that one is invisible to nothing
+    /// that re-reads the exact bytes returned, which every case in this suite already does.
+    /// This one corrupts a byte no case named, which only a check of the *whole block* a
+    /// read's own setup left behind can see.
+    ReadCorruptsWhatFollows,
     /// A program also clears the program unit *before* the one it was given.
     ProgramCorruptsThePrecedingUnit,
     /// An erase also clears the erase block *before* the one it was given.
@@ -252,6 +259,25 @@ impl StableStorage for Broken {
             // The bytes handed back are the right ones; the media they came from is not,
             // one instruction later. Nothing that compares what a read returned can see it.
             self.fill(offset, len, |_| 0x00);
+            return Ok(());
+        }
+        if self.flaw == Flaw::ReadCorruptsWhatFollows {
+            let Ok(start) = usize::try_from(offset) else {
+                return Err(Refused);
+            };
+            let Some(end) = start.checked_add(dst.len()) else {
+                return Err(Refused);
+            };
+            let Some(source) = self.media.get(start..end) else {
+                return Err(Refused);
+            };
+            dst.copy_from_slice(source);
+            // The bytes handed back are exactly right; the unit right after the ones named
+            // is not. No case that only re-reads what it asked for can see this.
+            let unit = self.geometry.program_size();
+            if let Some(after) = offset.checked_add(len) {
+                self.fill(after, unit, |_| 0x00);
+            }
             return Ok(());
         }
         let Ok(start) = usize::try_from(offset) else {
@@ -528,6 +554,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Failure::ReadBackDiffers,
     ),
     (
+        Flaw::ReadCorruptsWhatFollows,
+        CaseId::ReadingChangesNoMedia,
+        Failure::ReadBackDiffers,
+    ),
+    (
         Flaw::ProgramCorruptsThePrecedingUnit,
         CaseId::ProgramLeavesTheRestOfTheBlockAlone,
         Failure::MediaOutsideTheOperationChanged,
@@ -714,6 +745,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::ProgramCorruptsThePrecedingUnit
         | Flaw::MultiUnitProgramCorruptsThePrecedingUnit
         | Flaw::MultiBlockEraseCorruptsThePrecedingBlock
+        | Flaw::ReadCorruptsWhatFollows
         | Flaw::BarrierScribbles
         | Flaw::BarrierScribblesInTheMiddleBlock
         | Flaw::BarrierScribblesBeyondTheWorkingBlocks => true,
@@ -803,7 +835,7 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::MultiBlockEraseIsLegal,
             Failure::LegalOperationRefused,
         )),
-        Flaw::ReadCorruptsWhatItReturned => {
+        Flaw::ReadCorruptsWhatItReturned | Flaw::ReadCorruptsWhatFollows => {
             Some((CaseId::ReadingChangesNoMedia, Failure::ReadBackDiffers))
         }
         Flaw::ZeroLengthIsRefused => Some((
@@ -856,6 +888,7 @@ const ALL: &[Flaw] = &[
     Flaw::RejectsAMultiUnitProgram,
     Flaw::RejectsAMultiBlockErase,
     Flaw::ReadCorruptsWhatItReturned,
+    Flaw::ReadCorruptsWhatFollows,
     Flaw::EraseTakesTheWholeDevice,
     Flaw::EraseTakesThePrecedingBlock,
     Flaw::BarrierScribblesInTheMiddleBlock,
