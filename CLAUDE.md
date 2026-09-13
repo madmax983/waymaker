@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — refined against a real swap since issue #73, but the model's own gaps (a bank holds no record, and a generation is unbounded) are still owed |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`, and refined against a real two-bank swap since issue #73's `tests/refinement.rs` abstraction of `waymaker_flash::bank` — though that refinement and the record refinement beside it have never been driven by one writer, so the bank check itself is still owed against a real device with a record on it |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -1027,24 +1027,51 @@ Stated so that nobody mistakes silence for coverage:
 - **That the crash oracle is as strict as the specification.** `waymaker_fault::verify_oracle`
   compares a recovery against *committed* history, which filters out records that never
   reached media, so it accepts a history that skips a gap and carries on; the specification's
-  prefix safety is a prefix of *declaration order* and refuses it. The two agree over the
-  specified machine — no reachable state has a gap — and `tests/oracle.rs` measures where
-  they stop agreeing rather than leaving the difference implied.
+  prefix safety is a prefix of *declaration order* and refuses it. `waymaker-fault`'s own
+  `tests/harness.rs` drives that acceptance on purpose — a writer whose middle record's
+  program call fails outright and who carries on to the next is exactly the case a stricter
+  oracle would wrongly refuse — so the fix for issue #67's smaller item is not a stricter
+  `verify_oracle`. The two agree over the specified machine because no reachable state has a
+  gap, and that used to be argued from a theorem about a different type
+  (`tests/machine.rs`'s, about `Journal`) rather than checked directly against what the
+  agreement tests actually judge; `tests/oracle.rs`'s
+  `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history` is now that check,
+  against the `Ledger` itself.
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers
   records, and — since issue #73 — banks: a real swap writer, styled on
   `crates/waymaker-fault/tests/banks.rs`'s own, is folded into `[Bank; 2]` at every crash
-  point and checked against the model's reachable set. What is not covered is every bank
-  sequence a firmware could produce, only the one swap this file drives; and
-  `single-authority`'s two remaining gaps — a bank holding no record, and an unbounded
-  generation — are the model's own limits rather than a refinement question, and
-  `obligation.rs`'s row says so. See
-  [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md).
+  point and checked against the model's reachable set. Issue #67 gave the *model* the
+  dimension that made a bank-aware refinement possible in the first place — a `Record`'s
+  `BankId`, and recovery scoped to the one a reader would boot from. What it has not made
+  possible yet is a *joint* refinement: the record writers never touch a bank and the
+  bank-swap writer never declares a record, so `single_authority`'s own bank check — that a
+  recovered record's bank is the sole authoritative one — has been refined only against
+  `recovered: &[]`, never against a real crash that leaves a device with both an authority
+  and a record on it. `obligation.rs`'s row says so rather than the earlier, wider claim that
+  `single-authority` was fully proved about a device; Codex found the gap between the claim
+  and the two sweeps' actual coverage on review of the pull request that closed issue #67.
+  What is not covered is every bank sequence a firmware could produce, only the one swap this
+  file drives — and, until the two sweeps compose, no sequence with a record in it. See
+  [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md) and
+  [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
   order of edits inside one commit is not a thing a rule can read.
+- **A wrong-bank reader whose wrong bank happens to be empty.** `Invariant::SingleAuthority`'s
+  bank check — issue #67 — is handed `recovered` and nothing else, matching every other
+  guarantee here: a `Reader` reports what it produced, not which bank it consulted. An empty
+  answer from the retired bank is byte-for-byte the same `Vec` an empty answer from the
+  authoritative one would be, and `legal_recoveries` already treats stopping before anything
+  is required as correct, so flagging every empty `recovered` would reject readers that broke
+  no rule. Codex's review of the pull request that added this clause asked for exactly this
+  fix and it is not one: it is the same shape of gap `tests/teeth.rs`'s `Mutant::SkipsGaps`
+  already lives with under `Guard::AppendOnly` — a wrong reader coinciding with a legal
+  answer in *some* states without being right everywhere — and that file's
+  `Mutant::BootsTheRetiredBank` already supplies the one state where this mutant and a
+  correct reader diverge, which is what a falsifier owes rather than every state.
 - **Allocation, as a measurement — no longer.** This bullet used to end "a global allocator
   that counted allocations would need the `unsafe` this workspace denies", and that was true
   of the only mechanism it considered. `cargo xtask profile` needs no allocator at all:
@@ -2816,3 +2843,315 @@ async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's 
 criterion are here — issues #35, #36, #37, #38 and #39, above — and in-boot sleep is the
 rest of 0.4. The gates went in before the code they govern, which is the point: a gate
 retrofitted after coverage has slipped is a gate that ratifies the slip.
+
+Issue #67 closes the three dimensions issue #20's review found `waymaker-spec`'s ghost model
+short of, none of which raising `Bound::PROOF` would have reached: the shapes of history the
+model admitted were one-dimensional, and the bound was never what they were short of.
+`model::Record` now carries a `BankId`; `Journal::begin_erase` drops exactly the erased
+bank's records and dispatch-log entries, and `recover`, `committed`, `declared` and
+`acknowledged` are all scoped to the bank a reader would boot from — so "never recover the
+old run as current" is a fact `Journal::recover` states rather than a sentence the model had
+no way to say. `Invariant::SingleAuthority` takes the recovered history now, not only
+`state.banks`, and `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank` shows the guarantee
+falsifiable by a reader instead of only by deleting a guard — issue #67's own "done when",
+met by name. Record identity moved off `records.len()` onto a counter that only grows, which
+is what let `begin_erase` drop a record from the middle of history without a later `declare`
+reissuing its id to something else; `Transition::Reboot` is the transition that identity
+scheme exists for, legal only while unpowered, restoring power and changing nothing else —
+`recover()` already computes the survived prefix fresh from the same bytes, and an earlier
+version that pruned `records` toward that answer was a real bug review caught: the prune was
+scoped to one bank and silently erased the *other* bank's own history too, which only
+`begin_erase` may do, and let a live write land back in a bank a crash had left with no legal
+append point. Compaction — the obvious firmware response to
+`Interruption::Failure`, retrying elsewhere rather than being stuck behind a torn record —
+turned out to need no transition of its own: `begin_seal` and `begin_erase` never consulted
+the other bank's records, so a live device behind a torn tail could already seal the blank
+bank and carry on there, and `tests/compaction.rs` is the proof that this reachable state is
+reached with no power loss anywhere in the run. A necessity proof found
+`Guard::DispatchFromCurrentBank` — added on the reasoning that a real swap consumes the old
+run's writer — unnecessary once `durable_intent` correctly treats a dispatch from a retired
+bank as moot the same way `continue_as_new` already forfeits identity across one (issue #95);
+it was removed rather than kept, per this crate's own rule that a guard removable at no cost
+was never load-bearing. Generation arithmetic now refuses at `u32::MAX`
+(`checked_add`, not `saturating_add`) instead of silently repeating it — a hand-built state
+in `model.rs`'s own `#[cfg(test)]` module, since no explorable bound reaches the ceiling.
+And a direct "no gap before committed history" check in `waymaker_fault::verify_oracle` was
+tried and reverted: `waymaker-fault`'s own `tests/harness.rs` deliberately drives a writer
+whose failed middle record is skipped over, which the oracle's committed-history filter is
+what makes acceptable, so the circularity issue #67 named is closed by a test that checks the
+claim directly against the `Ledger` the agreement tests build
+(`tests/oracle.rs`'s `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history`)
+rather than by a stricter oracle. Issue #73 had already closed the refinement half of this
+guarantee's gap — the paragraph above — and this issue closes the other half, the model's
+own expressiveness, so `obligation.rs`'s `single-authority` row now says nothing is owed. See
+[ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+
+Review of the pull request that closed issue #67 then found a fourth gap `Guard::
+NeverEraseTheAuthority` left open: `authoritative()` is always empty before the first seal,
+so the guard protected nothing pre-seal — `BeginErase(A)` was legal on a fresh device even
+though `A` is where `declare` puts every record, letting a live `Declare`-`Program` land
+inside a bank already `Erasing` and survive `CommitErase`, which never touches `records`.
+`Journal::protects_current_run(bank)` closes it: post-seal it is `authoritative().contains`
+exactly as before, and pre-seal it is `bank == current_bank()`, the implicit bank a fresh
+device writes into. `tests/machine.rs`'s
+`erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority` is the
+proof, over every pre-seal reachable state; `REACHABLE_STATES` and `TRANSITION_EDGES` in
+`tests/census.rs` moved again, down rather than up, because a whole family of states in
+which a fresh device erased its only writable bank stopped being reachable.
+
+A fifth finding asked for a guard refusing `Dispatch` against a bank a swap has since
+retired, arguing a dispatch happening *after* retirement is a physical effect with no run
+behind it rather than merely an old run's forfeited one. Investigated directly: restricting
+`Dispatch` to `current_bank()` moves `TRANSITION_EDGES` and leaves `REACHABLE_STATES`
+unchanged, because every state a post-retirement dispatch could reach is also reachable by
+dispatching while the bank is still current and retiring it afterward — a `Journal` is a
+snapshot rather than a log, so the two are one state, not two. `tests/necessity.rs`'s
+`a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
+constructs that legitimate trace by hand; no guard was added, and ADR 0043's alternatives
+section says why.
+
+A sixth found a real bug: `Journal::from_parts` (which `Journal::reconstructed` uses to turn
+a crash harness's observation into a state) takes `next_id` from the observation's own record
+ids via `saturating_add`, so an observation naming `RecordId(u32::MAX)` left `next_id` at the
+ceiling, and `declare`'s plain `+= 1` then overflowed on the next declaration — a panic with
+overflow checks, a reused `RecordId(0)` without them. `next_id` now advances with
+`checked_add`, refusing with `Illegal::CapacityReached` instead;
+`a_record_id_at_the_ceiling_is_refused_rather_than_reused` is a hand-built unit test beside
+the existing generation-ceiling one, since no exhaustive search reaches either ceiling.
+
+A seventh found that `tests/refinement.rs`'s own `REFINEMENT` bound — one generation, because
+its own comment says no writer there touches a bank — was reachable in states split across
+both banks anyway, since nothing stops the model's first-ever seal landing on bank B while
+bank A already holds records. `Observation` carries no bank identity, so
+`reachable_observations` flattening one of those states in declaration order could produce a
+`Whole` record following a gap, a shape no single-bank writer this file drives could ever
+leave, and the refinement check's first assertion ("is this a state the model says is
+reachable") would have accepted it. `reachable_observations` now filters to states where
+every record is in `BankId::A` before projecting;
+`no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave` asserts the filtered
+set is clean, verified to fail without the filter (488 of the run's reachable states leaked
+an impossible shape) and pass with it.
+
+An eighth finding was the sharpest of the round: `Declare -> Program -> Barrier` in bank A
+(pre-seal, current), then `BeginSeal(B) -> CommitSeal(B)` as the device's very first seal,
+left A's `Bank` tag at `Erased` — it was never touched — while A still held the record it
+declared before B took over. `Journal::begin_seal` read only that tag, so `BeginSeal(A)`
+afterward saw nothing wrong and resealed A's stale record at a higher generation than B, with
+no erase anywhere in the trace — recovering a superseded run as current, exactly what §14's
+failure table forbids. `begin_seal` now also refuses a bank that still holds records unless
+that bank is the one currently being written to (`current_bank()`), which is the ordinary
+shape of a device's very first seal and the only case a bank may carry records into its own
+seal. `tests/machine.rs`'s `a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase`
+drives the trace end to end; `REACHABLE_STATES` and `TRANSITION_EDGES` moved down a third
+time, and `tests/compaction.rs`'s surviving-bank test needed its witness search corrected to
+look for a bank with no records rather than an `Erased` tag alone — the tag-only search had
+been finding this same bug's witness and calling it a demonstration.
+
+A ninth, in the same round, was in the previous round's own fix: `next_id`'s `checked_add`
+refused *before* advancing, so a `Journal` reconstructed with `RecordId(u32::MAX)` already
+the highest id in it refused `RecordId(u32::MAX)` itself rather than only the id after it —
+the last representable id was never allocatable, not just the one past the ceiling.
+`next_id: Option<u32>` fixes it: `None` means no id is left, `Some(u32::MAX)` still hands out
+the last one and then becomes `None`. `the_last_record_id_is_still_allocated_exactly_once`
+and `declaring_past_the_last_record_id_is_refused_rather_than_reused` are the positive and
+negative halves.
+
+This branch's own merge with issue #73's landed on `main`, reconciling the two independent
+halves of `single-authority`'s "owed" gap each issue closed, drew a tenth and an eleventh
+finding on the merge commit. The tenth: `Journal::reboot` restored power and left *every*
+record in place, `OnMedia::Absent` ones included — a record `declare` puts in `records`
+before a single byte is programmed, so it is a fact about RAM rather than about media, and a
+power cut takes RAM with the power. `Declare(Schedule)` immediately followed by
+`PowerLoss`/`Reboot` left the phantom declaration in place, and `unresolved_schedule_in` and
+`whole_before` read it exactly as they would a real one — permanently stranding that bank,
+refusing a second `Declare` as `OutOfProtocolOrder` and refusing every later `Program` behind
+the absent record's own `whole_before` check, with no real bytes anywhere to blame it on.
+`reboot` now discards every still-`Absent` record and prunes `dispatched` to match, the same
+way `begin_erase` already does for an erased bank's records; `next_id` does not roll back,
+matching the "total ever declared" accounting `declare`'s own doc comment already states for
+an erased bank. `a_reboot_discards_only_records_still_absent_from_media` is the positive
+claim and `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank`
+gained `Reboot` as a second, narrower exception beside `BeginErase`'s. `REACHABLE_STATES` and
+`TRANSITION_EDGES` moved up substantially this time — a whole family of states that used to
+dead-end at `Reboot` behind an undischarged declaration reopened into the states a bank that
+had never declared anything reaches.
+
+The eleventh was independent of the tenth, on the observation/reconstruction path
+`tests/refinement.rs` abstracts a real crashed device through: `Journal::from_parts` inferred
+`next_id` from `records.iter().map(id).max() + 1`, which is exact only while nothing has ever
+been dropped from `records`. A device that declares record 0, swaps authority away from its
+bank and erases it has a real counter at 1 with no record anywhere naming 0; inferring from
+what survives computed 0 and handed that id out a second time on the very next `Declare` —
+the identity collision issue #67's whole scheme exists to forbid, unreachable by any test
+here only because the bank-swap refinement declares no records at all. `Observation` gained
+its own `next_id: Option<u32>` field, reported by the caller rather than inferred — exactly
+the shape `banks` and `sealed_once` already take, for the same reason: `Journal::observation`
+reads the real field directly, `refine::abstraction`'s record-only callers compute it from
+the ledger's own records because none of them ever erases, and `Journal::from_parts` takes it
+as a parameter instead of computing it at all.
+`reconstruction_never_reissues_an_id_an_erase_already_spent` is the regression, built directly
+against a hand-supplied `Observation` rather than a full crash-harness run, since the gap is
+in the reconstruction machinery itself rather than in any particular writer's behaviour.
+
+A twelfth finding, on the same round's next pass, was in the tenth's own fix: dropping a
+still-`Absent` record on reboot without rolling `next_id` back too meant a device that
+crashes before its first-ever media write, over and over, eventually reads
+`Illegal::CapacityReached` against media that has never held a single byte —
+`Declare`/`PowerLoss`/`Reboot` repeated `bound.records` times, with nothing else ever
+happening, strands a device the real firmware would never strand. Codex's evidence was the
+real firmware itself: `waymaker_core::id::EffectIdAllocator::resume` derives the next
+sequence from the *highest committed* one, so an attempt that never durably landed is never
+counted against a run at all. `reboot` now rolls `next_id` back by exactly the count of
+`Absent` records it discards — but never past `1 +` the highest surviving id, because an id
+`begin_erase` retired earlier in the *same* run is not in `records` to protect itself, and
+rolling all the way down to what the current residents alone justify would let a later,
+unrelated `Declare` reuse an id an erased bank had already spent — the collision issue #67's
+whole scheme exists to forbid, reached through the combination of the two transitions rather
+than through either alone. `a_crash_before_the_first_media_write_never_spends_capacity` is
+the positive claim, driven ten cycles deep against `Bound::PROOF`'s three-record ceiling
+(which stranded a device after exactly three, before the fix); the sharper edge is
+`an_id_an_erase_already_spent_survives_a_later_reboots_own_rollback`, which declares and
+commits two records in one bank, retires it behind a seal on the other, erases it, and
+requires a crash-and-reboot of a fresh, still-`Absent` declaration in the new bank to skip
+both of the first bank's spent ids rather than reusing either — verified against the naive
+fix (recomputing purely from surviving residents, with no floor) before landing this one,
+since that naive version reaches exactly the collision this test exists to catch.
+`REACHABLE_STATES` and `TRANSITION_EDGES` moved again, down substantially this time (8,360 →
+5,620): every distinct crash count a device could accumulate before its first media write
+used to be a distinct state, purely because `next_id` climbed higher with each cycle even
+though nothing on media ever changed, and those cycles now collapse back onto the states a
+device that crashed once, or never, already reaches.
+
+Review of that round's fix drew two more findings, both on the observation/reconstruction
+path rather than on `reboot` itself. The first was documentation left behind by the second
+finding's own history: this ADR still said a reboot "changes nothing but the power" and
+still named `a_reboot_changes_nothing_but_the_power` as the proof, both stale since the tenth
+finding taught `reboot` to discard `Absent` records — [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md)
+now narrates all three versions of the transition in order, with the test's current, narrower
+name. The second was a real gap in `refine::Observation::reconstructed`: the eleventh
+finding's `next_id` field is the caller's own report and was checked against nothing, so an
+observation could name a `next_id` that collides with a record in its *own* `records` list
+rather than only with one an earlier erase had dropped. Records 0 and 1 with
+`next_id: Some(1)` used to reconstruct without complaint; a `Reboot` then a
+`Declare(Schedule)` minted a second `RecordId(1)`, and the `Program` after it found the older
+record already whole and refused with `RecordAlreadyWritten`, stranding the new declaration
+on the identity collision issue #67's whole counter scheme exists to forbid — reached with no
+erase anywhere in the trace. `reconstructed` now refuses with
+`Impossible::NextIdReissuesAResident` whenever `next_id` is not strictly past every resident
+record's id, the same floor `reboot` itself keeps.
+`reconstruction_refuses_a_next_id_that_reissues_a_resident` is the regression, verified
+against a scratch reproduction of the stranding before the check existed and checking both
+the refusal and that the exact floor (one past the highest resident id) is still accepted.
+
+The same round's next pass found the sharper of the two: `Observation`'s per-record tuple
+carried no bank identity at all, so `Journal::reconstructed` hardcoded every record to
+`BankId::A` regardless of which bank `observation()` had actually read it from. A device that
+retires a record in bank A behind its very first seal — landing on B — and then declares a
+fresh record in B recovers `[1]` directly; round-tripped through `observation()` and
+`reconstructed()`, both records land in `BankId::A`, `recovering_bank()` stays `B`, and
+neither record's bank matches it, so the reconstructed state recovers `[]` instead — a real
+defect in the general bridge, invisible only because every writer this crate currently drives
+through it is single-bank. `Observation::records` now carries each record's bank as a fifth
+tuple element; `Journal::observation()` reports the real field, `Journal::reconstructed()`
+uses it instead of the hardcoded convention, and `refine::abstraction()` tags every record
+`BankId::A`, matching the module docs' "no writer this function abstracts ever touches a
+second bank" exactly as it already does for `next_id`.
+`observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks` is the
+regression, driving the real two-record two-bank sequence end to end and asserting the
+round-trip preserves what `Specified.recover` returns, verified against a scratch
+reproduction of the `[1]` vs `[]` divergence before the fix existed.
+
+The round after that found the sharper defect the new bank field made reachable:
+`Journal::bank_of` — which `single_authority` and `durable_intent` both call to ask "which
+bank is this id's record really in" — answers with the *first* matching record it finds,
+ignoring bank entirely, so a hand-built `Observation` naming `RecordId(0)` once in a retired
+bank and again in the sole authoritative bank made `single_authority` misreport a
+legitimately recovered record as belonging to the retired one, and could equally make
+`durable_intent` skip checking a dispatch that needed checking. The real firmware's own
+effect sequence does restart at zero across a swap
+(`waymaker_core::id::EffectIdAllocator` via `Installed::allocator`), but that is a different
+identity space from this crate's `RecordId`: the model's id is a single, device-wide counter
+invented by issue #67 specifically so it is never reused, so no legal transition sequence
+can ever declare the same id twice, in one bank or two — a caller bridging a real device that
+restarts its own sequence per run has to assign each record a distinct label the way
+`refine::abstraction()` already does, not reuse the real restarting number directly.
+`Journal::reconstructed` now refuses with a new `Impossible::RecordIdDeclaredTwice` whenever
+an observation's `records` names one id more than once, closing the gap the same way as
+`next_id`'s own floor rather than by threading bank identity through every by-id lookup and
+through `dispatched` (which carries no bank tag at all, and would need one too).
+`reconstruction_refuses_the_same_id_declared_in_two_banks` is the regression, verified
+against a scratch reproduction of `single_authority`'s false-positive breach before the check
+existed.
+
+The same round's Codex pass raised a second finding on the same shift the eleventh finding's
+fix uses: `refine::bank_after_seal`'s `real_generation.0 + 1` numbering has no model value for
+the real firmware's actual final usable generation, since `Generation::successor` only
+refuses *at* `Generation::MAX` and the shift would need `u32::MAX + 1` to represent sealing
+there. Investigated rather than fixed: the reservation exists so a bank with no seal
+(`authoritative_generation() == None`) and a bank the model has not yet distinguished from one
+both read as "nothing sealed here" through `begin_seal`'s own `None => 1`, and removing it
+(numbering the model's first seal `0`, since `Bank`'s variants already tell "unsealed" apart
+from `Sealed(0)` without needing the reservation) would change how many distinct generation
+values `Bound::generations` admits at a given cap, moving `tests/census.rs`'s pinned counts —
+for a boundary nothing here drives anywhere near: `Bound::PROOF` and the bank-swap refinement
+sweep both cap generations at 3, and the one place this crate reaches a real `u32::MAX` is
+`model.rs`'s own hand-built `a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank`,
+entirely on the model's own terms and never through this shift. Documented as the same
+standing `obligation.rs` already records for `single-authority`'s generation dimension — "a
+generation is an unbounded integer, where the firmware refuses at the ceiling rather than
+proving the refusal unnecessary" — one integer narrower than stated there, in both
+`refine::bank_after_seal`'s doc comment and beside `begin_seal`'s own `checked_add`, rather
+than moving the census for a boundary no proof or refinement test comes near.
+
+The same round's next pass on the pull request that closed issue #67 found that the "nothing
+is owed" `single-authority` row itself overclaimed. `tests/refinement.rs`'s two refinements
+never compose: the record writers (`journal`, `effect_protocol`, and the one that survives a
+failed program) never touch a bank, and the bank-swap writer's own bound —
+`BANK_REFINEMENT.records: 0` — never declares one, so every `Observation` the swap sweep
+builds is `records: Vec::new()` and `single_authority` is checked there against
+`recovered: &[]`. `Invariant::SingleAuthority`'s bank check — that a recovered record's bank
+is the sole authoritative one, the very thing this round's earlier finding fixed `bank_of`
+over — has therefore never been refined against a real crashed device that both wrote a
+record and swapped banks, only proved exhaustively over the model and unit-tested directly
+against a hand-built multi-bank `Observation`. `obligation.rs`'s `single-authority` row now
+names this gap in its `owed` field instead of `None`, matching the standing every other
+partly-discharged clause here already has;
+`what_is_still_owed_is_written_down_rather_than_left_out` in `tests/obligations.rs` pins the
+exact set of clauses with something owed, which is now `single-authority` and
+`bounded-decoding` rather than `bounded-decoding` alone. CLAUDE.md's own guarantees table and
+its "that the ghost model is a model of *this* firmware" bullet are corrected the same way,
+rather than left to read as though the earlier, wider claim still held. Closing it for real
+needs a writer that both declares records and performs a real two-bank swap — the two things
+`crates/waymaker-fault/tests/banks.rs` and `tests/refinement.rs`'s two existing halves each
+do on their own — refined together the way each already is separately.
+
+A merge-time round found a second real bug beside the ADR staleness above: `durable_intent`'s
+own retired-bank exemption compared `bank_of(intent) != recovering_bank()`, and `bank_of`
+answers `None` when `intent` names no record at all — not only when it names one in a bank
+other than the one recovery would boot from. `None != Some(bank)` took the same branch as a
+genuine retired-bank mismatch, so a dispatched effect with no schedule record on media
+*anywhere* was silently exempted rather than breaching, even though `refine::abstraction`'s
+`dispatched` parameter is documented to report exactly that shape on purpose — "an effect
+that reached the world" independent of what the ledger holds, so a run whose effect left
+nothing recoverable behind can be described and judged rather than shrugged off as moot. The
+fix only takes the exemption when `bank_of` answers `Some(bank)` that disagrees with
+`recovering_bank()`, via `is_some_and`; `a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot`
+in `tests/refinement.rs` is the regression, verified to fail against the old check. No
+reachable state changes: `Journal::dispatch` refuses a `Transition::Dispatch` naming a record
+that does not exist, so `explore()`'s exhaustive search never produces the shape this bug
+needed — only a hand-built `Observation`, of the kind `refine::abstraction` exists to build
+from a real crashed device, could reach it.
+
+The next round found a third: `Journal::reconstructed` passed `observation.sealed_once`
+straight through with no check against `observation.banks`, so a hand-built `Observation`
+could claim `banks: [Bank::Erased, Bank::Sealed(1)]` while leaving `sealed_once` at its
+default of `false` — a combination no real transition sequence can produce, since
+`commit_seal` is the only place a bank becomes `Sealed` and it sets `sealed_once` true in the
+same step. Left unrefused, `recovering_bank()` took the pre-seal convention at face value and
+answered `BankId::A` regardless of which bank was really sealed, and `has_sealed()` then
+exempted the state from `SingleAuthority` entirely — a reconstructed state could recover a
+stale bank's records while the truly sealed bank's were ignored, with the one guarantee built
+to catch exactly that never even consulted. `Impossible::SealedBeforeAnyHistoryOfSealing` is
+the fix, refused in `reconstructed` the same way as the existing `RecordIdDeclaredTwice` and
+`NextIdReissuesAResident` checks; `reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false`
+in `tests/refinement.rs` is the regression, verified to fail against the old code.

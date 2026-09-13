@@ -12,7 +12,9 @@
 
 use waymaker_fault::Durability;
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bank, BankId, Bound, Guards, Journal, OnMedia, Transition};
+use waymaker_spec::model::{
+    Bank, BankId, Bound, Guards, Illegal, Journal, OnMedia, Record, Role, Transition,
+};
 
 const CEILING: usize = 200_000;
 
@@ -38,6 +40,27 @@ fn edges() -> Vec<(Journal, Transition, Journal)> {
     edges
 }
 
+/// Every record present on both sides of an edge, paired by id.
+///
+/// `Transition::BeginErase` — issue [#67](https://github.com/madmax983/waymaker/issues/67) —
+/// is now the one transition allowed to drop a record outright, so a plain `.zip()` over the
+/// raw slices would pair the survivor of an erased bank against whatever unrelated record
+/// happens to sit at its old index and file the difference as a state change nothing made.
+/// Matching by id instead means a test below is a claim about a record that persisted across
+/// the edge, which is what "never taken back", "never un-acknowledged" and "moves only along
+/// these edges" are actually claims about.
+fn matched<'a>(from: &'a Journal, to: &'a Journal) -> Vec<(&'a Record, &'a Record)> {
+    to.records()
+        .iter()
+        .filter_map(|after| {
+            from.records()
+                .iter()
+                .find(|before| before.id == after.id)
+                .map(|before| (before, after))
+        })
+        .collect()
+}
+
 #[test]
 fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
     // Design document §15: merely attempted, possibly durable before acknowledgment, and
@@ -52,7 +75,7 @@ fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
         (Durability::PossiblyDurable, Durability::Acknowledged),
     ];
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             let (before, after) = (before.durability(), after.durability());
             if before == after {
                 continue;
@@ -68,7 +91,7 @@ fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
 #[test]
 fn an_acknowledged_record_is_never_un_acknowledged() {
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             if before.acknowledged {
                 assert!(
                     after.acknowledged,
@@ -84,9 +107,12 @@ fn an_acknowledged_record_is_never_un_acknowledged() {
 fn bytes_on_media_are_never_taken_back_within_a_run() {
     // NOR flash only clears bits, and rung 0.1 has no erase of the journal region. A record
     // that reached media stays there for the life of the run; the two-bank swap is how
-    // history is reclaimed, and that is the bank machine below rather than this one.
+    // history is reclaimed, and that is the bank machine below rather than this one. A record
+    // an erase drops is not "taken back" in this sense — it is gone, which
+    // `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank` covers —
+    // so this is a claim about the records that survive an edge, matched by id.
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             let regressed = matches!(
                 (before.media, after.media),
                 (OnMedia::Whole, OnMedia::Absent | OnMedia::Partial)
@@ -102,16 +128,75 @@ fn bytes_on_media_are_never_taken_back_within_a_run() {
 }
 
 #[test]
-fn a_declared_record_is_never_renumbered_or_removed() {
+fn a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank() {
     for (from, transition, to) in edges() {
-        assert!(
-            to.records().len() >= from.records().len(),
-            "{transition:?} dropped a record"
-        );
-        for (before, after) in from.records().iter().zip(to.records()) {
+        let dropped = from.records().len() - matched(&from, &to).len();
+        if matches!(transition, Transition::BeginErase(_)) {
+            // The one exception, and `erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else`
+            // is the claim about which records it may drop — exactly the named bank's.
+            continue;
+        }
+        if transition == Transition::Reboot {
+            // The other exception, narrower than an erase: `Reboot` may drop a record, but
+            // only one that never reached media in the first place —
+            // `a_reboot_discards_only_records_still_absent_from_media` is the claim about
+            // which ones. Every record that *does* survive still keeps its id, checked below
+            // with every other transition.
+            let dropped_ids: std::collections::BTreeSet<_> = from
+                .records()
+                .iter()
+                .map(|record| record.id)
+                .filter(|id| to.records().iter().all(|record| record.id != *id))
+                .collect();
+            for id in dropped_ids {
+                let before = from
+                    .records()
+                    .iter()
+                    .find(|record| record.id == id)
+                    .expect("id came from from.records()");
+                assert_eq!(
+                    before.media,
+                    OnMedia::Absent,
+                    "Reboot dropped record {} which was {:?}, not Absent",
+                    id.0,
+                    before.media
+                );
+            }
+        } else {
+            assert_eq!(
+                dropped, 0,
+                "{transition:?} dropped {dropped} record(s) without erasing a bank or rebooting"
+            );
+        }
+        for (before, after) in matched(&from, &to) {
             assert_eq!(
                 before.id, after.id,
                 "{transition:?} renumbered a declared record"
+            );
+        }
+    }
+}
+
+#[test]
+fn erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else() {
+    // The other half of issue #67's first gap: `BeginErase` is now allowed to shrink
+    // `records`, and this is the claim about *which* records it may drop — exactly the
+    // named bank's, never the other bank's.
+    for (from, transition, to) in edges() {
+        let Transition::BeginErase(erased) = transition else {
+            continue;
+        };
+        let after_ids: std::collections::BTreeSet<_> =
+            to.records().iter().map(|record| record.id).collect();
+        for record in from.records() {
+            let should_survive = record.bank != erased;
+            assert_eq!(
+                after_ids.contains(&record.id),
+                should_survive,
+                "erasing {erased:?} {} record {} in bank {:?}",
+                if should_survive { "dropped" } else { "kept" },
+                record.id.0,
+                record.bank
             );
         }
     }
@@ -226,12 +311,7 @@ fn committed_history_and_declaration_order_are_the_same_prefix() {
     // a gap-skipping reader exploiting.
     for state in proof_space().states() {
         let committed: Vec<_> = state.committed().collect();
-        let declared: Vec<_> = state
-            .records()
-            .iter()
-            .take(committed.len())
-            .map(|record| record.id)
-            .collect();
+        let declared: Vec<_> = state.declared().into_iter().take(committed.len()).collect();
         assert_eq!(
             committed, declared,
             "committed history is not a prefix of declaration order in {state:?}"
@@ -270,4 +350,384 @@ fn no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to() 
             );
         }
     }
+}
+
+#[test]
+fn a_reboot_changes_nothing_media_backed_but_the_power() {
+    // Issue #67's second gap, corrected after review found the first version wrong twice
+    // over. First: a reboot must not prune `records` down to `recover()`'s answer —
+    // `recover()` already computes that fresh from whatever bytes are there, and pruning
+    // would erase a torn record's bytes (and, since `recover()` is scoped to one bank, the
+    // *other* bank's own history too) the way only `Transition::BeginErase` may. A device
+    // rebooting behind a torn record has to stay stuck behind it, exactly as
+    // `Guard::AppendOnly` already requires, until a real erase clears that bank. Second,
+    // found on review of the fix for the first: a still-`Absent` record is not a torn
+    // record's bytes — it is a fact about RAM a crash actually took, and a reboot must
+    // discard it or a device permanently strands itself behind a declaration nothing durable
+    // underwrites (`a_reboot_discards_only_records_still_absent_from_media`, below).
+    for (from, transition, to) in edges() {
+        if transition != Transition::Reboot {
+            continue;
+        }
+        let media_backed: Vec<Record> = from
+            .records()
+            .iter()
+            .filter(|record| record.media != OnMedia::Absent)
+            .copied()
+            .collect();
+        assert_eq!(
+            to.records(),
+            media_backed.as_slice(),
+            "Reboot changed a media-backed record, or its order"
+        );
+        assert_eq!(to.banks(), from.banks(), "Reboot changed a bank's seal");
+        assert!(to.powered(), "Reboot left the device unpowered");
+    }
+}
+
+#[test]
+fn a_reboot_discards_only_records_still_absent_from_media() {
+    // Codex, PR #135's merge round: `Declare(Schedule)` immediately followed by
+    // `PowerLoss`/`Reboot` used to leave the still-`Absent` schedule record in place, and
+    // `unresolved_schedule_in` and `whole_before` read it exactly as they would a real one —
+    // permanently stranding that bank behind a declaration no byte on media backs. This
+    // requires the scenario to be reachable at all, then requires it not to strand anything:
+    // a fresh `Declare` of the opposite role succeeds, exactly as it would from a bank that
+    // had never declared anything.
+    let mut checked = 0_usize;
+    for (from, transition, to) in edges() {
+        if transition != Transition::Reboot {
+            continue;
+        }
+        let Some(absent) = from
+            .records()
+            .iter()
+            .find(|record| record.media == OnMedia::Absent)
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            to.records().iter().all(|record| record.id != absent.id),
+            "record {} was still Absent before reboot and survived it",
+            absent.id.0
+        );
+        let bank = absent.bank;
+        let schedule = to.step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let outcome = to.step(
+            Transition::Declare(Role::Outcome),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        // `Bound::PROOF`'s own record ceiling can legitimately refuse both — that is
+        // `Illegal::CapacityReached`, not the stranding this test is about. The stranding
+        // this bug caused was always `Illegal::OutOfProtocolOrder` on the role that should
+        // have been open, because a dropped `Absent` record kept reading as one that never
+        // left.
+        let capacity_reached =
+            |result: &Result<Journal, Illegal>| matches!(result, Err(Illegal::CapacityReached));
+        if capacity_reached(&schedule) && capacity_reached(&outcome) {
+            continue;
+        }
+        assert!(
+            schedule.is_ok() || outcome.is_ok(),
+            "bank {bank:?} is stranded after reboot discarded its only declaration: \
+             schedule {schedule:?}, outcome {outcome:?}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reachable Reboot edge ever had an Absent record to discard"
+    );
+}
+
+#[test]
+fn a_reboot_behind_a_torn_record_still_cannot_write_past_it() {
+    // The positive claim `a_reboot_changes_nothing_but_the_power` exists to protect: a device
+    // that reboots with a torn tail in the bank it is still writing to is exactly as stuck in
+    // that bank afterwards as it was the instant before the crash — ADR 0018's "only erased
+    // media is an append point", now proved to survive a reboot rather than only a first
+    // boot. Before the fix, `Journal::reboot` dropped the torn record along with everything
+    // else, which made this false: `Declare` then `Program` into the same bank succeeded
+    // right after reboot.
+    let mut checked = 0_usize;
+    for (_, transition, to) in edges() {
+        if transition != Transition::Reboot || !to.has_torn_record() {
+            continue;
+        }
+        // Whichever bank `Declare` lands a new record in is the bank still being written to;
+        // if that is not the torn record's bank, the torn one belongs to an already-retired
+        // bank and this edge is not the scenario this test is about. Whichever role protocol
+        // order permits here is fine — either demonstrates the same append-only refusal.
+        let declare_outcome = to.step(
+            Transition::Declare(waymaker_spec::model::Role::Outcome),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let declare_schedule = to.step(
+            Transition::Declare(waymaker_spec::model::Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let Ok(declared) = declare_outcome.or(declare_schedule) else {
+            continue;
+        };
+        let new_record = declared
+            .records()
+            .iter()
+            .find(|record| !to.records().iter().any(|old| old.id == record.id))
+            .expect("Declare added exactly one record");
+        let Some(torn) = to
+            .records()
+            .iter()
+            .find(|record| record.bank == new_record.bank && record.media == OnMedia::Partial)
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            declared
+                .step(
+                    Transition::Program(new_record.id),
+                    Guards::ENFORCED,
+                    Bound::PROOF
+                )
+                .is_err(),
+            "programming a new record in {:?} succeeded right after reboot, behind torn \
+             record {} in {to:?}",
+            new_record.bank,
+            torn.id.0
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reboot ever landed behind a torn record in the bank still being written to, so \
+         this claim is about nothing"
+    );
+}
+
+#[test]
+fn erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority() {
+    // Before the first seal, `authoritative()` is always empty, so
+    // `Guard::NeverEraseTheAuthority`'s original check protected nothing: `BeginErase(A)` was
+    // legal on a fresh device even though `A` is where `Journal::declare` puts every record.
+    // Codex found the run this let through during review of issue #67: erase `A`, declare and
+    // program a record into it while it is `Erasing`, `CommitErase(A)` — which never touches
+    // `records` — leaves that record behind, and sealing `A` afterward recovers bytes an
+    // erase should have destroyed. `Journal::protects_current_run` closes it by checking the
+    // implicit current bank before the first seal the same way `authoritative()` already
+    // closes the case after one.
+    let mut checked = 0_usize;
+    for state in proof_space().states() {
+        if state.has_sealed() || !state.powered() {
+            continue;
+        }
+        let current = state
+            .recovering_bank()
+            .expect("recovering_bank is always Some before the first seal");
+        checked += 1;
+        assert_eq!(
+            state.step(
+                Transition::BeginErase(current),
+                Guards::ENFORCED,
+                Bound::PROOF
+            ),
+            Err(Illegal::WouldEraseTheAuthority),
+            "erasing the pre-seal current bank {current:?} was not refused in {state:?}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reachable state was ever pre-seal, so this claim is about nothing"
+    );
+}
+
+#[test]
+fn a_record_programmed_while_the_pre_seal_current_bank_erases_can_never_be_sealed_in() {
+    // The scenario the previous test's refusal exists to prevent, driven end to end: without
+    // the fix, `BeginErase(A) -> Declare -> Program -> CommitErase(A) -> BeginSeal(A) ->
+    // CommitSeal(A)` would recover a record from a bank that was supposed to have been wiped.
+    // With `Journal::protects_current_run` in place the very first step is refused, so the
+    // rest of the sequence is unreachable — checked here directly, rather than trusted from
+    // the single-step refusal alone.
+    let fresh = Journal::default();
+    assert!(!fresh.has_sealed());
+    let current = fresh
+        .recovering_bank()
+        .expect("a fresh device has a current bank");
+    assert_eq!(
+        fresh.step(
+            Transition::BeginErase(current),
+            Guards::ENFORCED,
+            Bound::PROOF
+        ),
+        Err(Illegal::WouldEraseTheAuthority),
+        "a fresh device let its only writable bank start erasing"
+    );
+}
+
+#[test]
+fn a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase() {
+    // Codex, PR #135 round 7: `Declare(Schedule) -> Program -> Barrier` in A (pre-seal,
+    // current), then `BeginSeal(B) -> CommitSeal(B)` as the device's very first seal, leaves
+    // A's `Bank` tag at `Erased` — it was never touched — while A still holds the record it
+    // declared before B took over. Without the fix, `BeginSeal(A)` reads that tag and sees
+    // nothing wrong, resealing A's stale record at a higher generation than B and recovering
+    // a superseded run as current with no erase anywhere in the trace.
+    let mut state = Journal::default();
+    state = state
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("declare in A");
+    let id = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id), Guards::ENFORCED, Bound::PROOF)
+        .expect("program");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, Bound::PROOF)
+        .expect("barrier");
+    state = state
+        .step(
+            Transition::BeginSeal(BankId::B),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("begin seal B, the device's first seal");
+    state = state
+        .step(
+            Transition::CommitSeal(BankId::B),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("commit seal B");
+    assert_eq!(state.recovering_bank(), Some(BankId::B));
+
+    assert_eq!(
+        state.step(
+            Transition::BeginSeal(BankId::A),
+            Guards::ENFORCED,
+            Bound::PROOF
+        ),
+        Err(Illegal::BankNotErased),
+        "A was resealed with a stale record still in it and no erase in the trace"
+    );
+}
+
+#[test]
+fn a_crash_before_the_first_media_write_never_spends_capacity() {
+    // Codex, PR #135's merge round, third finding: dropping a still-`Absent` record on
+    // reboot without rolling `next_id` back too meant a device that crashes before its
+    // first-ever media write, over and over, eventually read `Illegal::CapacityReached`
+    // against media that had never held a single byte —
+    // `waymaker_core::id::EffectIdAllocator::resume`'s real answer is that an attempt which
+    // never durably committed is never counted against a run at all. `Bound::PROOF`'s own
+    // three-record ceiling is small enough that the old code stranded a device after exactly
+    // three such crashes; this drives ten and requires none of them to be the last.
+    let bound = Bound::PROOF;
+    let mut state = Journal::default();
+    for cycle in 0..10 {
+        state = state
+            .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+            .unwrap_or_else(|error| {
+                panic!("cycle {cycle}: declaring against empty media refused with {error:?}")
+            });
+        assert!(
+            state
+                .records()
+                .iter()
+                .all(|record| record.media == OnMedia::Absent),
+            "cycle {cycle}: a record reached media with no Program ever issued"
+        );
+        state = state
+            .step(Transition::PowerLoss, Guards::ENFORCED, bound)
+            .expect("power loss is always legal while powered");
+        state = state
+            .step(Transition::Reboot, Guards::ENFORCED, bound)
+            .expect("reboot is always legal while unpowered");
+    }
+}
+
+#[test]
+fn an_id_an_erase_already_spent_survives_a_later_reboots_own_rollback() {
+    // Codex's third finding, the sharper edge: `reboot`'s `next_id` rollback must not roll
+    // past an id `begin_erase` retired earlier in the *same* run. `begin_erase` never rolls
+    // `next_id` back — an erased bank's records are gone from `records`, so they cannot
+    // protect their own ids from a later, unrelated reboot's rollback the way a still-resident
+    // record does. This drives exactly that combination — declare and commit two records in
+    // A, retire A behind a seal on B, erase A, then crash a fresh, still-`Absent` declaration
+    // in B before it ever reaches media — and requires the id after reboot to skip both of
+    // A's spent ids rather than reusing either.
+    let bound = Bound {
+        records: 10,
+        generations: 3,
+    };
+    let mut state = Journal::default();
+    state = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare id 0 in A");
+    let id0 = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id0), Guards::ENFORCED, bound)
+        .expect("program id 0");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier");
+    state = state
+        .step(Transition::Declare(Role::Outcome), Guards::ENFORCED, bound)
+        .expect("declare id 1 in A");
+    let id1 = state.records()[1].id;
+    state = state
+        .step(Transition::Program(id1), Guards::ENFORCED, bound)
+        .expect("program id 1");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier");
+    state = state
+        .step(Transition::BeginSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("begin seal B, the device's first seal");
+    state = state
+        .step(Transition::CommitSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("commit seal B");
+    state = state
+        .step(Transition::BeginErase(BankId::A), Guards::ENFORCED, bound)
+        .expect("begin erase A, dropping ids 0 and 1");
+    state = state
+        .step(Transition::CommitErase(BankId::A), Guards::ENFORCED, bound)
+        .expect("commit erase A");
+    assert!(state.records().is_empty(), "erase left a record behind");
+
+    state = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare in B, current bank, stays absent");
+    state = state
+        .step(Transition::PowerLoss, Guards::ENFORCED, bound)
+        .expect("power loss before B's record ever reaches media");
+    state = state
+        .step(Transition::Reboot, Guards::ENFORCED, bound)
+        .expect("reboot drops B's absent record");
+    assert!(state.records().is_empty(), "reboot left a record behind");
+
+    let redeclared = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declaring again after the reboot's rollback");
+    let new_id = redeclared
+        .records()
+        .last()
+        .expect("the declare above added exactly one record")
+        .id;
+    assert_ne!(
+        new_id, id0,
+        "reboot's rollback reused an id A's erase had already spent"
+    );
+    assert_ne!(
+        new_id, id1,
+        "reboot's rollback reused an id A's erase had already spent"
+    );
 }

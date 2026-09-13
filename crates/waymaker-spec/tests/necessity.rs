@@ -19,7 +19,7 @@
 
 use waymaker_spec::explore::explore;
 use waymaker_spec::invariant::Invariant;
-use waymaker_spec::model::{Bound, Guard, Guards, Journal};
+use waymaker_spec::model::{BankId, Bound, Guard, Guards, Journal, Role, Transition};
 use waymaker_spec::reader::Specified;
 
 const CEILING: usize = 400_000;
@@ -216,6 +216,155 @@ fn highest_generation(state: &Journal) -> Option<u32> {
         .iter()
         .filter_map(|bank| bank.authoritative_generation())
         .max()
+}
+
+#[test]
+fn a_dispatch_from_a_bank_a_swap_has_since_retired_is_moot_rather_than_a_breach() {
+    // Issue #67's first gap, closed: once records carry a bank, a schedule record a swap left
+    // behind is still sitting in `self.records` until its bank is erased, and nothing in
+    // `Journal::dispatch` refuses dispatching against it after a newer bank has taken
+    // authority. That is not a hole in this specification: `continue_as_new` starts a fresh
+    // run that owes the superseded one nothing, so recovery no longer accounting for that
+    // effect is exactly what §10's swap intends rather than a durable-intent breach. This is
+    // the positive claim — reachable, and still `Ok` — that
+    // `every_precondition_holds_up_the_guarantee_it_is_there_for` cannot make on its own,
+    // since a claim about a *legal* transition needing no guard has nothing to remove.
+    let explored = explore(Bound::PROOF, Guards::ENFORCED, CEILING).expect("the proof bound");
+    let dispatched_from_a_retired_bank = explored.states().iter().any(|state| {
+        state.dispatched().iter().any(|id| {
+            state
+                .bank_of(*id)
+                .is_some_and(|bank| Some(bank) != state.recovering_bank())
+        })
+    });
+    assert!(
+        dispatched_from_a_retired_bank,
+        "no reachable state ever dispatched from a bank a later swap retired, so this claim \
+         is about nothing"
+    );
+    assert!(
+        explored.first_breach(&Specified).is_none(),
+        "a dispatch from a retired bank is reachable and the spine proofs are still supposed \
+         to hold, which is asserted again here rather than trusted from tests/spine.rs"
+    );
+}
+
+#[test]
+fn a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts() {
+    // Codex, PR #135 round 4: worried that `durable_intent`'s moot exemption for a dispatch
+    // from a retired bank might be hiding a dispatch that happened *after* the bank was
+    // already retired — which real firmware cannot do, since design document §10's swap
+    // consumes the old run's writer (`crates/waymaker-flash/src/swap.rs`). Answered by
+    // construction: this is the exact "moot" shape (`bank_of(id) != recovering_bank()`),
+    // reached here with `Dispatch(id)` as the fourth transition and the bank not retiring
+    // until two transitions later — an ordinary run dispatching an effect while its own bank
+    // is still the one being written to, only afterward superseded by a swap. A `Journal` is
+    // a snapshot rather than a log, so this state is indistinguishable from one reached by
+    // dispatching after retirement, which is exactly why restricting `Dispatch` to the
+    // current bank (tried directly, see `Journal::dispatch`'s doc comment) changes
+    // `tests/census.rs`'s edge counts and not its `REACHABLE_STATES`: every state the removed
+    // edges could reach is also reachable by the legitimate order built here.
+    let bound = Bound::PROOF;
+    let guards = Guards::ENFORCED;
+    let mut state = Journal::default();
+    state = state
+        .step(Transition::Declare(Role::Schedule), guards, bound)
+        .expect("declare");
+    let id = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id), guards, bound)
+        .expect("program");
+    state = state
+        .step(Transition::Barrier, guards, bound)
+        .expect("barrier");
+    assert_eq!(state.recovering_bank(), Some(BankId::A));
+    state = state
+        .step(Transition::Dispatch(id), guards, bound)
+        .expect("dispatch while A is still the run being written to");
+    state = state
+        .step(Transition::BeginSeal(BankId::B), guards, bound)
+        .expect("begin seal B");
+    state = state
+        .step(Transition::CommitSeal(BankId::B), guards, bound)
+        .expect("commit seal B");
+    assert_eq!(state.recovering_bank(), Some(BankId::B));
+    assert_eq!(state.bank_of(id), Some(BankId::A));
+    assert!(state.dispatched().contains(&id));
+}
+
+#[test]
+fn a_seal_or_erase_interrupted_by_reboot_reaches_no_state_the_uninterrupted_call_could_not() {
+    // Codex, PR #135's next round: `reboot()` leaves `Bank::Sealing`/`Bank::Erasing` exactly
+    // as it found them, so `BeginSeal(B) -> PowerLoss -> Reboot -> CommitSeal(B)` can seal a
+    // bank, and the analogous `BeginErase`/`CommitErase` sequence can blank one, with no
+    // physical operation happening *after* the reboot — argued to let an interrupted, possibly
+    // partial seal or erase become authoritative without ever being redone.
+    //
+    // Investigated the same way as the dispatch finding two tests above, because it has the
+    // same shape: a `Journal` is a snapshot with no memory of *when*, relative to a reboot, a
+    // transition fired, so "sealed/erased via a reboot in the middle" and "sealed/erased with
+    // the power never interrupted at all" are not two states — they are one, if both are
+    // reachable. They are: `BeginSeal(bank) -> CommitSeal(bank)` and
+    // `BeginErase(bank) -> CommitErase(bank)`, with no `PowerLoss`/`Reboot` between them, are
+    // both legal from the same starting points as their interrupted twins and produce
+    // byte-for-byte identical `Journal`s. A guard refusing `CommitSeal`/`CommitErase` across an
+    // intervening reboot would therefore remove edges `tests/census.rs`'s `TRANSITION_EDGES`
+    // pins and change no `REACHABLE_STATES` at all — the same standing this crate already
+    // gives a guard proven removable at no cost, and the same "not a hole, a redundant path"
+    // shape `Journal::dispatch`'s own doc comment records for the analogous dispatch finding.
+    //
+    // It is also not a misrepresentation of the real firmware to leave the redundant path in:
+    // `BeginSeal`'s physical write is already assumed complete when it lands, so a `CommitSeal`
+    // called on a later boot is exactly what real recovery already does by reading the bytes
+    // directly off media, no resumed call required; and `Swap::prepare`'s real erase is a
+    // single unconditional call every time it runs, so however many boots and retries an
+    // erase takes, the boot that finally reaches `Erased` did so via one genuine, uninterrupted
+    // `storage.erase()` — which is exactly what the direct, uninterrupted trace below models.
+    let bound = Bound::PROOF;
+    let guards = Guards::ENFORCED;
+
+    let interrupted_seal = Journal::default()
+        .step(Transition::BeginSeal(BankId::A), guards, bound)
+        .expect("begin seal A")
+        .step(Transition::PowerLoss, guards, bound)
+        .expect("power loss mid-seal")
+        .step(Transition::Reboot, guards, bound)
+        .expect("reboot")
+        .step(Transition::CommitSeal(BankId::A), guards, bound)
+        .expect("commit seal A after the reboot");
+    let uninterrupted_seal = Journal::default()
+        .step(Transition::BeginSeal(BankId::A), guards, bound)
+        .expect("begin seal A")
+        .step(Transition::CommitSeal(BankId::A), guards, bound)
+        .expect("commit seal A with the power never interrupted");
+    assert_eq!(
+        interrupted_seal, uninterrupted_seal,
+        "a seal committed after a reboot reached a state the uninterrupted call could not"
+    );
+
+    let sealed_b = Journal::default()
+        .step(Transition::BeginSeal(BankId::B), guards, bound)
+        .expect("begin seal B")
+        .step(Transition::CommitSeal(BankId::B), guards, bound)
+        .expect("commit seal B, so A is no longer the implicit current bank");
+    let interrupted_erase = sealed_b
+        .step(Transition::BeginErase(BankId::A), guards, bound)
+        .expect("begin erase A")
+        .step(Transition::PowerLoss, guards, bound)
+        .expect("power loss mid-erase")
+        .step(Transition::Reboot, guards, bound)
+        .expect("reboot")
+        .step(Transition::CommitErase(BankId::A), guards, bound)
+        .expect("commit erase A after the reboot");
+    let uninterrupted_erase = sealed_b
+        .step(Transition::BeginErase(BankId::A), guards, bound)
+        .expect("begin erase A")
+        .step(Transition::CommitErase(BankId::A), guards, bound)
+        .expect("commit erase A with the power never interrupted");
+    assert_eq!(
+        interrupted_erase, uninterrupted_erase,
+        "an erase committed after a reboot reached a state the uninterrupted call could not"
+    );
 }
 
 #[test]
