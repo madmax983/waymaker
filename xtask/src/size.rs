@@ -2781,21 +2781,46 @@ fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Bloc
 
 /// The name a `trait` declaration names. Also whether it is `pub`.
 ///
-/// A `pub` trait is reachable from a separate crate. A `pub(crate)` or fully private
-/// trait is not. Reads the line that declares the trait, the same line
-/// [`declaration_kind`] classifies a block from. Returns `None` for a line with no
-/// trait declaration.
+/// A `pub` trait is reachable from a separate crate. Every restricted form —
+/// `pub(crate)`, `pub(super)`, `pub(in a::path)`, or fully private — is not. Reads
+/// the line that declares the trait, the same line [`declaration_kind`] classifies a
+/// block from. Returns `None` for a line with no trait declaration.
 fn trait_declaration(line: &str) -> Option<(&str, bool)> {
     let public = declares_public(line);
-    let rest = line.strip_prefix("pub ").unwrap_or(line);
-    let rest = rest
-        .split_once("(crate)")
-        .map_or(rest, |(_, after)| after.trim_start());
+    let rest = skip_restricted_visibility(line.strip_prefix("pub ").unwrap_or(line));
     let name = rest
         .strip_prefix("trait ")?
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .find(|token| !token.is_empty())?;
     Some((name, public))
+}
+
+/// `line` with a leading `pub(...)` restricted-visibility clause removed.
+///
+/// Covers `pub(crate)`, `pub(super)`, and `pub(in a::path)` alike, balanced across a
+/// nested parenthesis — a path can carry one of its own. Returns `line` unchanged if
+/// it has no leading `pub(...)`.
+fn skip_restricted_visibility(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("pub(") else {
+        return line;
+    };
+    let mut depth: u32 = 1;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    line
 }
 
 /// The names of every non-public trait a crate declares — a bare `trait` or a
@@ -2838,11 +2863,14 @@ fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<Str
 /// group, since a bound can carry a nested `<...>` of its own. Second, the trait's
 /// own generic arguments, so `Storage<T>` names `Storage`.
 ///
-/// A path names its last segment: `crate::sealed::Sealed` names `Sealed`. The second
-/// field is `false` when the path is qualified by anything but `crate`, `self`, or
-/// `super`. `core::fmt::Debug` names an external trait, and its last segment must
-/// never be checked against this crate's own private trait names — a private trait
-/// happening to share that name is a different trait, in a different crate.
+/// A path names its last segment: `crate::sealed::Sealed` and `sealed::Sealed` both
+/// name `Sealed`. The second field is `false` only when the path's first segment is
+/// one of [`EXTERNAL_PATH_ROOTS`] — `core::fmt::Debug` names an external trait, and
+/// its last segment must never be checked against this crate's own private trait
+/// names, a private trait happening to share that name is a different trait, in a
+/// different crate. Every other qualified path — `crate::`, `self::`, `super::`, or a
+/// bare relative path such as `sealed::Sealed` — can still name a trait this crate
+/// itself declares, so its last segment is checked.
 fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
     let (before, _after) = line.split_once(" for ")?;
     let before = before.strip_prefix("impl").unwrap_or(before);
@@ -2860,9 +2888,17 @@ fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
         name = segment;
         qualified = true;
     }
-    let local = !qualified || matches!(first, "crate" | "self" | "super");
+    let local = !qualified || !EXTERNAL_PATH_ROOTS.contains(&first);
     Some((name, local))
 }
+
+/// Path roots no crate in this workspace can declare a module or a trait under.
+///
+/// A qualified trait path starting with one of these is always a foreign trait, so
+/// its name is never checked against this crate's own private trait names. Every
+/// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
+/// can still resolve to a trait this crate declares itself.
+const EXTERNAL_PATH_ROOTS: &[&str] = &["core", "std", "alloc"];
 
 /// Removes one leading `<...>` group from `text`, balanced across any nested pair.
 ///
@@ -6047,6 +6083,66 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_relative_module_path_to_a_private_trait_is_not_required_of_the_probe() {
+        // `sealed::Sealed`, with no `crate`/`self`/`super` prefix, is still a path
+        // this crate can declare a trait under. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_super_traits_methods_are_not_required_of_the_probe() {
+        // `pub(super)` restricts a trait to its parent module. A separate crate has
+        // no path to it either. Codex found this on PR #136.
+        let functions = public_functions(&kernel(
+            "pub(super) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_in_path_traits_methods_are_not_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub(in crate::internal) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_pub_super_trait_is_not_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub(super) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
     }
 
     #[test]
