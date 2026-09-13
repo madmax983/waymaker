@@ -10262,6 +10262,25 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_derived_through_nested_cfg_attr_is_still_rejected() {
+        // `cfg_attr(a, cfg_attr(b, derive(Clone)))` is valid Rust, and rustc derives
+        // `Clone` from it exactly as from a bare `#[derive(Clone)]` once both conditions
+        // hold. Found by Codex review of this change (PR #143): the first version of
+        // this check only unwrapped one level of `cfg_attr` and missed a second.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(all(), cfg_attr(all(), derive(Clone)))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_recovery_with_a_handwritten_clone_impl_is_rejected() {
         // A reviewer told to remove the derive can still write the same defect by hand.
         // `clone` also lands as a new name on the surface pin — unlike a derive, a
@@ -10307,6 +10326,27 @@ mod tests {
              Recovery;\n",
         );
         let violations = check_recovery_surface(&renamed);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_decoy_named_recovery_does_not_save_a_renamed_clone_from_failing_closed() {
+        // Found by Codex review of this change (PR #143): the first version of this
+        // check recursed into every nested `mod` looking for a struct named `Recovery`,
+        // so an unrelated, private `struct Recovery` tucked inside an inner module
+        // satisfied "declared" — and, deriving nothing, answered "not `Clone`" — while
+        // the real exported type, renamed to `Scan` and `Clone`, went unexamined. Only a
+        // struct at this file's top level may answer for `Recovery`.
+        let renamed_with_decoy = recovery_source_with_struct(
+            "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as \
+             Recovery;\nmod hidden {\n    struct Recovery;\n}\n",
+        );
+        let violations = check_recovery_surface(&renamed_with_decoy);
         assert!(
             violations
                 .iter()

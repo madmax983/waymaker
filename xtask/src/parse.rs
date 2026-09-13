@@ -393,10 +393,19 @@ fn collect_trait_implementors(
 /// resolves through the file's `use` aliases and keeps its last segment, so
 /// `use core::clone::Clone as Klon; #[derive(Klon)]` reports `Clone`, the same way
 /// [`trait_implementors`] resolves the trait name of a handwritten `impl`. And a derive
-/// named inside `#[cfg_attr(.., derive(..))]` is read too, whatever the condition is: a
-/// `Clone` that only applies under one build is still a `Clone` under that build, and
-/// reading past the condition rather than evaluating it is what `codec-is-optional`
-/// already does for a compound `cfg`, for the same reason.
+/// named inside `#[cfg_attr(.., derive(..))]` is read too, however deeply `cfg_attr`
+/// nests, and whatever every condition on the way down is: a `Clone` that only applies
+/// under one build is still a `Clone` under that build, and reading past a condition
+/// rather than evaluating it is what `codec-is-optional` already does for a compound
+/// `cfg`, for the same reason.
+///
+/// Only a struct declared at the top level of `contents` is `name`. A private struct of
+/// the same name nested inside a `mod` is a different declaration, not a second sighting
+/// of the one the crate's public API exports under that name — reading it as one is
+/// exactly how a rename survives this pin: a real `Recovery` renamed to `Scan` and
+/// re-exported, sitting beside an unrelated inner `struct Recovery` that derives nothing,
+/// would let the decoy answer "declared, not `Clone`" for a struct nobody exported by
+/// that name.
 ///
 /// # Errors
 ///
@@ -406,74 +415,58 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     let mut aliases = Vec::new();
     collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
     let mut derives = Vec::new();
-    let declared = collect_struct_derives(&file.items, name, &aliases, &mut derives);
-    Ok(declared.then_some(derives))
-}
-
-/// Whether `name` is declared anywhere in `items`, filling `derives` with what it derives.
-fn collect_struct_derives(
-    items: &[syn::Item],
-    name: &str,
-    aliases: &[UseAlias],
-    derives: &mut Vec<String>,
-) -> bool {
     let mut declared = false;
-    for item in items {
+    for item in &file.items {
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
-        match item {
-            syn::Item::Struct(found) if found.ident == name => {
+        if let syn::Item::Struct(found) = item {
+            if found.ident == name {
                 declared = true;
                 for attr in &found.attrs {
-                    collect_derive_names(attr, aliases, derives);
+                    collect_derive_names_from_meta(&attr.meta, &aliases, &mut derives);
                 }
             }
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = module.content.as_ref() {
-                    declared |= collect_struct_derives(nested, name, aliases, derives);
-                }
-            }
-            _ => {}
         }
     }
-    declared
+    Ok(declared.then_some(derives))
 }
 
-/// The trait names `attr` derives, resolved through `aliases`: from a plain
-/// `#[derive(..)]`, or from every `derive(..)` inside a `#[cfg_attr(.., ..)]`.
-fn collect_derive_names(attr: &syn::Attribute, aliases: &[UseAlias], derives: &mut Vec<String>) {
-    if attr.path().is_ident("derive") {
-        if let Ok(paths) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) {
-            push_resolved_names(&paths, aliases, derives);
-        }
-        return;
-    }
-    if !attr.path().is_ident("cfg_attr") {
-        return;
-    }
-    // `cfg_attr(condition, attr, attr, ..)`: the first argument is the condition and
-    // every argument after it applies when the condition holds. Every one is read
-    // regardless of what the condition is, for the reason the doc comment above gives.
-    let Ok(metas) = attr.parse_args_with(
-        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-    ) else {
+/// The trait names `meta` derives, resolved through `aliases`: from a plain
+/// `derive(..)`, or from every `derive(..)` reachable by expanding `cfg_attr(.., ..)`
+/// however many levels deep — `cfg_attr(a, cfg_attr(b, derive(Clone)))` is valid Rust,
+/// and rustc derives `Clone` from it exactly as it would from a bare `#[derive(Clone)]`,
+/// so a scan that only looked one level in would miss it.
+fn collect_derive_names_from_meta(
+    meta: &syn::Meta,
+    aliases: &[UseAlias],
+    derives: &mut Vec<String>,
+) {
+    let syn::Meta::List(list) = meta else {
         return;
     };
-    for meta in metas.into_iter().skip(1) {
-        let syn::Meta::List(list) = &meta else {
-            continue;
-        };
-        if !list.path.is_ident("derive") {
-            continue;
-        }
+    if list.path.is_ident("derive") {
         if let Ok(paths) = list.parse_args_with(
             syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
         ) {
             push_resolved_names(&paths, aliases, derives);
         }
+        return;
+    }
+    if !list.path.is_ident("cfg_attr") {
+        return;
+    }
+    // `cfg_attr(condition, attr, attr, ..)`: the first argument is the condition and
+    // every argument after it applies when the condition holds. Every one is read
+    // regardless of what the condition is, for the reason the doc comment above gives —
+    // including one that is itself a `cfg_attr`, which is why this recurses.
+    let Ok(metas) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return;
+    };
+    for nested in metas.into_iter().skip(1) {
+        collect_derive_names_from_meta(&nested, aliases, derives);
     }
 }
 
