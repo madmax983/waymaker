@@ -12623,6 +12623,32 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_decoy_nested_in_a_module_is_reported_rather_than_shadowing_the_scan_step() {
+        // Issue #62: a `mod lookahead` above `Scan::next` called `decode_with`.
+        // The old scan read only the first `fn next` and missed the real body.
+        // `count_tokens` and `fns_named` scan the whole file. A second `fn next`
+        // is reported even when it sits inside a nested module.
+        let clean = tests_support::clean_integrity_routing();
+        let clean = clean
+            .strip_prefix("//! The codec.\n")
+            .expect("the routing fixture starts with its doc comment");
+        let decoy = format!(
+            "//! d\nmod lookahead {{\n    pub(super) fn {}(rest: &[u8]) -> Option<usize> {{\n        \
+             None\n    }}\n}}\n{clean}",
+            SCAN_STEP.0
+        );
+        let violations = check_integrity_routing(&[layer(INTEGRITY_ROUTING_PATH, &decoy)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains(&format!("`fn {}`", SCAN_STEP.0))
+                && violation.detail.contains("2 times")),
+            "a decoy `fn {}` nested in another module went unreported: {violations:?}",
+            SCAN_STEP.0
+        );
+    }
+
+    #[test]
     fn a_path_qualified_delegation_is_reported() {
         // `count_tokens(body, "crc32") == 1` is satisfied by `fast::crc32(bytes)` calling a
         // Castagnoli loop in a sibling module, with `crc.rs` untouched so the other half of
