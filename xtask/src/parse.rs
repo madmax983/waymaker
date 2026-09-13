@@ -921,11 +921,13 @@ pub enum InlineCode {
 /// `- ` markers, so the ADR field and heading scans run unchanged on the result.
 /// Inline code spans are kept or dropped per [`InlineCode`].
 ///
-/// HTML — a block comment included — is dropped by the parser itself, through the
-/// events this function does not handle, so `contents` may be raw. A caller may
-/// still pre-strip comments for a narrower reason of its own (`check_adr_structure`
-/// does, to avoid two fields fusing across a same-line comment); this function does
-/// not require it.
+/// An HTML comment is dropped, block or inline, so `contents` may be raw. Real,
+/// non-comment HTML is kept verbatim (Codex, pull request #138, round 18): a decision
+/// recorded inside `<div>...</div>` is visible to a reader and a renderer alike, and
+/// dropping it would fail a build over content that renders fine. A caller may still
+/// pre-strip comments for a narrower reason of its own (`check_adr_structure` does, to
+/// avoid two fields fusing across a same-line comment); this function does not
+/// require it.
 #[must_use]
 pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -942,6 +944,14 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // `- ` marker, and reconstructing every item with it regardless of list kind
     // would let an ordered-list example stand in for the real bullet.
     let mut ordered_lists: Vec<bool> = Vec::new();
+    // Whether a multi-line HTML comment, opened by an earlier `Event::Html` line, is
+    // still open (Codex, pull request #138, round 18): real block-level HTML is raw
+    // passthrough with no separate `Event::Text` for its content, one `Event::Html` per
+    // source line, so a comment's own lines have to be tracked the way a fence's are
+    // rather than judged one event at a time. Real, non-comment HTML is kept — a
+    // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
+    // comment, and dropping it would fail a build over content that renders fine.
+    let mut in_html_comment = false;
     for (event, range) in parser {
         let hidden = in_fence || blockquote_depth > 0;
         match event {
@@ -1037,10 +1047,42 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             {
                 out.push('\n');
             }
+            Event::Html(html) => {
+                append_visible_html_line(&html, hidden, &mut in_html_comment, &mut out);
+            }
+            Event::InlineHtml(html) if !hidden && !html.starts_with("<!--") => {
+                out.push_str(&html);
+            }
             _ => {}
         }
     }
     out
+}
+
+/// Appends one `Event::Html` line to `out` unless it is hidden or part of a comment,
+/// tracking a multi-line comment across calls via `in_html_comment`.
+///
+/// Real block-level HTML is raw passthrough with no separate `Event::Text` for its
+/// content — one `Event::Html` per source line — so a comment spanning several lines
+/// has to be tracked the way a fence's lines are, not judged one event at a time; a
+/// self-contained one-line comment never sets `in_html_comment` at all.
+fn append_visible_html_line(
+    html: &str,
+    hidden: bool,
+    in_html_comment: &mut bool,
+    out: &mut String,
+) {
+    if *in_html_comment {
+        if html.contains("-->") {
+            *in_html_comment = false;
+        }
+    } else if html.trim_start().starts_with("<!--") {
+        if !html.contains("-->") {
+            *in_html_comment = true;
+        }
+    } else if !hidden {
+        out.push_str(html);
+    }
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,

@@ -6117,6 +6117,34 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_recorded_inside_real_html_still_counts() {
+        // Codex, pull request #138, round 18: `markdown_prose` dropped every
+        // `Event::Html`/`Event::InlineHtml` outright, comment or not — real block-level
+        // HTML is raw passthrough with no separate `Event::Text` for its content, so a
+        // decision recorded inside `<div>...</div>` (visible to a reader and a
+        // renderer, unlike a comment) was invisible to this check, which then reported
+        // it missing even though the ADR states it plainly.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                // The id is removed from its usual heading and placed instead in a
+                // standalone block-level `<div>`, so the check can only find it through
+                // real (non-comment) HTML rather than through the heading text.
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!("{without_heading_id}\n<div>\n{}\n</div>\n", first.id);
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn ids_hidden_in_an_html_comment_do_not_record_a_decision() {
         // Otherwise an ADR reduced to a title and a block of ids in a comment passes.
         let mut ids = String::new();
