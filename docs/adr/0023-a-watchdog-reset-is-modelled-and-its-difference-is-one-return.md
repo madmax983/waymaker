@@ -51,15 +51,23 @@ dispatches after a power cut and does not after a watchdog reset.
 **RAM survives.** Nothing in `waymaker-fault` models RAM. `waymaker-rig` owns that half,
 because a durable witness is exactly what RAM retention would let a reader skip.
 
-The enumeration is the same shape as the power-cut half at a coarser granularity: a reset
-before every operation, an interior point per *unit* boundary, and one per whole operation. A
-point inside a unit is the boundary above it — the unit completes, so the media are the same
-and the caller is answered the same — and an exhaustive list that counts one crash point twice
-is no longer a count of anything. `a_watchdog_reset_inside_a_unit_is_the_watchdog_reset_at_the_boundary_above_it`
+The enumeration is the same shape as the power-cut half at a coarser granularity for two of
+its three points: an interior point per *unit* boundary, and one per whole operation. The
+third does not match: a watchdog reset offers `None` before *every* operation, where the
+power-cut half reuses the previous operation's `Whole` point instead and stands alone only
+before the first — the `Progress::None` paragraph below states this in full. A point inside a
+unit is the boundary above it — the unit completes, so the media are the same and the caller
+is answered the same — and an exhaustive list that counts one crash point twice is no longer a
+count of anything. `a_watchdog_reset_inside_a_unit_is_the_watchdog_reset_at_the_boundary_above_it`
 measures that; `a_watchdog_reset_at_a_unit_boundary_is_not_the_power_cut_beside_it` measures
-why it stops there. This sentence itself said "before the sequence" until issue #88 caught it
-disagreeing with the `Progress::None` paragraph below. The decision did not change; only the
-summary sentence was wrong.
+why it stops there.
+
+This paragraph first said the whole enumeration was "the same shape as the power-cut half at a
+coarser granularity," with a reset "before the sequence." Issue #88 caught the reset clause as
+stale; correcting it to "before every operation" then left the "same shape" framing wrong for
+that clause, since the `Progress::None` paragraph below already says the reset points differ —
+Codex's review of this pull request caught that. The decision did not change: only this
+paragraph's framing was wrong, twice.
 
 That second test is Codex's, from the first review round on this pull request, and the version
 of this ADR it reviewed had the argument wrong. It said the interior watchdog points were
