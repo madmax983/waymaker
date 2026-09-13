@@ -49,7 +49,7 @@ be superseded.
 | [0038](0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md) | `no_alloc` is a measurement, and the instruction figure is a comparison | accepted |
 | [0039](0039-the-book-quotes-tests-and-the-matrix-is-derived.md) | The book quotes tests, and the matrix is derived | accepted |
 | [0040](0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) | The emulator runs the rig, and attests to no board | accepted |
-| [0041](0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
+| [0043](0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
 
 ## Reading the numbers
 

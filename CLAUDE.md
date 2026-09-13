@@ -1169,7 +1169,7 @@ Stated so that nobody mistakes silence for coverage:
   no device instance here to bind — what disagrees is a bank size and a program granularity,
   both plain numbers a `BankLayout` derived, and two devices of one model agreeing on those
   is the check working rather than the gap issue #84 named.
-  [ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  [ADR 0043](docs/adr/0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
   says which of the two shapes each `WrongDevice` variant is.
 - **That the device handed to the *first* call of a new protocol invocation is the right
   one.** `Journal::stage`, `Recovery::new`/`with_integrity` and `Swap::prepare` are each
@@ -1181,7 +1181,7 @@ Stated so that nobody mistakes silence for coverage:
   once per record over a journal's life can still hand two different same-model chips to two
   separate calls with no refusal. That is a precondition on the caller, the same standing
   `Swap::beginning`'s two unverified arguments already have, and
-  [ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  [ADR 0043](docs/adr/0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
   is where it is argued rather than implied closed.
 - **That a run id a swap installs is one the device has never used.** `SwapError::RunReused`
   compares the next run against the one being retired, which is the adjacent mistake and not
@@ -2823,7 +2823,7 @@ comparison rather than moving to a borrow, and correctly: neither of its two ent
 takes a `storage` argument at all, so there is no device instance there to bind, only a bank
 size and a program granularity that two devices of one model are right to agree on. Every
 `WrongDevice` variant's documentation now says which of the two shapes it is, and
-[ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+[ADR 0043](docs/adr/0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
 is where the choice is argued end to end.
 
 Closing the gap by construction rather than by a wider comparison cost two new functions —

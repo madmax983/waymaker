@@ -1,4 +1,4 @@
-# 0041. A device is a borrow in three modules, and a value in a fourth
+# 0043. A device is a borrow in three modules, and a value in a fourth
 
 - Status: Accepted
 - Date: 2026-09-13
