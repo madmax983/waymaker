@@ -5086,6 +5086,32 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_a_script_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 27: `<script>` and `<style>` are real HTML —
+        // `markdown_prose` previously kept every non-comment HTML block verbatim — but
+        // neither element's body is ever rendered as visible text by a browser. A
+        // marker hidden inside `<script>...</script>` must not settle anything, the
+        // same way one hidden inside an HTML comment does not.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-script.md".to_owned(),
+            contents: format!(
+                "{}\n<script>\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n",
+                clean_adr("hidden in a script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a <script> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the
@@ -5756,6 +5782,15 @@ mod tests {
         // real, complete, one-line field, and `<span>`/`</span>` are not `<br>`.
         let contents = "# ADR\n\n- Status: <span>accepted</span>\n";
         assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_an_attributed_break_tag() {
+        // Codex, pull request #138, round 27: the round-26 fix compared an inline
+        // tag's *entire* trimmed body to `"br"`, so an attribute — `<br class="x">` —
+        // no longer matched and the decoy it should disqualify slipped through.
+        let contents = "# ADR\n\n- Sta<br class=\"x\">tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 
     #[test]

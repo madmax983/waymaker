@@ -952,6 +952,9 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
+    // Whether the open `HtmlBlock` is a `<script>` or `<style>` element, whose body a
+    // reader never sees (Codex, round 27; see `is_non_rendering_html_block`).
+    let mut in_non_rendering_block = false;
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -971,9 +974,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         let container_hidden = in_fence || blockquote_depth > 0;
         let hidden = container_hidden || in_html_comment;
         match event {
-            Event::Start(Tag::List(kind)) => {
-                ordered_lists.push(kind.is_some());
-            }
+            Event::Start(Tag::List(kind)) => ordered_lists.push(kind.is_some()),
             Event::End(TagEnd::List(_)) => {
                 ordered_lists.pop();
             }
@@ -988,13 +989,11 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     out.push('\n');
                 }
             }
-            Event::Start(Tag::CodeBlock(kind)) => {
-                // Only fenced blocks are dropped: the old line scan never removed
-                // indented code blocks, and narrowing what counts as code would
-                // newly blind the gate to prose it used to read.
-                if matches!(kind, CodeBlockKind::Fenced(_)) {
-                    in_fence = true;
-                }
+            // Only fenced blocks are dropped: the old line scan never removed indented
+            // code blocks, and narrowing what counts as code would newly blind the
+            // gate to prose it used to read.
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
+                in_fence = true;
             }
             Event::End(TagEnd::CodeBlock) => {
                 if in_fence {
@@ -1094,7 +1093,11 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             {
                 out.push('\n');
             }
-            Event::Html(html) => {
+            Event::Start(Tag::HtmlBlock) => {
+                in_non_rendering_block = is_non_rendering_html_block(&contents[range.clone()]);
+            }
+            Event::End(TagEnd::HtmlBlock) => in_non_rendering_block = false,
+            Event::Html(html) if !in_non_rendering_block => {
                 append_visible_html_line(&html, container_hidden, &mut in_html_comment, &mut out);
             }
             Event::InlineHtml(html) if !hidden && !html.starts_with("<!--") => {
@@ -1104,6 +1107,26 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         }
     }
     out
+}
+
+/// Whether a `Tag::HtmlBlock`'s own source opens with `<script` or `<style` —
+/// case-insensitively, and only when the tag name ends there rather than continuing
+/// into a longer one (`<scriptx>` does not match).
+///
+/// These are the two HTML elements whose body a browser never renders as visible text
+/// (Codex, pull request #138, round 27); every other tag `markdown_prose` keeps
+/// verbatim because a reader does see it.
+fn is_non_rendering_html_block(source: &str) -> bool {
+    ["script", "style"].iter().any(|tag| {
+        let open = format!("<{tag}");
+        source
+            .get(..open.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&open))
+            && source
+                .as_bytes()
+                .get(open.len())
+                .is_some_and(|&byte| matches!(byte, b'>' | b' ' | b'\t' | b'\n' | b'/'))
+    })
 }
 
 /// Appends one `Event::Html` line to `out`, comment subranges cut out of it, tracking
@@ -1230,17 +1253,22 @@ fn append_text_after_comment_close(
 /// Whether an `Event::InlineHtml`'s text is some spelling of the `<br>` tag — the one
 /// inline HTML element that renders as a line break rather than inline.
 ///
-/// Matched case-insensitively and tolerant of the self-closing spellings `CommonMark`
-/// admits — `<br>`, `<br/>`, `<br />`, `<BR>` — because HTML tag names and the
-/// self-closing slash are exactly the parts a browser (and `pulldown-cmark`) also
-/// ignores case and spacing on. Any other tag, opening or closing, is ordinary inline
-/// formatting that renders with no break at all (Codex, pull request #138, round 26).
+/// Matched case-insensitively on the tag *name* alone, extracted up to the first
+/// whitespace or self-closing slash, so an attribute changes nothing: `<br>`, `<br/>`,
+/// `<br />`, `<BR>` and `<br class="x">` all admit (Codex, pull request #138, rounds 26
+/// and 27) — HTML tag names, attributes, spacing and the self-closing slash are all
+/// parts a browser (and `pulldown-cmark`) ignores when deciding this is a line break.
+/// Any other tag name, opening or closing, is ordinary inline formatting that renders
+/// with no break at all.
 fn is_line_break_tag(html: &str) -> bool {
-    html.trim()
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_suffix('>'))
-        .map(|rest| rest.trim().trim_end_matches('/').trim())
-        .is_some_and(|name| name.eq_ignore_ascii_case("br"))
+    let Some(rest) = html.trim().strip_prefix('<') else {
+        return false;
+    };
+    let rest = rest.strip_suffix('>').unwrap_or(rest);
+    let name_end = rest
+        .find(|character: char| character.is_whitespace() || character == '/')
+        .unwrap_or(rest.len());
+    rest[..name_end].eq_ignore_ascii_case("br")
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
