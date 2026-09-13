@@ -831,12 +831,24 @@ impl<S: StableStorage> Run<'_, S> {
 
         // A caller with nothing to write is not a caller with a bug, and an adapter that
         // refused would push the empty case into every call site above it.
-        let legal = self.storage.read(base, &mut []).is_ok()
+        let mut legal = self.storage.read(base, &mut []).is_ok()
             && self.storage.program(base, &[]).is_ok()
             && self.storage.erase(base, 0).is_ok()
             && self.storage.read(second, &mut []).is_ok()
             && self.storage.program(second, &[]).is_ok()
             && self.storage.erase(second, 0).is_ok();
+
+        // The capacity itself is safe to name here too, but only when the region reaches
+        // it: a clamp a broken adapter applies then lands inside the region the caller
+        // declared expendable, rather than past it — which is exactly the case a
+        // whole-device run is for.
+        if self.region.end() == self.capacity() {
+            let capacity = self.capacity();
+            legal = legal
+                && self.storage.read(capacity, &mut []).is_ok()
+                && self.storage.program(capacity, &[]).is_ok()
+                && self.storage.erase(capacity, 0).is_ok();
+        }
         if !legal {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
