@@ -44,6 +44,10 @@ facade = ["engine", "dep:waymaker-embassy"]
 # `cargo xtask check-layering` requires one of these per layer feature.
 embassy-serde = ["facade", "waymaker-embassy/serde"]
 embassy-postcard = ["embassy-serde", "waymaker-embassy/postcard"]
+# ADR 0010's five checksum candidates, linked in one image so `cargo xtask size` can read
+# each one's own `.text` and `.rodata` for issue #61. Independent of every layer: no
+# `dep:` entry, and off by default like every other cost here.
+crc-candidates = []
 
 [lints]
 workspace = true
