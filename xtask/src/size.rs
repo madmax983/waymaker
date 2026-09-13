@@ -2576,7 +2576,7 @@ pub fn measure_into(
     // since that section carries no row `diff` ever reads, failing the base measurement
     // over it would cost every other row's comparison for a section nobody compares.
     let checksum_candidates = if kernel_state.is_some() || runtime.is_some() {
-        measure_checksum_candidates(root, build_dir, &graph)?
+        Some(measure_checksum_candidates(root, build_dir, &graph)?)
     } else {
         None
     };
@@ -2622,22 +2622,25 @@ fn linked_image(image: &Path) -> Result<(Vec<Section>, Vec<elf::Symbol>), SizeEr
 
 /// ADR 0010's five checksum candidates, measured rather than typed by hand.
 ///
-/// `None` for a checkout whose probe declares no [`CRC_CANDIDATES_FEATURE`] — a checkout
-/// that predates issue #61. Callers measuring a checkout other than the one `xtask` was
-/// built from should not reach this at all, for [`measure_into`]'s reason: the identifiers
-/// this function searches for are compiled into *this* binary from *this* checkout's
-/// source, and matching them against another commit's image is a comparison that means
-/// nothing and can fail on a rename neither side made wrong.
+/// Only ever called for the checkout `xtask` was built from — [`measure_into`] skips this
+/// entirely for a base-branch worktree, because the identifiers this function searches for
+/// are compiled into *this* binary from *this* checkout's source, and matching them
+/// against another commit's image is a comparison that means nothing and can fail on a
+/// rename neither side made wrong. So a caller reaching this function has already
+/// committed to "this checkout ought to have the section," and an undeclared feature here
+/// is a real regression — the probe's `Cargo.toml` and this file's own
+/// [`CHECKSUM_CANDIDATES`] table have drifted apart — refused rather than read as "not
+/// measured", the same way every other missing figure in this report is.
 ///
 /// # Errors
 ///
-/// Returns [`SizeError`] if the checkout declares the feature but the image cannot be
-/// built, read, or attributed candidate by candidate.
+/// Returns [`SizeError`] if the checkout's probe declares no [`CRC_CANDIDATES_FEATURE`],
+/// or if the image cannot be built, read, or attributed candidate by candidate.
 fn measure_checksum_candidates(
     root: &Path,
     build_dir: &Path,
     graph: &PackageGraph,
-) -> Result<Option<Vec<ChecksumCandidate>>, SizeError> {
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
     let declared = graph.find(PROBE_PACKAGE).is_some_and(|package| {
         package
             .features
@@ -2645,7 +2648,9 @@ fn measure_checksum_candidates(
             .any(|feature| feature == CRC_CANDIDATES_FEATURE)
     });
     if !declared {
-        return Ok(None);
+        return Err(SizeError::new(format!(
+            "`{PROBE_PACKAGE}` declares no `{CRC_CANDIDATES_FEATURE}` feature, so ADR 0010's checksum candidates cannot be measured on the checkout `xtask` was built from"
+        )));
     }
 
     let variant = Variant {
@@ -2659,7 +2664,7 @@ fn measure_checksum_candidates(
     check_symbols_are_not_measured(&sections).map_err(|err| {
         SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
     })?;
-    checksum_candidate_sizes(&symbols).map(Some)
+    checksum_candidate_sizes(&symbols)
 }
 
 /// Links one image and returns the path to it.
@@ -5086,16 +5091,26 @@ mod tests {
     }
 
     #[test]
-    fn measure_checksum_candidates_skips_the_build_for_a_checkout_that_predates_the_feature() {
-        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`
-        // — every checkout before issue #61, base-branch worktrees included. A caller that
-        // tried to build it anyway would fail here, because neither path names a real
-        // workspace: the guard has to answer `None` before `build_variant` is ever reached.
+    fn measure_checksum_candidates_refuses_a_checkout_with_no_crc_candidates_feature() {
+        // Codex review on PR #133: `measure_into` only ever calls this function for the
+        // checkout `xtask` was built from — a base-branch worktree is skipped one level up,
+        // before this is reached at all (see `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`, which drives that guard against the real
+        // workspace). So a call that lands here with the feature undeclared is not "this
+        // checkout predates issue #61" — it is `size.rs`'s own `CHECKSUM_CANDIDATES` table
+        // and the probe's `Cargo.toml` having drifted apart, and has to fail loudly rather
+        // than silently report nothing.
+        //
+        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`.
+        // The refusal has to come before `build_variant` is ever reached, which is what a
+        // bogus path proves: a caller that tried to build it anyway would fail on the path
+        // rather than on the feature, and this asserts the feature message instead.
         let bogus = Path::new("/does/not/exist/waymaker-size-checksum-candidates-fixture");
-        let result = measure_checksum_candidates(bogus, bogus, &probe_graph());
-        assert_eq!(
-            result.expect("a checkout with no `crc-candidates` feature must not fail"),
-            None
+        let error = measure_checksum_candidates(bogus, bogus, &probe_graph())
+            .expect_err("a checkout with no `crc-candidates` feature must not be read as `None`");
+        assert!(
+            error.to_string().contains(CRC_CANDIDATES_FEATURE),
+            "{error}"
         );
     }
 
