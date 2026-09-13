@@ -45,17 +45,12 @@ fn a_live_device_can_swap_banks_behind_a_torn_record_with_no_power_loss() {
             .records()
             .iter()
             .find(|record| record.media == OnMedia::Partial && record.bank != authoritative)?;
-        Some((state, authoritative, torn.id))
+        Some((state, authoritative, torn))
     });
-    let (state, authoritative, torn_id) = compacted.expect(
+    let (state, authoritative, torn) = compacted.expect(
         "no reachable state has a torn record abandoned in a retired bank on a still-powered \
          device — the live compaction this file exists to prove has no witness",
     );
-    let torn = state
-        .records()
-        .iter()
-        .find(|record| record.id == torn_id)
-        .expect("torn_id came from this same state's records");
     assert_ne!(
         torn.bank, authoritative,
         "the torn record is in the bank recovery would boot from, which is not compaction — \
@@ -87,10 +82,9 @@ fn a_seal_on_the_surviving_bank_is_legal_with_a_torn_record_still_on_the_other_o
     // than argued: a `BeginSeal` on the blank bank stays legal even from a state where a live,
     // still-powered device has a torn record sitting in the bank it is about to abandon.
     let explored = proof_space();
-    let mut found = false;
-    for state in explored.states() {
+    let witness = explored.states().iter().find_map(|state| {
         if !(state.powered() && state.has_torn_record()) {
-            continue;
+            return None;
         }
         let torn_bank = state
             .records()
@@ -100,7 +94,7 @@ fn a_seal_on_the_surviving_bank_is_legal_with_a_torn_record_still_on_the_other_o
             .bank;
         let blank = torn_bank.other();
         if state.bank(blank) != waymaker_spec::model::Bank::Erased {
-            continue;
+            return None;
         }
         let sealed = state
             .step(
@@ -109,17 +103,11 @@ fn a_seal_on_the_surviving_bank_is_legal_with_a_torn_record_still_on_the_other_o
                 Bound::PROOF,
             )
             .expect("sealing the blank bank does not consult the torn record elsewhere");
-        assert_eq!(
-            sealed.bank(torn_bank),
-            state.bank(torn_bank),
-            "sealing changed the other bank"
-        );
-        found = true;
-        break;
-    }
-    assert!(
-        found,
+        Some((state.bank(torn_bank), sealed.bank(torn_bank)))
+    });
+    let (before, after) = witness.expect(
         "no reachable, still-powered, torn-record state had a blank bank to seal — this test \
-         is about nothing"
+         is about nothing",
     );
+    assert_eq!(before, after, "sealing changed the other bank");
 }

@@ -518,25 +518,23 @@ impl Journal {
 
     /// Which bank a new record declared right now would belong to.
     ///
-    /// The sole authoritative bank once any bank has sealed, or [`BankId::A`] by convention
-    /// before the device's first seal — the same convention [`Journal::new`] and
-    /// [`from_parts`](Self::from_parts) already carry, since a rung-0.1 device has exactly one
-    /// implicit bank. Total rather than an `Option`: a live writer always has somewhere to
-    /// write, even under a relaxed [`Guards`] where authority is momentarily ambiguous.
+    /// [`recovering_bank`](Self::recovering_bank)'s answer, or [`BankId::A`] when that is
+    /// `None`: a live writer always has somewhere to write, even under a relaxed [`Guards`]
+    /// where authority is momentarily absent or ambiguous, which is what makes this total
+    /// rather than an `Option`.
     fn current_bank(&self) -> BankId {
-        match self.authoritative().as_slice() {
-            [one] => *one,
-            _ => BankId::A,
-        }
+        self.recovering_bank().unwrap_or(BankId::A)
     }
 
     /// Which bank a reader would recover from right now, or `None` if there is nothing safe
     /// to boot.
     ///
-    /// [`BankId::A`] by the same convention as `current_bank` before the first seal; the sole
-    /// authoritative bank once one exists; `None` when authority is absent or ambiguous,
-    /// matching [`Invariant::SingleAuthority`](crate::invariant::Invariant::SingleAuthority)'s
-    /// own refusal to pick one.
+    /// [`BankId::A`] by convention before the device's first seal — the same convention
+    /// [`Journal::new`] and `from_parts` already carry, since a rung-0.1
+    /// device has exactly one implicit bank; the sole authoritative bank once one exists;
+    /// `None` when authority is absent or ambiguous, matching
+    /// [`Invariant::SingleAuthority`](crate::invariant::Invariant::SingleAuthority)'s own
+    /// refusal to pick one.
     #[must_use]
     pub fn recovering_bank(&self) -> Option<BankId> {
         if !self.sealed_once {
@@ -566,12 +564,10 @@ impl Journal {
     /// clause instead of being compared against a run it does not belong to.
     #[must_use]
     pub fn declared(&self) -> Vec<RecordId> {
-        let Some(bank) = self.recovering_bank() else {
-            return Vec::new();
-        };
+        let bank = self.recovering_bank();
         self.records
             .iter()
-            .filter(|record| record.bank == bank)
+            .filter(|record| Some(record.bank) == bank)
             .map(|record| record.id)
             .collect()
     }
@@ -662,12 +658,10 @@ impl Journal {
     /// reader the proofs quantify over and the reader this type describes cannot drift.
     #[must_use]
     pub fn recover(&self) -> Vec<RecordId> {
-        let Some(bank) = self.recovering_bank() else {
-            return Vec::new();
-        };
+        let bank = self.recovering_bank();
         self.records
             .iter()
-            .filter(|record| record.bank == bank)
+            .filter(|record| Some(record.bank) == bank)
             .take_while(|record| record.is_recoverable())
             .map(|record| record.id)
             .collect()

@@ -231,10 +231,11 @@ fn a_dispatch_from_a_bank_a_swap_has_since_retired_is_moot_rather_than_a_breach(
     // since a claim about a *legal* transition needing no guard has nothing to remove.
     let explored = explore(Bound::PROOF, Guards::ENFORCED, CEILING).expect("the proof bound");
     let dispatched_from_a_retired_bank = explored.states().iter().any(|state| {
-        state
-            .dispatched()
-            .iter()
-            .any(|id| state.bank_of(*id).is_some() && state.bank_of(*id) != state.recovering_bank())
+        state.dispatched().iter().any(|id| {
+            state
+                .bank_of(*id)
+                .is_some_and(|bank| Some(bank) != state.recovering_bank())
+        })
     });
     assert!(
         dispatched_from_a_retired_bank,

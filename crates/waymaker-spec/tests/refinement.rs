@@ -485,9 +485,9 @@ fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
     // Written down as a test rather than left to be discovered. `Observation` carries no
     // banks, so `reconstructed` builds a state that has never sealed, and `SingleAuthority`
     // returns `Ok` for it whatever history it is handed — including one that is pure
-    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank` is one, and abstracting it is still owed — gets three
-    // guarantees judged and the fourth answered for free, and this is the assertion that
-    // says so out loud.
+    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank`
+    // is one, and abstracting it is still owed — gets three guarantees judged and the fourth
+    // answered for free, and this is the assertion that says so out loud.
     let nonsense = [RecordId(99), RecordId(7)];
     for run in drive(journal) {
         let observed = abstraction(run.ledger(), &[], role_of);
