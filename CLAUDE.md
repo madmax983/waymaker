@@ -3124,3 +3124,20 @@ rather than left to read as though the earlier, wider claim still held. Closing 
 needs a writer that both declares records and performs a real two-bank swap — the two things
 `crates/waymaker-fault/tests/banks.rs` and `tests/refinement.rs`'s two existing halves each
 do on their own — refined together the way each already is separately.
+
+A merge-time round found a second real bug beside the ADR staleness above: `durable_intent`'s
+own retired-bank exemption compared `bank_of(intent) != recovering_bank()`, and `bank_of`
+answers `None` when `intent` names no record at all — not only when it names one in a bank
+other than the one recovery would boot from. `None != Some(bank)` took the same branch as a
+genuine retired-bank mismatch, so a dispatched effect with no schedule record on media
+*anywhere* was silently exempted rather than breaching, even though `refine::abstraction`'s
+`dispatched` parameter is documented to report exactly that shape on purpose — "an effect
+that reached the world" independent of what the ledger holds, so a run whose effect left
+nothing recoverable behind can be described and judged rather than shrugged off as moot. The
+fix only takes the exemption when `bank_of` answers `Some(bank)` that disagrees with
+`recovering_bank()`, via `is_some_and`; `a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot`
+in `tests/refinement.rs` is the regression, verified to fail against the old check. No
+reachable state changes: `Journal::dispatch` refuses a `Transition::Dispatch` naming a record
+that does not exist, so `explore()`'s exhaustive search never produces the shape this bug
+needed — only a hand-built `Observation`, of the kind `refine::abstraction` exists to build
+from a real crashed device, could reach it.
