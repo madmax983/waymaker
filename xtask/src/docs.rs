@@ -1808,7 +1808,12 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
     // Fences as well as comments, for the reason the ADR half strips them: a fenced example
     // listing the six ids would otherwise satisfy every check below in a file whose table
     // has been deleted.
-    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — the escaped example a
+    // `\|`-written row renders to is indistinguishable from a real one once the backslash
+    // is gone, and a real GFM table needs a delimiter row an escaped example never has
+    // (issue #82's continuation).
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for clause in SPEC_CLAUSES {
         // The clause's own table row, found by its backticked id — not three global
@@ -1816,10 +1821,10 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // PR #58 and which bites harder here: four of the six clauses name the same proof
         // file, so a whole-file check for `tests/spine.rs` is satisfied by any one of their
         // rows on behalf of all four.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -1864,7 +1869,7 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         }
     }
     let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "recovery-spec",
             "clause count",
@@ -2072,17 +2077,19 @@ fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violat
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own table row, found by its backticked id. Not three whole-file
         // `contains` calls, for the reason the recovery half is written this way: four of
         // the six clauses share a discharge, so a file-wide check for "the in-process suite"
         // is satisfied by one row on behalf of all of them.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2131,7 +2138,7 @@ fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violat
         "All {} storage-contract clauses",
         STORAGE_CONTRACT_CLAUSES.len()
     );
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "storage-conformance",
             "clause count",
@@ -2151,16 +2158,18 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              and what it can observe are choices nobody wrote down",
         )];
     };
-    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(&adr.contents);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own row, as in the `CLAUDE.md` half. The ADR states what discharges
         // each clause in a table of its own; checking only the id would let that table say
         // the opposite of the one it is a record of.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2287,7 +2296,11 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for field in ADR_REQUIRED_FIELDS {
-            if !prose.lines().any(|line| line.starts_with(field)) {
+            // Read as a real list item, not a rendered line (issue #82's continuation): a
+            // field shown escaped as an example, `\- Status: accepted`, must not satisfy
+            // the presence check a real `- Status:` line is meant to pass.
+            let name = field.trim_start_matches("- ");
+            if crate::parse::unordered_list_item_value(&adr.contents, name).is_none() {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -2299,7 +2312,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         // The template's placeholder is the one status that is allowed to be
         // unrecognised, because the template records no decision.
         let is_template = adr_number(&adr.name) == Some(0);
-        if let Some(status) = adr_status(&prose) {
+        if let Some(status) = adr_status(&adr.contents) {
             if !is_template && !ADR_STATUSES.contains(&status.as_str()) {
                 violations.push(Violation::new(
                     "adr-structure",
@@ -2313,24 +2326,20 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         // A non-template ADR's date has to be a `YYYY-MM-DD` the index can sort, not just
-        // a non-empty line (issue #51e): `- Date:` with no value used to pass the
-        // `starts_with` presence check above, and `- Date: yesterday` passed it too.
-        if !is_template && prose.lines().any(|line| line.starts_with("- Date:")) {
-            let date = prose
-                .lines()
-                .find_map(|line| line.strip_prefix("- Date:"))
-                .unwrap_or_default()
-                .trim();
-            if !is_adr_date(date) {
-                violations.push(Violation::new(
-                    "adr-structure",
-                    adr.name.clone(),
-                    format!(
-                        "has no usable `- Date:`: `{date}` is not a `YYYY-MM-DD` the index \
-                         can sort"
-                    ),
-                ));
-            }
+        // a non-empty line (issue #51e): `- Date:` with no value used to pass the presence
+        // check above, and `- Date: yesterday` passed it too.
+        if !is_template
+            && let Some(date) = crate::parse::unordered_list_item_value(&adr.contents, "Date:")
+            && !is_adr_date(&date)
+        {
+            violations.push(Violation::new(
+                "adr-structure",
+                adr.name.clone(),
+                format!(
+                    "has no usable `- Date:`: `{date}` is not a `YYYY-MM-DD` the index \
+                     can sort"
+                ),
+            ));
         }
 
         for heading in ADR_REQUIRED_HEADINGS {
@@ -2349,15 +2358,14 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
 
 /// The lowercased value of an ADR's `- Status:` line, if it has one.
 ///
-/// Strips fenced code and HTML comments first, for `hardware-attestation`'s and
-/// `deferred-questions`' reason: a decoy `- Status: accepted` shown as an example, or
-/// hidden in a comment, must not out-rank the real line.
+/// Reads the parser's own list-item events (`parse::unordered_list_item_value`), for
+/// `hardware-attestation`'s and `deferred-questions`' reason: a decoy `- Status: accepted`
+/// shown as an example, hidden in a comment, or written escaped as `\- Status: accepted` to
+/// display the field's syntax, must not out-rank the real line. A rendered-prose line scan
+/// cannot tell the escaped decoy from a real item once the backslash is gone; this can,
+/// because the decoy is never a `Tag::Item` in the first place.
 fn adr_status(contents: &str) -> Option<String> {
-    crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep)
-        .lines()
-        .map(str::trim_start)
-        .find_map(|line| line.strip_prefix("- Status:"))
-        .map(|status| status.trim().to_lowercase())
+    crate::parse::unordered_list_item_value(contents, "Status:").map(|status| status.to_lowercase())
 }
 
 /// Whether `date` is a `YYYY-MM-DD` the ADR index can sort on.
@@ -2767,14 +2775,17 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
 
     // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
     // every target id would otherwise satisfy this check in a file whose table is gone.
-    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
 
     for target in HARDWARE_TARGETS {
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", target.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", target.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2820,7 +2831,7 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
     }
 
     let count = format!("{} hardware target", HARDWARE_TARGETS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "hardware-attestation",
             "target count",
@@ -3204,13 +3215,16 @@ fn check_failure_rows_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for row in FAILURE_ROWS {
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", row.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains(&format!("`{}`", row.id)))
             .collect();
         let [line] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -3246,7 +3260,7 @@ fn check_failure_rows_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         }
     }
     let count = format!("All {} failure rows", FAILURE_ROWS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "failure-matrix",
             "row count",
@@ -3362,7 +3376,10 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
 
     // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
     // every question id would otherwise satisfy this check in a file whose table is gone.
-    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
 
     for question in DEFERRED_QUESTIONS {
@@ -3375,10 +3392,10 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
         // And a *table* row rather than any line, which Codex caught in the round after
         // that: prose mentioning an id above the table shadowed the row, which fails a
         // correct file and passes one whose row has gone stale.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", question.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", question.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -3425,7 +3442,7 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
     }
 
     let count = format!("{} deferred question", DEFERRED_QUESTIONS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "deferred-questions",
             "question count",
@@ -4131,7 +4148,14 @@ pub mod tests_support {
     }
 
     /// The checked tables of a clean `CLAUDE.md`: questions, targets, clauses and rows.
+    ///
+    /// Every table gets its own header and delimiter row, and a blank line separates it
+    /// from the prose on either side: `table_rows` reads real `pulldown-cmark` table
+    /// events (issue #82's continuation), and a real GFM table needs both — without a
+    /// blank line, a table does not end at the next sentence or the next table's header,
+    /// it keeps swallowing them as more of its own rows.
     fn tables(body: &mut String) {
+        body.push('\n');
         line(body, format_args!("| Id | Question | Where it stands |"));
         line(body, format_args!("| --- | --- | --- |"));
         for question in DEFERRED_QUESTIONS {
@@ -4145,10 +4169,12 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} deferred questions.", DEFERRED_QUESTIONS.len()),
         );
+        body.push('\n');
         line(body, format_args!("| Id | Target | Where it stands |"));
         line(body, format_args!("| --- | --- | --- |"));
         for target in HARDWARE_TARGETS {
@@ -4162,10 +4188,14 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} hardware targets.", HARDWARE_TARGETS.len()),
         );
+        body.push('\n');
+        line(body, format_args!("| Id | Guarantee | Discharged by |"));
+        line(body, format_args!("| --- | --- | --- |"));
         for clause in SPEC_CLAUSES {
             line(
                 body,
@@ -4175,10 +4205,14 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} recovery invariants.", SPEC_CLAUSES.len()),
         );
+        body.push('\n');
+        line(body, format_args!("| Id | Sentence | Discharged by |"));
+        line(body, format_args!("| --- | --- | --- |"));
         for clause in STORAGE_CONTRACT_CLAUSES {
             line(
                 body,
@@ -4190,6 +4224,7 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!(
@@ -4197,6 +4232,12 @@ pub mod tests_support {
                 STORAGE_CONTRACT_CLAUSES.len()
             ),
         );
+        body.push('\n');
+        line(
+            body,
+            format_args!("| Id | Failure point | Discharged on the model by | On the rig |"),
+        );
+        line(body, format_args!("| --- | --- | --- | --- |"));
         for row in FAILURE_ROWS {
             line(
                 body,
@@ -4209,6 +4250,7 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} failure rows.", FAILURE_ROWS.len()),
@@ -5154,15 +5196,18 @@ mod tests {
             question.headline,
             question.render_status()
         );
-        let prose_only = clean_claude_md(RULES).replace(
-            &row,
-            &format!(
-                "`{}` {} {} — stated in prose, in no table at all",
-                question.id,
-                question.headline,
-                question.render_status()
-            ),
+        let prose = format!(
+            "`{}` {} {} — stated in prose, in no table at all.\n",
+            question.id,
+            question.headline,
+            question.render_status()
         );
+        // The row's own line is removed outright, not replaced in place: a line with no
+        // pipes sitting where a table row was expected does not end the table, it becomes
+        // another (mangled) row of it — `table_rows` reads real `Tag::TableRow` events, and
+        // the prose has to sit outside any table to test what it claims to (issue #82's
+        // continuation). The remaining rows stay one real, unbroken table.
+        let prose_only = clean_claude_md(RULES).replace(&format!("{row}\n"), "") + "\n" + &prose;
         let violations = check_deferred_questions(Some(&prose_only), &clean_inputs(RULES).adrs);
         assert!(
             violations.iter().any(|v| v.subject == question.id),
@@ -5596,6 +5641,17 @@ mod tests {
         // with `- ` regardless of the source marker, so `* Status: accepted` shown
         // as an example became indistinguishable from a real `- ` bullet.
         let contents = "# ADR\n\n* Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_written_escaped() {
+        // Codex, pull request #138, round 12: an escaped marker, `\- Status: accepted`,
+        // unescapes to text that reads like a real bullet once rendered — `markdown_prose`
+        // could not tell it from a real `Tag::Item`, because the backslash that would have
+        // said otherwise is already gone. Reading the parser's own item events instead
+        // means the escaped line never became an item to begin with.
+        let contents = "# ADR\n\n\\- Status: accepted\n\n- Status: proposed\n";
         assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 
@@ -6493,6 +6549,31 @@ mod tests {
             violations
                 .iter()
                 .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_shown_as_an_escaped_pipe_example_does_not_vouch_for_it() {
+        // Codex, pull request #138, round 12: `\|`-escaped prose meant to *show* a row's
+        // syntax unescapes to text indistinguishable from a real row once rendered, and a
+        // rendered-line scan for a line starting with `|` cannot tell the two apart —
+        // `markdown_prose` reconstructs the escaped example as a paragraph reading
+        // `| \`id\` | headline | proof |`, backslash gone. A real GFM table needs a header
+        // row and a delimiter row of dashes, which a lone escaped line in prose never has,
+        // so reading real `Tag::TableRow` events instead leaves the example invisible
+        // rather than merely outranked by a real row that also happens to exist.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "\\| `{}` \\| {} \\| {} \\|\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
             "{violations:?}"
         );
     }
@@ -7750,7 +7831,11 @@ mod tests {
                 .find(|line| line.contains(&format!("`{}`", row.id)))
                 .unwrap_or_default()
                 .to_owned();
-            format!("{md}\n{line}\n")
+            // Doubled as a second row of the same real table, not appended after the
+            // document's last blank line: a `table_rows` reads real `Tag::TableRow`
+            // events, and a line dangling with no header and delimiter above it is not
+            // one (issue #82's continuation).
+            md.replacen(&format!("{line}\n"), &format!("{line}\n{line}\n"), 1)
         });
         assert!(
             matrix_violations(&doubled)

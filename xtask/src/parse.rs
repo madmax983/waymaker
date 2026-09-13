@@ -1145,6 +1145,149 @@ pub fn visible_source(contents: &str) -> String {
     out
 }
 
+/// The text after `prefix` in the first non-hidden list item marked with a literal `-`.
+///
+/// `unordered_list_item_value(contents, "Status:")` reads an ADR's `- Status: accepted`
+/// as `"accepted"`. Reads the parser's own `Tag::Item` events rather than scanning
+/// [`markdown_prose`]'s
+/// rendered lines, for the limit stated there: an escaped marker like `\- Status: accepted`
+/// unescapes to text that reads like a bullet once rendered, and a line scan over that
+/// output cannot tell it from a real list item — this can, because the escaped line
+/// produces no `Tag::Item` event at all, only paragraph text (issue #82's continuation).
+/// Fenced code blocks and blockquotes are hidden, and HTML — a comment included — is
+/// dropped by the parser itself, for [`markdown_prose`]'s reason: a decoy value shown as a
+/// worked example, or hidden away, must not out-rank the real one.
+///
+/// The marker itself is read back from the source at the item's own range, the way
+/// [`markdown_prose`] reads it, rather than assumed: an ADR field is always written `- `,
+/// so an example deliberately marked `*` or `1.` to read as a worked case rather than the
+/// real field stays a decoy, exactly as it would once rendered.
+///
+/// Only the item's own text is read, so a value split across a hard break or held in a
+/// nested block is not reconstructed — an ADR field is one line, and that is what this is
+/// for.
+#[must_use]
+pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String> {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+    let mut in_fence = false;
+    let mut blockquote_depth: u32 = 0;
+    let mut collecting = false;
+    let mut item = String::new();
+
+    for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
+        let hidden = in_fence || blockquote_depth > 0;
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                if matches!(kind, CodeBlockKind::Fenced(_)) {
+                    in_fence = true;
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => in_fence = false,
+            Event::Start(Tag::Item) if !hidden => {
+                let marker = contents[range.start..].chars().next();
+                if marker == Some('-') {
+                    collecting = true;
+                    item.clear();
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if collecting {
+                    collecting = false;
+                    if let Some(value) = item.strip_prefix(prefix) {
+                        return Some(value.trim().to_owned());
+                    }
+                }
+            }
+            Event::Text(text) if collecting => item.push_str(&text),
+            Event::Code(code) if collecting => {
+                item.push('`');
+                item.push_str(&code);
+                item.push('`');
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every real Markdown table row in `contents`, rendered as `| cell | cell | ... |` with
+/// inline code backticks kept, in source order.
+///
+/// Enables `pulldown-cmark`'s GFM table extension, so a row exists only where the source
+/// forms a real table — a header line followed by its delimiter row of dashes. A line that
+/// merely starts with `|` is not one: `markdown_prose`'s line scan could not tell a real row
+/// from an escaped example written to *show* the row syntax, `\| id \| headline \| proof \|`,
+/// because unescaping and reconstructing prose happen before either line reaches a reader —
+/// the backslash is gone and the two are the same text. A table walk is structural instead:
+/// an escaped example forms no `Tag::TableRow` at all, table syntax or not, so it is invisible
+/// here rather than merely dropped after being read as one (issue #82's continuation).
+///
+/// Fenced code blocks and blockquotes are hidden, for [`markdown_prose`]'s reason: a real
+/// table quoted inside either must not stand in for the document's own.
+#[must_use]
+pub fn table_rows(contents: &str) -> Vec<String> {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+    let mut rows = Vec::new();
+    let mut in_fence = false;
+    let mut blockquote_depth: u32 = 0;
+    let mut in_row = false;
+    let mut row = String::new();
+    let mut cell = String::new();
+
+    for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
+        let hidden = in_fence || blockquote_depth > 0;
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                if matches!(kind, CodeBlockKind::Fenced(_)) {
+                    in_fence = true;
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => in_fence = false,
+            Event::Start(Tag::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) if !hidden => {
+                in_row = true;
+                row.clear();
+                row.push('|');
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) if !hidden => {
+                if in_row {
+                    rows.push(row.clone());
+                }
+                in_row = false;
+            }
+            Event::Start(Tag::TableCell) if in_row => {
+                cell.clear();
+            }
+            Event::End(TagEnd::TableCell) if in_row => {
+                row.push(' ');
+                row.push_str(cell.trim());
+                row.push_str(" |");
+            }
+            Event::Text(text) if in_row => cell.push_str(&text),
+            Event::Code(code) if in_row => {
+                cell.push('`');
+                cell.push_str(&code);
+                cell.push('`');
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
 /// Every `marker` claim in `contents`, in source order.
 ///
 /// The shared reader for the marker lines the rules track: `Settles deferred
