@@ -1044,7 +1044,105 @@ impl<S: StableStorage> Run<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ERASED, pattern};
+    use super::{ERASED, Report, Run, pattern};
+    use crate::region::Region;
+    use waymaker_fault::Device;
+    use waymaker_flash::storage::{Geometry, StableStorage};
+
+    const UNIT: u32 = 4;
+    const ERASE_SIZE: u32 = 256;
+
+    /// Three whole erase blocks, which is what [`Region::whole_device`] requires and more
+    /// than the widest span either test below scans.
+    fn geometry() -> Geometry {
+        let Ok(geometry) = Geometry::new(3 * ERASE_SIZE, ERASE_SIZE, UNIT, 1) else {
+            unreachable!("768 is three whole 256-byte blocks of 4-byte units")
+        };
+        geometry
+    }
+
+    /// A [`Run`] over `device`, scratching in `buffer` — built directly rather than
+    /// through [`run`] because these tests exist to pin the private chunking `media_matches`
+    /// does internally, at buffer sizes narrower than, equal to and wider than the span
+    /// scanned, which [`run`]'s own `SuiteError::BufferTooSmall` floor does not let a caller
+    /// choose freely below two program units.
+    fn run_over<'a>(device: &'a mut Device, buffer: &'a mut [u8]) -> Run<'a, Device> {
+        let Ok(region) = Region::whole_device(geometry()) else {
+            unreachable!("geometry() is three whole erase blocks")
+        };
+        Run {
+            storage: device,
+            region,
+            buffer,
+            unit: UNIT as usize,
+            report: Report::new(),
+        }
+    }
+
+    /// `media_is_erased` has to agree with "every byte is [`ERASED`]" — and detect a lone
+    /// programmed unit — at every buffer size this chunking optimization changes the
+    /// grouping of: narrower than the span, exactly a unit, exactly the whole span, and
+    /// wider than the span. And at every unit position inside the span, including the
+    /// first, an interior one, and the last — the one a narrow buffer puts in its own
+    /// trailing chunk and a wide one does not.
+    #[test]
+    fn media_is_erased_agrees_at_every_buffer_size_and_unit_position() {
+        const UNITS_IN_SPAN: u32 = 5;
+        let span = UNITS_IN_SPAN * UNIT;
+
+        for buffer_len in [
+            UNIT as usize,
+            (2 * UNIT) as usize,
+            span as usize,
+            (span * 3) as usize,
+        ] {
+            for programmed_unit in 0..UNITS_IN_SPAN {
+                let mut device = Device::new(geometry());
+                // Programming can only clear bits from the erased baseline, so this is what
+                // one non-erased unit looks like on real media.
+                let programmed = [ERASED & 0xFE, ERASED, ERASED, ERASED];
+                device
+                    .program(programmed_unit * UNIT, &programmed)
+                    .expect("a unit-aligned program inside the span");
+
+                let mut buffer = [0_u8; 4096];
+                let mut run = run_over(&mut device, &mut buffer[..buffer_len]);
+                assert_eq!(
+                    run.media_is_erased(0, span),
+                    Some(false),
+                    "buffer_len={buffer_len} programmed_unit={programmed_unit}"
+                );
+            }
+
+            let mut device = Device::new(geometry());
+            let mut buffer = [0_u8; 4096];
+            let mut run = run_over(&mut device, &mut buffer[..buffer_len]);
+            assert_eq!(
+                run.media_is_erased(0, span),
+                Some(true),
+                "buffer_len={buffer_len} freshly erased"
+            );
+        }
+    }
+
+    /// A span that is not a whole number of chunks still gets checked completely — the
+    /// remainder the internal loop's last iteration leaves over is neither skipped nor
+    /// double-counted — at every buffer size.
+    #[test]
+    fn media_is_erased_covers_a_span_that_is_not_a_whole_number_of_chunks() {
+        for buffer_len in [UNIT as usize, (3 * UNIT) as usize, 4096_usize] {
+            for span in [1_u32, UNIT - 1, UNIT + 1, UNIT * 3 + 1, ERASE_SIZE - 1] {
+                let mut device = Device::new(geometry());
+                let mut buffer = [0_u8; 4096];
+                let mut run = run_over(&mut device, &mut buffer[..buffer_len]);
+                assert_eq!(
+                    run.media_is_erased(0, span),
+                    Some(true),
+                    "buffer_len={buffer_len} span={span}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_pattern_byte_is_programmable_from_erased_and_is_not_the_erased_byte() {
