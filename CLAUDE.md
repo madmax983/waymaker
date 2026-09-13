@@ -3141,3 +3141,17 @@ reachable state changes: `Journal::dispatch` refuses a `Transition::Dispatch` na
 that does not exist, so `explore()`'s exhaustive search never produces the shape this bug
 needed — only a hand-built `Observation`, of the kind `refine::abstraction` exists to build
 from a real crashed device, could reach it.
+
+The next round found a third: `Journal::reconstructed` passed `observation.sealed_once`
+straight through with no check against `observation.banks`, so a hand-built `Observation`
+could claim `banks: [Bank::Erased, Bank::Sealed(1)]` while leaving `sealed_once` at its
+default of `false` — a combination no real transition sequence can produce, since
+`commit_seal` is the only place a bank becomes `Sealed` and it sets `sealed_once` true in the
+same step. Left unrefused, `recovering_bank()` took the pre-seal convention at face value and
+answered `BankId::A` regardless of which bank was really sealed, and `has_sealed()` then
+exempted the state from `SingleAuthority` entirely — a reconstructed state could recover a
+stale bank's records while the truly sealed bank's were ignored, with the one guarantee built
+to catch exactly that never even consulted. `Impossible::SealedBeforeAnyHistoryOfSealing` is
+the fix, refused in `reconstructed` the same way as the existing `RecordIdDeclaredTwice` and
+`NextIdReissuesAResident` checks; `reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false`
+in `tests/refinement.rs` is the regression, verified to fail against the old code.
