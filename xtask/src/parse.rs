@@ -1043,9 +1043,9 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     out
 }
 
-/// `contents` with every fenced code block, blockquote and HTML block or comment
-/// removed, keeping the exact source bytes of everything else — link syntax, code
-/// span backticks, and all.
+/// `contents` with every fenced code block, blockquote and HTML comment removed,
+/// keeping the exact source bytes of everything else — link syntax, code span
+/// backticks, real (non-comment) HTML, and all.
 ///
 /// [`markdown_prose`] answers "what does a reader see", which is the wrong question
 /// for a rule that needs raw Markdown syntax rather than rendered text: a link's
@@ -1059,6 +1059,10 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
 /// any other cannot defeat this the way composing two independent line scanners
 /// could, because there is one parse producing one consistent set of spans rather
 /// than two scans that disagree about what is inside what.
+///
+/// Real HTML is not one of the three: `<a href="target">label</a>` is a link a
+/// reader (and a renderer) sees, not an example, so only HTML that is actually a
+/// comment is hidden.
 #[must_use]
 pub fn visible_source(contents: &str) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -1067,6 +1071,7 @@ pub fn visible_source(contents: &str) -> String {
     let mut fence_start: Option<usize> = None;
     let mut quote_start: Option<usize> = None;
     let mut quote_depth: u32 = 0;
+    let mut html_block_start: Option<usize> = None;
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -1096,11 +1101,27 @@ pub fn visible_source(contents: &str) -> String {
                     hidden.push((start, range.end));
                 }
             }
-            // Block HTML (`Event::Html`) and inline HTML (`Event::InlineHtml`) are
-            // two different events for the same reason a fence and a code span are:
-            // `<!-- ... -->` sitting on its own line is one, and `text <!-- ... -->
-            // text` mid-paragraph is the other. Both must be hidden the same way.
-            Event::Html(_) | Event::InlineHtml(_) => hidden.push((range.start, range.end)),
+            // A block-level HTML comment is a `Tag::HtmlBlock` whose span covers the
+            // whole thing; the leaf `Event::Html`s inside it are one per source line
+            // and are not read directly, the same way a fence's inner lines are not.
+            // Only a *comment* is hidden — `<a href="...">label</a>` is real, visible
+            // HTML a reader (and a renderer) sees, not an example, and hiding it would
+            // remove a legitimate link's destination along with its label.
+            Event::Start(Tag::HtmlBlock) => {
+                html_block_start.get_or_insert(range.start);
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                if let Some(start) = html_block_start.take()
+                    && contents[start..range.end].trim_start().starts_with("<!--")
+                {
+                    hidden.push((start, range.end));
+                }
+            }
+            // Inline HTML has no enclosing tag, so a self-contained inline comment,
+            // `text <!-- ... --> text`, is judged from its own event text instead.
+            Event::InlineHtml(html) if html.starts_with("<!--") => {
+                hidden.push((range.start, range.end));
+            }
             _ => {}
         }
     }

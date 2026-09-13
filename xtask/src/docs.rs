@@ -7257,6 +7257,33 @@ mod tests {
     }
 
     #[test]
+    fn a_link_written_as_raw_html_still_counts() {
+        // Codex, pull request #138: `visible_source` hid every raw HTML span, not
+        // only comments, so a link written as `<a href="...">label</a>` — real,
+        // visible HTML a reader and a renderer both see — lost its destination the
+        // same way a commented-out one should.
+        let mut inputs = wire_format_inputs();
+        inputs.claude_md = inputs.claude_md.map(|claude_md| {
+            claude_md.replace(
+                WIRE_FORMAT_SPEC_PATH,
+                &format!("<a href=\"{WIRE_FORMAT_SPEC_PATH}\">wire-format specification</a>"),
+            )
+        });
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not link")),
+            "a link written as raw HTML was read as missing: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_missing_specification_is_reported() {
         // Fail closed: issue #41's first `done when` is that the format be documented byte
         // by byte, and a document that is not there documents nothing.
