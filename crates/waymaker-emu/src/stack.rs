@@ -78,7 +78,7 @@ fn stack_ceiling() -> usize {
 }
 
 /// Holds `depth_from` to `[stack_floor(), stack_ceiling()]`, then to the stack pointer's
-/// live reading.
+/// live reading — or to an empty region entirely, in Handler mode.
 ///
 /// [`paint`] and [`high_water_mark`] are `pub fn`, not `unsafe fn`: a safe function must stay
 /// sound for every input, not only the one reading `main` actually passes. The region clamp
@@ -90,7 +90,26 @@ fn stack_ceiling() -> usize {
 /// argument. A caller's `depth_from` can therefore only ever narrow what gets painted or
 /// scanned, never widen it past where the stack pointer genuinely is. The cost of a wrong
 /// reading is a wrong *measurement*, never an out-of-bounds access.
+///
+/// Handler mode is a narrower case the live-MSP reading alone cannot cover: MSP is genuinely
+/// the active register there, but an exception can interrupt Thread mode while it was using
+/// PSP for a second, still-live stack this module has no way to represent — `_stack_end` and
+/// `_stack_start` name one region, not two. Trusting MSP alone as "everything below this is
+/// unused" would be right about which register is active and wrong about what is free. So
+/// outside Thread mode this collapses to the empty region at [`stack_floor`] instead: the same
+/// degenerate case a region no wider than [`GUARD_BYTES`] already produces, which
+/// [`paint`] already declines to write into and [`crate::emulate::StackUsage::shortfall`]
+/// already refuses as a measurement that did not happen. This image never calls these
+/// functions from Handler mode — nothing here installs a handler that does — so the branch
+/// is not one this boot's own measurement ever takes; it exists for the caller this crate does
+/// not have yet.
 fn clamp_to_stack_region(depth_from: usize) -> usize {
+    if !matches!(
+        cortex_m::peripheral::SCB::vect_active(),
+        cortex_m::peripheral::scb::VectActive::ThreadMode
+    ) {
+        return stack_floor();
+    }
     depth_from
         .clamp(stack_floor(), stack_ceiling())
         .min(current_stack_pointer())

@@ -228,6 +228,27 @@ read-only status register with no side effects, the same shape of safety `msp::r
 `psp::read()` already have — and Handler mode answers MSP without consulting `SPSEL` at all;
 only `VectActive::ThreadMode` reaches the `SPSEL` check the seventh finding added.
 
+**Answering "which register is active" correctly is not the same as answering "is it safe to
+paint below it", and a tenth finding is that the ninth's own fix conflated the two.** MSP
+genuinely is the active register in Handler mode — that part of the ninth finding's fix is
+right — but `paint` does not merely need to know which register is active; it needs "every
+byte between `_stack_end` and that register is unused", and that second claim can be false in
+Handler mode in a way no register read can rescue: an exception can interrupt Thread mode
+while Thread mode was using PSP for a *second* stack, and this module's single `_stack_end` /
+`_stack_start` pair has no way to represent two regions or to know where that interrupted PSP
+frame sits. Reading MSP correctly identified the active register and then let
+`clamp_to_stack_region` treat it as if it were the only stack this image has, which is exactly
+the assumption a second stack breaks. `clamp_to_stack_region` now checks `SCB::vect_active()`
+itself, before it does anything else, and collapses to the empty region at `stack_floor()`
+outside Thread mode — the same degenerate shape a region no wider than `GUARD_BYTES` already
+produces, which `paint` already declines to write into and `StackUsage::shortfall` already
+refuses as a measurement that did not happen. No new mechanism was needed to close it, because
+the failure mode this closes is already one this module knows how to refuse. This image
+installs no handler that reaches `crate::stack` at all, so the branch is dead code on every
+boot this ADR measures — it exists for the caller this crate does not have yet, the same
+standing `CLAUDE.md`'s "What is not checked" section already states for gaps a scanner or a
+runtime check cannot see past.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -257,7 +278,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the nine hardenings changed what the figure means, only what a wrong caller could do
+**None of the ten hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*

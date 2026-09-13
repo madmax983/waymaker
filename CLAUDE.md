@@ -2909,7 +2909,16 @@ executes on MSP regardless of it, so a caller reached from a handler after Threa
 selected PSP would still have read the inactive register. `current_stack_pointer` now checks
 `SCB::vect_active()` first — a safe function, reading a read-only status register with no
 side effects — and answers MSP outright in Handler mode, consulting `SPSEL` only in Thread
-mode. See
+mode. A fourth finding is that answering "which register is active" correctly is not the same
+question as "is it safe to paint below it": MSP genuinely is active in Handler mode, but an
+exception can interrupt Thread mode while Thread mode was using PSP for a *second*, still-live
+stack this module's one `_stack_end`/`_stack_start` pair has no way to represent — so treating
+MSP as though everything below it were free is wrong in exactly the case a second stack
+exists, whichever register correctly answered "active". `clamp_to_stack_region` now checks
+`SCB::vect_active()` itself and collapses to the empty region at `stack_floor()` outside
+Thread mode, reusing the same degenerate case a region no wider than `GUARD_BYTES` already
+produces — which `paint` already declines to write into and `StackUsage::shortfall` already
+refuses as a measurement that did not happen, so no new mechanism was needed to close it. See
 [ADR 0042](docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
