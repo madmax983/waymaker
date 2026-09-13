@@ -5163,6 +5163,65 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_after_a_mismatched_close_tag_inside_a_script_does_not_settle_anything() {
+        // Codex, pull request #138, round 30: a `<script>` body can contain the
+        // literal text `</style>` — a JavaScript string, say — without ending HTML
+        // parsing of the script. Closing on any of the three non-rendering tags
+        // rather than the one that actually opened would resume visibility too early
+        // and let the marker after it settle the question.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-mismatched-close.md".to_owned(),
+            contents: format!(
+                "{}\n<script>\nvar x = \"</style>\";\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n",
+                clean_adr("mismatched close"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a mismatched close tag inside a script settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_nested_script_that_outlived_its_block_does_not_settle_anything() {
+        // Codex, pull request #138, round 30: a bare `<script>...</script>` is HTML
+        // block type 1, which `pulldown-cmark` (like CommonMark) ends only at the real
+        // close tag, blank line or not — so a *nested* `<script>` inside a type-6 block
+        // like `<div>` is the case that actually outlives its block at a blank line: the
+        // `<div>` ends there, and the marker on the next, structurally separate
+        // paragraph reaches `Event::Text` while a browser is still in script-data state
+        // until the real `</script>` two lines later. `hidden` has to fold in the open
+        // non-rendering tag for `Event::Text` too, or that marker settles the question
+        // the same way one after an unterminated comment's own blank line used to
+        // (round 20).
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-nested-script-outlived-its-block.md".to_owned(),
+            contents: format!(
+                "{}\n<div>\n<script>\n\n{DEFERRED_QUESTION_MARKER} {}\n\n</script>\n</div>\n",
+                clean_adr("nested script outlived its block"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a nested script that outlived its block settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the
@@ -5778,6 +5837,21 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_item_reached_while_a_nested_script_is_still_open() {
+        // Codex, pull request #138, round 30: a nested `<script>` inside a type-6
+        // block like `<div>` can outlive that `HtmlBlock` across a blank line the same
+        // way a comment does — `pulldown-cmark` ends the block at the blank line
+        // before the decoy item, resuming it as an ordinary, structurally separate
+        // list item, even though a browser is still in script-data state until the
+        // real `</script>` two lines later. `hidden` has to fold in the open
+        // non-rendering tag for `Start(Tag::Item)`, not only for `Event::Html`, or the
+        // decoy item is read as a real one.
+        let contents = "# ADR\n\n<div>\n<script>\n\n- Status: accepted\n\n\
+                         </script>\n</div>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn adr_status_ignores_a_decoy_whose_item_opens_with_an_unterminated_comment() {
         // Codex, pull request #138, round 21: `- <div>\n  <!--` opens the item with raw
         // HTML whose comment then outlives that `HtmlBlock` across a blank line, so the
@@ -5858,6 +5932,18 @@ mod tests {
         // *leading* one — from the closing spelling — left an empty extracted name that
         // never matched `"br"`, letting this decoy slip through undisqualified.
         let contents = "# ADR\n\n- Sta</br>tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_inside_a_script() {
+        // Codex, pull request #138, round 30: `<script>` is a real, non-comment inline
+        // element whose content a reader never sees, and the item disqualifies
+        // outright rather than merely excluding the hidden value — excluding alone
+        // would leave `item` at `"Status: "`, which still strips and trims to an
+        // empty value that still trivially matches, exactly the failure round 15
+        // already closed for a nested fence or blockquote.
+        let contents = "# ADR\n\n- Status: <script>accepted</script>\n\n- Status: proposed\n";
         assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 
@@ -7187,6 +7273,28 @@ mod tests {
                     && violation.detail.contains("no table row")),
             "a table after a comment only apparently closed by plain prose still \
              counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_headline_hidden_inside_a_script_does_not_count() {
+        // Codex, pull request #138, round 30: `table_rows` is an independent parser
+        // from `markdown_prose` and had no non-rendering-element handling at all, so a
+        // required cell value placed inside `<script>` (or `<style>`/`<template>`) was
+        // still copied into the row verbatim, even though a reader never sees it.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "| Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | <script>{}</script> | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains(&format!("`{}`", clause.headline))),
+            "a table headline hidden inside a <script> still counted: {violations:?}"
         );
     }
 

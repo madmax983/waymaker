@@ -952,16 +952,22 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
-    // Whether the open `HtmlBlock` is a `<script>` or `<style>` element, whose body a
-    // reader never sees (Codex, round 27; see `is_non_rendering_html_block`).
-    let mut in_non_rendering_block = false;
+    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open,
+    // if any — named rather than a bare flag (Codex, pull request #138, round 30) so a
+    // matching close is required: a `<script>` body containing the literal text
+    // `</style>` (a JavaScript string, say) does not end HTML parsing of the script,
+    // and closing on any of the three would resume visibility while a browser is still
+    // in script-data state.
+    let mut open_non_rendering_tag: Option<&'static str> = None;
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
         // so ordinary `Text`/`Item`/`Heading` events resume right after — structurally
         // separate from the comment, but still inside it by real HTML rules, until an
         // actual `-->` appears. Without this, a decoy placed after the blank line reads as
-        // ordinary visible prose.
+        // ordinary visible prose. A non-rendering element outlives its own `HtmlBlock` the
+        // same way (Codex, round 30) — `open_non_rendering_tag` folds in here too, or a
+        // decision after the blank line inside a still-open `<script>` reads as prose.
         //
         // Kept apart from the container half (Codex, pull request #138, round 21): a
         // comment closing *within* one `Event::Html` or `Event::Text` leaves a visible
@@ -972,7 +978,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         // half is passed to the helper; the full `hidden` still gates every event that has
         // no text of its own to scan for a close, such as a heading or item marker.
         let container_hidden = in_fence || blockquote_depth > 0;
-        let hidden = container_hidden || in_html_comment;
+        let hidden = container_hidden || in_html_comment || open_non_rendering_tag.is_some();
         match event {
             Event::Start(Tag::List(kind)) => ordered_lists.push(kind.is_some()),
             Event::End(TagEnd::List(_)) => {
@@ -1080,16 +1086,20 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             // own end, matching an HTML comment's own fail-closed handling: a `<script>`
             // whose close is never found hides everything after it the way a browser's
             // script-data parsing state would.
-            Event::Html(html) if in_non_rendering_block => {
-                if closes_non_rendering_element(&html) {
-                    in_non_rendering_block = false;
-                }
-            }
-            Event::Html(html) if opens_non_rendering_element(&html) => {
-                in_non_rendering_block = !closes_non_rendering_element(&html);
-            }
+            //
+            // The close must name the *same* tag that opened (Codex, round 30): a
+            // `<script>` body can contain the literal text `</style>` — a JavaScript
+            // string, say — without ending HTML parsing of the script, so closing on
+            // any of the three would resume visibility too early.
             Event::Html(html) => {
-                append_visible_html_line(&html, container_hidden, &mut in_html_comment, &mut out);
+                if !track_non_rendering_html(&html, &mut open_non_rendering_tag) {
+                    append_visible_html_line(
+                        &html,
+                        container_hidden,
+                        &mut in_html_comment,
+                        &mut out,
+                    );
+                }
             }
             Event::InlineHtml(html) if !hidden && !html.starts_with("<!--") => {
                 out.push_str(&html);
@@ -1100,19 +1110,47 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     out
 }
 
-/// Whether `line` contains an opening `<script`, `<style` or `<template` tag anywhere
-/// in it — not only at its start, since a nested element can open partway through an
-/// enclosing `HtmlBlock`'s own `Event::Html` lines — case-insensitively, and only where
-/// the tag name ends right there rather than continuing into a longer one (`<scriptx>`
-/// does not match).
+/// Opens or closes `open_non_rendering_tag` from one `Event::Html`/`Event::InlineHtml`
+/// line, returning whether the line was consumed as such — a caller has nothing further
+/// to do with a consumed line, since a non-rendering element's own open and close tags
+/// are not visible text either.
+///
+/// Shared by every function in this module that tracks a `<script>`, `<style>` or
+/// `<template>` element (Codex, pull request #138, round 30): the close must name the
+/// *same* tag that opened, because a `<script>` body can contain the literal text
+/// `</style>` — a JavaScript string, say — without ending HTML parsing of the script, and
+/// closing on any of the three would resume visibility too early.
+fn track_non_rendering_html(html: &str, open_non_rendering_tag: &mut Option<&'static str>) -> bool {
+    match *open_non_rendering_tag {
+        Some(tag) => {
+            if closes_non_rendering_element(html, tag) {
+                *open_non_rendering_tag = None;
+            }
+            true
+        }
+        None => opens_non_rendering_element(html).is_some_and(|tag| {
+            *open_non_rendering_tag = (!closes_non_rendering_element(html, tag)).then_some(tag);
+            true
+        }),
+    }
+}
+
+/// The tag name (`"script"`, `"style"` or `"template"`) of an opening non-rendering
+/// tag found anywhere in `line` — not only at its start, since a nested element can
+/// open partway through an enclosing `HtmlBlock`'s own `Event::Html` lines —
+/// case-insensitively, and only where the tag name ends right there rather than
+/// continuing into a longer one (`<scriptx>` does not match).
 ///
 /// These are the three HTML elements whose body a browser never renders as visible
 /// text (Codex, pull request #138, rounds 27, 28 and 29 — `<template>`'s content is
 /// inert DOM meant for cloning by script, not display); every other tag
-/// `markdown_prose` keeps verbatim because a reader does see it.
-fn opens_non_rendering_element(line: &str) -> bool {
+/// `markdown_prose` keeps verbatim because a reader does see it. The name is returned,
+/// not just whether one matched, because closing has to name the *same* element
+/// (round 30): a `<script>` body can contain the literal text `</style>` — a
+/// JavaScript string, say — without ending HTML parsing of the script.
+fn opens_non_rendering_element(line: &str) -> Option<&'static str> {
     let lower = line.to_ascii_lowercase();
-    ["script", "style", "template"].iter().any(|tag| {
+    ["script", "style", "template"].into_iter().find(|tag| {
         let open = format!("<{tag}");
         lower.match_indices(&open).any(|(index, _)| {
             lower
@@ -1123,13 +1161,10 @@ fn opens_non_rendering_element(line: &str) -> bool {
     })
 }
 
-/// Whether `line` contains a closing `</script>`, `</style>` or `</template>` tag
-/// anywhere in it, case-insensitively.
-fn closes_non_rendering_element(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    ["script", "style", "template"]
-        .iter()
-        .any(|tag| lower.contains(&format!("</{tag}>")))
+/// Whether `line` contains a closing tag for `tag` (`"script"`, `"style"` or
+/// `"template"`) anywhere in it, case-insensitively.
+fn closes_non_rendering_element(line: &str, tag: &str) -> bool {
+    line.to_ascii_lowercase().contains(&format!("</{tag}>"))
 }
 
 /// Appends one `Event::Html` line to `out`, comment subranges cut out of it, tracking
@@ -1381,15 +1416,27 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // writes to the discarded scratch buffer, only advances `in_html_comment`.
     let mut in_html_comment = false;
     let mut html_scratch = String::new();
+    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open at
+    // block level, if any (Codex, pull request #138, round 30): `<div>\n<script>\n\n-
+    // Status: accepted\n\n</script>\n</div>` outlives its own `HtmlBlock` across the blank
+    // line the same way an unterminated comment does — `pulldown-cmark` ends the block
+    // there and resumes the decoy item as an ordinary, structurally separate one, even
+    // though a browser is still in script-data state until the real `</script>` two lines
+    // later. Folded into `hidden` below so `Start(Tag::Item)` never begins collecting such
+    // an item at all, the same disqualification a fence or blockquote already gets.
+    let mut open_non_rendering_tag: Option<&'static str> = None;
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
-        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
+        let hidden =
+            in_fence || blockquote_depth > 0 || in_html_comment || open_non_rendering_tag.is_some();
         if collecting && paragraph_closed && matches!(event, Event::Start(_)) {
             collecting = false;
         }
         match event {
             Event::Html(html) => {
-                append_visible_html_line(&html, true, &mut in_html_comment, &mut html_scratch);
+                if !track_non_rendering_html(&html, &mut open_non_rendering_tag) {
+                    append_visible_html_line(&html, true, &mut in_html_comment, &mut html_scratch);
+                }
             }
             // A fenced block or blockquote opening while an item is being collected
             // disqualifies it, the same way a line break does (Codex, pull request
@@ -1479,9 +1526,23 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // disqualifies the item differs. `Html` block, appearing only for a
             // comment that outlived its own block, is excluded because it is handled
             // separately above and cannot occur while a paragraph is still open.
+            //
+            // A non-rendering element — `<script>`, `<style>`, `<template>` —
+            // disqualifies the item too (Codex, round 30): `- Status:
+            // <script>accepted</script>` has a real, visible `Status: ` prefix ahead
+            // of the tag, so merely *excluding* the hidden value (rather than
+            // disqualifying the item) would leave `item` at `"Status: "`, which still
+            // strips and trims to an empty value that still trivially matches —
+            // exactly the failure round 15 already closed for a nested fence or
+            // blockquote. Disqualifying outright, the same way `<br>` and a nested
+            // fence or blockquote already do, is what actually closes it: `collecting`
+            // drops before `End(TagEnd::Item)` can try matching an empty prefix.
+            // Checked by the tag *opening* alone — a stray, unmatched close needs no
+            // separate case, since the item is already disqualified by then.
             Event::InlineHtml(html)
                 if collecting
                     && (is_line_break_tag(&html)
+                        || opens_non_rendering_element(&html).is_some()
                         || (html.starts_with("<!--") && html.contains('\n'))) =>
             {
                 collecting = false;
@@ -1525,9 +1586,16 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // writes to the discarded scratch buffer, only advances `in_html_comment`.
     let mut in_html_comment = false;
     let mut html_scratch = String::new();
+    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open
+    // inside a cell, if any (Codex, pull request #138, round 30): this parser is
+    // independent of `markdown_prose`'s own non-rendering handling (rounds 27-29), and
+    // a required value placed inside one of these three elements is invisible to a
+    // reader the same way a comment is, but was still copied into the cell verbatim.
+    let mut open_non_rendering_tag: Option<&'static str> = None;
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
-        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
+        let hidden =
+            in_fence || blockquote_depth > 0 || in_html_comment || open_non_rendering_tag.is_some();
         match event {
             Event::Html(html) => {
                 append_visible_html_line(&html, true, &mut in_html_comment, &mut html_scratch);
@@ -1568,10 +1636,14 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // rendered, so a `-->` reaching `Event::Text` never survives as three
             // unescaped bytes in the rendered HTML a browser parses. A comment a
             // genuine, unescaped `<!--` opened stays open through any amount of later
-            // `Event::Text`; only `Event::Html` can close it, which is why `in_row`
-            // (never set while `hidden`) is the only gate this arm needs.
-            Event::Text(text) if in_row => cell.push_str(&text),
-            Event::Code(code) if in_row => {
+            // `Event::Text`; only `Event::Html`/`Event::InlineHtml` can close it, which
+            // is why `open_non_rendering_tag` (round 30) is checked explicitly here
+            // rather than folded into `in_row`: it can open *partway through* a row
+            // already started, from an inline `<script>` in this very cell.
+            Event::Text(text) if in_row && open_non_rendering_tag.is_none() => {
+                cell.push_str(&text);
+            }
+            Event::Code(code) if in_row && open_non_rendering_tag.is_none() => {
                 cell.push('`');
                 cell.push_str(&code);
                 cell.push('`');
@@ -1582,7 +1654,9 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // raw source text and saw the destination along with the label, so a cell
             // whose required value is the link target rather than its label must still
             // carry that value for `.contains` to find.
-            Event::Start(Tag::Link { dest_url, .. }) if in_row => {
+            Event::Start(Tag::Link { dest_url, .. })
+                if in_row && open_non_rendering_tag.is_none() =>
+            {
                 cell.push_str(&dest_url);
                 cell.push(' ');
             }
@@ -1594,7 +1668,15 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // a literal substring. An inline comment is excluded (Codex, round 16), for
             // `visible_source`'s reason: `| <!-- \`id\` --> |` is a hidden decoy, not a
             // real cell, and keeping its text would let it stand in for the real one.
-            Event::InlineHtml(html) if in_row && !html.starts_with("<!--") => {
+            // A non-rendering element — `<script>`, `<style>`, `<template>` — is
+            // excluded the same way (Codex, round 30), and its own open/close tags
+            // update `open_non_rendering_tag` instead of joining the cell's text: a
+            // required value placed inside one is invisible to a reader.
+            Event::InlineHtml(html)
+                if !track_non_rendering_html(&html, &mut open_non_rendering_tag)
+                    && in_row
+                    && !html.starts_with("<!--") =>
+            {
                 cell.push_str(&html);
             }
             _ => {}
