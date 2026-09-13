@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — there is now a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`; there is still a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -1027,15 +1027,24 @@ Stated so that nobody mistakes silence for coverage:
 - **That the crash oracle is as strict as the specification.** `waymaker_fault::verify_oracle`
   compares a recovery against *committed* history, which filters out records that never
   reached media, so it accepts a history that skips a gap and carries on; the specification's
-  prefix safety is a prefix of *declaration order* and refuses it. The two agree over the
-  specified machine — no reachable state has a gap — and `tests/oracle.rs` measures where
-  they stop agreeing rather than leaving the difference implied.
+  prefix safety is a prefix of *declaration order* and refuses it. `waymaker-fault`'s own
+  `tests/harness.rs` drives that acceptance on purpose — a writer whose middle record's
+  program call fails outright and who carries on to the next is exactly the case a stricter
+  oracle would wrongly refuse — so the fix for issue #67's smaller item is not a stricter
+  `verify_oracle`. The two agree over the specified machine because no reachable state has a
+  gap, and that used to be argued from a theorem about a different type
+  (`tests/machine.rs`'s, about `Journal`) rather than checked directly against what the
+  agreement tests actually judge; `tests/oracle.rs`'s
+  `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history` is now that check,
+  against the `Ledger` itself.
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers
   records; it does not cover banks, because rung 0.2 owns the two-bank adapter and there is
-  nothing yet to abstract. `single-authority` is therefore proved about a model and not about
-  a device, and its row in `obligation.rs` says so.
+  nothing yet to abstract — issue #67 gave the *model* a bank dimension (a `Record`'s
+  `BankId`, and recovery scoped to the one a reader would boot from), which is a different
+  thing from refining a real two-bank writer against it. `single-authority` is therefore
+  still proved about a model and not about a device, and its row in `obligation.rs` says so.
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
@@ -2793,3 +2802,41 @@ async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's 
 criterion are here — issues #35, #36, #37, #38 and #39, above — and in-boot sleep is the
 rest of 0.4. The gates went in before the code they govern, which is the point: a gate
 retrofitted after coverage has slipped is a gate that ratifies the slip.
+
+Issue #67 closes the three dimensions issue #20's review found `waymaker-spec`'s ghost model
+short of, none of which raising `Bound::PROOF` would have reached: the shapes of history the
+model admitted were one-dimensional, and the bound was never what they were short of.
+`model::Record` now carries a `BankId`; `Journal::begin_erase` drops exactly the erased
+bank's records and dispatch-log entries, and `recover`, `committed`, `declared` and
+`acknowledged` are all scoped to the bank a reader would boot from — so "never recover the
+old run as current" is a fact `Journal::recover` states rather than a sentence the model had
+no way to say. `Invariant::SingleAuthority` takes the recovered history now, not only
+`state.banks`, and `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank` shows the guarantee
+falsifiable by a reader instead of only by deleting a guard — issue #67's own "done when",
+met by name. Record identity moved off `records.len()` onto a counter that only grows, which
+is what let `begin_erase` drop a record from the middle of history without a later `declare`
+reissuing its id to something else; `Transition::Reboot` is the transition that identity
+scheme exists for, legal only while unpowered, reseeding a live device with exactly what
+`recover()` says survived the crash. Compaction — the obvious firmware response to
+`Interruption::Failure`, retrying elsewhere rather than being stuck behind a torn record —
+turned out to need no transition of its own: `begin_seal` and `begin_erase` never consulted
+the other bank's records, so a live device behind a torn tail could already seal the blank
+bank and carry on there, and `tests/compaction.rs` is the proof that this reachable state is
+reached with no power loss anywhere in the run. A necessity proof found
+`Guard::DispatchFromCurrentBank` — added on the reasoning that a real swap consumes the old
+run's writer — unnecessary once `durable_intent` correctly treats a dispatch from a retired
+bank as moot the same way `continue_as_new` already forfeits identity across one (issue #95);
+it was removed rather than kept, per this crate's own rule that a guard removable at no cost
+was never load-bearing. Generation arithmetic now refuses at `u32::MAX`
+(`checked_add`, not `saturating_add`) instead of silently repeating it — a hand-built state
+in `model.rs`'s own `#[cfg(test)]` module, since no explorable bound reaches the ceiling.
+And a direct "no gap before committed history" check in `waymaker_fault::verify_oracle` was
+tried and reverted: `waymaker-fault`'s own `tests/harness.rs` deliberately drives a writer
+whose failed middle record is skipped over, which the oracle's committed-history filter is
+what makes acceptable, so the circularity issue #67 named is closed by a test that checks the
+claim directly against the `Ledger` the agreement tests build
+(`tests/oracle.rs`'s `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history`)
+rather than by a stricter oracle. What remains owed is written down in `obligation.rs`'s
+`single-authority` row rather than left to be noticed: the refinement against a real
+two-bank writer, which is issue #22's adapter and a project of its own. See
+[ADR 0041](docs/adr/0041-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).

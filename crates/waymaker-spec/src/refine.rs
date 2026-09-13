@@ -24,7 +24,7 @@
 
 use waymaker_fault::{Durability, Ledger, RecordId};
 
-use crate::model::{Journal, OnMedia, Record, Role};
+use crate::model::{BankId, Journal, OnMedia, Record, Role};
 
 /// The part of a ghost state a crash harness can report.
 ///
@@ -108,6 +108,10 @@ impl Journal {
                 role: *role,
                 media,
                 acknowledged: *state == Durability::Acknowledged,
+                // No writer this crate drives touches a second bank — see the module doc —
+                // so every reconstructed record is `BankId::A` by the same convention
+                // `Journal::new` uses before a device's first seal.
+                bank: BankId::A,
             });
         }
         Ok(Self::from_parts(records, observation.dispatched.clone()))

@@ -172,6 +172,7 @@ fn a_record_reports_the_design_documents_state_for_every_shape_it_can_hold() {
         role: Role::Schedule,
         media,
         acknowledged,
+        bank: BankId::A,
     };
     assert_eq!(
         record(OnMedia::Absent, false).durability(),

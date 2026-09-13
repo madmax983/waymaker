@@ -15,6 +15,18 @@ use waymaker_fault::RecordId;
 
 use crate::model::{Journal, OnMedia};
 
+/// Mirrors [`Journal::recover`]'s recoverable-prefix rule against a given bank, for
+/// [`Mutant::BootsTheRetiredBank`].
+fn recoverable_prefix_of(journal: &Journal, bank: crate::model::BankId) -> Vec<RecordId> {
+    journal
+        .records()
+        .iter()
+        .filter(|record| record.bank == bank)
+        .take_while(|record| record.is_recoverable())
+        .map(|record| record.id)
+        .collect()
+}
+
 /// Something that turns a ghost state into the history a reboot would see.
 pub trait Reader {
     /// The records this reader would produce after a reset in `journal`'s state.
@@ -60,16 +72,24 @@ pub enum Mutant {
     /// safety by exposing history behind a gap — the failure mode a reader that treated an
     /// erased header as "keep looking" would have.
     SkipsGaps,
+    /// Boots the *other* bank's history when exactly one bank is authoritative. Breaks
+    /// single authority: issue [#67](https://github.com/madmax983/waymaker/issues/67)'s
+    /// "the sentence that matters" — never recover the old run as current — stated as a
+    /// reader wrong in exactly this one way rather than as an argument about the model.
+    /// Falls back to [`Specified`] when no bank has sealed yet, since "the other bank" is not
+    /// a question a fresh device answers.
+    BootsTheRetiredBank,
 }
 
 impl Mutant {
     /// Every mutant, in a fixed order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ProducesOneMore,
         Self::IncludesTorn,
         Self::Reorders,
         Self::DropsTheLast,
         Self::SkipsGaps,
+        Self::BootsTheRetiredBank,
     ];
 
     /// One line naming the way this reader is wrong.
@@ -81,6 +101,7 @@ impl Mutant {
             Self::Reorders => "produces the last two records in the wrong order",
             Self::DropsTheLast => "stops one record early",
             Self::SkipsGaps => "carries on past a record that is not wholly on media",
+            Self::BootsTheRetiredBank => "recovers the bank that is not the sole authority",
         }
     }
 }
@@ -121,12 +142,24 @@ impl Reader for Mutant {
                 history.pop();
             }
             Self::SkipsGaps => {
-                history = journal
-                    .records()
-                    .iter()
-                    .filter(|record| record.is_recoverable())
-                    .map(|record| record.id)
-                    .collect();
+                // Scoped to `recovering_bank`, the same as `Specified`: a scanner bug that
+                // carries on past a gap still only ever reads the bytes of the one bank it is
+                // scanning, never a second bank's separate flash region — issue #67's bank
+                // dimension, met here so this mutant stays a reader wrong in exactly the one
+                // way its name says rather than gaining a second, unrelated way for free.
+                history = journal.recovering_bank().map_or_else(Vec::new, |bank| {
+                    journal
+                        .records()
+                        .iter()
+                        .filter(|record| record.bank == bank && record.is_recoverable())
+                        .map(|record| record.id)
+                        .collect()
+                });
+            }
+            Self::BootsTheRetiredBank => {
+                if let [sole] = journal.authoritative().as_slice() {
+                    history = recoverable_prefix_of(journal, sole.other());
+                }
             }
         }
         history

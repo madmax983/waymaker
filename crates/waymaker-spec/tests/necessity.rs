@@ -219,6 +219,36 @@ fn highest_generation(state: &Journal) -> Option<u32> {
 }
 
 #[test]
+fn a_dispatch_from_a_bank_a_swap_has_since_retired_is_moot_rather_than_a_breach() {
+    // Issue #67's first gap, closed: once records carry a bank, a schedule record a swap left
+    // behind is still sitting in `self.records` until its bank is erased, and nothing in
+    // `Journal::dispatch` refuses dispatching against it after a newer bank has taken
+    // authority. That is not a hole in this specification: `continue_as_new` starts a fresh
+    // run that owes the superseded one nothing, so recovery no longer accounting for that
+    // effect is exactly what §10's swap intends rather than a durable-intent breach. This is
+    // the positive claim — reachable, and still `Ok` — that
+    // `every_precondition_holds_up_the_guarantee_it_is_there_for` cannot make on its own,
+    // since a claim about a *legal* transition needing no guard has nothing to remove.
+    let explored = explore(Bound::PROOF, Guards::ENFORCED, CEILING).expect("the proof bound");
+    let dispatched_from_a_retired_bank = explored.states().iter().any(|state| {
+        state
+            .dispatched()
+            .iter()
+            .any(|id| state.bank_of(*id).is_some() && state.bank_of(*id) != state.recovering_bank())
+    });
+    assert!(
+        dispatched_from_a_retired_bank,
+        "no reachable state ever dispatched from a bank a later swap retired, so this claim \
+         is about nothing"
+    );
+    assert!(
+        explored.first_breach(&Specified).is_none(),
+        "a dispatch from a retired bank is reachable and the spine proofs are still supposed \
+         to hold, which is asserted again here rather than trusted from tests/spine.rs"
+    );
+}
+
+#[test]
 fn removing_the_generation_precondition_leaves_two_banks_claiming_the_run() {
     let relaxed = explore(
         Bound::PROOF,
