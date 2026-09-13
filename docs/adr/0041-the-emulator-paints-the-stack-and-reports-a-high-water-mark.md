@@ -121,6 +121,19 @@ named beside `_stack_end`, and `crate::stack::clamp_to_stack_region` holds `dept
 cost of a wrong reading is now a wrong *measurement* — the same lower-bound honesty this ADR
 already states — never an out-of-bounds access.
 
+**Holding `depth_from` inside the stack's memory map is not the same as holding it below the
+live stack pointer, and review of the fix above found exactly that gap.** A stale `depth_from`
+that is still a legal address somewhere in `[_stack_end, _stack_start]` — or `usize::MAX`,
+which the region clamp alone converts to `_stack_start` — passes the first clamp untouched,
+and `paint` would fill up to it even where the real stack pointer sits far below that address,
+overwriting frames the caller and its own callees are still using. `clamp_to_stack_region` now
+also takes the lower of the region-clamped value and a *fresh* [`current_stack_pointer`]
+reading, taken at the moment either function is called rather than trusted from the argument:
+a caller's `depth_from` can only ever narrow what gets touched, never widen it past where the
+stack genuinely is. The two functions' own live readings can differ by the few bytes each
+one's own call frame costs — `GUARD_BYTES` is what already exists to absorb exactly that kind
+of variance, so no new margin was needed.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -151,11 +164,14 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 the same file does not get a blanket pass.
 
 **Neither hardening changed what the figure means, only what a wrong caller could do to it.**
-`clamp_to_stack_region` is a floor-and-ceiling clamp, not a new measurement path: a
-`depth_from` inside the real stack region is unaffected, and the reported figure for the one
-caller this crate has — `main`, reading `current_stack_pointer()` first — is identical before
-and after. What changed is the *worst case* for an argument this ADR's own text had already
-named as an obligation on the caller rather than a check: it is now a check too.
+`clamp_to_stack_region` is a floor-and-ceiling clamp plus a live-stack-pointer clamp, not a new
+measurement path, and what changed is the *worst case* for an argument this ADR's own text had
+already named as an obligation on the caller rather than a check: it is now a check too. The
+one caller this crate has — `main`, reading `current_stack_pointer()` before calling anything
+else — sees the figure move by at most the handful of bytes `clamp_to_stack_region`'s own call
+frame costs against `main`'s original reading, which is inside the noise `GUARD_BYTES` already
+exists to absorb and smaller than what the ADR's own lower-bound honesty already asks a reader
+to expect.
 
 **What is still owed.** A decoy `stack.rs` reproducing the whole crate-relative suffix in a
 different, deeper directory would still be read as the permitted module — narrower than the

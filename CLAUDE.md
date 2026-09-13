@@ -2836,8 +2836,13 @@ exactly as before. `paint`, `high_water_mark` and `available_bytes` are safe `pu
 caller-supplied `depth_from`, and a safe function has to stay sound for any argument — so a
 second linker symbol, `_stack_start`, names the stack's other end and
 `stack::clamp_to_stack_region` holds `depth_from` inside `[_stack_end, _stack_start]` before
-either function computes a pointer from it; a stale or wrong reading is now a wrong
-measurement, never an out-of-bounds access. See
+either function computes a pointer from it. Being inside that range is not being below the
+*live* stack pointer, though — a stale address that is still a legal stack address, or
+`usize::MAX` clamped down to `_stack_start`, both pass that check — so the clamp also takes
+the lower of the region-clamped value and a fresh stack-pointer reading of its own, taken at
+the moment either function is called; a stale or wrong reading is now a wrong measurement,
+never an out-of-bounds access, and a caller's `depth_from` can only narrow what gets touched,
+never widen it past where the stack genuinely is. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

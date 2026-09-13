@@ -40,10 +40,13 @@ const POISON: u8 = 0xA5;
 ///
 /// A margin, not a proof. Fat LTO usually inlines [`paint`] and [`high_water_mark`] into
 /// their one caller, so neither reliably owns a frame of its own for this margin to protect.
-/// It guards two things this reasoning cannot rule out instead: an exception stacked below
-/// the stack pointer while either runs, and a future rebuild that stops inlining them. Never
-/// painted and never scanned, so [`high_water_mark`] can never read below it: a run that used
-/// fewer bytes than this margin still reports at least this many.
+/// It guards three things this reasoning cannot rule out instead: an exception stacked below
+/// the stack pointer while either runs, a future rebuild that stops inlining them, and the
+/// two functions' own call frames costing slightly different amounts — [`clamp_to_stack_region`]
+/// reads a fresh stack pointer inside each, so [`high_water_mark`]'s live reading can sit a
+/// handful of bytes above [`paint`]'s own without this margin covering the gap. Never painted
+/// and never scanned, so [`high_water_mark`] can never read below it: a run that used fewer
+/// bytes than this margin still reports at least this many.
 pub const GUARD_BYTES: usize = 128;
 
 unsafe extern "C" {
@@ -74,16 +77,23 @@ fn stack_ceiling() -> usize {
     core::ptr::addr_of!(_stack_start) as usize
 }
 
-/// Holds `depth_from` to `[stack_floor(), stack_ceiling()]`.
+/// Holds `depth_from` to `[stack_floor(), stack_ceiling()]`, then to the stack pointer's
+/// live reading.
 ///
 /// [`paint`] and [`high_water_mark`] are `pub fn`, not `unsafe fn`: a safe function must stay
-/// sound for every input, not only the one reading `main` actually passes. Without this, a
-/// stale or otherwise wrong `depth_from` would let `paint` write above the stack this image
-/// owns. Clamping first means every pointer either function computes afterwards stays inside
-/// `[_stack_end, _stack_start]` — real memory this image owns — whatever `depth_from` was.
-/// The cost of a wrong reading is a wrong *measurement*, never an out-of-bounds access.
+/// sound for every input, not only the one reading `main` actually passes. The region clamp
+/// alone is not enough — a stale `depth_from` that is still a legal *stack* address, or
+/// `usize::MAX` clamped down to `_stack_start`, both pass it, and either would let [`paint`]
+/// fill memory the stack is genuinely using right now, above the true stack pointer. So this
+/// also takes the lower of the region-clamped value and a *fresh* [`current_stack_pointer`]
+/// reading, taken at the moment either function is called rather than trusted from the
+/// argument. A caller's `depth_from` can therefore only ever narrow what gets painted or
+/// scanned, never widen it past where the stack pointer genuinely is. The cost of a wrong
+/// reading is a wrong *measurement*, never an out-of-bounds access.
 fn clamp_to_stack_region(depth_from: usize) -> usize {
-    depth_from.clamp(stack_floor(), stack_ceiling())
+    depth_from
+        .clamp(stack_floor(), stack_ceiling())
+        .min(current_stack_pointer())
 }
 
 /// The stack pointer, read from the core rather than inferred from a local's address.
@@ -103,9 +113,10 @@ pub fn current_stack_pointer() -> usize {
 /// moment of the call. Painting less than the true free region is safe; painting more is
 /// not, which is why the caller should read `depth_from` first and use nothing below it
 /// afterwards until the run this call is measuring has finished. A wrong or stale reading
-/// still cannot reach memory this image does not own: [`clamp_to_stack_region`] holds
-/// `depth_from` inside the stack region first, so the cost of a wrong reading is a wrong
-/// measurement, never an out-of-bounds write.
+/// still cannot reach memory this image does not own, or memory the stack is genuinely using
+/// right now: [`clamp_to_stack_region`] holds `depth_from` inside the stack region first, then
+/// takes the lower of that and a fresh stack pointer reading of its own, so the cost of a
+/// wrong reading is a wrong measurement, never an out-of-bounds write.
 ///
 /// Call this once per boot. A second call would paint over whatever the first call's own
 /// caller had already done, and report on the wrong run.
@@ -120,10 +131,12 @@ pub fn paint(depth_from: usize) {
     }
     // SAFETY: `bottom` is the linker's own `_stack_end`, the lowest address this image's
     // stack ever reaches. `top` is `depth_from` less a margin this function never touches,
-    // and `clamp_to_stack_region` has already held `depth_from` inside
-    // `[_stack_end, _stack_start]` — real memory this image owns — whatever the caller
-    // passed in. Every byte in `[bottom, top)` is therefore stack this image owns. The fill
-    // goes through a volatile write so it cannot be optimised away as dead.
+    // and `clamp_to_stack_region` has already held `depth_from` to no more than the lower of
+    // `_stack_start` and a stack pointer reading it took itself, moments before this loop
+    // runs — real memory this image owns, and never above where the stack genuinely is right
+    // now, whatever the caller passed in. Every byte in `[bottom, top)` is therefore stack
+    // this image owns and is not currently using. The fill goes through a volatile write so
+    // it cannot be optimised away as dead.
     unsafe {
         let mut at = bottom as *mut u8;
         let end = top as *mut u8;
@@ -154,10 +167,13 @@ pub fn high_water_mark(depth_from: usize) -> u32 {
     if ceiling <= bottom {
         return 0;
     }
-    // SAFETY: `clamp_to_stack_region` holds `depth_from` inside `[_stack_end, _stack_start]`
-    // first, so `[bottom, ceiling)` is real memory this image owns. It is also the same
-    // range `paint` fills when called with the same `depth_from`, so every byte read here is
-    // either still `POISON` or was legitimately written by the run being measured.
+    // SAFETY: `clamp_to_stack_region` holds `depth_from` to no more than the stack pointer's
+    // own live reading, taken at this call, so `[bottom, ceiling)` is real memory this image
+    // owns and is at or below where the stack genuinely is right now. Every byte in it is
+    // therefore either still `POISON` — untouched by the run — or was legitimately written by
+    // it: `paint`'s own equivalent clamp, taken at its own call, can differ from this one only
+    // by the few bytes each function's own call frame costs, which is what `GUARD_BYTES`
+    // exists to absorb.
     let deepest = unsafe {
         let mut at = bottom as *const u8;
         let end = ceiling as *const u8;
