@@ -47,6 +47,9 @@
 
 use core::panic::PanicInfo;
 
+#[cfg(feature = "crc-candidates")]
+mod checksum_candidates;
+
 /// Required of any `no_std` binary, and never reached: nothing runs this image.
 ///
 /// `const` because the workspace's nursery lints ask for it and there is no reason to
@@ -78,6 +81,7 @@ fn probe() -> usize {
     kept = kept.wrapping_add(facade());
     kept = kept.wrapping_add(codec_bridge());
     kept = kept.wrapping_add(codec_postcard());
+    kept = kept.wrapping_add(crc_candidates());
     core::hint::black_box(kept)
 }
 
@@ -2244,6 +2248,21 @@ fn codec_postcard() -> usize {
 #[cfg(not(feature = "embassy-serde"))]
 #[inline(never)]
 fn codec_bridge() -> usize {
+    core::hint::black_box(0)
+}
+
+/// Issue #61's row: ADR 0010's five checksum candidates, linked so their `.text` and
+/// `.rodata` can be read rather than typed into an ADR by hand.
+#[cfg(feature = "crc-candidates")]
+#[inline(never)]
+fn crc_candidates() -> usize {
+    checksum_candidates::probe()
+}
+
+/// Nothing, in an image built without the checksum candidates.
+#[cfg(not(feature = "crc-candidates"))]
+#[inline(never)]
+fn crc_candidates() -> usize {
     core::hint::black_box(0)
 }
 

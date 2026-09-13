@@ -2787,6 +2787,18 @@ and a Cortex-M0 is not a Cortex-M0+. ADR 0040 carries no attestation marker, so
 `hardware-attestation` fails a build in which somebody moves a row and cites it. See
 [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
+Issue #61 closes a gap ADR 0010 named in its own text: its `.text` and `.rodata` figures
+were typed in by hand, from a build this repository did not run. `waymaker-size-probe` gains
+a `crc-candidates` feature that links all five candidates ADR 0010 measured — the two shipped
+algorithms copied from `waymaker-flash/src/crc.rs`, and the three rejected candidates copied
+from `waymaker-flash/tests/integrity.rs` — each `#[inline(never)]` so it keeps its own symbol.
+`cargo xtask size` reads each one by name and prints a `checksum candidates` section: five
+rows, reported and not gated, because ADR 0010 is a comparison between candidates rather than
+a cost this firmware pays. A wrong, missing, or duplicated candidate still fails the command,
+for the same reason every other section here does. The real numbers are close to ADR 0010's —
+52 B, 52 B, 64 B of `.rodata`, 1024 B of `.rodata`, 60 B — and now come from a linked image
+rather than from a paragraph.
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
 async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's exit
