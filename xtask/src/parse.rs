@@ -37,6 +37,27 @@ pub fn parse_rust(contents: &str) -> Result<syn::File, syn::Error> {
     syn::parse_file(contents)
 }
 
+/// The name of `ident`. Strips a leading `r#` marker.
+///
+/// `r#alloc` and `alloc` name the same crate (issues #68, #90). Use this function,
+/// or [`ident_is`], for every name comparison in this module.
+fn ident_name(ident: &syn::Ident) -> String {
+    ident.unraw().to_string()
+}
+
+/// True if `ident` has the name `name`. Ignores a raw marker on `ident`.
+fn ident_is(ident: &syn::Ident, name: &str) -> bool {
+    ident.unraw() == name
+}
+
+/// True if `path` is one identifier with the name `name`. Ignores a raw marker.
+///
+/// [`syn::Path::is_ident`] keeps the raw marker. Without this function,
+/// `#[r#cfg(test)]` would not match `"cfg"` (issue #90).
+fn path_is_ident(path: &syn::Path, name: &str) -> bool {
+    path.get_ident().is_some_and(|ident| ident_is(ident, name))
+}
+
 /// Whether `attrs` carries exactly `#[cfg(test)]`.
 ///
 /// The textual `without_test_modules` blanked on the substring `#[cfg(test)]`; the
@@ -45,10 +66,10 @@ pub fn parse_rust(contents: &str) -> Result<syn::File, syn::Error> {
 /// skipped — the textual version did not blank on it either.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
+        path_is_ident(attr.path(), "cfg")
             && attr
                 .parse_args::<syn::Ident>()
-                .is_ok_and(|ident| ident == "test")
+                .is_ok_and(|ident| ident_is(&ident, "test"))
     })
 }
 
@@ -132,9 +153,9 @@ pub fn extern_crate_names(contents: &str) -> Result<Vec<String>, syn::Error> {
         .items
         .iter()
         .filter_map(|item| match item {
-            // `unraw()` strips the `r#` prefix: `extern crate r#alloc;` is the same
-            // crate as `extern crate alloc;` (issues #68/#90).
-            syn::Item::ExternCrate(declaration) => Some(declaration.ident.unraw().to_string()),
+            // `extern crate r#alloc;` is the same crate as `extern crate alloc;`
+            // (issues #68/#90).
+            syn::Item::ExternCrate(declaration) => Some(ident_name(&declaration.ident)),
             _ => None,
         })
         .collect())
@@ -196,22 +217,23 @@ fn collect_tree_aliases(
 ) {
     match tree {
         syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(ident_name(&path.ident));
             collect_tree_aliases(&path.tree, prefix, aliases);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
+            // A raw identifier cannot spell `self`. This check needs no `ident_is`.
             if name.ident != "self" {
                 aliases.push(UseAlias {
-                    local: name.ident.to_string(),
-                    target: [prefix.clone(), vec![name.ident.to_string()]].concat(),
+                    local: ident_name(&name.ident),
+                    target: [prefix.clone(), vec![ident_name(&name.ident)]].concat(),
                 });
             }
         }
         syn::UseTree::Rename(rename) => {
             aliases.push(UseAlias {
-                local: rename.rename.to_string(),
-                target: [prefix.clone(), vec![rename.ident.to_string()]].concat(),
+                local: ident_name(&rename.rename),
+                target: [prefix.clone(), vec![ident_name(&rename.ident)]].concat(),
             });
         }
         syn::UseTree::Glob(_) => {}
@@ -298,7 +320,7 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     let mut segments: Vec<String> = path
         .segments
         .iter()
-        .map(|segment| segment.ident.to_string())
+        .map(|segment| ident_name(&segment.ident))
         .collect();
     if path.leading_colon.is_some() {
         return segments;
@@ -349,7 +371,7 @@ fn collect_future_implementors(
                     if resolved.last().is_some_and(|last| last == "Future") {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
-                                implementors.push(name.ident.to_string());
+                                implementors.push(ident_name(&name.ident));
                             }
                         }
                     }
@@ -386,7 +408,7 @@ fn count_fn_declarations(items: &[syn::Item], name: &str) -> usize {
         .iter()
         .map(|item| {
             match item {
-            syn::Item::Fn(function) => usize::from(function.sig.ident == name),
+            syn::Item::Fn(function) => usize::from(ident_is(&function.sig.ident, name)),
             syn::Item::Mod(module) => module
                 .content
                 .as_ref()
@@ -395,14 +417,14 @@ fn count_fn_declarations(items: &[syn::Item], name: &str) -> usize {
                 .items
                 .iter()
                 .filter(|member| {
-                    matches!(member, syn::TraitItem::Fn(function) if function.sig.ident == name)
+                    matches!(member, syn::TraitItem::Fn(function) if ident_is(&function.sig.ident, name))
                 })
                 .count(),
             syn::Item::Impl(implementation) => implementation
                 .items
                 .iter()
                 .filter(|member| {
-                    matches!(member, syn::ImplItem::Fn(function) if function.sig.ident == name)
+                    matches!(member, syn::ImplItem::Fn(function) if ident_is(&function.sig.ident, name))
                 })
                 .count(),
             _ => 0,
@@ -429,7 +451,9 @@ pub fn declares_countable_test(contents: &str, name: &str) -> Result<bool, syn::
 
 fn items_declare_countable_test(items: &[syn::Item], name: &str) -> bool {
     items.iter().any(|item| match item {
-        syn::Item::Fn(function) => function.sig.ident == name && is_countable_test(&function.attrs),
+        syn::Item::Fn(function) => {
+            ident_is(&function.sig.ident, name) && is_countable_test(&function.attrs)
+        }
         syn::Item::Mod(module) => module
             .content
             .as_ref()
@@ -442,10 +466,13 @@ fn is_countable_test(attributes: &[syn::Attribute]) -> bool {
     let mut tested = false;
     for attribute in attributes {
         let path = attribute.path();
-        if path.is_ident("test") {
+        if path_is_ident(path, "test") {
             tested = true;
         }
-        if path.is_ident("ignore") || path.is_ident("cfg") || path.is_ident("cfg_attr") {
+        if path_is_ident(path, "ignore")
+            || path_is_ident(path, "cfg")
+            || path_is_ident(path, "cfg_attr")
+        {
             return false;
         }
     }
@@ -600,7 +627,7 @@ fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTar
                         continue;
                     }
                     if let syn::ImplItem::Fn(function) = item {
-                        if function.sig.ident == name {
+                        if ident_is(&function.sig.ident, name) {
                             blocks.push(InsideTarget::Block(&function.block));
                         }
                     }
@@ -623,7 +650,7 @@ fn fn_blocks<'a>(items: &'a [syn::Item], name: &str, blocks: &mut Vec<&'a syn::B
             continue;
         }
         match item {
-            syn::Item::Fn(function) if function.sig.ident == name => {
+            syn::Item::Fn(function) if ident_is(&function.sig.ident, name) => {
                 blocks.push(&function.block);
             }
             syn::Item::Impl(implementation) => {
@@ -632,7 +659,7 @@ fn fn_blocks<'a>(items: &'a [syn::Item], name: &str, blocks: &mut Vec<&'a syn::B
                         continue;
                     }
                     if let syn::ImplItem::Fn(function) = impl_item {
-                        if function.sig.ident == name {
+                        if ident_is(&function.sig.ident, name) {
                             blocks.push(&function.block);
                         }
                     }
@@ -681,7 +708,7 @@ fn self_ty_names(self_ty: &syn::Type, ty: &str) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|segment| segment.ident == ty),
+            .is_some_and(|segment| ident_is(&segment.ident, ty)),
         _ => false,
     }
 }
@@ -754,7 +781,7 @@ pub fn trait_impls(contents: &str) -> Result<Vec<TraitImpl>, syn::Error> {
             let trait_segments: Vec<String> = trait_path
                 .segments
                 .iter()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| ident_name(&segment.ident))
                 .collect();
             let trait_generics = match &last.arguments {
                 syn::PathArguments::AngleBracketed(args) => {
@@ -873,7 +900,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         }
 
         fn visit_ident(&mut self, node: &'ast syn::Ident) {
-            self.idents.push(node.to_string());
+            self.idents.push(ident_name(node));
         }
 
         fn visit_path(&mut self, node: &'ast syn::Path) {
@@ -1066,7 +1093,7 @@ fn collect_fns_named(
 ) {
     for item in items {
         match item {
-            syn::Item::Fn(function) if function.sig.ident == name => {
+            syn::Item::Fn(function) if ident_is(&function.sig.ident, name) => {
                 if !include_test_gated && has_cfg_test(&function.attrs) {
                     continue;
                 }
@@ -1081,7 +1108,7 @@ fn collect_fns_named(
                 }
                 for inner in &implementation.items {
                     if let syn::ImplItem::Fn(method) = inner {
-                        if method.sig.ident == name
+                        if ident_is(&method.sig.ident, name)
                             && (include_test_gated || !has_cfg_test(&method.attrs))
                         {
                             found.push(NamedFn {
@@ -1131,10 +1158,13 @@ pub fn declares_test(contents: &str, name: &str) -> bool {
             let Some(first) = attr.path().segments.first() else {
                 continue;
             };
-            if attr.path().segments.len() == 1 && first.ident == "test" {
+            if attr.path().segments.len() == 1 && ident_is(&first.ident, "test") {
                 tested = true;
             }
-            if first.ident == "ignore" || first.ident == "cfg" || first.ident == "cfg_attr" {
+            if ident_is(&first.ident, "ignore")
+                || ident_is(&first.ident, "cfg")
+                || ident_is(&first.ident, "cfg_attr")
+            {
                 skippable = true;
             }
         }
@@ -1240,7 +1270,7 @@ fn collect_child_modules(
         let syn::Item::Mod(module) = item else {
             continue;
         };
-        let name = module.ident.to_string();
+        let name = ident_name(&module.ident);
         let item_gated = gated || has_cfg_test(&module.attrs);
         if let Some((_, nested)) = module.content.as_ref() {
             // Inline: no file of its own, but its out-of-line children live under it.
@@ -1273,7 +1303,7 @@ fn collect_child_modules(
 
 /// The string value of a `#[path = "..."]` attribute, if present.
 fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
-    if !attr.path().is_ident("path") {
+    if !path_is_ident(attr.path(), "path") {
         return None;
     }
     let syn::Meta::NameValue(named) = &attr.meta else {
@@ -1302,4 +1332,113 @@ fn block_text(block: &syn::Block) -> String {
         body.push(' ');
     }
     body.replace(" :: ", "::")
+}
+
+#[cfg(test)]
+mod raw_identifier_tests {
+    //! A raw identifier and its plain spelling name the same item (issue #90).
+    //! `extern_crate_names` already strips the `r#` marker. This module tests
+    //! every other parser in this file against the same rule.
+    use super::{
+        FnScope, child_modules, declares_test, fn_declaration_count, future_trait_implementors,
+        name_uses, resolved_path_uses, struct_literal_counts, trait_impls, use_aliases,
+    };
+
+    #[test]
+    fn a_raw_trait_name_is_still_the_trait() {
+        let impls = trait_impls("impl r#TryFrom<&[u8]> for Foo {}").expect("the fixture parses");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].trait_segments, ["TryFrom"]);
+    }
+
+    #[test]
+    fn a_raw_future_implementor_is_still_reported() {
+        let implementors = future_trait_implementors("impl core::future::r#Future for Fifth {}")
+            .expect("the fixture parses");
+        assert_eq!(implementors, ["Fifth"]);
+    }
+
+    #[test]
+    fn a_raw_use_segment_resolves_to_its_plain_name() {
+        let aliases = use_aliases("use r#serde::Deserialize;").expect("the fixture parses");
+        assert_eq!(aliases.len(), 1, "{aliases:?}");
+        assert_eq!(aliases[0].target, ["serde", "Deserialize"]);
+    }
+
+    #[test]
+    fn a_raw_use_rename_target_resolves_to_its_plain_name() {
+        let aliases = use_aliases("use serde::r#Deserialize as D;").expect("the fixture parses");
+        assert_eq!(aliases.len(), 1, "{aliases:?}");
+        assert_eq!(aliases[0].local, "D");
+        assert_eq!(aliases[0].target, ["serde", "Deserialize"]);
+    }
+
+    #[test]
+    fn a_raw_path_segment_resolves_to_its_plain_name() {
+        let paths =
+            resolved_path_uses("fn f() { r#serde::Deserialize; }").expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["serde", "Deserialize"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_fn_name_is_still_counted() {
+        assert_eq!(
+            fn_declaration_count("fn r#new() {}", "new").expect("the fixture parses"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_raw_test_attribute_is_still_a_test() {
+        assert!(declares_test("#[r#test]\nfn r#it_works() {}", "it_works"));
+    }
+
+    #[test]
+    fn a_raw_cfg_test_marker_still_excludes_the_item() {
+        // `has_cfg_test` controls the visitor in `trait_impls`. A `#[cfg(r#test)]`
+        // module must skip, like a `#[cfg(test)]` module.
+        let impls =
+            trait_impls("#[cfg(r#test)]\nmod tests {\n    impl TryFrom<&[u8]> for Foo {}\n}\n")
+                .expect("the fixture parses");
+        assert!(impls.is_empty(), "{impls:?}");
+    }
+
+    #[test]
+    fn a_raw_inherent_type_name_is_still_matched() {
+        // `self_ty_names` must read `impl r#Foo` as "Foo". Else `FnScope::InherentImpls`
+        // finds no body to search.
+        let counts = struct_literal_counts(
+            "impl r#Foo { fn build() -> Foo { Foo {} } }",
+            "Foo",
+            FnScope::InherentImpls("Foo"),
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.inside, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_raw_module_name_resolves_to_its_plain_file() {
+        let modules = child_modules("src/crc.rs", "mod r#type;").expect("the fixture parses");
+        assert_eq!(modules.len(), 1, "{}", modules.len());
+        assert_eq!(modules[0].name, "type");
+        assert!(
+            modules[0]
+                .candidates
+                .iter()
+                .any(|candidate| candidate.ends_with("type.rs")),
+            "{:?}",
+            modules[0].candidates
+        );
+    }
+
+    #[test]
+    fn a_raw_ident_use_is_still_named() {
+        let uses = name_uses("fn f() { let r#alloc = 1; }").expect("the fixture parses");
+        assert!(uses.names_word("alloc"), "{uses:?}");
+    }
 }
