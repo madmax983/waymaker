@@ -413,6 +413,31 @@ mod bare_metal_tests {
     }
 
     #[test]
+    fn a_raw_identifier_extern_crate_is_caught_in_a_nested_module() {
+        // Issue #68: this scan must catch `r#alloc` too, the same as the
+        // crate-root scan does.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-flash",
+            "crates/waymaker-flash/src/frame.rs",
+            "extern crate r#alloc;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].detail.contains("extern crate alloc"));
+    }
+
+    #[test]
+    fn a_raw_identifier_extern_crate_std_is_caught_in_a_nested_module() {
+        // Issue #68: check `r#std` too. Do not check `r#alloc` only.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-core",
+            "crates/waymaker-core/src/replay.rs",
+            "extern crate r#std;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].detail.contains("extern crate std"));
+    }
+
+    #[test]
     fn an_ordinary_layer_source_passes() {
         assert!(
             check_layer_sources_are_bare_metal(&[source(
@@ -9547,6 +9572,19 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_identifier_extern_crate_std_is_detected() {
+        // Issue #68: check `r#std` too. Do not check `r#alloc` only.
+        let source = "#![no_std]\n#![forbid(unsafe_code)]\nextern crate r#std;\n";
+        let violations = check_crate_attributes(&sources("waymaker-core", source));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("extern crate std")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_multiline_attribute_is_read_as_one_attribute() {
         // Rust accepts an attribute split over several lines, and a line-oriented scan
         // reads only `#![allow(` — which is how a crate silences a lint the gate is
@@ -12623,6 +12661,38 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn used_call_reports_a_conforming_decoy_nested_in_a_module() {
+        // Issue #62's own reproduction, isolated to `used_call` so the
+        // `SEALING_FUNCTIONS` ambiguity check cannot mask it (Codex found
+        // that `check_integrity_routing` end to end cannot isolate this,
+        // since `next` is also a `SEALING_FUNCTIONS` row: any second
+        // `fn next`, conforming or not, trips that check on its own).
+        //
+        // The decoy sits in `mod lookahead`, calls `decode_with` and is
+        // textually first. The real `next` calls nothing. The old
+        // `braced_body` read the first `fn next` it found — the conforming
+        // decoy — and declared the pin satisfied while the broken real
+        // body went unseen.
+        let contents = format!(
+            "mod lookahead {{\n    fn {name}(rest: &[u8]) -> Option<usize> {{\n        \
+             let frame = {callee}(rest);\n        Some(frame)\n    }}\n}}\nfn {name}() {{\n    \
+             let _ = 0;\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains(&format!("`fn {}`", SCAN_STEP.0))
+                && violation.detail.contains("2 times")),
+            "a conforming decoy `fn {}` nested in another module went unreported: \
+             {violations:?}",
+            SCAN_STEP.0
+        );
+    }
+
+    #[test]
     fn a_path_qualified_delegation_is_reported() {
         // `count_tokens(body, "crc32") == 1` is satisfied by `fast::crc32(bytes)` calling a
         // Castagnoli loop in a sibling module, with `crc.rs` untouched so the other half of
@@ -14186,6 +14256,27 @@ mod deferred_answer_pins {
                 .iter()
                 .any(|v| v.detail.contains("more than one")),
             "an ambiguous module was silently resolved to the first file: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_two_level_plain_directory_split_test_module_is_excluded() {
+        // Issue #59. `crc.rs` declares `mod table;`. `table.rs` declares
+        // `#[cfg(test)] mod tests;`. The gate reads from the child file, not
+        // from the root. The old code read the gate from the root file only.
+        // It did not see the child's test module. It reported the test
+        // fixture as a shipped table.
+        let parent = format!("{}\nmod table;\n", tests_support::clean_checksum_module());
+        let table = "//! Nibble tables.\n#[cfg(test)]\nmod tests;\n";
+        let table_tests = "//! Table tests.\nconst FIXTURE: [u8; 4] = [0; 4];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/table.rs", table),
+            layer("waymaker-flash/src/crc/table/tests.rs", table_tests),
+        ]);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("FIXTURE")),
+            "a test-only file two directories deep was scanned as production: {violations:?}"
         );
     }
 
