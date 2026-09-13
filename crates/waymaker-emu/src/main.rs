@@ -96,12 +96,11 @@ fn main() -> ! {
 
     let resolved = stack::paint(depth_from);
     let outcome = measured_run();
-    // Read against `resolved` — the bound `paint` actually used — rather than the original
-    // `depth_from` or a fresh reading of its own. Either of those would let this figure and
-    // `used` below disagree by the few bytes each call's own frame costs, which could report
+    // Both figures come from this one call, against `resolved` — the bound `paint` actually
+    // used — rather than two separate calls each re-deriving their own live reading. Two
+    // calls could disagree by the few bytes each one's own frame costs, which could report
     // `used` short of `available` even where a run disturbed every byte `paint` painted.
-    let used = stack::high_water_mark(resolved);
-    let available = stack::available_bytes(resolved);
+    let (used, available) = stack::high_water_mark(resolved);
 
     match outcome {
         Ok(census) => {

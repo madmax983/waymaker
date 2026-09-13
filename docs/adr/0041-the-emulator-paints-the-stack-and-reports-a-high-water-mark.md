@@ -165,6 +165,21 @@ the shipped file rather than trusting the two copies to stay in step on their ow
 `a_stack_region_no_wider_than_the_guard_is_refused_even_when_not_empty` is the test watched
 failing against the `== 0` check before this closed it.
 
+**Passing the same argument to two functions is not the same as computing one number, and
+review found that `high_water_mark` and `available_bytes` still each clamped it on their
+own.** Both took `resolved` — the bound `paint` returned — but each still called
+`clamp_to_stack_region` itself, at its own call site, taking the lower of `resolved` and *its
+own* fresh stack-pointer reading. Two calls one statement apart can still read that fresh
+value differently if their own frames differ enough, so `used` and a later `available` could
+still disagree by those few bytes — the same shape of gap the bound-reuse fix above closed
+between `paint` and its callers, reopened one level down between `high_water_mark` and
+`available_bytes`. `high_water_mark` now returns *both* numbers, computed from the one
+`depth_from` it resolves for itself in that single call, through `region_bytes` — a shared
+arithmetic function neither figure can be computed from a different bound at, because there
+is now only the one place either is computed. What `available_bytes` alone is still for is
+the pre-`paint` gate check, where `paint` has not run yet and there is no shared bound yet to
+reuse.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -194,18 +209,18 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the four hardenings changed what the figure means, only what a wrong caller could do
-to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate
-report.** `clamp_to_stack_region` is a floor-and-ceiling
-clamp plus a live-stack-pointer clamp, not a new measurement path, and what changed is the
-*worst case* for an argument this ADR's own text had already named as an obligation on the
-caller rather than a check: it is now a check too. `main` now reads `available_bytes` twice —
-once on its own original reading, to decide whether to attempt a measurement at all, and once
-more on the bound `paint` returned, to report a figure measured against the same bound
-`high_water_mark` used — and both readings sit within the handful of bytes each call's own
-frame costs of `main`'s original reading, which is inside the noise `GUARD_BYTES` already
-exists to absorb and smaller than what the ADR's own lower-bound honesty already asks a reader
-to expect.
+**None of the five hardenings changed what the figure means, only what a wrong caller could do
+to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
+an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
+a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*
+for an argument this ADR's own text had already named as an obligation on the caller rather
+than a check: it is now a check too. `main` calls `available_bytes` once, on its own original
+reading, to decide whether to attempt a measurement at all; the reported `used` and
+`available` both then come from the single later call to `high_water_mark`, against the bound
+`paint` returned. That one early reading sits within the handful of bytes `available_bytes`'s
+own call frame costs of `main`'s original reading, which is inside the noise `GUARD_BYTES`
+already exists to absorb and smaller than what the ADR's own lower-bound honesty already asks
+a reader to expect.
 
 **What is still owed.** A decoy `stack.rs` reproducing the whole crate-relative suffix in a
 different, deeper directory would still be read as the permitted module — narrower than the

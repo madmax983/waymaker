@@ -2856,7 +2856,11 @@ and reports the region's full width regardless, so a resolved bound 50 bytes wid
 `used=0 available=50`, which the shortfall check's original `available == 0` line did not
 catch even though nothing was measured. `emulate::StackUsage::shortfall` now refuses any
 `available` no wider than a duplicated `STACK_GUARD_BYTES`, held to the real constant by a
-test that reads the literal back out of the shipped file. See
+test that reads the literal back out of the shipped file. Passing the same `resolved` value to
+two separate calls still let them disagree, because each still clamped it against its own
+fresh stack-pointer reading at its own call site — `stack::high_water_mark` now returns both
+`used` and `available` together, computed from the one `depth_from` it resolves for itself in
+that single call, so there is no second call left to read a different bound. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

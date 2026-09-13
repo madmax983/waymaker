@@ -158,27 +158,36 @@ pub fn paint(depth_from: usize) -> usize {
     depth_from
 }
 
-/// How many bytes below `depth_from` a run since [`paint`] disturbed.
+/// How many bytes below `depth_from` a run since [`paint`] disturbed, and the size of the
+/// region that measurement is against.
 ///
-/// `depth_from` must be the bound [`paint`] returned, not the original stack pointer reading
-/// — passing the same already-resolved value is what keeps this call's clamp a no-op rather
-/// than an independent live reading of its own, which is what makes `used` comparable to a
-/// later [`available_bytes`] call over the same bound. Scans from `_stack_end` upward for the
-/// first byte that is no longer [`POISON`]; everything below that byte was never touched, so
-/// the run reached no deeper. The scan stops at the same ceiling `paint` stopped filling at —
-/// `depth_from` less [`GUARD_BYTES`] — and never reads the guard margin itself: that memory
-/// was never painted, so a byte that happened to already read as [`POISON`] there would be
-/// indistinguishable from one `paint` wrote, and the figure would under-report rather than
-/// over-report. Bounding the scan the same way `paint` bounded the fill closes that off.
+/// `depth_from` must be the bound [`paint`] returned, not the original stack pointer reading.
+/// Both figures come from the *one* `depth_from` this call resolves for itself — there is no
+/// separate call for `available` to disagree with, which is what closes a gap review found in
+/// an earlier version of this fix: `high_water_mark` and a later [`available_bytes`] call each
+/// clamped `depth_from` on their own, at different points in the boot, and a run that
+/// genuinely disturbed every painted byte could still report `used` a few bytes short of
+/// `available` — which would defeat `StackUsage::shortfall`'s fail-closed check on exactly the
+/// case it exists to catch. Computing both from one clamp, in one call, makes that impossible:
+/// whatever `depth_from` resolves to here is what both numbers are measured against.
+///
+/// Scans from `_stack_end` upward for the first byte that is no longer [`POISON`]; everything
+/// below that byte was never touched, so the run reached no deeper. The scan stops at the
+/// same ceiling `paint` stopped filling at — `depth_from` less [`GUARD_BYTES`] — and never
+/// reads the guard margin itself: that memory was never painted, so a byte that happened to
+/// already read as [`POISON`] there would be indistinguishable from one `paint` wrote, and the
+/// figure would under-report rather than over-report. Bounding the scan the same way `paint`
+/// bounded the fill closes that off.
 #[must_use]
-pub fn high_water_mark(depth_from: usize) -> u32 {
+pub fn high_water_mark(depth_from: usize) -> (u32, u32) {
     let depth_from = clamp_to_stack_region(depth_from);
     let bottom = stack_floor();
+    let available = region_bytes(bottom, depth_from);
     let Some(ceiling) = depth_from.checked_sub(GUARD_BYTES) else {
-        return 0;
+        return (0, available);
     };
     if ceiling <= bottom {
-        return 0;
+        return (0, available);
     }
     // SAFETY: `clamp_to_stack_region` holds `depth_from` to no more than the stack pointer's
     // own live reading, taken at this call, so `[bottom, ceiling)` is real memory this image
@@ -196,7 +205,7 @@ pub fn high_water_mark(depth_from: usize) -> u32 {
         }
         at as usize
     };
-    used_bytes(bottom, depth_from, deepest)
+    (used_bytes(bottom, depth_from, deepest), available)
 }
 
 /// The arithmetic [`high_water_mark`] reports, apart from the read that feeds it.
@@ -214,20 +223,28 @@ fn used_bytes(bottom: usize, top: usize, deepest: usize) -> u32 {
     u32::try_from(top - deepest).unwrap_or(u32::MAX)
 }
 
-/// The size of the region [`paint`] fills and [`high_water_mark`] scans.
+/// The size of `[bottom, depth_from)`, or `0` if `depth_from` is at or below `bottom`.
 ///
-/// Called twice in the one real boot: once on the original stack pointer reading, before
-/// [`paint`] runs, to decide whether there is room to attempt a measurement at all; and once
-/// more on the bound [`paint`] returned, after the run, so the figure this second call reports
-/// is measured against the same bound [`high_water_mark`] used rather than an earlier,
-/// independent live reading that a genuinely exhausted run could otherwise slip past.
-#[must_use]
-pub fn available_bytes(depth_from: usize) -> u32 {
-    let depth_from = clamp_to_stack_region(depth_from);
-    let bottom = stack_floor();
+/// The one place both [`available_bytes`] and [`high_water_mark`] compute this figure, so
+/// the arithmetic itself cannot drift between the two — only which `depth_from` each was
+/// given can.
+fn region_bytes(bottom: usize, depth_from: usize) -> u32 {
     if depth_from <= bottom {
         0
     } else {
         u32::try_from(depth_from - bottom).unwrap_or(u32::MAX)
     }
+}
+
+/// The size of the region [`paint`] would fill, from a stack pointer reading taken before it.
+///
+/// Called once in the one real boot, before [`paint`] runs, to decide whether there is room
+/// to attempt a measurement at all. The figure that matters for the *report* is
+/// [`high_water_mark`]'s own `available` — computed from the bound `paint` actually resolved,
+/// in the same call as `used` — not this one, which [`clamp_to_stack_region`]'s own live
+/// reading can differ from by the few bytes a call frame costs.
+#[must_use]
+pub fn available_bytes(depth_from: usize) -> u32 {
+    let depth_from = clamp_to_stack_region(depth_from);
+    region_bytes(stack_floor(), depth_from)
 }
