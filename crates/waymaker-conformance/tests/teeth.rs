@@ -97,14 +97,14 @@ enum Flaw {
     /// notices, then reports. Whether the suite sees it depends entirely on whether its
     /// witness bytes lie inside the range the erase named.
     RefusedMisalignedEraseTakesTheRangeItNamed,
-    /// A program whose *offset* is misaligned is silently accepted; length and bounds are
-    /// still checked.
+    /// A program whose *offset* is misaligned still writes to media before refusing.
     ///
-    /// The shape an adapter that validates length before media and offset only after
-    /// programming has: with an all-erased source, this and `RefusalScribblesFirst` would be
-    /// invisible to each other, so this needs its own witness that a clearing source can
-    /// damage.
-    MisalignedProgramOffsetIsAccepted,
+    /// The shape an adapter that validates the offset only after programming has: it still
+    /// returns an error, so a check that only asks whether the call was refused cannot see
+    /// it. Scoped to the offset misalignment alone — unlike `RefusalScribblesFirst`, which
+    /// scribbles on any validation failure — so it can only be caught by a case that probes
+    /// an offset misalignment specifically and then checks what it left behind.
+    MisalignedProgramOffsetScribblesBeforeRefusing,
     /// A program of more than one unit corrupts the program unit *before* the one it named.
     ///
     /// Distinct from [`Flaw::ProgramCorruptsThePrecedingUnit`], which fires on *every*
@@ -307,11 +307,12 @@ impl StableStorage for Broken {
         if self.validates() {
             match self.geometry.validate_program(offset, len) {
                 Ok(()) => {}
-                Err(GeometryError::MisalignedOffset)
-                    if self.flaw == Flaw::MisalignedProgramOffsetIsAccepted => {}
                 Err(GeometryError::OutOfBounds) if !self.checks_the_end(offset) => {}
                 Err(error) => {
-                    if self.flaw == Flaw::RefusalScribblesFirst {
+                    if self.flaw == Flaw::RefusalScribblesFirst
+                        || (self.flaw == Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
+                            && error == GeometryError::MisalignedOffset)
+                    {
                         self.apply(offset, src);
                     }
                     if self.flaw == Flaw::StraddlingMutationWipesTheValidPrefix
@@ -460,6 +461,17 @@ fn nested() -> Geometry {
 fn two_units_per_block() -> Geometry {
     let Ok(geometry) = Geometry::new(1024, 8, 4, 2) else {
         unreachable!("1024 is whole 8-byte blocks of two whole 4-byte units")
+    };
+    geometry
+}
+
+/// A geometry whose erase block is a single program unit.
+///
+/// `nested()` never exercises `multi_unit_program_crossing_a_block`: with a block wider
+/// than a unit, a two-unit program always fits inside one block. Here it spans two.
+fn block_is_one_unit() -> Geometry {
+    let Ok(geometry) = Geometry::new(1024, 4, 4, 2) else {
+        unreachable!("1024 is whole 4-byte blocks that are one 4-byte program unit")
     };
     geometry
 }
@@ -619,9 +631,9 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Failure::LegalOperationRefused,
     ),
     (
-        Flaw::MisalignedProgramOffsetIsAccepted,
+        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
         CaseId::MisalignedProgramIsRefused,
-        Failure::IllegalOperationAccepted,
+        Failure::RefusedOperationTouchedMedia,
     ),
     (
         Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
@@ -751,7 +763,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::BarrierScribblesBeyondTheWorkingBlocks => true,
         Flaw::None
         | Flaw::NoValidation
-        | Flaw::MisalignedProgramOffsetIsAccepted
+        | Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
         | Flaw::PastCapacityIsClamped
         | Flaw::BoundsCheckedAtTheStartOnly
         | Flaw::WanderingGeometry
@@ -855,9 +867,9 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::RefusedProgramTouchesNoMedia,
             Failure::LegalOperationRefused,
         )),
-        Flaw::MisalignedProgramOffsetIsAccepted => Some((
+        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing => Some((
             CaseId::MisalignedProgramIsRefused,
-            Failure::IllegalOperationAccepted,
+            Failure::RefusedOperationTouchedMedia,
         )),
         Flaw::MultiUnitProgramCorruptsThePrecedingUnit => Some((
             CaseId::MultiUnitProgramIsLegal,
@@ -901,7 +913,7 @@ const ALL: &[Flaw] = &[
     Flaw::ReadAlwaysFails,
     Flaw::ProgramAlwaysFails,
     Flaw::EraseAlwaysFails,
-    Flaw::MisalignedProgramOffsetIsAccepted,
+    Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
     Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
     Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
 ];
@@ -990,6 +1002,25 @@ fn a_program_that_spills_into_the_next_block_is_caught_when_the_block_holds_two_
 
     assert_eq!(
         report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
+        Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_multi_unit_program_that_corrupts_the_preceding_unit_is_caught_when_it_crosses_a_block() {
+    // The main sweep runs every flaw against `nested()`, where a block holds sixteen program
+    // units and a two-unit program always fits inside one — `multi_unit_program_is_legal`
+    // takes its `within_a_block` branch there and never its `crossing_a_block` one. This is
+    // the adversarial coverage that branch is otherwise missing.
+    let geometry = block_is_one_unit();
+    let mut device = Broken::new(geometry, Flaw::MultiUnitProgramCorruptsThePrecedingUnit);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(
+        report.outcome(CaseId::MultiUnitProgramIsLegal),
         Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
         "{report:?}"
     );
