@@ -12624,10 +12624,11 @@ mod deferred_answer_pins {
 
     #[test]
     fn a_decoy_nested_in_a_module_is_reported_rather_than_shadowing_the_scan_step() {
-        // Issue #62: a `mod lookahead` above `Scan::next` called `decode_with`.
-        // The old scan read only the first `fn next` and missed the real body.
-        // `count_tokens` and `fns_named` scan the whole file. A second `fn next`
-        // is reported even when it sits inside a nested module.
+        // Issue #62's own reproduction: a `mod lookahead` above the real
+        // `Scan::next`. `next` is both a `SEALING_FUNCTIONS` row and the
+        // `SCAN_STEP` name, so two independent checks must refuse the decoy.
+        // Only `input_digest` (tested above) isolates the `fns_named` fix
+        // alone, because it is not a `SEALING_FUNCTIONS` row.
         let clean = tests_support::clean_integrity_routing();
         let clean = clean
             .strip_prefix("//! The codec.\n")
