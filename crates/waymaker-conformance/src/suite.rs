@@ -7,7 +7,7 @@
 //!
 //! # What a run costs the device
 //!
-//! Three erase blocks, erased and reprogrammed several times, inside the [`Region`] the
+//! Four erase blocks, erased and reprogrammed several times, inside the [`Region`] the
 //! caller named — and one erase-and-read pass over the whole region, which
 //! [`CaseId::BarrierChangesNoMedia`] needs because "changes no media" is a claim about media
 //! and not about the three blocks that happened to be convenient. A caller who wants a
@@ -198,6 +198,14 @@ impl<S: StableStorage> Run<'_, S> {
     /// The third erase block: what a barrier that scribbled elsewhere would show up in.
     const fn block_c(&self) -> u32 {
         self.region.offset()
+            + self.region.geometry().erase_size()
+            + self.region.geometry().erase_size()
+    }
+
+    /// The fourth erase block: the far witness for a two-block bulk erase.
+    const fn block_d(&self) -> u32 {
+        self.region.offset()
+            + self.region.geometry().erase_size()
             + self.region.geometry().erase_size()
             + self.region.geometry().erase_size()
     }
@@ -393,21 +401,24 @@ impl<S: StableStorage> Run<'_, S> {
     }
 
     fn misaligned_program_is_refused(&mut self) {
+        let case = CaseId::MisalignedProgramIsRefused;
         let unit = self.program_size();
         if unit == 1 {
             self.record(
-                CaseId::MisalignedProgramIsRefused,
+                case,
                 Outcome::NotApplicable(NotApplicable::TheUnitIsOneByte),
             );
             return;
         }
+        // A witness first, so a source that clears bits is observable: an all-erased source
+        // damages nothing if wrongly accepted, which lets an adapter that validates the
+        // length before media and the offset only after programming pass unnoticed.
+        if !self.program_a_unit(case, self.block_a()) {
+            return;
+        }
         let half = usize::try_from(unit >> 1).unwrap_or(1);
         let base = self.block_a();
-        // All ones: on erased media this clears nothing, so an adapter that wrongly accepted
-        // the operation has not damaged the block the next case needs. Whether it *did*
-        // accept it is what this case reports, and whether a refusal touched media is
-        // `RefusedProgramTouchesNoMedia`'s question rather than this one's.
-        self.fill_source(self.unit + half, ERASED);
+        self.fill_source(self.unit + half, 0x00);
 
         let offset_refused = match self.buffer.get(..self.unit) {
             Some(src) => self.storage.program(base + (unit >> 1), src).is_err(),
@@ -417,12 +428,18 @@ impl<S: StableStorage> Run<'_, S> {
             Some(src) => self.storage.program(base, src).is_err(),
             None => false,
         };
-        let outcome = if offset_refused && length_refused {
-            Outcome::Passed
-        } else {
-            Outcome::Failed(Failure::IllegalOperationAccepted)
+        if !(offset_refused && length_refused) {
+            self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
+            return;
+        }
+        let outcome = match self.media_matches(base, unit, |position| {
+            pattern(usize::try_from(position).unwrap_or(0))
+        }) {
+            Some(true) => Outcome::Passed,
+            Some(false) => Outcome::Failed(Failure::RefusedOperationTouchedMedia),
+            None => Outcome::Failed(Failure::LegalOperationRefused),
         };
-        self.record(CaseId::MisalignedProgramIsRefused, outcome);
+        self.record(case, outcome);
     }
 
     fn misaligned_erase_is_refused(&mut self) {
@@ -697,6 +714,13 @@ impl<S: StableStorage> Run<'_, S> {
         if !self.erase_block(case, self.block_a()) {
             return;
         }
+        // A witness in the *following* block too, set up before the target is programmed.
+        // When the block holds exactly two program units the target is the block's last
+        // unit, so its own suffix is empty and has nothing left to catch a program that
+        // spills forward past its own block — only a witness one block over can.
+        if !self.program_a_unit(case, self.block_b()) {
+            return;
+        }
         // The *second* unit of the block, not the first. Every other legal program in this
         // suite is anchored at a block start, so with a first-unit target there is never a
         // preceding unit to watch and an adapter that also clears the unit before the one it
@@ -720,11 +744,15 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
+        let Some(neighbour) = self.block_holds_the_pattern(self.block_b()) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
         if !written {
             self.record(case, Outcome::Failed(Failure::ReadBackDiffers));
             return;
         }
-        let outcome = if prefix && suffix {
+        let outcome = if prefix && suffix && neighbour {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
@@ -791,26 +819,39 @@ impl<S: StableStorage> Run<'_, S> {
         if !self.program_a_unit(case, self.block_a()) {
             return;
         }
+        // A second witnessed offset, aligned and inside the region rather than at the
+        // capacity: the capacity lies past the caller's region on anything but a
+        // whole-device run, and asking a zero-length operation there invites an adapter that
+        // clamps to damage media the caller did not authorise.
+        if !self.program_a_unit(case, self.block_d()) {
+            return;
+        }
         let base = self.block_a();
+        let second = self.block_d();
 
         // A caller with nothing to write is not a caller with a bug, and an adapter that
-        // refused would push the empty case into every call site above it. The capacity is
-        // an aligned offset for all three units, so it is a legal empty operation too.
-        let capacity = self.capacity();
+        // refused would push the empty case into every call site above it.
         let legal = self.storage.read(base, &mut []).is_ok()
             && self.storage.program(base, &[]).is_ok()
             && self.storage.erase(base, 0).is_ok()
-            && self.storage.read(capacity, &mut []).is_ok()
-            && self.storage.program(capacity, &[]).is_ok()
-            && self.storage.erase(capacity, 0).is_ok();
+            && self.storage.read(second, &mut []).is_ok()
+            && self.storage.program(second, &[]).is_ok()
+            && self.storage.erase(second, 0).is_ok();
         if !legal {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let outcome = match self.block_holds_the_pattern(base) {
-            Some(true) => Outcome::Passed,
-            Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
-            None => Outcome::Failed(Failure::LegalOperationRefused),
+        let (Some(first_untouched), Some(second_untouched)) = (
+            self.block_holds_the_pattern(base),
+            self.block_holds_the_pattern(second),
+        ) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if first_untouched && second_untouched {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
         };
         self.record(case, outcome);
     }
@@ -932,42 +973,138 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn multi_unit_program_is_legal(&mut self) {
         let case = CaseId::MultiUnitProgramIsLegal;
-        let block = self.erase_size();
         let unit = self.program_size();
-        if block == unit {
-            self.record(
-                case,
-                Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit),
-            );
-            return;
-        }
-        // Every other successful program in this suite is exactly one unit long, and the
-        // longer requests are all deliberately illegal. An adapter that accepts one unit and
-        // refuses two would be certified by a suite that never asked — and the journal above
+        let block = self.erase_size();
+        // Anchored at the *second* designated block, not the region's own first block, so a
+        // preceding program unit exists to watch. Every other legal program in this suite is
+        // one unit long and starts at a block's own start; neither direction of containment
+        // was ever tested for a write spanning more than one unit — and the journal above
         // this contract writes whole frames in one call.
         if !self.erase_block(case, self.block_a()) {
             return;
         }
-        let base = self.block_a();
-        let span = self.unit + self.unit;
-        self.fill_pattern_len(span);
-        if !self.program_source(base, span) {
+        let Some(before) = self.block_b().checked_sub(unit) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        if !self.program_unit_at(case, before) {
+            return;
+        }
+        if block <= unit {
+            // `validate_program` checks unit alignment and bounds and says nothing about
+            // erase-block containment, so when a block holds exactly one program unit a
+            // two-unit program is still legal — it just spans two erase blocks. A block-sized
+            // exemption here would mean no multi-unit program is ever exercised on such a
+            // device.
+            self.multi_unit_program_crossing_a_block(case, before);
+        } else {
+            self.multi_unit_program_within_a_block(case, before);
+        }
+    }
+
+    /// [`Run::multi_unit_program_is_legal`] on a device where the target fits in one block.
+    ///
+    /// `before` is the witnessed unit immediately ahead of the target; a fresh witness is
+    /// programmed at [`Run::block_c`] as the one immediately behind it.
+    fn multi_unit_program_within_a_block(&mut self, case: CaseId, before: u32) {
+        let unit = self.program_size();
+        let block = self.erase_size();
+        if !self.program_a_unit(case, self.block_c()) {
+            return;
+        }
+        if !self.erase_block(case, self.block_b()) {
+            return;
+        }
+        let base = self.block_b();
+        let span = unit + unit;
+        let Ok(span_len) = usize::try_from(span) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        self.fill_pattern_len(span_len);
+        if !self.program_source(base, span_len) {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let Some(written) = self.media_matches(base, unit + unit, |position| {
+        // One direct read of the whole span, rather than through `media_matches`'s per-unit
+        // chunking: every other successful read in this suite is at most one program unit
+        // long, and an adapter that refused a longer one would be certified by a suite that
+        // never asked for one.
+        if self.read_into(base, span_len, 0).is_none() {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        }
+        let written = self
+            .bytes(0, span_len)
+            .is_some_and(|held| held.iter().copied().eq((0..span_len).map(pattern)));
+        let Some(rest) = self.media_is_erased(base + span, block - span) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let Some(preceding) = self.media_matches(before, unit, |position| {
             pattern(usize::try_from(position).unwrap_or(0))
         }) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        let Some(rest) = self.media_is_erased(base + unit + unit, block - unit - unit) else {
+        let Some(following) = self.block_holds_the_pattern(self.block_c()) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
         let outcome = if !written {
             Outcome::Failed(Failure::ReadBackDiffers)
-        } else if rest {
+        } else if rest && preceding && following {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
+        };
+        self.record(case, outcome);
+    }
+
+    /// [`Run::multi_unit_program_is_legal`] on a device whose block is one program unit, so
+    /// the two-unit target spans [`Run::block_b`] and [`Run::block_c`] whole.
+    ///
+    /// `before` is the witnessed unit immediately ahead of the target; a fresh witness is
+    /// programmed at [`Run::block_d`] as the one immediately behind it.
+    fn multi_unit_program_crossing_a_block(&mut self, case: CaseId, before: u32) {
+        let unit = self.program_size();
+        if !self.program_a_unit(case, self.block_d()) {
+            return;
+        }
+        if !self.erase_block(case, self.block_b()) || !self.erase_block(case, self.block_c()) {
+            return;
+        }
+        let base = self.block_b();
+        let span = unit + unit;
+        let Ok(span_len) = usize::try_from(span) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        self.fill_pattern_len(span_len);
+        if !self.program_source(base, span_len) {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        }
+        if self.read_into(base, span_len, 0).is_none() {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        }
+        let written = self
+            .bytes(0, span_len)
+            .is_some_and(|held| held.iter().copied().eq((0..span_len).map(pattern)));
+        let Some(preceding) = self.media_matches(before, unit, |position| {
+            pattern(usize::try_from(position).unwrap_or(0))
+        }) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let Some(following) = self.block_holds_the_pattern(self.block_d()) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if !written {
+            Outcome::Failed(Failure::ReadBackDiffers)
+        } else if preceding && following {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
@@ -977,16 +1114,23 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn multi_block_erase_is_legal(&mut self) {
         let case = CaseId::MultiBlockEraseIsLegal;
-        // As above, for erases: every successful erase elsewhere is exactly one block, so an
-        // adapter that refuses a legal two-block erase has never been asked for one. The
-        // two-bank journal erases a whole bank in a single call.
-        for block in [self.block_a(), self.block_b(), self.block_c()] {
+        // Anchored at the second and third designated blocks, not the region's own first
+        // block, so a block exists on *both* sides of the pair to watch. Every other
+        // successful erase elsewhere is one block, so an adapter that refuses a legal
+        // two-block erase — or corrupts a neighbour of the pair — has never been asked. The
+        // two-bank journal erases a whole bank in one call.
+        for block in [
+            self.block_a(),
+            self.block_b(),
+            self.block_c(),
+            self.block_d(),
+        ] {
             if !self.program_a_unit(case, block) {
                 return;
             }
         }
         let size = self.erase_size();
-        let base = self.block_a();
+        let base = self.block_b();
         if self.storage.erase(base, size + size).is_err() {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
@@ -995,16 +1139,18 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        // And it stops where it was told: the third block is one past the range and still
-        // holds what was programmed into it.
-        let third = self.block_c();
-        let Some(untouched) = self.block_holds_the_pattern(third) else {
+        // And it stops where it was told, on both sides: the block before the pair and the
+        // block after it still hold what was programmed into them.
+        let (Some(before), Some(after)) = (
+            self.block_holds_the_pattern(self.block_a()),
+            self.block_holds_the_pattern(self.block_d()),
+        ) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
         let outcome = if !cleared {
             Outcome::Failed(Failure::EraseDidNotClearTheRegion)
-        } else if untouched {
+        } else if before && after {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
@@ -1044,7 +1190,93 @@ impl<S: StableStorage> Run<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ERASED, pattern};
+    use super::{ERASED, Run, pattern};
+    use crate::case::Report;
+    use crate::region::Region;
+    use waymaker_flash::storage::{Geometry, StableStorage};
+
+    /// Records every offset an operation names, and otherwise agrees to everything.
+    ///
+    /// A white-box double rather than a model of a device: it exists to answer "where did
+    /// the case look", which no adapter that actually behaves like NOR can be asked either.
+    struct OffsetRecorder {
+        geometry: Geometry,
+        offsets: [u32; 8],
+        count: usize,
+    }
+
+    impl OffsetRecorder {
+        fn note(&mut self, offset: u32) {
+            if let Some(slot) = self.offsets.get_mut(self.count) {
+                *slot = offset;
+            }
+            self.count += 1;
+        }
+    }
+
+    impl StableStorage for OffsetRecorder {
+        type Error = core::convert::Infallible;
+
+        fn geometry(&self) -> Geometry {
+            self.geometry
+        }
+
+        fn read(&mut self, offset: u32, _dst: &mut [u8]) -> Result<(), Self::Error> {
+            self.note(offset);
+            Ok(())
+        }
+
+        fn program(&mut self, offset: u32, _src: &[u8]) -> Result<(), Self::Error> {
+            self.note(offset);
+            Ok(())
+        }
+
+        fn erase(&mut self, offset: u32, _len: u32) -> Result<(), Self::Error> {
+            self.note(offset);
+            Ok(())
+        }
+
+        fn barrier(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn zero_length_probes_stay_inside_a_region_that_ends_short_of_the_capacity() {
+        // The capacity is one past the device's own last byte — never a byte the caller's
+        // region reaches unless the region is the whole device. A case anchored there names
+        // no byte of its own (a zero-length operation names none), but it still tells a
+        // broken adapter where to look, and an adapter that clamps and mutates would be
+        // reaching past whatever the caller declared expendable.
+        let Ok(geometry) = Geometry::new(1024, 64, 4, 2) else {
+            unreachable!("1024 is whole 64-byte blocks of whole 4-byte units of 2-byte reads")
+        };
+        let Ok(region) = Region::new(geometry, 64, 256) else {
+            unreachable!("64 and 256 are whole 64-byte blocks inside 1024 bytes")
+        };
+        let mut storage = OffsetRecorder {
+            geometry,
+            offsets: [0; 8],
+            count: 0,
+        };
+        let mut buffer = [0_u8; 8];
+        let mut run = Run {
+            storage: &mut storage,
+            region,
+            buffer: &mut buffer,
+            unit: 4,
+            report: Report::new(),
+        };
+        run.zero_length_operations_are_legal_and_change_nothing();
+
+        assert!(storage.count > 0, "the case issued no operations at all");
+        for offset in storage.offsets.iter().take(storage.count) {
+            assert!(
+                (region.offset()..region.end()).contains(offset),
+                "a zero-length probe named offset {offset}, outside the region {region:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_pattern_byte_is_programmable_from_erased_and_is_not_the_erased_byte() {

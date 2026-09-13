@@ -38,7 +38,7 @@
 //!
 //! # What a run costs
 //!
-//! Three erase blocks of the region the caller names, erased and reprogrammed several
+//! Four erase blocks of the region the caller names, erased and reprogrammed several
 //! times, one erase-and-read pass over the whole region for the barrier case, and two
 //! program units of scratch. A caller who wants a cheaper run names a smaller region. **No case names a byte outside that region** —
 //! not even in an operation it expects to be refused, which is the part that matters: an

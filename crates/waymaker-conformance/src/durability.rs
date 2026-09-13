@@ -225,7 +225,8 @@ impl Layout {
         if buffer.len() < needed {
             return Err(SuiteError::BufferTooSmall);
         }
-        // `Region::new` guarantees three erase blocks, so all three are `Some`.
+        // `Region::new` guarantees at least four erase blocks, so all three of these are
+        // `Some`.
         let (Some(acknowledged), Some(seal), Some(unacknowledged)) =
             (region.block(0), region.block(1), region.block(2))
         else {
