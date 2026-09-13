@@ -601,32 +601,50 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     Ok(declared.then_some(derives))
 }
 
-/// Whether `contents` invokes any macro at the top level — `Item::Macro`, which covers
-/// both a `macro_rules!` definition and an invocation of one defined elsewhere
-/// (`generate_clone_impl!(Recovery);`).
+/// Whether `contents` invokes any macro at any nesting depth.
 ///
-/// Reads only the top level for the same reason [`struct_derives`] does: an item a macro
-/// like this one expands to would land at module scope, next to the struct it names, not
-/// inside some unrelated nested `mod`.
+/// `Item::Macro` covers both a `macro_rules!` definition and an invocation of one defined
+/// elsewhere (`generate_clone_impl!(Recovery);`).
+///
+/// Unlike [`struct_derives`]'s struct-declaration lookup, this reads every nested `mod`
+/// too, not only the top level: a macro invocation is not scoped the way a declaration
+/// is. `generate_clone_impl!(super::Recovery)` written inside `mod hidden { .. }` still
+/// expands to an `impl Clone for Recovery` at the crate's real recovery type, an item
+/// that names the outer type through a path rather than declaring a second one — so a
+/// nested invocation is exactly as dangerous as a top-level one. Found by Codex review of
+/// this change (PR #143), round 10, correcting round 9's fix, which read only
+/// `file.items` and so missed exactly this.
 ///
 /// This module cannot expand a macro (see the module doc's residual limits), so an
 /// item-level invocation could expand to anything — a `#[derive(Clone)]`, a handwritten
 /// `impl Clone`, or nothing at all — and neither [`struct_derives`] nor
-/// [`trait_implementors`] can tell which. Found by Codex review of this change (PR #143),
-/// round 9: mirrors the ban `names_identifier(&code, "macro_rules")` already places on a
-/// **declared** macro elsewhere in this file, generalized to any invocation rather than
-/// only a local definition, because the macro doing the expanding does not have to be
-/// declared in the file it expands into.
+/// [`trait_implementors`] can tell which. This generalizes the ban
+/// `names_identifier(&code, "macro_rules")` already places on a **declared** macro
+/// elsewhere in this file to any invocation, because the macro doing the expanding does
+/// not have to be declared in the file it expands into.
 ///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
     let file = parse_rust(contents)?;
-    Ok(file
-        .items
-        .iter()
-        .any(|item| matches!(item, syn::Item::Macro(_)) && !has_cfg_test(item_attrs(item))))
+    Ok(any_item_macro(&file.items))
+}
+
+fn any_item_macro(items: &[syn::Item]) -> bool {
+    items.iter().any(|item| {
+        if has_cfg_test(item_attrs(item)) {
+            return false;
+        }
+        match item {
+            syn::Item::Macro(_) => true,
+            syn::Item::Mod(module) => module
+                .content
+                .as_ref()
+                .is_some_and(|(_, nested)| any_item_macro(nested)),
+            _ => false,
+        }
+    })
 }
 
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one

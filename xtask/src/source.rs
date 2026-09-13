@@ -10664,6 +10664,32 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_invocation_nested_in_a_module_is_also_rejected() {
+        // Found by Codex review of this change (PR #143), round 10: the first version of
+        // the macro-invocation check read only the file's top-level items, on the same
+        // reasoning `struct_derives` uses for a struct declaration — but a macro
+        // invocation is not scoped the way a declaration is.
+        // `generate_clone_impl!(super::Recovery)` written inside a nested `mod hidden`
+        // still expands to `impl Clone for Recovery`, naming the outer type through a
+        // path rather than declaring a second one, so it is exactly as dangerous as a
+        // top-level invocation and has to be read the same way.
+        let nested_macro_invocation = recovery_source_with_struct(concat!(
+            "mod hidden {\n",
+            "    generate_clone_impl!(super::Recovery);\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&nested_macro_invocation);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
