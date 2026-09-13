@@ -1047,6 +1047,8 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             Event::Text(text) if !in_fence => {
                 append_text_after_comment_close(
                     &text,
+                    &contents[range.clone()],
+                    preceded_by_backslash(contents, range.start),
                     container_hidden,
                     &mut in_html_comment,
                     &mut out,
@@ -1169,25 +1171,76 @@ fn append_visible_html_line(
 /// three ordinary characters, not a tag — so it reaches `Event::Text` as real, unescaped
 /// source whenever a comment has outlived its own `HtmlBlock` across a blank line
 /// (round 21), and is still recognized here for exactly that reason.
+///
+/// A match at the very start of `source` is trusted only when `escaped_first_char` is
+/// false (Codex, round 26): `pulldown-cmark` can decode a backslash escape into a
+/// literal character and then keep coalescing the ordinary text that follows into the
+/// *same* `Event::Text` — `\-->` decodes to one `Text("-->")` event — but its own
+/// reported byte range starts right at the escaped character, excluding the backslash
+/// before it, so the event's raw source and its decoded text are identical and a plain
+/// substring search cannot tell them apart. The backslash itself is still there in the
+/// document, one byte before the event's own range, which is what `escaped_first_char`
+/// reads: when it is set, only a `-->` found *after* that first character is trusted,
+/// because every character but the first is unquestionably literal — an escape masks
+/// exactly one character and never more. An entity (`&lt;`) cannot reproduce this: it
+/// never coalesces with neighbouring text on *either* side in `pulldown-cmark` 0.13, so
+/// `--&gt;` always splits into pieces too short on their own to contain `-->` at all,
+/// verified with a throwaway probe before writing this rather than assumed.
+/// Whether `contents[position]` is immediately preceded by a literal backslash.
+///
+/// A backslash escape's own byte is excluded from the range `pulldown-cmark` reports
+/// for the `Event` it produces, so the escaped character and any literal text
+/// `pulldown-cmark` coalesces after it are indistinguishable from genuine source by
+/// range alone — the backslash is still there, one byte earlier in `contents`, and
+/// this is how [`append_text_after_comment_close`] reads it (Codex, round 26).
+fn preceded_by_backslash(contents: &str, position: usize) -> bool {
+    position
+        .checked_sub(1)
+        .and_then(|index| contents.as_bytes().get(index))
+        .is_some_and(|&byte| byte == b'\\')
+}
+
 fn append_text_after_comment_close(
     text: &str,
+    source: &str,
+    escaped_first_char: bool,
     hidden: bool,
     in_html_comment: &mut bool,
     out: &mut String,
 ) {
     if *in_html_comment {
-        let Some(close) = text.find("-->") else {
+        let search_from = usize::from(escaped_first_char).min(source.len());
+        let Some(close) = source[search_from..]
+            .find("-->")
+            .map(|relative| search_from + relative)
+        else {
             return;
         };
         *in_html_comment = false;
         if !hidden {
-            out.push_str(&text[close + "-->".len()..]);
+            out.push_str(&source[close + "-->".len()..]);
         }
         return;
     }
     if !hidden {
         out.push_str(text);
     }
+}
+
+/// Whether an `Event::InlineHtml`'s text is some spelling of the `<br>` tag — the one
+/// inline HTML element that renders as a line break rather than inline.
+///
+/// Matched case-insensitively and tolerant of the self-closing spellings `CommonMark`
+/// admits — `<br>`, `<br/>`, `<br />`, `<BR>` — because HTML tag names and the
+/// self-closing slash are exactly the parts a browser (and `pulldown-cmark`) also
+/// ignores case and spacing on. Any other tag, opening or closing, is ordinary inline
+/// formatting that renders with no break at all (Codex, pull request #138, round 26).
+fn is_line_break_tag(html: &str) -> bool {
+    html.trim()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .map(|rest| rest.trim().trim_end_matches('/').trim())
+        .is_some_and(|name| name.eq_ignore_ascii_case("br"))
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
@@ -1448,6 +1501,8 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                 let mut visible = String::new();
                 append_text_after_comment_close(
                     &text,
+                    &contents[range.clone()],
+                    preceded_by_backslash(contents, range.start),
                     container_hidden,
                     &mut in_html_comment,
                     &mut visible,
@@ -1470,15 +1525,21 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // rather than being kept for `End(TagEnd::Item)` to still try matching what
             // was gathered before the break.
             Event::SoftBreak | Event::HardBreak if collecting => collecting = false,
-            // Non-comment inline HTML disqualifies the item unconditionally (Codex,
-            // round 25): a real tag — `<br>`, `<b>`, `</b>` — is not invisible the way
-            // a comment is, so `- Sta<br>tus: accepted` renders as two lines even
-            // though its *source* is one, and concatenating the surrounding `Text`
-            // fragments bare reconstructs `Status: accepted` out of a field a reader
-            // never sees as one line. A same-line inline comment carries no newline of
-            // its own and is not disqualifying (Codex, round 24): `- Status: accepted
-            // <!-- rationale -->` is a real, complete, one-line field with a trailing
-            // note, and disqualifying it discarded a value that had already been fully
+            // A tag that itself renders as a line break disqualifies the item (Codex,
+            // round 26, narrowing round 25): `<br>` is not invisible the way a comment
+            // is, so `- Sta<br>tus: accepted` renders as two lines even though its
+            // *source* is one, and concatenating the surrounding `Text` fragments bare
+            // reconstructs `Status: accepted` out of a field a reader never sees as one
+            // line. Ordinary inline formatting — `<span>`, `<time>`, `<b>`, their
+            // closing tags — renders inline with no break at all and is *not*
+            // disqualifying: `- Status: <span>accepted</span>` is a real, complete,
+            // one-line field, and round 25's blanket "any non-comment tag" rule
+            // rejected it along with every other harmless tag.
+            //
+            // A same-line inline comment carries no newline of its own and is not
+            // disqualifying either (Codex, round 24): `- Status: accepted <!--
+            // rationale -->` is a real, complete, one-line field with a trailing note,
+            // and disqualifying it discarded a value that had already been fully
             // collected before the comment appeared. A comment that itself spans more
             // than one source line still disqualifies (Codex, round 23):
             // `pulldown-cmark` collapses a multi-line comment into a single
@@ -1491,7 +1552,9 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // comment that outlived its own block, is excluded because it is handled
             // separately above and cannot occur while a paragraph is still open.
             Event::InlineHtml(html)
-                if collecting && (!html.starts_with("<!--") || html.contains('\n')) =>
+                if collecting
+                    && (is_line_break_tag(&html)
+                        || (html.starts_with("<!--") && html.contains('\n'))) =>
             {
                 collecting = false;
             }
@@ -1535,7 +1598,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     let mut in_html_comment = false;
     let mut html_scratch = String::new();
 
-    for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
+    for (event, range) in Parser::new_ext(contents, Options::ENABLE_TABLES).into_offset_iter() {
         let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
         match event {
             Event::Html(html) => {
@@ -1587,6 +1650,8 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             Event::Text(text) if !in_fence => {
                 append_text_after_comment_close(
                     &text,
+                    &contents[range.clone()],
+                    preceded_by_backslash(contents, range.start),
                     true,
                     &mut in_html_comment,
                     &mut html_scratch,

@@ -5749,6 +5749,16 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_reads_a_valid_field_with_harmless_inline_formatting() {
+        // Codex, pull request #138, round 26: the round-25 fix disqualified *any*
+        // non-comment inline HTML, which also rejected ordinary inline formatting that
+        // renders with no line break at all — `- Status: <span>accepted</span>` is a
+        // real, complete, one-line field, and `<span>`/`</span>` are not `<br>`.
+        let contents = "# ADR\n\n- Status: <span>accepted</span>\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -6345,6 +6355,36 @@ mod tests {
         assert!(
             !violations.iter().any(|v| v.subject == sixth.id),
             "a decision after an escaped comment-marker decoy was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_escaped_fake_closer_still_does_not_count() {
+        // Codex, pull request #138, round 26: `pulldown-cmark` can decode an escape
+        // into the literal characters `-->` inside `Event::Text` just as readily as it
+        // can for `<!--` (round 22) — `\-->` decodes to a single `Text("-->")` event
+        // whose raw source is `\-->`, four bytes starting with a backslash a renderer
+        // shows as nothing while displaying `-->` as ordinary characters. The source
+        // never contains a real, unescaped comment terminator, so a comment that
+        // outlived its own `HtmlBlock` is still open, and the decision after this decoy
+        // must not count.
+        let mut inputs = clean_inputs(RULES);
+        let seventh = SETTLED_DECISIONS[6];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", seventh.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n\\-->\n\n{} {}\n",
+                    seventh.id, seventh.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == seventh.id),
+            "a decision after an escaped fake closer still counted: {violations:?}"
         );
     }
 
