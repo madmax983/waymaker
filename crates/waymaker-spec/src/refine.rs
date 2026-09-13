@@ -63,6 +63,11 @@ pub struct Observation {
     /// review of the pull request that closed issue #67, on the observation/reconstruction
     /// path specifically. `Some(0)` for a writer that has declared nothing, matching
     /// [`crate::model::Journal::new`]; `None` only once the counter itself is exhausted.
+    ///
+    /// Must be strictly past every id in `records`, or [`Journal::reconstructed`] refuses it
+    /// with [`Impossible::NextIdReissuesAResident`] — a floor `reconstructed` checks rather
+    /// than trusts, since a caller can misreport this field within one observation and not
+    /// only across the erase this doc comment's first paragraph is about.
     pub next_id: Option<u32>,
 }
 
@@ -121,9 +126,23 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// [`Impossible`] when the observation describes a record no media could hold. Refused
-    /// rather than normalised: a state builder that quietly repaired its input would answer
-    /// questions about a record the caller did not describe, and answer them cheerfully.
+    /// [`Impossible`] when the observation describes a record no media could hold, or a
+    /// `next_id` that lands at or before a resident record's own id. Refused rather than
+    /// normalised: a state builder that quietly repaired its input would answer questions
+    /// about a record the caller did not describe, and answer them cheerfully.
+    ///
+    /// The second check exists because the first round of review that added `next_id` to this
+    /// struct closed only half the gap: a caller can still report a `next_id` that collides
+    /// with a record it is naming in the very same observation, rather than one an erase
+    /// dropped from an earlier one. Records 0 and 1 with `next_id: Some(1)` used to reconstruct
+    /// without complaint; the next `Declare` then minted a second `RecordId(1)`, and the
+    /// `Program` after it found the *older* record already whole and refused with
+    /// `RecordAlreadyWritten`, stranding the new declaration — the identity collision issue
+    /// #67's whole counter scheme exists to forbid, reached without ever going through an
+    /// erase at all. Codex found it on review of the pull request that closed the erase/reboot
+    /// version of this gap. The floor is exactly `reboot`'s own: `next_id` must be past every
+    /// record this observation names, the same way a real device's counter can never point at
+    /// an id something on media already holds.
     pub fn reconstructed(observation: &Observation) -> Result<Self, Impossible> {
         let mut records = Vec::with_capacity(observation.records.len());
         for (id, role, state, torn) in &observation.records {
@@ -149,6 +168,13 @@ impl Journal {
                 bank: BankId::A,
             });
         }
+        if let Some(next_id) = observation.next_id {
+            if let Some(resident) = records.iter().map(|record| record.id).max() {
+                if next_id <= resident.0 {
+                    return Err(Impossible::NextIdReissuesAResident { resident });
+                }
+            }
+        }
         Ok(Self::from_parts(
             records,
             observation.dispatched.clone(),
@@ -172,6 +198,11 @@ pub enum Impossible {
         /// The record that claimed both.
         record: RecordId,
     },
+    /// `next_id` names an id at or before a record this observation already holds.
+    NextIdReissuesAResident {
+        /// The highest resident record's id, which `next_id` must be strictly past.
+        resident: RecordId,
+    },
 }
 
 impl core::fmt::Display for Impossible {
@@ -186,6 +217,12 @@ impl core::fmt::Display for Impossible {
                 formatter,
                 "record {} is torn and never reached media, and half of it cannot be both",
                 record.0
+            ),
+            Self::NextIdReissuesAResident { resident } => write!(
+                formatter,
+                "next_id is not past resident record {}, so the next declaration would reissue \
+                 an id this observation already holds",
+                resident.0
             ),
         }
     }

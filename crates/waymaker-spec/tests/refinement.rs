@@ -600,6 +600,51 @@ fn reconstruction_never_reissues_an_id_an_erase_already_spent() {
 }
 
 #[test]
+fn reconstruction_refuses_a_next_id_that_reissues_a_resident() {
+    // Codex, PR #135's next round: the erase-only version of this check let a `next_id`
+    // collide with a record named in the *same* observation, rather than only with one an
+    // earlier erase had dropped. Records 0 and 1 with `next_id: Some(1)` used to reconstruct
+    // successfully; a `Reboot` then a `Declare(Schedule)` minted a second `RecordId(1)`, and
+    // the `Program` after it found the older record already whole and refused with
+    // `RecordAlreadyWritten` — stranding the new declaration on the identity collision issue
+    // #67's whole counter scheme exists to forbid.
+    let colliding = Observation {
+        records: vec![
+            (RecordId(0), Role::Schedule, Durability::Acknowledged, false),
+            (RecordId(1), Role::Outcome, Durability::Acknowledged, false),
+        ],
+        dispatched: Vec::new(),
+        next_id: Some(1),
+        ..Observation::default()
+    };
+    let error =
+        Journal::reconstructed(&colliding).expect_err("next_id collides with resident record 1");
+    assert!(error.to_string().contains("resident record 1"), "{error}");
+
+    // The floor is exact, not merely "somewhere higher": one past the highest resident id is
+    // accepted, and the next legal declaration gets that id rather than reissuing 0 or 1.
+    let just_past = Observation {
+        next_id: Some(2),
+        ..colliding
+    };
+    let state = Journal::reconstructed(&just_past).expect("next_id past every resident id");
+    let declared = state
+        .step(Transition::Reboot, Guards::ENFORCED, Bound::PROOF)
+        .expect("reboot is legal from an unpowered state")
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("record 1 is the Outcome that resolves record 0's Schedule, so a fresh Schedule is legal here");
+    assert_eq!(
+        declared.records().last().map(|record| record.id),
+        Some(RecordId(2)),
+        "next_id: Some(2) should hand out RecordId(2), not reissue 0 or 1"
+    );
+}
+
+#[test]
 fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
     let runs = drive(journal);
     for run in &runs {

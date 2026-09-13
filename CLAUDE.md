@@ -3015,3 +3015,24 @@ since that naive version reaches exactly the collision this test exists to catch
 used to be a distinct state, purely because `next_id` climbed higher with each cycle even
 though nothing on media ever changed, and those cycles now collapse back onto the states a
 device that crashed once, or never, already reaches.
+
+Review of that round's fix drew two more findings, both on the observation/reconstruction
+path rather than on `reboot` itself. The first was documentation left behind by the second
+finding's own history: this ADR still said a reboot "changes nothing but the power" and
+still named `a_reboot_changes_nothing_but_the_power` as the proof, both stale since the tenth
+finding taught `reboot` to discard `Absent` records — [ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md)
+now narrates all three versions of the transition in order, with the test's current, narrower
+name. The second was a real gap in `refine::Observation::reconstructed`: the eleventh
+finding's `next_id` field is the caller's own report and was checked against nothing, so an
+observation could name a `next_id` that collides with a record in its *own* `records` list
+rather than only with one an earlier erase had dropped. Records 0 and 1 with
+`next_id: Some(1)` used to reconstruct without complaint; a `Reboot` then a
+`Declare(Schedule)` minted a second `RecordId(1)`, and the `Program` after it found the older
+record already whole and refused with `RecordAlreadyWritten`, stranding the new declaration
+on the identity collision issue #67's whole counter scheme exists to forbid — reached with no
+erase anywhere in the trace. `reconstructed` now refuses with
+`Impossible::NextIdReissuesAResident` whenever `next_id` is not strictly past every resident
+record's id, the same floor `reboot` itself keeps.
+`reconstruction_refuses_a_next_id_that_reissues_a_resident` is the regression, verified
+against a scratch reproduction of the stranding before the check existed and checking both
+the refusal and that the exact floor (one past the highest resident id) is still accepted.

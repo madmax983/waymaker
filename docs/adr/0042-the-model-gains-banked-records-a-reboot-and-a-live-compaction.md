@@ -68,24 +68,51 @@ run may ever declare in total (matching its own doc comment), not how many are r
 once, which is what keeps the state space finite once erase can free capacity back up.
 
 **`Transition::Reboot`** is the one transition legal while `Journal::powered` is `false`, and
-legal only then. It sets `powered` back to `true` and changes nothing else — a reboot
-restores power, it does not erase anything, so `records`, `dispatched` and every bank's seal
-survive untouched, and `recover()` computes the recovered prefix fresh from those same bytes
-rather than needing the transition to prune anything toward it. A device on its second or
-third boot is now a state this machine reaches, and `tests/machine.rs`'s
-`a_reboot_changes_nothing_but_the_power` is that claim.
+legal only then. It sets `powered` back to `true`, and every *media-backed* record survives
+untouched — `dispatched` and every bank's seal too — so `recover()` computes the recovered
+prefix fresh from those same bytes rather than needing the transition to prune anything
+toward it. A device on its second or third boot is now a state this machine reaches, and
+`tests/machine.rs`'s `a_reboot_changes_nothing_media_backed_but_the_power` is that claim.
 
-An earlier version of this transition pruned `records` down to `recover()`'s own answer, on
-the reasoning that a reboot should carry forward "nothing more forgiving" than what recovery
-already permits. Codex's review of the pull request caught the defect that reasoning hid: the
-prune is scoped to `recovering_bank()`, so it silently erased the *other* bank's own history
-too — not only a torn tail in the current bank — which only `begin_erase` may do, and which
-let a live write land right back in a bank a crash had just left with no legal append point
+What does not survive is a record that was never media-backed to begin with:
+`Journal::declare` puts a record in `records` before a single byte is programmed, so an
+`OnMedia::Absent` record is a fact about RAM, and a power cut takes RAM with the power.
+`reboot` discards every still-`Absent` record and prunes `dispatched` to match — the same way
+`begin_erase` already does for an erased bank's records — and rolls `next_id` back by the
+count discarded, floored at one past the highest surviving id so an id an earlier
+`begin_erase` already spent in this same run is never handed out twice.
+`tests/machine.rs`'s `a_reboot_discards_only_records_still_absent_from_media` and
+`a_crash_before_the_first_media_write_never_spends_capacity` are that pair of claims, and
+`a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank` gained `Reboot`
+as a second, narrower exception beside `BeginErase`'s.
+
+An earlier version of this transition left *every* record in place, `Absent` ones included,
+on the reasoning that a reboot "changes nothing but the power" — this ADR used to say so, and
+named `a_reboot_changes_nothing_but_the_power` as the test that proved it, which is now
+`a_reboot_changes_nothing_media_backed_but_the_power`'s narrower claim. Codex's review of the
+pull request that added this ADR found the defect that reasoning hid: `Declare(Schedule)`
+immediately followed by `PowerLoss`/`Reboot` left the phantom declaration in place, and
+`unresolved_schedule_in` and `whole_before` read it exactly as they would a real one —
+permanently stranding that bank, with no real bytes anywhere to blame it on. Discarding
+`Absent` records fixes it, and a still-earlier version of *that* fix — dropping them without
+rolling `next_id` back — traded one strand for another: a device that crashes before its
+first-ever media write, over and over, would otherwise eventually read
+`Illegal::CapacityReached` against media that has never held a single byte, which
+`waymaker_core::id::EffectIdAllocator::resume`'s real behaviour (deriving the next sequence
+from the highest *committed* one) says a real device never does.
+
+Before either of the above, a still earlier version of this transition pruned `records` down
+to `recover()`'s own answer entirely, on the reasoning that a reboot should carry forward
+"nothing more forgiving" than what recovery already permits. That version's defect was
+sharper still: the prune was scoped to `recovering_bank()`, so it silently erased the *other*
+bank's own history too — not only a torn tail in the current bank — which only `begin_erase`
+may do, and which let a live write land right back in a bank a crash had just left with no
+legal append point
 ([ADR 0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s rule,
-reachable again one transition later). Leaving every record in place fixes both: recovery
-still answers correctly, because it already scopes and stops at the right place, and
-`whole_before` still refuses a write past the torn record until an erase — not a reboot —
-clears it.
+reachable again one transition later). Discarding only `Absent` records rather than pruning to
+`recover()`'s answer avoids that: recovery still answers correctly, because it already scopes
+and stops at the right place, and `whole_before` still refuses a write past a torn *media*
+record until an erase — not a reboot — clears it.
 
 **Compaction needed no transition of its own.** `begin_seal` and `begin_erase` never
 consulted the *other* bank's record state, so once records carried a bank, a live device
