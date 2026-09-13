@@ -619,3 +619,115 @@ fn a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase() {
         "A was resealed with a stale record still in it and no erase in the trace"
     );
 }
+
+#[test]
+fn a_crash_before_the_first_media_write_never_spends_capacity() {
+    // Codex, PR #135's merge round, third finding: dropping a still-`Absent` record on
+    // reboot without rolling `next_id` back too meant a device that crashes before its
+    // first-ever media write, over and over, eventually read `Illegal::CapacityReached`
+    // against media that had never held a single byte —
+    // `waymaker_core::id::EffectIdAllocator::resume`'s real answer is that an attempt which
+    // never durably committed is never counted against a run at all. `Bound::PROOF`'s own
+    // three-record ceiling is small enough that the old code stranded a device after exactly
+    // three such crashes; this drives ten and requires none of them to be the last.
+    let bound = Bound::PROOF;
+    let mut state = Journal::default();
+    for cycle in 0..10 {
+        state = state
+            .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+            .unwrap_or_else(|error| {
+                panic!("cycle {cycle}: declaring against empty media refused with {error:?}")
+            });
+        assert!(
+            state
+                .records()
+                .iter()
+                .all(|record| record.media == OnMedia::Absent),
+            "cycle {cycle}: a record reached media with no Program ever issued"
+        );
+        state = state
+            .step(Transition::PowerLoss, Guards::ENFORCED, bound)
+            .expect("power loss is always legal while powered");
+        state = state
+            .step(Transition::Reboot, Guards::ENFORCED, bound)
+            .expect("reboot is always legal while unpowered");
+    }
+}
+
+#[test]
+fn an_id_an_erase_already_spent_survives_a_later_reboots_own_rollback() {
+    // Codex's third finding, the sharper edge: `reboot`'s `next_id` rollback must not roll
+    // past an id `begin_erase` retired earlier in the *same* run. `begin_erase` never rolls
+    // `next_id` back — an erased bank's records are gone from `records`, so they cannot
+    // protect their own ids from a later, unrelated reboot's rollback the way a still-resident
+    // record does. This drives exactly that combination — declare and commit two records in
+    // A, retire A behind a seal on B, erase A, then crash a fresh, still-`Absent` declaration
+    // in B before it ever reaches media — and requires the id after reboot to skip both of
+    // A's spent ids rather than reusing either.
+    let bound = Bound {
+        records: 10,
+        generations: 3,
+    };
+    let mut state = Journal::default();
+    state = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare id 0 in A");
+    let id0 = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id0), Guards::ENFORCED, bound)
+        .expect("program id 0");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier");
+    state = state
+        .step(Transition::Declare(Role::Outcome), Guards::ENFORCED, bound)
+        .expect("declare id 1 in A");
+    let id1 = state.records()[1].id;
+    state = state
+        .step(Transition::Program(id1), Guards::ENFORCED, bound)
+        .expect("program id 1");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier");
+    state = state
+        .step(Transition::BeginSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("begin seal B, the device's first seal");
+    state = state
+        .step(Transition::CommitSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("commit seal B");
+    state = state
+        .step(Transition::BeginErase(BankId::A), Guards::ENFORCED, bound)
+        .expect("begin erase A, dropping ids 0 and 1");
+    state = state
+        .step(Transition::CommitErase(BankId::A), Guards::ENFORCED, bound)
+        .expect("commit erase A");
+    assert!(state.records().is_empty(), "erase left a record behind");
+
+    state = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare in B, current bank, stays absent");
+    state = state
+        .step(Transition::PowerLoss, Guards::ENFORCED, bound)
+        .expect("power loss before B's record ever reaches media");
+    state = state
+        .step(Transition::Reboot, Guards::ENFORCED, bound)
+        .expect("reboot drops B's absent record");
+    assert!(state.records().is_empty(), "reboot left a record behind");
+
+    let redeclared = state
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declaring again after the reboot's rollback");
+    let new_id = redeclared
+        .records()
+        .last()
+        .expect("the declare above added exactly one record")
+        .id;
+    assert_ne!(
+        new_id, id0,
+        "reboot's rollback reused an id A's erase had already spent"
+    );
+    assert_ne!(
+        new_id, id1,
+        "reboot's rollback reused an id A's erase had already spent"
+    );
+}

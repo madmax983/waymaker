@@ -2986,3 +2986,32 @@ as a parameter instead of computing it at all.
 `reconstruction_never_reissues_an_id_an_erase_already_spent` is the regression, built directly
 against a hand-supplied `Observation` rather than a full crash-harness run, since the gap is
 in the reconstruction machinery itself rather than in any particular writer's behaviour.
+
+A twelfth finding, on the same round's next pass, was in the tenth's own fix: dropping a
+still-`Absent` record on reboot without rolling `next_id` back too meant a device that
+crashes before its first-ever media write, over and over, eventually reads
+`Illegal::CapacityReached` against media that has never held a single byte —
+`Declare`/`PowerLoss`/`Reboot` repeated `bound.records` times, with nothing else ever
+happening, strands a device the real firmware would never strand. Codex's evidence was the
+real firmware itself: `waymaker_core::id::EffectIdAllocator::resume` derives the next
+sequence from the *highest committed* one, so an attempt that never durably landed is never
+counted against a run at all. `reboot` now rolls `next_id` back by exactly the count of
+`Absent` records it discards — but never past `1 +` the highest surviving id, because an id
+`begin_erase` retired earlier in the *same* run is not in `records` to protect itself, and
+rolling all the way down to what the current residents alone justify would let a later,
+unrelated `Declare` reuse an id an erased bank had already spent — the collision issue #67's
+whole scheme exists to forbid, reached through the combination of the two transitions rather
+than through either alone. `a_crash_before_the_first_media_write_never_spends_capacity` is
+the positive claim, driven ten cycles deep against `Bound::PROOF`'s three-record ceiling
+(which stranded a device after exactly three, before the fix); the sharper edge is
+`an_id_an_erase_already_spent_survives_a_later_reboots_own_rollback`, which declares and
+commits two records in one bank, retires it behind a seal on the other, erases it, and
+requires a crash-and-reboot of a fresh, still-`Absent` declaration in the new bank to skip
+both of the first bank's spent ids rather than reusing either — verified against the naive
+fix (recomputing purely from surviving residents, with no floor) before landing this one,
+since that naive version reaches exactly the collision this test exists to catch.
+`REACHABLE_STATES` and `TRANSITION_EDGES` moved again, down substantially this time (8,360 →
+5,620): every distinct crash count a device could accumulate before its first media write
+used to be a distinct state, purely because `next_id` climbed higher with each cycle even
+though nothing on media ever changed, and those cycles now collapse back onto the states a
+device that crashed once, or never, already reaches.

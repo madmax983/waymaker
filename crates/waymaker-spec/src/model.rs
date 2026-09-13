@@ -1221,12 +1221,10 @@ impl Journal {
     /// with it, the same way [`begin_erase`](Self::begin_erase) prunes it; a dispatched
     /// `Absent` record can only be reached with `Guard::DurableIntent` disabled, and
     /// [`dispatched`](Self::dispatched) must never outlive the record it names.
-    /// `next_id` does not roll back — a declaration a crash erased still spent its slot of
-    /// `bound.records`'s "total ever declared", the accounting
-    /// [`declare`](Self::declare)'s own doc comment already states for an erased bank's
-    /// records.
+    /// `next_id` rolls back by exactly the count of records this discards — never further,
+    /// and never past what a surviving record already needs.
     ///
-    /// Codex found the bug this replaced, on two review rounds of the same pull request. The
+    /// Codex found three bugs here, across three review rounds of the same pull request. The
     /// first: dropping every record `recover()` did not name used to remove a torn record's
     /// bytes from the model along with it, which let a `Declare`/`Program` right back into
     /// the bank a crash had just left with no legal append point — [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s
@@ -1239,11 +1237,45 @@ impl Journal {
     /// `PowerLoss`/`Reboot` permanently stranded that bank, refusing a second `Declare` as
     /// `OutOfProtocolOrder` and refusing every later `Program` behind the phantom record's
     /// `whole_before` check, with no real bytes anywhere to blame it on.
+    ///
+    /// The third, once the second was fixed: dropping the record without rolling `next_id`
+    /// back too meant a device that crashes before its first-ever media write, over and over,
+    /// eventually reads `Illegal::CapacityReached` against media that has never held a single
+    /// byte — a `Declare`/`PowerLoss`/`Reboot` cycle repeated `bound.records` times, with
+    /// nothing else ever happening, strands a device the real firmware would never strand.
+    /// `waymaker_core::id::EffectIdAllocator::resume` is the real firmware's answer, and it is
+    /// exact: it derives the next sequence from the *highest committed* one, so an id an
+    /// attempt never durably reached is never counted against the run at all. Rolling `next_id`
+    /// back by the number of `Absent` records just discarded reproduces that — but only down
+    /// to `1 +` the highest surviving id, never further: an id `begin_erase` retired earlier in
+    /// this same run is not in `records` to protect itself, and rolling `next_id` all the way
+    /// down to what the *current* residents alone justify would let a later, unrelated
+    /// `Declare` reissue that already-spent id — the collision issue #67's whole scheme exists
+    /// to forbid, arriving through the combination rather than through either transition alone.
     fn reboot(&mut self) {
+        let dropped = self
+            .records
+            .iter()
+            .filter(|record| record.media == OnMedia::Absent)
+            .count();
         self.records
             .retain(|record| record.media != OnMedia::Absent);
         let remaining: BTreeSet<RecordId> = self.records.iter().map(|record| record.id).collect();
         self.dispatched.retain(|id| remaining.contains(id));
+        if dropped > 0 {
+            let spent = self
+                .next_id
+                .map_or_else(|| u64::from(u32::MAX) + 1, u64::from);
+            let rolled_back = spent.saturating_sub(dropped as u64);
+            let floor = self
+                .records
+                .iter()
+                .map(|record| u64::from(record.id.0))
+                .max()
+                .map_or(0, |highest| highest + 1);
+            let restored = rolled_back.max(floor);
+            self.next_id = u32::try_from(restored).ok();
+        }
         self.powered = true;
     }
 

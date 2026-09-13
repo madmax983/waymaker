@@ -46,8 +46,13 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// record instead of leaving it in place to permanently strand its bank (Codex, PR #135's
 /// merge round): every state with an undischarged `Absent` declaration used to dead-end at
 /// `Reboot` with no further `Declare` legal in that bank, and now opens back up into the
-/// states a bank that had never declared anything reaches.
-const REACHABLE_STATES: usize = 8_360;
+/// states a bank that had never declared anything reaches. It shrank again, substantially,
+/// once that same `reboot` started rolling `next_id` back by the count of records it just
+/// discarded (a second Codex finding on the same round): before that, every distinct crash
+/// count before a bank's first media write was a distinct state — `next_id` climbing higher
+/// with each crash cycle even though nothing ever changed on media — and now those cycles
+/// collapse back onto the states a device that crashed once, or not at all, already reaches.
+const REACHABLE_STATES: usize = 5_620;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -70,18 +75,18 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
 /// led to is reachable by some other path. Every invariant, every mutant verdict and every
 /// necessity proof stays green through all three. The edge counts do not.
 const TRANSITION_EDGES: [(TransitionKind, usize); 12] = [
-    (TransitionKind::Declare, 1_010),
-    (TransitionKind::Program, 1_140),
-    (TransitionKind::FailedProgram, 1_140),
-    (TransitionKind::Barrier, 4_180),
-    (TransitionKind::Dispatch, 555),
-    (TransitionKind::BeginErase, 3_348),
-    (TransitionKind::CommitErase, 832),
-    (TransitionKind::BeginSeal, 728),
-    (TransitionKind::CommitSeal, 728),
-    (TransitionKind::Tear, 810),
-    (TransitionKind::PowerLoss, 4_180),
-    (TransitionKind::Reboot, 4_180),
+    (TransitionKind::Declare, 821),
+    (TransitionKind::Program, 947),
+    (TransitionKind::FailedProgram, 947),
+    (TransitionKind::Barrier, 2_810),
+    (TransitionKind::Dispatch, 380),
+    (TransitionKind::BeginErase, 2_312),
+    (TransitionKind::CommitErase, 498),
+    (TransitionKind::BeginSeal, 400),
+    (TransitionKind::CommitSeal, 400),
+    (TransitionKind::Tear, 654),
+    (TransitionKind::PowerLoss, 2_810),
+    (TransitionKind::Reboot, 2_810),
 ];
 
 #[test]
