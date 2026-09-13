@@ -5727,6 +5727,17 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_reads_a_valid_field_with_a_trailing_same_line_comment() {
+        // Codex, pull request #138, round 24: the round-23 fix disqualified any inline
+        // HTML while collecting, but a same-line trailing comment carries no newline of
+        // its own — `- Status: accepted <!-- rationale -->` is a real, complete,
+        // one-line field with a note after it, and disqualifying it discarded a value
+        // that had already been fully collected before the comment ever appeared.
+        let contents = "# ADR\n\n- Status: accepted <!-- rationale -->\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
