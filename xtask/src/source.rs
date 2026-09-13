@@ -10467,6 +10467,48 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_identifier_derive_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `r#Clone` is a raw-identifier
+        // spelling of the same `Clone` derive macro, but the first version of this check
+        // kept the `r#` prefix when collecting a path's segments, so the string comparison
+        // against the plain "Clone" missed it.
+        let raw_derive =
+            recovery_source_with_struct("#[derive(r#Clone, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&raw_derive);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_hidden_behind_a_duplicate_conditional_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): mutually exclusive `cfg`s can
+        // validly bind one local name to two different targets —
+        // `#[cfg(any())] use core::fmt::Debug as Klon;` never applies and
+        // `#[cfg(all())] use core::clone::Clone as Klon;` always does — and the first
+        // version of this check resolved only whichever `Klon` was declared first in the
+        // file, which happened to be the inactive `Debug` one, missing the real `Clone`.
+        let duplicate_conditional_alias = recovery_source_with_struct(concat!(
+            "#[cfg(any())]\n",
+            "use core::fmt::Debug as Klon;\n",
+            "#[cfg(all())]\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&duplicate_conditional_alias);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

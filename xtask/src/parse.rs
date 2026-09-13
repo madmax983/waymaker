@@ -295,10 +295,13 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 }
 
 fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
+    // `.unraw()`: `r#Clone` and `Clone` name the same item when `Clone` is not a
+    // keyword, and a comparison against the plain spelling must not miss the raw one
+    // (issues #68/#90's reasoning for `extern_crate_names`, met again here).
     let mut segments: Vec<String> = path
         .segments
         .iter()
-        .map(|segment| segment.ident.to_string())
+        .map(|segment| segment.ident.unraw().to_string())
         .collect();
     if path.leading_colon.is_some() {
         return segments;
@@ -328,8 +331,7 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 /// such as one running back through a grouped import (`use a::{B as C};`) whose own target
 /// already has more than one segment. Real multi-hop resolution needs the crate's full
 /// module tree, which is outside what this file's syntax-only reading can ever have.
-fn resolve_segments_transitively(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
-    let mut segments = resolve_segments(path, aliases);
+fn chase_self_alias(mut segments: Vec<String>, aliases: &[UseAlias]) -> Vec<String> {
     for _ in 0..aliases.len() {
         let [first, second] = segments.as_slice() else {
             break;
@@ -343,6 +345,47 @@ fn resolve_segments_transitively(path: &syn::Path, aliases: &[UseAlias]) -> Vec<
         segments = alias.target.clone();
     }
     segments
+}
+
+/// Every name `path` could ultimately mean, branching over every alias sharing its first
+/// segment's local name rather than only the one [`resolve_segments`] would pick.
+///
+/// Mutually exclusive `cfg`s can validly bind one local name to two different targets, and
+/// this scan does not evaluate which is active — so it has to consider each:
+/// `#[cfg(any())] use core::fmt::Debug as Klon; #[cfg(all())] use core::clone::Clone as
+/// Klon;` derives `Clone` under the condition that always holds, and a scan that resolved
+/// only whichever `Klon` happened to be declared first in the file would miss it whenever
+/// that one loses the race. Each candidate is chased through [`chase_self_alias`] on its
+/// own; a duplicate met again *inside* that chase still resolves to only its first match,
+/// which is the same bounded-depth trade [`chase_self_alias`]'s own doc states.
+fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
+    // `.unraw()`: see `resolve_segments`.
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.unraw().to_string())
+        .collect();
+    if path.leading_colon.is_some() {
+        return segments.last().cloned().into_iter().collect();
+    }
+    let Some(first) = segments.first().cloned() else {
+        return Vec::new();
+    };
+    let matching: Vec<&UseAlias> = aliases
+        .iter()
+        .filter(|candidate| candidate.local == first)
+        .collect();
+    if matching.is_empty() {
+        return segments.last().cloned().into_iter().collect();
+    }
+    matching
+        .into_iter()
+        .filter_map(|alias| {
+            let mut resolved = alias.target.clone();
+            resolved.extend(segments.iter().skip(1).cloned());
+            chase_self_alias(resolved, aliases).last().cloned()
+        })
+        .collect()
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
@@ -397,7 +440,9 @@ fn collect_trait_implementors(
                     if resolved.last().is_some_and(|last| last == trait_name) {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
-                                implementors.push(name.ident.to_string());
+                                // `.unraw()`: `impl Clone for r#Recovery` names the same
+                                // struct a plain `Recovery` would.
+                                implementors.push(name.ident.unraw().to_string());
                             }
                         }
                     }
@@ -486,7 +531,8 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
             continue;
         }
         if let syn::Item::Struct(found) = item {
-            if found.ident == name {
+            // `.unraw()`: `pub struct r#Recovery` declares the same item `Recovery` would.
+            if found.ident.unraw() == name {
                 declared = true;
                 for attr in &found.attrs {
                     collect_derive_names_from_meta(&attr.meta, &aliases, &mut derives);
@@ -589,16 +635,14 @@ fn collect_derive_names_from_meta(
     }
 }
 
-/// Pushes the resolved last segment of each path in `paths` onto `derives`.
+/// Pushes every name each path in `paths` could resolve to onto `derives`.
 fn push_resolved_names(
     paths: &syn::punctuated::Punctuated<syn::Path, syn::Token![,]>,
     aliases: &[UseAlias],
     derives: &mut Vec<String>,
 ) {
     for path in paths {
-        if let Some(name) = resolve_segments_transitively(path, aliases).pop() {
-            derives.push(name);
-        }
+        derives.extend(every_resolution(path, aliases));
     }
 }
 
