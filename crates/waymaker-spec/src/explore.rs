@@ -55,11 +55,13 @@ pub enum TransitionKind {
     Tear,
     /// [`Transition::PowerLoss`].
     PowerLoss,
+    /// [`Transition::Reboot`].
+    Reboot,
 }
 
 impl TransitionKind {
     /// Every transition kind, in a fixed order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Declare,
         Self::Program,
         Self::FailedProgram,
@@ -71,6 +73,7 @@ impl TransitionKind {
         Self::CommitSeal,
         Self::Tear,
         Self::PowerLoss,
+        Self::Reboot,
     ];
 }
 
@@ -90,6 +93,7 @@ impl Transition {
             Self::CommitSeal(_) => TransitionKind::CommitSeal,
             Self::Tear => TransitionKind::Tear,
             Self::PowerLoss => TransitionKind::PowerLoss,
+            Self::Reboot => TransitionKind::Reboot,
         }
     }
 }
@@ -341,25 +345,34 @@ pub fn explore(bound: Bound, guards: Guards, ceiling: usize) -> Result<Explored,
 }
 
 /// Counts one legal edge, and every record- and bank-state change it made.
+///
+/// Records are matched by id rather than by position: `Transition::BeginErase` — issue
+/// [#67](https://github.com/madmax983/waymaker/issues/67) — is now the one transition
+/// permitted to drop records outright, and a zip over the raw slices would pair the survivor
+/// of an erased bank against whatever record happens to sit at its old index, filing the
+/// difference as an invented durability step. `tests/machine.rs`'s
+/// `a_declared_record_is_never_renumbered_or_removed` names `BeginErase` as the one
+/// exception, and this is the matching change on the census side of the same fact.
 fn record_edge(census: &mut Census, transition: Transition, from: &Journal, to: &Journal) {
     *census.transitions.entry(transition.kind()).or_default() += 1;
     census.edges = census.edges.saturating_add(1);
 
-    for (before, after) in from.records().iter().zip(to.records()) {
-        // `tests/machine.rs` proves no transition renumbers or drops a record, and this is
-        // what stops the census silently mis-attributing an edge in the window before that
-        // test runs: a zip over reordered records compares different records at the same
-        // position and files the difference as a state change.
-        debug_assert_eq!(before.id, after.id, "a transition renumbered a record");
-        let (before, after) = (before.durability(), after.durability());
-        if before != after {
-            *census.durability_steps.entry((before, after)).or_default() += 1;
+    for after in to.records() {
+        match from.records().iter().find(|record| record.id == after.id) {
+            Some(before) => {
+                let (before, after) = (before.durability(), after.durability());
+                if before != after {
+                    *census.durability_steps.entry((before, after)).or_default() += 1;
+                }
+            }
+            // A record with no predecessor of the same id either just arrived, or reboot
+            // (which changes no id but can drop some) carried it across the crash unchanged;
+            // only a genuine arrival is counted, which is exactly the records `declare`
+            // creates: `Attempted` and nothing else.
+            None => {
+                *census.arrivals.entry(after.durability()).or_default() += 1;
+            }
         }
-    }
-    // A record the transition created has no predecessor to compare against, and its
-    // arrival is counted on its own rather than as a step between two states.
-    for new in to.records().iter().skip(from.records().len()) {
-        *census.arrivals.entry(new.durability()).or_default() += 1;
     }
 
     for (before, after) in from.banks().iter().zip(to.banks()) {

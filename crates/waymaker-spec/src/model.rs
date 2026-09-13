@@ -28,7 +28,7 @@
 //!
 //! # The guards are the design
 //!
-//! Five preconditions carry the whole specification, and each is separately removable
+//! Six preconditions carry the whole specification, and each is separately removable
 //! through [`Guards`]. That is not a convenience: `tests/necessity.rs` removes them one at
 //! a time and requires that each removal makes some §14 guarantee reachable-false. A guard
 //! that can be deleted with every proof still passing is a guard that was never load-bearing,
@@ -128,7 +128,10 @@ impl Role {
 /// every state the enforced machine reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Record {
-    /// The writer's own numbering, allocated in declaration order.
+    /// The writer's own numbering, allocated once and never reused — issue #67's scheme for
+    /// identity across a bank swap and across a reboot. Not a position: `Journal::declare`
+    /// takes it from a counter that only grows, so a record dropped by
+    /// `Journal::begin_erase` can never be reissued to something else.
     pub id: RecordId,
     /// Whether this record is a durable intent or the outcome of one.
     pub role: Role,
@@ -136,6 +139,14 @@ pub struct Record {
     pub media: OnMedia,
     /// Whether a barrier has returned since the last of its writes.
     pub acknowledged: bool,
+    /// Which bank holds these bytes.
+    ///
+    /// Issue [#67](https://github.com/madmax983/waymaker/issues/67)'s first gap: without
+    /// this, erasing a bank left every record untouched, and "never recover the old run as
+    /// current" was a sentence the model had no way to state. `Journal::begin_erase` drops
+    /// every record with a matching `bank`, and recovery reads only the records whose `bank`
+    /// is the one bank a reader would boot from.
+    pub bank: BankId,
 }
 
 impl Record {
@@ -228,6 +239,14 @@ pub enum Transition {
     Tear,
     /// The power goes away between operations.
     PowerLoss,
+    /// The device powers back on, resuming from the recovered prefix.
+    ///
+    /// Issue [#67](https://github.com/madmax983/waymaker/issues/67)'s second gap: the only
+    /// transition legal while [`Journal::powered`] is `false`, and it is legal only then. A
+    /// fresh run seeded straight from a crash rather than from [`Journal::new`] had no
+    /// representation before this, so a device on its second or third boot was a state this
+    /// machine could not reach.
+    Reboot,
 }
 
 /// Why a transition was refused.
@@ -285,6 +304,8 @@ pub enum Illegal {
     WouldEraseTheAuthority,
     /// The model's generation bound is reached.
     GenerationExhausted,
+    /// The device is already powered; there is nothing to reboot from.
+    AlreadyPowered,
 }
 
 impl Illegal {
@@ -309,6 +330,7 @@ impl Illegal {
             Self::BankNotSealing => "the bank has no seal in flight",
             Self::WouldEraseTheAuthority => "this is the bank a reader would boot from",
             Self::GenerationExhausted => "the model's generation bound is reached",
+            Self::AlreadyPowered => "the device is already powered",
         }
     }
 }
@@ -463,6 +485,15 @@ pub struct Journal {
     dispatched: Vec<RecordId>,
     powered: bool,
     sealed_once: bool,
+    /// The next id [`declare`](Self::declare) will hand out.
+    ///
+    /// Issue [#67](https://github.com/madmax983/waymaker/issues/67)'s identity scheme: a
+    /// counter that only grows, rather than `records.len()`. Once [`begin_erase`](Self::begin_erase)
+    /// can drop records from the middle of `records`, length is no longer a record's position
+    /// in history, and reusing it would let a record dropped by an erase be reissued to a
+    /// record that means something else — the one thing a reboot's redelivery proof cannot
+    /// survive.
+    next_id: u32,
 }
 
 impl Default for Journal {
@@ -481,7 +512,64 @@ impl Journal {
             dispatched: Vec::new(),
             powered: true,
             sealed_once: false,
+            next_id: 0,
         }
+    }
+
+    /// Which bank a new record declared right now would belong to.
+    ///
+    /// [`recovering_bank`](Self::recovering_bank)'s answer, or [`BankId::A`] when that is
+    /// `None`: a live writer always has somewhere to write, even under a relaxed [`Guards`]
+    /// where authority is momentarily absent or ambiguous, which is what makes this total
+    /// rather than an `Option`.
+    fn current_bank(&self) -> BankId {
+        self.recovering_bank().unwrap_or(BankId::A)
+    }
+
+    /// Which bank a reader would recover from right now, or `None` if there is nothing safe
+    /// to boot.
+    ///
+    /// [`BankId::A`] by convention before the device's first seal — the same convention
+    /// [`Journal::new`] and `from_parts` already carry, since a rung-0.1
+    /// device has exactly one implicit bank; the sole authoritative bank once one exists;
+    /// `None` when authority is absent or ambiguous, matching
+    /// [`Invariant::SingleAuthority`](crate::invariant::Invariant::SingleAuthority)'s own
+    /// refusal to pick one.
+    #[must_use]
+    pub fn recovering_bank(&self) -> Option<BankId> {
+        if !self.sealed_once {
+            return Some(BankId::A);
+        }
+        match self.authoritative().as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        }
+    }
+
+    /// Which bank holds `id`'s bytes, or `None` if no declared record has that id.
+    #[must_use]
+    pub fn bank_of(&self, id: RecordId) -> Option<BankId> {
+        self.records
+            .iter()
+            .find(|record| record.id == id)
+            .map(|record| record.bank)
+    }
+
+    /// The records the bank a reader would boot from has declared, in declaration order.
+    ///
+    /// [`Invariant::PrefixSafety`](crate::invariant::Invariant::PrefixSafety)'s first clause
+    /// against: "this run declared" means the run recovery would boot into, not every record
+    /// any bank has ever held. Empty when [`recovering_bank`](Self::recovering_bank) is
+    /// `None`, which is what lets a reader that boots the wrong (retired) bank fail this
+    /// clause instead of being compared against a run it does not belong to.
+    #[must_use]
+    pub fn declared(&self) -> Vec<RecordId> {
+        let bank = self.recovering_bank();
+        self.records
+            .iter()
+            .filter(|record| Some(record.bank) == bank)
+            .map(|record| record.id)
+            .collect()
     }
 
     /// The records this run declared, in declaration order.
@@ -522,37 +610,58 @@ impl Journal {
             .any(|record| record.media == OnMedia::Partial)
     }
 
-    /// The records that reached media at all, in declaration order.
+    /// The records that reached media at all, in declaration order, in the bank a reader
+    /// would boot from.
     ///
-    /// *Committed history* as design document §15's oracle means it.
+    /// *Committed history* as design document §15's oracle means it — scoped to
+    /// [`recovering_bank`](Self::recovering_bank) for the reason [`declared`](Self::declared)
+    /// is: a record a retired bank still holds reached media once, but not in the run
+    /// recovery is about.
     pub fn committed(&self) -> impl Iterator<Item = RecordId> + use<'_> {
+        let bank = self.recovering_bank();
         self.records
             .iter()
-            .filter(|record| record.media != OnMedia::Absent)
+            .filter(move |record| Some(record.bank) == bank && record.media != OnMedia::Absent)
             .map(|record| record.id)
     }
 
-    /// The records recovery is required to produce.
+    /// The records recovery is required to produce, in the bank a reader would boot from.
+    ///
+    /// Scoped to [`recovering_bank`](Self::recovering_bank) for the reason
+    /// [`declared`](Self::declared) is: a record acknowledged in a bank a later swap
+    /// superseded is a promise the run recovery boots into was never asked to keep, and
+    /// `crate::invariant::acknowledged_durability` and [`legal_recoveries`](Self::legal_recoveries)
+    /// both rest on this being true rather than filtering it out twice.
     pub fn acknowledged(&self) -> impl Iterator<Item = RecordId> + use<'_> {
+        let bank = self.recovering_bank();
         self.records
             .iter()
-            .filter(|record| record.acknowledged)
+            .filter(move |record| Some(record.bank) == bank && record.acknowledged)
             .map(|record| record.id)
     }
 
     /// What the specified reader produces from this state's media.
     ///
-    /// The longest prefix of declaration order whose records are wholly on media. A reader
-    /// walks an append-only journal from the start and stops at the first frame it cannot
-    /// accept, so the stopping rule is the specification of recovery, not a convenience:
-    /// everything after a gap is unreachable whether or not its bytes are there.
+    /// The longest prefix of declaration order, *in the bank a reader would boot from*, whose
+    /// records are wholly on media. A reader walks an append-only journal from the start and
+    /// stops at the first frame it cannot accept, so the stopping rule is the specification of
+    /// recovery, not a convenience: everything after a gap is unreachable whether or not its
+    /// bytes are there — and everything in a bank that is not the one authority is
+    /// unreachable full stop, which is issue [#67](https://github.com/madmax983/waymaker/issues/67)'s
+    /// "never recover the old run as current" as a fact about this function rather than a
+    /// hope about its caller.
+    ///
+    /// Empty when [`recovering_bank`](Self::recovering_bank) is `None`: a device with no
+    /// authority, or with two banks claiming it, has nothing safe to boot.
     ///
     /// This is the one definition; [`crate::reader::Specified`] delegates to it, so the
     /// reader the proofs quantify over and the reader this type describes cannot drift.
     #[must_use]
     pub fn recover(&self) -> Vec<RecordId> {
+        let bank = self.recovering_bank();
         self.records
             .iter()
+            .filter(|record| Some(record.bank) == bank)
             .take_while(|record| record.is_recoverable())
             .map(|record| record.id)
             .collect()
@@ -619,11 +728,16 @@ impl Journal {
     /// The abstraction runs this way on purpose: the ghost model is the specification and
     /// [`waymaker_fault::verify_recovery`] is the implementation of the judgement, so the
     /// model produces the oracle's input rather than the other way round.
+    /// Scoped to [`recovering_bank`](Self::recovering_bank): `waymaker_fault`'s oracle judges
+    /// one run at a time, and a retired bank's leftover bytes are a different run's, not a
+    /// second copy of this one's history to be confused with it.
     #[must_use]
     pub fn ledger(&self) -> Ledger {
+        let bank = self.recovering_bank();
         Ledger::new(
             self.records
                 .iter()
+                .filter(|record| Some(record.bank) == bank)
                 .map(|record| {
                     (
                         record.id,
@@ -647,6 +761,7 @@ impl Journal {
             Transition::Barrier,
             Transition::Tear,
             Transition::PowerLoss,
+            Transition::Reboot,
         ];
         for index in 0..bound.records {
             let id = RecordId(u32::try_from(index).unwrap_or(u32::MAX));
@@ -678,6 +793,16 @@ impl Journal {
         guards: Guards,
         bound: Bound,
     ) -> Result<Self, Illegal> {
+        // `Reboot` is the one exception to "the power is gone and nothing happens after
+        // that": it is the only transition legal while unpowered, and it is legal only then.
+        if transition == Transition::Reboot {
+            if self.powered {
+                return Err(Illegal::AlreadyPowered);
+            }
+            let mut next = self.clone();
+            next.reboot();
+            return Ok(next);
+        }
         if !self.powered {
             return Err(Illegal::PowerIsGone);
         }
@@ -696,44 +821,57 @@ impl Journal {
             Transition::CommitSeal(bank) => next.commit_seal(bank)?,
             Transition::Tear => next.tear(guards)?,
             Transition::PowerLoss => next.powered = false,
+            Transition::Reboot => unreachable!("handled above"),
         }
         Ok(next)
     }
 
-    /// Gives the next record in declaration order an identity. Nothing reaches media.
+    /// Gives the next record in declaration order an identity, in the current bank. Nothing
+    /// reaches media.
     ///
     /// # Postconditions
     ///
     /// One record longer, and identical in every other dimension. The new record is
-    /// [`OnMedia::Absent`] and unacknowledged, its id is its position, and no earlier record
-    /// changes. Held over every edge by `tests/machine.rs`'s
-    /// `a_declared_record_is_never_renumbered_or_removed` and by the census's requirement
-    /// that a record arrive [`Durability::Attempted`] and in no other state.
+    /// [`OnMedia::Absent`] and unacknowledged, its id comes from a counter that only grows —
+    /// issue [#67](https://github.com/madmax983/waymaker/issues/67)'s identity scheme, rather
+    /// than a position an erase could later reuse — and no earlier record changes. Held over
+    /// every edge by `tests/machine.rs`'s `a_declared_record_is_never_renumbered_or_removed`
+    /// and by the census's requirement that a record arrive [`Durability::Attempted`] and in
+    /// no other state. `bound.records` caps how many records this run may ever declare in
+    /// total, not how many are resident at once, so an erased bank does not reopen capacity a
+    /// swap already spent.
     fn declare(&mut self, role: Role, bound: Bound) -> Result<(), Illegal> {
-        if self.records.len() >= bound.records {
+        if self.next_id as usize >= bound.records {
             return Err(Illegal::CapacityReached);
         }
-        let unresolved = self.unresolved_schedule().is_some();
+        let bank = self.current_bank();
+        let unresolved = self.unresolved_schedule_in(bank).is_some();
         if (role == Role::Schedule) == unresolved {
             return Err(Illegal::OutOfProtocolOrder);
         }
-        let id = RecordId(u32::try_from(self.records.len()).unwrap_or(u32::MAX));
+        let id = RecordId(self.next_id);
+        self.next_id += 1;
         self.records.push(Record {
             id,
             role,
             media: OnMedia::Absent,
             acknowledged: false,
+            bank,
         });
         Ok(())
     }
 
-    /// The schedule record this run has declared and not yet declared an outcome for.
+    /// The schedule record `bank` has declared and not yet declared an outcome for.
     ///
-    /// At most one, which is the whole of §11's order: history is sequential, so an effect is
-    /// scheduled only after the previous one's outcome is committed.
-    fn unresolved_schedule(&self) -> Option<&Record> {
+    /// At most one per bank, which is the whole of §11's order: history is sequential, so an
+    /// effect is scheduled only after the previous one's outcome is committed. Scoped to one
+    /// bank rather than to the whole run: a bank swap starts a fresh run (§10's
+    /// `continue_as_new`) that owes nothing to whatever the retired bank left unresolved —
+    /// issue [#95](https://github.com/madmax983/waymaker/issues/95) is the accepted cost of
+    /// that, not something this function should pretend does not happen.
+    fn unresolved_schedule_in(&self, bank: BankId) -> Option<&Record> {
         let mut open = None;
-        for record in &self.records {
+        for record in self.records.iter().filter(|record| record.bank == bank) {
             match record.role {
                 Role::Schedule => open = Some(record),
                 Role::Outcome => open = None,
@@ -761,7 +899,8 @@ impl Journal {
         if target.media != OnMedia::Absent {
             return Err(Illegal::RecordAlreadyWritten);
         }
-        if guards.enforces(Guard::AppendOnly) && !self.whole_before(position) {
+        let bank = target.bank;
+        if guards.enforces(Guard::AppendOnly) && !self.whole_before(bank, position) {
             return Err(Illegal::EarlierRecordIncomplete);
         }
         let target = self
@@ -811,6 +950,14 @@ impl Journal {
     /// `id` was already acknowledged when this ran — §02 decision 3, which is what makes
     /// [`crate::invariant::Invariant::DurableIntent`] hold rather than a thing to check
     /// afterwards.
+    ///
+    /// Nothing here refuses a dispatch whose record's bank a later swap has since retired:
+    /// design document §10's swap consumes the old run's writer in the real firmware, but
+    /// nothing here rests on that being true, because
+    /// [`crate::invariant::holds`]'s `DurableIntent` clause already treats such a dispatch as
+    /// moot rather than as a breach — the old run is superseded either way, and a precondition
+    /// guarding against it would be a guard `tests/necessity.rs` could delete without breaking
+    /// a single proof.
     fn dispatch(&mut self, id: RecordId, guards: Guards) -> Result<(), Illegal> {
         let record = self
             .records
@@ -826,7 +973,7 @@ impl Journal {
         // resolved is an effect happening after the record that says it finished. Checked
         // only for a schedule, so that removing the guard above reaches the state it exists
         // to forbid rather than being stopped here instead.
-        if is_schedule && self.unresolved_schedule().map(|open| open.id) != Some(id) {
+        if is_schedule && self.unresolved_schedule_in(record.bank).map(|open| open.id) != Some(id) {
             return Err(Illegal::OutOfProtocolOrder);
         }
         if self.dispatched.contains(&id) {
@@ -840,15 +987,18 @@ impl Journal {
         Ok(())
     }
 
-    /// Begins erasing a bank, clearing its seal before the erase has returned.
+    /// Begins erasing a bank, clearing its seal before the erase has returned and destroying
+    /// every record it held.
     ///
     /// # Postconditions
     ///
-    /// The named bank is [`Bank::Erasing`] and is not bootable; the other bank is untouched,
-    /// as is every record — which is precisely the dimension this model does not yet have,
-    /// and [`crate::obligation`]'s `single-authority` row is where that is written down.
-    /// With [`Guard::NeverEraseTheAuthority`] enforced the named bank was not the one a
-    /// reader would boot from, so the authoritative generation does not fall —
+    /// The named bank is [`Bank::Erasing`] and is not bootable; the other bank is untouched.
+    /// Every record whose `bank` was the named one is gone — issue
+    /// [#67](https://github.com/madmax983/waymaker/issues/67)'s first gap, "erasing a bank
+    /// destroys the journal in it" — and so is every dispatched id that pointed at one of
+    /// them, so [`dispatched`](Self::dispatched) never outlives the record it names. With
+    /// [`Guard::NeverEraseTheAuthority`] enforced the named bank was not the one a reader
+    /// would boot from, so the authoritative generation does not fall —
     /// `the_authoritative_generation_never_goes_backwards`, over every edge.
     fn begin_erase(&mut self, bank: BankId, guards: Guards) -> Result<(), Illegal> {
         if self.bank(bank) == Bank::Erasing {
@@ -857,6 +1007,9 @@ impl Journal {
         if guards.enforces(Guard::NeverEraseTheAuthority) && self.authoritative().contains(&bank) {
             return Err(Illegal::WouldEraseTheAuthority);
         }
+        self.records.retain(|record| record.bank != bank);
+        let remaining: BTreeSet<RecordId> = self.records.iter().map(|record| record.id).collect();
+        self.dispatched.retain(|id| remaining.contains(id));
         self.set_bank(bank, Bank::Erasing);
         Ok(())
     }
@@ -892,7 +1045,17 @@ impl Journal {
         }
         let other = self.bank(bank.other()).authoritative_generation();
         let generation = if guards.enforces(Guard::StrictGeneration) {
-            other.map_or(1, |seen| seen.saturating_add(1))
+            match other {
+                None => 1,
+                // Issue #67's smaller item: `seen.saturating_add(1)` used to answer `seen`
+                // again once `seen` was `u32::MAX`, so a device at the ceiling could seal a
+                // *second* bank at the same generation — the tie `Guard::StrictGeneration`
+                // exists to make impossible, reached only because nothing here could ever
+                // explore that far before a bank carried a hand-built generation. Refusing
+                // instead matches `Generation::successor`'s real behaviour (ADR 0017): the
+                // firmware treats the ceiling as exhausted, not as a value worth repeating.
+                Some(seen) => seen.checked_add(1).ok_or(Illegal::GenerationExhausted)?,
+            }
         } else {
             other.unwrap_or(1)
         };
@@ -929,14 +1092,18 @@ impl Journal {
     /// `the_power_going_away_is_the_end_of_the_run` holds over every state. The torn record
     /// is the last one on media and nothing behind it is acknowledged, which is the lemma
     /// acknowledged durability rests on and which `tests/spine.rs` proves rather than
-    /// assumes.
+    /// assumes. The record has to be in [`current_bank`](Self::current_bank): nothing is
+    /// physically being programmed into a bank a swap has already retired, so a dangling
+    /// declared-but-unwritten record left behind there is not a live write a power loss can
+    /// tear.
     fn tear(&mut self, guards: Guards) -> Result<(), Illegal> {
+        let bank = self.current_bank();
         let position = self
             .records
             .iter()
-            .position(|record| record.media == OnMedia::Absent)
+            .position(|record| record.bank == bank && record.media == OnMedia::Absent)
             .ok_or(Illegal::NoOpenRecord)?;
-        if guards.enforces(Guard::AppendOnly) && !self.whole_before(position) {
+        if guards.enforces(Guard::AppendOnly) && !self.whole_before(bank, position) {
             return Err(Illegal::EarlierRecordIncomplete);
         }
         let target = self
@@ -948,6 +1115,26 @@ impl Journal {
         Ok(())
     }
 
+    /// The device powers back on. History is exactly what recovery would produce; anything
+    /// declared but not fully durable at the crash is gone, which is what makes reboot a
+    /// genuine restart rather than a resumed write.
+    ///
+    /// # Postconditions
+    ///
+    /// [`powered`](Self::powered) is `true`; [`records`](Self::records) is
+    /// [`recover`](Self::recover)'s answer, unchanged, so every id it carries keeps the
+    /// acknowledgment and media state it crossed the crash with; [`dispatched`](Self::dispatched)
+    /// keeps only ids that still have a record. `next_id` and every bank's seal survive
+    /// untouched — a reboot learns nothing new about either, and a record dropped here can
+    /// never be reissued, which is issue [#67](https://github.com/madmax83/waymaker/issues/67)'s
+    /// identity scheme doing its job.
+    fn reboot(&mut self) {
+        let kept = self.recover();
+        self.records.retain(|record| kept.contains(&record.id));
+        self.dispatched.retain(|id| kept.contains(id));
+        self.powered = true;
+    }
+
     /// The record and dispatch fields of a state, built without going through
     /// [`step`](Self::step).
     ///
@@ -955,16 +1142,29 @@ impl Journal {
     /// that `tests/refinement.rs` requires every state it builds to match a state the search
     /// really reached. Crate-private so that no test can reach for it as a shortcut past the
     /// preconditions.
+    ///
+    /// Every record is assumed to be in [`BankId::A`]: `waymaker-fault`'s harness drives one
+    /// writer over one bank's region, so `records` never names a second one, and both banks
+    /// start [`Bank::Erased`] here regardless — the reconstructed state has never sealed, so
+    /// [`recovering_bank`](Self::recovering_bank) already answers `Some(BankId::A)` by the
+    /// same convention. `next_id` is set past every id `records` carries so a caller that went
+    /// on to call [`step`](Self::step) — nothing in this crate does — could not reissue one.
     pub(crate) fn from_parts(records: Vec<Record>, dispatched: Vec<RecordId>) -> Self {
         let mut sorted = dispatched;
         sorted.sort_unstable();
         sorted.dedup();
+        let next_id = records
+            .iter()
+            .map(|record| record.id.0.saturating_add(1))
+            .max()
+            .unwrap_or(0);
         Self {
             records,
             banks: [Bank::Erased; BANKS],
             dispatched: sorted,
             powered: false,
             sealed_once: false,
+            next_id,
         }
     }
 
@@ -973,16 +1173,77 @@ impl Journal {
         self.records.iter().position(|record| record.id == id)
     }
 
-    /// Whether every record declared before `position` is wholly on media.
-    fn whole_before(&self, position: usize) -> bool {
-        self.records
-            .get(..position)
-            .is_some_and(|earlier| earlier.iter().all(|record| record.media == OnMedia::Whole))
+    /// Whether every record of `bank` declared before `position` is wholly on media.
+    ///
+    /// Scoped to `bank` rather than to every record before `position`: a record a retired
+    /// bank left torn or absent must not block append-only writes to the bank that
+    /// superseded it, which is exactly what makes a live swap while a torn record sits behind
+    /// it — issue [#67](https://github.com/madmax983/waymaker/issues/67)'s third gap,
+    /// compaction — representable at all.
+    fn whole_before(&self, bank: BankId, position: usize) -> bool {
+        self.records.get(..position).is_some_and(|earlier| {
+            earlier
+                .iter()
+                .filter(|record| record.bank == bank)
+                .all(|record| record.media == OnMedia::Whole)
+        })
     }
 
     fn set_bank(&mut self, id: BankId, bank: Bank) {
         if let Some(slot) = self.banks.get_mut(id.index()) {
             *slot = bank;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue [#67](https://github.com/madmax983/waymaker/issues/67)'s smaller item: no bound
+    /// small enough for the exhaustive search to finish ever reaches a generation near
+    /// [`u32::MAX`], so a hand-built state is the only way to reach the ceiling at all. A unit
+    /// test rather than an integration one, because [`Journal`]'s fields are private and
+    /// nothing outside this crate has a legitimate reason to build a bank already sealed nine
+    /// hundred billion generations in.
+    #[test]
+    fn a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank() {
+        let near_ceiling = Journal {
+            records: Vec::new(),
+            banks: [Bank::Sealed(u32::MAX - 1), Bank::Erased],
+            dispatched: Vec::new(),
+            powered: true,
+            sealed_once: true,
+            next_id: 0,
+        };
+        let bound = Bound {
+            records: 3,
+            generations: u32::MAX,
+        };
+
+        // One more generation is still short of the ceiling, so it succeeds.
+        let sealing = near_ceiling
+            .step(Transition::BeginSeal(BankId::B), Guards::ENFORCED, bound)
+            .expect("u32::MAX - 1 + 1 does not overflow");
+        assert_eq!(sealing.bank(BankId::B), Bank::Sealing(u32::MAX));
+        let sealed = sealing
+            .step(Transition::CommitSeal(BankId::B), Guards::ENFORCED, bound)
+            .expect("committing a seal that was legal to begin");
+        assert_eq!(sealed.bank(BankId::B), Bank::Sealed(u32::MAX));
+
+        // Reclaiming the now-retired bank and sealing it again would need generation
+        // `u32::MAX + 1`. `seen.saturating_add(1)` used to answer `u32::MAX` again here —
+        // the same generation bank B already holds — which is the tie
+        // `Guard::StrictGeneration` exists to make impossible. It is refused instead.
+        let erased = sealed
+            .step(Transition::BeginErase(BankId::A), Guards::ENFORCED, bound)
+            .and_then(|erasing| {
+                erasing.step(Transition::CommitErase(BankId::A), Guards::ENFORCED, bound)
+            })
+            .expect("reclaiming the bank the swap retired");
+        assert_eq!(
+            erased.step(Transition::BeginSeal(BankId::A), Guards::ENFORCED, bound),
+            Err(Illegal::GenerationExhausted)
+        );
     }
 }

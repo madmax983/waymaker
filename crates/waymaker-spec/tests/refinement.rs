@@ -451,10 +451,15 @@ fn the_refinement_check_can_tell_the_specified_reader_from_a_wrong_one() {
     //
     // `Mutant::SkipsGaps` is excluded, and `tests/teeth.rs` is where that is established:
     // under the append-only precondition it is not a wrong reader at all, because no
-    // reachable state has anything behind a gap for it to find.
+    // reachable state has anything behind a gap for it to find. `Mutant::BootsTheRetiredBank`
+    // is excluded for the parallel reason this file's own module doc gives: no writer here
+    // drives the two-bank adapter, so every reconstructed state has never sealed and the
+    // mutant's "boot the other bank" branch never triggers — it falls back to `Specified` and
+    // agrees with it everywhere, which is a gap in what this file exercises rather than in the
+    // mutant.
     let runs = drive(journal);
     for mutant in Mutant::ALL {
-        if mutant == Mutant::SkipsGaps {
+        if matches!(mutant, Mutant::SkipsGaps | Mutant::BootsTheRetiredBank) {
             continue;
         }
         let disagreements = runs
@@ -480,9 +485,9 @@ fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
     // Written down as a test rather than left to be discovered. `Observation` carries no
     // banks, so `reconstructed` builds a state that has never sealed, and `SingleAuthority`
     // returns `Ok` for it whatever history it is handed — including one that is pure
-    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank` is one, and abstracting it is still owed — gets three
-    // guarantees judged and the fourth answered for free, and this is the assertion that
-    // says so out loud.
+    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank`
+    // is one, and abstracting it is still owed — gets three guarantees judged and the fourth
+    // answered for free, and this is the assertion that says so out loud.
     let nonsense = [RecordId(99), RecordId(7)];
     for run in drive(journal) {
         let observed = abstraction(run.ledger(), &[], role_of);

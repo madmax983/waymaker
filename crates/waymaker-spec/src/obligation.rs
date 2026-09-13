@@ -117,17 +117,22 @@ pub const CLAUSES: &[Clause] = &[
         proof: "tests/spine.rs",
         falsifier: "tests/necessity.rs",
         owed: Some(
-            "the refinement, and three things about the model with it. There is now a \
-             two-bank adapter to abstract — `waymaker_flash::bank`, issue #22 — and \
-             `tests/refinement.rs` does not yet abstract it, so this clause is still \
-             discharged against the model alone and a reconstructed state has no banks, \
-             which answers it vacuously for one. The model's banks hold no records: no \
-             transition changes a bank and a record at once, so \"never recover the old run \
-             as current\" is not something this machine can state, only \"exactly one bank \
-             is bootable\". And generations are compared as unbounded integers, so a seal \
-             counter that wraps is a counterexample no bound reaches — the firmware makes \
-             that unreachable rather than orderable (`Generation::successor` refuses at the \
-             ceiling, ADR 0017), which is a fact about the code and not yet about the model",
+            "the refinement. Issue #67 closed the other two: a `Record` now carries a \
+             `BankId`, `Journal::begin_erase` drops the erased bank's records, and recovery \
+             is scoped to the bank a reader would boot from — so \"never recover the old run \
+             as current\" is exactly what `Journal::recover` and `Journal::committed` state, \
+             and `Mutant::BootsTheRetiredBank` (`tests/teeth.rs`) shows this guarantee is now \
+             falsifiable by a reader rather than only by removing a guard. Generation \
+             arithmetic now refuses at `u32::MAX` (`checked_add`, not `saturating_add`) \
+             instead of silently repeating it, matching `Generation::successor`'s real \
+             refusal (ADR 0017) rather than leaving the ceiling a fact about the code alone — \
+             proved by a hand-built state in `src/model.rs`'s own `#[cfg(test)]` module, \
+             since no bound small enough to explore ever reaches it. What is still owed is \
+             the refinement itself: there is a two-bank adapter to abstract — \
+             `waymaker_flash::bank`, issue #22 — and `tests/refinement.rs` does not yet \
+             abstract it, so this clause is discharged against the model alone and a \
+             reconstructed state has no banks, which answers it vacuously for one \
+             (`tests/refinement.rs`'s `a_reconstructed_state_cannot_falsify_the_fourth_guarantee`).",
         ),
     },
     Clause {

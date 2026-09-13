@@ -121,7 +121,7 @@ pub fn holds(
         Invariant::PrefixSafety => prefix_safety(state, recovered),
         Invariant::AcknowledgedDurability => acknowledged_durability(state, recovered),
         Invariant::DurableIntent => durable_intent(state, recovered),
-        Invariant::SingleAuthority => single_authority(state),
+        Invariant::SingleAuthority => single_authority(state, recovered),
     };
     detail.map_or(Ok(()), |detail| {
         Err(Box::new(Breach {
@@ -135,7 +135,11 @@ pub fn holds(
 
 /// The three clauses of [`Invariant::PrefixSafety`], in the order a reader would check them.
 fn prefix_safety(state: &Journal, recovered: &[RecordId]) -> Option<String> {
-    let declared: Vec<RecordId> = state.records().iter().map(|record| record.id).collect();
+    // `declared()` rather than `records()`: "this run" means the run recovery would boot
+    // into, not every record any bank has ever held — issue #67's bank dimension, so a
+    // reader that boots a retired bank's history fails this clause instead of being compared
+    // against a run it does not belong to.
+    let declared: Vec<RecordId> = state.declared();
     if let Some(detail) = is_prefix_of(
         recovered,
         &declared,
@@ -191,7 +195,16 @@ fn is_prefix_of(
     None
 }
 
-/// [`Invariant::AcknowledgedDurability`]: a barrier that returned is a promise.
+/// [`Invariant::AcknowledgedDurability`]: a barrier that returned is a promise — for the run a
+/// reader would boot into.
+///
+/// [`Journal::acknowledged`] is already scoped to [`Journal::recovering_bank`], for the reason
+/// its own doc comment gives: a bank swap is precisely the mechanism by which one run ends and
+/// its bank is later reclaimed, so a record acknowledged in a bank a later swap retired is a
+/// promise the *next* run's recovery was never asked to keep. Without that scope, sealing a
+/// second bank at a higher generation would turn every earlier acknowledgment in the first
+/// bank into a permanent, unfixable breach of this guarantee — which is not §14's
+/// "acknowledged after its barrier", it is "ever acknowledged by any run this device has had".
 fn acknowledged_durability(state: &Journal, recovered: &[RecordId]) -> Option<String> {
     state
         .acknowledged()
@@ -202,6 +215,16 @@ fn acknowledged_durability(state: &Journal, recovered: &[RecordId]) -> Option<St
 /// [`Invariant::DurableIntent`]: §02 decision 3, after the fact.
 fn durable_intent(state: &Journal, recovered: &[RecordId]) -> Option<String> {
     for intent in state.dispatched() {
+        // An effect dispatched from a bank a later swap retired is moot rather than a new
+        // breach: `continue_as_new` starts a fresh run that owes the superseded one nothing,
+        // which is issue #95's accepted gap for stable redelivery and the same reasoning
+        // applies here. Whether the dispatch happened while that bank was still current, or
+        // only became possible because nothing here refuses one from an already-retired bank,
+        // makes no difference to the run recovery now boots into — that run never had this
+        // effect in its own history either way.
+        if state.bank_of(*intent) != state.recovering_bank() {
+            continue;
+        }
         if !recovered.contains(intent) {
             return Some(format!(
                 "an effect was dispatched and recovery has no record {} to account for it",
@@ -225,15 +248,32 @@ fn durable_intent(state: &Journal, recovered: &[RecordId]) -> Option<String> {
 }
 
 /// [`Invariant::SingleAuthority`]: §02 decision 7, for a device that has sealed at all.
-fn single_authority(state: &Journal) -> Option<String> {
+///
+/// Two clauses now rather than one, and the second is issue
+/// [#67](https://github.com/madmax983/waymaker/issues/67)'s "the sentence that matters":
+/// counting bootable banks says nothing about whose history a reader actually produced, so a
+/// reader that boots the wrong (retired) bank used to pass this guarantee outright. It is
+/// checked here, over `recovered`, rather than left to `PrefixSafety` alone — a reader wrong
+/// in this one way has to be caught by *this* clause for `tests/teeth.rs` to show the
+/// guarantee is falsifiable on its own, not only in the company of another.
+fn single_authority(state: &Journal, recovered: &[RecordId]) -> Option<String> {
     if !state.has_sealed() {
         return None;
     }
-    match state.authoritative().len() {
-        1 => None,
-        0 => Some("this device sealed a bank and now has none to boot from".to_owned()),
-        count => Some(format!(
-            "{count} banks are authoritative, so which history is the run's is undecided"
+    match state.authoritative().as_slice() {
+        [sole] => recovered.iter().find_map(|id| {
+            (state.bank_of(*id) != Some(*sole)).then(|| {
+                format!(
+                    "record {} did not come from the sole authoritative bank, so an old run \
+                     was recovered as current",
+                    id.0
+                )
+            })
+        }),
+        [] => Some("this device sealed a bank and now has none to boot from".to_owned()),
+        banks => Some(format!(
+            "{} banks are authoritative, so which history is the run's is undecided",
+            banks.len()
         )),
     }
 }

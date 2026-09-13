@@ -12,7 +12,7 @@
 
 use waymaker_fault::Durability;
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bank, BankId, Bound, Guards, Journal, OnMedia, Transition};
+use waymaker_spec::model::{Bank, BankId, Bound, Guards, Journal, OnMedia, Record, Transition};
 
 const CEILING: usize = 200_000;
 
@@ -38,6 +38,27 @@ fn edges() -> Vec<(Journal, Transition, Journal)> {
     edges
 }
 
+/// Every record present on both sides of an edge, paired by id.
+///
+/// `Transition::BeginErase` — issue [#67](https://github.com/madmax983/waymaker/issues/67) —
+/// is now the one transition allowed to drop a record outright, so a plain `.zip()` over the
+/// raw slices would pair the survivor of an erased bank against whatever unrelated record
+/// happens to sit at its old index and file the difference as a state change nothing made.
+/// Matching by id instead means a test below is a claim about a record that persisted across
+/// the edge, which is what "never taken back", "never un-acknowledged" and "moves only along
+/// these edges" are actually claims about.
+fn matched<'a>(from: &'a Journal, to: &'a Journal) -> Vec<(&'a Record, &'a Record)> {
+    to.records()
+        .iter()
+        .filter_map(|after| {
+            from.records()
+                .iter()
+                .find(|before| before.id == after.id)
+                .map(|before| (before, after))
+        })
+        .collect()
+}
+
 #[test]
 fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
     // Design document §15: merely attempted, possibly durable before acknowledgment, and
@@ -52,7 +73,7 @@ fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
         (Durability::PossiblyDurable, Durability::Acknowledged),
     ];
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             let (before, after) = (before.durability(), after.durability());
             if before == after {
                 continue;
@@ -68,7 +89,7 @@ fn a_record_moves_only_along_the_three_state_edges_the_design_document_names() {
 #[test]
 fn an_acknowledged_record_is_never_un_acknowledged() {
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             if before.acknowledged {
                 assert!(
                     after.acknowledged,
@@ -84,9 +105,12 @@ fn an_acknowledged_record_is_never_un_acknowledged() {
 fn bytes_on_media_are_never_taken_back_within_a_run() {
     // NOR flash only clears bits, and rung 0.1 has no erase of the journal region. A record
     // that reached media stays there for the life of the run; the two-bank swap is how
-    // history is reclaimed, and that is the bank machine below rather than this one.
+    // history is reclaimed, and that is the bank machine below rather than this one. A record
+    // an erase drops is not "taken back" in this sense — it is gone, which
+    // `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank` covers —
+    // so this is a claim about the records that survive an edge, matched by id.
     for (from, transition, to) in edges() {
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             let regressed = matches!(
                 (before.media, after.media),
                 (OnMedia::Whole, OnMedia::Absent | OnMedia::Partial)
@@ -102,16 +126,50 @@ fn bytes_on_media_are_never_taken_back_within_a_run() {
 }
 
 #[test]
-fn a_declared_record_is_never_renumbered_or_removed() {
+fn a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank() {
     for (from, transition, to) in edges() {
-        assert!(
-            to.records().len() >= from.records().len(),
-            "{transition:?} dropped a record"
+        let dropped = from.records().len() - matched(&from, &to).len();
+        if matches!(transition, Transition::BeginErase(_) | Transition::Reboot) {
+            // `BeginErase` drops a whole bank's records — `erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else`
+            // is the claim about which ones. `Reboot` can also shrink `records`, but only
+            // down to what `recover()` already said survives the crash —
+            // `a_reboot_keeps_exactly_the_recovered_prefix_and_nothing_it_declared_after` is
+            // that claim.
+            continue;
+        }
+        assert_eq!(
+            dropped, 0,
+            "{transition:?} dropped {dropped} record(s) without erasing a bank"
         );
-        for (before, after) in from.records().iter().zip(to.records()) {
+        for (before, after) in matched(&from, &to) {
             assert_eq!(
                 before.id, after.id,
                 "{transition:?} renumbered a declared record"
+            );
+        }
+    }
+}
+
+#[test]
+fn erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else() {
+    // The other half of issue #67's first gap: `BeginErase` is now allowed to shrink
+    // `records`, and this is the claim about *which* records it may drop — exactly the
+    // named bank's, never the other bank's.
+    for (from, transition, to) in edges() {
+        let Transition::BeginErase(erased) = transition else {
+            continue;
+        };
+        let after_ids: std::collections::BTreeSet<_> =
+            to.records().iter().map(|record| record.id).collect();
+        for record in from.records() {
+            let should_survive = record.bank != erased;
+            assert_eq!(
+                after_ids.contains(&record.id),
+                should_survive,
+                "erasing {erased:?} {} record {} in bank {:?}",
+                if should_survive { "dropped" } else { "kept" },
+                record.id.0,
+                record.bank
             );
         }
     }
@@ -226,12 +284,7 @@ fn committed_history_and_declaration_order_are_the_same_prefix() {
     // a gap-skipping reader exploiting.
     for state in proof_space().states() {
         let committed: Vec<_> = state.committed().collect();
-        let declared: Vec<_> = state
-            .records()
-            .iter()
-            .take(committed.len())
-            .map(|record| record.id)
-            .collect();
+        let declared: Vec<_> = state.declared().into_iter().take(committed.len()).collect();
         assert_eq!(
             committed, declared,
             "committed history is not a prefix of declaration order in {state:?}"
@@ -269,5 +322,24 @@ fn no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to() 
                 "{transition:?} is legal from {from:?} and changes nothing"
             );
         }
+    }
+}
+
+#[test]
+fn a_reboot_keeps_exactly_the_recovered_prefix_and_nothing_it_declared_after() {
+    // Issue #67's second gap: a reboot has to carry forward precisely what recovery says
+    // survived the crash, id for id, and drop everything else — nothing more forgiving, and
+    // nothing that quietly kept a record recovery would have refused.
+    for (from, transition, to) in edges() {
+        if transition != Transition::Reboot {
+            continue;
+        }
+        let kept: Vec<_> = from.recover();
+        let after_ids: Vec<_> = to.records().iter().map(|record| record.id).collect();
+        assert_eq!(
+            after_ids, kept,
+            "Reboot from {from:?} kept {after_ids:?}, and recovery says {kept:?}"
+        );
+        assert!(to.powered(), "Reboot left the device unpowered");
     }
 }
