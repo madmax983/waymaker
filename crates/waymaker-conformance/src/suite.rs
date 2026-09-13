@@ -63,6 +63,27 @@ pub const ERASED: u8 = 0xFF;
 /// Two: a source and the read-back of it, which is the widest any case holds at once.
 pub const REQUIRED_BUFFER_UNITS: u32 = 2;
 
+/// Whether every byte of `bytes` is [`ERASED`], a word at a time.
+///
+/// [`Run::media_is_erased`] is the suite's most-called primitive — nearly every case that
+/// touches media ends in an erased-tail or erased-region check, frequently over a span the
+/// width of an erase block — so a byte-at-a-time `iter().any(|&b| b != ERASED)` here pays a
+/// bounds check and a compare per byte for an answer usable in `usize`-sized chunks. Same
+/// technique `waymaker_flash::recovery::is_erased` uses for the same reason, reimplemented
+/// rather than shared: that function is private to a different layer and reaching it from
+/// here would be a `waymaker-conformance` dependency the module does not otherwise need for
+/// one helper. Checked against the byte-at-a-time definition at every length and
+/// single-byte-mutation position around a word boundary in this module's tests, so a
+/// remainder handled short does not pass silently.
+fn slice_is_erased(bytes: &[u8]) -> bool {
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|&byte| byte == ERASED)
+}
+
 /// Why a conformance run could not start.
 ///
 /// Distinct from a [`Failure`]: a failure means the adapter is wrong, and one of these
@@ -298,7 +319,7 @@ impl<S: StableStorage> Run<'_, S> {
             let chunk = core::cmp::min(step, usize::try_from(len - seen).ok()?);
             self.read_into(offset.checked_add(seen)?, chunk, 0)?;
             let held = self.bytes(0, chunk)?;
-            if held.iter().any(|&byte| byte != ERASED) {
+            if !slice_is_erased(held) {
                 return Some(false);
             }
             seen = seen.checked_add(u32::try_from(chunk).ok()?)?;
@@ -1071,7 +1092,7 @@ impl<S: StableStorage> Run<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ERASED, Report, Run, pattern};
+    use super::{ERASED, Report, Run, pattern, slice_is_erased};
     use crate::region::Region;
     use waymaker_fault::Device;
     use waymaker_flash::storage::{Geometry, StableStorage};
@@ -1103,6 +1124,35 @@ mod tests {
             buffer,
             unit: UNIT as usize,
             report: Report::new(),
+        }
+    }
+
+    /// `slice_is_erased` has to agree with "every byte is [`ERASED`]", at every length
+    /// around a word boundary and with the one non-erased byte at every position — inside
+    /// a whole word-sized chunk and inside whatever a word-at-a-time walk would leave as a
+    /// remainder. Pinned before `slice_is_erased` stops being a plain `iter().all(...)` and
+    /// starts comparing a word at a time, mirroring
+    /// `waymaker_flash::recovery::is_erased`'s own sweep of the same shape.
+    #[test]
+    fn slice_is_erased_agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        const MAX_LEN: usize = 32;
+        let word = core::mem::size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [ERASED; MAX_LEN];
+            assert!(
+                slice_is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !slice_is_erased(&bytes[..len]),
+                    "length {len} spoiled at {spoiled}"
+                );
+            }
         }
     }
 
