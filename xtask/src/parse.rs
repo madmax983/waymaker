@@ -194,24 +194,28 @@ fn collect_tree_aliases(
     prefix: &mut Vec<String>,
     aliases: &mut Vec<UseAlias>,
 ) {
+    // `.unraw()` throughout: `r#Klon` names the same local binding a plain `Klon` would
+    // when `Klon` is not a keyword, and a later comparison against the plain spelling
+    // must not miss the raw one (issues #68/#90's reasoning for `extern_crate_names`).
     match tree {
         syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(path.ident.unraw().to_string());
             collect_tree_aliases(&path.tree, prefix, aliases);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
             if name.ident != "self" {
+                let ident = name.ident.unraw().to_string();
                 aliases.push(UseAlias {
-                    local: name.ident.to_string(),
-                    target: [prefix.clone(), vec![name.ident.to_string()]].concat(),
+                    local: ident.clone(),
+                    target: [prefix.clone(), vec![ident]].concat(),
                 });
             }
         }
         syn::UseTree::Rename(rename) => {
             aliases.push(UseAlias {
-                local: rename.rename.to_string(),
-                target: [prefix.clone(), vec![rename.ident.to_string()]].concat(),
+                local: rename.rename.unraw().to_string(),
+                target: [prefix.clone(), vec![rename.ident.unraw().to_string()]].concat(),
             });
         }
         syn::UseTree::Glob(_) => {}
@@ -316,49 +320,42 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     segments
 }
 
-/// [`resolve_segments`], chasing a `self::name` result whose `name` is itself an alias.
-///
-/// `resolve_segments` substitutes once: `use core::clone::Clone as C; use self::C as
-/// Klon;` resolves `Klon` to `[self, C]` and stops there, because `self` is never itself a
-/// registered alias and the substitution logic has nowhere else to look. But `self::C`
-/// means "this module's own `C`", and if `C` names a second alias, that is what `Klon`
-/// ultimately refers to — here, `core::clone::Clone`. Bounded by `aliases.len()` hops
-/// rather than run to a fixed point, so a `use A as B; use B as A;` cycle — not something
-/// real Rust name resolution could produce, but something a text file can still spell —
-/// terminates instead of looping.
-///
-/// What this does not chase: a chain that leaves the `self::` shape after its first hop,
-/// such as one running back through a grouped import (`use a::{B as C};`) whose own target
-/// already has more than one segment. Real multi-hop resolution needs the crate's full
-/// module tree, which is outside what this file's syntax-only reading can ever have.
-fn chase_self_alias(mut segments: Vec<String>, aliases: &[UseAlias]) -> Vec<String> {
-    for _ in 0..aliases.len() {
-        let [first, second] = segments.as_slice() else {
-            break;
-        };
-        if first != "self" {
-            break;
-        }
-        let Some(alias) = aliases.iter().find(|candidate| &candidate.local == second) else {
-            break;
-        };
-        segments = alias.target.clone();
+/// The identifier a further alias lookup has to match against `segments`, and what
+/// follows it — stripping a leading `self` or `crate`, because a module qualifier is not
+/// itself an aliasable name: `self::C` and `crate::C` both mean "this crate's own `C`",
+/// whether that qualifier opens a derive path directly (`#[derive(self::C)]`) or shows up
+/// partway through, in an alias's own target (`use self::C as Klon;`).
+fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
+    match segments {
+        [first, second, tail @ ..] if first == "self" || first == "crate" => Some((second, tail)),
+        [first, tail @ ..] => Some((first, tail)),
+        [] => None,
     }
-    segments
 }
 
-/// Every name `path` could ultimately mean, branching over every alias sharing its first
-/// segment's local name rather than only the one [`resolve_segments`] would pick.
+/// Every name `path` could ultimately mean, considering every alias that could bind any
+/// step along the way — not just the one [`resolve_segments`] would pick by taking the
+/// first match at the first step alone.
 ///
-/// Mutually exclusive `cfg`s can validly bind one local name to two different targets, and
-/// this scan does not evaluate which is active — so it has to consider each:
-/// `#[cfg(any())] use core::fmt::Debug as Klon; #[cfg(all())] use core::clone::Clone as
-/// Klon;` derives `Clone` under the condition that always holds, and a scan that resolved
-/// only whichever `Klon` happened to be declared first in the file would miss it whenever
-/// that one loses the race. Each candidate is chased through [`chase_self_alias`] on its
-/// own; a duplicate met again *inside* that chase still resolves to only its first match,
-/// which is the same bounded-depth trade [`chase_self_alias`]'s own doc states.
+/// Two things this branches for, both because this scan does not evaluate which of
+/// several possibilities is real. Mutually exclusive `cfg`s can validly bind one local
+/// name to two different targets: `#[cfg(any())] use core::fmt::Debug as Klon;
+/// #[cfg(all())] use core::clone::Clone as Klon;` derives `Clone` under the condition
+/// that always holds, and resolving only whichever `Klon` happened to be declared first
+/// would miss it whenever that one loses the race. And a resolved target can itself need
+/// another hop — `use core::clone::Clone as C; use self::C as Klon;` needs two — which
+/// [`lookup_candidate`]'s `self`/`crate` stripping makes visible at every step, not only
+/// the first.
+///
+/// Bounded twice over, so neither an adversarial pile of aliases nor a cycle spelled by
+/// hand (`use A as B; use B as A;` — not something real Rust name resolution could
+/// produce, but something a text file can still spell) can make this loop unbounded: at
+/// most `aliases.len()` hops, and at most `MAX_CANDIDATES` names explored in total, with
+/// anything cut off by the second bound returned unresolved rather than dropped, so
+/// nothing this scan stopped chasing early is silently treated as safe.
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
+    const MAX_CANDIDATES: usize = 64;
+
     // `.unraw()`: see `resolve_segments`.
     let segments: Vec<String> = path
         .segments
@@ -368,23 +365,42 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     if path.leading_colon.is_some() {
         return segments.last().cloned().into_iter().collect();
     }
-    let Some(first) = segments.first().cloned() else {
-        return Vec::new();
-    };
-    let matching: Vec<&UseAlias> = aliases
-        .iter()
-        .filter(|candidate| candidate.local == first)
-        .collect();
-    if matching.is_empty() {
-        return segments.last().cloned().into_iter().collect();
+
+    let mut frontier = vec![segments];
+    let mut finished = Vec::new();
+    for _ in 0..=aliases.len() {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for current in frontier {
+            let Some((candidate, tail)) = lookup_candidate(&current) else {
+                continue;
+            };
+            let matching: Vec<&UseAlias> = aliases
+                .iter()
+                .filter(|alias| alias.local == candidate)
+                .collect();
+            if matching.is_empty() {
+                finished.push(current);
+                continue;
+            }
+            for alias in matching {
+                if finished.len() + next.len() >= MAX_CANDIDATES {
+                    finished.push(current.clone());
+                    continue;
+                }
+                let mut resolved = alias.target.clone();
+                resolved.extend(tail.iter().cloned());
+                next.push(resolved);
+            }
+        }
+        frontier = next;
     }
-    matching
+    finished.extend(frontier);
+    finished
         .into_iter()
-        .filter_map(|alias| {
-            let mut resolved = alias.target.clone();
-            resolved.extend(segments.iter().skip(1).cloned());
-            chase_self_alias(resolved, aliases).last().cloned()
-        })
+        .filter_map(|segments| segments.last().cloned())
         .collect()
 }
 

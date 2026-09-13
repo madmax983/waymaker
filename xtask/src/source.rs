@@ -10509,6 +10509,48 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_derived_under_a_raw_aliased_name_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): the alias's own local name can
+        // be a raw identifier too — `use core::clone::Clone as r#Klon;` binds the same
+        // name a plain `Klon` would — and the first version of this check normalised the
+        // derive path's segments but not the alias table's, so `r#Klon` never matched the
+        // plain `Klon` a `#[derive(Klon)]` looked up.
+        let raw_aliased = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as r#Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&raw_aliased);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_self_qualified_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `#[derive(self::C)]` is a
+        // qualified derive path, and the first version of this check only looked for an
+        // alias named the *first* segment of a path — here, the module qualifier `self`,
+        // which is never itself a registered alias — rather than stripping `self::` first
+        // and looking up `C`.
+        let self_qualified = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as C;\n",
+            "#[derive(self::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&self_qualified);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
