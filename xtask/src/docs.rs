@@ -1377,8 +1377,13 @@ fn without_fenced_code(contents: &str) -> String {
         let trimmed = line.trim();
         let fence = fence_length(trimmed);
         match open_fence {
+            // A closing fence carries nothing but its own characters: a line with an
+            // info string, like an inner ` ```rust `, is quoted content, not a closer.
+            // `mermaid_blocks` already holds fences to this; this is the same rule.
             Some((marker, width))
-                if fence.is_some_and(|(found, length)| found == marker && length >= width) =>
+                if fence.is_some_and(|(found, length)| {
+                    found == marker && length >= width && trimmed.len() == length
+                }) =>
             {
                 open_fence = None;
             }
@@ -5149,6 +5154,19 @@ mod tests {
         // be closed by a tilde line, or everything after it stops being fenced.
         assert_eq!(
             without_fenced_code("keep\n```\nhidden\n~~~\nstill hidden\n```\nkeep too"),
+            "keep\nkeep too"
+        );
+    }
+
+    #[test]
+    fn a_closing_fence_cannot_carry_an_info_string() {
+        // Codex, pull request #138. CommonMark allows nothing but whitespace after the
+        // fence characters on a closing line. A line like "```rust" is not a closing
+        // fence — it is content quoted inside the outer ```text block — so it must not
+        // end the block early, and it must not be mistaken for a new opener either.
+        // `mermaid_blocks` already gets this right; `without_fenced_code` did not.
+        assert_eq!(
+            without_fenced_code("keep\n```text\nhidden\n```rust\nstill hidden\n```\nkeep too"),
             "keep\nkeep too"
         );
     }
