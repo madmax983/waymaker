@@ -57,8 +57,9 @@ point inside a unit is the boundary above it — the unit completes, so the medi
 and the caller is answered the same — and an exhaustive list that counts one crash point twice
 is no longer a count of anything. `a_watchdog_reset_inside_a_unit_is_the_watchdog_reset_at_the_boundary_above_it`
 measures that; `a_watchdog_reset_at_a_unit_boundary_is_not_the_power_cut_beside_it` measures
-why it stops there. (Corrected per issue #88: this sentence said "before the sequence," which
-the `Progress::None` paragraph below already contradicted. The decision did not change.)
+why it stops there. This sentence itself said "before the sequence" until issue #88 caught it
+disagreeing with the `Progress::None` paragraph below. The decision did not change; only the
+summary sentence was wrong.
 
 That second test is Codex's, from the first review round on this pull request, and the version
 of this ADR it reviewed had the argument wrong. It said the interior watchdog points were
