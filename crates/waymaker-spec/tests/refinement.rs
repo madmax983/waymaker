@@ -792,6 +792,37 @@ fn reconstruction_refuses_the_same_id_declared_in_two_banks() {
 }
 
 #[test]
+fn reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false() {
+    // Codex, PR #135's next round: the only place a bank becomes `Bank::Sealed` is
+    // `commit_seal`, which sets `sealed_once` true in the same step — so a bank reported as
+    // `Sealed` while `sealed_once` is `false` describes two different devices at once. Left
+    // unchecked, `recovering_bank()` takes the pre-seal convention at face value and answers
+    // `BankId::A` regardless of which bank is really sealed, and `has_sealed()` then exempts
+    // the state from `SingleAuthority` entirely — so a legitimately-sealed bank B's record
+    // could be ignored in favor of a stale bank A, with the one guarantee built to catch
+    // exactly that never even consulted.
+    let observed = Observation {
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            false,
+            BankId::B,
+        )],
+        banks: [Bank::Erased, Bank::Sealed(1)],
+        sealed_once: false,
+        next_id: Some(1),
+        ..Observation::default()
+    };
+    let error = Journal::reconstructed(&observed)
+        .expect_err("a bank cannot be durably sealed on a device that has never sealed one");
+    assert!(
+        error.to_string().contains("sealed_once is false"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot() {
     // Codex, PR #135's next round: `durable_intent`'s "moot" exemption for a dispatch from a
     // retired bank compared `bank_of(intent) != recovering_bank()`, and `bank_of` answers

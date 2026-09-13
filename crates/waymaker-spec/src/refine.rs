@@ -203,6 +203,15 @@ impl Journal {
                 }
             }
         }
+        if !observation.sealed_once {
+            if let Some((bank, _)) = BankId::ALL
+                .into_iter()
+                .zip(observation.banks)
+                .find(|(_, state)| state.authoritative_generation().is_some())
+            {
+                return Err(Impossible::SealedBeforeAnyHistoryOfSealing { bank });
+            }
+        }
         Ok(Self::from_parts(
             records,
             observation.dispatched.clone(),
@@ -236,6 +245,22 @@ pub enum Impossible {
         /// The id declared more than once.
         record: RecordId,
     },
+    /// A bank is durably [`Bank::Sealed`], but the device has never sealed anything.
+    ///
+    /// The only place a bank becomes [`Bank::Sealed`] is the model's own `commit_seal`, which
+    /// sets `sealed_once` true in the same step — so a currently-sealed bank is itself proof
+    /// that some seal has happened, and a caller reporting `sealed_once: false` beside one is
+    /// describing two different devices at once. Left unchecked, [`Journal::recovering_bank`]
+    /// takes the pre-seal convention at face value and answers
+    /// [`BankId::A`] regardless of which bank the observation actually
+    /// shows sealed, and [`Journal::has_sealed`] then exempts the state from
+    /// [`crate::invariant::Invariant::SingleAuthority`] entirely — so a reconstructed state
+    /// could recover a stale bank's records while the truly sealed bank's are ignored, with the
+    /// one guarantee that would catch it never even consulted.
+    SealedBeforeAnyHistoryOfSealing {
+        /// The bank the observation reports as sealed.
+        bank: BankId,
+    },
 }
 
 impl core::fmt::Display for Impossible {
@@ -261,6 +286,11 @@ impl core::fmt::Display for Impossible {
                 formatter,
                 "record {} is named twice, and this crate's id scheme never reuses one",
                 record.0
+            ),
+            Self::SealedBeforeAnyHistoryOfSealing { bank } => write!(
+                formatter,
+                "{bank:?} is sealed, but sealed_once is false, and a bank cannot be durably \
+                 sealed on a device that has never sealed one"
             ),
         }
     }
