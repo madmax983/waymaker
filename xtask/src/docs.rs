@@ -5701,6 +5701,20 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_whose_item_opens_with_an_unterminated_comment() {
+        // Codex, pull request #138, round 21: `- <div>\n  <!--` opens the item with raw
+        // HTML whose comment then outlives that `HtmlBlock` across a blank line, so the
+        // loose paragraph that follows inside the very same item — `Status: accepted`
+        // — is `Event::Text` with `collecting` already true. Checking only
+        // `collecting`, not `hidden`, let the hidden value through despite the round-20
+        // fix correctly marking it hidden. The comment closes as plain prose (its own
+        // round-21 finding) between the two items so the real one stays reachable.
+        let contents =
+            "# ADR\n\n- <div>\n  <!--\n\n  Status: accepted\n\n-->\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -6210,6 +6224,63 @@ mod tests {
             violations.iter().any(|v| v.subject == third.id),
             "content after an unterminated comment that outlived its block still counted: \
              {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_comment_closed_as_plain_prose_still_counts() {
+        // Codex, pull request #138, round 21: once a comment has outlived its own
+        // `HtmlBlock` across a blank line, its closing `-->` is no longer structural at
+        // all — `pulldown-cmark` emits it as an ordinary paragraph's `Event::Text`, not
+        // `Event::Html` — so only a text-scanning check can see it and clear
+        // `in_html_comment`. Without one, a real decision after the close would stay
+        // hidden for the rest of the document.
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n-->\n\n{} {}\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fourth.id),
+            "a decision after a comment closed as plain prose was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_suffix_after_a_same_line_comment_close_still_counts() {
+        // Codex, pull request #138, round 21: a later `Event::Html` line can both close
+        // an open comment and carry real, visible text after the close on the very same
+        // line — `-->decision-id headline</div>`. Passing the blanket `hidden` (still
+        // true from before the close) into the text-scanning helper for that one event
+        // would suppress the suffix along with the comment; only fence/blockquote
+        // containment is passed instead, so the helper's own close-then-resume logic
+        // decides the rest.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- open\n-->{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after a same-line comment close was still hidden: {violations:?}"
         );
     }
 

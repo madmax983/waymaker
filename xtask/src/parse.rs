@@ -959,7 +959,17 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         // separate from the comment, but still inside it by real HTML rules, until an
         // actual `-->` appears. Without this, a decoy placed after the blank line reads as
         // ordinary visible prose.
-        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
+        //
+        // Kept apart from the container half (Codex, pull request #138, round 21): a
+        // comment closing *within* one `Event::Html` or `Event::Text` leaves a visible
+        // suffix in that same event — `-->decision-id` — and passing the blanket `hidden`
+        // (which is still true from before the close) into the text-scanning helper for
+        // that event would suppress the suffix along with the comment. Only fence and
+        // blockquote containment says nothing about *this* event's own text, so only that
+        // half is passed to the helper; the full `hidden` still gates every event that has
+        // no text of its own to scan for a close, such as a heading or item marker.
+        let container_hidden = in_fence || blockquote_depth > 0;
+        let hidden = container_hidden || in_html_comment;
         match event {
             Event::Start(Tag::List(kind)) => {
                 ordered_lists.push(kind.is_some());
@@ -1008,10 +1018,23 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     out.push('`');
                 }
             }
-            Event::Text(text) => {
-                if !hidden {
-                    out.push_str(&text);
-                }
+            // Routed through the same comment-aware scan as `Event::Html` (Codex, pull
+            // request #138, round 21): once a comment has outlived its own `HtmlBlock`
+            // across a blank line, its closing `-->` is no longer structural at all —
+            // `pulldown-cmark` emits it as ordinary paragraph text — so only a
+            // text-scanning check can see it and clear `in_html_comment`. A plain
+            // `if !hidden` here would never notice the close and would leave every
+            // later event hidden for the rest of the document.
+            //
+            //
+            // Skipped entirely inside a fence: fenced content is opaque literal text —
+            // `some markup looks like <!-- this` inside a fenced example is characters,
+            // not a comment — and scanning it would let that literal `<!--` open a real
+            // comment state that then swallows everything after the fence closes. Fenced
+            // text is already excluded from `out` regardless, since `hidden` includes
+            // `in_fence`.
+            Event::Text(text) if !in_fence => {
+                append_visible_html_line(&text, container_hidden, &mut in_html_comment, &mut out);
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 if !hidden {
@@ -1054,7 +1077,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                 out.push('\n');
             }
             Event::Html(html) => {
-                append_visible_html_line(&html, hidden, &mut in_html_comment, &mut out);
+                append_visible_html_line(&html, container_hidden, &mut in_html_comment, &mut out);
             }
             Event::InlineHtml(html) if !hidden && !html.starts_with("<!--") => {
                 out.push_str(&html);
@@ -1338,8 +1361,41 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     }
                 }
             }
-            Event::Text(text) if collecting => item.push_str(&text),
-            Event::Code(code) if collecting => {
+            // Routed through the comment-aware scan unconditionally, not only while
+            // `collecting` (Codex, pull request #138, round 21, second finding): once a
+            // comment has outlived its own `HtmlBlock` across a blank line, its closing
+            // `-->` is no longer structural at all — emitted as ordinary text — and if
+            // that text falls outside the item being collected (as it typically does,
+            // sitting between two items or after the list), skipping `Event::Text`
+            // whenever `!collecting` would mean `in_html_comment` is never cleared and
+            // every later item stays hidden for good. `container_hidden` rather than
+            // `hidden` is passed for the reason `markdown_prose` passes it to the same
+            // helper: a close and a visible suffix can land in the same event. Writing
+            // into a fresh, per-call buffer and only then copying it into `item` (rather
+            // than disqualifying the item outright, as a nested fence or blockquote
+            // does) stays safe the way it did not in round 15: the whole value is one
+            // Text event with nothing already collected before it, so a hidden value
+            // simply leaves `item` empty rather than leaving a prefix that trivially
+            // matches.
+            // Skipped entirely inside a fence, for `markdown_prose`'s reason: fenced
+            // content is opaque literal text, so a literal `<!--` inside a fenced
+            // example must not be scanned as a real comment opener — doing so would
+            // set `in_html_comment` from characters that mean nothing and hide every
+            // later item for good, whether or not this one was being collected.
+            Event::Text(text) if !in_fence => {
+                let container_hidden = in_fence || blockquote_depth > 0;
+                let mut visible = String::new();
+                append_visible_html_line(
+                    &text,
+                    container_hidden,
+                    &mut in_html_comment,
+                    &mut visible,
+                );
+                if collecting {
+                    item.push_str(&visible);
+                }
+            }
+            Event::Code(code) if collecting && !hidden => {
                 item.push('`');
                 item.push_str(&code);
                 item.push('`');
