@@ -222,7 +222,21 @@ fn durable_intent(state: &Journal, recovered: &[RecordId]) -> Option<String> {
         // only became possible because nothing here refuses one from an already-retired bank,
         // makes no difference to the run recovery now boots into — that run never had this
         // effect in its own history either way.
-        if state.bank_of(*intent) != state.recovering_bank() {
+        //
+        // `is_some_and` rather than a bare `!=`: `bank_of` answers `None` when `intent` names
+        // no record at all, which is not "some other bank" — it is the sharpest shape of
+        // breach this guarantee exists to catch. `refine::abstraction`'s `dispatched`
+        // parameter is documented to report exactly that ("an effect that reached the world"
+        // independent of what the ledger holds), precisely so a run whose effect left no
+        // schedule record on media anywhere can be described and judged. A bare `!=` treated
+        // `None != Some(bank)` the same as a retired-bank mismatch and exempted it too, so
+        // `check(state, &[])` accepted a state whose dispatched effect had no recoverable
+        // schedule at all. Codex found it on review of the pull request that closed issue
+        // #67's bank dimension.
+        if state
+            .bank_of(*intent)
+            .is_some_and(|bank| Some(bank) != state.recovering_bank())
+        {
             continue;
         }
         if !recovered.contains(intent) {

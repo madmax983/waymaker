@@ -792,6 +792,48 @@ fn reconstruction_refuses_the_same_id_declared_in_two_banks() {
 }
 
 #[test]
+fn a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot() {
+    // Codex, PR #135's next round: `durable_intent`'s "moot" exemption for a dispatch from a
+    // retired bank compared `bank_of(intent) != recovering_bank()`, and `bank_of` answers
+    // `None` when `intent` names no record at all — not only when it names one in the wrong
+    // bank. `None != Some(bank)` took the same branch as a real retired-bank mismatch, so a
+    // dispatched effect with *no* schedule record anywhere was silently exempted instead of
+    // breaching. `refine::abstraction`'s `dispatched` parameter is documented to report
+    // exactly this shape — "an effect that reached the world" independent of the ledger — so
+    // the model has to be able to judge it: a run whose effect left no record on media at all
+    // is the sharpest violation of "no dispatched effect lacks a recoverable schedule record".
+    let observed = Observation {
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            false,
+            BankId::A,
+        )],
+        dispatched: vec![RecordId(1)],
+        next_id: Some(2),
+        ..Observation::default()
+    };
+    let state = Journal::reconstructed(&observed).expect("a real state is never impossible");
+    assert_eq!(
+        state.bank_of(RecordId(1)),
+        None,
+        "record 1 was never declared"
+    );
+    let recovered = vec![RecordId(0)];
+    let breach = waymaker_spec::invariant::holds(
+        waymaker_spec::invariant::Invariant::DurableIntent,
+        &state,
+        &recovered,
+    )
+    .expect_err("an effect dispatched with no record at all is a durable-intent breach");
+    assert!(
+        breach.detail.contains("no record 1 to account for it"),
+        "{breach}"
+    );
+}
+
+#[test]
 fn no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave() {
     // Codex, PR #135 round 6: nothing stops `REFINEMENT`'s exploration reaching a state whose
     // first-ever seal lands on bank B while records already sit in A — `Observation` carries
