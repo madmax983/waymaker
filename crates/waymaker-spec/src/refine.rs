@@ -25,7 +25,8 @@
 //! `[Bank::Erased; BANKS]` and `false` into [`Journal::reconstructed`], matching this crate's
 //! behaviour before this issue.
 
-use waymaker_fault::{Durability, Injection, Ledger, Progress, RecordId, Run};
+use waymaker_fault::{Durability, Interruption, Ledger, Op, Progress, RecordId, Run};
+use waymaker_flash::storage::Geometry;
 
 use crate::model::{BANKS, Bank, Journal, OnMedia, Record, Role};
 
@@ -211,10 +212,16 @@ pub fn abstraction(
 
 /// Whether the call recorded at `run.ops()[op]` changed any cell of media at all.
 ///
-/// `false` when `op` is past the end of `run.ops()` — the call was never issued — or when it
-/// is the one [`Run::injection`] names at [`Progress::None`] or at a zero [`Progress::Bytes`],
-/// which that type's own documentation calls the same world as `None`: a hand-built zero, the
-/// only route to one, since the enumerated crash points never produce it.
+/// `false` when `op` is past the end of `run.ops()` — the call was never issued; when
+/// [`Run::injection`] names it at [`Progress::None`] or at a zero [`Progress::Bytes`], which
+/// that type's own documentation calls the same world as `None`; or when it is an
+/// [`Op::Erase`] and `geometry`'s erase block is wider than the bytes [`Run::injection`] says
+/// landed — a partial erase block is not a landed one, because
+/// `waymaker_fault::Session::erase_blocks_of` rounds it down to zero cells changed. `geometry`
+/// is the one this run's device was built with; the enumerated crash points never produce a
+/// value that needs it, since an erase only ever tears at a whole block boundary, but a
+/// hand-built [`Run`] from `Harness::run_one` can name a byte offset the enumeration would
+/// not.
 ///
 /// # Why this and not "did the call return `Ok`"
 ///
@@ -226,14 +233,29 @@ pub fn abstraction(
 /// module trying to infer "committed" from [`Run::injection`] alone, which cannot see a
 /// watchdog's rounding.
 #[must_use]
-pub fn call_touched(run: &Run, op: usize) -> bool {
-    if op >= run.ops().len() {
+pub fn call_touched(run: &Run, op: usize, geometry: Geometry) -> bool {
+    let Some(injection) = run.injection().filter(|injection| injection.op == op) else {
+        return op < run.ops().len();
+    };
+    let bytes = match injection.progress {
+        Progress::None => return false,
+        Progress::Bytes(bytes) => bytes,
+        Progress::Whole => return true,
+    };
+    if bytes == 0 {
         return false;
     }
-    !matches!(
-        run.injection(),
-        Some(Injection { op: at, progress: Progress::None | Progress::Bytes(0), .. }) if at == op
-    )
+    // A watchdog reset finishes the block in flight — rounds up, never down — so only the
+    // other two causes can land fewer bytes than `Progress::Bytes` names.
+    if injection.interruption == Interruption::Watchdog {
+        return true;
+    }
+    if matches!(run.ops().get(op), Some(Op::Erase { .. })) {
+        let block = geometry.erase_size();
+        bytes & !block.wrapping_sub(1) != 0
+    } else {
+        true
+    }
 }
 
 /// The bank state after the erase recorded at `run.ops()[op]`, given `prior`.
@@ -243,11 +265,17 @@ pub fn call_touched(run: &Run, op: usize) -> bool {
 /// run's answer for an erase never issued, since `op` is then past the end of `run.ops()`.
 ///
 /// `erased` is the caller's own read of the bank after the run: whether the region is, in
-/// fact, fully erased. This module does not read bytes, for the reason [`call_touched`]
-/// gives.
+/// fact, fully erased. `geometry` is [`call_touched`]'s. This module does not read bytes, for
+/// the reason [`call_touched`] gives.
 #[must_use]
-pub fn bank_after_erase(prior: Bank, run: &Run, op: usize, erased: bool) -> Bank {
-    if !call_touched(run, op) {
+pub fn bank_after_erase(
+    prior: Bank,
+    run: &Run,
+    op: usize,
+    geometry: Geometry,
+    erased: bool,
+) -> Bank {
+    if !call_touched(run, op, geometry) {
         return prior;
     }
     if erased { Bank::Erased } else { Bank::Erasing }
@@ -259,8 +287,9 @@ pub fn bank_after_erase(prior: Bank, run: &Run, op: usize, erased: bool) -> Bank
 /// touched media without that, and `prior` unchanged if it never touched media at all.
 ///
 /// `sealed` is the caller's own read of the bank after the run: whether its header and seal
-/// decode together at `generation` — see `waymaker_flash::bank::sealed_generation`. This
-/// module does not read bytes, for the reason [`call_touched`] gives.
+/// decode together at `generation` — see `waymaker_flash::bank::sealed_generation`.
+/// `geometry` is [`call_touched`]'s. This module does not read bytes, for the reason
+/// [`call_touched`] gives.
 ///
 /// # `generation` is the model's number, not `waymaker_flash::bank::Generation`'s
 ///
@@ -272,13 +301,74 @@ pub fn bank_after_erase(prior: Bank, run: &Run, op: usize, erased: bool) -> Bank
 /// two schemes agree from there: both increment by one per seal, so the shift is exact at
 /// every later generation too.
 #[must_use]
-pub fn bank_after_seal(prior: Bank, run: &Run, op: usize, generation: u32, sealed: bool) -> Bank {
-    if !call_touched(run, op) {
+pub fn bank_after_seal(
+    prior: Bank,
+    run: &Run,
+    op: usize,
+    geometry: Geometry,
+    generation: u32,
+    sealed: bool,
+) -> Bank {
+    if !call_touched(run, op, geometry) {
         return prior;
     }
     if sealed {
         Bank::Sealed(generation)
     } else {
         Bank::Sealing(generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use waymaker_fault::{Harness, Injection, Interruption, Session};
+    use waymaker_flash::storage::StableStorage;
+
+    use super::*;
+
+    /// Two 32-byte erase blocks, so a hand-built injection can land short of one.
+    fn geometry() -> Geometry {
+        Geometry::new(64, 32, 4, 1).expect("64 is two whole 32-byte blocks of 4-byte units")
+    }
+
+    /// A hand-built injection is the only route to a byte offset the enumerated crash points
+    /// never produce for an erase — see [`call_touched`]'s docs.
+    fn run_one_erase(progress: Progress) -> Run {
+        let injection = Injection {
+            op: 0,
+            progress,
+            interruption: Interruption::PowerLoss,
+        };
+        Harness::new(geometry())
+            .run_one(injection, |session: &mut Session| session.erase(0, 32))
+            .expect("the injection fires on the one erase this writer issues")
+    }
+
+    #[test]
+    fn less_than_one_erase_block_is_not_touched() {
+        // `Session::erase_blocks_of` rounds a partial-block landing down to zero, so this
+        // never changed a cell of media even though `Progress::Bytes(1)` is not zero.
+        let run = run_one_erase(Progress::Bytes(1));
+        assert!(!call_touched(&run, 0, geometry()));
+    }
+
+    #[test]
+    fn a_whole_erase_block_is_touched() {
+        let run = run_one_erase(Progress::Bytes(32));
+        assert!(call_touched(&run, 0, geometry()));
+    }
+
+    #[test]
+    fn a_watchdog_reset_never_rounds_an_erase_down() {
+        // The one cause that rounds up rather than down: the block in flight finishes.
+        let injection = Injection {
+            op: 0,
+            progress: Progress::Bytes(1),
+            interruption: Interruption::Watchdog,
+        };
+        let run = Harness::new(geometry())
+            .run_one(injection, |session: &mut Session| session.erase(0, 32))
+            .expect("the injection fires on the one erase this writer issues");
+        assert!(call_touched(&run, 0, geometry()));
     }
 }

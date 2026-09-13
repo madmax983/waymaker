@@ -818,7 +818,7 @@ fn is_erased(image: &[u8], id: FlashBankId) -> bool {
 /// tell one from the other — a build with the two branches of `bank_after_erase` swapped
 /// passes both unchanged. This is the check that actually pins the branch.
 fn assert_erase_matches_ground_truth(run: &Run, op: usize, bank: Bank, erased: bool) {
-    if !call_touched(run, op) {
+    if !call_touched(run, op, bank_geometry()) {
         return;
     }
     assert_eq!(
@@ -834,7 +834,7 @@ fn assert_erase_matches_ground_truth(run: &Run, op: usize, bank: Bank, erased: b
 /// [`assert_erase_matches_ground_truth`] for why this, and not the checks below, is what
 /// pins [`Bank::Sealed`] against [`Bank::Sealing`].
 fn assert_seal_matches_ground_truth(run: &Run, op: usize, bank: Bank, sealed: bool) {
-    if !call_touched(run, op) {
+    if !call_touched(run, op, bank_geometry()) {
         return;
     }
     assert_eq!(
@@ -862,6 +862,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
         ground_prior(run.image(), FlashBankId::B, Bank::Erased),
         run,
         OP_SEAL_B_STALE,
+        bank_geometry(),
         model_generation(STALE),
         stale_sealed,
     );
@@ -873,6 +874,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
         ground_prior(run.image(), FlashBankId::A, Bank::Erased),
         run,
         OP_SEAL_A_CURRENT,
+        bank_geometry(),
         model_generation(CURRENT),
         current_sealed,
     );
@@ -880,7 +882,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
     sealed_once |= matches!(a_seal, Bank::Sealed(_));
 
     let erased = is_erased(run.image(), FlashBankId::B);
-    b = bank_after_erase(b, run, OP_ERASE_B, erased);
+    b = bank_after_erase(b, run, OP_ERASE_B, bank_geometry(), erased);
     assert_erase_matches_ground_truth(run, OP_ERASE_B, b, erased);
 
     let new_sealed = decodes_sealed_at(run.image(), FlashBankId::B, NEW);
@@ -888,6 +890,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
         ground_prior(run.image(), FlashBankId::B, b),
         run,
         OP_SEAL_B_NEW,
+        bank_geometry(),
         model_generation(NEW),
         new_sealed,
     );
