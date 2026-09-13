@@ -469,9 +469,53 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
     let file = parse_rust(contents)?;
     let mut aliases = Vec::new();
     collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    // `type R = super::Recovery;` binds a local name to a path exactly the way
+    // `use super::Recovery as R;` does, and `impl Clone for R` is an impl for the type
+    // the alias names — so a plain-path type alias is collected into the same table a
+    // `use` alias is, and every resolution below chases it exactly the same way.
+    collect_type_aliases(&file.items, &mut aliases);
     let mut implementors = Vec::new();
     collect_trait_implementors(&file.items, &aliases, trait_name, &mut implementors);
     Ok(implementors)
+}
+
+/// Every `type NAME = TARGET;` declaration in `items` whose `TARGET` is a plain path,
+/// file scope and inline modules alike, appended to `aliases` in the same shape
+/// [`collect_item_aliases`] collects a `use` binding in.
+///
+/// Found by Codex review of this change (PR #143), round 13: a self-type read straight
+/// off the `impl` block, with no alias resolution at all, missed `impl Clone for R` where
+/// `R` is a local alias of the real type — the same shape of miss `every_resolution`
+/// already closes for a derive path and a handwritten impl's *trait* name, just on the
+/// other side of the `impl`.
+fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Type(type_item) => {
+                if let syn::Type::Path(target) = type_item.ty.as_ref() {
+                    aliases.push(UseAlias {
+                        local: type_item.ident.unraw().to_string(),
+                        // `.unraw()`: see `resolve_segments`.
+                        target: target
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.unraw().to_string())
+                            .collect(),
+                    });
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    collect_type_aliases(nested, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_trait_implementors(
@@ -487,14 +531,24 @@ fn collect_trait_implementors(
         match item {
             syn::Item::Impl(implementation) => {
                 if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
-                    let resolved = resolve_segments(trait_path, aliases);
-                    if resolved.last().is_some_and(|last| last == trait_name) {
+                    // `every_resolution`, not `resolve_segments`: a handwritten impl's
+                    // trait name can be aliased through the same chains and cfg-gated
+                    // duplicates a derive path can (round 13's second finding), and an
+                    // `UNRESOLVED_DERIVE` here is treated as a match — this scan cannot
+                    // rule out that the alias it gave up chasing is the trait being
+                    // searched for.
+                    let resolved_trait = every_resolution(trait_path, aliases);
+                    let names_trait = resolved_trait
+                        .iter()
+                        .any(|name| name == trait_name || name == UNRESOLVED_DERIVE);
+                    if names_trait {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
-                            if let Some(name) = self_type.path.segments.last() {
-                                // `.unraw()`: `impl Clone for r#Recovery` names the same
-                                // struct a plain `Recovery` would.
-                                implementors.push(name.ident.unraw().to_string());
-                            }
+                            // `every_resolution` again: the self-type can be a local
+                            // type alias (round 13's first finding), and an
+                            // `UNRESOLVED_DERIVE` here is pushed through unchanged so
+                            // the caller can fail closed on it the same way
+                            // `struct_derives`'s caller already does.
+                            implementors.extend(every_resolution(&self_type.path, aliases));
                         }
                     }
                 }

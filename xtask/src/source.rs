@@ -1999,9 +1999,13 @@ fn recovery_reachable_file_is_clone_free(path: &str, contents: &str) -> Option<V
         }
     }
     // Every file the tree reaches is read for a handwritten `impl`, the root included:
-    // `trait_implementors` resolves an implementor by its type's own last path segment,
-    // so `impl Clone for super::Recovery` in a child module is caught here the same way
-    // `impl Clone for Recovery` in the root file is.
+    // `trait_implementors` resolves both the trait name and the self-type through every
+    // alias it can chase — including a local `type` alias on the self-type side, since
+    // round 13 found both a trait alias (`use Clone as C; use self::C as Klon; impl Klon
+    // for ..`) and a type alias (`type R = super::Recovery; impl Clone for R`) that a
+    // single-hop, unaliased read of either side would miss — so `impl Clone for
+    // super::Recovery` in a child module, however it spells either name, is caught here
+    // the same way `impl Clone for Recovery` in the root file is.
     let handwritten = match crate::parse::trait_implementors(contents, "Clone") {
         Ok(implementors) => implementors,
         Err(error) => {
@@ -2015,6 +2019,20 @@ fn recovery_reachable_file_is_clone_free(path: &str, contents: &str) -> Option<V
             ));
         }
     };
+    if handwritten
+        .iter()
+        .any(|implementor| implementor == crate::parse::UNRESOLVED_DERIVE)
+    {
+        return Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{path} implements a trait, or names a self-type, through an alias this \
+                 scan could not fully resolve, so whether it implements `Clone` for \
+                 `{RECOVERY_TYPE}` cannot be ruled out"
+            ),
+        ));
+    }
     if handwritten
         .iter()
         .any(|implementor| implementor == RECOVERY_TYPE)
@@ -10857,6 +10875,76 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_local_type_alias_of_recovery_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 13: a child module can
+        // write `type R = super::Recovery; impl Clone for R { .. }`, and the first
+        // version of the handwritten-impl scan read the self-type's own last path
+        // segment with no alias resolution at all, so it recorded `R` — never equal to
+        // `Recovery` — and missed the impl entirely.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type R = super::Recovery;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_chained_trait_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 13: a child module can
+        // write `use core::clone::Clone as C; use self::C as Klon; impl Klon for
+        // super::Recovery { .. }`, and the first version of the handwritten-impl scan
+        // resolved the trait path only once (`resolve_segments`, not the multi-hop
+        // `every_resolution` the derive scan already uses), so it followed `Klon` to
+        // `self::C` and stopped there — never reaching `Clone` — and missed the impl.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "use self::C as Klon;\n",
+                "impl Klon for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
             "{}",
             violations[0].detail
         );
