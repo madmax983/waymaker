@@ -57,7 +57,7 @@
 //! ceiling, never compared between the two machines: different cores compile the same source
 //! into different instructions, so a different byte count is expected rather than a finding.
 //! See
-//! [ADR 0041](https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
+//! [ADR 0042](https://github.com/madmax983/waymaker/blob/main/docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -416,7 +416,7 @@ impl Report {
              hardware table stays `Not run`. See ADR 0040.\n\n\
              Stack is the whole image's own call-chain depth on this run, not the engine's share of it,\n\
              and the two machines are not required to agree: different cores compile the same source\n\
-             into different instructions. See ADR 0041.\n",
+             into different instructions. See ADR 0042.\n",
         );
         out
     }
@@ -682,7 +682,7 @@ pub const STACK_MODULE: &str = "crates/waymaker-emu/src/stack.rs";
 ///
 /// The reset vector and the semihosting exit are macro expansions; this is the third
 /// exception and the last, and it is hand-written rather than expanded, so it is pinned by
-/// name instead of being invisible to this scan the way a macro's own `unsafe` is. ADR 0041
+/// name instead of being invisible to this scan the way a macro's own `unsafe` is. ADR 0042
 /// is the reason either function needs it at all: a raw fill and a raw read, over the region
 /// between the linker's `_stack_end` and a stack-pointer reading taken before either runs.
 ///
@@ -880,10 +880,10 @@ const STACK_FLOOR_SYMBOL: &str = "_stack_end";
 /// permitted name.
 ///
 /// Named so `crate::stack::clamp_to_stack_region` can hold a caller's reading inside memory
-/// this image actually owns, whatever the reading says — [ADR 0041]'s soundness fix for
+/// this image actually owns, whatever the reading says — [ADR 0042]'s soundness fix for
 /// `paint` and `high_water_mark` being safe `pub fn`s over a caller-supplied bound.
 ///
-/// [ADR 0041]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+/// [ADR 0042]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 const STACK_CEILING_SYMBOL: &str = "_stack_start";
 
 /// Every place [`PERMITTED_UNSAFE_FUNCTIONS`] and the one linker-symbol block permit `unsafe`
@@ -1714,7 +1714,7 @@ mod tests {
     #[test]
     fn the_real_stack_module_passes() {
         // The literal shipped file, read at compile time — not a stand-in for its shape.
-        // ADR 0041's own claim: the linker-symbol block, and `unsafe` confined to the two
+        // ADR 0042's own claim: the linker-symbol block, and `unsafe` confined to the two
         // functions `PERMITTED_UNSAFE_FUNCTIONS` names — nothing this rule should catch.
         assert_eq!(
             check(&tests_support::sources_with_stack_module(

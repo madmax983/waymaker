@@ -37,7 +37,7 @@ cortex-m-semihosting = { version = "0.5.0", optional = true }
 # `register::msp::read` — the real stack pointer, so `stack::paint` and
 # `stack::high_water_mark` measure from where the core actually is rather than from where a
 # compiler happened to place a local. Already in the dependency graph through `cortex-m-rt`;
-# this names it directly rather than reaching for a transitive crate. ADR 0041.
+# this names it directly rather than reaching for a transitive crate. ADR 0042.
 cortex-m = { version = "0.7.9", optional = true }
 
 [features]

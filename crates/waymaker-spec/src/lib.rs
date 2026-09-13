@@ -62,4 +62,6 @@ pub use model::{
 };
 pub use obligation::{CLAUSES, Clause, Discharge, clause};
 pub use reader::{Mutant, Reader, Specified};
-pub use refine::{Impossible, Observation, abstraction};
+pub use refine::{
+    Impossible, Observation, abstraction, bank_after_erase, bank_after_seal, call_touched,
+};

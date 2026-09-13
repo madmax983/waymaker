@@ -1,4 +1,4 @@
-# ADR 0041: the emulator paints the stack, and reports a high-water mark
+# ADR 0042: the emulator paints the stack, and reports a high-water mark
 
 - Status: accepted
 - Date: 2026-09-13

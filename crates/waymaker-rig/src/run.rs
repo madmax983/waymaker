@@ -35,10 +35,10 @@
 //! [`Rig::iterate`] through the crash injector, which interrupts every byte of every program
 //! and every block of every erase, exhaustively rather than at random.
 
-use waymaker_core::RecordRef;
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation, LayoutError};
-use waymaker_flash::frame::ProgramAlign;
+use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
@@ -60,6 +60,17 @@ pub enum RigError<E, D = core::convert::Infallible> {
     Window(WindowError),
     /// The engine area cannot hold §10's two banks.
     Layout(LayoutError),
+    /// The bank's journal is too small for the run.
+    ///
+    /// The check prices every payload at [`Workload::MAX_PAYLOAD_BYTES`], the largest a
+    /// payload can be. So this bank could not hold the run in any iteration of the plan.
+    /// See [`Rig::new`].
+    BankTooSmall {
+        /// How many journal bytes the run needs, in the worst case.
+        needed: u32,
+        /// How many the bank's journal holds.
+        capacity: u32,
+    },
     /// The instrument area cannot hold a witness.
     Witness(WitnessError<E>),
     /// The journal region is not one this geometry permits.
@@ -219,6 +230,71 @@ impl Rig {
         per_effect.checked_add(4)
     }
 
+    /// Journal bytes a clean run of `effects` effects needs, in the worst case.
+    ///
+    /// `RunStarted`, `EffectCompleted` and `RunCompleted` each carry a payload of one to
+    /// [`Workload::MAX_PAYLOAD_BYTES`] bytes. Any iteration may reach the top of that range.
+    /// So this prices each one at the top of the range, with a real [`RecordRef`] through
+    /// [`frame::encoded_len`] — not a second copy of that sum.
+    ///
+    /// A schedule record has one fixed size. It is priced once, the same way.
+    ///
+    /// Saturates rather than returning `None` on overflow, unlike
+    /// [`marks_per_run`](Self::marks_per_run): a saturated sum still exceeds any real bank's
+    /// capacity, so `new` still refuses it. No later caller needs a distinct "too many
+    /// effects" reason for this figure the way [`marks_per_run`] gives one.
+    fn worst_case_journal_bytes(effects: u16, align: ProgramAlign) -> u32 {
+        let widest = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let start = record_bytes(
+            &RecordRef::RunStarted {
+                workflow_kind: 0,
+                workflow_version: 0,
+                input: &widest,
+            },
+            align,
+        );
+        let schedule = record_bytes(
+            &RecordRef::EffectScheduled {
+                seq: EffectSeq(0),
+                kind: ActivityKind(1),
+                input_len: 0,
+                input_crc: 0,
+            },
+            align,
+        );
+        let completion = record_bytes(
+            &RecordRef::EffectCompleted {
+                seq: EffectSeq(0),
+                result: &widest,
+            },
+            align,
+        );
+        let finish = record_bytes(&RecordRef::RunCompleted { result: &widest }, align);
+
+        let per_effect = schedule.saturating_add(completion);
+        let scheduled = per_effect.saturating_mul(u32::from(effects));
+        start.saturating_add(scheduled).saturating_add(finish)
+    }
+
+    /// How many journal bytes this bank has, once its header holds the widest
+    /// `RunStarted` input it can be asked for.
+    ///
+    /// Returns `0` when that header leaves no journal room at all.
+    /// [`worst_case_journal_bytes`](Self::worst_case_journal_bytes) is then always larger, so
+    /// the bank is refused: it has no room for any run.
+    fn worst_case_journal_capacity(layout: BankLayout) -> u32 {
+        let widest = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let header = BankHeader {
+            run: RunId(0),
+            align: layout.align(),
+            workflow_kind: 0,
+            workflow_version: 0,
+            input_schema: 0,
+            input: &widest,
+        };
+        JournalRegion::of(layout, Self::BANK, &header).map_or(0, JournalRegion::bytes)
+    }
+
     /// How many torn slots the instrument reserves past a clean run's marks.
     ///
     /// A reset inside a mark's program leaves a slot that is neither erased nor a mark. A
@@ -267,9 +343,10 @@ impl Rig {
     /// # Errors
     ///
     /// [`RigError::Window`] when the part cannot be split, [`RigError::Layout`] when the
-    /// engine area cannot hold §10's two banks, [`RigError::Witness`] when the instrument
-    /// area cannot hold a mark, and [`RigError::Geometry`] when either area is not a
-    /// geometry.
+    /// engine area cannot hold §10's two banks, [`RigError::BankTooSmall`] when the bank
+    /// cannot hold `effects` effects at their worst-case width,
+    /// [`RigError::Witness`] when the instrument area cannot hold a mark, and
+    /// [`RigError::Geometry`] when either area is not a geometry.
     pub fn new<E>(part: Geometry, plan: Plan, effects: u16) -> Result<Self, RigError<E>> {
         // Before any layout arithmetic: a seal and a witness slot are both sized in program
         // units, and this rig's buffers are fixed. Refused here so that a caller learns it
@@ -308,6 +385,20 @@ impl Rig {
         )
         .map_err(RigError::Geometry)?;
         let layout = BankLayout::new(engine).map_err(RigError::Layout)?;
+
+        // Checked before the witness. A bank too small for the run is an engine-area fault,
+        // not an instrument fault. Named `journal_*` rather than `needed`/`capacity` so a
+        // reader does not read this as the witness check a few lines below, which needs
+        // different numbers for a different reason.
+        let journal_capacity = Self::worst_case_journal_capacity(layout);
+        let journal_needed = Self::worst_case_journal_bytes(effects, layout.align());
+        if journal_needed > journal_capacity {
+            return Err(RigError::BankTooSmall {
+                needed: journal_needed,
+                capacity: journal_capacity,
+            });
+        }
+
         let witness = WitnessRegion::of(instrument, 0, witness_bytes)
             .map_err(|error| RigError::Witness(promote(error)))?;
         // `WitnessRegion::of` checks that *one* mark fits. A clean run writes rather more, and
@@ -978,6 +1069,13 @@ impl Rig {
     }
 
     /// Erases the instrument area, as the rig's own traffic, and waits for it.
+    ///
+    /// # Errors
+    ///
+    /// [`RigError::Storage`] when the driver refuses the erase or the barrier.
+    /// [`instrument`](Self::instrument) already checked the window, so a window error cannot
+    /// happen here. [`unwindow`] still reports a real driver failure as `RigError::Storage`,
+    /// not as `RigError::Witness`.
     fn erase_instrument<S: StableStorage>(
         &self,
         part: &mut Metered<'_, S>,
@@ -991,7 +1089,7 @@ impl Rig {
                 .and_then(|()| instrument.barrier())
         };
         part.set_traffic(Traffic::Engine);
-        outcome.map_err(|_| RigError::Witness(WitnessError::Region))
+        outcome.map_err(unwindow)
     }
 
     /// The witness as the reset left it, positioned to append, and what it claims.
@@ -1330,6 +1428,18 @@ const fn effect_of(role: Role) -> Option<u16> {
     }
 }
 
+/// [`frame::encoded_len`] of `record`, saturating to [`u32::MAX`] instead of failing.
+///
+/// Every record [`Rig::worst_case_journal_bytes`] builds is short enough to encode. The
+/// saturation covers the one case that cannot happen here, so this function always returns
+/// a value.
+fn record_bytes(record: &RecordRef<'_>, align: ProgramAlign) -> u32 {
+    frame::encoded_len(record, align)
+        .ok()
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .unwrap_or(u32::MAX)
+}
+
 /// How many bytes the engine area of `layout` spans.
 ///
 /// `BankLayout` reports a bank's size rather than the window's, and the window is the geometry
@@ -1354,6 +1464,7 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
     match error {
         RigError::Window(inner) => RigError::Window(inner),
         RigError::Layout(inner) => RigError::Layout(inner),
+        RigError::BankTooSmall { needed, capacity } => RigError::BankTooSmall { needed, capacity },
         RigError::Witness(inner) => RigError::Witness(inner),
         RigError::Region(inner) => RigError::Region(inner),
         RigError::Bank => RigError::Bank,

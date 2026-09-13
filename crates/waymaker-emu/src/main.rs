@@ -36,24 +36,24 @@
 //! reset vector points at, and `cortex_m_semihosting::debug::exit` is how a guest tells QEMU
 //! what to exit with — neither can be written without the attribute the workspace denies.
 //! [`crate::stack`] is the third: reading how far a run disturbed a painted stack needs a raw
-//! fill and a raw read, named by [ADR 0041]. The workspace manifest names this exact escape —
+//! fill and a raw read, named by [ADR 0042]. The workspace manifest names this exact escape —
 //! *"`deny` keeps a documented exception a reviewable one-line `#![allow(unsafe_code)]` plus
 //! an ADR"* — and this is the one crate that takes it. It is a crate nothing depends on, that
 //! is never published, and that no layer, test-support crate or firmware image links.
 //!
 //! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
-//! [ADR 0041]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+//! [ADR 0042]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 
 #![no_std]
 #![no_main]
 #![warn(missing_docs)]
 // The one exception in the workspace, argued in the module documentation above and in
-// ADR 0040 and ADR 0041. `allow` rather than the `forbid` every other crate carries, because
+// ADR 0040 and ADR 0042. `allow` rather than the `forbid` every other crate carries, because
 // a reset vector, a semihosting exit and a stack high-water mark cannot be spelled without
 // it — and scoped to a crate nothing depends on and no image links.
 #![allow(
     unsafe_code,
-    reason = "the reset vector, the semihosting exit, and the stack high-water mark; see ADR 0040 and ADR 0041"
+    reason = "the reset vector, the semihosting exit, and the stack high-water mark; see ADR 0040 and ADR 0042"
 )]
 
 pub mod boot;

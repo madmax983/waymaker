@@ -229,6 +229,47 @@ fn a_wear_total_saturates_rather_than_wrapping() {
 }
 
 #[test]
+fn a_saturated_wear_hundredths_agrees_with_its_own_whole_number() {
+    // Issue #81: the old code saturated the multiply before the divide. This made
+    // `Wear::SATURATED`'s exact 1:1 ratio render as "0.01", while `whole()` answered `1` for
+    // the same value.
+    let figure = Wear::SATURATED
+        .programmed_bytes_per_effect()
+        .expect("effects ran");
+    assert_eq!(figure.whole(), 1);
+    assert_eq!(
+        figure.hundredths(),
+        100,
+        "whole() and hundredths() disagree"
+    );
+    assert_eq!(figure.to_string(), "1.00");
+    assert!(figure.is_exact());
+}
+
+#[test]
+fn a_numerator_above_the_old_multiply_ceiling_still_divides_correctly() {
+    // `u32::MAX / 100` is 42,949,672. Above that value, the old code clamped the multiply
+    // before it divided, and understated the ratio. The meter counts a program's length even
+    // when the device refuses the call. So one huge `program` call reaches the numerator
+    // without writing that much media.
+    metered!(part, meter);
+    let huge = vec![0_u8; 50_000_000];
+    let refused = meter.program(0, &huge);
+    assert!(refused.is_err(), "the tiny device refuses a 50 MB program");
+    meter.credit_effect();
+    meter.credit_effect();
+    let figure = meter
+        .wear()
+        .programmed_bytes_per_effect()
+        .expect("effects ran");
+    assert_eq!(figure.total(), 50_000_000);
+    assert_eq!(figure.effects(), 2);
+    assert_eq!(figure.whole(), 25_000_000);
+    assert_eq!(figure.hundredths(), 2_500_000_000);
+    assert_eq!(figure.to_string(), "25000000.00");
+}
+
+#[test]
 fn the_journals_own_amplification_is_carried_alongside_the_meters() {
     // The two are the same measurement taken from opposite ends: the journal counts what it
     // asked for, the meter counts what the device was asked for. They agree when nothing
