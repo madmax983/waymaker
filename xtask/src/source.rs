@@ -10690,6 +10690,57 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_statement_inside_a_method_body_is_also_rejected() {
+        // Found by Codex review of this change (PR #143), round 11: a bare
+        // `path!(..);` standing alone as its own statement in a function or method
+        // body is the other position Rust's reference grants item expansion, and the
+        // nested-module recursion the round 10 fix added reads `syn::Item` alone, which
+        // never reaches inside a function body at all. `generate_clone_impl!(Recovery);`
+        // written this way can expand to a non-local `impl Clone for Recovery`, naming
+        // the outer type exactly as the round 10 example did.
+        let macro_statement = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated() {\n",
+            "        generate_clone_impl!(Recovery);\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&macro_statement);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_expression_position_macro_does_not_trip_the_recovery_pin() {
+        // The other half of the round 11 fix: a macro used where Rust's reference
+        // requires an expression — a `const` initializer, a condition, a `let` binding,
+        // a tail expression — can never expand to an item, so flagging it would reject
+        // ordinary code `recovery.rs` already has (its own `const _: () =
+        // assert!(..);` compile-time checks, for one). This is the false-positive check
+        // the fix for round 11 has to pass, not a bypass anyone reported.
+        let expression_macro = recovery_source_with_struct(concat!(
+            "const _: () = assert!(1 == 1);\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated() -> bool {\n",
+            "        matches!(1, 1)\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&expression_macro);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

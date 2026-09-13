@@ -601,24 +601,37 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     Ok(declared.then_some(derives))
 }
 
-/// Whether `contents` invokes any macro at any nesting depth.
+/// Whether `contents` invokes a macro anywhere it could expand to an item, at any
+/// nesting depth.
 ///
-/// `Item::Macro` covers both a `macro_rules!` definition and an invocation of one defined
-/// elsewhere (`generate_clone_impl!(Recovery);`).
+/// Two shapes count, both because Rust's grammar — not this scan's judgement — is what
+/// lets a macro produce a new item there. `Item::Macro` covers a `macro_rules!`
+/// definition and an item-position invocation alike, at the top of the file, inside a
+/// nested `mod` (however deep), or inside an `impl` or `trait` body. `Stmt::Macro` covers
+/// the other position the reference grants item expansion: a bare `path!(..);` standing
+/// alone in a function or method body, as its own statement rather than bound to a `let`
+/// or read as a value. A path in either position can still name a type outside the file
+/// it is written in — `generate_clone_impl!(super::Recovery)` inside `mod hidden { .. }`,
+/// or inside a method body, still expands to an `impl Clone for Recovery` at the crate's
+/// real type — so both are read at every depth this scan reaches, matching the
+/// [`syn::visit::Visit`] traversal [`resolved_path_uses`] already uses for the same
+/// reason.
 ///
-/// Unlike [`struct_derives`]'s struct-declaration lookup, this reads every nested `mod`
-/// too, not only the top level: a macro invocation is not scoped the way a declaration
-/// is. `generate_clone_impl!(super::Recovery)` written inside `mod hidden { .. }` still
-/// expands to an `impl Clone for Recovery` at the crate's real recovery type, an item
-/// that names the outer type through a path rather than declaring a second one — so a
-/// nested invocation is exactly as dangerous as a top-level one. Found by Codex review of
-/// this change (PR #143), round 10, correcting round 9's fix, which read only
-/// `file.items` and so missed exactly this.
+/// A macro used anywhere else — an argument, a condition, a `let` binding, a tail
+/// expression — parses as `Expr::Macro` instead, and the reference does not let an
+/// expression position expand to an item: `assert!(a == b)` and `matches!(x, Some(_))`
+/// stay expressions everywhere this crate already uses them, so reading only the two
+/// item-granting shapes is precise rather than merely convenient — a version that also
+/// flagged `Expr::Macro` would reject `recovery.rs`'s own compile-time assertions.
 ///
-/// This module cannot expand a macro (see the module doc's residual limits), so an
-/// item-level invocation could expand to anything — a `#[derive(Clone)]`, a handwritten
-/// `impl Clone`, or nothing at all — and neither [`struct_derives`] nor
-/// [`trait_implementors`] can tell which. This generalizes the ban
+/// This module cannot expand a macro (see the module doc's residual limits), so either
+/// shape could expand to anything — a `#[derive(Clone)]`, a handwritten `impl Clone`, or
+/// nothing at all — and neither [`struct_derives`] nor [`trait_implementors`] can tell
+/// which. Found by Codex review of this change (PR #143): round 9 added `Item::Macro` at
+/// the top level, round 10 corrected it to recurse into nested `mod`s the way a
+/// declaration cannot, and round 11 added `Stmt::Macro`, the position a hand-rolled
+/// recursion over `syn::Item` alone cannot reach at all — a visitor is what closes it
+/// rather than a fourth case bolted onto the same recursion. This generalizes the ban
 /// `names_identifier(&code, "macro_rules")` already places on a **declared** macro
 /// elsewhere in this file to any invocation, because the macro doing the expanding does
 /// not have to be declared in the file it expands into.
@@ -627,24 +640,33 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
-    let file = parse_rust(contents)?;
-    Ok(any_item_macro(&file.items))
-}
+    struct MacroVisitor {
+        found: bool,
+    }
 
-fn any_item_macro(items: &[syn::Item]) -> bool {
-    items.iter().any(|item| {
-        if has_cfg_test(item_attrs(item)) {
-            return false;
+    impl<'ast> syn::visit::Visit<'ast> for MacroVisitor {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            // Test code is not shipped: `#[cfg(test)]` removes the item, and anything
+            // inside it, before any expansion that could reach the real `Recovery` runs.
+            if has_cfg_test(item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
         }
-        match item {
-            syn::Item::Macro(_) => true,
-            syn::Item::Mod(module) => module
-                .content
-                .as_ref()
-                .is_some_and(|(_, nested)| any_item_macro(nested)),
-            _ => false,
+
+        fn visit_item_macro(&mut self, _node: &'ast syn::ItemMacro) {
+            self.found = true;
         }
-    })
+
+        fn visit_stmt_macro(&mut self, _node: &'ast syn::StmtMacro) {
+            self.found = true;
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = MacroVisitor { found: false };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
 }
 
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one
