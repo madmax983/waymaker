@@ -44,6 +44,7 @@
 //! memory, and issue [#39](https://github.com/madmax983/waymaker/issues/39) asks that a
 //! large future not be hidden behind a small context.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -2643,6 +2644,10 @@ enum Block {
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
     let mut found = Vec::new();
     for source in sources {
+        // A trait can live in one file. Its `impl` can live in another. Collect the
+        // crate's private trait names first, before any `impl` in the crate is read.
+        let private_traits = private_trait_names(sources, &source.crate_name);
+
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
         let mut pending_test_attribute = false;
@@ -2689,7 +2694,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here = declaration_kind(classified);
+                    let declared_here = declaration_kind(classified, &private_traits);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
@@ -2713,7 +2718,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(classified) {
+                if let Some(kind) = declaration_kind(classified, &private_traits) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -2750,26 +2755,152 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
 /// its own, and classifying that bare `{` would read every method of the impl as an
 /// ordinary private one and quietly drop them from the reach rule.
 ///
+/// A bare `trait` or a `pub(crate) trait` reads as [`Block::Other`]. So does an `impl` of
+/// one. `waymaker-size-probe` is a separate crate. It has no path to either. This is issue
+/// #49: `check_probe_reach` demanded a call the probe could not make. `private_traits`
+/// names every non-public trait already found in this crate, from [`private_trait_names`].
+///
 /// `None` for every other line, so that a block nobody declared — a `mod`, a function body
 /// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
-fn declaration_kind(line: &str) -> Option<Block> {
-    let declaration = line.strip_prefix("pub ").unwrap_or(line);
-    let declaration = declaration
-        .split_once("(crate)")
-        .map_or(declaration, |(_, rest)| rest.trim_start());
-    if declaration.starts_with("trait ") {
-        return Some(Block::Trait);
+fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Block> {
+    if let Some((_, public)) = trait_declaration(line) {
+        return Some(if public { Block::Trait } else { Block::Other });
     }
-    if declaration.starts_with("impl") {
+    if line.starts_with("impl") {
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
-        // makes its unmarked methods callable from outside.
-        return Some(if declaration.contains(" for ") {
-            Block::TraitImpl
-        } else {
-            Block::Other
+        // makes its unmarked methods callable from outside, and only while `Storage` is
+        // itself a trait the probe has a path to.
+        return Some(match impl_trait_name(line) {
+            Some(name) if private_traits.contains(name) => Block::Other,
+            Some(_) => Block::TraitImpl,
+            None => Block::Other,
         });
     }
     None
+}
+
+/// The name a `trait` declaration names. Also whether it is `pub`.
+///
+/// A `pub` trait is reachable from a separate crate. A `pub(crate)` or fully private
+/// trait is not. Reads the line that declares the trait, the same line
+/// [`declaration_kind`] classifies a block from. Returns `None` for a line with no
+/// trait declaration.
+fn trait_declaration(line: &str) -> Option<(&str, bool)> {
+    let public = declares_public(line);
+    let rest = line.strip_prefix("pub ").unwrap_or(line);
+    let rest = rest
+        .split_once("(crate)")
+        .map_or(rest, |(_, after)| after.trim_start());
+    let name = rest
+        .strip_prefix("trait ")?
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .find(|token| !token.is_empty())?;
+    Some((name, public))
+}
+
+/// The names of every non-public trait a crate declares — a bare `trait` or a
+/// `pub(crate) trait`. A separate crate has no path to any of these.
+///
+/// `size-probe-reach` needs this list before it can classify an `impl <Trait> for
+/// <Type>`. A trait's methods are as reachable as the trait itself. The trait can live
+/// in one file of the crate and the impl in another. Skips `#[cfg(test)]` modules and
+/// comments, the same way [`public_functions`] does. This stops a test-only trait from
+/// marking a shipped trait of the same name as private.
+///
+/// A floor, not a proof: two traits sharing one name in a crate collapse into one
+/// entry here, public or not. Naming a private trait after a public one in the same
+/// crate is a review question, not a case this set can tell apart.
+fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == crate_name)
+    {
+        let mut depth: i32 = 0;
+        let mut test_module: Option<i32> = None;
+        let mut pending_test_attribute = false;
+
+        for line in source.contents.lines() {
+            let trimmed = line.trim();
+            let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+            let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+
+            if !trimmed.starts_with("//") {
+                if trimmed.contains("#[cfg(test)]") {
+                    pending_test_attribute = true;
+                }
+                if pending_test_attribute && opens > 0 {
+                    test_module = Some(depth);
+                    pending_test_attribute = false;
+                }
+            }
+
+            if test_module.is_none() && !trimmed.starts_with("//") {
+                let classified = without_leading_attributes(trimmed);
+                if let Some((name, false)) = trait_declaration(classified) {
+                    names.insert(name.to_owned());
+                }
+            }
+
+            depth += opens;
+            depth -= closes;
+            if test_module.is_some_and(|opened| depth <= opened) {
+                test_module = None;
+            }
+        }
+    }
+    names
+}
+
+/// The trait name an `impl <Trait> for <Type>` line names. Returns `None` for an
+/// inherent `impl` with no `for`.
+///
+/// `line` is the item's declaration line, the same line [`declaration_kind`] reads.
+/// Two things are stripped before the name is read. First, the impl's own generic
+/// parameters — `impl<T: Copy> Storage<T> for Bank<T>` — as one balanced `<...>`
+/// group, since a bound can carry a nested `<...>` of its own. Second, a path
+/// qualifier and the trait's own generic arguments, so `crate::sealed::Sealed<T>`
+/// names `Sealed`, not `crate`.
+fn impl_trait_name(line: &str) -> Option<&str> {
+    let (before, _after) = line.split_once(" for ")?;
+    let before = before.strip_prefix("impl").unwrap_or(before);
+    let before = skip_leading_generic_params(before);
+    // The trait's own generic arguments, if any: `Storage<T>` names `Storage`.
+    let path = before.split('<').next().unwrap_or(before);
+    // The last path segment: `crate::sealed::Sealed` names `Sealed`.
+    path.rsplit("::")
+        .map(str::trim)
+        .find(|segment| !segment.is_empty())
+}
+
+/// Removes one leading `<...>` group from `text`, balanced across any nested pair.
+///
+/// Returns `text` unchanged if it has no leading `<`.
+fn skip_leading_generic_params(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('<') else {
+        return trimmed;
+    };
+    let mut depth: u32 = 1;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '<' => depth = depth.saturating_add(1),
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced: the header spans lines. `public_functions`'s own `pending` state
+    // handles the line that opens the block instead. Report no trait name here.
+    // Under-reporting is the safe direction.
+    ""
 }
 
 /// `line` with any leading attributes removed.
@@ -5730,6 +5861,123 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["seal", "erase", "erase"]);
+    }
+
+    #[test]
+    fn a_private_traits_methods_are_not_required_of_the_probe() {
+        // Issue #49. A bare `trait` has no path from another crate. The probe cannot
+        // call it. The gate must not ask for a call nothing can make.
+        let functions = public_functions(&kernel(
+            "trait Internal {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_crate_traits_methods_are_not_required_of_the_probe() {
+        // `pub(crate)` keeps the trait inside its own crate. The probe is a separate
+        // crate, so it has no path to the trait either.
+        let functions = public_functions(&kernel(
+            "pub(crate) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_public_traits_methods_are_still_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub trait Storage {\n\
+            \x20   fn seal(&self);\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal"]);
+    }
+
+    #[test]
+    fn an_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // The trait and its impl can sit in different files of one crate.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Internal for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_public_trait_is_still_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub trait Storage {\n    fn seal(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Storage for Bank {\n    fn seal(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal", "seal"]);
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // A qualified path names the trait too: `crate::sealed::Sealed` names
+        // `Sealed`, not `crate`. Taking the first token instead reads a common
+        // sealed-trait idiom as an unrelated public name and demands the call back.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl crate::sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_an_external_trait_is_still_required_of_the_probe() {
+        // No local declaration named `core` exists, so the trait is external and
+        // stays reachable — the same as an unqualified external trait always was.
+        let functions = public_functions(&kernel(
+            "impl core::fmt::Debug for Bank {\n\
+            \x20   fn fmt(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
     }
 
     #[test]
