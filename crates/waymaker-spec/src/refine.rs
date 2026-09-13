@@ -212,7 +212,9 @@ pub fn abstraction(
 /// Whether the call recorded at `run.ops()[op]` changed any cell of media at all.
 ///
 /// `false` when `op` is past the end of `run.ops()` — the call was never issued — or when it
-/// is the one [`Run::injection`] names at [`Progress::None`].
+/// is the one [`Run::injection`] names at [`Progress::None`] or at a zero [`Progress::Bytes`],
+/// which that type's own documentation calls the same world as `None`: a hand-built zero, the
+/// only route to one, since the enumerated crash points never produce it.
 ///
 /// # Why this and not "did the call return `Ok`"
 ///
@@ -230,7 +232,7 @@ pub fn call_touched(run: &Run, op: usize) -> bool {
     }
     !matches!(
         run.injection(),
-        Some(Injection { op: at, progress: Progress::None, .. }) if at == op
+        Some(Injection { op: at, progress: Progress::None | Progress::Bytes(0), .. }) if at == op
     )
 }
 
