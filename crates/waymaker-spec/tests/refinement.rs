@@ -614,8 +614,16 @@ fn bank_align() -> ProgramAlign {
 }
 
 /// The model's generation number for a real one. See [`bank_after_seal`]'s docs.
-const fn model_generation(generation: Generation) -> u32 {
-    generation.0.saturating_add(1)
+///
+/// Both sides number generations with a `u32`, so the `+1` shift cannot represent
+/// `Generation::MAX` — there is no model number left for it. Refuses rather than clamping and
+/// silently colliding it with `Generation::MAX - 1`'s: this test's own generations never
+/// approach the boundary, so reaching it here would be this shift breaking, not the firmware.
+fn model_generation(generation: Generation) -> u32 {
+    let Some(shifted) = generation.0.checked_add(1) else {
+        unreachable!("the +1 shift cannot represent Generation::MAX")
+    };
+    shifted
 }
 
 fn header_of(generation: Generation) -> BankHeader<'static> {
@@ -931,11 +939,15 @@ fn model_authority(state: &Journal) -> RealAuthority {
         BankId::B => FlashBankId::B,
     };
     let real_generation = |id: BankId| {
-        let model = state
-            .bank(id)
-            .authoritative_generation()
-            .unwrap_or_default();
-        Generation(model.saturating_sub(1))
+        // Only ever called with an `id` from `state.authoritative()`, which answers `Some`
+        // for exactly the ids it names — see `Journal::authoritative`.
+        let Some(model) = state.bank(id).authoritative_generation() else {
+            unreachable!("an authoritative bank names its own generation")
+        };
+        let Some(real) = model.checked_sub(1) else {
+            unreachable!("model_generation never produces zero")
+        };
+        Generation(real)
     };
     match state.authoritative().as_slice() {
         [] => RealAuthority::None,

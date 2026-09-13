@@ -235,6 +235,17 @@ pub fn abstraction(
 /// caller reads back and passes to [`bank_after_erase`] or [`bank_after_seal`] — not by this
 /// module trying to infer "committed" from [`Run::injection`] alone, which cannot see a
 /// watchdog's rounding.
+///
+/// # What a length and a progress cannot see
+///
+/// An idempotent call — `0xFF` programmed over media that is already erased, or an
+/// already-erased block erased again — changes no cell either, and this reports it touched
+/// anyway: `Op` carries no payload, so nothing here can tell such a call apart from an
+/// ordinary one without `waymaker_fault::Session`'s own per-operation record surviving into
+/// [`Run`], which it does not today. No call in this crate's own driven writers is ever
+/// idempotent — every program writes real header or seal bytes over freshly erased media, and
+/// the one erase always targets a bank an earlier install actually wrote — so the gap is
+/// stated here rather than closed.
 #[must_use]
 pub fn call_touched(run: &Run, op: usize, geometry: Geometry) -> bool {
     let len = match run.ops().get(op) {
