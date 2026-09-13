@@ -285,18 +285,19 @@ where
 
 /// Every observation the model says a run can end in.
 ///
-/// Scoped to states where every record is in `BankId::A` — matching `Journal::reconstructed`'s
-/// hardcoded convention and this file's own claim that "no writer here touches a bank" — rather
-/// than every explored state. `explore` does not know that claim: nothing here stops the
-/// model's *first* seal landing on bank B while records already sit in A, so `REFINEMENT`'s
-/// reachable set includes states whose records are split across both banks. `Observation`
-/// carries no bank identity, so flattening one of those through `Journal::observation` in
-/// declaration order can produce a shape no single-bank writer could ever leave — `Whole`
-/// following a gap, which `Guard::AppendOnly` forbids within one bank — and including it here
-/// would make assertion 1 below accept an impossible history merely because it happens to
-/// match a real, multi-bank state's flattened shape. Codex found this on review of issue #67's
-/// pull request, which is what gave the model a bank dimension to split across in the first
-/// place.
+/// Scoped to states where every record is in `BankId::A` — matching [`abstraction`]'s own
+/// convention and this file's own claim that "no writer here touches a bank" — rather than
+/// every explored state. `explore` does not know that claim: nothing here stops the model's
+/// *first* seal landing on bank B while records already sit in A, so `REFINEMENT`'s reachable
+/// set includes states whose records are split across both banks, which no writer this file
+/// drives (all single-bank) could ever produce. Including one here would make assertion 1
+/// below accept a real crash against an observation no run of these writers could match,
+/// since `abstraction` always tags every record `BankId::A`. Codex found the reachability gap
+/// this filter closes on review of issue #67's pull request, which is what gave the model a
+/// bank dimension to split across in the first place; a later round found that
+/// `Observation`'s per-record tuple carried no bank identity at all, which this filter's own
+/// correctness happened to hide since it always compared same-bank observations — see
+/// `Observation::records`'s doc comment.
 fn reachable_observations() -> BTreeSet<Observation> {
     let explored = match explore(REFINEMENT, Guards::ENFORCED, CEILING) {
         Ok(explored) => explored,
@@ -414,7 +415,11 @@ fn the_refinement_reaches_the_dimensions_the_guarantees_are_about() {
         for geometry in [geometry(), blocks()] {
             for run in drive_on(geometry, |session| writer(session)) {
                 let observed = abstraction(run.ledger(), &[], role_of);
-                if observed.records.iter().any(|(.., torn_here)| *torn_here) {
+                if observed
+                    .records
+                    .iter()
+                    .any(|(_, _, _, torn_here, _)| *torn_here)
+                {
                     torn += 1;
                 }
                 let history = recovered(run.image());
@@ -546,7 +551,13 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     // claims a barrier returned for a half-written record describes nothing, and the state
     // builder says so instead of quietly repairing it.
     let impossible = Observation {
-        records: vec![(RecordId(0), Role::Schedule, Durability::Acknowledged, true)],
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            true,
+            BankId::A,
+        )],
         dispatched: Vec::new(),
         ..Observation::default()
     };
@@ -557,7 +568,13 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     );
 
     let also_impossible = Observation {
-        records: vec![(RecordId(0), Role::Schedule, Durability::Attempted, true)],
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Attempted,
+            true,
+            BankId::A,
+        )],
         dispatched: Vec::new(),
         ..Observation::default()
     };
@@ -610,8 +627,20 @@ fn reconstruction_refuses_a_next_id_that_reissues_a_resident() {
     // #67's whole counter scheme exists to forbid.
     let colliding = Observation {
         records: vec![
-            (RecordId(0), Role::Schedule, Durability::Acknowledged, false),
-            (RecordId(1), Role::Outcome, Durability::Acknowledged, false),
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
+            (
+                RecordId(1),
+                Role::Outcome,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
         ],
         dispatched: Vec::new(),
         next_id: Some(1),
@@ -654,7 +683,7 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             run.ledger().len(),
             "the abstraction invented or dropped a record"
         );
-        for (id, _, state, torn) in &observed.records {
+        for (id, _, state, torn, _) in &observed.records {
             assert_eq!(run.ledger().state(*id), Some(*state));
             assert_eq!(run.ledger().torn(*id), Some(*torn));
         }
@@ -664,6 +693,64 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             "the abstraction did not deduplicate the dispatch log"
         );
     }
+}
+
+#[test]
+fn observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks() {
+    // Codex, PR #135's round on commit 76dab02: `Observation`'s per-record tuple carried no
+    // bank identity at all, so `Journal::reconstructed` hardcoded every record to `BankId::A`
+    // regardless of which bank `observation()` actually read it from. A device that retires a
+    // record in bank A behind its very first seal (landing on B), then declares a fresh
+    // record in B, recovers `[1]` directly — but round-tripped through `observation()` and
+    // `reconstructed()`, both records land in `BankId::A`, `recovering_bank()` stays `B`, and
+    // neither record's bank matches it, so the reconstructed state recovers `[]` instead.
+    let bound = Bound {
+        records: 4,
+        generations: 2,
+    };
+    let state = Journal::new()
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare record 0 in bank A")
+        .step(Transition::Program(RecordId(0)), Guards::ENFORCED, bound)
+        .expect("program record 0")
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier over record 0")
+        .step(Transition::BeginSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("the device's very first seal, on bank B")
+        .step(Transition::CommitSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("commit the seal; B is now sole authority")
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare record 1 in bank B, now current")
+        .step(Transition::Program(RecordId(1)), Guards::ENFORCED, bound)
+        .expect("program record 1")
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier over record 1");
+
+    let direct = Specified.recover(&state);
+    assert_eq!(
+        direct,
+        vec![RecordId(1)],
+        "record 0 sits in a bank that lost authority, so only record 1 should recover"
+    );
+
+    let observed = state.observation();
+    assert_eq!(
+        observed
+            .records
+            .iter()
+            .map(|(id, .., bank)| (*id, *bank))
+            .collect::<Vec<_>>(),
+        vec![(RecordId(0), BankId::A), (RecordId(1), BankId::B)],
+        "observation() must report each record's real bank"
+    );
+
+    let reconstructed =
+        Journal::reconstructed(&observed).expect("a real state is never impossible");
+    assert_eq!(
+        Specified.recover(&reconstructed),
+        direct,
+        "round-tripping through observation()/reconstructed() changed what recovery returns"
+    );
 }
 
 #[test]
@@ -677,7 +764,7 @@ fn no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave() {
     // over every observation the filtered set contains rather than over one example.
     for observation in reachable_observations() {
         let mut saw_gap = false;
-        for (id, _, state, torn) in &observation.records {
+        for (id, _, state, torn, _) in &observation.records {
             let whole = matches!(
                 state,
                 Durability::PossiblyDurable | Durability::Acknowledged

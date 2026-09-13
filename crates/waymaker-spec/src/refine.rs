@@ -39,12 +39,21 @@ use crate::model::{BANKS, Bank, BankId, Journal, OnMedia, Record, Role};
 /// defaulting them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Observation {
-    /// Each record in declaration order, as `(id, role, state, torn)`.
+    /// Each record in declaration order, as `(id, role, state, torn, bank)`.
     ///
     /// The role comes from the caller rather than from the ledger: `waymaker-fault` names no
     /// record type, which is exactly what makes the harness reusable, so what a record is
     /// *for* is something only the writer under test knows.
-    pub records: Vec<(RecordId, Role, Durability, bool)>,
+    ///
+    /// The bank is real, not a hardcoded `BankId::A` — the earlier version of this field
+    /// carried no bank at all, so a device with record 0 retired in bank A and record 1
+    /// authoritative in bank B abstracted to `observation()`'s correct
+    /// `recover() == [1]` but `reconstructed()`'s wrong `[]`, because every record landed in
+    /// `BankId::A` regardless of which bank it was really in. Codex found it on review of the
+    /// pull request that closed the erase/reboot version of the reboot gap, one round after
+    /// `next_id`'s own missing floor. [`abstraction`] tags every record `BankId::A`, matching
+    /// the module docs' "no writer this function abstracts ever touches a second bank".
+    pub records: Vec<(RecordId, Role, Durability, bool, BankId)>,
     /// The schedule records of effects the run really handed to the world.
     pub dispatched: Vec<RecordId>,
     /// Both banks, read off the crashed run.
@@ -97,6 +106,7 @@ impl Journal {
                         record.role,
                         record.durability(),
                         record.media == OnMedia::Partial,
+                        record.bank,
                     )
                 })
                 .collect(),
@@ -145,7 +155,7 @@ impl Journal {
     /// an id something on media already holds.
     pub fn reconstructed(observation: &Observation) -> Result<Self, Impossible> {
         let mut records = Vec::with_capacity(observation.records.len());
-        for (id, role, state, torn) in &observation.records {
+        for (id, role, state, torn, bank) in &observation.records {
             let media = match (state, torn) {
                 (Durability::Attempted, false) => OnMedia::Absent,
                 (Durability::Attempted, true) => {
@@ -162,10 +172,7 @@ impl Journal {
                 role: *role,
                 media,
                 acknowledged: *state == Durability::Acknowledged,
-                // No writer this crate drives touches a second bank — see the module doc —
-                // so every reconstructed record is `BankId::A` by the same convention
-                // `Journal::new` uses before a device's first seal.
-                bank: BankId::A,
+                bank: *bank,
             });
         }
         if let Some(next_id) = observation.next_id {
@@ -243,8 +250,10 @@ impl core::error::Error for Impossible {}
 /// [`waymaker_fault::Recovery::dispatched`] is: an oracle that only admitted an effect once
 /// its intent was durable could not describe the violation it exists to catch.
 ///
-/// Reports no bank: a caller with one to report builds an [`Observation`] directly and folds
-/// [`bank_after_erase`] and [`bank_after_seal`] into its `banks` field instead.
+/// Reports every record in `BankId::A`, and no bank *state*: a caller with a bank to report
+/// builds an [`Observation`] directly and folds [`bank_after_erase`] and [`bank_after_seal`]
+/// into its `banks` field instead. Exact here and only here, for the same reason `next_id`'s
+/// own inference is — no writer this function abstracts ever touches a second bank.
 ///
 /// `next_id` is inferred from `ledger.records()`'s highest id, which is exact here and only
 /// here: no writer this function abstracts ever erases anything, so nothing is ever dropped
@@ -263,7 +272,15 @@ pub fn abstraction(
     sorted.dedup();
     let records: Vec<_> = ledger
         .records()
-        .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
+        .map(|(id, state)| {
+            (
+                id,
+                role(id),
+                state,
+                ledger.torn(id).unwrap_or(false),
+                BankId::A,
+            )
+        })
         .collect();
     let next_id = records
         .iter()

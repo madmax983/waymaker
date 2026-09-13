@@ -3036,3 +3036,21 @@ record's id, the same floor `reboot` itself keeps.
 `reconstruction_refuses_a_next_id_that_reissues_a_resident` is the regression, verified
 against a scratch reproduction of the stranding before the check existed and checking both
 the refusal and that the exact floor (one past the highest resident id) is still accepted.
+
+The same round's next pass found the sharper of the two: `Observation`'s per-record tuple
+carried no bank identity at all, so `Journal::reconstructed` hardcoded every record to
+`BankId::A` regardless of which bank `observation()` had actually read it from. A device that
+retires a record in bank A behind its very first seal — landing on B — and then declares a
+fresh record in B recovers `[1]` directly; round-tripped through `observation()` and
+`reconstructed()`, both records land in `BankId::A`, `recovering_bank()` stays `B`, and
+neither record's bank matches it, so the reconstructed state recovers `[]` instead — a real
+defect in the general bridge, invisible only because every writer this crate currently drives
+through it is single-bank. `Observation::records` now carries each record's bank as a fifth
+tuple element; `Journal::observation()` reports the real field, `Journal::reconstructed()`
+uses it instead of the hardcoded convention, and `refine::abstraction()` tags every record
+`BankId::A`, matching the module docs' "no writer this function abstracts ever touches a
+second bank" exactly as it already does for `next_id`.
+`observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks` is the
+regression, driving the real two-record two-bank sequence end to end and asserting the
+round-trip preserves what `Specified.recover` returns, verified against a scratch
+reproduction of the `[1]` vs `[]` divergence before the fix existed.
