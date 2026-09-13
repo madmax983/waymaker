@@ -1417,22 +1417,31 @@ impl SizeReport {
         // A report can name every candidate it has correctly and still be missing most of
         // ADR 0010's table — `--report` reads a document this process did not produce, and
         // a section with one valid entry passed every check above it until this one.
-        for &(name, shipped, ..) in CHECKSUM_CANDIDATES {
-            match candidates.iter().find(|candidate| candidate.name == name) {
-                None => shortfalls.push(BudgetShortfall::Unmeasurable {
+        for &(name, shipped, _function, table) in CHECKSUM_CANDIDATES {
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) else {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
                         "the report names no checksum candidate `{name}`; ADR 0010 measured it"
                     ),
-                }),
-                Some(candidate) if candidate.shipped != shipped => {
-                    shortfalls.push(BudgetShortfall::Unmeasurable {
-                        detail: format!(
-                            "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
-                            candidate.shipped
-                        ),
-                    });
-                }
-                Some(_) => {}
+                });
+                continue;
+            };
+            if candidate.shipped != shipped {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
+                        candidate.shipped
+                    ),
+                });
+            }
+            // The two table candidates are the ones ADR 0010's decision turns on — a 0 B
+            // reading here is the one number the whole section exists to report, missing.
+            if table.is_some() && candidate.rodata == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures 0 B of `.rodata`, but ADR 0010's table names a lookup table for it"
+                    ),
+                });
             }
         }
 
@@ -2551,7 +2560,18 @@ pub fn measure_into(
         });
     }
 
-    let checksum_candidates = measure_checksum_candidates(root, build_dir, &graph)?;
+    // Only for the checkout `xtask` was built from, [`KernelState::measured`]'s own
+    // reason and its own signal: `CHECKSUM_CANDIDATES` names identifiers this binary's
+    // source declares, so reading them out of a *base-branch* image is reading this
+    // binary's expectations against another commit's code. A rename on either side would
+    // turn a base-branch worktree's checksum-candidate section into a hard error — and
+    // since that section carries no row `diff` ever reads, failing the base measurement
+    // over it would cost every other row's comparison for a section nobody compares.
+    let checksum_candidates = if kernel_state.is_some() || runtime.is_some() {
+        measure_checksum_candidates(root, build_dir, &graph)?
+    } else {
+        None
+    };
 
     Ok(SizeReport::new(rows, kernel_state, runtime).with_checksum_candidates(checksum_candidates))
 }
@@ -2594,11 +2614,12 @@ fn linked_image(image: &Path) -> Result<(Vec<Section>, Vec<elf::Symbol>), SizeEr
 
 /// ADR 0010's five checksum candidates, measured rather than typed by hand.
 ///
-/// `None` for a checkout whose probe declares no [`CRC_CANDIDATES_FEATURE`] — the same
-/// answer [`KernelState::measured`] gives for a checkout `xtask` was not built against: a
-/// measurement this workspace cannot yet take is not a zero. Every checkout this pull
-/// request's own commits produce declares the feature, so the checkout comparison is what
-/// keeps a base-branch diff from failing on the one side that predates issue #61.
+/// `None` for a checkout whose probe declares no [`CRC_CANDIDATES_FEATURE`] — a checkout
+/// that predates issue #61. Callers measuring a checkout other than the one `xtask` was
+/// built from should not reach this at all, for [`measure_into`]'s reason: the identifiers
+/// this function searches for are compiled into *this* binary from *this* checkout's
+/// source, and matching them against another commit's image is a comparison that means
+/// nothing and can fail on a rename neither side made wrong.
 ///
 /// # Errors
 ///
@@ -5176,6 +5197,23 @@ mod tests {
         let message = rendered(&report.shortfalls());
         assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
         assert!(message.contains("shipped"), "{message}");
+    }
+
+    #[test]
+    fn a_table_candidate_that_measures_no_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the `.text` check alone let a truncated report set
+        // `rodata: 0` on either table candidate — dropping the 64 B / 1024 B figures ADR
+        // 0010's decision turns on — and still pass.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-nibble-table" {
+                candidate.rodata = 0;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-nibble-table"), "{message}");
+        assert!(message.contains("0 B of `.rodata`"), "{message}");
     }
 
     #[test]

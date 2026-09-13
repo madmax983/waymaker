@@ -133,6 +133,28 @@ fn adr_0010s_five_checksum_candidates_are_measured_rather_than_typed_by_hand() {
 }
 
 #[test]
+fn a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image() {
+    // Codex review on PR #133: `measure_baseline` measures the base branch by running
+    // *this* `xtask`'s `measure_into` against that checkout, passing `None` for both
+    // registries because their figures belong to whatever crate this binary was compiled
+    // from. `CHECKSUM_CANDIDATES` is exactly such a figure — a table of identifiers this
+    // binary's own source declares — so a future rename on either side of a diff would
+    // turn the base half into a hard error, failing the whole comparison over a section
+    // `diff` never reads. `measure_into` skips the checksum-candidates build whenever
+    // both registries are `None`, and this is the real workspace proving it: the probe
+    // really does declare `crc-candidates` here, so a naive implementation would attempt
+    // the build and this would still pass — the point is that it does not even try.
+    let report = size::measure_into(
+        &workspace_root(),
+        &scratch("checksum-candidates-base-shape"),
+        None,
+        None,
+    )
+    .expect("a base-branch-shaped measurement of the real workspace should still link");
+    assert_eq!(report.checksum_candidates(), None);
+}
+
+#[test]
 fn the_engine_costs_more_flash_than_the_baseline() {
     // The whole gate rests on the probe actually linking the layers rather than the
     // linker discarding them: a probe whose engine is dead-stripped reports a delta of
