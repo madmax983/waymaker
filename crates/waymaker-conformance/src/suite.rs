@@ -1133,6 +1133,49 @@ mod tests {
         }
     }
 
+    /// `media_is_erased`'s answer has to agree with an oracle that shares none of its
+    /// code: one `StableStorage::read` of the whole span into a single buffer, compared
+    /// byte by byte against [`ERASED`] with no chunk loop of its own. Pinned before
+    /// `media_is_erased` stops going through the generic, closure-driven `media_matches`
+    /// and gets a loop of its own — a chunk-boundary regression in the specialized
+    /// version would disagree with an oracle that has no chunk boundaries at all to get
+    /// wrong.
+    #[test]
+    fn media_is_erased_agrees_with_an_unchunked_oracle_read() {
+        const SPAN: u32 = 5 * UNIT + 1;
+
+        for buffer_len in [
+            UNIT as usize,
+            (2 * UNIT) as usize,
+            SPAN as usize,
+            4096_usize,
+        ] {
+            for programmed_unit in [None, Some(0_u32), Some(2_u32), Some(4_u32)] {
+                let mut device = Device::new(geometry());
+                if let Some(unit_index) = programmed_unit {
+                    let programmed = [ERASED & 0xFE, ERASED, ERASED, ERASED];
+                    device
+                        .program(unit_index * UNIT, &programmed)
+                        .expect("a unit-aligned program inside the span");
+                }
+
+                let mut oracle = [0_u8; SPAN as usize];
+                device
+                    .read(0, &mut oracle)
+                    .expect("the whole span is a legal read");
+                let expected = oracle.iter().all(|&byte| byte == ERASED);
+
+                let mut buffer = [0_u8; 4096];
+                let mut run = run_over(&mut device, &mut buffer[..buffer_len]);
+                assert_eq!(
+                    run.media_is_erased(0, SPAN),
+                    Some(expected),
+                    "buffer_len={buffer_len} programmed_unit={programmed_unit:?}"
+                );
+            }
+        }
+    }
+
     /// A span that is not a whole number of chunks still gets checked completely — the
     /// remainder the internal loop's last iteration leaves over is neither skipped nor
     /// double-counted — at every buffer size.
