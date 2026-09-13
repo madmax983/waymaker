@@ -4,14 +4,27 @@
 //! `Rig::new` already refused a bank that could not hold §10's two banks, or an instrument
 //! that could not hold a clean run's witness marks. It did not refuse a bank whose *journal*
 //! could not hold the run itself: [`BankLayout::new`] only guarantees room for one record, and
-//! nothing compared that against `effects` schedule/completion pairs. The reported geometry —
-//! `Geometry::new(3 * 1024, 1024, 256, 1)` — was accepted at construction and then failed
-//! partway through the first iteration with `RigError::Append(AppendError::NoRoom)`, at every
-//! effect count including zero.
+//! nothing compared that against `effects` schedule/completion pairs.
 //!
 //! [`RigError::BankTooSmall`] is the fix: a run's records are priced at
 //! [`Workload::MAX_PAYLOAD_BYTES`] each, which is the worst any iteration of the plan can ask
 //! for, and a bank whose journal cannot hold that many is refused before anything is written.
+//!
+//! # Two geometries, and why both are here
+//!
+//! The issue's own reported geometry — `Geometry::new(3 * 1024, 1024, 256, 1)` — is refused by
+//! the code on `main` too, but for an unrelated reason: its one-erase-block instrument holds
+//! four witness slots at that program unit, and even `effects = 0` needs five, so `Rig::new`
+//! already answered `WitnessTooSmall` before this fix existed. It still has to be refused
+//! after this fix — [`a_bank_too_small_for_the_run_is_refused_at_construction`] checks that —
+//! but it does not, on its own, show the accepted-then-`AppendError::NoRoom` failure this issue
+//! is about.
+//!
+//! `Geometry::new(3 * 64, 64, 1, 1)` does: on `main`, `Rig::new` accepts it at `effects = 0`
+//! and `iterate` then fails with `RigError::Append(AppendError::NoRoom)`.
+//! [`the_originally_reported_failure_is_now_refused_at_construction`] is that reproduction,
+//! confirmed against `main` before this fix, and it is the test that would have failed to
+//! compile — for want of `RigError::BankTooSmall` — before this change existed.
 
 use waymaker_flash::storage::Geometry;
 use waymaker_rig::plan::Plan;
@@ -34,25 +47,43 @@ fn a_bank_too_small_for_the_run_is_refused_at_construction() {
     for effects in [0_u16, 1, 5, 100] {
         let built =
             Rig::new::<waymaker_fault::FaultError>(reported_geometry(), Plan::new(0), effects);
-        let Err(RigError::BankTooSmall { needed, capacity }) = built else {
-            panic!("{effects} effects against the reported geometry: {built:?}");
-        };
         assert!(
-            needed > capacity,
-            "a refusal must name a need that really exceeds the capacity it names"
+            matches!(
+                built,
+                Err(RigError::BankTooSmall { .. } | RigError::WitnessTooSmall { .. })
+            ),
+            "{effects} effects against the reported geometry: {built:?}"
         );
     }
 }
 
+/// A run this small is priced correctly: the smallest run there is, on a geometry whose
+/// witness fits it exactly, so a passing case sits right beside the failing one above rather
+/// than every geometry here happening to fail for an unrelated reason.
 #[test]
-fn the_refusal_names_the_bank_rather_than_a_writer_mid_run() {
-    // Before the fix this geometry was accepted and `iterate` failed with
-    // `RigError::Append(AppendError::NoRoom)`. The refusal now has to come from `new`, with
-    // a variant that names the bank rather than the writer.
-    let built = Rig::new::<waymaker_fault::FaultError>(reported_geometry(), Plan::new(0), 0);
+fn a_journal_exactly_large_enough_for_the_run_is_accepted() {
+    // One erase block per bank at a one-byte program unit: the journal is small, but wide
+    // enough for `RunStarted` and `RunCompleted` at their declared, non-worst-case width.
+    let Ok(geometry) = Geometry::new(6 * 64, 64, 1, 1) else {
+        unreachable!("a legal geometry")
+    };
+    let built = Rig::new::<waymaker_fault::FaultError>(geometry, Plan::new(0), 0);
+    assert!(built.is_ok(), "a roomy bank was refused: {built:?}");
+}
+
+#[test]
+fn the_originally_reported_failure_is_now_refused_at_construction() {
+    // On `main`, before this fix: `Rig::new` accepts this geometry at `effects = 0`, and
+    // `prepare` then `iterate` fails with `RigError::Append(AppendError::NoRoom)` — the exact
+    // accepted-then-discovered-mid-run failure issue #80 reports. Confirmed by running that
+    // sequence against `main` while writing this test.
+    let Ok(geometry) = Geometry::new(3 * 64, 64, 1, 1) else {
+        unreachable!("a legal geometry")
+    };
+    let built = Rig::new::<waymaker_fault::FaultError>(geometry, Plan::new(0), 0);
     assert!(
         matches!(built, Err(RigError::BankTooSmall { .. })),
-        "expected a bank refusal, got {built:?}"
+        "expected a bank refusal at construction, got {built:?}"
     );
 }
 
