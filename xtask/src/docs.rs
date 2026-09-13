@@ -5137,6 +5137,32 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_a_script_nested_in_a_div_does_not_settle_anything() {
+        // Codex, pull request #138, round 29: `<div>\n<script>\n...\n</script>\n</div>`
+        // is one `HtmlBlock` whose nested `<script>` opens on its own `Event::Html` line
+        // partway through the block, not at the block's own start — classifying only
+        // the block's first line (rounds 27/28) missed it, and the marker inside read
+        // as visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-nested-script.md".to_owned(),
+            contents: format!(
+                "{}\n<div>\n<script>\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n</div>\n",
+                clean_adr("hidden in a nested script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a script nested in a div settled something: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the

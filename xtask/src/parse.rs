@@ -1070,11 +1070,25 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             {
                 out.push('\n');
             }
-            Event::Start(Tag::HtmlBlock) => {
-                in_non_rendering_block = is_non_rendering_html_block(&contents[range.clone()]);
+            // Tracked per line rather than only at the block's own start (Codex, pull
+            // request #138, round 29): `<div>\n<script>\n...\n</script>\n</div>` is one
+            // `HtmlBlock` whose *nested* `<script>` opens partway through it, on its own
+            // `Event::Html` line — classifying only the block's first line missed a
+            // non-rendering element that does not open the block itself. A top-level
+            // `<script>...</script>` block is simply the case where the opening line is
+            // its own first line, so one check handles both. Never reset at the block's
+            // own end, matching an HTML comment's own fail-closed handling: a `<script>`
+            // whose close is never found hides everything after it the way a browser's
+            // script-data parsing state would.
+            Event::Html(html) if in_non_rendering_block => {
+                if closes_non_rendering_element(&html) {
+                    in_non_rendering_block = false;
+                }
             }
-            Event::End(TagEnd::HtmlBlock) => in_non_rendering_block = false,
-            Event::Html(html) if !in_non_rendering_block => {
+            Event::Html(html) if opens_non_rendering_element(&html) => {
+                in_non_rendering_block = !closes_non_rendering_element(&html);
+            }
+            Event::Html(html) => {
                 append_visible_html_line(&html, container_hidden, &mut in_html_comment, &mut out);
             }
             Event::InlineHtml(html) if !hidden && !html.starts_with("<!--") => {
@@ -1086,25 +1100,36 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     out
 }
 
-/// Whether a `Tag::HtmlBlock`'s own source opens with `<script`, `<style` or
-/// `<template` — case-insensitively, and only when the tag name ends there rather than
-/// continuing into a longer one (`<scriptx>` does not match).
+/// Whether `line` contains an opening `<script`, `<style` or `<template` tag anywhere
+/// in it — not only at its start, since a nested element can open partway through an
+/// enclosing `HtmlBlock`'s own `Event::Html` lines — case-insensitively, and only where
+/// the tag name ends right there rather than continuing into a longer one (`<scriptx>`
+/// does not match).
 ///
 /// These are the three HTML elements whose body a browser never renders as visible
-/// text (Codex, pull request #138, rounds 27 and 28 — `<template>`'s content is inert
-/// DOM meant for cloning by script, not display); every other tag `markdown_prose`
-/// keeps verbatim because a reader does see it.
-fn is_non_rendering_html_block(source: &str) -> bool {
+/// text (Codex, pull request #138, rounds 27, 28 and 29 — `<template>`'s content is
+/// inert DOM meant for cloning by script, not display); every other tag
+/// `markdown_prose` keeps verbatim because a reader does see it.
+fn opens_non_rendering_element(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
     ["script", "style", "template"].iter().any(|tag| {
         let open = format!("<{tag}");
-        source
-            .get(..open.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(&open))
-            && source
+        lower.match_indices(&open).any(|(index, _)| {
+            lower
                 .as_bytes()
-                .get(open.len())
-                .is_some_and(|&byte| matches!(byte, b'>' | b' ' | b'\t' | b'\n' | b'/'))
+                .get(index + open.len())
+                .is_none_or(|&byte| matches!(byte, b'>' | b' ' | b'\t' | b'\n' | b'/'))
+        })
     })
+}
+
+/// Whether `line` contains a closing `</script>`, `</style>` or `</template>` tag
+/// anywhere in it, case-insensitively.
+fn closes_non_rendering_element(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["script", "style", "template"]
+        .iter()
+        .any(|tag| lower.contains(&format!("</{tag}>")))
 }
 
 /// Appends one `Event::Html` line to `out`, comment subranges cut out of it, tracking
