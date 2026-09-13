@@ -2902,7 +2902,14 @@ register is actually live. And `emulation-boot`'s extern-block exemption was a b
 rather than the one keyword's own offset the two permitted functions are each held to, so a
 second, unrelated `unsafe` sitting anywhere between the linker-symbol block's braces passed
 unnoticed; it now matches only that one offset, the same way `sole_depth_zero_unsafe` already
-does for `paint` and `high_water_mark`. See
+does for `paint` and `high_water_mark`. A third finding on that same commit is that the
+`CONTROL.SPSEL` check answered a narrower question than the one it needed to: `SPSEL` only
+governs which register *Thread mode* uses, and Handler mode — running an exception — always
+executes on MSP regardless of it, so a caller reached from a handler after Thread mode had
+selected PSP would still have read the inactive register. `current_stack_pointer` now checks
+`SCB::vect_active()` first — a safe function, reading a read-only status register with no
+side effects — and answers MSP outright in Handler mode, consulting `SPSEL` only in Thread
+mode. See
 [ADR 0042](docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

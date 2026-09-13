@@ -100,18 +100,25 @@ fn clamp_to_stack_region(depth_from: usize) -> usize {
 ///
 /// A local's address depends on where a compiler chooses to place it within its frame, which
 /// this workspace's own layering rules do not promise and a future rebuild could change. The
-/// stack pointer is the one number that is always exactly where the hardware says it is —
-/// but Thread mode has *two* candidates, MSP and PSP, and the `CONTROL` register's `SPSEL` bit
-/// says which one is live. This image never touches `SPSEL` — nothing here runs an RTOS or a
-/// second stack — so MSP is the only stack that has ever been selected, and reading it
-/// unconditionally happened to agree with the active pointer for that reason alone. That
-/// reason is a fact about how this crate is used today, not one `current_stack_pointer`'s own
-/// signature states, so a future caller in a different execution context — this function is
-/// `pub`, and nothing pins it to one file the way `paint` and `high_water_mark` are — could
-/// read `SPSEL == Psp` and still get MSP back. Reading `CONTROL` first closes that: whichever
-/// stack Thread mode is actually using is the one this returns.
+/// stack pointer is the one number that is always exactly where the hardware says it is — but
+/// which register that is depends on the processor mode. Handler mode — running an exception
+/// — always executes on MSP, whatever `CONTROL.SPSEL` says; only Thread mode consults `SPSEL`
+/// at all, and then it names MSP or PSP. This image never touches `SPSEL` and never installs a
+/// handler that calls this — nothing here runs an RTOS or a second stack — so MSP has in fact
+/// always been the active register, and reading it unconditionally happened to agree with that
+/// for reasons this function's own signature does not state: it is `pub`, and nothing pins it
+/// to one file the way `paint` and `high_water_mark` are, so a future caller reached from a
+/// handler after Thread mode had selected PSP could still get the wrong register back from a
+/// check of `SPSEL` alone. `SCB::vect_active()` is checked first, so Handler mode always
+/// answers MSP regardless of `SPSEL`, and only Thread mode's own selection is consulted at all.
 #[must_use]
 pub fn current_stack_pointer() -> usize {
+    if !matches!(
+        cortex_m::peripheral::SCB::vect_active(),
+        cortex_m::peripheral::scb::VectActive::ThreadMode
+    ) {
+        return cortex_m::register::msp::read() as usize;
+    }
     match cortex_m::register::control::read().spsel() {
         cortex_m::register::control::Spsel::Psp => cortex_m::register::psp::read() as usize,
         cortex_m::register::control::Spsel::Msp => cortex_m::register::msp::read() as usize,

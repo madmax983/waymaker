@@ -217,6 +217,17 @@ is stored and matched exactly, so a sibling `unsafe` elsewhere in the block is r
 than inherited. `a_second_unsafe_hidden_inside_the_extern_block_is_reported` is the test
 watched failing against the old range check before this closed it.
 
+**`SPSEL` is a Thread-mode question, and a ninth finding is that the seventh's own fix
+answered it unconditionally.** Handler mode — running an exception — always executes on MSP,
+whatever `CONTROL.SPSEL` says; `SPSEL` only governs which register Thread mode uses. Nothing
+in this image installs a handler that calls `current_stack_pointer`, so the gap was again one
+of signature rather than of the one real call site — a future caller reached from an
+exception, after Thread mode had selected PSP, would have read `SPSEL` and returned the
+*inactive* register. `SCB::vect_active()` is checked first now — a safe function, reading a
+read-only status register with no side effects, the same shape of safety `msp::read()` and
+`psp::read()` already have — and Handler mode answers MSP without consulting `SPSEL` at all;
+only `VectActive::ThreadMode` reaches the `SPSEL` check the seventh finding added.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -246,7 +257,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the eight hardenings changed what the figure means, only what a wrong caller could do
+**None of the nine hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*
