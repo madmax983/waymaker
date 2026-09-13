@@ -249,6 +249,23 @@ boot this ADR measures — it exists for the caller this crate does not have yet
 standing `CLAUDE.md`'s "What is not checked" section already states for gaps a scanner or a
 runtime check cannot see past.
 
+**Handler mode was one half of "MSP is not necessarily the stack in use", and an eleventh
+finding is that Thread mode is the other half of the same question.** The tenth's fix checked
+processor *mode* — Handler or Thread — but `SPSEL` can name PSP while Thread mode is still the
+mode in force, and nothing about being in Thread mode says PSP is inside
+`[_stack_end, _stack_start]`: a PSP reading from a stack this module knows nothing about can
+sit *above* `_stack_start` outright, at which point `clamp_to_stack_region`'s own
+`.min(current_stack_pointer())` stops narrowing anything — the region clamp alone decides the
+bound, which is exactly the protection the live-pointer check exists to add, silently absent.
+The question the clamp actually needs answered is not "which mode", but "is MSP the register
+in use at all", and Handler mode is only one of the two ways that can be true: it always
+executes on MSP outright, and Thread mode does only when `SPSEL` names it. `clamp_to_stack_region`
+now asks that question directly — `msp_is_the_stack_in_use`, which answers `true` unconditionally
+in Handler mode and defers to `SPSEL` in Thread mode — and collapses to the same empty region as
+before whenever the answer is `false`. This image selects only MSP, in Thread mode, for the
+whole of every boot this ADR measures, so — as with the tenth finding — the new branch is dead
+code here; it exists for the caller this crate does not have yet.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -278,7 +295,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the ten hardenings changed what the figure means, only what a wrong caller could do
+**None of the eleven hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*

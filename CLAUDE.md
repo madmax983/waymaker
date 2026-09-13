@@ -2918,7 +2918,17 @@ exists, whichever register correctly answered "active". `clamp_to_stack_region` 
 `SCB::vect_active()` itself and collapses to the empty region at `stack_floor()` outside
 Thread mode, reusing the same degenerate case a region no wider than `GUARD_BYTES` already
 produces — which `paint` already declines to write into and `StackUsage::shortfall` already
-refuses as a measurement that did not happen, so no new mechanism was needed to close it. See
+refuses as a measurement that did not happen, so no new mechanism was needed to close it. A
+fifth finding is that checking processor *mode* answered only half of "is MSP the register in
+use": Handler mode always executes on MSP, but Thread mode can select PSP too, and nothing
+about being in Thread mode confines a PSP reading to `[_stack_end, _stack_start]` — a PSP
+value above `_stack_start` makes `clamp_to_stack_region`'s own `.min` a no-op, silently
+dropping the live-pointer protection back to the region clamp alone. `clamp_to_stack_region`
+now asks the real question directly — `msp_is_the_stack_in_use`, true unconditionally in
+Handler mode and by `SPSEL` in Thread mode — and collapses to the same empty region whenever
+MSP is not it. This image selects only MSP, in Thread mode, for the whole of every boot this
+ADR measures, so the branch is dead code here too; it exists for the caller this crate does
+not have yet. See
 [ADR 0042](docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
