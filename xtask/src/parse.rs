@@ -1059,29 +1059,50 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     out
 }
 
-/// Appends one `Event::Html` line to `out` unless it is hidden or part of a comment,
-/// tracking a multi-line comment across calls via `in_html_comment`.
+/// Appends one `Event::Html` line to `out`, comment subranges cut out of it, tracking
+/// a multi-line comment across calls via `in_html_comment`.
 ///
 /// Real block-level HTML is raw passthrough with no separate `Event::Text` for its
 /// content — one `Event::Html` per source line — so a comment spanning several lines
-/// has to be tracked the way a fence's lines are, not judged one event at a time; a
-/// self-contained one-line comment never sets `in_html_comment` at all.
+/// has to be tracked the way a fence's lines are, not judged one event at a time. A
+/// comment does not have to be the whole line, either (Codex, pull request #138, round
+/// 19): `<div><!-- decision-id headline --></div>` is real HTML with a comment inside
+/// it, on one line, and checking only whether the line *starts with* `<!--` would let
+/// the comment's own hidden text ride along with the real tags around it. Every
+/// `<!--` ... `-->` span on the line is cut out instead, however many there are and
+/// wherever they sit; HTML comments do not nest, so the first `-->` found always
+/// closes the `<!--` before it.
 fn append_visible_html_line(
     html: &str,
     hidden: bool,
     in_html_comment: &mut bool,
     out: &mut String,
 ) {
-    if *in_html_comment {
-        if html.contains("-->") {
-            *in_html_comment = false;
+    let mut cursor = if *in_html_comment {
+        let Some(close) = html.find("-->") else {
+            return;
+        };
+        *in_html_comment = false;
+        close + "-->".len()
+    } else {
+        0
+    };
+    loop {
+        let Some(open_rel) = html[cursor..].find("<!--") else {
+            if !hidden {
+                out.push_str(&html[cursor..]);
+            }
+            return;
+        };
+        let open = cursor + open_rel;
+        if !hidden {
+            out.push_str(&html[cursor..open]);
         }
-    } else if html.trim_start().starts_with("<!--") {
-        if !html.contains("-->") {
+        let Some(close_rel) = html[open..].find("-->") else {
             *in_html_comment = true;
-        }
-    } else if !hidden {
-        out.push_str(html);
+            return;
+        };
+        cursor = open + close_rel + "-->".len();
     }
 }
 

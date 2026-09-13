@@ -6145,6 +6145,33 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_in_a_comment_embedded_in_real_html_does_not_count() {
+        // Codex, pull request #138, round 19: a comment does not have to be the whole
+        // line — `<div><!-- id headline --></div>` is real HTML with a comment inside
+        // it, on one `Event::Html` line, and checking only whether the line starts
+        // with `<!--` let the comment's own hidden text ride along with the real tags
+        // around it.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- {} {} --></div>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision hidden in a comment embedded in real HTML still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn ids_hidden_in_an_html_comment_do_not_record_a_decision() {
         // Otherwise an ADR reduced to a title and a block of ids in a comment passes.
         let mut ids = String::new();
