@@ -1111,10 +1111,27 @@ pub fn visible_source(contents: &str) -> String {
                 html_block_start.get_or_insert(range.start);
             }
             Event::End(TagEnd::HtmlBlock) => {
-                if let Some(start) = html_block_start.take()
-                    && contents[start..range.end].trim_start().starts_with("<!--")
-                {
-                    hidden.push((start, range.end));
+                if let Some(start) = html_block_start.take() {
+                    // A comment nested inside a block that opens with a real tag —
+                    // `<div>\n<!-- [x](y) -->\n</div>` — is still a comment, and the
+                    // whole block does not start with `<!--` for that reason (Codex,
+                    // pull request #138, round 13). One `HtmlBlock` event covers the
+                    // whole block, real tags and nested comments alike, so each
+                    // `<!--` ... `-->` span inside it is hidden on its own rather than
+                    // requiring the block to be nothing but a comment. HTML comments do
+                    // not nest, so the first `-->` always closes the `<!--` before it;
+                    // an unterminated `<!--` hides nothing, the same as before.
+                    let block = &contents[start..range.end];
+                    let mut cursor = 0usize;
+                    while let Some(open) = block[cursor..].find("<!--") {
+                        let open = cursor + open;
+                        let Some(close) = block[open..].find("-->") else {
+                            break;
+                        };
+                        let end = open + close + "-->".len();
+                        hidden.push((start + open, start + end));
+                        cursor = end;
+                    }
                 }
             }
             // Inline HTML has no enclosing tag, so a self-contained inline comment,
@@ -1211,6 +1228,15 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                 item.push_str(&code);
                 item.push('`');
             }
+            // A line break inside the item disqualifies it (Codex, pull request #138,
+            // round 13): the text before and after one are two separate `Event::Text`
+            // events, and concatenating them bare reconstructs a one-line-looking field
+            // out of a value split across a line on purpose — `- Sta\n  tus: accepted`
+            // becomes `Status: accepted` with the break silently dropped. An ADR field
+            // is one line, so a break means this item is not one; `collecting` drops
+            // rather than being kept for `End(TagEnd::Item)` to still try matching what
+            // was gathered before the break.
+            Event::SoftBreak | Event::HardBreak if collecting => collecting = false,
             _ => {}
         }
     }

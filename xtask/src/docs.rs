@@ -5656,6 +5656,16 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_status_split_by_a_line_break() {
+        // Codex, pull request #138, round 13: a line break inside an item is a
+        // `SoftBreak` event between two `Text` events, and concatenating the two
+        // bare reconstructs the field the break was meant to split — `- Sta\n  tus:
+        // accepted` becomes `Status: accepted`, dropping the break silently.
+        let contents = "# ADR\n\n- Sta\n  tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -5947,6 +5957,36 @@ mod tests {
         }];
         let violations = check_adr_index(Some(index), &adrs);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_comment_nested_inside_a_real_html_block_does_not_vouch_for_the_link_inside_it() {
+        // Codex, pull request #138, round 13: a comment inside a block that opens with
+        // a real tag, `<div>\n<!-- ... -->\n</div>`, is still one `Tag::HtmlBlock` event
+        // covering the whole thing, and the old check only hid the block when it started
+        // with `<!--` — so a comment nested inside real HTML was never hidden at all.
+        let index = "<div>\n<!-- [0002-two.md](0002-two.md) -->\n</div>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link inside a comment nested in real HTML counted as a real one: {violations:?}"
+        );
     }
 
     #[test]
