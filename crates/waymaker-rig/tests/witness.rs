@@ -431,6 +431,27 @@ fn with_iteration(iteration: u32) -> Progress {
 }
 
 #[test]
+fn a_run_of_many_marks_round_trips_its_full_count() {
+    // Issue #81: `Rig::marks_per_run(effects)` is `5 * effects + 4`. A run of 51 effects or
+    // more writes more than 255 marks. The old encoding narrowed the count to one byte. The
+    // log line then understated what the instrument actually saw.
+    let mut progress = Progress::EMPTY;
+    for index in 0..300_u16 {
+        progress = progress.raising(Stage::Attempted, index);
+    }
+    assert_eq!(progress.marks(), 300);
+    let mut bytes = [0_u8; Progress::ENCODED_BYTES];
+    assert_eq!(progress.encode(&mut bytes), Some(Progress::ENCODED_BYTES));
+    let read = Progress::decode(&bytes).expect("a whole progress");
+    assert_eq!(
+        read.marks(),
+        300,
+        "the mark count was narrowed by the encoding"
+    );
+    assert_eq!(read, progress);
+}
+
+#[test]
 fn an_undefined_flag_bit_is_not_a_witness() {
     // The same rule the mark's reserved byte is held to: a bit nothing reads is a bit nothing
     // can detect a change in.

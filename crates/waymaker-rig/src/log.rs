@@ -22,8 +22,8 @@
 //! * **the witness** — the three high waters, the mark count and the tear flag. This is the
 //!   field that makes the "done when" true rather than nearly true: the seed rebuilds the
 //!   *run*, but §14's guarantees are entirely statements about what the rig **knew**, and
-//!   without these twelve bytes a violation is only reproducible while the host still has the
-//!   device that produced it.
+//!   without these fifteen bytes a violation is only reproducible while the host still has
+//!   the device that produced it.
 //! * **the wear** — issue #27's fourth work item, per iteration, so the published figure is a
 //!   sum of lines rather than a number somebody typed.
 //!
@@ -49,13 +49,25 @@ use crate::wear::Wear;
 use crate::witness::Progress;
 
 /// How many bytes an encoded entry occupies.
-pub const ENTRY_BYTES: usize = 92;
+///
+/// Issue #81 grew [`Progress::ENCODED_BYTES`] from twelve to fifteen, so this is 95, not 92.
+/// [`Entry::FORMAT_VERSION`] moved with it.
+pub const ENTRY_BYTES: usize = 95;
 
 /// The magic an entry opens with.
 const ENTRY_MAGIC: u16 = 0x4752;
 
 /// How many bytes of an entry the check covers.
 const ENTRY_BODY_BYTES: usize = ENTRY_BYTES - 4;
+
+/// How many bytes a v1 entry occupied, before issue #81 widened the witness's mark count.
+///
+/// The one older length this build knows well enough to verify. A build only ever wrote at
+/// one version until this one, so this is the whole of the read set's history so far.
+const V1_ENTRY_BYTES: usize = 92;
+
+/// How many bytes of a v1 entry its own check covered.
+const V1_ENTRY_BODY_BYTES: usize = V1_ENTRY_BYTES - 4;
 
 /// The text every rendered line opens with.
 const LINE_PREFIX: &str = "waymaker-rig ";
@@ -292,7 +304,10 @@ pub struct Entry {
 
 impl Entry {
     /// The format version this build writes and reads.
-    pub const FORMAT_VERSION: u8 = 1;
+    ///
+    /// This is 2. Issue #81 widened [`Progress`]'s mark count from one byte to four. The
+    /// reader refuses a line from another version. It never misreads one.
+    pub const FORMAT_VERSION: u8 = 2;
 
     /// The longest line [`render`](Self::render) produces.
     pub const LINE_BYTES: usize = LINE_PREFIX.len() + 64 + 2 * ENTRY_BYTES;
@@ -504,14 +519,29 @@ impl Entry {
     /// As [`decode`](Self::decode).
     pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Self, LogError> {
         let Some(slot) = bytes.get(..ENTRY_BYTES) else {
-            return Err(LogError::ShortBuffer);
+            // Too short for this build's own length. A real v1 line is genuinely 92 bytes,
+            // not merely short for a 95-byte read, so check for one on its own sealed
+            // length before giving up on the buffer as too short to be anything.
+            return Err(
+                v1_version::<C>(bytes).map_or(LogError::ShortBuffer, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         };
         let (body, seal) = slot.split_at(ENTRY_BODY_BYTES);
         let Ok(seal) = <[u8; 4]>::try_from(seal) else {
             return Err(LogError::NotAnEntry);
         };
         if C::frame_check(body) != u32::from_le_bytes(seal) {
-            return Err(LogError::NotAnEntry);
+            // Not this build's own version at this length. A genuine v1 line, three bytes
+            // shorter, can still be sitting at the front of the same buffer -- a caller
+            // holding a scratch page sized for this build should not have to know which
+            // version is in it before checking.
+            return Err(
+                v1_version::<C>(bytes).map_or(LogError::NotAnEntry, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         }
 
         let mut reader = Reader { bytes: body, at: 0 };
@@ -640,7 +670,8 @@ impl Entry {
     ///
     /// # Errors
     ///
-    /// [`LogError::NotAnEntry`] for a line that is not one, and whatever
+    /// [`LogError::NotAnEntry`] for a line that is not one, [`LogError::UnknownVersion`] for
+    /// a line at a length this build has never written, and whatever
     /// [`decode`](Self::decode) refuses the bytes with.
     pub fn parse(line: &[u8]) -> Result<Self, LogError> {
         // Trimmed at both ends before anything else. A rig's transport is a serial port and a
@@ -658,7 +689,13 @@ impl Entry {
                 rest.get(position.saturating_add(1)..).unwrap_or_default()
             });
         if tail.len() != 2 * ENTRY_BYTES {
-            return Err(LogError::NotAnEntry);
+            // The wrong length for this build. A real v1 line hex-decodes to its own
+            // sealed, 92-byte length, so check for one before giving up on the line.
+            return Err(
+                v1_version_from_hex(tail).map_or(LogError::NotAnEntry, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         }
         let mut bytes = [0_u8; ENTRY_BYTES];
         for (slot, pair) in bytes.iter_mut().zip(tail.chunks_exact(2)) {
@@ -694,6 +731,60 @@ const fn unnibble(digit: u8) -> Option<u8> {
         b'A'..=b'F' => Some(10 + digit - b'A'),
         _ => None,
     }
+}
+
+/// The version of a genuine, correctly sealed v1 entry, or `None`.
+///
+/// A magic and a version byte that merely *look* like a v1 line are not evidence of one:
+/// issue #81, round 2, found that any length with that three-byte prefix was accepted, so
+/// noise or a truncated buffer with a coincidental match read as a real historical line.
+/// This checks the length and the seal a v1 writer actually produced. Corrupted data would
+/// then also have to collide with a 32-bit check, the same odds every other refusal in this
+/// file already rests on.
+fn v1_version<C: IntegrityCheck>(bytes: &[u8]) -> Option<u8> {
+    // The front of `bytes`, tolerating trailing bytes beyond it -- the same convention
+    // `decode_with` already applies to its own, longer length, so a caller's buffer sized
+    // for this build does not stop a v1 line from being recognised at the front of it.
+    let (body, seal) = bytes.get(..V1_ENTRY_BYTES)?.split_at(V1_ENTRY_BODY_BYTES);
+    let seal = <[u8; 4]>::try_from(seal).ok()?;
+    if C::frame_check(body) != u32::from_le_bytes(seal) {
+        return None;
+    }
+    let magic = <[u8; 2]>::try_from(body.get(..2)?).ok()?;
+    if u16::from_le_bytes(magic) != ENTRY_MAGIC {
+        return None;
+    }
+    let version = *body.get(2)?;
+    if version != 1 {
+        return None;
+    }
+    // The reserved word sits at the same offset in both formats: issue #81 widened the
+    // witness block near the end of the body, not the header. A real v1 writer zeroed it,
+    // for the reason `decode_with` refuses a nonzero one on its own version -- a bit
+    // nothing reads is a bit nothing can detect drift in, unless something checks it.
+    let reserved = <[u8; 2]>::try_from(body.get(18..20)?).ok()?;
+    if u16::from_le_bytes(reserved) != 0 {
+        return None;
+    }
+    Some(version)
+}
+
+/// The same, for [`Entry::parse`]'s hex tail.
+fn v1_version_from_hex(tail: &[u8]) -> Option<u8> {
+    if tail.len() != 2 * V1_ENTRY_BYTES {
+        return None;
+    }
+    let mut bytes = [0_u8; V1_ENTRY_BYTES];
+    for (slot, pair) in bytes.iter_mut().zip(tail.chunks_exact(2)) {
+        let (Some(high), Some(low)) = (pair.first(), pair.get(1)) else {
+            return None;
+        };
+        let (Some(high), Some(low)) = (unnibble(*high), unnibble(*low)) else {
+            return None;
+        };
+        *slot = (high << 4) | low;
+    }
+    v1_version::<Catalogued>(&bytes)
 }
 
 /// `line` without leading or trailing ASCII whitespace.

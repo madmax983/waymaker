@@ -395,6 +395,62 @@ fn a_device_that_goes_unreadable_during_verification_is_an_error_and_not_a_pass(
     assert!(refused > 0, "no read budget reached the device at all");
 }
 
+/// A device whose `erase` and `barrier` calls always refuse. Reads and programs pass through.
+///
+/// Issue #81: `Rig::prepare`'s instrument erase mapped every refusal here to
+/// `RigError::Witness(WitnessError::Region)`. That case cannot happen: the window is already
+/// validated at construction. The mapping discarded a real driver failure instead.
+struct FailsErase<'a> {
+    device: &'a mut waymaker_fault::Device,
+}
+
+impl StableStorage for FailsErase<'_> {
+    type Error = waymaker_fault::FaultError;
+
+    fn geometry(&self) -> waymaker_flash::storage::Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, _offset: u32, _len: u32) -> Result<(), Self::Error> {
+        Err(waymaker_fault::FaultError::PowerLoss)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        Err(waymaker_fault::FaultError::PowerLoss)
+    }
+}
+
+#[test]
+fn a_driver_refusal_during_the_instrument_erase_is_storage_not_a_layout_error() {
+    let part = part();
+    let rig =
+        Rig::new::<waymaker_fault::FaultError>(part, Plan::new(0), 1).expect("a legal layout");
+    let mut device = waymaker_fault::Device::new(part);
+    let mut failing = FailsErase {
+        device: &mut device,
+    };
+    let mut metered = Metered::new(&mut failing);
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let error = rig
+        .prepare(&mut metered, 0, &mut page)
+        .expect_err("the instrument erase always refuses");
+    assert!(
+        matches!(
+            error,
+            RigError::Storage(waymaker_fault::FaultError::PowerLoss)
+        ),
+        "a real driver refusal was reported as {error:?}, not RigError::Storage"
+    );
+}
+
 #[test]
 fn a_witness_too_small_for_the_whole_run_is_refused_at_construction() {
     // A clean run writes `5 * effects + 4` marks — three for every schedule record, two for
