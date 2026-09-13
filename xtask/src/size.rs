@@ -1162,6 +1162,22 @@ impl SizeReport {
             // the budget for "core + flash adapter", and issue #72 is that the probe's own
             // arithmetic had grown to more than a third of what was being gated.
             let layers = Self::layers_of(row, baseline);
+            // The whole-image delta saturates, so a row that links *less* than the
+            // baseline displays `Δflash` 0 while `probe` keeps its sign and `layers`
+            // keeps its growth: `probe` + `layers` no longer reconciles with
+            // `Δflash`, and the rendered row contradicts the table's own legend. A
+            // row that links less is a measurement fault rather than a negative
+            // cost — [`SectionSizes::saturating_delta`]'s reason — so it is refused
+            // rather than rendered.
+            if row.sizes.flash < baseline.sizes.flash {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` links {} B less flash than the baseline, which the saturating image delta reads as 0 while `probe` keeps its sign; the row cannot reconcile, so it is not a measurement",
+                        row.name,
+                        baseline.sizes.flash - row.sizes.flash,
+                    ),
+                });
+            }
             // A gated row links the kernel and the flash adapter, which cannot cost
             // nothing — the baseline's own zero is refused above for that reason. Two
             // routes reach this one, and both are faults rather than results: the linker
@@ -4760,6 +4776,43 @@ mod tests {
         assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(0));
         assert!(
             rendered(&report.shortfalls()).contains("cannot cost nothing"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_gated_row_that_links_less_than_the_baseline_is_not_a_measurement() {
+        // A shrinking probe with growing layers reads `probe` negative, `layers`
+        // positive, and the saturating whole-image delta 0: `probe` + `layers` no
+        // longer reconciles with `Δflash`, so the row is a measurement fault rather
+        // than a negative cost.
+        let base = baseline_sizes();
+        let row = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: base.text - 5,
+                flash: base.flash - 5,
+                ..base
+            },
+            BASELINE_PROBE_FLASH - 8,
+            true,
+        );
+        let report = SizeReport::new(
+            vec![baseline_row(), row],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.probe_delta_signed_of(DEFAULT_ROW), Some(-8));
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(3));
+        assert_eq!(
+            report.delta_of(DEFAULT_ROW).map(|delta| delta.flash),
+            Some(0)
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("cannot reconcile"),
             "{:?}",
             report.shortfalls()
         );

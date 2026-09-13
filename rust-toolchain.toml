@@ -7,9 +7,11 @@
 # run the firmware build too. `cargo xtask check-layering` fails if it is removed.
 #
 # `thumbv7em-none-eabi` is the second one, and it is the `emulate` stage's: `cargo xtask
-# emulate` links the rig into an image for each of the two architectures Waymaker is built
-# for and starts both under QEMU. `emulation-boot` fails a build in which a machine's target
-# is not pinned here, so the two lists cannot drift.
+# emulate` links the rig into an image for each ARM architecture Waymaker is built for and
+# starts both under QEMU. `emulation-boot` fails a build in which a machine's ARM target is
+# not pinned here, so the two lists cannot drift. The ESP32-S3's
+# `xtensa-esp32s3-none-elf` exists only in the Espressif fork toolchain — no channel this
+# file can name ships it — so it cannot be pinned here and the rule exempts it.
 [toolchain]
 channel = "1.97"
 # `llvm-tools-preview` is what `cargo llvm-cov` needs; without it here the tool installs it

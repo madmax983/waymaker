@@ -74,13 +74,47 @@ A board cannot complete the failure matrix, and nothing asks it to. The rig reac
 its ten rows by design. To tell three of those six apart, you must know whether the
 dispatcher ran and returned. A harness knows that. A reset takes it with the RAM.
 
-`waymaker-rig` links on the target. Since the `emulate` stage it also *runs* on two of
-them, under QEMU: a Cortex-M0 and a Cortex-M4. That is the two architectures Waymaker is
-built for, executing the rig's own code — and it is not two parts.
+`waymaker-rig` links on the target. Since the `emulate` stage it also *runs* on three of
+them, under QEMU: a Cortex-M0 (ARMv6-M) and a Cortex-M4 (ARMv7E-M), and an ESP32-S3 (Xtensa
+LX7). That is every architecture Waymaker is built for, executing the rig's own code — and
+it is not three parts.
 
-An emulated core has no NOR flash, no supply to remove, no reset-cause register and no
-backup domain. QEMU has no Cortex-M0+ at all. So every row above stays `Not run`, and the
-emulated boot may not be cited to move one. See
+The ESP32-S3 joins the run only when `WAYMAKER_XTENSA_OPT_IN` is set. Its toolchain, its
+emulator, its cargo cache, `esptool`, and the emulator's libraries are provisioned beside
+the checkout rather than in CI, so the CI `emulation` job runs the ARM pair. An opted-in
+machine with missing dependencies still fails the run rather than skipping: the opt-in
+chooses the machines, it never excuses a missing one.
+
+The ESP32-S3 run is emulation, not hardware: no physical board has ever run Waymaker. Its
+image is built by the Espressif Rust fork — `espup` installs it as the `esp` toolchain —
+because only the fork knows `xtensa-esp32s3-none-elf`. The build needs `-Z build-std=core`
+(the fork ships prebuilt std for the host alone), links against the crate's
+`memory-xtensa.x` through the toolchain's GCC driver with `-nostartfiles` (so no toolchain
+`crt0` supplies its own `_start`) — the driver is `xtensa-esp32s3-elf-gcc` in
+`~/.rustup/toolchains/esp/xtensa-esp-elf/esp-15.2.0_20250920/xtensa-esp-elf/bin`, which
+the build puts on `PATH` itself rather than requiring the toolchain's export script —
+and goes through `esptool elf2image` (from `~/workspace/esptools/py`)
+into a 4 MiB flash image with the image at offset `0x0` — the offset the S3 ROM loads the
+boot image from, the one real hardware boots. The QEMU is the Espressif fork at 9.2.2
+(`esp_develop_9.2.2_20260417`), at `~/workspace/waymaker/esp32s3/qemu/bin/qemu-system-xtensa`,
+started as
+
+```console
+qemu-system-xtensa -nographic -machine esp32s3 \
+    -drive file=flash_image.bin,if=mtd,format=raw \
+    -serial file:uart0.log -monitor none -no-reboot
+```
+
+The guest never exits, so the harness polls `uart0.log` for the census and terminates QEMU
+itself once a complete one is there. Starting the ELF directly with `-kernel` was never
+verified — ROM boot from the flash image is the only verified path. The fork's binary
+links against libraries no package manager provides (`libslirp.so.0` among them); the
+harness puts `~/workspace/tooling/qemu-esp32/libs/usr/lib/x86_64-linux-gnu` on
+`LD_LIBRARY_PATH`, as the spike verified.
+
+No emulated machine has NOR flash, a supply to remove, a reset-cause register or a backup
+domain. QEMU has no Cortex-M0+ at all. So every row above stays `Not run`, and no emulated
+boot may be cited to move one. See
 [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
 `waymaker-rig` has never run on a board.

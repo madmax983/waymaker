@@ -48,7 +48,7 @@ pub const ERASED: u8 = 0xFF;
 /// Small on purpose. The image is linked against 16 KiB of RAM — the micro:bit's — and this
 /// array is a local of the boot rather than a `static`, so it is spent out of that. Sixteen
 /// erase blocks is more than the rig's window and the conformance region need between them,
-/// and every byte beyond that is stack the tighter of the two machines does not have.
+/// and every byte beyond that is stack the tightest of the three machines does not have.
 pub const CAPACITY: u32 = 4096;
 
 /// The erase block, in bytes.

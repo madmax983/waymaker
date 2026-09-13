@@ -758,13 +758,6 @@ impl Witness {
     }
 
     /// Every slot, and the index of the first erased one after the last used one.
-    ///
-    /// Marks are appended in order, so the first slot that reads as erased ends the marks:
-    /// every slot from there to the end of the region must be erased too, or this is a
-    /// [`WitnessError::Hole`], and nothing past that point can still be a mark. Once that
-    /// slot is found, [`verify_erased_to_end`](Self::verify_erased_to_end) confirms it a
-    /// page at a time rather than reading and decoding one twelve-byte slot at a time for
-    /// however much of the region is capacity nothing has used yet.
     fn read<S: StableStorage>(
         self,
         storage: &mut S,
@@ -772,6 +765,7 @@ impl Witness {
     ) -> Result<(Progress, u32), WitnessError<S::Error>> {
         let slot_bytes = self.check(storage, page)?;
         let mut progress = Progress::default();
+        let mut ended = false;
         let mut next = 0_u32;
 
         for index in 0..self.region.capacity() {
@@ -783,15 +777,21 @@ impl Witness {
             };
             storage.read(offset, slot).map_err(WitnessError::Driver)?;
 
+            let erased = slot.iter().all(|byte| *byte == 0xFF);
             match Mark::decode(slot) {
-                Ok(mark) => {
+                Ok(mark) if !ended => {
                     progress = progress.accept(mark).map_err(promote)?;
                     next = index.saturating_add(1);
                 }
-                Err(_) if slot.iter().all(|byte| *byte == 0xFF) => {
-                    self.verify_erased_to_end(storage, page, offset)?;
-                    return Ok((progress, next));
+                Ok(_) => return Err(WitnessError::Hole),
+                // Everything past the end must be erased. Anything else is a second region
+                // of writing, which marks are never appended as.
+                Err(_) if ended => {
+                    if !erased {
+                        return Err(WitnessError::Hole);
+                    }
                 }
+                Err(_) if erased => ended = true,
                 // A mark the reset tore. The next boot appends after it.
                 Err(_) => {
                     progress.torn = true;
@@ -800,60 +800,6 @@ impl Witness {
             }
         }
         Ok((progress, next))
-    }
-
-    /// Confirms every byte from `from` to the end of the region reads as erased.
-    ///
-    /// The caller has already found the first erased slot at `from`; what is left is a
-    /// region that, by construction, is either wholly erased or a [`WitnessError::Hole`] —
-    /// nothing in it can still decode as a mark, because marks are appended in order and
-    /// this is the first slot that was not one. So this reads `page`'s worth of the region
-    /// at a time rather than one slot at a time, which is the same trade
-    /// `waymaker_flash::recovery`'s own erased-tail walk makes over the same shape of cost.
-    fn verify_erased_to_end<S: StableStorage>(
-        self,
-        storage: &mut S,
-        page: &mut [u8],
-        from: u32,
-    ) -> Result<(), WitnessError<S::Error>> {
-        let region = self.region;
-        let Some(end) = region
-            .capacity()
-            .checked_mul(region.slot_bytes())
-            .and_then(|span| region.base().checked_add(span))
-        else {
-            return Err(WitnessError::Region);
-        };
-        let read_unit = region.geometry().read_size();
-        let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
-        // Rounded down to a whole number of read units, the same arithmetic
-        // `waymaker_flash::recovery`'s page-bounded reader uses for the same reason: every
-        // read this issues has to be one `StableStorage::read` may accept.
-        let chunk = page_bytes & !read_unit.wrapping_sub(1);
-        if chunk == 0 {
-            return Err(WitnessError::ShortBuffer);
-        }
-
-        let mut at = from;
-        while at < end {
-            let want = chunk.min(end - at);
-            let Ok(want_bytes) = usize::try_from(want) else {
-                return Err(WitnessError::ShortBuffer);
-            };
-            let Some(slice) = page.get_mut(..want_bytes) else {
-                return Err(WitnessError::ShortBuffer);
-            };
-            storage.read(at, slice).map_err(WitnessError::Driver)?;
-            if !slice.iter().all(|byte| *byte == 0xFF) {
-                return Err(WitnessError::Hole);
-            }
-            // `want` is at least one read unit whenever `at < end`, so this always advances.
-            let Some(next) = at.checked_add(want) else {
-                return Err(WitnessError::Region);
-            };
-            at = next;
-        }
-        Ok(())
     }
 }
 
