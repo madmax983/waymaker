@@ -1863,12 +1863,13 @@ pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Viola
 /// comparison and this is a shape, and a reader chasing one does not have to read the
 /// other.
 ///
-/// Fails closed four ways, each reported rather than read as a pass: the file does not
-/// parse, so none of the checks below can be run; the file invokes a macro at module
-/// scope, which could expand to a `Clone` impl this scan cannot see; the file parses but
-/// declares no `Recovery` struct at all, which is a rename this pin must not read as "no
-/// `Clone` found"; or it declares one that is `Clone`, by a derive or by a handwritten
-/// `impl`.
+/// Fails closed five ways, each reported rather than read as a pass: the module tree
+/// rooted at `recovery.rs` cannot be walked (an unparseable file, or an out-of-line `mod`
+/// this scan cannot resolve to exactly one scanned file); a file that tree reaches, in
+/// production, invokes a macro this scan cannot expand; the root file parses but declares
+/// no `Recovery` struct at all, which is a rename this pin must not read as "no `Clone`
+/// found"; or `Recovery` is `Clone`, by a derive in the root file or by a handwritten
+/// `impl` anywhere the tree reaches.
 fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
     const RULE: &str = "recovery-surface";
     const ADAPTER: &str = "waymaker-flash";
@@ -1877,29 +1878,38 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
         // `check_pinned_surface`, called just above, already reports a missing module.
         return Vec::new();
     };
-    match crate::parse::declares_item_macro(&source.contents) {
-        Ok(false) => {}
-        Ok(true) => {
-            return vec![Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{RECOVERY_SURFACE_PATH} invokes a macro at module scope: this scan \
-                     cannot expand it, so whether it generates a `Clone` impl for \
-                     `{RECOVERY_TYPE}` cannot be ruled out"
-                ),
-            )];
-        }
+    // Codex review of this change (PR #143), round 12: an out-of-line `mod clone_impl;`
+    // in `recovery.rs` has no content in `recovery.rs`'s own text at all — its body
+    // lives in a sibling file this function never looked at — and that sibling can
+    // write `impl Clone for super::Recovery` or invoke a macro that does, with neither
+    // caught by anything below that reads only `source.contents`. `module_tree` is the
+    // walk `integrity-check`'s table scan already uses for the identical shape of
+    // problem (a `mod` this scan cannot resolve to exactly one scanned file), so this
+    // reuses it rather than re-deriving the same fail-closed resolution a second time.
+    let (production_reachable, _test_only) = match module_tree(sources, source) {
+        Ok(reachable) => reachable,
         Err(error) => {
             return vec![Violation::new(
                 RULE,
                 ADAPTER,
                 format!(
-                    "{RECOVERY_SURFACE_PATH} does not parse, so whether it invokes a \
-                     macro that could generate `Clone` for `{RECOVERY_TYPE}` cannot be \
-                     checked: {error}"
+                    "{RECOVERY_SURFACE_PATH}'s module tree {error}, so whether it reaches \
+                     a `Clone` impl for `{RECOVERY_TYPE}` cannot be checked"
                 ),
             )];
+        }
+    };
+    for path in &production_reachable {
+        // `find_source` matches by suffix; `module_tree` already resolved this path to
+        // exactly one of `sources`, so an exact match is what is wanted here.
+        let Some(reached) = sources
+            .iter()
+            .find(|candidate| candidate.path.replace('\\', "/") == *path)
+        else {
+            continue;
+        };
+        if let Some(violation) = recovery_reachable_file_is_clone_free(path, &reached.contents) {
+            return vec![violation];
         }
     }
     let derived = match crate::parse::struct_derives(&source.contents, RECOVERY_TYPE) {
@@ -1925,19 +1935,6 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
             )];
         }
     };
-    let handwritten = match crate::parse::trait_implementors(&source.contents, "Clone") {
-        Ok(implementors) => implementors,
-        Err(error) => {
-            return vec![Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{RECOVERY_SURFACE_PATH} does not parse, so its `Clone` implementors \
-                     cannot be checked: {error}"
-                ),
-            )];
-        }
-    };
     if derived
         .iter()
         .any(|name| name == crate::parse::UNRESOLVED_DERIVE)
@@ -1952,11 +1949,9 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
             ),
         )];
     }
-    let is_clone = derived.iter().any(|name| name == "Clone")
-        || handwritten
-            .iter()
-            .any(|implementor| implementor == RECOVERY_TYPE);
-    if !is_clone {
+    // A handwritten `impl Clone`, anywhere the module tree reaches, is already handled
+    // by the loop above — this is only the derive half.
+    if !derived.iter().any(|name| name == "Clone") {
         return Vec::new();
     }
     vec![Violation::new(
@@ -1968,6 +1963,73 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
              anyway (issue #77)"
         ),
     )]
+}
+
+/// A violation over `contents`, one file [`check_recovery_is_not_clone`]'s module-tree
+/// walk reached at `path` — a macro this scan cannot expand, or a handwritten `impl
+/// Clone` for [`RECOVERY_TYPE`] — or [`None`] if neither is there.
+///
+/// Split out of [`check_recovery_is_not_clone`] to keep the per-file checks readable on
+/// their own; every reachable file, root included, is checked the same way.
+fn recovery_reachable_file_is_clone_free(path: &str, contents: &str) -> Option<Violation> {
+    const RULE: &str = "recovery-surface";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::declares_item_macro(contents) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} invokes a macro this scan cannot expand, so whether it \
+                     generates a `Clone` impl for `{RECOVERY_TYPE}` cannot be ruled out"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so whether it invokes a macro that could \
+                     generate `Clone` for `{RECOVERY_TYPE}` cannot be checked: {error}"
+                ),
+            ));
+        }
+    }
+    // Every file the tree reaches is read for a handwritten `impl`, the root included:
+    // `trait_implementors` resolves an implementor by its type's own last path segment,
+    // so `impl Clone for super::Recovery` in a child module is caught here the same way
+    // `impl Clone for Recovery` in the root file is.
+    let handwritten = match crate::parse::trait_implementors(contents, "Clone") {
+        Ok(implementors) => implementors,
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so its `Clone` implementors cannot be \
+                     checked: {error}"
+                ),
+            ));
+        }
+    };
+    if handwritten
+        .iter()
+        .any(|implementor| implementor == RECOVERY_TYPE)
+    {
+        return Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{path} implements `Clone` for `{RECOVERY_TYPE}`: `Journal::after` takes \
+                 it by value so one scan cannot hand out two writers, and a clone hands \
+                 out two writers from one scan anyway (issue #77)"
+            ),
+        ));
+    }
+    None
 }
 
 /// The file whose public surface [`check_rig_oracle`] pins: the rig's oracle.
@@ -10738,6 +10800,66 @@ mod tests {
         ));
         let violations = check_recovery_surface(&expression_macro);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_handwritten_clone_in_an_out_of_line_submodule_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 12: an out-of-line
+        // `mod clone_impl;` has no content in `recovery.rs`'s own text at all — its body
+        // lives in a sibling file this check never read before — and that sibling can
+        // write `impl Clone for super::Recovery` with nothing in `recovery.rs` itself to
+        // catch it. `trait_implementors` already resolves an implementor by its type's
+        // last path segment, so once the module tree is walked to find this file at
+        // all, the existing check needs no change to read it correctly.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_an_out_of_line_submodule_is_rejected() {
+        // The macro-invocation half of the same finding: a `mod clone_impl;` file could
+        // just as easily invoke a macro that expands to `impl Clone for super::Recovery`
+        // rather than writing the `impl` by hand, and `declares_item_macro` needs the
+        // same module-tree walk to ever see that file's contents at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "generate_clone_impl!(super::Recovery);\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
     }
 
     #[test]
