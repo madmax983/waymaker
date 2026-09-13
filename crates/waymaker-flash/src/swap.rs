@@ -458,7 +458,7 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     ///
     /// On success the bank to install into is the one the device did **not** boot from, the
     /// generation is strictly greater than the one it did, the next run's id differs from
-    /// the retired one, and [`Installed::region`] is a journal that bank really has room
+    /// the retired one, and [`Installed::recovery`] is a journal that bank really has room
     /// for. Nothing has been read, programmed, erased or barriered.
     ///
     /// # Errors
@@ -762,9 +762,11 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
 /// §10 step 7's other half: what a caller does *after* a successful swap. This type carries
 /// the check `C` the swap sealed with. See [`recovery`](Self::recovery) for why.
 ///
-/// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to drop `C`.
-/// The old docs said no later step reads or writes a seal. That is true of `reclaim`. It is
-/// not true if a caller uses [`region`](Self::region) with the wrong check.
+/// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to drop `C`
+/// and hand back a bare `JournalRegion`. The old docs said no later step reads or writes a
+/// seal. That is true of `reclaim`. It was not true of a region a caller could read with the
+/// wrong check — so this type keeps `C` and hands back only a [`Recovery`](Self::recovery)
+/// already keyed to it.
 ///
 /// # Why it is not `Copy`
 ///
@@ -796,34 +798,25 @@ impl<C: IntegrityCheck> Installed<C> {
         }
     }
 
-    /// The journal the new run writes into.
+    /// A [`Recovery`] of the journal the new run writes into, keyed to the check `C` this
+    /// bank was sealed with.
     ///
     /// Validated at [`Swap::beginning`], before the erase, so this costs the caller no
-    /// second chance to get §10's chain wrong. Every byte of it is erased media: step 2
-    /// erased the whole bank and step 3 programmed only the header in front of this region,
-    /// so a [`Recovery`] over it ends [`Clean`](crate::recovery::Ending::Clean) at zero.
+    /// second chance to get §10's chain wrong. Every byte of the journal is erased media:
+    /// step 2 erased the whole bank and step 3 programmed only the header in front of it, so
+    /// this recovery ends [`Clean`](crate::recovery::Ending::Clean) at zero.
     ///
     /// A [`Journal`] is deliberately *not* handed back. [`Journal::after`] taking a finished
     /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
     /// and a second constructor for the writer — even one this module could prove correct —
     /// is a second way to reach an append offset that no scan vouched for.
     ///
-    /// This bank was sealed with `C`. Use [`recovery`](Self::recovery) to read it, not
-    /// [`Recovery::new`] — see there for why.
-    #[must_use]
-    pub const fn region(&self) -> JournalRegion {
-        self.plan.region
-    }
-
-    /// A [`Recovery`] of the journal this swap installed, keyed to the check `C` it was
-    /// sealed with.
-    ///
-    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): a caller may pass
-    /// [`region`](Self::region) to [`Recovery::new`] by mistake. `Recovery::new` defaults to
-    /// [`Catalogued`], the wrong check for a bank sealed with another one — recovery then
-    /// stops at the first frame with
-    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the same
-    /// journal, keyed to the right check.
+    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to hand
+    /// back the bare [`JournalRegion`] instead. A caller could pass it to [`Recovery::new`]
+    /// by mistake. `Recovery::new` defaults to [`Catalogued`], the wrong check for a bank
+    /// sealed with another one — recovery then stops at the first frame with
+    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the journal
+    /// already keyed to the right check, so that mistake has no route left.
     #[must_use]
     pub const fn recovery(&self) -> Recovery<C> {
         Recovery::with_integrity(self.plan.region)

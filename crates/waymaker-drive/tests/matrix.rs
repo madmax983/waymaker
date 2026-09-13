@@ -1192,7 +1192,7 @@ fn row_nine() -> Row {
         &mut device,
         &mut new_world,
         &mut new_workflow,
-        installed.region(),
+        installed.recovery().region(),
         NEXT_RUN,
         reserve,
     );
@@ -1202,7 +1202,7 @@ fn row_nine() -> Row {
         "the new run starts and does work"
     );
     assert_eq!(
-        history_of(&mut device, installed.region()).0,
+        history_of(&mut device, installed.recovery().region()).0,
         [Record::Started, Record::Schedule(0), Record::Outcome(0)]
     );
     assert!(

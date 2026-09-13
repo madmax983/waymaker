@@ -536,10 +536,9 @@ fn the_installed_journal_is_erased_and_takes_the_new_runs_opening_record() {
     // media — which is the one ending after which appending is safe.
     let mut device = booted();
     let installed = perform(&mut device);
-    let region = installed.region();
 
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
+    let mut recovery = installed.recovery();
     while recovery.next(&mut device, &mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: 0 }));
 
@@ -619,7 +618,7 @@ fn recovery_never_combines_the_footprints_of_the_two_runs() {
 
     // And the journal behind that header is the new run's, which is empty: the old run's
     // record is in the bank the reader did not boot.
-    let mut recovery = Recovery::new(installed.region());
+    let mut recovery = installed.recovery();
     while recovery.next(&mut device, &mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: 0 }));
 }
@@ -1040,7 +1039,7 @@ fn an_installed_run_can_write_the_opening_record_it_must_write() {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
 
-    let mut recovery = Recovery::new(installed.region());
+    let mut recovery = installed.recovery();
     while recovery.next(&mut device, &mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased journal has an append point")
@@ -1362,9 +1361,11 @@ fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
     );
 
     // Issue #85's trap: `Recovery::new` defaults to `Catalogued`. It cannot verify a
-    // journal `Other` sealed. The typed handoff stops a caller from reaching this by
-    // accident. This shows what happens if they do.
-    let mut wrong = Recovery::new(installed.region());
+    // journal `Other` sealed. `Installed` has no bare `JournalRegion` accessor any more, so
+    // reaching `Recovery::new` at all now takes a deliberate second step: pulling the region
+    // back out of a `Recovery` already keyed correctly. This shows what happens if a caller
+    // does that anyway.
+    let mut wrong = Recovery::new(installed.recovery().region());
     assert_eq!(
         wrong.next(&mut device, &mut page),
         Some(Err(RecoveryError::Decode(DecodeError::IntegrityFailed))),

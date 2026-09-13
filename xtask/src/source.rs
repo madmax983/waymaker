@@ -2563,7 +2563,6 @@ pub const SWAP_SURFACE: &[&str] = &[
     "prepare",
     "reclaim",
     "recovery",
-    "region",
     "stage",
 ];
 
