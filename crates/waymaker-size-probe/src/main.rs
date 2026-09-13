@@ -1712,10 +1712,12 @@ fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -
     };
 
     // Everything a caller does with a completed swap: where the new run writes, what the
-    // next swap begins from, and the identity space it starts in.
+    // next swap begins from, the identity space it starts in, and a reader keyed to the
+    // check it was sealed with (issue #85).
     let mut kept = (installed.region().bytes() as usize)
         .wrapping_add(generation_cost(installed.authority()))
-        .wrapping_add(usize::from(installed.allocator().peek().is_some()));
+        .wrapping_add(usize::from(installed.allocator().peek().is_some()))
+        .wrapping_add(installed.recovery().region().bytes() as usize);
     kept = kept.wrapping_add(match installed.reclaim(media) {
         Ok(()) => 1,
         Err(error) => swap_failure_cost(error),

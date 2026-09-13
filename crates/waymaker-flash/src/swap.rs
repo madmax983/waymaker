@@ -744,20 +744,27 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
     pub fn commit<S: StableStorage>(
         self,
         storage: &mut S,
-    ) -> Result<Installed, SwapStepError<S::Error>> {
+    ) -> Result<Installed<C>, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
         storage
             .program(self.plan.installing.seal_offset(), self.seal)
             .map_err(SwapStepError::Storage)?;
         storage.barrier().map_err(SwapStepError::Storage)?;
-        Ok(Installed { plan: self.plan })
+        Ok(Installed {
+            plan: self.plan,
+            check: PhantomData,
+        })
     }
 }
 
 /// A run that is on media and authoritative, and the bank the swap replaced.
 ///
-/// §10 step 7's other half: what a caller does *after* a successful swap. It is not generic
-/// over the integrity check, because nothing left to do reads or writes a seal.
+/// §10 step 7's other half: what a caller does *after* a successful swap. This type carries
+/// the check `C` the swap sealed with. See [`recovery`](Self::recovery) for why.
+///
+/// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to drop `C`.
+/// Its own docs said nothing left to do reads or writes a seal. That is true of `reclaim`. It
+/// is not true of a caller that reads [`region`](Self::region) back with the wrong check.
 ///
 /// # Why it is not `Copy`
 ///
@@ -767,11 +774,14 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
 /// of them. `Journal` is not `Copy` for the same shape of reason, one layer down.
 #[must_use = "a completed swap reports the journal the new run writes into"]
 #[derive(Debug, PartialEq, Eq)]
-pub struct Installed {
+pub struct Installed<C: IntegrityCheck = Catalogued> {
     plan: Plan,
+    /// The check this bank was sealed with. Zero-sized: [`IntegrityCheck`]'s methods take no
+    /// `self`.
+    check: PhantomData<C>,
 }
 
-impl Installed {
+impl<C: IntegrityCheck> Installed<C> {
     /// What [`bank::select`] would now say, and what the next swap begins from.
     ///
     /// Not read back from media: it is what this swap installed, and a device that
@@ -797,9 +807,26 @@ impl Installed {
     /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
     /// and a second constructor for the writer — even one this module could prove correct —
     /// is a second way to reach an append offset that no scan vouched for.
+    ///
+    /// This bank was sealed with `C`. Use [`recovery`](Self::recovery) to read it, not
+    /// [`Recovery::new`]. `Recovery::new` defaults to [`Catalogued`]. A bank sealed with
+    /// another check then stops at the first frame with
+    /// [`IntegrityFailed`](DecodeError::IntegrityFailed).
     #[must_use]
     pub const fn region(&self) -> JournalRegion {
         self.plan.region
+    }
+
+    /// A [`Recovery`] of the journal this swap installed, keyed to the check `C` it was
+    /// sealed with.
+    ///
+    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85):
+    /// [`region`](Self::region) alone lets a caller pick [`Recovery::new`] by mistake and
+    /// read this bank with [`Catalogued`]. This method returns the same journal, keyed to
+    /// the right check.
+    #[must_use]
+    pub const fn recovery(&self) -> Recovery<C> {
+        Recovery::with_integrity(self.plan.region)
     }
 
     /// An effect id allocator for the run this swap installed.

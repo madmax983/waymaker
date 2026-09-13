@@ -2562,6 +2562,7 @@ pub const SWAP_SURFACE: &[&str] = &[
     "payload_barrier",
     "prepare",
     "reclaim",
+    "recovery",
     "region",
     "stage",
 ];

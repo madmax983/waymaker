@@ -24,12 +24,15 @@
 //! [ADR 0013](https://github.com/madmax983/waymaker/blob/main/docs/adr/0013-the-fault-harness-is-a-crate-above-the-layers.md)
 //! makes for every other writer in this workspace.
 
-use waymaker_core::{EffectId, EffectIdAllocator, EffectSeq, KernelError, RecordRef, RunId};
+use waymaker_core::{
+    DecodeError, EffectId, EffectIdAllocator, EffectSeq, KernelError, RecordRef, RunId,
+};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Bounds, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ERASED_BYTE, ProgramAlign};
-use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RegionError};
+use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
+use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 use waymaker_flash::swap::{Installed, Retired, Swap, SwapError, SwapStepError};
 
@@ -1270,5 +1273,101 @@ fn a_swap_error_says_which_refusal_it_is() {
         std::format!("{}", SwapError::RunReused),
         SwapError::RunReused.message(),
         "`Display` writes the message and nothing else"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #85: the handoff keeps the check a swap sealed with
+// ---------------------------------------------------------------------------------------
+
+/// An integrity check that is not the shipped one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Other;
+
+impl IntegrityCheck for Other {
+    fn header_check(bytes: &[u8]) -> u16 {
+        !Catalogued::header_check(bytes)
+    }
+
+    fn frame_check(bytes: &[u8]) -> u32 {
+        !Catalogued::frame_check(bytes)
+    }
+}
+
+/// The whole protocol, steps 2 to 6, sealed with [`Other`] rather than the shipped check.
+fn perform_with_other(device: &mut Nor) -> Installed<Other> {
+    let retired = Retired::Recovery(Recovery::<Other>::with_integrity(current_region()));
+    let Ok(swap) = Swap::<Other>::beginning(
+        layout(),
+        Authority::Bank {
+            id: BankId::A,
+            generation: CURRENT,
+        },
+        RUN,
+        retired,
+        next_header(),
+    ) else {
+        unreachable!("this device is on a run that can roll over")
+    };
+    let mut page = [0_u8; PAGE];
+    let Ok(installed) = swap
+        .prepare(device)
+        .and_then(|prepared| prepared.stage(device, &mut page))
+        .and_then(|staged| staged.payload_barrier(device))
+        .and_then(|sealable| sealable.commit(device))
+    else {
+        unreachable!("a swap on a device that accepts every mutation succeeds")
+    };
+    installed
+}
+
+#[test]
+fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
+    let mut device = booted();
+    let installed = perform_with_other(&mut device);
+
+    // The typed handoff: `installed.recovery()` verifies with `Other`. That is the check
+    // this swap sealed with, not the default `Recovery::new` picks.
+    let mut page = [0_u8; PAGE];
+    let mut recovery = installed.recovery();
+    while recovery.next(&mut device, &mut page).is_some() {}
+    assert_eq!(
+        recovery.ending(),
+        Some(Ending::Clean { append_at: 0 }),
+        "a freshly installed bank's journal is erased media"
+    );
+
+    let Some(mut journal) = Journal::after(recovery) else {
+        unreachable!("a clean recovery has an append point")
+    };
+    let record = RecordRef::EffectCompleted {
+        seq: EffectSeq(0),
+        result: b"sealed with Other",
+    };
+    let Ok(_written) = journal
+        .stage(&mut device, &record, &mut page)
+        .and_then(|staged| staged.payload_barrier(&mut device))
+        .and_then(|sealable| sealable.commit(&mut device))
+    else {
+        unreachable!("a swap on a device that accepts every mutation accepts an append")
+    };
+
+    // Read back with the same handoff. The record round-trips under the check that sealed
+    // it.
+    let mut readback = installed.recovery();
+    assert_eq!(
+        readback.next(&mut device, &mut page),
+        Some(Ok(record)),
+        "a record sealed with `Other` reads back under `Other`"
+    );
+
+    // Issue #85's trap: `Recovery::new` defaults to `Catalogued`. It cannot verify a
+    // journal `Other` sealed. The typed handoff stops a caller reaching this by accident.
+    // This shows what happens if they do.
+    let mut wrong = Recovery::new(installed.region());
+    assert_eq!(
+        wrong.next(&mut device, &mut page),
+        Some(Err(RecoveryError::Decode(DecodeError::IntegrityFailed))),
+        "the shipped check cannot read a journal sealed with another one"
     );
 }
