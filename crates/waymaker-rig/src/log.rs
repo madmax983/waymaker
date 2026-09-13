@@ -22,8 +22,8 @@
 //! * **the witness** — the three high waters, the mark count and the tear flag. This is the
 //!   field that makes the "done when" true rather than nearly true: the seed rebuilds the
 //!   *run*, but §14's guarantees are entirely statements about what the rig **knew**, and
-//!   without these twelve bytes a violation is only reproducible while the host still has the
-//!   device that produced it.
+//!   without these fifteen bytes a violation is only reproducible while the host still has
+//!   the device that produced it.
 //! * **the wear** — issue #27's fourth work item, per iteration, so the published figure is a
 //!   sum of lines rather than a number somebody typed.
 //!
@@ -49,7 +49,10 @@ use crate::wear::Wear;
 use crate::witness::Progress;
 
 /// How many bytes an encoded entry occupies.
-pub const ENTRY_BYTES: usize = 92;
+///
+/// Issue #81 grew [`Progress::ENCODED_BYTES`] from twelve to fifteen, so this is 95, not 92.
+/// [`Entry::FORMAT_VERSION`] moved with it.
+pub const ENTRY_BYTES: usize = 95;
 
 /// The magic an entry opens with.
 const ENTRY_MAGIC: u16 = 0x4752;
@@ -292,7 +295,10 @@ pub struct Entry {
 
 impl Entry {
     /// The format version this build writes and reads.
-    pub const FORMAT_VERSION: u8 = 1;
+    ///
+    /// This is 2. Issue #81 widened [`Progress`]'s mark count from one byte to four. A line
+    /// from the other version is refused as [`LogError::UnknownVersion`], never misread.
+    pub const FORMAT_VERSION: u8 = 2;
 
     /// The longest line [`render`](Self::render) produces.
     pub const LINE_BYTES: usize = LINE_PREFIX.len() + 64 + 2 * ENTRY_BYTES;

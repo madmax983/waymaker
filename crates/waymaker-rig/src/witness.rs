@@ -517,7 +517,7 @@ impl Progress {
     }
 
     /// How many bytes [`encode`](Self::encode) writes.
-    pub const ENCODED_BYTES: usize = 12;
+    pub const ENCODED_BYTES: usize = 15;
 
     /// A high water, as two bytes, with `0xFFFF` for "none".
     ///
@@ -546,10 +546,15 @@ impl Progress {
     /// third "done when" true rather than nearly true. A log line carrying a seed, an
     /// iteration and a geometry can rebuild the *run*; it cannot rebuild what the rig
     /// **knew**, and the obligations §14 puts on a recovery are entirely statements about
-    /// that. Without these twelve bytes a violation is reproducible only if the host still
+    /// that. Without these fifteen bytes a violation is reproducible only if the host still
     /// has the device.
     ///
-    /// The mark count and the tear flag travel too, because `Audit::finish` reads both.
+    /// The mark count and the tear flag travel too, because `Audit::finish` reads both. The
+    /// count uses four bytes, not one. Issue
+    /// [#81](https://github.com/madmax983/waymaker/issues/81) found a one-byte count that
+    /// silently narrowed on a run of 51 or more effects. Two bytes would not be enough
+    /// either: see [`Rig::marks_per_run`](crate::run::Rig::marks_per_run) for the largest
+    /// legal run's mark count.
     ///
     /// # Errors
     ///
@@ -565,11 +570,8 @@ impl Progress {
         acknowledged.copy_from_slice(&Self::word(self.acknowledged));
         let (dispatched, rest) = rest.split_at_mut(2);
         dispatched.copy_from_slice(&Self::word(self.dispatched));
-        let (marks, flags) = rest.split_at_mut(1);
-        // Saturating: the count is a figure in a report, and a wrapped one would read as an
-        // empty witness — which `Audit::finish` treats as "the run never began".
-        let count = u8::try_from(self.marks.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
-        marks.fill(count);
+        let (marks, flags) = rest.split_at_mut(4);
+        marks.copy_from_slice(&self.marks.to_le_bytes());
         // Presence is a flag rather than a reserved iteration number. `u32::MAX` is a legal
         // iteration — `Plan::cut` answers for it and a rig can be asked to run it — so a
         // sentinel would make a real witness from that iteration decode as *no* witness, and
@@ -599,7 +601,7 @@ impl Progress {
         let (attempted, rest) = rest.split_at(2);
         let (acknowledged, rest) = rest.split_at(2);
         let (dispatched, rest) = rest.split_at(2);
-        let (marks, flags) = rest.split_at(1);
+        let (marks, flags) = rest.split_at(4);
         let iteration = u32::from_le_bytes(<[u8; 4]>::try_from(iteration).ok()?);
         let bits = flags.first().copied()?;
         if bits & !(FLAG_TORN | FLAG_ITERATION) != 0 {
@@ -613,7 +615,7 @@ impl Progress {
             attempted: Self::unword(<[u8; 2]>::try_from(attempted).ok()?),
             acknowledged: Self::unword(<[u8; 2]>::try_from(acknowledged).ok()?),
             dispatched: Self::unword(<[u8; 2]>::try_from(dispatched).ok()?),
-            marks: u32::from(marks.first().copied()?),
+            marks: u32::from_le_bytes(<[u8; 4]>::try_from(marks).ok()?),
             torn: bits & FLAG_TORN != 0,
         })
     }
