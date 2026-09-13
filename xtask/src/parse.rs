@@ -933,8 +933,24 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     let parser = Parser::new_ext(contents, Options::empty());
     let mut out = String::new();
     let mut in_fence = false;
+    // A quoted example is an example: `> - Status: accepted` shown as a worked case
+    // must not read as the real thing, so nothing inside a blockquote is emitted,
+    // at any nesting depth — the same treatment a fence already gets.
+    let mut blockquote_depth: u32 = 0;
     for event in parser {
+        let hidden = in_fence || blockquote_depth > 0;
         match event {
+            Event::Start(Tag::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+                if blockquote_depth == 0 {
+                    // A blockquote is a paragraph break too, for the same reason a
+                    // fence is: without it, text on either side fuses into one line.
+                    out.push('\n');
+                }
+            }
             Event::Start(Tag::CodeBlock(kind)) => {
                 // Only fenced blocks are dropped: the old line scan never removed
                 // indented code blocks, and narrowing what counts as code would
@@ -947,12 +963,16 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                 if in_fence {
                     in_fence = false;
                     // A fence is a paragraph break; without it the text on either
-                    // side fuses into one line the field scans would misread.
-                    out.push('\n');
+                    // side fuses into one line the field scans would misread. Only
+                    // while a blockquote does not already hide it, or a fence closing
+                    // inside a quoted example leaks a blank line into hidden output.
+                    if blockquote_depth == 0 {
+                        out.push('\n');
+                    }
                 }
             }
             Event::Code(code) => {
-                if !in_fence && matches!(inline_code, InlineCode::Keep) {
+                if !hidden && matches!(inline_code, InlineCode::Keep) {
                     // Backticks kept, not just the content: row and claim scans match
                     // on a backtick-delimited id, and a bare id could be a substring
                     // of a longer one.
@@ -962,12 +982,12 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                 }
             }
             Event::Text(text) => {
-                if !in_fence {
+                if !hidden {
                     out.push_str(&text);
                 }
             }
             Event::Start(Tag::Heading { level, .. }) => {
-                if !in_fence {
+                if !hidden {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
@@ -978,7 +998,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                 }
             }
             Event::Start(Tag::Item) => {
-                if !in_fence {
+                if !hidden {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
@@ -988,7 +1008,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item)
             | Event::SoftBreak
             | Event::HardBreak
-                if !in_fence =>
+                if !hidden =>
             {
                 out.push('\n');
             }

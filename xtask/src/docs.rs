@@ -5619,6 +5619,16 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_status_inside_a_blockquote() {
+        // Codex, pull request #138: `markdown_prose` rendered a blockquoted list item
+        // exactly like a top-level one, backticks and structure markers reconstructed
+        // identically, so `> - Status: accepted` shown as a worked example was
+        // indistinguishable from the real status and `find_map` picked it first.
+        let contents = "# ADR\n\n> - Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
