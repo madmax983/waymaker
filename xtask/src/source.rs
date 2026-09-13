@@ -12623,6 +12623,38 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn used_call_reports_a_conforming_decoy_nested_in_a_module() {
+        // Issue #62's own reproduction, isolated to `used_call` so the
+        // `SEALING_FUNCTIONS` ambiguity check cannot mask it (Codex found
+        // that `check_integrity_routing` end to end cannot isolate this,
+        // since `next` is also a `SEALING_FUNCTIONS` row: any second
+        // `fn next`, conforming or not, trips that check on its own).
+        //
+        // The decoy sits in `mod lookahead`, calls `decode_with` and is
+        // textually first. The real `next` calls nothing. The old
+        // `braced_body` read the first `fn next` it found — the conforming
+        // decoy — and declared the pin satisfied while the broken real
+        // body went unseen.
+        let contents = format!(
+            "mod lookahead {{\n    fn {name}(rest: &[u8]) -> Option<usize> {{\n        \
+             let frame = {callee}(rest);\n        Some(frame)\n    }}\n}}\nfn {name}() {{\n    \
+             let _ = 0;\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains(&format!("`fn {}`", SCAN_STEP.0))
+                && violation.detail.contains("2 times")),
+            "a conforming decoy `fn {}` nested in another module went unreported: \
+             {violations:?}",
+            SCAN_STEP.0
+        );
+    }
+
+    #[test]
     fn a_path_qualified_delegation_is_reported() {
         // `count_tokens(body, "crc32") == 1` is satisfied by `fast::crc32(bytes)` calling a
         // Castagnoli loop in a sibling module, with `crc.rs` untouched so the other half of
