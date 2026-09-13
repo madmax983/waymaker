@@ -2898,6 +2898,14 @@ fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
 /// its name is never checked against this crate's own private trait names. Every
 /// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
 /// can still resolve to a trait this crate declares itself.
+///
+/// A floor, not a proof: a real dependency root this list does not name — `serde` in
+/// `impl serde::Serialize for Bank`, say — reads as potentially local too. A private
+/// trait declared under that exact name in the same crate would then hide a live,
+/// reachable impl. Closing that needs the crate's real dependency names, which this
+/// function has no path to; [`PackageGraph`] holds them elsewhere in this module, and
+/// issue [#141](https://github.com/madmax983/waymaker/issues/141) is where wiring it
+/// through is owed.
 const EXTERNAL_PATH_ROOTS: &[&str] = &["core", "std", "alloc"];
 
 /// Removes one leading `<...>` group from `text`, balanced across any nested pair.
