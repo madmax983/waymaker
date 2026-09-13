@@ -2562,7 +2562,7 @@ pub const SWAP_SURFACE: &[&str] = &[
     "payload_barrier",
     "prepare",
     "reclaim",
-    "region",
+    "recovery",
     "stage",
 ];
 
@@ -10473,6 +10473,14 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_trait_name_is_still_the_forbidden_trait() {
+        // Issue #90: `r#TryFrom` and `TryFrom` name the same trait. This rule must
+        // catch the raw spelling too.
+        let source = kernel_source("impl r#TryFrom<&[u8]> for RecordKind {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
+    }
+
+    #[test]
     fn a_char_literal_is_not_a_lifetime() {
         // Issue #108: the textual scan ate the `'a` of the char literal and left its
         // closing quote behind, mangling the header. `syn` reads a const generic's
@@ -11529,6 +11537,21 @@ mod deferred_answer_pins {
         assert!(
             details.iter().any(|detail| detail.contains("Sneaky")),
             "an aliased `Future` impl went unreported: {details:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_future_trait_name_is_still_a_fifth_future() {
+        // Issue #90: `r#Future` and `Future` name the same trait. This rule must
+        // catch a fifth future written with the raw spelling.
+        let sneaky = format!(
+            "{}\nimpl core::future::r#Future for Sneaky {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &sneaky);
+        assert!(
+            details.iter().any(|detail| detail.contains("Sneaky")),
+            "a raw `Future` impl went unreported: {details:?}"
         );
     }
 
