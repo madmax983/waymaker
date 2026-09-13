@@ -78,7 +78,7 @@ fn stack_ceiling() -> usize {
 }
 
 /// Holds `depth_from` to `[stack_floor(), stack_ceiling()]`, then to the stack pointer's
-/// live reading — or to an empty region entirely, whenever MSP is not the register in use.
+/// live reading — or to an empty region entirely, outside Thread mode with MSP selected.
 ///
 /// [`paint`] and [`high_water_mark`] are `pub fn`, not `unsafe fn`: a safe function must stay
 /// sound for every input, not only the one reading `main` actually passes. The region clamp
@@ -91,22 +91,26 @@ fn stack_ceiling() -> usize {
 /// scanned, never widen it past where the stack pointer genuinely is. The cost of a wrong
 /// reading is a wrong *measurement*, never an out-of-bounds access.
 ///
-/// That live reading only means something in this module's terms when it is *MSP*: `_stack_end`
-/// and `_stack_start` name the linker's one stack region, and this module has no way to
-/// represent a second one. Handler mode always executes on MSP, whatever `CONTROL.SPSEL` says,
-/// so that half is covered; but Thread mode can select PSP for a stack this module knows
-/// nothing about, and a PSP reading outside `[_stack_end, _stack_start]` makes the `.min` above
-/// a no-op — the region clamp alone, with none of the live-pointer protection it exists to add,
-/// exactly the gap the region clamp by itself was already found not to close. So this collapses
-/// to the empty region at [`stack_floor`] whenever MSP is not the register actually in use —
-/// Handler mode, or Thread mode with `SPSEL` naming PSP — the same degenerate case a region no
-/// wider than [`GUARD_BYTES`] already produces, which [`paint`] already declines to write into
-/// and [`crate::emulate::StackUsage::shortfall`] already refuses as a measurement that did not
-/// happen. This image never selects PSP and never calls these functions from Handler mode —
-/// nothing here runs an RTOS or installs a handler that does — so the branch is not one this
-/// boot's own measurement ever takes; it exists for the caller this crate does not have yet.
+/// Trusting that live reading needs more than "which register is active", because the
+/// question this module actually needs answered is "is everything below it unused" and those
+/// are different questions in two distinct ways. Thread mode can select PSP for a stack this
+/// module has no way to represent — `_stack_end` and `_stack_start` name the linker's one
+/// region, not two — and a PSP reading outside it makes the `.min` above a no-op, silently
+/// falling back to the region clamp alone. And Handler mode, though it always executes on MSP
+/// whatever `CONTROL.SPSEL` says, can still be running because an exception interrupted Thread
+/// mode while Thread mode was using PSP for that second, still-live stack: MSP being the
+/// *active* register there says nothing about whether the memory below it is free, only about
+/// which register answers the question. So this trusts the live reading in exactly one state —
+/// Thread mode, with `SPSEL` itself naming MSP — and collapses to the empty region at
+/// [`stack_floor`] in every other one, which is the same degenerate case a region no wider than
+/// [`GUARD_BYTES`] already produces: [`paint`] already declines to write into it and
+/// [`crate::emulate::StackUsage::shortfall`] already refuses it as a measurement that did not
+/// happen. This image runs in Thread mode with MSP selected for the whole of every boot this
+/// measures — nothing here runs an RTOS, selects PSP, or installs a handler that reaches this
+/// module — so the collapse is not one this boot's own measurement ever takes; it exists for
+/// the caller this crate does not have yet.
 fn clamp_to_stack_region(depth_from: usize) -> usize {
-    if !msp_is_the_stack_in_use() {
+    if !thread_mode_has_msp_selected() {
         return stack_floor();
     }
     depth_from
@@ -114,20 +118,23 @@ fn clamp_to_stack_region(depth_from: usize) -> usize {
         .min(current_stack_pointer())
 }
 
-/// Whether MSP — the one register [`stack_floor`] and [`stack_ceiling`] describe a region
-/// for — is the register actually in use right now.
+/// Whether the caller is in Thread mode with MSP selected — the one execution state in which
+/// the memory below the live stack pointer is safe for [`clamp_to_stack_region`] to trust.
 ///
-/// Handler mode always executes on MSP regardless of `CONTROL.SPSEL`, so it answers `true`
-/// outright; Thread mode answers according to `SPSEL` itself, since that is the one case where
-/// PSP can be live instead.
-fn msp_is_the_stack_in_use() -> bool {
-    match cortex_m::peripheral::SCB::vect_active() {
-        cortex_m::peripheral::scb::VectActive::ThreadMode => matches!(
-            cortex_m::register::control::read().spsel(),
-            cortex_m::register::control::Spsel::Msp
-        ),
-        _ => true,
-    }
+/// Both halves are required, and neither alone is enough. Handler mode always executes on
+/// MSP, but that says only which register is active, not that a Thread-mode context using PSP
+/// for a second, still-live stack was not interrupted to get there — so Handler mode answers
+/// `false` outright rather than being read as "MSP, so safe". Thread mode is trusted only when
+/// `SPSEL` itself names MSP, because Thread mode with PSP selected is exactly the other way
+/// this module's single-region model stops describing the memory actually in use.
+fn thread_mode_has_msp_selected() -> bool {
+    matches!(
+        cortex_m::peripheral::SCB::vect_active(),
+        cortex_m::peripheral::scb::VectActive::ThreadMode
+    ) && matches!(
+        cortex_m::register::control::read().spsel(),
+        cortex_m::register::control::Spsel::Msp
+    )
 }
 
 /// The active stack pointer, read from the core rather than inferred from a local's address.

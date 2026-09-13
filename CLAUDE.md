@@ -2926,9 +2926,17 @@ value above `_stack_start` makes `clamp_to_stack_region`'s own `.min` a no-op, s
 dropping the live-pointer protection back to the region clamp alone. `clamp_to_stack_region`
 now asks the real question directly — `msp_is_the_stack_in_use`, true unconditionally in
 Handler mode and by `SPSEL` in Thread mode — and collapses to the same empty region whenever
-MSP is not it. This image selects only MSP, in Thread mode, for the whole of every boot this
-ADR measures, so the branch is dead code here too; it exists for the caller this crate does
-not have yet. See
+MSP is not it. That fifth fix's own framing was the sixth finding's bug: answering "is MSP the
+register in use" `true` for Handler mode is a true fact about which register is active, and not
+the fact the fourth finding needed — MSP being active in Handler mode does not make the memory
+below it safe, because an exception can land there having interrupted a Thread-mode context
+that was using PSP for a second, still-live stack. Treating "which register" as "safe" quietly
+undid the fourth finding's unconditional Handler-mode refusal. The two conditions are
+conjunctive, not a choice of which to ask: `clamp_to_stack_region` now trusts the live reading
+in exactly one state, Thread mode with `SPSEL` naming MSP, and collapses in every other one —
+Handler mode included, unconditionally, regardless of what register answers there. This image
+runs in Thread mode with MSP selected for the whole of every boot this ADR measures, so the
+branch is dead code here too; it exists for the caller this crate does not have yet. See
 [ADR 0042](docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

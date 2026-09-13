@@ -257,14 +257,22 @@ mode in force, and nothing about being in Thread mode says PSP is inside
 sit *above* `_stack_start` outright, at which point `clamp_to_stack_region`'s own
 `.min(current_stack_pointer())` stops narrowing anything — the region clamp alone decides the
 bound, which is exactly the protection the live-pointer check exists to add, silently absent.
-The question the clamp actually needs answered is not "which mode", but "is MSP the register
-in use at all", and Handler mode is only one of the two ways that can be true: it always
-executes on MSP outright, and Thread mode does only when `SPSEL` names it. `clamp_to_stack_region`
-now asks that question directly — `msp_is_the_stack_in_use`, which answers `true` unconditionally
-in Handler mode and defers to `SPSEL` in Thread mode — and collapses to the same empty region as
-before whenever the answer is `false`. This image selects only MSP, in Thread mode, for the
-whole of every boot this ADR measures, so — as with the tenth finding — the new branch is dead
-code here; it exists for the caller this crate does not have yet.
+
+**The eleventh's own fix reframed the question in a way that quietly undid the tenth's, and a
+twelfth finding is that regression.** It restated the check as "is MSP the register in use at
+all" and answered `true` unconditionally in Handler mode — which is a true fact about which
+register is active, but not the fact `clamp_to_stack_region` needs: the tenth's whole point was
+that MSP being active in Handler mode does *not* make the memory below it safe, because an
+exception can land there having interrupted a Thread-mode context that was using PSP for a
+second, still-live stack. Answering the "which register" question and calling that "safe"
+collapsed the tenth's unconditional Handler-mode refusal back into the ordinary clamp-and-min
+path — precisely the state the tenth finding closed. The two conditions are conjunctive, not a
+choice of which one to ask: `clamp_to_stack_region` now trusts the live reading in exactly one
+state, Thread mode with `SPSEL` itself naming MSP, and collapses to the empty region in every
+other one — Handler mode included, unconditionally, regardless of what register answers there.
+This image runs in Thread mode with MSP selected for the whole of every boot this ADR
+measures, so the collapse is not one this boot's own measurement ever takes; it exists for the
+caller this crate does not have yet.
 
 ## Consequences
 
@@ -295,7 +303,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the eleven hardenings changed what the figure means, only what a wrong caller could do
+**None of the twelve hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*
