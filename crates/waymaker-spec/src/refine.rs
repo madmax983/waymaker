@@ -212,16 +212,19 @@ pub fn abstraction(
 
 /// Whether the call recorded at `run.ops()[op]` changed any cell of media at all.
 ///
-/// `false` when `op` is past the end of `run.ops()` — the call was never issued; when
+/// `false` when `op` is past the end of `run.ops()` — the call was never issued; when it names
+/// an [`Op::Barrier`] or a legal zero-length [`Op::Program`]/[`Op::Erase`] — neither moves a
+/// byte whatever [`Run::injection`] says about it, the same reason
+/// `waymaker_fault::inject::Op::mutates_nothing` excludes them from the enumeration; when
 /// [`Run::injection`] names it at [`Progress::None`] or at a zero [`Progress::Bytes`], which
 /// that type's own documentation calls the same world as `None`; or when it is an
 /// [`Op::Erase`] and `geometry`'s erase block is wider than the bytes [`Run::injection`] says
 /// landed — a partial erase block is not a landed one, because
 /// `waymaker_fault::Session::erase_blocks_of` rounds it down to zero cells changed. `geometry`
 /// is the one this run's device was built with; the enumerated crash points never produce a
-/// value that needs it, since an erase only ever tears at a whole block boundary, but a
-/// hand-built [`Run`] from `Harness::run_one` can name a byte offset the enumeration would
-/// not.
+/// value that needs any of the last three checks — a barrier and a zero-length call are never
+/// offered a `Whole` point, and an erase only ever tears at a whole block boundary — but a
+/// hand-built [`Run`] from `Harness::run_one` can name any of them.
 ///
 /// # Why this and not "did the call return `Ok`"
 ///
@@ -234,8 +237,15 @@ pub fn abstraction(
 /// watchdog's rounding.
 #[must_use]
 pub fn call_touched(run: &Run, op: usize, geometry: Geometry) -> bool {
+    let len = match run.ops().get(op) {
+        None | Some(Op::Barrier) => return false,
+        Some(Op::Program { len, .. } | Op::Erase { len, .. }) => *len,
+    };
+    if len == 0 {
+        return false;
+    }
     let Some(injection) = run.injection().filter(|injection| injection.op == op) else {
-        return op < run.ops().len();
+        return true;
     };
     let bytes = match injection.progress {
         Progress::None => return false,
@@ -370,5 +380,32 @@ mod tests {
             .run_one(injection, |session: &mut Session| session.erase(0, 32))
             .expect("the injection fires on the one erase this writer issues");
         assert!(call_touched(&run, 0, geometry()));
+    }
+
+    #[test]
+    fn a_barrier_is_never_touched() {
+        // A barrier moves no byte, whatever a hand-built injection claims about it.
+        let injection = Injection {
+            op: 0,
+            progress: Progress::Whole,
+            interruption: Interruption::PowerLoss,
+        };
+        let run = Harness::new(geometry())
+            .run_one(injection, |session: &mut Session| session.barrier())
+            .expect("the injection fires on the one barrier this writer issues");
+        assert!(!call_touched(&run, 0, geometry()));
+    }
+
+    #[test]
+    fn a_zero_length_program_is_never_touched() {
+        let injection = Injection {
+            op: 0,
+            progress: Progress::None,
+            interruption: Interruption::Failure,
+        };
+        let run = Harness::new(geometry())
+            .run_one(injection, |session: &mut Session| session.program(0, &[]))
+            .expect("the injection fires on the one program call this writer issues");
+        assert!(!call_touched(&run, 0, geometry()));
     }
 }
