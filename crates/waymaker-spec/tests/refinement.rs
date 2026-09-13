@@ -754,6 +754,44 @@ fn observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks() {
 }
 
 #[test]
+fn reconstruction_refuses_the_same_id_declared_in_two_banks() {
+    // Codex, PR #135's next round: `Journal::bank_of` — which `single_authority` and
+    // `durable_intent` both use to ask "which bank is this id's record really in" — answers
+    // with the *first* matching record it finds, ignoring bank. A hand-built `Observation`
+    // naming `RecordId(0)` once in a retired bank and again in the sole authoritative bank
+    // made `single_authority` misreport a legitimately recovered record (from the
+    // authoritative bank) as belonging to the retired one, breaching a guarantee that in fact
+    // held. This id scheme has a single, device-wide counter — no legal transition sequence
+    // ever declares the same id twice, in one bank or two — so the fix is to refuse the
+    // observation rather than to make every by-id lookup bank-aware.
+    let observed = Observation {
+        records: vec![
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::B,
+            ),
+        ],
+        dispatched: vec![RecordId(0)],
+        banks: [Bank::Erased, Bank::Sealed(1)],
+        sealed_once: true,
+        next_id: Some(1),
+    };
+    let error =
+        Journal::reconstructed(&observed).expect_err("the same id names two different records");
+    assert!(error.to_string().contains("named twice"), "{error}");
+}
+
+#[test]
 fn no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave() {
     // Codex, PR #135 round 6: nothing stops `REFINEMENT`'s exploration reaching a state whose
     // first-ever seal lands on bank B while records already sit in A — `Observation` carries

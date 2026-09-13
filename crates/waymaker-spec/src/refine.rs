@@ -153,9 +153,30 @@ impl Journal {
     /// version of this gap. The floor is exactly `reboot`'s own: `next_id` must be past every
     /// record this observation names, the same way a real device's counter can never point at
     /// an id something on media already holds.
+    ///
+    /// The third check is `record.id` itself: `next_id` is a single counter over the whole
+    /// device, so no legal transition sequence can ever declare the same id twice, in one bank
+    /// or two. `Journal::bank_of` — which `single_authority` and `durable_intent` both use to
+    /// ask "which bank is this id's record really in" — answers with the *first* matching
+    /// record it finds, so an `Observation` naming `RecordId(0)` once in a retired bank and
+    /// again in the sole authoritative one made `single_authority` misreport a legitimately
+    /// recovered record as coming from the wrong bank, and could equally make `durable_intent`
+    /// skip checking a dispatch that genuinely needed checking. Codex found it on the same
+    /// review round that gave records a real bank field. The real firmware's own effect
+    /// sequence *does* restart at zero across a swap ([`waymaker_core::id::EffectIdAllocator`]
+    /// via `Installed::allocator`), but that is a different identity space from this one:
+    /// `RecordId` is this crate's own bookkeeping label, invented by issue #67 specifically to
+    /// never be reused, and a caller bridging a real device into it has to assign each real
+    /// record a distinct label the way [`abstraction`] already does — reusing the real
+    /// restarting sequence number directly is a translation mistake, not a state the model can
+    /// or should represent.
     pub fn reconstructed(observation: &Observation) -> Result<Self, Impossible> {
         let mut records = Vec::with_capacity(observation.records.len());
+        let mut seen = std::collections::BTreeSet::new();
         for (id, role, state, torn, bank) in &observation.records {
+            if !seen.insert(*id) {
+                return Err(Impossible::RecordIdDeclaredTwice { record: *id });
+            }
             let media = match (state, torn) {
                 (Durability::Attempted, false) => OnMedia::Absent,
                 (Durability::Attempted, true) => {
@@ -210,6 +231,11 @@ pub enum Impossible {
         /// The highest resident record's id, which `next_id` must be strictly past.
         resident: RecordId,
     },
+    /// The same `RecordId` names two different records, in one bank or two.
+    RecordIdDeclaredTwice {
+        /// The id declared more than once.
+        record: RecordId,
+    },
 }
 
 impl core::fmt::Display for Impossible {
@@ -230,6 +256,11 @@ impl core::fmt::Display for Impossible {
                 "next_id is not past resident record {}, so the next declaration would reissue \
                  an id this observation already holds",
                 resident.0
+            ),
+            Self::RecordIdDeclaredTwice { record } => write!(
+                formatter,
+                "record {} is named twice, and this crate's id scheme never reuses one",
+                record.0
             ),
         }
     }
@@ -405,7 +436,25 @@ pub fn bank_after_erase(
 /// `Generation::FIRST` is `0`, because the firmware has a `Bank`-shaped `None` for that case
 /// and does not need the reservation. A caller passes `real_generation.0 + 1` here, and the
 /// two schemes agree from there: both increment by one per seal, so the shift is exact at
-/// every later generation too.
+/// every later generation too — except the last one. The real `Generation::successor` refuses
+/// only at `Generation::MAX`, so the firmware can validly seal a bank *at* `Generation::MAX`;
+/// this shift has no model number left for it (`u32::MAX + 1` does not exist), and
+/// `Journal::step`'s own `begin_seal` refuses one generation earlier than that for the same
+/// reason, at model generation `u32::MAX` rather than `u32::MAX + 1`. Codex found this reading
+/// the shift on review of the pull request that gave records a real bank field, and it is real
+/// — but removing the reservation (numbering the model's first seal `0` instead of `1`, since
+/// [`Bank`] already tells "unsealed" apart from `Sealed(0)` through its own variants rather
+/// than through the number) would change how many distinct generation values
+/// [`Bound::generations`](crate::model::Bound::generations) admits at any given cap, which
+/// `tests/census.rs`'s pinned counts would have to absorb for a boundary nothing here comes
+/// anywhere near: `Bound::PROOF` caps generations at 3, `tests/refinement.rs`'s bank-swap
+/// sweep at 3 more, and the one place this crate drives a real `u32::MAX` at all is
+/// `model.rs`'s own hand-built `a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank`,
+/// which exercises the model's ceiling entirely on its own terms and never through this shift.
+/// This is the same standing `obligation.rs` already records for `single-authority`'s
+/// generation dimension — "a generation is an unbounded integer, where the firmware refuses at
+/// the ceiling rather than proving the refusal unnecessary" — one integer narrower than stated
+/// there, and stated here rather than silently inherited.
 #[must_use]
 pub fn bank_after_seal(
     prior: Bank,

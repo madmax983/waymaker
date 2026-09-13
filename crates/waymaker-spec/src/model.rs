@@ -1143,6 +1143,12 @@ impl Journal {
                 // explore that far before a bank carried a hand-built generation. Refusing
                 // instead matches `Generation::successor`'s real behaviour (ADR 0017): the
                 // firmware treats the ceiling as exhausted, not as a value worth repeating.
+                //
+                // This model number is one past the real generation it stands for (`None => 1`
+                // above, not `0`), so this refuses one generation before the real firmware's
+                // own ceiling does — `crate::refine::bank_after_seal`'s doc comment has the
+                // reservation, why removing it would move `tests/census.rs`'s pinned counts,
+                // and why that trade is not taken for a boundary nothing here comes near.
                 Some(seen) => seen.checked_add(1).ok_or(Illegal::GenerationExhausted)?,
             }
         } else {

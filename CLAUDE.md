@@ -3054,3 +3054,45 @@ second bank" exactly as it already does for `next_id`.
 regression, driving the real two-record two-bank sequence end to end and asserting the
 round-trip preserves what `Specified.recover` returns, verified against a scratch
 reproduction of the `[1]` vs `[]` divergence before the fix existed.
+
+The round after that found the sharper defect the new bank field made reachable:
+`Journal::bank_of` — which `single_authority` and `durable_intent` both call to ask "which
+bank is this id's record really in" — answers with the *first* matching record it finds,
+ignoring bank entirely, so a hand-built `Observation` naming `RecordId(0)` once in a retired
+bank and again in the sole authoritative bank made `single_authority` misreport a
+legitimately recovered record as belonging to the retired one, and could equally make
+`durable_intent` skip checking a dispatch that needed checking. The real firmware's own
+effect sequence does restart at zero across a swap
+(`waymaker_core::id::EffectIdAllocator` via `Installed::allocator`), but that is a different
+identity space from this crate's `RecordId`: the model's id is a single, device-wide counter
+invented by issue #67 specifically so it is never reused, so no legal transition sequence
+can ever declare the same id twice, in one bank or two — a caller bridging a real device that
+restarts its own sequence per run has to assign each record a distinct label the way
+`refine::abstraction()` already does, not reuse the real restarting number directly.
+`Journal::reconstructed` now refuses with a new `Impossible::RecordIdDeclaredTwice` whenever
+an observation's `records` names one id more than once, closing the gap the same way as
+`next_id`'s own floor rather than by threading bank identity through every by-id lookup and
+through `dispatched` (which carries no bank tag at all, and would need one too).
+`reconstruction_refuses_the_same_id_declared_in_two_banks` is the regression, verified
+against a scratch reproduction of `single_authority`'s false-positive breach before the check
+existed.
+
+The same round's Codex pass raised a second finding on the same shift the eleventh finding's
+fix uses: `refine::bank_after_seal`'s `real_generation.0 + 1` numbering has no model value for
+the real firmware's actual final usable generation, since `Generation::successor` only
+refuses *at* `Generation::MAX` and the shift would need `u32::MAX + 1` to represent sealing
+there. Investigated rather than fixed: the reservation exists so a bank with no seal
+(`authoritative_generation() == None`) and a bank the model has not yet distinguished from one
+both read as "nothing sealed here" through `begin_seal`'s own `None => 1`, and removing it
+(numbering the model's first seal `0`, since `Bank`'s variants already tell "unsealed" apart
+from `Sealed(0)` without needing the reservation) would change how many distinct generation
+values `Bound::generations` admits at a given cap, moving `tests/census.rs`'s pinned counts —
+for a boundary nothing here drives anywhere near: `Bound::PROOF` and the bank-swap refinement
+sweep both cap generations at 3, and the one place this crate reaches a real `u32::MAX` is
+`model.rs`'s own hand-built `a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank`,
+entirely on the model's own terms and never through this shift. Documented as the same
+standing `obligation.rs` already records for `single-authority`'s generation dimension — "a
+generation is an unbounded integer, where the firmware refuses at the ceiling rather than
+proving the refusal unnecessary" — one integer narrower than stated there, in both
+`refine::bank_after_seal`'s doc comment and beside `begin_seal`'s own `checked_add`, rather
+than moving the census for a boundary no proof or refinement test comes near.
