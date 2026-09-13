@@ -171,6 +171,8 @@ fn genuine_v1_bytes() -> [u8; 92] {
     bytes[0] = 0x52; // ENTRY_MAGIC low byte, unchanged across versions
     bytes[1] = 0x47; // ENTRY_MAGIC high byte
     bytes[2] = 1; // the version a v1 build wrote
+    bytes[18] = 0; // reserved, at the same offset in both formats; a real writer zeroed it
+    bytes[19] = 0;
     let check =
         <waymaker_flash::integrity::Catalogued as waymaker_flash::integrity::IntegrityCheck>::frame_check(
             &bytes[..88],
@@ -226,6 +228,23 @@ fn a_buffer_that_only_looks_like_a_v1_prefix_is_not_misread_as_one() {
         "the fixture must not be a real seal by accident"
     );
     assert_eq!(Entry::decode(&fake), Err(LogError::ShortBuffer));
+}
+
+#[test]
+fn a_sealed_buffer_with_a_dirty_reserved_word_is_not_misread_as_v1() {
+    // Codex, round 4 of issue #81: a checksum that matches its own bytes is not evidence
+    // that those bytes are a real v1 entry. A genuine v1 writer zeroed the reserved word at
+    // the same offset a v2 writer does. This buffer reseals itself with that word dirty, so
+    // the check passes and the version claim must still be refused.
+    let mut dirty = genuine_v1_bytes();
+    dirty[18] = 0x11;
+    dirty[19] = 0x11;
+    let check =
+        <waymaker_flash::integrity::Catalogued as waymaker_flash::integrity::IntegrityCheck>::frame_check(
+            &dirty[..88],
+        );
+    dirty[88..].copy_from_slice(&check.to_le_bytes());
+    assert_eq!(Entry::decode(&dirty), Err(LogError::ShortBuffer));
 }
 
 #[test]

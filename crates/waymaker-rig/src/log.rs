@@ -747,7 +747,18 @@ fn v1_version<C: IntegrityCheck>(bytes: &[u8]) -> Option<u8> {
         return None;
     }
     let version = *body.get(2)?;
-    (version == 1).then_some(version)
+    if version != 1 {
+        return None;
+    }
+    // The reserved word sits at the same offset in both formats: issue #81 widened the
+    // witness block near the end of the body, not the header. A real v1 writer zeroed it,
+    // for the reason `decode_with` refuses a nonzero one on its own version -- a bit
+    // nothing reads is a bit nothing can detect drift in, unless something checks it.
+    let reserved = <[u8; 2]>::try_from(body.get(18..20)?).ok()?;
+    if u16::from_le_bytes(reserved) != 0 {
+        return None;
+    }
+    Some(version)
 }
 
 /// The same, for [`Entry::parse`]'s hex tail.
