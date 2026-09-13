@@ -10,7 +10,7 @@
 //! Four erase blocks, erased and reprogrammed several times, inside the [`Region`] the
 //! caller named — and one erase-and-read pass over the whole region, which
 //! [`CaseId::BarrierChangesNoMedia`] needs because "changes no media" is a claim about media
-//! and not about the three blocks that happened to be convenient. A caller who wants a
+//! and not about the four blocks that happened to be convenient. A caller who wants a
 //! cheaper run passes a smaller region; that is what naming one is for. No case names a byte
 //! outside it — not even in an operation it expects to be
 //! refused, which is the part that matters: an adapter that wrongly *accepted* one could then
@@ -907,9 +907,9 @@ impl<S: StableStorage> Run<'_, S> {
 
     fn barrier_changes_no_media(&mut self) {
         let case = CaseId::BarrierChangesNoMedia;
-        // The *whole region*, not the three blocks this run otherwise works in. "Changes no
-        // media" is a claim about media, and a check that snapshots three blocks of a
-        // sixteen-block region certifies an adapter whose barrier corrupts the fourth. The
+        // The *whole region*, not the four blocks this run otherwise works in. "Changes no
+        // media" is a claim about media, and a check that snapshots four blocks of a
+        // sixteen-block region certifies an adapter whose barrier corrupts the fifth. The
         // region is what the caller declared expendable, so it is also what the caller has
         // asked to have checked; a caller who wants a cheaper run passes a smaller region.
         let start = self.region.offset();
@@ -1201,7 +1201,7 @@ mod tests {
     /// the case look", which no adapter that actually behaves like NOR can be asked either.
     struct OffsetRecorder {
         geometry: Geometry,
-        offsets: [u32; 8],
+        offsets: [u32; 256],
         count: usize,
     }
 
@@ -1256,7 +1256,7 @@ mod tests {
         };
         let mut storage = OffsetRecorder {
             geometry,
-            offsets: [0; 8],
+            offsets: [0; 256],
             count: 0,
         };
         let mut buffer = [0_u8; 8];
@@ -1270,6 +1270,13 @@ mod tests {
         run.zero_length_operations_are_legal_and_change_nothing();
 
         assert!(storage.count > 0, "the case issued no operations at all");
+        assert!(
+            storage.count <= storage.offsets.len(),
+            "the case issued {} operations, more than this recorder can hold — widen it \
+             rather than silently checking only the first {}",
+            storage.count,
+            storage.offsets.len()
+        );
         for offset in storage.offsets.iter().take(storage.count) {
             assert!(
                 (region.offset()..region.end()).contains(offset),
