@@ -50,7 +50,8 @@ be superseded.
 | [0039](0039-the-book-quotes-tests-and-the-matrix-is-derived.md) | The book quotes tests, and the matrix is derived | accepted |
 | [0040](0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) | The emulator runs the rig, and attests to no board | accepted |
 | [0041](0041-the-bank-refinement-abstracts-a-real-swap.md) | The bank refinement abstracts a real swap | accepted |
-| [0042](0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md) | The model gains banked records, a reboot, and a live compaction | accepted |
+| [0042](0042-a-terminal-watchdog-reset-is-the-fault-free-run.md) | A terminal watchdog reset is the fault-free run | accepted |
+| [0043](0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md) | The model gains banked records, a reboot, and a live compaction | accepted |
 
 ## Reading the numbers
 

@@ -1,4 +1,4 @@
-# ADR 0042: The model gains banked records, a reboot, and a live compaction
+# ADR 0043: The model gains banked records, a reboot, and a live compaction
 
 - Status: accepted
 - Date: 2026-09-13

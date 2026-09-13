@@ -1055,7 +1055,7 @@ Stated so that nobody mistakes silence for coverage:
   What is not covered is every bank sequence a firmware could produce, only the one swap this
   file drives — and, until the two sweeps compose, no sequence with a record in it. See
   [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md) and
-  [ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+  [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
@@ -2884,7 +2884,7 @@ claim directly against the `Ledger` the agreement tests build
 rather than by a stricter oracle. Issue #73 had already closed the refinement half of this
 guarantee's gap — the paragraph above — and this issue closes the other half, the model's
 own expressiveness, so `obligation.rs`'s `single-authority` row now says nothing is owed. See
-[ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+[ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 
 Review of the pull request that closed issue #67 then found a fourth gap `Guard::
 NeverEraseTheAuthority` left open: `authoritative()` is always empty before the first seal,
@@ -2907,7 +2907,7 @@ unchanged, because every state a post-retirement dispatch could reach is also re
 dispatching while the bank is still current and retiring it afterward — a `Journal` is a
 snapshot rather than a log, so the two are one state, not two. `tests/necessity.rs`'s
 `a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
-constructs that legitimate trace by hand; no guard was added, and ADR 0042's alternatives
+constructs that legitimate trace by hand; no guard was added, and ADR 0043's alternatives
 section says why.
 
 A sixth found a real bug: `Journal::from_parts` (which `Journal::reconstructed` uses to turn
@@ -3026,7 +3026,7 @@ Review of that round's fix drew two more findings, both on the observation/recon
 path rather than on `reboot` itself. The first was documentation left behind by the second
 finding's own history: this ADR still said a reboot "changes nothing but the power" and
 still named `a_reboot_changes_nothing_but_the_power` as the proof, both stale since the tenth
-finding taught `reboot` to discard `Absent` records — [ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md)
+finding taught `reboot` to discard `Absent` records — [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md)
 now narrates all three versions of the transition in order, with the test's current, narrower
 name. The second was a real gap in `refine::Observation::reconstructed`: the eleventh
 finding's `next_id` field is the caller's own report and was checked against nothing, so an
