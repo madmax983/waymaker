@@ -2803,9 +2803,10 @@ fn trait_declaration(line: &str) -> Option<(&str, bool)> {
 ///
 /// `size-probe-reach` needs this list before it can classify an `impl <Trait> for
 /// <Type>`. A trait's methods are as reachable as the trait itself. The trait can live
-/// in one file of the crate and the impl in another. Skips `#[cfg(test)]` modules and
-/// comments, the same way [`public_functions`] does. This stops a test-only trait from
-/// marking a shipped trait of the same name as private.
+/// in one file of the crate and the impl in another. Reads `source::code_only` and
+/// `source::without_test_modules` first, the same lexical pass most rules in this
+/// workspace use. A trait named inside a comment, a string, or a `#[cfg(test)]`
+/// module is then never mistaken for a shipped declaration.
 ///
 /// A floor, not a proof: two traits sharing one name in a crate collapse into one
 /// entry here, public or not. Naming a private trait after a public one in the same
@@ -2816,36 +2817,11 @@ fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<Str
         .iter()
         .filter(|source| source.crate_name == crate_name)
     {
-        let mut depth: i32 = 0;
-        let mut test_module: Option<i32> = None;
-        let mut pending_test_attribute = false;
-
-        for line in source.contents.lines() {
-            let trimmed = line.trim();
-            let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
-            let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
-
-            if !trimmed.starts_with("//") {
-                if trimmed.contains("#[cfg(test)]") {
-                    pending_test_attribute = true;
-                }
-                if pending_test_attribute && opens > 0 {
-                    test_module = Some(depth);
-                    pending_test_attribute = false;
-                }
-            }
-
-            if test_module.is_none() && !trimmed.starts_with("//") {
-                let classified = without_leading_attributes(trimmed);
-                if let Some((name, false)) = trait_declaration(classified) {
-                    names.insert(name.to_owned());
-                }
-            }
-
-            depth += opens;
-            depth -= closes;
-            if test_module.is_some_and(|opened| depth <= opened) {
-                test_module = None;
+        let code = crate::source::without_test_modules(&crate::source::code_only(&source.contents));
+        for line in code.lines() {
+            let classified = without_leading_attributes(line.trim());
+            if let Some((name, false)) = trait_declaration(classified) {
+                names.insert(name.to_owned());
             }
         }
     }
@@ -6038,6 +6014,31 @@ mod tests {
                 crate_name: "waymaker-core".to_owned(),
                 path: "crates/waymaker-core/src/bank.rs".to_owned(),
                 contents: "impl core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_trait_declared_only_inside_a_block_comment_is_not_counted_as_private() {
+        // A hand-rolled `//`-only comment skip leaves a block-commented trait
+        // declaration counted as real. That hides a live impl of an unrelated
+        // trait sharing its name. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "/*\ntrait Display {\n    fn hidden(&self);\n}\n*/\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Display for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
             },
         ];
         let functions = public_functions(&sources);
