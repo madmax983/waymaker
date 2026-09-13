@@ -876,9 +876,15 @@ impl Harness {
     /// Only this one `op` value is accepted, not every value past the end. A past-the-end
     /// `op` is usually a caller's mistake, and `crates/waymaker-fault/tests/harness.rs`
     /// holds a regression for exactly that having once been silently accepted.
+    ///
+    /// `Progress::Bytes(0)` is read as [`Progress::None`] rather than matched on the
+    /// variant, because [`Progress::Bytes`] documents a hand-built zero as exactly that —
+    /// the same clamping [`Session::barrier`] holds itself to, and for the reason its own
+    /// comment gives: a guard that compared the variant would read `Bytes(0)` as a shape
+    /// the sentinel refuses, which is the clamping given back one caller at a time.
     fn is_terminal_watchdog_sentinel(injection: Injection, baseline: &Session) -> bool {
         injection.op == baseline.ops.len()
-            && injection.progress == Progress::None
+            && matches!(injection.progress, Progress::None | Progress::Bytes(0))
             && injection.interruption == Interruption::Watchdog
     }
 }

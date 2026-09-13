@@ -70,6 +70,14 @@ This also let `is_empty_sequence_sentinel` drop its `Watchdog` arm. An empty seq
 `injection.op == baseline.ops.len()` there — so the new sentinel already answers it, and the
 two predicates no longer overlap.
 
+**A second review round found the sentinel's `progress` check compared the `Progress`
+variant rather than the number of bytes.** `Progress::Bytes` documents a hand-built zero as
+`Progress::None` — the same clamping `Session::barrier` already holds itself to, after an
+identical mistake there was fixed for the same reason. `is_terminal_watchdog_sentinel` now
+reads `matches!(injection.progress, Progress::None | Progress::Bytes(0))`, and
+`a_hand_built_zero_bytes_at_the_terminal_point_is_the_sentinel_too` holds both spellings to
+the same answer.
+
 ## Alternatives considered
 
 **Enumerate the point.** Rejected in [#87](https://github.com/madmax983/waymaker/issues/87)'s

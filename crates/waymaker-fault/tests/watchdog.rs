@@ -681,6 +681,32 @@ fn nearby_shapes_at_the_terminal_point_are_still_refused() {
     }
 }
 
+#[test]
+fn a_hand_built_zero_bytes_at_the_terminal_point_is_the_sentinel_too() {
+    // A review finding on issue #87. `Progress::Bytes` documents that a hand-built zero is
+    // `Progress::None` — the same clamping `Session::barrier` already holds itself to, so
+    // that a caller normalizing progress through `Bytes(0)` sees one sentinel, not two.
+    let none = run_one(
+        Injection {
+            op: baseline_op_count(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+    let zero_bytes = run_one(
+        Injection {
+            op: baseline_op_count(),
+            progress: Progress::Bytes(0),
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+    assert_eq!(zero_bytes.image(), none.image());
+    assert_eq!(zero_bytes.ops(), none.ops());
+    assert_eq!(zero_bytes.ledger(), none.ledger());
+}
+
 /// How many operations [`one_program`] issues.
 fn baseline_op_count() -> usize {
     match Harness::new(geometry()).run_fault_free(one_program) {
