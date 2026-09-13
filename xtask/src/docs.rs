@@ -5885,6 +5885,34 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_comment_does_not_vouch_for_the_link_inside_it() {
+        // Codex, pull request #138: an HTML comment sitting on its own line is
+        // `Event::Html`, but one mid-paragraph — `text <!-- ... --> text` — is
+        // `Event::InlineHtml`, a different event `visible_source` did not hide.
+        let index = "See docs. <!-- [0002-two.md](0002-two.md) --> more text.\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link inside an inline comment counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_settled_decision_missing_from_the_adr_is_reported() {
         let mut inputs = clean_inputs(RULES);
         let first = SETTLED_DECISIONS[0];

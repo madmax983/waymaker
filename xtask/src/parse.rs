@@ -1089,7 +1089,11 @@ pub fn visible_source(contents: &str) -> String {
                     hidden.push((start, range.end));
                 }
             }
-            Event::Html(_) => hidden.push((range.start, range.end)),
+            // Block HTML (`Event::Html`) and inline HTML (`Event::InlineHtml`) are
+            // two different events for the same reason a fence and a code span are:
+            // `<!-- ... -->` sitting on its own line is one, and `text <!-- ... -->
+            // text` mid-paragraph is the other. Both must be hidden the same way.
+            Event::Html(_) | Event::InlineHtml(_) => hidden.push((range.start, range.end)),
             _ => {}
         }
     }
