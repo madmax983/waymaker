@@ -1401,6 +1401,39 @@ impl SizeReport {
                     ),
                 });
             }
+            if !CHECKSUM_CANDIDATES
+                .iter()
+                .any(|&(name, ..)| name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names a checksum candidate `{}`, which ADR 0010 never measured",
+                        candidate.name
+                    ),
+                });
+            }
+        }
+
+        // A report can name every candidate it has correctly and still be missing most of
+        // ADR 0010's table — `--report` reads a document this process did not produce, and
+        // a section with one valid entry passed every check above it until this one.
+        for &(name, shipped, ..) in CHECKSUM_CANDIDATES {
+            match candidates.iter().find(|candidate| candidate.name == name) {
+                None => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names no checksum candidate `{name}`; ADR 0010 measured it"
+                    ),
+                }),
+                Some(candidate) if candidate.shipped != shipped => {
+                    shortfalls.push(BudgetShortfall::Unmeasurable {
+                        detail: format!(
+                            "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
+                            candidate.shipped
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
         }
 
         shortfalls
@@ -5087,6 +5120,62 @@ mod tests {
         let message = rendered(&report.shortfalls());
         assert!(message.contains("crc32c-bitwise"), "{message}");
         assert!(message.contains("0 B"), "{message}");
+    }
+
+    #[test]
+    fn a_section_missing_four_of_the_five_candidates_is_not_a_pass() {
+        // Codex review on PR #133: a nonempty section with one valid, uniquely-named,
+        // nonzero candidate passed every check above. ADR 0010 measured five, and a
+        // report naming only one is a measurement that mostly did not happen.
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        for missing in [
+            "crc32-iso-hdlc-bitwise",
+            "crc32c-nibble-table",
+            "crc32c-byte-table",
+            "crc16-ccitt-false-bitwise",
+        ] {
+            assert!(message.contains(missing), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_candidate_adr_0010_never_named_is_not_a_pass() {
+        // A renamed, substituted, or invented candidate must be refused by name, not
+        // waved through because it happens to be unique and nonzero.
+        let mut candidates = fixture_checksum_candidates();
+        candidates.push(ChecksumCandidate {
+            name: "crc32-koopman".to_owned(),
+            shipped: false,
+            text: 52,
+            rodata: 0,
+        });
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-koopman"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_with_the_wrong_shipped_flag_is_not_a_pass() {
+        // ADR 0010 says exactly two of the five ship. A report that flipped the flag on
+        // one is not the measurement it claims to be.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32-iso-hdlc-bitwise" {
+                candidate.shipped = false;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
+        assert!(message.contains("shipped"), "{message}");
     }
 
     #[test]
