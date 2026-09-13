@@ -5112,6 +5112,31 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_a_template_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 28: `<template>` joins `<script>` and
+        // `<style>` (round 27) as a non-rendering element — its content is inert DOM
+        // meant for cloning by script, never displayed by default, so a marker hidden
+        // inside `<template>...</template>` must not settle anything either.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-template.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n{DEFERRED_QUESTION_MARKER} {}\n</template>\n",
+                clean_adr("hidden in a template"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a <template> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the
@@ -5733,10 +5758,16 @@ mod tests {
         // loose paragraph that follows inside the very same item — `Status: accepted`
         // — is `Event::Text` with `collecting` already true. Checking only
         // `collecting`, not `hidden`, let the hidden value through despite the round-20
-        // fix correctly marking it hidden. The comment closes as plain prose (its own
-        // round-21 finding) between the two items so the real one stays reachable.
-        let contents =
-            "# ADR\n\n- <div>\n  <!--\n\n  Status: accepted\n\n-->\n\n- Status: proposed\n";
+        // fix correctly marking it hidden.
+        //
+        // The comment is closed by a second, self-contained `<div>...</div>` block
+        // between the two items, not by plain prose (round 28 corrects round 21's own
+        // fix here: ordinary Markdown text is always HTML-escaped when rendered, so a
+        // bare `-->` on its own line can never really close a comment — only content
+        // that reaches this module as genuine, unescaped `Event::Html` can, which this
+        // second block's own `-->` line does).
+        let contents = "# ADR\n\n- <div>\n  <!--\n\n  Status: accepted\n\n\
+                         <div>\n-->\n</div>\n\n- Status: proposed\n";
         assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 
@@ -5790,6 +5821,17 @@ mod tests {
         // tag's *entire* trimmed body to `"br"`, so an attribute — `<br class="x">` —
         // no longer matched and the decoy it should disqualify slipped through.
         let contents = "# ADR\n\n- Sta<br class=\"x\">tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_closing_break_tag() {
+        // Codex, pull request #138, round 28: `<br>` has no real closing tag, but a
+        // browser recovers from the `</br>` parse error by treating it as a line break
+        // anyway. The round-27 fix stripped only a trailing self-closing slash, so a
+        // *leading* one — from the closing spelling — left an empty extracted name that
+        // never matched `"br"`, letting this decoy slip through undisqualified.
+        let contents = "# ADR\n\n- Sta</br>tus: accepted\n\n- Status: proposed\n";
         assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 
@@ -6307,13 +6349,19 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_after_a_comment_closed_as_plain_prose_still_counts() {
-        // Codex, pull request #138, round 21: once a comment has outlived its own
-        // `HtmlBlock` across a blank line, its closing `-->` is no longer structural at
-        // all — `pulldown-cmark` emits it as an ordinary paragraph's `Event::Text`, not
-        // `Event::Html` — so only a text-scanning check can see it and clear
-        // `in_html_comment`. Without one, a real decision after the close would stay
-        // hidden for the rest of the document.
+    fn a_decision_after_a_comment_never_really_closed_by_plain_prose_does_not_count() {
+        // Codex, pull request #138, round 28, correcting round 21's own fix: once a
+        // comment has outlived its own `HtmlBlock` across a blank line, its apparent
+        // closing `-->` on a later line is ordinary paragraph `Event::Text`, not
+        // `Event::Html` — and ordinary Markdown text is always HTML-escaped when
+        // rendered. Verified with a throwaway `pulldown-cmark` render: this exact
+        // source renders to `...<p>--&gt; two-banks-for-atomic-replacement ...`, so the
+        // literal three-byte sequence `-->` never survives into the HTML a browser
+        // parses, and the real, unescaped `<!--` a few lines up is still open through
+        // it — and everything after — exactly as if the paragraph had never been
+        // there. A decision after this decoy must stay hidden, the same as one after a
+        // comment with no apparent close of any kind (see
+        // `adr_status_hides_everything_after_an_unterminated_comment_that_outlived_its_block`).
         let mut inputs = clean_inputs(RULES);
         let fourth = SETTLED_DECISIONS[3];
         for adr in &mut inputs.adrs {
@@ -6329,8 +6377,9 @@ mod tests {
         }
         let violations = check_settled_decisions(&inputs.adrs);
         assert!(
-            !violations.iter().any(|v| v.subject == fourth.id),
-            "a decision after a comment closed as plain prose was still hidden: {violations:?}"
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision after a comment only apparently closed by plain prose still \
+             counted: {violations:?}"
         );
     }
 
@@ -6395,14 +6444,13 @@ mod tests {
 
     #[test]
     fn a_decision_after_an_escaped_fake_closer_still_does_not_count() {
-        // Codex, pull request #138, round 26: `pulldown-cmark` can decode an escape
-        // into the literal characters `-->` inside `Event::Text` just as readily as it
-        // can for `<!--` (round 22) — `\-->` decodes to a single `Text("-->")` event
-        // whose raw source is `\-->`, four bytes starting with a backslash a renderer
-        // shows as nothing while displaying `-->` as ordinary characters. The source
-        // never contains a real, unescaped comment terminator, so a comment that
-        // outlived its own `HtmlBlock` is still open, and the decision after this decoy
-        // must not count.
+        // Codex, pull request #138, round 26, subsumed by round 28's broader fix: an
+        // escaped `\-->` decodes to a `Text("-->")` event, but round 28 established
+        // that *no* `Event::Text` can ever close a real comment — ordinary Markdown
+        // text is always HTML-escaped when rendered, so `-->` never survives as three
+        // unescaped bytes in the rendered HTML regardless of how it reached this
+        // module. The decision after this decoy must not count, for that simpler,
+        // more general reason.
         let mut inputs = clean_inputs(RULES);
         let seventh = SETTLED_DECISIONS[6];
         for adr in &mut inputs.adrs {
@@ -7088,12 +7136,16 @@ mod tests {
     }
 
     #[test]
-    fn a_table_after_a_comment_closed_as_plain_prose_still_counts() {
-        // Codex, pull request #138, round 22: `table_rows` tracked `in_html_comment`
-        // only from `Event::Html`, so a comment that outlived its own `HtmlBlock`
-        // across a blank line and then closed via a standalone `-->` — emitted as
-        // ordinary `Event::Text`, not `Event::Html` — left the state stuck open,
-        // hiding every table after it for good, whatever came later.
+    fn a_table_after_a_comment_never_really_closed_by_plain_prose_does_not_count() {
+        // Codex, pull request #138, round 28, correcting round 22's own fix: a comment
+        // that outlives its own `HtmlBlock` across a blank line appears to close via a
+        // standalone `-->` a few lines later, but that line is ordinary paragraph
+        // `Event::Text`, not `Event::Html` — and ordinary Markdown text is always
+        // HTML-escaped when rendered, so the literal three-byte sequence `-->` never
+        // survives into the HTML a browser parses (verified with a throwaway
+        // `pulldown-cmark` render). The real, unescaped `<!--` stays open through it —
+        // and everything after, including the table below — exactly as it would with
+        // no apparent close at all.
         let clause = SPEC_CLAUSES.first().expect("the table is not empty");
         let claude_md = format!(
             "<div>\n<!--\n</div>\n\n-->\n\n\
@@ -7103,10 +7155,12 @@ mod tests {
         );
         let violations = check_spec_clauses_are_written_down(Some(&claude_md));
         assert!(
-            !violations
+            violations
                 .iter()
-                .any(|violation| violation.subject == clause.id),
-            "a table after a comment closed as plain prose was still hidden: {violations:?}"
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "a table after a comment only apparently closed by plain prose still \
+             counted: {violations:?}"
         );
     }
 

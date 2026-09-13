@@ -1017,42 +1017,19 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     out.push('`');
                 }
             }
-            // Clears an open comment against `Event::Text` (Codex, pull request #138,
-            // round 21): once a comment has outlived its own `HtmlBlock` across a blank
-            // line, its closing `-->` is no longer structural at all — `pulldown-cmark`
-            // emits it as ordinary paragraph text — so only a text-scanning check can
-            // see it and clear `in_html_comment`. A plain `if !hidden` here would never
-            // notice the close and would leave every later event hidden for the rest of
-            // the document.
-            //
-            // Never treated as an *opener*, even when the text contains `<!--` (Codex,
-            // round 22): a genuine, unescaped `<!--` in the source is always recognized
-            // by `pulldown-cmark`'s own inline scanner first and reaches this module as
-            // `Event::InlineHtml` or inside an `HtmlBlock` — never as `Event::Text`. So a
-            // `<!--`-looking sequence that does reach `Event::Text` can only be an
-            // escaped opener (`\<!--`) or a decoded HTML entity (`&lt;!--`), both of
-            // which a renderer shows as plain visible characters rather than as a
-            // comment; treating either as a real opener hides real content that follows
-            // a decoy meant to display literally. `append_visible_html_line`'s own
-            // opener search would misread both, so `Event::Text` uses a narrower helper
-            // that only ever looks for a *close*.
-            //
-            // Skipped entirely inside a fence: fenced content is opaque literal text —
-            // `some markup looks like <!-- this` inside a fenced example is characters,
-            // not a comment — and scanning it would let that literal `<!--` open a real
-            // comment state that then swallows everything after the fence closes. Fenced
-            // text is already excluded from `out` regardless, since `hidden` includes
-            // `in_fence`.
-            Event::Text(text) if !in_fence => {
-                append_text_after_comment_close(
-                    &text,
-                    &contents[range.clone()],
-                    preceded_by_backslash(contents, range.start),
-                    container_hidden,
-                    &mut in_html_comment,
-                    &mut out,
-                );
-            }
+            // Never scanned for a comment marker of either kind, opener or closer
+            // (Codex, pull request #138, round 28, correcting rounds 21/22/26): ordinary
+            // Markdown text is always HTML-escaped when rendered, so a literal `-->`
+            // reaching `Event::Text` never survives as three unescaped bytes in the
+            // rendered HTML a browser parses — verified with a throwaway `pulldown-cmark`
+            // render, where `--> visible suffix` renders to `--&gt; visible suffix`, and
+            // a browser's still-open comment (from an earlier, genuinely unterminated
+            // `<!--`) never sees a real close there, so it — and everything after —
+            // stays exactly as hidden as if the paragraph had never been there.
+            // `Event::Text` therefore can never open *or* close a comment; only
+            // `Event::Html` and `Event::InlineHtml` are ever rendered unescaped, and are
+            // the only events this module trusts to change `in_html_comment`.
+            Event::Text(text) if !hidden => out.push_str(&text),
             Event::Start(Tag::Heading { level, .. }) => {
                 if !hidden {
                     if !out.is_empty() && !out.ends_with('\n') {
@@ -1109,15 +1086,16 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     out
 }
 
-/// Whether a `Tag::HtmlBlock`'s own source opens with `<script` or `<style` —
-/// case-insensitively, and only when the tag name ends there rather than continuing
-/// into a longer one (`<scriptx>` does not match).
+/// Whether a `Tag::HtmlBlock`'s own source opens with `<script`, `<style` or
+/// `<template` — case-insensitively, and only when the tag name ends there rather than
+/// continuing into a longer one (`<scriptx>` does not match).
 ///
-/// These are the two HTML elements whose body a browser never renders as visible text
-/// (Codex, pull request #138, round 27); every other tag `markdown_prose` keeps
-/// verbatim because a reader does see it.
+/// These are the three HTML elements whose body a browser never renders as visible
+/// text (Codex, pull request #138, rounds 27 and 28 — `<template>`'s content is inert
+/// DOM meant for cloning by script, not display); every other tag `markdown_prose`
+/// keeps verbatim because a reader does see it.
 fn is_non_rendering_html_block(source: &str) -> bool {
-    ["script", "style"].iter().any(|tag| {
+    ["script", "style", "template"].iter().any(|tag| {
         let open = format!("<{tag}");
         source
             .get(..open.len())
@@ -1176,80 +1154,6 @@ fn append_visible_html_line(
     }
 }
 
-/// Clears an open HTML comment against an `Event::Text` fragment, appending whatever
-/// follows the close when it is not hidden — and, unlike [`append_visible_html_line`],
-/// never treats the fragment's own text as *opening* a comment.
-///
-/// A real, unescaped `<!--` in the source is always recognized by `pulldown-cmark`'s
-/// own inline scanner before this module ever sees it, and reaches here as
-/// `Event::InlineHtml` or inside an `Event::Html` block — never as `Event::Text`
-/// (Codex, pull request #138, round 22). So a `<!--`-looking sequence that does reach
-/// `Event::Text` can only have come from an escaped opener (`\<!--`) or a decoded HTML
-/// entity (`&lt;!--`), and a renderer shows both as plain visible characters rather
-/// than as a comment; searching this text for an opener the way
-/// `append_visible_html_line` does would misread either as a real one and hide
-/// everything genuine that follows a decoy meant to display literally.
-///
-/// A standalone closing `-->`, in contrast, has no special inline meaning of its own —
-/// three ordinary characters, not a tag — so it reaches `Event::Text` as real, unescaped
-/// source whenever a comment has outlived its own `HtmlBlock` across a blank line
-/// (round 21), and is still recognized here for exactly that reason.
-///
-/// A match at the very start of `source` is trusted only when `escaped_first_char` is
-/// false (Codex, round 26): `pulldown-cmark` can decode a backslash escape into a
-/// literal character and then keep coalescing the ordinary text that follows into the
-/// *same* `Event::Text` — `\-->` decodes to one `Text("-->")` event — but its own
-/// reported byte range starts right at the escaped character, excluding the backslash
-/// before it, so the event's raw source and its decoded text are identical and a plain
-/// substring search cannot tell them apart. The backslash itself is still there in the
-/// document, one byte before the event's own range, which is what `escaped_first_char`
-/// reads: when it is set, only a `-->` found *after* that first character is trusted,
-/// because every character but the first is unquestionably literal — an escape masks
-/// exactly one character and never more. An entity (`&lt;`) cannot reproduce this: it
-/// never coalesces with neighbouring text on *either* side in `pulldown-cmark` 0.13, so
-/// `--&gt;` always splits into pieces too short on their own to contain `-->` at all,
-/// verified with a throwaway probe before writing this rather than assumed.
-/// Whether `contents[position]` is immediately preceded by a literal backslash.
-///
-/// A backslash escape's own byte is excluded from the range `pulldown-cmark` reports
-/// for the `Event` it produces, so the escaped character and any literal text
-/// `pulldown-cmark` coalesces after it are indistinguishable from genuine source by
-/// range alone — the backslash is still there, one byte earlier in `contents`, and
-/// this is how [`append_text_after_comment_close`] reads it (Codex, round 26).
-fn preceded_by_backslash(contents: &str, position: usize) -> bool {
-    position
-        .checked_sub(1)
-        .and_then(|index| contents.as_bytes().get(index))
-        .is_some_and(|&byte| byte == b'\\')
-}
-
-fn append_text_after_comment_close(
-    text: &str,
-    source: &str,
-    escaped_first_char: bool,
-    hidden: bool,
-    in_html_comment: &mut bool,
-    out: &mut String,
-) {
-    if *in_html_comment {
-        let search_from = usize::from(escaped_first_char).min(source.len());
-        let Some(close) = source[search_from..]
-            .find("-->")
-            .map(|relative| search_from + relative)
-        else {
-            return;
-        };
-        *in_html_comment = false;
-        if !hidden {
-            out.push_str(&source[close + "-->".len()..]);
-        }
-        return;
-    }
-    if !hidden {
-        out.push_str(text);
-    }
-}
-
 /// Whether an `Event::InlineHtml`'s text is some spelling of the `<br>` tag — the one
 /// inline HTML element that renders as a line break rather than inline.
 ///
@@ -1258,12 +1162,15 @@ fn append_text_after_comment_close(
 /// `<br />`, `<BR>` and `<br class="x">` all admit (Codex, pull request #138, rounds 26
 /// and 27) — HTML tag names, attributes, spacing and the self-closing slash are all
 /// parts a browser (and `pulldown-cmark`) ignores when deciding this is a line break.
-/// Any other tag name, opening or closing, is ordinary inline formatting that renders
-/// with no break at all.
+/// A leading `/` is stripped first, too (Codex, round 28): `<br>` has no closing tag in
+/// real HTML, so `</br>` is a parse error a browser recovers from by treating it as a
+/// line break anyway, the same as the opening spelling. Any other tag name is ordinary
+/// inline formatting that renders with no break at all.
 fn is_line_break_tag(html: &str) -> bool {
     let Some(rest) = html.trim().strip_prefix('<') else {
         return false;
     };
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
     let rest = rest.strip_suffix('>').unwrap_or(rest);
     let name_end = rest
         .find(|character: char| character.is_whitespace() || character == '/')
@@ -1497,48 +1404,16 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     }
                 }
             }
-            // Routed through the comment-aware scan unconditionally, not only while
-            // `collecting` (Codex, pull request #138, round 21, second finding): once a
-            // comment has outlived its own `HtmlBlock` across a blank line, its closing
-            // `-->` is no longer structural at all — emitted as ordinary text — and if
-            // that text falls outside the item being collected (as it typically does,
-            // sitting between two items or after the list), skipping `Event::Text`
-            // whenever `!collecting` would mean `in_html_comment` is never cleared and
-            // every later item stays hidden for good. `container_hidden` rather than
-            // `hidden` is passed for the reason `markdown_prose` passes it to the same
-            // helper: a close and a visible suffix can land in the same event. Writing
-            // into a fresh, per-call buffer and only then copying it into `item` (rather
-            // than disqualifying the item outright, as a nested fence or blockquote
-            // does) stays safe the way it did not in round 15: the whole value is one
-            // Text event with nothing already collected before it, so a hidden value
-            // simply leaves `item` empty rather than leaving a prefix that trivially
-            // matches.
-            // Skipped entirely inside a fence, for `markdown_prose`'s reason: fenced
-            // content is opaque literal text, so a literal `<!--` inside a fenced
-            // example must not be scanned as a real comment opener — doing so would
-            // set `in_html_comment` from characters that mean nothing and hide every
-            // later item for good, whether or not this one was being collected.
-            //
-            // Never treated as an opener even when it contains `<!--` (Codex, round
-            // 22), for `append_text_after_comment_close`'s reason: a real, unescaped
-            // one is always caught by `pulldown-cmark`'s inline scanner first and never
-            // reaches `Event::Text`, so one that does is an escape or a decoded entity a
-            // renderer shows as plain characters, not a real comment.
-            Event::Text(text) if !in_fence => {
-                let container_hidden = in_fence || blockquote_depth > 0;
-                let mut visible = String::new();
-                append_text_after_comment_close(
-                    &text,
-                    &contents[range.clone()],
-                    preceded_by_backslash(contents, range.start),
-                    container_hidden,
-                    &mut in_html_comment,
-                    &mut visible,
-                );
-                if collecting {
-                    item.push_str(&visible);
-                }
-            }
+            // Never scanned for a comment marker (Codex, pull request #138, round 28,
+            // correcting rounds 21/22): ordinary Markdown text is always HTML-escaped
+            // when rendered, so a `-->` reaching `Event::Text` never survives as three
+            // unescaped bytes in the rendered HTML a browser parses — verified with a
+            // throwaway render, where `-->` in prose renders to `--&gt;`. A comment a
+            // genuine, unescaped `<!--` opened therefore stays open through any amount
+            // of later `Event::Text`, exactly as it would in a browser; only
+            // `Event::Html` can close it, which `hidden` (folding in `in_html_comment`)
+            // already reflects here.
+            Event::Text(text) if collecting && !hidden => item.push_str(&text),
             Event::Code(code) if collecting && !hidden => {
                 item.push('`');
                 item.push_str(&code);
@@ -1626,7 +1501,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     let mut in_html_comment = false;
     let mut html_scratch = String::new();
 
-    for (event, range) in Parser::new_ext(contents, Options::ENABLE_TABLES).into_offset_iter() {
+    for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
         match event {
             Event::Html(html) => {
@@ -1663,28 +1538,14 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                 row.push_str(cell.trim());
                 row.push_str(" |");
             }
+            // Never scanned for a comment closer (Codex, pull request #138, round 28,
+            // correcting round 22): ordinary Markdown text is always HTML-escaped when
+            // rendered, so a `-->` reaching `Event::Text` never survives as three
+            // unescaped bytes in the rendered HTML a browser parses. A comment a
+            // genuine, unescaped `<!--` opened stays open through any amount of later
+            // `Event::Text`; only `Event::Html` can close it, which is why `in_row`
+            // (never set while `hidden`) is the only gate this arm needs.
             Event::Text(text) if in_row => cell.push_str(&text),
-            // Comment state cleared outside a row too (Codex, pull request #138, round
-            // 22): a comment that outlives its own `HtmlBlock` across a blank line
-            // closes via a standalone `-->` that `pulldown-cmark` emits as ordinary
-            // `Event::Text`, not `Event::Html`. Without watching for it here as well —
-            // this function previously updated `in_html_comment` only from
-            // `Event::Html` — the state never clears and every table after it is hidden
-            // for good, since a table cannot start while `hidden` is true. Discarded
-            // into the same scratch buffer `Event::Html` already writes into, for its
-            // reason: only the state transition matters here. Skipped entirely inside a
-            // fence, and never treated as an opener, both for
-            // `append_text_after_comment_close`'s reasons.
-            Event::Text(text) if !in_fence => {
-                append_text_after_comment_close(
-                    &text,
-                    &contents[range.clone()],
-                    preceded_by_backslash(contents, range.start),
-                    true,
-                    &mut in_html_comment,
-                    &mut html_scratch,
-                );
-            }
             Event::Code(code) if in_row => {
                 cell.push('`');
                 cell.push_str(&code);
