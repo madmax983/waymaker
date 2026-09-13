@@ -589,6 +589,106 @@ fn a_watchdog_reset_after_the_last_operation_is_the_fault_free_run() {
     );
 }
 
+#[test]
+fn a_watchdog_reset_after_the_last_operation_does_not_run_the_writer_again() {
+    // A review finding on issue #87. `Session::injection` is public, so a writer can see
+    // that a crash point is armed. Running the writer a second time for the terminal
+    // sentinel would let such a writer add a mark after its last storage call — here,
+    // `begin_record` with no op after it — that changes the ledger without changing any
+    // operation. `trace` cannot catch this: it compares operations up to the crash point,
+    // and a mark placed at `ops.len()` sits outside every span `trace` computes here. So
+    // the terminal sentinel must not run the writer again at all; it answers with the
+    // fault-free run itself.
+    let calls = RefCell::new(0_u32);
+    let writer = |session: &mut Session| -> Result<(), FaultError> {
+        *calls.borrow_mut() += 1;
+        session.begin_record(RecordId(1));
+        session.program(0, PAYLOAD)?;
+        session.barrier()?;
+        session.end_record();
+        if session.injection().is_some() {
+            // No further storage call follows: this mark sits at `ops.len()`.
+            session.begin_record(RecordId(99));
+        }
+        Ok(())
+    };
+
+    // `program(0, PAYLOAD)` and `barrier()`: two operations, known ahead of time so the
+    // terminal sentinel's `op` does not need a separate baseline call of its own — the
+    // point of this test is that `run_one` calls `writer` exactly once in total.
+    let harness = Harness::new(geometry());
+    let Ok(terminal) = harness.run_one(
+        Injection {
+            op: 2,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        writer,
+    ) else {
+        unreachable!("the terminal sentinel is answerable")
+    };
+
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "the terminal sentinel answered without running the writer a second time"
+    );
+    assert_eq!(
+        terminal.ledger().state(RecordId(99)),
+        None,
+        "the terminal sentinel's ledger is the fault-free run's, with no record a writer \
+         added only because it saw the crash point armed"
+    );
+    assert_eq!(
+        terminal.ledger().state(RecordId(1)),
+        Some(waymaker_fault::Durability::Acknowledged)
+    );
+}
+
+#[test]
+fn nearby_shapes_at_the_terminal_point_are_still_refused() {
+    // The sentinel is exactly one shape, not every `op` past the end. Issue #87's review:
+    // pin the narrowness rather than leave it true only by inspection.
+    let ops = baseline_op_count();
+    for injection in [
+        Injection {
+            op: ops,
+            progress: Progress::Bytes(1),
+            interruption: Interruption::Watchdog,
+        },
+        Injection {
+            op: ops,
+            progress: Progress::Whole,
+            interruption: Interruption::Watchdog,
+        },
+        Injection {
+            op: ops,
+            progress: Progress::None,
+            interruption: Interruption::PowerLoss,
+        },
+        Injection {
+            op: ops + 1,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+    ] {
+        let outcome = Harness::new(geometry()).run_one(injection, one_program);
+        assert_eq!(
+            outcome.err(),
+            Some(waymaker_fault::HarnessError::CrashPointNeverFired { injection }),
+            "{injection:?} looks close to the terminal sentinel but must not be accepted"
+        );
+    }
+}
+
+/// How many operations [`one_program`] issues.
+fn baseline_op_count() -> usize {
+    match Harness::new(geometry()).run_fault_free(one_program) {
+        Ok(run) => run.ops().len(),
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // 4. The real writer, at every watchdog reset
 // ---------------------------------------------------------------------------------------
