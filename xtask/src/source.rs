@@ -413,6 +413,31 @@ mod bare_metal_tests {
     }
 
     #[test]
+    fn a_raw_identifier_extern_crate_is_caught_in_a_nested_module() {
+        // Issue #68: this scan must catch `r#alloc` too, the same as the
+        // crate-root scan does.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-flash",
+            "crates/waymaker-flash/src/frame.rs",
+            "extern crate r#alloc;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].detail.contains("extern crate alloc"));
+    }
+
+    #[test]
+    fn a_raw_identifier_extern_crate_std_is_caught_in_a_nested_module() {
+        // Issue #68: check `r#std` too. Do not check `r#alloc` only.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-core",
+            "crates/waymaker-core/src/replay.rs",
+            "extern crate r#std;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].detail.contains("extern crate std"));
+    }
+
+    #[test]
     fn an_ordinary_layer_source_passes() {
         assert!(
             check_layer_sources_are_bare_metal(&[source(
@@ -9542,6 +9567,19 @@ mod tests {
             violations
                 .iter()
                 .any(|v| v.detail.contains("extern crate alloc")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_extern_crate_std_is_detected() {
+        // Issue #68: check `r#std` too. Do not check `r#alloc` only.
+        let source = "#![no_std]\n#![forbid(unsafe_code)]\nextern crate r#std;\n";
+        let violations = check_crate_attributes(&sources("waymaker-core", source));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.detail.contains("extern crate std")),
             "{violations:?}"
         );
     }
