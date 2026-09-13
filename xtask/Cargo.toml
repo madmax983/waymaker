@@ -55,6 +55,10 @@ pulldown-cmark = { version = "0.13.3", default-features = false }
 # produced (`#![forbid(unsafe_code)]`). Comes along with `syn`'s `printing` feature;
 # named here so the `use` is a direct dependency rather than a transitive accident.
 quote = "1"
+# Reading a `macro_rules!` body for a nested `include!` walks `syn::Macro`'s opaque
+# token stream, which is `proc-macro2`'s type. Comes along with `syn`; named here so
+# the `use` is a direct dependency rather than a transitive accident.
+proc-macro2 = "1"
 
 # The compile-fail test for the kernel-state assertion reads the budget from the crate
 # that declares it rather than restating the number it expects to be rejected.

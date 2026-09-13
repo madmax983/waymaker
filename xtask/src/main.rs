@@ -49,11 +49,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// Links the emulated image for both cores, starts both, and gates what they said.
+/// Links the emulated image for every selected core, starts each, and gates what they said.
 ///
-/// Takes no arguments: the machines are [`xtask::emulate::MACHINES`] and the run is either
-/// taken or failed. A `--skip-if-missing` here would be the one flag that turns this gate
-/// into a command that exits zero having measured nothing.
+/// Takes no arguments: the machines are [`xtask::emulate::selected_machines`] — the ARM
+/// pair always, and the ESP32-S3 when `WAYMAKER_XTENSA_OPT_IN` opts it in — and the run is
+/// either taken or failed. A `--skip-if-missing` here would be the one flag that turns this
+/// gate into a command that exits zero having measured nothing; the opt-in is not one,
+/// because an opted-in machine whose dependencies are absent still fails the run.
 fn run_emulate(args: &[String]) -> ExitCode {
     if let Some(argument) = args.first() {
         eprintln!("xtask: unknown argument `{argument}`\n{USAGE}");

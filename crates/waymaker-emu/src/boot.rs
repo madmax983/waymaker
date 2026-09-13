@@ -60,7 +60,7 @@ pub const SEED: u64 = 0x7761_796D_616B_6572;
 /// How many iterations the boot drives.
 ///
 /// Enough that the plan's cut lands in more than one phase — the point of the sweep is that
-/// the cut moves — and small enough that both emulated runs finish in a second or so.
+/// the cut moves — and small enough that every emulated run finishes in a second or so.
 pub const ITERATIONS: u32 = 12;
 
 /// How many effects each iteration's run schedules.
