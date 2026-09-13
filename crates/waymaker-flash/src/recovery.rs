@@ -515,11 +515,39 @@ pub enum RecoveryError<E> {
 /// * [`append_offset`](Self::append_offset) answers [`Some`] only for a scan that ended in
 ///   erased media.
 ///
-/// # Why it is not `Copy`
+/// # Why it is not `Copy` or `Clone`
 ///
-/// A position, and a copied position is two readers of one journal that each believe they
-/// are the only one. `Clone` stays, because forking a scan deliberately is a thing a caller
-/// may want to write down.
+/// A recovery is a position, and the one thing a position buys is a writer.
+///
+/// [`Journal::after`](crate::append::Journal::after) takes a recovery by value, not by
+/// reference, so that one scan cannot hand out two writers at one offset. A derived `Clone`
+/// used to defeat that: `Journal::after(recovery.clone())` made two writers from one scan,
+/// each ready to program its frame over the other's — see issue
+/// [#77](https://github.com/madmax983/waymaker/issues/77).
+///
+/// A caller that wants two writers must run two scans. Each scan is its own [`Recovery`]
+/// over the same [`JournalRegion`], built and pumped from scratch. A clone copied one
+/// scan's answer. It did not read the device again.
+///
+/// ```
+/// # use waymaker_flash::append::Journal;
+/// # use waymaker_flash::recovery::Recovery;
+/// fn one_writer_from_one_scan(recovery: Recovery) -> Option<Journal> {
+///     Journal::after(recovery)
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use waymaker_flash::append::Journal;
+/// # use waymaker_flash::recovery::Recovery;
+/// fn two_writers_from_one_scan(recovery: Recovery) -> (Option<Journal>, Option<Journal>) {
+///     (Journal::after(recovery.clone()), Journal::after(recovery))
+/// }
+/// ```
+///
+/// The two differ in one call. The first compiles, which is what stops the second from
+/// failing for some unrelated reason, and the second names `E0599`, so it fails for "no
+/// method named `clone`" specifically rather than for a typo.
 ///
 /// # Why the integrity check is a type parameter
 ///
@@ -527,7 +555,7 @@ pub enum RecoveryError<E> {
 /// is walking. It defaults to [`Catalogued`], so `Recovery` is the shipped check and a
 /// caller that wants another writes it down at the type, where it is visible in every
 /// signature the value passes through.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Recovery<C: IntegrityCheck = Catalogued> {
     region: JournalRegion,
     offset: u32,

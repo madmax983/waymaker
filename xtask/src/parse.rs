@@ -325,17 +325,33 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn future_trait_implementors(contents: &str) -> Result<Vec<String>, syn::Error> {
+    trait_implementors(contents, "Future")
+}
+
+/// The self types of every `impl` of `trait_name` found in `contents`, however the trait
+/// path ends.
+///
+/// [`future_trait_implementors`] is this at `trait_name = "Future"`. Issue #77 needs a
+/// second trait — `Clone` — so this is the general form: a handwritten `impl Clone for
+/// Recovery` is caught the same way a `#[derive(Clone)]` is, and an alias on the trait
+/// name cannot hide the implementor.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
     let mut aliases = Vec::new();
     collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
     let mut implementors = Vec::new();
-    collect_future_implementors(&file.items, &aliases, &mut implementors);
+    collect_trait_implementors(&file.items, &aliases, trait_name, &mut implementors);
     Ok(implementors)
 }
 
-fn collect_future_implementors(
+fn collect_trait_implementors(
     items: &[syn::Item],
     aliases: &[UseAlias],
+    trait_name: &str,
     implementors: &mut Vec<String>,
 ) {
     for item in items {
@@ -346,7 +362,7 @@ fn collect_future_implementors(
             syn::Item::Impl(implementation) => {
                 if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
                     let resolved = resolve_segments(trait_path, aliases);
-                    if resolved.last().is_some_and(|last| last == "Future") {
+                    if resolved.last().is_some_and(|last| last == trait_name) {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
                                 implementors.push(name.ident.to_string());
@@ -357,10 +373,119 @@ fn collect_future_implementors(
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    collect_future_implementors(nested, aliases, implementors);
+                    collect_trait_implementors(nested, aliases, trait_name, implementors);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// The derive traits named on the struct `name` in `contents`, or [`None`] when `contents`
+/// declares no struct of that name.
+///
+/// [`Some`] may still be empty: a declared struct that derives nothing is not the same as
+/// no struct at all, and a caller pinning "this struct must not derive `Clone`" needs to
+/// tell the two apart the way every surface pin in this file already says "or the module
+/// is gone, so the pin checks nothing" rather than reading a rename as a clean pass.
+///
+/// Two things a naive `#[derive(..)]` scan misses, both closed here. A derive path
+/// resolves through the file's `use` aliases and keeps its last segment, so
+/// `use core::clone::Clone as Klon; #[derive(Klon)]` reports `Clone`, the same way
+/// [`trait_implementors`] resolves the trait name of a handwritten `impl`. And a derive
+/// named inside `#[cfg_attr(.., derive(..))]` is read too, whatever the condition is: a
+/// `Clone` that only applies under one build is still a `Clone` under that build, and
+/// reading past the condition rather than evaluating it is what `codec-is-optional`
+/// already does for a compound `cfg`, for the same reason.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>, syn::Error> {
+    let file = parse_rust(contents)?;
+    let mut aliases = Vec::new();
+    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    let mut derives = Vec::new();
+    let declared = collect_struct_derives(&file.items, name, &aliases, &mut derives);
+    Ok(declared.then_some(derives))
+}
+
+/// Whether `name` is declared anywhere in `items`, filling `derives` with what it derives.
+fn collect_struct_derives(
+    items: &[syn::Item],
+    name: &str,
+    aliases: &[UseAlias],
+    derives: &mut Vec<String>,
+) -> bool {
+    let mut declared = false;
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Struct(found) if found.ident == name => {
+                declared = true;
+                for attr in &found.attrs {
+                    collect_derive_names(attr, aliases, derives);
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    declared |= collect_struct_derives(nested, name, aliases, derives);
+                }
+            }
+            _ => {}
+        }
+    }
+    declared
+}
+
+/// The trait names `attr` derives, resolved through `aliases`: from a plain
+/// `#[derive(..)]`, or from every `derive(..)` inside a `#[cfg_attr(.., ..)]`.
+fn collect_derive_names(attr: &syn::Attribute, aliases: &[UseAlias], derives: &mut Vec<String>) {
+    if attr.path().is_ident("derive") {
+        if let Ok(paths) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+        ) {
+            push_resolved_names(&paths, aliases, derives);
+        }
+        return;
+    }
+    if !attr.path().is_ident("cfg_attr") {
+        return;
+    }
+    // `cfg_attr(condition, attr, attr, ..)`: the first argument is the condition and
+    // every argument after it applies when the condition holds. Every one is read
+    // regardless of what the condition is, for the reason the doc comment above gives.
+    let Ok(metas) = attr.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return;
+    };
+    for meta in metas.into_iter().skip(1) {
+        let syn::Meta::List(list) = &meta else {
+            continue;
+        };
+        if !list.path.is_ident("derive") {
+            continue;
+        }
+        if let Ok(paths) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+        ) {
+            push_resolved_names(&paths, aliases, derives);
+        }
+    }
+}
+
+/// Pushes the resolved last segment of each path in `paths` onto `derives`.
+fn push_resolved_names(
+    paths: &syn::punctuated::Punctuated<syn::Path, syn::Token![,]>,
+    aliases: &[UseAlias],
+    derives: &mut Vec<String>,
+) {
+    for path in paths {
+        if let Some(name) = resolve_segments(path, aliases).pop() {
+            derives.push(name);
         }
     }
 }

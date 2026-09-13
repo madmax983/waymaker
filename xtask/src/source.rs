@@ -1821,13 +1821,29 @@ pub const RECOVERY_SURFACE: &[&str] = &[
     "with_integrity",
 ];
 
-/// Rule: the recovery reader's public surface is exactly the one that was reviewed.
+/// The struct the second half of [`check_recovery_surface`] pins, in
+/// [`RECOVERY_SURFACE_PATH`].
+const RECOVERY_TYPE: &str = "Recovery";
+
+/// Rule: the recovery reader's public surface is exactly the one that was reviewed, and
+/// `Recovery` cannot be duplicated.
 ///
-/// The same shape as [`check_replay_cursor_surface`], for the reader that walks a journal on
-/// media rather than one in RAM.
+/// The surface half is the same shape as [`check_replay_cursor_surface`], for the reader
+/// that walks a journal on media rather than one in RAM.
+///
+/// The second half is issue [#77](https://github.com/madmax983/waymaker/issues/77).
+/// [`waymaker_flash::append::Journal::after`] takes a `Recovery` by value so that one scan
+/// cannot hand out two writers at one offset. A derived `Clone` undid that:
+/// `Journal::after(recovery.clone())` is one scan and two writers, not two scans. This
+/// fires on that derive and on a handwritten `impl Clone for Recovery`, because both give
+/// the mutation back without touching `Journal::after` at all.
+///
+/// What it cannot see: a `Recovery` rebuilt from its own public `region`, `offset` and
+/// `ending` readings, by a struct literal written inside this same file. That needs no
+/// `Clone` anywhere, and CLAUDE.md's "What is not checked" names the limit.
 #[must_use]
 pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
-    check_pinned_surface(
+    let mut violations = check_pinned_surface(
         "recovery-surface",
         "waymaker-flash",
         RECOVERY_SURFACE_PATH,
@@ -1836,7 +1852,81 @@ pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Viola
         "the reader's public API is where design document \u{a7}02 decision 2 and the rule \
          that an append offset is only ever erased media are both enforced, so a seek or a \
          second way to an offset cannot be added without a reviewer writing it down",
-    )
+    );
+    violations.extend(check_recovery_is_not_clone(sources));
+    violations
+}
+
+/// The second half of [`check_recovery_surface`], over one file's parsed syntax.
+///
+/// Split out for the reason [`check_append_typestate`] is: a surface pin is a set
+/// comparison and this is a shape, and a reader chasing one does not have to read the
+/// other.
+///
+/// Fails closed three ways, each reported rather than read as a pass: the file does not
+/// parse, so neither half below can be checked; the file parses but declares no
+/// `Recovery` struct at all, which is a rename this pin must not read as "no `Clone`
+/// found"; or it declares one that is `Clone`, by a derive or by a handwritten `impl`.
+fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "recovery-surface";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, RECOVERY_SURFACE_PATH) else {
+        // `check_pinned_surface`, called just above, already reports a missing module.
+        return Vec::new();
+    };
+    let derived = match crate::parse::struct_derives(&source.contents, RECOVERY_TYPE) {
+        Ok(Some(derived)) => derived,
+        Ok(None) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} declares no `{RECOVERY_TYPE}` struct: a rename \
+                     or a re-export under that name leaves this pin checking nothing"
+                ),
+            )];
+        }
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} does not parse, so whether `{RECOVERY_TYPE}` is \
+                     `Clone` cannot be checked: {error}"
+                ),
+            )];
+        }
+    };
+    let handwritten = match crate::parse::trait_implementors(&source.contents, "Clone") {
+        Ok(implementors) => implementors,
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} does not parse, so its `Clone` implementors \
+                     cannot be checked: {error}"
+                ),
+            )];
+        }
+    };
+    let is_clone = derived.iter().any(|name| name == "Clone")
+        || handwritten
+            .iter()
+            .any(|implementor| implementor == RECOVERY_TYPE);
+    if !is_clone {
+        return Vec::new();
+    }
+    vec![Violation::new(
+        RULE,
+        ADAPTER,
+        format!(
+            "`{RECOVERY_TYPE}` is `Clone`: `Journal::after` takes it by value so one scan \
+             cannot hand out two writers, and a clone hands out two writers from one scan \
+             anyway (issue #77)"
+        ),
+    )]
 }
 
 /// The file whose public surface [`check_rig_oracle`] pins: the rig's oracle.
@@ -10093,6 +10183,138 @@ mod tests {
         );
     }
 
+    /// [`tests_support::clean_recovery_surface`] with its `Recovery` struct's own line
+    /// replaced by `struct_decl`, as one [`crate::size::LayerSource`].
+    ///
+    /// A second `pub struct Recovery` appended beside the clean one, the way
+    /// [`recovery_source`] would append it, is not a file `waymaker-flash` could ship —
+    /// two declarations of one name — so the Clone-shape tests below replace the
+    /// declaration in place instead, the way
+    /// [`a_recovery_function_that_disappeared_is_reported_too`] already replaces the
+    /// clean fixture's `append_offset` line.
+    fn recovery_source_with_struct(struct_decl: &str) -> Vec<crate::size::LayerSource> {
+        let contents = tests_support::clean_recovery_surface().replace(
+            "#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n",
+            struct_decl,
+        );
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents,
+        }]
+    }
+
+    #[test]
+    fn a_recovery_that_is_not_clone_is_accepted() {
+        // The shape issue #77's fix leaves behind: `Recovery` still derives `Debug`,
+        // `PartialEq` and `Eq`, and none of those is `Clone`.
+        assert!(check_recovery_surface(&recovery_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_recovery_that_derives_clone_is_rejected() {
+        // Issue #77: `Journal::after` takes a `Recovery` by value so one scan cannot hand
+        // out two writers, and a derived `Clone` let a caller do exactly that with
+        // `Journal::after(recovery.clone())` — one scan, two writers.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Clone, Debug)]\npub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "recovery-surface");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_inside_a_cfg_attr_is_still_rejected() {
+        // A `Clone` that only applies under one build is still a `Clone` under that
+        // build. `missing-docs` already treats a `cfg_attr` wrapper as the same
+        // regression as a bare one; this pin has to as well.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(not(feature = \"nope\"), derive(Clone))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_an_aliased_name_is_still_rejected() {
+        // `Clone` renamed on the way in is still `Clone`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "use core::clone::Clone as Klon;\n#[derive(Klon, Debug)]\npub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_recovery_with_a_handwritten_clone_impl_is_rejected() {
+        // A reviewer told to remove the derive can still write the same defect by hand.
+        // `clone` also lands as a new name on the surface pin — unlike a derive, a
+        // handwritten `impl` is a method the surface half can see too — so both halves
+        // fire, and both name `recovery-surface`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "pub struct Recovery;\nimpl Clone for Recovery {\n    fn clone(&self) -> Self { \
+             Recovery }\n}\n",
+        ));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.rule == "recovery-surface")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Clone")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clone_on_an_unrelated_struct_does_not_trip_the_recovery_pin() {
+        // The check is about `Recovery`, not about whether the file mentions `Clone` at
+        // all — a decoy in the same file must not report on a struct that is not the one
+        // `Journal::after` is written against.
+        let violations = check_recovery_surface(&recovery_source(
+            "#[derive(Clone)]\npub struct NotRecovery;\n",
+        ));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_recovery_renamed_and_reexported_fails_closed_rather_than_reading_as_clean() {
+        // No `syn::Item::Struct` here is named `Recovery` at all — it was renamed to
+        // `Scan` and re-exported under the old name. `struct_derives` must report that as
+        // "checking nothing" rather than as "no `Clone` found", or a `Clone` `Scan`
+        // behind this exact rename would read as a clean pass.
+        let renamed = recovery_source_with_struct(
+            "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as \
+             Recovery;\n",
+        );
+        let violations = check_recovery_surface(&renamed);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
     #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
@@ -15241,10 +15463,18 @@ mod tests {
         surface("A storage module.", STORAGE_CONTRACT_SURFACE)
     }
 
-    /// A recovery module declaring exactly [`RECOVERY_SURFACE`] and nothing else.
+    /// A recovery module declaring exactly [`RECOVERY_SURFACE`], and a `Recovery` struct
+    /// that derives neither `Clone`.
+    ///
+    /// The struct is part of "clean" now that issue #77's fix pins its derives too: a
+    /// fixture with no `Recovery` struct at all is not a recovery module the fix would
+    /// leave behind, it is the rename the pin has to fail closed on — see
+    /// `check_recovery_is_not_clone`.
     #[must_use]
     pub fn clean_recovery_surface() -> String {
-        surface("A recovery module.", RECOVERY_SURFACE)
+        let mut source = surface("A recovery module.", RECOVERY_SURFACE);
+        source.push_str("#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n");
+        source
     }
 
     /// A `waymaker-rig` oracle whose public surface is exactly the pin.
@@ -15567,6 +15797,8 @@ mod tests {
                 );
             }
         }
+        // Issue #77's half: a `Recovery` struct that is not `Clone`.
+        source.push_str("#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n");
         source
     }
 
