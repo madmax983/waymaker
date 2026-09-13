@@ -887,7 +887,7 @@ this table is how you find out what a red build is telling you.
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. The emulated boot's own targets are `emulation-boot`'s, which reads the same file: a rule about which cores the rig is started on belongs with the rest of that subject rather than here. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links — or it stops mirroring a layer feature under a feature of its own, so the row named after that feature links code the probe can reach none of. A probe cannot `#[cfg]` on another crate's feature, so `--features waymaker-embassy/postcard` would report the delta of an image nobody exercised, and no other rule would notice: the row is not identical to its base, because the probe's own constants already differ. |
 | `size-probe-reach` | A layer grows a public function the probe does not reach, so no budget charges for it. |
-| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword** outside `emulate::PERMITTED_UNSAFE_FUNCTIONS`, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call — and, since [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md), one measurement: `stack::paint` and `stack::high_water_mark`, confined to `emulate::STACK_MODULE`, plus the one `unsafe extern "C" { .. }` block the 2024 edition requires to name a linker symbol. Without this half the exception would be a licence for a crate rather than for two expansions and one measurement, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall`, `emulate::StackUsage::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md), [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md). |
+| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword** outside `emulate::PERMITTED_UNSAFE_FUNCTIONS`, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call — and, since [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md), one measurement: `stack::paint` and `stack::high_water_mark`, confined to `emulate::STACK_MODULE`'s crate-relative path, plus the one `unsafe extern "C" { .. }` block the 2024 edition requires to name the linker's `_stack_end` symbol. A name is not the whole of the pin: the header must reach a `{` before a `;` or a bodiless signature would still borrow the exemption, every permitted `unsafe` must sit at that function's own nesting depth or a nested item or a closure could hide a second one beside it, and the one permitted extern block must declare `_stack_end` and nothing else or a foreign function whose `unsafe` is also followed by the word `extern` would pass as one. Without this half the exception would be a licence for a crate rather than for two expansions and one measurement, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall`, `emulate::StackUsage::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md), [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md). |
 | `gate-broken` | The gate's own expected values do not parse. A gate must not be able to silently uncheck one of its rules. |
 
 ### Documentation
@@ -1517,12 +1517,15 @@ Stated so that nobody mistakes silence for coverage:
   diff cannot read the base checkout's registry, for `kernel_state_change`'s reason — the
   head binary is the only one that can read a type size — so `runtime_ram_change` always says
   "not compared". A future that grew is visible in the run that measured it and nowhere else.
-- **How deep the call chain goes.** Runtime RAM is now composed rather than sampled — the
-  caller's scratch page, the kernel-state registry, the context, and the largest statics
-  delta of any row, gated against §04's 768 B. Three of those four live on the stack, and
-  what is still unaccounted is the *depth* of the chain holding them: a deeper one moves no
-  writable section and no type size. The report says so where it prints the total rather
-  than printing "runtime RAM: ok", and stack accounting needs a call graph.
+- **How deep the call chain goes, in this composed figure.** Runtime RAM is now composed
+  rather than sampled — the caller's scratch page, the kernel-state registry, the context,
+  and the largest statics delta of any row, gated against §04's 768 B. Three of those four
+  live on the stack, and what is still unaccounted *here* is the *depth* of the chain holding
+  them: a deeper one moves no writable section and no type size. The report says so where it
+  prints the total rather than printing "runtime RAM: ok". Depth is measured elsewhere now,
+  by painting the stack rather than by a call graph — see the "Stack usage" entry below — and
+  that figure is the whole emulated image's, not this composed one's, so this bullet's own gap
+  stands even though the workspace is no longer silent about call-chain depth everywhere.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -1698,22 +1701,29 @@ Stated so that nobody mistakes silence for coverage:
   count at zero. It says nothing about a firmware that links an allocator for its *own*
   reasons and passes Waymaker a buffer from it, which is a firmware author's decision and one
   this engine is written to allow.
-- **Stack usage, by `cargo xtask size`.** Section sizes cannot see a cursor that lives on the
-  caller's stack, and the size report says so rather than implying otherwise. Neither can
-  either tool `cargo xtask profile` runs: DHAT is a heap profiler and callgrind counts
-  instructions, so the depth of the chain [the budgets](#budgets) already say is unaccounted
-  stays unaccounted *there*. [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md)
+- **Stack usage, by `cargo xtask size`, and the limit of the technique that measures it
+  elsewhere.** Section sizes cannot see a cursor that lives on the caller's stack, and the
+  size report says so rather than implying otherwise. Neither can either tool `cargo xtask
+  profile` runs: DHAT is a heap profiler and callgrind counts instructions, so the depth of
+  the chain [the budgets](#budgets) already say is unaccounted stays unaccounted *there*.
+  [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md)
   closes the other half: each emulated boot now paints its own unused stack before the rig
   runs and reports how far the paint was disturbed after, gated by `emulate::StackUsage`. What
   that figure is *not* is §04's runtime RAM total — it is the whole image's call-chain depth,
   on one run, on one core, and this image links `waymaker-rig` and `waymaker-conformance`
-  alongside the three layers, so it is not the engine's share alone. The two machines are not
-  required to agree about it, unlike their census: different cores compile the same source
-  into different instructions. A decoy `stack.rs` filed in a different directory of the crate
-  is read as the permitted module too, the same limit `check_image_attributes` already carries
-  for `main.rs`; `unsafe_in_paint_or_high_water_mark_is_permitted_only_in_stack_rs` and
-  `a_decoy_stack_rs_in_another_directory_is_out_of_scope` are the tests that say so, one of
-  each.
+  alongside the three layers, so it is not the engine's share alone. Nor is it exact: painting
+  the stack and reading back a high-water mark is a lower bound, not a ceiling — a frame can
+  reserve bytes it never writes, and a byte like that still reads as the paint pattern
+  afterwards, so a run can use more than it reports. The guard margin still guarantees a
+  floor, never painted or scanned, so the figure is never *below* what a run actually used by
+  more than that margin. The two machines are not required to agree about the figure, unlike
+  their census: different cores compile the same source into different instructions. A decoy
+  `stack.rs` reproducing the crate-relative path in a different, deeper directory is still
+  read as the permitted module — narrower than a bare-file-name suffix would allow, not
+  eliminated; `a_decoy_stack_rs_in_another_directory_is_rejected` is the test that shows the
+  common case is closed. A closure or nested item defined but never invoked, at the permitted
+  function's own nesting depth, would not be caught by depth alone either — the same shape of
+  gap `effect-protocol` accepts for its own pinned bodies.
 - **That an emulated core is the part a row of the hardware table names.** It is not, in four
   ways, and each one is a whole class of failure. QEMU's `microbit` is a Cortex-M0 and
   `cortex-m0plus` names a **Cortex-M0+** — the same instruction set and a different core, with
@@ -2804,16 +2814,24 @@ chain holding them was still unaccounted. ADR 0040 built the one thing that coul
 it — a linked image, run on real cores — and declined to, naming a second `unsafe` expansion
 and a memory-map symbol as the cost. This closes it: `waymaker_emu::stack` paints the image's
 own unused stack before the rig runs and reads back how far the paint was disturbed, over the
-region between the linker's `__ebss` and a marker `main` takes before calling anything else.
+region between the linker's `_stack_end` and a stack-pointer reading `main` takes — through
+`cortex_m::register::msp::read()`, a plain register read, before calling anything else.
 `measured_run` — `#[inline(never)]` — holds every local the run touches in a frame of its own,
-so the paint can never reach memory `main` still needs. The figure is real and it is gated,
-but it is not §04's: this image links `waymaker-rig` and `waymaker-conformance` alongside the
-three layers, so what is reported is the whole call chain's depth on this run, not the
-engine's share of it, and the two machines are not required to agree about it the way their
-census is — different cores compile the same source into different instructions.
-`emulation-boot`'s `unsafe`-keyword rule grows its third and last named exception, confined to
-two functions in one file, and every other file of the crate is held to the rule exactly as
-before. See
+so the paint can never reach memory `main` still needs. The figure is a *lower bound* rather
+than an exact reading — a frame can reserve bytes it never writes, and painting cannot see
+that — and the module says so rather than the sharper claim an earlier draft made; a guard
+margin near the reading still guarantees a floor, never a ceiling. The figure is real and it
+fails closed on a degenerate measurement, but it is not gated against a §04 ceiling — none
+exists for it, the same standing as the write-amplification and `no_alloc` instruction
+figures — and it is not §04's own number regardless: this image links `waymaker-rig` and
+`waymaker-conformance` alongside the three layers, so what is reported is the whole call
+chain's depth on this run, not the engine's share of it, and the two machines are not required
+to agree about it the way their census is — different cores compile the same source into
+different instructions. `emulation-boot`'s `unsafe`-keyword rule grows its third and last
+named exception, and a name alone was not enough to close it: a bodiless signature, a nested
+item and a foreign function all passed an earlier version of the rule and are refused by this
+one, each behind a test that was watched failing first. Every other file of the crate is held
+to the rule exactly as before. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

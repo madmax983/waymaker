@@ -323,7 +323,10 @@ the paint was disturbed after, gated by `emulate::StackUsage`
 It is not this gate's figure: that image links `waymaker-rig` and `waymaker-conformance`
 alongside the three layers, so what it reports is the whole call chain's depth on one run, on
 one core, not the engine's share of it — the two numbers answer different questions and
-neither substitutes for the other.
+neither substitutes for the other. It fails closed on a degenerate measurement rather than
+against a §04 ceiling — none exists for it, the same standing as the write-amplification and
+`no_alloc` instruction figures — and it is a lower bound rather than an exact reading: a
+frame can reserve bytes it never writes, which a poison-fill high-water mark cannot see.
 
 The `default` and `facade` rows are gated; the per-feature rows are reported with their
 incremental cost and not gated, because §04 requires an optional cost to be *shown* and

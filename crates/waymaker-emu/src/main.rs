@@ -79,16 +79,15 @@ pub const PREFIX: &str = "waymaker-emu:";
 
 #[entry]
 fn main() -> ! {
-    // Taken before anything else, so that every byte below it is unused stack at the moment
-    // `stack::paint` is called. `measured_run` is `#[inline(never)]` for the same reason:
-    // its locals — `part` and `page` among them — must sit in a frame of their own, below
-    // this one, and never share this function's frame with `marker`.
-    let marker = 0_u8;
-    let depth_from = core::ptr::addr_of!(marker) as usize;
+    // Read before anything else. Every byte below this reading is unused stack at the
+    // moment `stack::paint` is called. `measured_run` is `#[inline(never)]` for the same
+    // reason: its locals, `part` and `page` among them, must sit in a frame of their own,
+    // below this one, and must never share this frame with anything read here.
+    let depth_from = stack::current_stack_pointer();
     let available = stack::available_bytes(depth_from);
-    if available == 0 {
+    if available <= u32::try_from(stack::GUARD_BYTES).unwrap_or(u32::MAX) {
         hprintln!(
-            "{} failed the stack region between the linker's `__ebss` and this boot's own marker is empty; there is nothing to paint or measure",
+            "{} failed the stack region between the linker's `_stack_end` and the current stack pointer leaves no room to paint or measure",
             PREFIX
         );
         debug::exit(debug::EXIT_FAILURE);
@@ -122,11 +121,12 @@ fn main() -> ! {
 
 /// Runs the boot's own locals in a frame of their own.
 ///
-/// Both locals, not statics: `cortex-m-rt` puts the stack at the top of the 16 KiB the memory
-/// map declares, and a `static` would need interior mutability this crate has no way to
-/// spell without more of the exception it already carries. Kept out of `main`'s own frame,
-/// and marked so the compiler cannot fold it back in: `stack::paint` must not reach memory
-/// `main` still holds, and this function's frame is where `part` and `page` live instead.
+/// Both locals, not statics. `cortex-m-rt` puts the stack at the top of the 16 KiB the memory
+/// map declares, and a `static` would need interior mutability this crate has no way to spell
+/// without more of the exception it already carries. This function is kept out of `main`'s
+/// own frame, and marked so the compiler cannot fold it back in: `stack::paint` must not reach
+/// memory `main` still holds. `part` and `page` live in this frame instead, below the stack
+/// pointer `main` read before calling it.
 #[inline(never)]
 fn measured_run() -> Result<Census, Trouble> {
     let mut part = Nor::new();

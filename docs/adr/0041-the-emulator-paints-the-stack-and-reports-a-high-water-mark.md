@@ -45,17 +45,25 @@ proof of the first says nothing about the second.
 **Each emulated boot paints its own unused stack before the rig runs, and reports how far the
 paint was disturbed after.**
 
-`waymaker_emu::stack` is the new module, and it is the second and last reason this crate
-writes the `unsafe` keyword by hand, after `#[cortex_m_rt::entry]` and `debug::exit`.
-`main::measured_run` — `#[inline(never)]`, so its frame cannot be folded back into `main`'s —
-holds every local the rig and the conformance suite use. `main` takes the address of a local
-of its own, `depth_from`, before calling anything else; `stack::paint` fills every byte from
-the linker's `__ebss` up to `depth_from` (less a small guard margin near `depth_from`, which
-is never painted, so the two functions measuring it cannot corrupt their own frames) with a
-repeating, non-trivial byte; `measured_run` is called; and `stack::high_water_mark` scans back
-from `__ebss` for the first byte the run disturbed. The figure can only read *high*: nothing
-below the deepest disturbed byte was touched, and the guard margin is never painted, so it
-always counts as used.
+`waymaker_emu::stack` is the new module, and it is the third and last reason this crate writes
+the `unsafe` keyword at all — after the two macro expansions, `#[cortex_m_rt::entry]` and
+`debug::exit`. `main::measured_run` — `#[inline(never)]`, so its frame cannot be folded back
+into `main`'s — holds every local the rig and the conformance suite use. `main` reads the
+stack pointer first, before calling anything else, through `cortex_m::register::msp::read()` —
+a plain register read the `cortex-m` crate exposes as safe, so this needs no `unsafe` of its
+own and depends on nothing a compiler chose. `stack::paint` fills every byte from the linker's
+`_stack_end` up to that reading, less a guard margin near it that is never painted, with a
+repeating, non-trivial byte; `measured_run` is called; and `stack::high_water_mark` scans from
+`_stack_end` up to that same bound for the first byte the run disturbed.
+
+The figure this produces is a *lower bound*, not an exact reading, and the module documentation
+says so rather than the sharper claim an earlier draft of this change made: a frame can reserve
+bytes it never writes — alignment padding, a buffer only partly filled — and a byte like that
+still reads as the paint pattern, understating how deep the stack pointer actually went. The
+guard margin does still guarantee a *floor*: never painted and never scanned, so the reported
+figure can never read below it. Painting the stack and reading back a high-water mark is a
+known technique with a known limit, and stating the limit is more honest than a rule this
+workspace has never asked any other measurement here to meet either.
 
 **The number is reported and gated, not folded into §04's own figure.** `cargo xtask size` and
 `cargo xtask emulate` measure two different things and always will: the size gate's runtime
@@ -64,73 +72,107 @@ RAM figure is the *engine's* four terms, on a host build that never links `wayma
 whole thing on real ARM cores, and reports the *whole call chain's* depth on *this* run. A
 number that conflated the two would be exactly the "half-argued number" ADR 0040 declined to
 attach. So `xtask::emulate::StackUsage` is read from a third census line — `used` and
-`available` — gated on its own: a run that reports an empty region, or one in which the paint
-was disturbed all the way down, is not a measurement that happened, and `Report::shortfall`
-fails it by the same rule every other emulate failure obeys. The two machines' `StackUsage`
-values are **not** required to agree, unlike their `Census`: a Cortex-M0 and a Cortex-M4
-compile the same source into different instructions, so a different byte count here is
-expected, where a different census would mean the rig behaved differently on the two.
+`available` — and fails closed on its own account: a region reported empty, or one disturbed
+all the way to its own ceiling, is not a measurement that happened, by the same rule every
+other emulate failure obeys — not a byte ceiling against §04, which does not exist for this
+figure and is not invented here. The two machines' `StackUsage` values are **not** required to
+agree, unlike their `Census`: a Cortex-M0 and a Cortex-M4 compile the same source into
+different instructions, so a different byte count here is expected, where a different census
+would mean the rig behaved differently on the two.
 
-**`emulation-boot`'s `unsafe`-keyword rule grows a third, narrowly named exception.** Before
-this, the rule read: no file of `waymaker-emu` writes `unsafe`, full stop, with the two macro
-expansions never spelling the keyword in this crate's own source at all. `paint` and
-`high_water_mark` are hand-written, so the rule now also permits the keyword inside the
-braced body of a function named in `xtask::emulate::PERMITTED_UNSAFE_FUNCTIONS`, and inside
-the one `unsafe extern "C" { .. }` block the 2024 edition requires to name a linker symbol —
-both confined to the one file `xtask::emulate::STACK_MODULE` names. A decoy `fn paint`
-anywhere else in the crate gets none of it; `unsafe_in_paint_or_high_water_mark_is_permitted_only_in_stack_rs`
-is the test that says so.
+**`emulation-boot`'s `unsafe`-keyword rule grows a third, narrowly named exception, and it is
+more than a name check.** Before this, the rule read: no file of `waymaker-emu` writes
+`unsafe`, full stop, with the two macro expansions never spelling the keyword in this crate's
+own source at all. `paint` and `high_water_mark` are hand-written, so the rule now also
+permits the keyword inside the braced body of a function named in
+`xtask::emulate::PERMITTED_UNSAFE_FUNCTIONS`, and inside the one `unsafe extern "C" { .. }`
+block the 2024 edition requires to name the linker symbol — both confined to the one file
+`xtask::emulate::STACK_MODULE` now names by its crate-relative path rather than a bare file
+name. A name alone proved not to be enough: a bodiless signature — a trait method — has a
+`declaration_count` of exactly one too and would still resolve onto whatever block happens to
+follow it, so the rule also requires the header to reach a `{` before a `;`
+(`crate::emulate::has_a_body`), the found body to be scanned at its own nesting depth so a
+nested item or a closure cannot hide a second `unsafe` inside it
+(`crate::source::nesting_depth_at`), and the one permitted extern block to declare
+`_stack_end` and nothing else — which is what tells it apart from
+`unsafe extern "C" fn trap_handler() { .. }`, a foreign function whose `unsafe` is also
+immediately followed by the word `extern`.
 
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
-this workspace is built for. It is reported per machine, gated for running out of room on
-either, and never smoothed into a single cross-machine number the way the census is — because
-the two machines' code is not the same code, only the same source.
+this workspace is built for. It is reported per machine, fails closed on a degenerate
+measurement, and is never smoothed into a single cross-machine number the way the census is —
+because the two machines' code is not the same code, only the same source.
 
 **It is not §04's figure, and does not become one.** `cargo xtask size`'s runtime RAM total —
 the scratch page, the kernel-state registry, the context, and the statics delta — is
 untouched: it is still stack-blind for call-chain depth, and its own report still says so.
-This ADR closes issue #47 by the "or" in its own "done when": a real number now exists, it is
-gated, and the two figures' difference in scope is stated rather than implied — which is a
-sharper answer than folding one into the other would have been, because the two are not
-interchangeable.
+This ADR closes issue #47 by the "or" in its own "done when": a real number now exists and
+fails closed the way this workspace's other unbudgeted figures do — write amplification, the
+`no_alloc` instruction counts — and the two figures' difference in scope is stated rather than
+implied, which is a sharper answer than folding one into the other would have been.
 
-**The exception surface grows by two named functions, not by a crate.** `emulation-boot`'s
-scan is unchanged everywhere else in the crate: `main.rs`, `boot.rs` and `nor.rs` still permit
-nothing but the lint name. `hand_written_unsafe_is_reported` and
+**The exception surface grows by two named functions and one linker-symbol block, not by a
+crate**, and closing the surface took more than pinning a name: `has_a_body`,
+`nesting_depth_at` and the extern block's own content check are each answers to a concrete
+adversarial file constructed against an earlier version of this rule and found to pass it —
+`a_bodiless_signature_above_the_real_function_does_not_borrow_its_exemption`,
+`a_nested_function_inside_paint_does_not_inherit_its_exemption` and
+`a_foreign_function_item_is_not_the_permitted_extern_block` are the three that were watched
+failing before the checks that close them existed. `hand_written_unsafe_is_reported` and
 `hand_written_unsafe_in_a_sibling_module_is_reported` still pass unmodified, and
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**What is still owed.** A decoy `stack.rs` filed in a different directory of the crate would
-be read as the permitted module too, the same limit `check_image_attributes` already carries
-for `main.rs`; `CLAUDE.md`'s "what is not checked" names it. The figure is a whole-image
-number: it cannot be split into the engine's share and the rig-and-conformance harness's
-without a call graph, which is the same tool this ADR declined to add nightly for. And the
-guard margin's size — 128 bytes — is chosen rather than measured; it is conservative against
-what two small, register-heavy functions could plausibly spill, not a proven bound.
+**What is still owed.** A decoy `stack.rs` reproducing the whole crate-relative suffix in a
+different, deeper directory would still be read as the permitted module — narrower than the
+bare-file-name version this change replaced, but not eliminated, and named again in
+`CLAUDE.md`'s "what is not checked" rather than left implied. A closure or nested item defined
+but never invoked, at the permitted function's own nesting depth, is not caught by depth alone
+— the same shape of gap `effect-protocol` accepts for the same reason, and this rule inherits
+rather than closes further. The figure remains a whole-image number: it cannot be split into
+the engine's share and the rig-and-conformance harness's without a call graph, which is the
+same tool this ADR declined to add nightly for. And the guard margin's size — 128 bytes — is
+chosen rather than measured; it is conservative against what `paint` and `high_water_mark`
+could plausibly need if a future rebuild stopped inlining them, not a proven bound.
 
 ## Alternatives considered
 
-**`#[cortex_m_rt::pre_init]`**, which runs before `.data`/`.bss` are initialised and so avoids
-any question of where `paint`'s own locals land relative to the caller's. Rejected: the
-attribute's own documentation warns that even `&1` inside a `#[pre_init]` function or
-anything it calls is immediate undefined behaviour, through rvalue static promotion, before
-any static is valid to touch — a hazard this workspace cannot verify by running the result,
-since no board and no CI job here can catch a bug that only sometimes reproduces. Doing the
-paint from ordinary, fully-initialised `main`-time code, with the frame-isolation `main`'s own
-marker and `measured_run`'s `#[inline(never)]` provide, trades a theoretically tighter window
-for a mechanism this change could actually reason about and inspect in the linked image's
-disassembly.
+**Deriving `depth_from` from the address of a local `main` declares**, rather than reading the
+stack pointer register. This is what the first version of this change did, and review found
+the reasoning it rested on: Rust does not promise a compiler places one local at a shallower
+address than locals declared after it within the same frame, so nothing but incidental
+compiler behaviour kept a future local added to `main` from landing deeper than the one this
+measurement anchored to. `cortex_m::register::msp::read()` is ground truth instead — the
+hardware's own answer to "how deep is the stack right now" — and it costs nothing new: it is a
+plain safe function, already reachable through `cortex-m-rt`'s own dependency graph, named
+directly rather than reached through a crate that does not re-export it.
 
-**A generic "any `unsafe` block carrying a `// SAFETY:` comment" exception**, rather than two
-named functions in one named file. Rejected for matching this workspace's own convention worse:
+**`__ebss` as the stack's lower bound.** Also the first draft's choice, and also wrong for a
+reason review found rather than one anyone had argued for: `cortex-m-rt`'s linker script
+places an `.uninit` section, and only after it the `_stack_end` symbol this crate now names.
+The two coincide today because nothing in this workspace declares `#[link_section = ".uninit"]`
+— but a future use of that section, which is exactly how retained RAM would be modelled, would
+have `paint` overwrite it on every boot with no rule and no test noticing. Naming `_stack_end`
+costs nothing today and stays correct the day that changes.
+
+**`#[cortex_m_rt::pre_init]`**, which runs before `.data`/`.bss` are initialised and so would
+avoid any question of frame placement entirely. Rejected: the attribute's own documentation
+warns that even `&1` inside a `#[pre_init]` function or anything it calls is immediate
+undefined behaviour, through rvalue static promotion, before any static is valid to touch — a
+hazard this workspace cannot verify by running the result, since no board and no CI job here
+can catch a bug that only sometimes reproduces. Reading the stack pointer from ordinary,
+fully-initialised `main`-time code removes the reason `pre_init` would have been tempting —
+frame placement — without taking on a hazard this change could not inspect its way out of.
+
+**A generic "any `unsafe` block carrying a `// SAFETY:` comment" exception**, rather than named
+functions in one named file. Rejected for matching this workspace's own convention worse:
 every other pin in this gate — `EFFECT_STEP_BODIES`, `SEALING_FUNCTIONS`, and
 `emulation-boot`'s own file-and-attribute checks — names a program element and requires it
 found, not a floating comment convention a scanner cannot verify is even true of the code
 beneath it. A comment can be copied anywhere; a function name checked against a fixed list,
-in one file, is what the rest of this gate already does.
+in one file, at its own nesting depth, is what the rest of this gate already does.
 
 **Threading `Trouble::Stack` through `boot::Trouble` for a degenerate paint region.** Rejected
 because the two questions are independent: `boot::Trouble` is about whether the rig and the

@@ -3077,7 +3077,7 @@ fn implements_trait_for(code: &str, type_name: &str) -> bool {
 /// execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has
 /// no braces at all: three pinned calls, in order, at brace depth zero, in a closure nothing
 /// runs.
-fn nesting_depth_at(code: &str, index: usize) -> usize {
+pub(crate) fn nesting_depth_at(code: &str, index: usize) -> usize {
     let before = code.get(..index).unwrap_or_default();
     let opened = before.matches(['{', '(', '[']).count();
     let closed = before.matches(['}', ')', ']']).count();
@@ -8547,7 +8547,7 @@ pub(crate) fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
 /// by `use ...::Step as S;`, and it fires on an unrelated `BootStep::`. This compares both
 /// sides, so `Step` matches the type and nothing else.
 #[must_use]
-fn names_identifier(code: &str, identifier: &str) -> bool {
+pub(crate) fn names_identifier(code: &str, identifier: &str) -> bool {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(identifier).any(|(index, _)| {
         let before = code
@@ -8568,7 +8568,7 @@ fn names_identifier(code: &str, identifier: &str) -> bool {
 /// `impl` "declared twice — a decoy above the real one is what a first-match scan reads",
 /// and the pin here is the same shape and needs the same guard.
 #[must_use]
-fn declaration_count(code: &str, header: &str) -> usize {
+pub(crate) fn declaration_count(code: &str, header: &str) -> usize {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(header)
         .filter(|(index, _)| {
