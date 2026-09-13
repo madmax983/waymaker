@@ -1373,6 +1373,11 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
 /// `C::name(` and `name::<`, and the spaced rendering would hide both. What the scans
 /// do with the text is unchanged; this is only the bridge from the resolved item back
 /// to the textual analyses.
+///
+/// A raw marker is not stripped here (issue #90). It does not need to be: every
+/// consumer matches a substring at a token boundary, and `#` is such a boundary, so
+/// `r#stage(` still matches a scan for `stage(`. Strip it anyway if a future consumer
+/// starts comparing this text for exact equality.
 fn block_text(block: &syn::Block) -> String {
     let mut body = String::new();
     for stmt in &block.stmts {
