@@ -1911,6 +1911,20 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
             )];
         }
     };
+    if derived
+        .iter()
+        .any(|name| name == crate::parse::UNRESOLVED_DERIVE)
+    {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{RECOVERY_SURFACE_PATH} derives something through a `super`-qualified \
+                 alias, or an alias pile this scan gave up chasing, so whether \
+                 `{RECOVERY_TYPE}` is `Clone` cannot be ruled out"
+            ),
+        )];
+    }
     let is_clone = derived.iter().any(|name| name == "Clone")
         || handwritten
             .iter()
@@ -10542,6 +10556,55 @@ mod tests {
             "pub struct Recovery;\n",
         ));
         let violations = check_recovery_surface(&self_qualified);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_super_qualified_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143), round 8: `super::C` names
+        // whatever `C` binds to in the *parent* module — here, a
+        // `pub use core::clone::Clone as C;` this file never sees, since every function
+        // in `parse.rs` reads one file's `contents` alone. The first version of this
+        // check had no local alias named `super` to fail the lookup against, so
+        // `super::C` fell through to its own last segment, the harmless-looking name
+        // `"C"` — never equal to `"Clone"`, so the derive went unreported. This scan
+        // cannot read the parent file to resolve `C` for real, so the fix is the other
+        // half of failing closed: a `super`-qualified path reports as unresolved rather
+        // than as a plain name that merely fails to match.
+        let super_qualified =
+            recovery_source_with_struct("#[derive(super::C, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&super_qualified);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_dropped_past_the_alias_candidate_cap_is_still_rejected() {
+        // Found by Codex review of this change (PR #143), round 8: 64 inactive
+        // `#[cfg(any())] use core::fmt::Debug as Klon;` aliases followed by one active
+        // `use core::clone::Clone as Klon;` are all legal candidates for `Klon`, and the
+        // first version of the cap that bounds how many this scan will chase dropped
+        // whichever candidate crossed the 64th slot — here, the one real `Clone` — and
+        // reported the derive path's own still-aliased name (`"Klon"`) in its place,
+        // which never equals `"Clone"` either. The fix reports a dropped candidate as
+        // unresolved rather than as that harmless-looking leftover name.
+        let mut source = String::new();
+        for _ in 0..64 {
+            source.push_str("#[cfg(any())]\nuse core::fmt::Debug as Klon;\n");
+        }
+        source.push_str("use core::clone::Clone as Klon;\n");
+        source.push_str("#[derive(Klon)]\npub struct Recovery;\n");
+        let capped = recovery_source_with_struct(&source);
+        let violations = check_recovery_surface(&capped);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations[0].detail.contains("Clone"),

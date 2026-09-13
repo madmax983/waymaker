@@ -333,6 +333,27 @@ fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
     }
 }
 
+/// Sentinel a derive-path resolution emits in place of a name it could not pin down,
+/// rather than guessing one.
+///
+/// Two things earn it: a path (the derive path itself, or an alias reached partway
+/// through resolving it) that opens with `super`, whose meaning depends on the *parent*
+/// module's own bindings — a file this module never reads, since every function here
+/// parses one file's `contents` alone — and a candidate this scan gave up chasing once
+/// its bound on how many it will explore was reached.
+///
+/// A caller checking for one specific trait name must treat this the same as a match:
+/// "this scan could not run it down" is not evidence that it is not `Clone`, and reading
+/// it as a plain identifier that merely fails to equal `"Clone"` is exactly the bypass
+/// Codex found on PR #143's eighth review round — `super::C` resolved to the harmless-
+/// looking name `"C"` because there was no local alias named `super` to fail the lookup
+/// against, and a dropped 65th candidate resolved to its own still-aliased name (`"Klon"`)
+/// rather than to anything that could be compared against `"Clone"` at all. This sentinel
+/// is the same fail-closed shape [`struct_derives`] already uses for a file that will not
+/// parse or a struct that is not declared: an answer this scan cannot stand behind is
+/// reported as such, not folded into "resolved, and not a match".
+pub const UNRESOLVED_DERIVE: &str = "<unresolved derive>";
+
 /// Every name `path` could ultimately mean, considering every alias that could bind any
 /// step along the way — not just the one [`resolve_segments`] would pick by taking the
 /// first match at the first step alone.
@@ -350,9 +371,12 @@ fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
 /// Bounded twice over, so neither an adversarial pile of aliases nor a cycle spelled by
 /// hand (`use A as B; use B as A;` — not something real Rust name resolution could
 /// produce, but something a text file can still spell) can make this loop unbounded: at
-/// most `aliases.len()` hops, and at most `MAX_CANDIDATES` names explored in total, with
-/// anything cut off by the second bound returned unresolved rather than dropped, so
-/// nothing this scan stopped chasing early is silently treated as safe.
+/// most `aliases.len()` hops, and at most `MAX_CANDIDATES` names explored in total. Both
+/// bounds, and a `super`-qualified path met at any hop, contribute
+/// [`UNRESOLVED_DERIVE`] rather than the segment sequence a bound or a missing qualifier
+/// happened to stop resolution at — so nothing this scan stopped chasing early, and
+/// nothing it could never chase in the first place, is silently treated as a plain name
+/// that simply is not the one being looked for.
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     const MAX_CANDIDATES: usize = 64;
 
@@ -367,13 +391,20 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     }
 
     let mut frontier = vec![segments];
-    let mut finished = Vec::new();
+    let mut finished: Vec<String> = Vec::new();
     for _ in 0..=aliases.len() {
         if frontier.is_empty() {
             break;
         }
         let mut next = Vec::new();
         for current in frontier {
+            // A `super`-qualified path names something in the parent module's own
+            // namespace, which no function in this module reads — see
+            // `UNRESOLVED_DERIVE`.
+            if current.first().is_some_and(|first| first == "super") {
+                finished.push(UNRESOLVED_DERIVE.to_owned());
+                continue;
+            }
             let Some((candidate, tail)) = lookup_candidate(&current) else {
                 continue;
             };
@@ -382,12 +413,14 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
                 .filter(|alias| alias.local == candidate)
                 .collect();
             if matching.is_empty() {
-                finished.push(current);
+                if let Some(last) = current.last() {
+                    finished.push(last.clone());
+                }
                 continue;
             }
             for alias in matching {
                 if finished.len() + next.len() >= MAX_CANDIDATES {
-                    finished.push(current.clone());
+                    finished.push(UNRESOLVED_DERIVE.to_owned());
                     continue;
                 }
                 let mut resolved = alias.target.clone();
@@ -397,11 +430,13 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
         }
         frontier = next;
     }
-    finished.extend(frontier);
+    // Any candidate still in flight when the hop bound above is reached can only be a
+    // cycle a real compiler could never produce (`use A as B; use B as A;`) — a genuine
+    // acyclic chain resolves within `aliases.len()` hops. Reporting it unresolved rather
+    // than taking its still-aliased name is the same fail-closed shape as the two bounds
+    // above, for the reason `UNRESOLVED_DERIVE` gives.
+    finished.extend(frontier.into_iter().map(|_| UNRESOLVED_DERIVE.to_owned()));
     finished
-        .into_iter()
-        .filter_map(|segments| segments.last().cloned())
-        .collect()
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
@@ -519,6 +554,13 @@ fn collect_trait_implementors(
 /// `#[derive(Klon)]` to `X` instead — and a nested module cannot shadow a name in the
 /// scope the pinned struct is declared in, so reading only the top level is the correct
 /// resolution here, not merely a narrower one.
+///
+/// A returned name can also be [`UNRESOLVED_DERIVE`], found on the same review round as
+/// the two paragraphs above: a `super`-qualified derive path, or one buried past the pile
+/// this scan's alias resolution will chase, cannot be pinned to a name this scan can
+/// compare — and a caller checking for one specific trait has to treat that sentinel as a
+/// match, the same way it already treats [`None`] here as "cannot say" rather than as
+/// "not `Clone`".
 ///
 /// # Errors
 ///
