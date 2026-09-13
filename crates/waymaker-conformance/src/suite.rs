@@ -283,8 +283,27 @@ impl<S: StableStorage> Run<'_, S> {
     }
 
     /// Whether `len` bytes at `offset` are all erased.
+    ///
+    /// The same chunking [`Run::media_matches`] does, but without going through it: the
+    /// expected byte here never depends on position, so there is no reason to pay
+    /// `media_matches`'s per-byte closure call and checked position arithmetic
+    /// (`seen.checked_add(u32::try_from(index)?)?`) for an answer that is `expected(_) ==
+    /// ERASED` at every index. Checked against `media_matches(offset, len, |_| ERASED)` by
+    /// an independent oracle in this module's tests, so a chunk-boundary difference
+    /// between the two loops does not pass silently.
     fn media_is_erased(&mut self, offset: u32, len: u32) -> Option<bool> {
-        self.media_matches(offset, len, |_| ERASED)
+        let step = self.buffer.len() / self.unit * self.unit;
+        let mut seen = 0_u32;
+        while seen < len {
+            let chunk = core::cmp::min(step, usize::try_from(len - seen).ok()?);
+            self.read_into(offset.checked_add(seen)?, chunk, 0)?;
+            let held = self.bytes(0, chunk)?;
+            if held.iter().any(|&byte| byte != ERASED) {
+                return Some(false);
+            }
+            seen = seen.checked_add(u32::try_from(chunk).ok()?)?;
+        }
+        Some(true)
     }
 
     /// Whether the block at `offset` holds one unit of the pattern and is erased after it.
