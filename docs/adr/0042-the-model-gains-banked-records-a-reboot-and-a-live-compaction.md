@@ -180,7 +180,13 @@ records.
 `single-authority`'s gap: issue #73's `tests/refinement.rs` now drives a real writer across
 `waymaker_flash::bank`'s swap and checks it against this machine's reachable set, so a
 reconstructed state is no longer limited to the record dimension alone. Between the two
-issues, `obligation.rs`'s `single-authority` row now says nothing is owed.
+issues, `obligation.rs`'s `single-authority` row briefly said nothing was owed — but review
+of the pull request that closed issue #67 found the two refinements never compose: the
+record writers never touch a bank and the bank-swap writer never declares a record
+(`BANK_REFINEMENT.records` is `0`), so `single_authority`'s bank check has still never been
+exercised against a real crashed device holding both an authority and a record. The row
+names that gap rather than claiming it closed; closing it for real needs a writer that both
+declares records and performs a real two-bank swap.
 
 Issue #95's gap — that `continue_as_new` does not carry an effect's identity across a
 swap — is unaffected by this change and is not what
