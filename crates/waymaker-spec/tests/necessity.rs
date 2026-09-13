@@ -293,6 +293,81 @@ fn a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_s
 }
 
 #[test]
+fn a_seal_or_erase_interrupted_by_reboot_reaches_no_state_the_uninterrupted_call_could_not() {
+    // Codex, PR #135's next round: `reboot()` leaves `Bank::Sealing`/`Bank::Erasing` exactly
+    // as it found them, so `BeginSeal(B) -> PowerLoss -> Reboot -> CommitSeal(B)` can seal a
+    // bank, and the analogous `BeginErase`/`CommitErase` sequence can blank one, with no
+    // physical operation happening *after* the reboot — argued to let an interrupted, possibly
+    // partial seal or erase become authoritative without ever being redone.
+    //
+    // Investigated the same way as the dispatch finding two tests above, because it has the
+    // same shape: a `Journal` is a snapshot with no memory of *when*, relative to a reboot, a
+    // transition fired, so "sealed/erased via a reboot in the middle" and "sealed/erased with
+    // the power never interrupted at all" are not two states — they are one, if both are
+    // reachable. They are: `BeginSeal(bank) -> CommitSeal(bank)` and
+    // `BeginErase(bank) -> CommitErase(bank)`, with no `PowerLoss`/`Reboot` between them, are
+    // both legal from the same starting points as their interrupted twins and produce
+    // byte-for-byte identical `Journal`s. A guard refusing `CommitSeal`/`CommitErase` across an
+    // intervening reboot would therefore remove edges `tests/census.rs`'s `TRANSITION_EDGES`
+    // pins and change no `REACHABLE_STATES` at all — the same standing this crate already
+    // gives a guard proven removable at no cost, and the same "not a hole, a redundant path"
+    // shape `Journal::dispatch`'s own doc comment records for the analogous dispatch finding.
+    //
+    // It is also not a misrepresentation of the real firmware to leave the redundant path in:
+    // `BeginSeal`'s physical write is already assumed complete when it lands, so a `CommitSeal`
+    // called on a later boot is exactly what real recovery already does by reading the bytes
+    // directly off media, no resumed call required; and `Swap::prepare`'s real erase is a
+    // single unconditional call every time it runs, so however many boots and retries an
+    // erase takes, the boot that finally reaches `Erased` did so via one genuine, uninterrupted
+    // `storage.erase()` — which is exactly what the direct, uninterrupted trace below models.
+    let bound = Bound::PROOF;
+    let guards = Guards::ENFORCED;
+
+    let interrupted_seal = Journal::default()
+        .step(Transition::BeginSeal(BankId::A), guards, bound)
+        .expect("begin seal A")
+        .step(Transition::PowerLoss, guards, bound)
+        .expect("power loss mid-seal")
+        .step(Transition::Reboot, guards, bound)
+        .expect("reboot")
+        .step(Transition::CommitSeal(BankId::A), guards, bound)
+        .expect("commit seal A after the reboot");
+    let uninterrupted_seal = Journal::default()
+        .step(Transition::BeginSeal(BankId::A), guards, bound)
+        .expect("begin seal A")
+        .step(Transition::CommitSeal(BankId::A), guards, bound)
+        .expect("commit seal A with the power never interrupted");
+    assert_eq!(
+        interrupted_seal, uninterrupted_seal,
+        "a seal committed after a reboot reached a state the uninterrupted call could not"
+    );
+
+    let sealed_b = Journal::default()
+        .step(Transition::BeginSeal(BankId::B), guards, bound)
+        .expect("begin seal B")
+        .step(Transition::CommitSeal(BankId::B), guards, bound)
+        .expect("commit seal B, so A is no longer the implicit current bank");
+    let interrupted_erase = sealed_b
+        .step(Transition::BeginErase(BankId::A), guards, bound)
+        .expect("begin erase A")
+        .step(Transition::PowerLoss, guards, bound)
+        .expect("power loss mid-erase")
+        .step(Transition::Reboot, guards, bound)
+        .expect("reboot")
+        .step(Transition::CommitErase(BankId::A), guards, bound)
+        .expect("commit erase A after the reboot");
+    let uninterrupted_erase = sealed_b
+        .step(Transition::BeginErase(BankId::A), guards, bound)
+        .expect("begin erase A")
+        .step(Transition::CommitErase(BankId::A), guards, bound)
+        .expect("commit erase A with the power never interrupted");
+    assert_eq!(
+        interrupted_erase, uninterrupted_erase,
+        "an erase committed after a reboot reached a state the uninterrupted call could not"
+    );
+}
+
+#[test]
 fn removing_the_generation_precondition_leaves_two_banks_claiming_the_run() {
     let relaxed = explore(
         Bound::PROOF,
