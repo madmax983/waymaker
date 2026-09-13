@@ -5677,6 +5677,17 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_value_written_as_a_second_loose_paragraph() {
+        // Codex, pull request #138, round 16: a loose item — `- Status:` followed by a
+        // blank line and an indented `accepted` paragraph — is two `Tag::Paragraph`s
+        // with no `SoftBreak` or hidden container between them at all, so neither of
+        // the two earlier fixes catches it. An ADR field is one paragraph, so a second
+        // one opening before the item ends disqualifies it.
+        let contents = "# ADR\n\n- Status:\n\n  accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -6695,6 +6706,30 @@ mod tests {
                 .iter()
                 .any(|violation| violation.subject == clause.id
                     && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_of_html_comments_does_not_vouch_for_the_clause() {
+        // Codex, pull request #138, round 16: an inline HTML comment is one
+        // self-contained `InlineHtml` event, and the round-15 fix for a raw HTML link's
+        // `href` kept that event's text verbatim with no exception for a comment — so a
+        // row built entirely of comments, `| <!-- \`id\` --> | <!-- headline --> | <!--
+        // proof --> |`, rendered empty to a reader still carried every required
+        // substring into the reconstructed row.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "| Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | <!-- `{}` --> | <!-- {} --> | <!-- {} --> |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
             "{violations:?}"
         );
     }

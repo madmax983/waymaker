@@ -1197,10 +1197,20 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     let mut in_fence = false;
     let mut blockquote_depth: u32 = 0;
     let mut collecting = false;
+    // Whether the item's one legitimate paragraph has already closed (Codex, pull
+    // request #138, round 16): a loose item — `- Status:` followed by a blank line and
+    // an indented `accepted` paragraph — is two `Tag::Paragraph`s with no `SoftBreak`
+    // between them at all, so neither the line-break nor the hidden-container check
+    // catches it. An ADR field is one paragraph, so anything opening after the first
+    // one closes disqualifies the item, whatever kind of block it is.
+    let mut paragraph_closed = false;
     let mut item = String::new();
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence || blockquote_depth > 0;
+        if collecting && paragraph_closed && matches!(event, Event::Start(_)) {
+            collecting = false;
+        }
         match event {
             // A fenced block or blockquote opening while an item is being collected
             // disqualifies it, the same way a line break does (Codex, pull request
@@ -1227,9 +1237,11 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                 let marker = contents[range.start..].chars().next();
                 if marker == Some('-') {
                     collecting = true;
+                    paragraph_closed = false;
                     item.clear();
                 }
             }
+            Event::End(TagEnd::Paragraph) if collecting => paragraph_closed = true,
             Event::End(TagEnd::Item) => {
                 if collecting {
                     collecting = false;
@@ -1339,8 +1351,12 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // `Event::Text` (Codex, pull request #138, round 15) — so the destination is
             // read the way `visible_source` treats real HTML: kept verbatim rather than
             // parsed apart, since the tag's own text already carries the `href` value as
-            // a literal substring.
-            Event::InlineHtml(html) if in_row => cell.push_str(&html),
+            // a literal substring. An inline comment is excluded (Codex, round 16), for
+            // `visible_source`'s reason: `| <!-- \`id\` --> |` is a hidden decoy, not a
+            // real cell, and keeping its text would let it stand in for the real one.
+            Event::InlineHtml(html) if in_row && !html.starts_with("<!--") => {
+                cell.push_str(&html);
+            }
             _ => {}
         }
     }
