@@ -1362,11 +1362,21 @@ impl SizeReport {
     ///
     /// Issue #61 asks this section not to be gated against design document §04's budget: it
     /// is a comparison between candidates, not a cost this firmware pays. What it must not
-    /// do is go quiet — an empty, duplicated, or zero-byte candidate is a measurement that
-    /// did not happen, the same rule every other section in this file holds to.
+    /// do is go quiet — an empty, duplicated, missing, unknown, wrongly-`shipped`, or
+    /// zero-byte candidate is a measurement that did not happen, the same rule every other
+    /// section in this file holds to — and a `None` section is refused unconditionally, the
+    /// way [`Self::runtime_shortfalls`] refuses a missing `runtime` section, rather than read
+    /// as "nothing to check here". `measure_into` never produces `None` here for the
+    /// checkout `xtask` was built from — a checkout with the feature that fails to measure
+    /// fails the whole report instead — so the only way this method meets `None` is a
+    /// `--report` document with the section removed or nulled out after the fact, which is
+    /// exactly the case this refuses.
     fn checksum_candidate_shortfalls(&self) -> Vec<BudgetShortfall> {
         let mut shortfalls = Vec::new();
         let Some(candidates) = self.checksum_candidates.as_ref() else {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report has no checksum-candidate section, so ADR 0010's five candidates were not read".to_owned(),
+            });
             return shortfalls;
         };
 
@@ -4047,6 +4057,7 @@ mod tests {
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// A report within every budget whose one workflow future is `bytes` wide.
@@ -4059,6 +4070,7 @@ mod tests {
                 workflow_futures: vec![("ota_update".to_owned(), bytes)],
             }),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// Both gated rows at one figure. The façade image contains the engine one, so the two
@@ -4298,7 +4310,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(
             over_as_an_image.shortfalls().is_empty(),
             "{:?}",
@@ -5115,13 +5128,29 @@ mod tests {
     }
 
     #[test]
-    fn a_report_with_no_checksum_candidate_section_has_no_shortfall_for_it() {
-        // A checkout whose probe declares no `crc-candidates` feature — every checkout
-        // before issue #61 — says nothing about the section rather than failing over it,
-        // [`KernelState::measured`]'s reason for the same `None`.
-        let report = full_report(1_024, 0, 1_024, 0);
+    fn a_report_with_no_checksum_candidate_section_is_not_a_pass() {
+        // Codex review on PR #133: a `--report` document with the section removed or
+        // nulled out must not silently pass just because `None` reads as "nothing to
+        // check" — that is exactly how a stripped section would bypass every check above.
+        // `measure_into` never produces this shape for the checkout `xtask` was built
+        // from: a checkout with the feature that fails to measure fails the whole
+        // report, for [`KernelState::measured`]'s reason. So a `None` reaching
+        // `shortfalls` is always either a document from before issue #61 (which
+        // `shortfall_report` is never actually run against — see
+        // `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`) or a stripped one, and both are refused
+        // alike.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
         assert_eq!(report.checksum_candidates(), None);
-        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+        let message = rendered(&report.shortfalls());
+        assert!(
+            message.contains("no checksum-candidate section"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -5272,7 +5301,12 @@ mod tests {
 
     #[test]
     fn a_report_with_no_checksum_candidates_renders_no_section_for_them() {
-        let table = full_report(1_024, 0, 1_024, 0).render();
+        let table = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .render();
         assert!(!table.contains("checksum candidates"), "{table}");
     }
 
@@ -5606,7 +5640,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(report.shortfalls().is_empty());
         assert!(report.render().contains("waymaker-core/serde"));
     }
