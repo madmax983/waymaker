@@ -254,7 +254,7 @@ const OTA_ACTIVITIES: u32 = 3;
 /// A *unit* here is a conformance case rather than an effect, which is what
 /// [`super::Workload::unit`] exists to say.
 fn conformance() -> Result<u32, WorkloadError> {
-    // Three erase blocks is `waymaker_conformance::region::REQUIRED_ERASE_BLOCKS`, and the
+    // Four erase blocks is `waymaker_conformance::region::REQUIRED_ERASE_BLOCKS`, and the
     // suite refuses a region smaller than that rather than running a thinner sweep.
     let geometry = Geometry::new(4 * 1024, 1024, 4, 1)
         .map_err(|error| WorkloadError::new(format!("not a geometry ({})", error.message())))?;

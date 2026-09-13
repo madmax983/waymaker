@@ -76,6 +76,13 @@ enum Flaw {
     RejectsAMultiBlockErase,
     /// A read hands back the right bytes and then corrupts the media it read.
     ReadCorruptsWhatItReturned,
+    /// A read hands back the right bytes and then corrupts the unit right after them.
+    ///
+    /// Distinct from [`Flaw::ReadCorruptsWhatItReturned`]: that one is invisible to nothing
+    /// that re-reads the exact bytes returned, which every case in this suite already does.
+    /// This one corrupts a byte no case named, which only a check of the *whole block* a
+    /// read's own setup left behind can see.
+    ReadCorruptsWhatFollows,
     /// A program also clears the program unit *before* the one it was given.
     ProgramCorruptsThePrecedingUnit,
     /// An erase also clears the erase block *before* the one it was given.
@@ -90,6 +97,26 @@ enum Flaw {
     /// notices, then reports. Whether the suite sees it depends entirely on whether its
     /// witness bytes lie inside the range the erase named.
     RefusedMisalignedEraseTakesTheRangeItNamed,
+    /// A program whose *offset* is misaligned still writes to media before refusing.
+    ///
+    /// The shape an adapter that validates the offset only after programming has: it still
+    /// returns an error, so a check that only asks whether the call was refused cannot see
+    /// it. Scoped to the offset misalignment alone — unlike `RefusalScribblesFirst`, which
+    /// scribbles on any validation failure — so it can only be caught by a case that probes
+    /// an offset misalignment specifically and then checks what it left behind.
+    MisalignedProgramOffsetScribblesBeforeRefusing,
+    /// A program of more than one unit corrupts the program unit *before* the one it named.
+    ///
+    /// Distinct from [`Flaw::ProgramCorruptsThePrecedingUnit`], which fires on *every*
+    /// program: this one only fires on a multi-unit program, so it can only be caught by the
+    /// case that actually issues one.
+    MultiUnitProgramCorruptsThePrecedingUnit,
+    /// A multi-block erase corrupts the erase block *before* the pair it named.
+    ///
+    /// Distinct from [`Flaw::EraseTakesThePrecedingBlock`], which fires on *every* erase:
+    /// this one only fires on a multi-block erase, so it can only be caught by the case that
+    /// actually issues one.
+    MultiBlockEraseCorruptsThePrecedingBlock,
 }
 
 const ERASED: u8 = 0xFF;
@@ -234,6 +261,25 @@ impl StableStorage for Broken {
             self.fill(offset, len, |_| 0x00);
             return Ok(());
         }
+        if self.flaw == Flaw::ReadCorruptsWhatFollows {
+            let Ok(start) = usize::try_from(offset) else {
+                return Err(Refused);
+            };
+            let Some(end) = start.checked_add(dst.len()) else {
+                return Err(Refused);
+            };
+            let Some(source) = self.media.get(start..end) else {
+                return Err(Refused);
+            };
+            dst.copy_from_slice(source);
+            // The bytes handed back are exactly right; the unit right after the ones named
+            // is not. No case that only re-reads what it asked for can see this.
+            let unit = self.geometry.program_size();
+            if let Some(after) = offset.checked_add(len) {
+                self.fill(after, unit, |_| 0x00);
+            }
+            return Ok(());
+        }
         let Ok(start) = usize::try_from(offset) else {
             return Err(Refused);
         };
@@ -263,7 +309,10 @@ impl StableStorage for Broken {
                 Ok(()) => {}
                 Err(GeometryError::OutOfBounds) if !self.checks_the_end(offset) => {}
                 Err(error) => {
-                    if self.flaw == Flaw::RefusalScribblesFirst {
+                    if self.flaw == Flaw::RefusalScribblesFirst
+                        || (self.flaw == Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
+                            && error == GeometryError::MisalignedOffset)
+                    {
                         self.apply(offset, src);
                     }
                     if self.flaw == Flaw::StraddlingMutationWipesTheValidPrefix
@@ -293,6 +342,16 @@ impl StableStorage for Broken {
                 if let Some(previous) = offset.checked_sub(unit) {
                     let spill = vec![0_u8; unit as usize];
                     self.apply(previous, &spill);
+                }
+            }
+            Flaw::MultiUnitProgramCorruptsThePrecedingUnit => {
+                self.apply(offset, src);
+                let unit = self.geometry.program_size();
+                if len > unit {
+                    if let Some(previous) = offset.checked_sub(unit) {
+                        let spill = vec![0_u8; unit as usize];
+                        self.apply(previous, &spill);
+                    }
                 }
             }
             _ => self.apply(offset, src),
@@ -349,6 +408,15 @@ impl StableStorage for Broken {
                     self.fill(previous, block, |_| ERASED);
                 }
             }
+            Flaw::MultiBlockEraseCorruptsThePrecedingBlock => {
+                self.fill(offset, len, |_| ERASED);
+                let block = self.geometry.erase_size();
+                if len > block {
+                    if let Some(previous) = offset.checked_sub(block) {
+                        self.fill(previous, block, |_| ERASED);
+                    }
+                }
+            }
             _ => self.fill(offset, len, |_| ERASED),
         }
         Ok(())
@@ -384,9 +452,33 @@ fn nested() -> Geometry {
     geometry
 }
 
+/// A geometry whose erase block holds exactly two program units.
+///
+/// `nested()` never exercises this: with sixteen units per block, the interior unit
+/// `ProgramLeavesTheRestOfTheBlockAlone` targets is nowhere near a block boundary. Here it
+/// *is* the boundary unit, so a program that spills one unit past it lands in the next
+/// block rather than in the block's own suffix.
+fn two_units_per_block() -> Geometry {
+    let Ok(geometry) = Geometry::new(1024, 8, 4, 2) else {
+        unreachable!("1024 is whole 8-byte blocks of two whole 4-byte units")
+    };
+    geometry
+}
+
+/// A geometry whose erase block is a single program unit.
+///
+/// `nested()` never exercises `multi_unit_program_crossing_a_block`: with a block wider
+/// than a unit, a two-unit program always fits inside one block. Here it spans two.
+fn block_is_one_unit() -> Geometry {
+    let Ok(geometry) = Geometry::new(1024, 4, 4, 2) else {
+        unreachable!("1024 is whole 4-byte blocks that are one 4-byte program unit")
+    };
+    geometry
+}
+
 fn whole(geometry: Geometry) -> Region {
     let Ok(region) = Region::whole_device(geometry) else {
-        unreachable!("sixteen erase blocks is more than three")
+        unreachable!("sixteen erase blocks is more than four")
     };
     region
 }
@@ -474,6 +566,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Failure::ReadBackDiffers,
     ),
     (
+        Flaw::ReadCorruptsWhatFollows,
+        CaseId::ReadingChangesNoMedia,
+        Failure::ReadBackDiffers,
+    ),
+    (
         Flaw::ProgramCorruptsThePrecedingUnit,
         CaseId::ProgramLeavesTheRestOfTheBlockAlone,
         Failure::MediaOutsideTheOperationChanged,
@@ -532,6 +629,21 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Flaw::EraseAlwaysFails,
         CaseId::RefusedProgramTouchesNoMedia,
         Failure::LegalOperationRefused,
+    ),
+    (
+        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
+        CaseId::MisalignedProgramIsRefused,
+        Failure::RefusedOperationTouchedMedia,
+    ),
+    (
+        Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
+        CaseId::MultiUnitProgramIsLegal,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
+    (
+        Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
+        CaseId::MultiBlockEraseIsLegal,
+        Failure::MediaOutsideTheOperationChanged,
     ),
 ];
 
@@ -643,11 +755,15 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         Flaw::EraseTakesTheWholeDevice
         | Flaw::EraseTakesThePrecedingBlock
         | Flaw::ProgramCorruptsThePrecedingUnit
+        | Flaw::MultiUnitProgramCorruptsThePrecedingUnit
+        | Flaw::MultiBlockEraseCorruptsThePrecedingBlock
+        | Flaw::ReadCorruptsWhatFollows
         | Flaw::BarrierScribbles
         | Flaw::BarrierScribblesInTheMiddleBlock
         | Flaw::BarrierScribblesBeyondTheWorkingBlocks => true,
         Flaw::None
         | Flaw::NoValidation
+        | Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
         | Flaw::PastCapacityIsClamped
         | Flaw::BoundsCheckedAtTheStartOnly
         | Flaw::WanderingGeometry
@@ -731,7 +847,7 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::MultiBlockEraseIsLegal,
             Failure::LegalOperationRefused,
         )),
-        Flaw::ReadCorruptsWhatItReturned => {
+        Flaw::ReadCorruptsWhatItReturned | Flaw::ReadCorruptsWhatFollows => {
             Some((CaseId::ReadingChangesNoMedia, Failure::ReadBackDiffers))
         }
         Flaw::ZeroLengthIsRefused => Some((
@@ -750,6 +866,18 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
         Flaw::EraseAlwaysFails => Some((
             CaseId::RefusedProgramTouchesNoMedia,
             Failure::LegalOperationRefused,
+        )),
+        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing => Some((
+            CaseId::MisalignedProgramIsRefused,
+            Failure::RefusedOperationTouchedMedia,
+        )),
+        Flaw::MultiUnitProgramCorruptsThePrecedingUnit => Some((
+            CaseId::MultiUnitProgramIsLegal,
+            Failure::MediaOutsideTheOperationChanged,
+        )),
+        Flaw::MultiBlockEraseCorruptsThePrecedingBlock => Some((
+            CaseId::MultiBlockEraseIsLegal,
+            Failure::MediaOutsideTheOperationChanged,
         )),
     }
 }
@@ -772,6 +900,7 @@ const ALL: &[Flaw] = &[
     Flaw::RejectsAMultiUnitProgram,
     Flaw::RejectsAMultiBlockErase,
     Flaw::ReadCorruptsWhatItReturned,
+    Flaw::ReadCorruptsWhatFollows,
     Flaw::EraseTakesTheWholeDevice,
     Flaw::EraseTakesThePrecedingBlock,
     Flaw::BarrierScribblesInTheMiddleBlock,
@@ -784,6 +913,9 @@ const ALL: &[Flaw] = &[
     Flaw::ReadAlwaysFails,
     Flaw::ProgramAlwaysFails,
     Flaw::EraseAlwaysFails,
+    Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
+    Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
+    Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
 ];
 
 #[test]
@@ -793,11 +925,11 @@ fn no_wrong_adapter_lets_the_suite_damage_media_outside_the_region() {
     // does *not* refuse what it should. A conformant device makes it trivially true, which
     // is why `tests/suite.rs`'s region test cannot stand in for this one.
     //
-    // The region here deliberately ends three blocks short of the device, so the erase block
-    // an out-of-bounds mutation would start in is outside it.
+    // The region here deliberately ends eleven blocks short of the device, so the erase
+    // block an out-of-bounds mutation would start in is outside it.
     let geometry = nested();
-    let Ok(region) = Region::new(geometry, 64, 192) else {
-        unreachable!("64 and 192 are whole 64-byte blocks inside 1024 bytes")
+    let Ok(region) = Region::new(geometry, 64, 256) else {
+        unreachable!("64 and 256 are whole 64-byte blocks inside 1024 bytes")
     };
     let start = region.offset() as usize;
     let end = region.end() as usize;
@@ -841,8 +973,8 @@ fn a_region_short_of_the_end_of_the_device_says_which_question_it_cannot_ask() {
     // the capacity is not merely skipped, it is reported, so a run on a mid-device region
     // cannot be mistaken for one that asked everything.
     let geometry = nested();
-    let Ok(region) = Region::new(geometry, 64, 192) else {
-        unreachable!("64 and 192 are whole 64-byte blocks inside 1024 bytes")
+    let Ok(region) = Region::new(geometry, 64, 256) else {
+        unreachable!("64 and 256 are whole 64-byte blocks inside 1024 bytes")
     };
     let mut device = Broken::new(geometry, Flaw::None);
     let mut buffer = [0_u8; 64];
@@ -853,5 +985,43 @@ fn a_region_short_of_the_end_of_the_device_says_which_question_it_cannot_ask() {
     assert_eq!(
         report.outcome(CaseId::MutationStraddlingTheCapacityIsRefused),
         Outcome::NotApplicable(NotApplicable::TheRegionDoesNotEndAtTheCapacity)
+    );
+}
+
+#[test]
+fn a_program_that_spills_into_the_next_block_is_caught_when_the_block_holds_two_units() {
+    // `ProgramSpillsIntoTheNextUnit` corrupts the program unit right after the one it was
+    // given. On `nested()` that unit is still inside the target's own block, so the case
+    // already catches it there — this geometry is the one on which the *next block* is the
+    // only witness that can.
+    let geometry = two_units_per_block();
+    let mut device = Broken::new(geometry, Flaw::ProgramSpillsIntoTheNextUnit);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(
+        report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
+        Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_multi_unit_program_that_corrupts_the_preceding_unit_is_caught_when_it_crosses_a_block() {
+    // The main sweep runs every flaw against `nested()`, where a block holds sixteen program
+    // units and a two-unit program always fits inside one — `multi_unit_program_is_legal`
+    // takes its `within_a_block` branch there and never its `crossing_a_block` one. This is
+    // the adversarial coverage that branch is otherwise missing.
+    let geometry = block_is_one_unit();
+    let mut device = Broken::new(geometry, Flaw::MultiUnitProgramCorruptsThePrecedingUnit);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(
+        report.outcome(CaseId::MultiUnitProgramIsLegal),
+        Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
+        "{report:?}"
     );
 }
