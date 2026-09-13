@@ -106,16 +106,41 @@ fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     }
 }
 
+/// Strips a raw marker from every identifier in `stream`.
+///
+/// `#![allow(r#missing_docs)]` renders as `allow(r#missing_docs)` through
+/// [`quote::ToTokens`] unless this runs first. That text does not equal a rule's
+/// plain literal, so a raw marker used only to dodge a keyword would still silence
+/// the lint it names (issue #90).
+fn unraw_tokens(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    stream.into_iter().map(unraw_token_tree).collect()
+}
+
+/// [`unraw_tokens`], one token at a time. A group's own delimiters keep their span;
+/// only its contents are rewritten.
+fn unraw_token_tree(tree: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+    match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            let mut replaced =
+                proc_macro2::Group::new(group.delimiter(), unraw_tokens(group.stream()));
+            replaced.set_span(group.span());
+            proc_macro2::TokenTree::Group(replaced)
+        }
+        proc_macro2::TokenTree::Ident(ident) => proc_macro2::TokenTree::Ident(ident.unraw()),
+        other => other,
+    }
+}
+
 /// Render one attribute exactly as the old line scanner would have seen it.
 ///
 /// The historical checks compared attributes as whitespace-free text
 /// (`#![forbid(unsafe_code)]`); rendering the parsed attribute back to that spelling
 /// keeps those comparisons meaningful without re-scanning source lines. A string
 /// literal's interior keeps its characters but loses insignificant spacing, the same
-/// way the old comment stripper treated it.
+/// way the old comment stripper treated it. Every identifier's raw marker is stripped
+/// first, so `#[cfg(r#test)]` reads the same as `#[cfg(test)]` (issue #90).
 fn attribute_text(attribute: &syn::Attribute) -> String {
-    attribute
-        .to_token_stream()
+    unraw_tokens(attribute.to_token_stream())
         .to_string()
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -749,6 +774,23 @@ impl syn::visit_mut::VisitMut for EraseLifetimes {
     }
 }
 
+/// Strips a raw marker from every identifier in a syntax tree, before it is rendered
+/// with [`quote::quote!`].
+///
+/// `TryFrom<&[r#u8]>` renders its argument as `<&[r#u8]>` unless this runs first, and
+/// that text does not equal the plain spelling [`check_kernel_owns_no_encoding`] looks
+/// for — a raw marker used only to dodge a keyword would still hide the argument
+/// (issue #90).
+///
+/// [`check_kernel_owns_no_encoding`]: crate::source::check_kernel_owns_no_encoding
+struct UnrawIdents;
+
+impl syn::visit_mut::VisitMut for UnrawIdents {
+    fn visit_ident_mut(&mut self, ident: &mut syn::Ident) {
+        *ident = ident.unraw();
+    }
+}
+
 /// Every `impl Trait for Type` in `contents`, in source order.
 ///
 /// Inherent impls (`impl Foo { ... }`) are not trait implementations and are skipped.
@@ -799,6 +841,10 @@ pub fn trait_impls(contents: &str) -> Result<Vec<TraitImpl>, syn::Error> {
                                 &mut EraseLifetimes,
                                 &mut erased,
                             );
+                            syn::visit_mut::VisitMut::visit_generic_argument_mut(
+                                &mut UnrawIdents,
+                                &mut erased,
+                            );
                             Some(quote::quote!(#erased).to_string())
                         })
                         .collect();
@@ -806,10 +852,12 @@ pub fn trait_impls(contents: &str) -> Result<Vec<TraitImpl>, syn::Error> {
                 }
                 syn::PathArguments::None | syn::PathArguments::Parenthesized(_) => String::new(),
             };
+            let mut self_ty = (*node.self_ty).clone();
+            syn::visit_mut::VisitMut::visit_type_mut(&mut UnrawIdents, &mut self_ty);
             self.found.push(TraitImpl {
                 trait_segments,
                 trait_generics,
-                self_ty: quote::quote!(#node.self_ty).to_string().replace(' ', ""),
+                self_ty: quote::quote!(#self_ty).to_string().replace(' ', ""),
             });
             syn::visit::visit_item_impl(self, node);
         }
@@ -1341,7 +1389,8 @@ mod raw_identifier_tests {
     //! every other parser in this file against the same rule.
     use super::{
         FnScope, child_modules, declares_test, fn_declaration_count, future_trait_implementors,
-        name_uses, resolved_path_uses, struct_literal_counts, trait_impls, use_aliases,
+        inner_attributes, name_uses, resolved_path_uses, struct_literal_counts, trait_impls,
+        use_aliases,
     };
 
     #[test]
@@ -1349,6 +1398,26 @@ mod raw_identifier_tests {
         let impls = trait_impls("impl r#TryFrom<&[u8]> for Foo {}").expect("the fixture parses");
         assert_eq!(impls.len(), 1, "{impls:?}");
         assert_eq!(impls[0].trait_segments, ["TryFrom"]);
+    }
+
+    #[test]
+    fn a_raw_generic_argument_is_still_the_plain_argument() {
+        let impls = trait_impls("impl TryFrom<&[r#u8]> for Foo {}").expect("the fixture parses");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].trait_generics, "<&[u8]>");
+    }
+
+    #[test]
+    fn a_raw_self_type_is_still_the_plain_type() {
+        let impls = trait_impls("impl TryFrom<&[u8]> for r#Foo {}").expect("the fixture parses");
+        assert_eq!(impls.len(), 1, "{impls:?}");
+        assert_eq!(impls[0].self_ty, "Foo");
+    }
+
+    #[test]
+    fn a_raw_attribute_argument_still_silences_the_lint() {
+        let attributes = inner_attributes("#![allow(r#missing_docs)]").expect("the fixture parses");
+        assert_eq!(attributes, ["#![allow(missing_docs)]"]);
     }
 
     #[test]
