@@ -635,6 +635,16 @@ impl Journal {
         self.powered
     }
 
+    /// The next id `declare` will hand out, or `None` once the counter is exhausted.
+    ///
+    /// [`crate::refine::Observation::next_id`] is why this is public: a caller reconstructing
+    /// a real crashed device's state has to report the real counter rather than let it be
+    /// inferred from whatever records survive, and inferring needs this reading first.
+    #[must_use]
+    pub const fn next_id(&self) -> Option<u32> {
+        self.next_id
+    }
+
     /// Whether any record is on media in part but not in whole.
     #[must_use]
     pub fn has_torn_record(&self) -> bool {
@@ -1194,26 +1204,46 @@ impl Journal {
         Ok(())
     }
 
-    /// The device powers back on. A reboot restores power; it does not erase anything, so
-    /// nothing about the media changes.
+    /// The device powers back on. A reboot restores power and discards every record that
+    /// never reached media; nothing else about the media changes.
     ///
     /// # Postconditions
     ///
-    /// [`powered`](Self::powered) is `true`, and nothing else is. `records`, `dispatched` and
-    /// every bank's seal are exactly what they were the instant before — [`recover`](Self::recover)
-    /// already answers with the right prefix computed fresh from those bytes, so this
-    /// transition does not need to, and must not, prune anything to make that true.
+    /// [`powered`](Self::powered) is `true`. Every [`OnMedia::Whole`] or [`OnMedia::Partial`]
+    /// record and every bank's seal are exactly what they were the instant before —
+    /// [`recover`](Self::recover) already answers with the right prefix computed fresh from
+    /// those bytes, so this transition does not need to, and must not, prune either toward
+    /// that answer. An [`OnMedia::Absent`] record is different: [`declare`](Self::declare)
+    /// puts it in `records` before a single byte is programmed, so it is a fact about RAM and
+    /// not about media, and a power cut takes RAM along with the power — leaving it in place
+    /// would have the live device believe a declaration survived a crash that nothing durable
+    /// underwrites. `dispatched` is pruned to match, dropping any id whose record just went
+    /// with it, the same way [`begin_erase`](Self::begin_erase) prunes it; a dispatched
+    /// `Absent` record can only be reached with `Guard::DurableIntent` disabled, and
+    /// [`dispatched`](Self::dispatched) must never outlive the record it names.
+    /// `next_id` does not roll back — a declaration a crash erased still spent its slot of
+    /// `bound.records`'s "total ever declared", the accounting
+    /// [`declare`](Self::declare)'s own doc comment already states for an erased bank's
+    /// records.
     ///
-    /// Codex found the bug this replaced: dropping every record `recover()` did not name
-    /// used to remove a torn record's bytes from the model along with it, which let a
-    /// `Declare`/`Program` right back into the bank a crash had just left with no legal
-    /// append point — [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s
+    /// Codex found the bug this replaced, on two review rounds of the same pull request. The
+    /// first: dropping every record `recover()` did not name used to remove a torn record's
+    /// bytes from the model along with it, which let a `Declare`/`Program` right back into
+    /// the bank a crash had just left with no legal append point — [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s
     /// rule, restated for a live device rather than for the reader. It also silently erased
     /// the *other* bank's own history, which only [`begin_erase`](Self::begin_erase) may do.
-    /// Leaving every record in place means [`whole_before`](Self::whole_before) still sees
-    /// the torn record and keeps refusing a write past it, exactly as it did before the
-    /// crash, until a real `Transition::BeginErase` clears that bank.
-    const fn reboot(&mut self) {
+    /// The second, on review of the fix for the first: leaving *every* record in place,
+    /// `Absent` ones included, meant [`unresolved_schedule_in`](Self::unresolved_schedule_in)
+    /// and [`whole_before`](Self::whole_before) went on reading a declaration that never
+    /// reached media as though it had — `Declare(Schedule)` immediately followed by
+    /// `PowerLoss`/`Reboot` permanently stranded that bank, refusing a second `Declare` as
+    /// `OutOfProtocolOrder` and refusing every later `Program` behind the phantom record's
+    /// `whole_before` check, with no real bytes anywhere to blame it on.
+    fn reboot(&mut self) {
+        self.records
+            .retain(|record| record.media != OnMedia::Absent);
+        let remaining: BTreeSet<RecordId> = self.records.iter().map(|record| record.id).collect();
+        self.dispatched.retain(|id| remaining.contains(id));
         self.powered = true;
     }
 
@@ -1229,25 +1259,29 @@ impl Journal {
     /// existed; a bank-aware one passes what it read off a real crashed device. Every record is
     /// assumed to be in [`BankId::A`] regardless — no writer this crate drives touches a
     /// second bank at the *record* level, so `records` never names a second one; see
-    /// `crate::refine`'s module docs. `next_id` is set past every id `records` carries so a
-    /// caller that went on to call [`step`](Self::step) — nothing in this crate does — could
-    /// not reissue one. `checked_add` rather than `saturating_add`: an observation whose
-    /// highest id is already `RecordId(u32::MAX)` has no id left to set `next_id` *to*, and
-    /// saturating back to `u32::MAX` would have handed that same id out a second time.
+    /// `crate::refine`'s module docs.
+    ///
+    /// `next_id` is the caller's too, and is taken as given rather than inferred from
+    /// `records`. It used to be `records.iter().map(id).max() + 1`, which is exactly wrong
+    /// once an id can be dropped without being reissued: `Journal::begin_erase` removes every
+    /// record of an erased bank, so a device that declared record 0, swapped away from that
+    /// bank and erased it has a real counter at 1 with no record anywhere naming 0 — inferring
+    /// from what survives would compute 0 and hand that id out a second time on the very next
+    /// `Declare`, exactly the collision issue #67's identity scheme exists to forbid. Codex
+    /// found it on review of the pull request that closed issue #67, independently of the
+    /// `u32::MAX` case below: a caller that erases anything has to track the true counter and
+    /// report it, the same way [`crate::refine::Observation`] already carries `banks` and
+    /// `sealed_once` explicitly rather than inferring either from `records`.
     pub(crate) fn from_parts(
         records: Vec<Record>,
         dispatched: Vec<RecordId>,
         banks: [Bank; BANKS],
         sealed_once: bool,
+        next_id: Option<u32>,
     ) -> Self {
         let mut sorted = dispatched;
         sorted.sort_unstable();
         sorted.dedup();
-        let next_id = records
-            .iter()
-            .map(|record| record.id.0)
-            .max()
-            .map_or(Some(0), |highest| highest.checked_add(1));
         Self {
             records,
             banks,

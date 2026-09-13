@@ -134,14 +134,40 @@ fn a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank()
         if matches!(transition, Transition::BeginErase(_)) {
             // The one exception, and `erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else`
             // is the claim about which records it may drop — exactly the named bank's.
-            // `Reboot` restores power and nothing else, so it is not a second exception:
-            // `a_reboot_changes_nothing_but_the_power` is that claim.
             continue;
         }
-        assert_eq!(
-            dropped, 0,
-            "{transition:?} dropped {dropped} record(s) without erasing a bank"
-        );
+        if transition == Transition::Reboot {
+            // The other exception, narrower than an erase: `Reboot` may drop a record, but
+            // only one that never reached media in the first place —
+            // `a_reboot_discards_only_records_still_absent_from_media` is the claim about
+            // which ones. Every record that *does* survive still keeps its id, checked below
+            // with every other transition.
+            let dropped_ids: std::collections::BTreeSet<_> = from
+                .records()
+                .iter()
+                .map(|record| record.id)
+                .filter(|id| to.records().iter().all(|record| record.id != *id))
+                .collect();
+            for id in dropped_ids {
+                let before = from
+                    .records()
+                    .iter()
+                    .find(|record| record.id == id)
+                    .expect("id came from from.records()");
+                assert_eq!(
+                    before.media,
+                    OnMedia::Absent,
+                    "Reboot dropped record {} which was {:?}, not Absent",
+                    id.0,
+                    before.media
+                );
+            }
+        } else {
+            assert_eq!(
+                dropped, 0,
+                "{transition:?} dropped {dropped} record(s) without erasing a bank or rebooting"
+            );
+        }
         for (before, after) in matched(&from, &to) {
             assert_eq!(
                 before.id, after.id,
@@ -327,27 +353,96 @@ fn no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to() 
 }
 
 #[test]
-fn a_reboot_changes_nothing_but_the_power() {
-    // Issue #67's second gap, corrected after review found the first version wrong: a reboot
-    // restores power and nothing else. It must not prune `records` down to `recover()`'s
-    // answer — `recover()` already computes that fresh from whatever bytes are there, and
-    // pruning would erase a torn record's bytes (and, since `recover()` is scoped to one
-    // bank, the *other* bank's own history too) the way only `Transition::BeginErase` may.
-    // A device rebooting behind a torn record has to stay stuck behind it, exactly as
-    // `Guard::AppendOnly` already requires, until a real erase clears that bank.
+fn a_reboot_changes_nothing_media_backed_but_the_power() {
+    // Issue #67's second gap, corrected after review found the first version wrong twice
+    // over. First: a reboot must not prune `records` down to `recover()`'s answer —
+    // `recover()` already computes that fresh from whatever bytes are there, and pruning
+    // would erase a torn record's bytes (and, since `recover()` is scoped to one bank, the
+    // *other* bank's own history too) the way only `Transition::BeginErase` may. A device
+    // rebooting behind a torn record has to stay stuck behind it, exactly as
+    // `Guard::AppendOnly` already requires, until a real erase clears that bank. Second,
+    // found on review of the fix for the first: a still-`Absent` record is not a torn
+    // record's bytes — it is a fact about RAM a crash actually took, and a reboot must
+    // discard it or a device permanently strands itself behind a declaration nothing durable
+    // underwrites (`a_reboot_discards_only_records_still_absent_from_media`, below).
     for (from, transition, to) in edges() {
         if transition != Transition::Reboot {
             continue;
         }
-        assert_eq!(to.records(), from.records(), "Reboot changed the records");
+        let media_backed: Vec<Record> = from
+            .records()
+            .iter()
+            .filter(|record| record.media != OnMedia::Absent)
+            .copied()
+            .collect();
         assert_eq!(
-            to.dispatched(),
-            from.dispatched(),
-            "Reboot changed the dispatch log"
+            to.records(),
+            media_backed.as_slice(),
+            "Reboot changed a media-backed record, or its order"
         );
         assert_eq!(to.banks(), from.banks(), "Reboot changed a bank's seal");
         assert!(to.powered(), "Reboot left the device unpowered");
     }
+}
+
+#[test]
+fn a_reboot_discards_only_records_still_absent_from_media() {
+    // Codex, PR #135's merge round: `Declare(Schedule)` immediately followed by
+    // `PowerLoss`/`Reboot` used to leave the still-`Absent` schedule record in place, and
+    // `unresolved_schedule_in` and `whole_before` read it exactly as they would a real one —
+    // permanently stranding that bank behind a declaration no byte on media backs. This
+    // requires the scenario to be reachable at all, then requires it not to strand anything:
+    // a fresh `Declare` of the opposite role succeeds, exactly as it would from a bank that
+    // had never declared anything.
+    let mut checked = 0_usize;
+    for (from, transition, to) in edges() {
+        if transition != Transition::Reboot {
+            continue;
+        }
+        let Some(absent) = from
+            .records()
+            .iter()
+            .find(|record| record.media == OnMedia::Absent)
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            to.records().iter().all(|record| record.id != absent.id),
+            "record {} was still Absent before reboot and survived it",
+            absent.id.0
+        );
+        let bank = absent.bank;
+        let schedule = to.step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let outcome = to.step(
+            Transition::Declare(Role::Outcome),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        // `Bound::PROOF`'s own record ceiling can legitimately refuse both — that is
+        // `Illegal::CapacityReached`, not the stranding this test is about. The stranding
+        // this bug caused was always `Illegal::OutOfProtocolOrder` on the role that should
+        // have been open, because a dropped `Absent` record kept reading as one that never
+        // left.
+        let capacity_reached =
+            |result: &Result<Journal, Illegal>| matches!(result, Err(Illegal::CapacityReached));
+        if capacity_reached(&schedule) && capacity_reached(&outcome) {
+            continue;
+        }
+        assert!(
+            schedule.is_ok() || outcome.is_ok(),
+            "bank {bank:?} is stranded after reboot discarded its only declaration: \
+             schedule {schedule:?}, outcome {outcome:?}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reachable Reboot edge ever had an Absent record to discard"
+    );
 }
 
 #[test]

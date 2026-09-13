@@ -2949,3 +2949,40 @@ the last representable id was never allocatable, not just the one past the ceili
 the last one and then becomes `None`. `the_last_record_id_is_still_allocated_exactly_once`
 and `declaring_past_the_last_record_id_is_refused_rather_than_reused` are the positive and
 negative halves.
+
+This branch's own merge with issue #73's landed on `main`, reconciling the two independent
+halves of `single-authority`'s "owed" gap each issue closed, drew a tenth and an eleventh
+finding on the merge commit. The tenth: `Journal::reboot` restored power and left *every*
+record in place, `OnMedia::Absent` ones included — a record `declare` puts in `records`
+before a single byte is programmed, so it is a fact about RAM rather than about media, and a
+power cut takes RAM with the power. `Declare(Schedule)` immediately followed by
+`PowerLoss`/`Reboot` left the phantom declaration in place, and `unresolved_schedule_in` and
+`whole_before` read it exactly as they would a real one — permanently stranding that bank,
+refusing a second `Declare` as `OutOfProtocolOrder` and refusing every later `Program` behind
+the absent record's own `whole_before` check, with no real bytes anywhere to blame it on.
+`reboot` now discards every still-`Absent` record and prunes `dispatched` to match, the same
+way `begin_erase` already does for an erased bank's records; `next_id` does not roll back,
+matching the "total ever declared" accounting `declare`'s own doc comment already states for
+an erased bank. `a_reboot_discards_only_records_still_absent_from_media` is the positive
+claim and `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank`
+gained `Reboot` as a second, narrower exception beside `BeginErase`'s. `REACHABLE_STATES` and
+`TRANSITION_EDGES` moved up substantially this time — a whole family of states that used to
+dead-end at `Reboot` behind an undischarged declaration reopened into the states a bank that
+had never declared anything reaches.
+
+The eleventh was independent of the tenth, on the observation/reconstruction path
+`tests/refinement.rs` abstracts a real crashed device through: `Journal::from_parts` inferred
+`next_id` from `records.iter().map(id).max() + 1`, which is exact only while nothing has ever
+been dropped from `records`. A device that declares record 0, swaps authority away from its
+bank and erases it has a real counter at 1 with no record anywhere naming 0; inferring from
+what survives computed 0 and handed that id out a second time on the very next `Declare` —
+the identity collision issue #67's whole scheme exists to forbid, unreachable by any test
+here only because the bank-swap refinement declares no records at all. `Observation` gained
+its own `next_id: Option<u32>` field, reported by the caller rather than inferred — exactly
+the shape `banks` and `sealed_once` already take, for the same reason: `Journal::observation`
+reads the real field directly, `refine::abstraction`'s record-only callers compute it from
+the ledger's own records because none of them ever erases, and `Journal::from_parts` takes it
+as a parameter instead of computing it at all.
+`reconstruction_never_reissues_an_id_an_erase_already_spent` is the regression, built directly
+against a hand-supplied `Observation` rather than a full crash-harness run, since the gap is
+in the reconstruction machinery itself rather than in any particular writer's behaviour.

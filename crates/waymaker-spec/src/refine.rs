@@ -55,6 +55,15 @@ pub struct Observation {
     ///
     /// `false` for a writer that never touches a bank.
     pub sealed_once: bool,
+    /// The record-id counter, exactly as the real device's own reads.
+    ///
+    /// Not inferred from `records`: an id an erase dropped is not one `records.max_id + 1`
+    /// can see, and inferring it would hand that id out a second time on the next `Declare`
+    /// — the collision issue #67's identity scheme exists to forbid. Codex found this on
+    /// review of the pull request that closed issue #67, on the observation/reconstruction
+    /// path specifically. `Some(0)` for a writer that has declared nothing, matching
+    /// [`crate::model::Journal::new`]; `None` only once the counter itself is exhausted.
+    pub next_id: Option<u32>,
 }
 
 impl Default for Observation {
@@ -64,6 +73,7 @@ impl Default for Observation {
             dispatched: Vec::new(),
             banks: [Bank::Erased; BANKS],
             sealed_once: false,
+            next_id: Some(0),
         }
     }
 }
@@ -88,6 +98,7 @@ impl Journal {
             dispatched: self.dispatched().to_vec(),
             banks: *self.banks(),
             sealed_once: self.has_sealed(),
+            next_id: self.next_id(),
         }
     }
 
@@ -143,6 +154,7 @@ impl Journal {
             observation.dispatched.clone(),
             observation.banks,
             observation.sealed_once,
+            observation.next_id,
         ))
     }
 }
@@ -196,6 +208,14 @@ impl core::error::Error for Impossible {}
 ///
 /// Reports no bank: a caller with one to report builds an [`Observation`] directly and folds
 /// [`bank_after_erase`] and [`bank_after_seal`] into its `banks` field instead.
+///
+/// `next_id` is inferred from `ledger.records()`'s highest id, which is exact here and only
+/// here: no writer this function abstracts ever erases anything, so nothing is ever dropped
+/// from what the ledger still holds for `records.max_id + 1` to lose track of — see
+/// `Journal::from_parts`'s docs for the caller that does erase and cannot take this shortcut.
+/// `checked_add` rather than `saturating_add`: an id already at `u32::MAX` has no id left to
+/// set `next_id` *to*, and saturating back to
+/// `u32::MAX` would hand that same id out a second time.
 pub fn abstraction(
     ledger: &Ledger,
     dispatched: &[RecordId],
@@ -204,12 +224,19 @@ pub fn abstraction(
     let mut sorted = dispatched.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    let records: Vec<_> = ledger
+        .records()
+        .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
+        .collect();
+    let next_id = records
+        .iter()
+        .map(|(id, ..)| id.0)
+        .max()
+        .map_or(Some(0), |highest| highest.checked_add(1));
     Observation {
-        records: ledger
-            .records()
-            .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
-            .collect(),
+        records,
         dispatched: sorted,
+        next_id,
         ..Observation::default()
     }
 }

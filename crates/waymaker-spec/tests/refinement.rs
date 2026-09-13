@@ -32,7 +32,7 @@ use waymaker_flash::bank::{
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_spec::explore::{BankShape, explore};
-use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role};
+use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role, Transition};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
 use waymaker_spec::refine::{
     Observation, abstraction, bank_after_erase, bank_after_seal, call_touched,
@@ -563,6 +563,40 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     };
     let error = Journal::reconstructed(&also_impossible).expect_err("torn and absent");
     assert!(error.to_string().contains("never reached media"), "{error}");
+}
+
+#[test]
+fn reconstruction_never_reissues_an_id_an_erase_already_spent() {
+    // Codex, PR #135's merge round: `next_id` used to be inferred from `records.max_id + 1`,
+    // which cannot see an id `BeginErase` dropped along with its record. A caller that
+    // erased anything and then reported an observation with no surviving record at all would
+    // reconstruct a state that believed no id had ever been issued, and the very next
+    // `Declare` would reissue one a real device's counter had already moved past —
+    // `Observation::next_id` exists so the caller reports the real counter instead of
+    // leaving it to be inferred.
+    let no_records_but_two_ids_spent = Observation {
+        records: Vec::new(),
+        dispatched: Vec::new(),
+        next_id: Some(2),
+        ..Observation::default()
+    };
+    let state = Journal::reconstructed(&no_records_but_two_ids_spent)
+        .expect("an empty, unpowered observation is never impossible");
+    let state = state
+        .step(Transition::Reboot, Guards::ENFORCED, Bound::PROOF)
+        .expect("reboot is legal from an unpowered state");
+    let declared = state
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("declaring from a fresh bank is legal");
+    assert_eq!(
+        declared.records().last().map(|record| record.id),
+        Some(RecordId(2)),
+        "reconstruction reissued an id the real device's counter had already spent"
+    );
 }
 
 #[test]
