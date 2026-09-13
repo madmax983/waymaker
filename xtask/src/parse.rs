@@ -1470,27 +1470,29 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // rather than being kept for `End(TagEnd::Item)` to still try matching what
             // was gathered before the break.
             Event::SoftBreak | Event::HardBreak if collecting => collecting = false,
-            // Inline HTML that itself spans more than one source line disqualifies the
-            // item the same way (Codex, round 23): `pulldown-cmark` collapses a
-            // multi-line inline comment into a single `InlineHtml` event with no
-            // `SoftBreak` around it at all, so `- Sta<!--\n-->tus: accepted` reaches
-            // `Event::Text` as two separate fragments, `Sta` and `tus: accepted`, with
-            // nothing between them to say a comment — real or not — ever sat there.
-            // Concatenating the two bare reconstructs `Status: accepted` out of a value
-            // that was never one line in the source.
-            //
-            // A same-line inline comment carries no newline of its own and is not
-            // disqualifying (Codex, round 24): `- Status: accepted <!-- rationale -->`
-            // is a real, complete, one-line field with a trailing note, and the first
-            // fix disqualified it too, discarding a value that had already been fully
-            // collected before the comment ever appeared. The comment's own text is
-            // never appended to `item` either way, matching how a comment is invisible
-            // everywhere else in this module — only whether it disqualifies the item
-            // differs, and that turns on whether the comment itself proves the source
-            // broke across a line. `Html` block, appearing only for a comment that
-            // outlived its own block, is excluded because it is handled separately
-            // above and cannot occur while a paragraph is still open.
-            Event::InlineHtml(html) if collecting && html.contains('\n') => {
+            // Non-comment inline HTML disqualifies the item unconditionally (Codex,
+            // round 25): a real tag — `<br>`, `<b>`, `</b>` — is not invisible the way
+            // a comment is, so `- Sta<br>tus: accepted` renders as two lines even
+            // though its *source* is one, and concatenating the surrounding `Text`
+            // fragments bare reconstructs `Status: accepted` out of a field a reader
+            // never sees as one line. A same-line inline comment carries no newline of
+            // its own and is not disqualifying (Codex, round 24): `- Status: accepted
+            // <!-- rationale -->` is a real, complete, one-line field with a trailing
+            // note, and disqualifying it discarded a value that had already been fully
+            // collected before the comment appeared. A comment that itself spans more
+            // than one source line still disqualifies (Codex, round 23):
+            // `pulldown-cmark` collapses a multi-line comment into a single
+            // `InlineHtml` event with no `SoftBreak` around it at all, so `- Sta<!--\n
+            // -->tus: accepted` reaches `Event::Text` as two fragments with nothing
+            // between them to say the source ever broke there. The comment's own text
+            // is never appended to `item` in any of these cases, matching how a
+            // comment is invisible everywhere else in this module — only whether it
+            // disqualifies the item differs. `Html` block, appearing only for a
+            // comment that outlived its own block, is excluded because it is handled
+            // separately above and cannot occur while a paragraph is still open.
+            Event::InlineHtml(html)
+                if collecting && (!html.starts_with("<!--") || html.contains('\n')) =>
+            {
                 collecting = false;
             }
             _ => {}

@@ -5738,6 +5738,17 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_break_tag() {
+        // Codex, pull request #138, round 25: a real (non-comment) inline tag is not
+        // invisible the way a comment is, so `- Sta<br>tus: accepted` renders as two
+        // lines even though its source is one — `<br>` carries no newline of its own,
+        // so the round-24 newline check alone let this decoy's surrounding `Text`
+        // fragments fuse into a fake one-line `Status: accepted`.
+        let contents = "# ADR\n\n- Sta<br>tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
