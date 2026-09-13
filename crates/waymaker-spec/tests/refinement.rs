@@ -757,14 +757,20 @@ fn decodes_sealed_at(image: &[u8], id: FlashBankId, generation: Generation) -> b
     bank::sealed_generation(header, seal) == Some(generation)
 }
 
-/// Whether `id`'s header region of `image` is fully erased.
+/// Whether `id`'s whole bank — header and seal both — is fully erased in `image`.
 ///
-/// The header rather than the whole bank: a header that failed to decode at the intended
-/// generation and is not erased either is a torn write, which [`bank_after_erase`] reports as
-/// [`Bank::Erasing`] regardless — the only distinction `erased` has to make.
+/// Both regions, not the header alone: an erase interrupted after clearing the header but
+/// before reaching the seal's own block leaves an old seal standing over an erased header,
+/// which is a bank still *in flight*, not one this run has finished erasing. Checking the
+/// header alone would call that `erased` too, since a cleared header cannot decode either
+/// way — and [`bank_after_erase`] would then report [`Bank::Erased`] for a bank a later crash
+/// could still boot from its stale seal.
 fn is_erased(image: &[u8], id: FlashBankId) -> bool {
-    let (header, _) = regions(image, id);
-    header.iter().all(|byte| *byte == 0xFF)
+    let region = bank_layout().bank(id);
+    let whole = image
+        .get(region.base() as usize..(region.base() + region.bytes()) as usize)
+        .unwrap_or_default();
+    whole.iter().all(|byte| *byte == 0xFF)
 }
 
 /// Folds one crashed run's final image into `[Bank; BANKS]` and whether either bank has ever
