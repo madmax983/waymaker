@@ -2373,8 +2373,12 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
 }
 
 /// The lowercased value of an ADR's `- Status:` line, if it has one.
+///
+/// Strips fenced code and HTML comments first, for `hardware-attestation`'s and
+/// `deferred-questions`' reason: a decoy `- Status: accepted` shown as an example, or
+/// hidden in a comment, must not out-rank the real line.
 fn adr_status(contents: &str) -> Option<String> {
-    contents
+    without_fenced_code(&without_html_comments(contents))
         .lines()
         .map(str::trim_start)
         .find_map(|line| line.strip_prefix("- Status:"))
@@ -2534,7 +2538,9 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
 
-    let contents = without_html_comments(&adr.contents);
+    // Fences as well as comments, for the reason its three siblings strip them: a fenced
+    // example listing every decision id would otherwise settle this check on its own.
+    let contents = without_fenced_code(&without_html_comments(&adr.contents));
     SETTLED_DECISIONS
         .iter()
         .flat_map(|decision| {
@@ -2783,7 +2789,9 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
         )];
     };
 
-    let contents = without_html_comments(contents);
+    // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
+    // every target id would otherwise satisfy this check in a file whose table is gone.
+    let contents = without_fenced_code(&without_html_comments(contents));
     let mut violations = Vec::new();
 
     for target in HARDWARE_TARGETS {
@@ -3376,7 +3384,9 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
         )];
     };
 
-    let contents = without_html_comments(contents);
+    // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
+    // every question id would otherwise satisfy this check in a file whose table is gone.
+    let contents = without_fenced_code(&without_html_comments(contents));
     let mut violations = Vec::new();
 
     for question in DEFERRED_QUESTIONS {
@@ -3865,6 +3875,9 @@ fn check_wire_format_is_documented(
         ));
         return violations;
     };
+    // No `without_fenced_code` here, on purpose: the frozen values live inside fenced
+    // byte-layout blocks in this document, not in prose beside them. Stripping fences
+    // would blind this check to the content it exists to read.
     let spec = without_html_comments(spec);
 
     for frozen in WIRE_FORMAT_CONSTANTS {
@@ -3930,7 +3943,7 @@ fn check_wire_format_is_documented(
                  decision behind it"
             ),
         )),
-        Some(adr) if !adr.contents.contains("- Status: accepted") => {
+        Some(adr) if adr_status(&adr.contents).as_deref() != Some("accepted") => {
             violations.push(Violation::new(
                 RULE,
                 WIRE_FORMAT_ADR,
@@ -4724,6 +4737,26 @@ mod tests {
         let dropped =
             clean_claude_md(RULES).replace(&format!("`{}`", question.id), "(this one, whatever)");
         let violations = check_deferred_questions(Some(&dropped), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "deferred-questions" && v.subject == question.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_question_only_inside_a_fenced_block_in_claude_md_does_not_vouch_for_it() {
+        // Issue #82: the counterpart of `recovery-spec`'s fence test. Without stripping
+        // fences, a fenced example listing every question id would satisfy this check in
+        // a file whose real table has been deleted.
+        let claude_md = clean_claude_md(RULES);
+        let question = DEFERRED_QUESTIONS.first().expect("the table is not empty");
+        let fenced = claude_md.replace(
+            &format!("| `{}` |", question.id),
+            &format!("```text\n| `{}` |", question.id),
+        ) + "\n```\n";
+        let violations = check_deferred_questions(Some(&fenced), &clean_inputs(RULES).adrs);
         assert!(
             violations
                 .iter()
@@ -5530,6 +5563,21 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_status_inside_a_fenced_example() {
+        // Issue #82: `hardware-attestation` and `deferred-questions` read `adr_status`
+        // straight off `adr.contents`. A decoy `- Status:` line shown as an example must
+        // not out-rank the real one.
+        let contents = "# ADR\n\n```text\n- Status: accepted\n```\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_inside_an_html_comment() {
+        let contents = "# ADR\n\n<!--\n- Status: accepted\n-->\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -5584,6 +5632,27 @@ mod tests {
         assert!(
             hardware_attestation_claims(&contents).is_empty(),
             "an HTML comment was read as a claim"
+        );
+    }
+
+    #[test]
+    fn a_hardware_target_only_inside_a_fenced_block_in_claude_md_does_not_vouch_for_it() {
+        // Issue #82: the counterpart of `recovery-spec`'s fence test, for the other half
+        // of `hardware-attestation` — the one that reads `CLAUDE.md` rather than an ADR.
+        // Without stripping fences, a fenced example listing every target id would
+        // satisfy this check in a file whose real table has been deleted.
+        let claude_md = clean_claude_md(RULES);
+        let target = HARDWARE_TARGETS.first().expect("the table is not empty");
+        let fenced = claude_md.replace(
+            &format!("| `{}` |", target.id),
+            &format!("```text\n| `{}` |", target.id),
+        ) + "\n```\n";
+        let violations = check_hardware_attestation(Some(&fenced), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "hardware-attestation" && v.subject == target.id),
+            "{violations:?}"
         );
     }
 
@@ -5795,6 +5864,26 @@ mod tests {
         let adrs = vec![AdrFile {
             name: SETTLED_DECISIONS_ADR.to_owned(),
             contents: format!("# ADR 0003: nothing here\n\n<!--\n{ids}-->\n"),
+        }];
+        let violations = check_settled_decisions(&adrs);
+        assert_eq!(
+            violations.len(),
+            SETTLED_DECISIONS.len() * 2,
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn ids_hidden_in_a_fenced_example_do_not_record_a_decision() {
+        // Issue #82: the fenced-block counterpart of the HTML-comment test above.
+        let mut ids = String::new();
+        for decision in SETTLED_DECISIONS {
+            use std::fmt::Write as _;
+            let _ = writeln!(ids, "{} {}", decision.id, decision.headline);
+        }
+        let adrs = vec![AdrFile {
+            name: SETTLED_DECISIONS_ADR.to_owned(),
+            contents: format!("# ADR 0003: nothing here\n\n```text\n{ids}```\n"),
         }];
         let violations = check_settled_decisions(&adrs);
         assert_eq!(
@@ -7114,6 +7203,39 @@ mod tests {
                 .iter()
                 .any(|violation| violation.detail.contains("not accepted")),
             "an unaccepted freeze went unseen: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_accepted_status_written_with_different_case_still_counts() {
+        // Issue #82: the raw check this rule used to run was case-sensitive, and two real
+        // ADRs in this repository write `- Status: Accepted` with a capital letter.
+        let inputs = wire_format_inputs();
+        let adrs: Vec<AdrFile> = inputs
+            .adrs
+            .iter()
+            .map(|adr| AdrFile {
+                name: adr.name.clone(),
+                contents: if adr.name == WIRE_FORMAT_ADR {
+                    adr.contents
+                        .replace("- Status: accepted", "- Status: Accepted")
+                } else {
+                    adr.contents.clone()
+                },
+            })
+            .collect();
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == WIRE_FORMAT_ADR
+                    && violation.detail.contains("not accepted")),
+            "a capitalized accepted status was read as unaccepted: {violations:?}"
         );
     }
 
