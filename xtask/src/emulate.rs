@@ -256,7 +256,7 @@ impl StackUsage {
     /// Why this is not a measurement, if it is not.
     ///
     /// Three ways, all "a measurement that did not happen is not a measurement that passed":
-    /// a region no wider than [`STACK_GUARD_BYTES`] is one `paint` declines to write anything
+    /// a region no wider than `STACK_GUARD_BYTES` is one `paint` declines to write anything
     /// into at all, so nothing was painted and nothing was measured whether or not the report
     /// happens to read as `0`; and a region disturbed all the way down could not tell a run
     /// that used every byte from one that used one more than this image could see.

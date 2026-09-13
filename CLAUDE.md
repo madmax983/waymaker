@@ -2860,7 +2860,14 @@ test that reads the literal back out of the shipped file. Passing the same `reso
 two separate calls still let them disagree, because each still clamped it against its own
 fresh stack-pointer reading at its own call site — `stack::high_water_mark` now returns both
 `used` and `available` together, computed from the one `depth_from` it resolves for itself in
-that single call, so there is no second call left to read a different bound. See
+that single call, so there is no second call left to read a different bound. A bounded address
+is not the same thing as an initialized one, though, and that gap was still open: `paint`'s own
+doc comment asked a caller to pass its return value on to `high_water_mark`, but nothing
+stopped a safe caller reaching `high_water_mark` directly with an arbitrary `usize` and no
+`paint` call at all — and a raw read of stack memory nobody painted is undefined behavior
+however tightly the address is clamped. `paint` now returns `Painted`, a type this module is
+the only one able to construct, and `high_water_mark` takes one instead of a bare `usize`, so
+a caller with no `Painted` in hand cannot call it at all. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

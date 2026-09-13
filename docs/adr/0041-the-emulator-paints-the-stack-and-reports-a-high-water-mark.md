@@ -180,6 +180,20 @@ is now only the one place either is computed. What `available_bytes` alone is st
 the pre-`paint` gate check, where `paint` has not run yet and there is no shared bound yet to
 reuse.
 
+**A safe `pub fn` scanning raw stack bytes needs more than a bounded address, and a sixth
+finding said so.** `clamp_to_stack_region` keeps every read `high_water_mark` performs inside
+RAM this image owns, but "inside RAM" is not "initialized": a byte `paint` never wrote is not
+`POISON` and is not a byte the run touched either — it is memory nobody has told the compiler
+anything about, and `read_volatile`ing it is undefined behavior regardless of how carefully
+the address is bounded. Before this, that precondition — call `paint` first — lived only in
+`high_water_mark`'s own doc comment, and nothing stopped a safe caller from reaching the
+function directly with an arbitrary `usize` and no prior `paint` call at all. `paint` now
+returns `Painted`, a type with no public constructor of its own, and `high_water_mark` takes
+one instead of a bare `usize`: the one call in this crate that produces a `Painted` is `paint`
+itself, so a caller who has not painted cannot name a value of the type this scan requires.
+The fix costs nothing at the one real call site in `main`, which already passed `paint`'s own
+return value straight through.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -209,7 +223,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the five hardenings changed what the figure means, only what a wrong caller could do
+**None of the six hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*

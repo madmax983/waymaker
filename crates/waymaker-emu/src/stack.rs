@@ -106,8 +106,23 @@ pub fn current_stack_pointer() -> usize {
     cortex_m::register::msp::read() as usize
 }
 
+/// Proof that [`paint`] has poisoned the region [`high_water_mark`] is about to scan.
+///
+/// [`high_water_mark`]'s scan reads raw stack bytes on the assumption every one of them is
+/// either still [`POISON`] or was legitimately overwritten by the run — which is only true of
+/// memory [`paint`] actually filled first. Reading stack bytes nobody wrote is undefined
+/// behavior regardless of how carefully the address is bounded: [`clamp_to_stack_region`]
+/// keeps a read inside RAM this image owns, but "inside RAM" is not "initialized". Before this
+/// type existed, that precondition lived only in a doc comment on `high_water_mark`, and
+/// nothing stopped a safe caller from reaching it directly with an arbitrary `usize` and no
+/// `paint` call at all. Making [`paint`] the only function that can produce one, and
+/// `high_water_mark` the only function that accepts one, turns "call `paint` first" from a
+/// request into a compile error for a caller who does not.
+#[derive(Debug, Clone, Copy)]
+pub struct Painted(usize);
+
 /// Fills unused stack with [`POISON`], from the linker's `_stack_end` up to `depth_from`.
-/// Returns the resolved bound this call actually used.
+/// Returns proof of the resolved bound this call actually used.
 ///
 /// `depth_from` should be a stack pointer reading taken before the caller does anything else
 /// — [`current_stack_pointer`], called first — so everything below it is unused at the
@@ -119,9 +134,9 @@ pub fn current_stack_pointer() -> usize {
 /// takes the lower of that and a fresh stack pointer reading of its own, so the cost of a
 /// wrong reading is a wrong measurement, never an out-of-bounds write.
 ///
-/// The returned bound is what the caller should pass to [`high_water_mark`] and to a later
-/// [`available_bytes`] call, rather than the original `depth_from` reading. Each of those two
-/// would otherwise re-derive its own live stack pointer independently, at a different point
+/// The returned [`Painted`] is what the caller should pass to [`high_water_mark`] and to a
+/// later [`available_bytes`] call, rather than the original `depth_from` reading. Each of those
+/// two would otherwise re-derive its own live stack pointer independently, at a different point
 /// in the boot, and the two readings can differ enough to report `used` a few bytes short of
 /// `available` even when a run truly disturbed every painted byte — which would defeat
 /// `StackUsage::shortfall`'s fail-closed check on exactly the case it exists to catch. Reusing
@@ -130,14 +145,14 @@ pub fn current_stack_pointer() -> usize {
 /// Call this once per boot. A second call would paint over whatever the first call's own
 /// caller had already done, and report on the wrong run.
 #[must_use]
-pub fn paint(depth_from: usize) -> usize {
+pub fn paint(depth_from: usize) -> Painted {
     let depth_from = clamp_to_stack_region(depth_from);
     let bottom = stack_floor();
     let Some(top) = depth_from.checked_sub(GUARD_BYTES) else {
-        return depth_from;
+        return Painted(depth_from);
     };
     if top <= bottom {
-        return depth_from;
+        return Painted(depth_from);
     }
     // SAFETY: `bottom` is the linker's own `_stack_end`, the lowest address this image's
     // stack ever reaches. `top` is `depth_from` less a margin this function never touches,
@@ -155,32 +170,34 @@ pub fn paint(depth_from: usize) -> usize {
             at = at.add(1);
         }
     }
-    depth_from
+    Painted(depth_from)
 }
 
-/// How many bytes below `depth_from` a run since [`paint`] disturbed, and the size of the
+/// How many bytes below `painted`'s bound a run since [`paint`] disturbed, and the size of the
 /// region that measurement is against.
 ///
-/// `depth_from` must be the bound [`paint`] returned, not the original stack pointer reading.
-/// Both figures come from the *one* `depth_from` this call resolves for itself — there is no
+/// Takes a [`Painted`] rather than a bare `usize` — the value [`paint`] returned, not the
+/// original stack pointer reading — because the scan below reads raw stack bytes on the
+/// assumption every one of them was painted first, and only [`paint`] can vouch for that.
+/// Both figures come from the *one* bound this call resolves for itself — there is no
 /// separate call for `available` to disagree with, which is what closes a gap review found in
 /// an earlier version of this fix: `high_water_mark` and a later [`available_bytes`] call each
 /// clamped `depth_from` on their own, at different points in the boot, and a run that
 /// genuinely disturbed every painted byte could still report `used` a few bytes short of
 /// `available` — which would defeat `StackUsage::shortfall`'s fail-closed check on exactly the
 /// case it exists to catch. Computing both from one clamp, in one call, makes that impossible:
-/// whatever `depth_from` resolves to here is what both numbers are measured against.
+/// whatever the bound resolves to here is what both numbers are measured against.
 ///
 /// Scans from `_stack_end` upward for the first byte that is no longer [`POISON`]; everything
 /// below that byte was never touched, so the run reached no deeper. The scan stops at the
-/// same ceiling `paint` stopped filling at — `depth_from` less [`GUARD_BYTES`] — and never
-/// reads the guard margin itself: that memory was never painted, so a byte that happened to
-/// already read as [`POISON`] there would be indistinguishable from one `paint` wrote, and the
-/// figure would under-report rather than over-report. Bounding the scan the same way `paint`
-/// bounded the fill closes that off.
+/// same ceiling `paint` stopped filling at — the bound less [`GUARD_BYTES`] — and never reads
+/// the guard margin itself: that memory was never painted, so a byte that happened to already
+/// read as [`POISON`] there would be indistinguishable from one `paint` wrote, and the figure
+/// would under-report rather than over-report. Bounding the scan the same way `paint` bounded
+/// the fill closes that off.
 #[must_use]
-pub fn high_water_mark(depth_from: usize) -> (u32, u32) {
-    let depth_from = clamp_to_stack_region(depth_from);
+pub fn high_water_mark(painted: Painted) -> (u32, u32) {
+    let depth_from = clamp_to_stack_region(painted.0);
     let bottom = stack_floor();
     let available = region_bytes(bottom, depth_from);
     let Some(ceiling) = depth_from.checked_sub(GUARD_BYTES) else {
