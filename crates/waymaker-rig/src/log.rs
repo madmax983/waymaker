@@ -533,7 +533,15 @@ impl Entry {
             return Err(LogError::NotAnEntry);
         };
         if C::frame_check(body) != u32::from_le_bytes(seal) {
-            return Err(LogError::NotAnEntry);
+            // Not this build's own version at this length. A genuine v1 line, three bytes
+            // shorter, can still be sitting at the front of the same buffer -- a caller
+            // holding a scratch page sized for this build should not have to know which
+            // version is in it before checking.
+            return Err(
+                v1_version::<C>(bytes).map_or(LogError::NotAnEntry, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         }
 
         let mut reader = Reader { bytes: body, at: 0 };
@@ -734,10 +742,10 @@ const fn unnibble(digit: u8) -> Option<u8> {
 /// then also have to collide with a 32-bit check, the same odds every other refusal in this
 /// file already rests on.
 fn v1_version<C: IntegrityCheck>(bytes: &[u8]) -> Option<u8> {
-    if bytes.len() != V1_ENTRY_BYTES {
-        return None;
-    }
-    let (body, seal) = bytes.split_at(V1_ENTRY_BODY_BYTES);
+    // The front of `bytes`, tolerating trailing bytes beyond it -- the same convention
+    // `decode_with` already applies to its own, longer length, so a caller's buffer sized
+    // for this build does not stop a v1 line from being recognised at the front of it.
+    let (body, seal) = bytes.get(..V1_ENTRY_BYTES)?.split_at(V1_ENTRY_BODY_BYTES);
     let seal = <[u8; 4]>::try_from(seal).ok()?;
     if C::frame_check(body) != u32::from_le_bytes(seal) {
         return None;

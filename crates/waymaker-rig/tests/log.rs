@@ -196,6 +196,22 @@ fn a_shorter_older_version_is_refused_by_name_not_by_length() {
 }
 
 #[test]
+fn a_v1_line_at_the_front_of_a_current_sized_buffer_is_still_named() {
+    // Codex, round 5 of issue #81: `decode_with` already tolerates a buffer longer than
+    // `ENTRY_BYTES`, taking only the front of it -- that is the whole reason it slices
+    // with `bytes.get(..ENTRY_BYTES)` rather than requiring an exact length. A caller
+    // holding a scratch page sized for this build's own entries, but carrying a v1 line
+    // from before an upgrade, gets the same answer either way.
+    let mut padded = [0_u8; ENTRY_BYTES];
+    let old = genuine_v1_bytes();
+    padded[..old.len()].copy_from_slice(&old);
+    assert_eq!(
+        Entry::decode(&padded),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
 fn a_rendered_line_at_a_shorter_older_version_is_refused_by_name() {
     use std::fmt::Write as _;
 
