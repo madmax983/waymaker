@@ -167,6 +167,24 @@ retired-bank dispatch as moot (the run it belonged to is superseded either way),
 guard breaks no proof. Kept out, per this crate's own stated rule that a guard removable
 without cost was never load-bearing.
 
+Codex asked for the same guard again on review of this pull request, from a different
+angle: a dispatch happening *after* a bank's retirement, it argued, is not merely an old
+run's forfeited effect (issue #95's accepted cost) but a physical effect with no run behind
+it at all, since the real swap's consumed writer makes it impossible — and durable_intent's
+unconditional exemption cannot tell the two apart. Tried again, directly: restricting
+`Dispatch` to `current_bank()` moves `tests/census.rs`'s `TRANSITION_EDGES` (fewer legal
+`Dispatch` edges) and moves `REACHABLE_STATES` **not at all** — confirmed by rerunning the
+census with the restriction in place. Every state reachable by dispatching after retirement
+is also reachable by dispatching while the bank is still current and retiring it afterward,
+which `tests/necessity.rs`'s
+`a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
+constructs by hand. A `Journal` is a snapshot rather than a log, so "dispatched before
+retirement" and "dispatched after" are the same state once retirement has happened; the
+guard Codex asked for removes one of two (already redundant) paths to that one state, and the
+distinguishing Codex wants does not survive being asked of a state rather than of a trace.
+Kept out a second time, for the same reason and now with the state count checked rather than
+argued.
+
 **A same-bank retry at a new offset**, modelling `Interruption::Failure` as "abandon the torn
 record's span and declare a fresh one further into the same bank's journal." Rejected: NOR
 flash physically cannot make a new append point past a torn or unsealed frame without an

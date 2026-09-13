@@ -988,6 +988,19 @@ impl Journal {
     /// moot rather than as a breach — the old run is superseded either way, and a precondition
     /// guarding against it would be a guard `tests/necessity.rs` could delete without breaking
     /// a single proof.
+    ///
+    /// Codex asked for exactly that guard on review of issue #67's pull request, arguing a
+    /// dispatch happening *after* retirement is not merely an old run's forfeited effect but a
+    /// physical effect with no run behind it, since the real swap's consumed writer makes it
+    /// impossible. Tried directly: restricting this to `current_bank()` moves
+    /// `tests/census.rs`'s `TRANSITION_EDGES` and moves `REACHABLE_STATES` not at all. Every
+    /// state a post-retirement dispatch reaches is also reachable by dispatching while the
+    /// bank is still current and retiring it afterward — `tests/necessity.rs`'s
+    /// `a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
+    /// builds that trace by hand. A [`Journal`] is a snapshot rather than a log, so "dispatched
+    /// before retirement" and "dispatched after" are one state once retirement has happened; a
+    /// guard on this transition cannot separate them, only remove one of two redundant paths
+    /// to the state both describe.
     fn dispatch(&mut self, id: RecordId, guards: Guards) -> Result<(), Illegal> {
         let record = self
             .records

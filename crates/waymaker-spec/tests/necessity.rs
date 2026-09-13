@@ -19,7 +19,7 @@
 
 use waymaker_spec::explore::explore;
 use waymaker_spec::invariant::Invariant;
-use waymaker_spec::model::{Bound, Guard, Guards, Journal};
+use waymaker_spec::model::{BankId, Bound, Guard, Guards, Journal, Role, Transition};
 use waymaker_spec::reader::Specified;
 
 const CEILING: usize = 400_000;
@@ -247,6 +247,49 @@ fn a_dispatch_from_a_bank_a_swap_has_since_retired_is_moot_rather_than_a_breach(
         "a dispatch from a retired bank is reachable and the spine proofs are still supposed \
          to hold, which is asserted again here rather than trusted from tests/spine.rs"
     );
+}
+
+#[test]
+fn a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts() {
+    // Codex, PR #135 round 4: worried that `durable_intent`'s moot exemption for a dispatch
+    // from a retired bank might be hiding a dispatch that happened *after* the bank was
+    // already retired — which real firmware cannot do, since design document §10's swap
+    // consumes the old run's writer (`crates/waymaker-flash/src/swap.rs`). Answered by
+    // construction: this is the exact "moot" shape (`bank_of(id) != recovering_bank()`),
+    // reached here with `Dispatch(id)` as the fourth transition and the bank not retiring
+    // until two transitions later — an ordinary run dispatching an effect while its own bank
+    // is still the one being written to, only afterward superseded by a swap. A `Journal` is
+    // a snapshot rather than a log, so this state is indistinguishable from one reached by
+    // dispatching after retirement, which is exactly why restricting `Dispatch` to the
+    // current bank (tried directly, see `Journal::dispatch`'s doc comment) changes
+    // `tests/census.rs`'s edge counts and not its `REACHABLE_STATES`: every state the removed
+    // edges could reach is also reachable by the legitimate order built here.
+    let bound = Bound::PROOF;
+    let guards = Guards::ENFORCED;
+    let mut state = Journal::default();
+    state = state
+        .step(Transition::Declare(Role::Schedule), guards, bound)
+        .expect("declare");
+    let id = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id), guards, bound)
+        .expect("program");
+    state = state
+        .step(Transition::Barrier, guards, bound)
+        .expect("barrier");
+    assert_eq!(state.recovering_bank(), Some(BankId::A));
+    state = state
+        .step(Transition::Dispatch(id), guards, bound)
+        .expect("dispatch while A is still the run being written to");
+    state = state
+        .step(Transition::BeginSeal(BankId::B), guards, bound)
+        .expect("begin seal B");
+    state = state
+        .step(Transition::CommitSeal(BankId::B), guards, bound)
+        .expect("commit seal B");
+    assert_eq!(state.recovering_bank(), Some(BankId::B));
+    assert_eq!(state.bank_of(id), Some(BankId::A));
+    assert!(state.dispatched().contains(&id));
 }
 
 #[test]
