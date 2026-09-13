@@ -42,6 +42,20 @@
 //! register or a backup domain, so `docs::HARDWARE_TARGETS` stays `Not run` and this stage
 //! may not be cited to move a row of it. See
 //! [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+//!
+//! # What it now measures about the stack
+//!
+//! Each image paints its own unused stack before the rig runs and reports how far the paint
+//! was disturbed after — [`StackUsage`], read from a third census line. This is a real,
+//! on-target figure where before there was none, and it closes a limit `CLAUDE.md`'s budgets
+//! section names: §04's runtime RAM figure is stack-blind for call-chain depth, and this is
+//! the depth for *this* image, on *this* run. It is not the same figure. This image links
+//! `waymaker-rig` and `waymaker-conformance` alongside the three layers, so what is reported
+//! is the whole call chain's depth, not the engine's share of it — and it is gated only for
+//! running out of room, never compared between the two machines: different cores compile the
+//! same source into different instructions, so a different byte count is expected rather than
+//! a finding. See
+//! [ADR 0041](https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -205,11 +219,54 @@ impl Census {
     }
 }
 
+/// How much of the painted stack one run disturbed.
+///
+/// Read from the image's own third census line, alongside [`Census`] rather than folded into
+/// it: the two are parsed together and always answered together, but they are never compared
+/// the same way. [`Report::shortfall`]'s cross-machine equality check reads [`Census`] alone
+/// — two cores executing the same deterministic plan must agree about what the rig did, and
+/// this is what a difference there would mean. They are not expected to use the same number
+/// of stack bytes doing it: a Cortex-M0 and a Cortex-M4 compile the same source into
+/// different instructions, so a different figure here is expected and not itself a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StackUsage {
+    /// Bytes disturbed, from the deepest point the run reached up to the boot's own marker.
+    pub used: u32,
+    /// Bytes the paint covered: the whole region between the linker's `__ebss` and the
+    /// marker.
+    pub available: u32,
+}
+
+impl StackUsage {
+    /// Why this is not a measurement, if it is not.
+    ///
+    /// Two ways, both "a measurement that did not happen is not a measurement that passed":
+    /// a region reported as empty painted nothing and scanned nothing, and a region disturbed
+    /// all the way down could not tell a run that used every byte from one that used one more
+    /// than this image could see.
+    #[must_use]
+    pub fn shortfall(&self) -> Option<String> {
+        if self.available == 0 {
+            return Some(
+                "the stack region reported as empty, so nothing was painted and nothing was measured"
+                    .to_owned(),
+            );
+        }
+        if self.used >= self.available {
+            return Some(format!(
+                "used {} of {} available bytes: the paint was disturbed all the way down, so the true high-water mark could not be read",
+                self.used, self.available
+            ));
+        }
+        None
+    }
+}
+
 /// What became of one machine's boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The image ran, said what it did, and the census holds.
-    Ran(Census),
+    Ran(Census, StackUsage),
     /// The run is not a measurement, and this is why.
     ///
     /// One variant rather than several, for [`crate::profile::Verdict::Unmeasurable`]'s
@@ -222,7 +279,16 @@ impl Outcome {
     #[must_use]
     pub const fn census(&self) -> Option<&Census> {
         match self {
-            Self::Ran(census) => Some(census),
+            Self::Ran(census, _) => Some(census),
+            Self::Unmeasurable(_) => None,
+        }
+    }
+
+    /// The stack usage, if there is one.
+    #[must_use]
+    pub const fn stack(&self) -> Option<&StackUsage> {
+        match self {
+            Self::Ran(_, stack) => Some(stack),
             Self::Unmeasurable(_) => None,
         }
     }
@@ -268,8 +334,11 @@ impl Report {
                 Outcome::Unmeasurable(why) => {
                     return Some(format!("{}: {why}", row.machine.name));
                 }
-                Outcome::Ran(census) => {
+                Outcome::Ran(census, stack) => {
                     if let Some(shortfall) = census.shortfall() {
+                        return Some(format!("{}: {shortfall}", row.machine.name));
+                    }
+                    if let Some(shortfall) = stack.shortfall() {
                         return Some(format!("{}: {shortfall}", row.machine.name));
                     }
                 }
@@ -307,8 +376,8 @@ impl Report {
                 row.machine.qemu,
                 row.machine.architecture,
                 match &row.outcome {
-                    Outcome::Ran(census) => format!(
-                        "cases {}+{} · iterations {} · cuts {} · resumes {} · redeliveries {} · verdicts {} · effects {}",
+                    Outcome::Ran(census, stack) => format!(
+                        "cases {}+{} · iterations {} · cuts {} · resumes {} · redeliveries {} · verdicts {} · effects {} · stack {} of {}",
                         census.cases_passed,
                         census.cases_exempt,
                         census.iterations,
@@ -316,7 +385,9 @@ impl Report {
                         census.resumes,
                         census.redeliveries,
                         census.verdicts,
-                        census.dispatched
+                        census.dispatched,
+                        stack.used,
+                        stack.available
                     ),
                     Outcome::Unmeasurable(why) => format!("unmeasurable: {why}"),
                 }
@@ -326,22 +397,27 @@ impl Report {
             "\nWhat this establishes is that the rig executes on both instruction sets, and that both\n\
              agree about what it did. What it does not establish is a board: neither machine has a NOR\n\
              part, a supply to remove, a reset-cause register or a backup domain, so every row of the\n\
-             hardware table stays `Not run`. See ADR 0040.\n",
+             hardware table stays `Not run`. See ADR 0040.\n\n\
+             Stack is the whole image's own call-chain depth on this run, not the engine's share of it,\n\
+             and the two machines are not required to agree: different cores compile the same source\n\
+             into different instructions. See ADR 0041.\n",
         );
         out
     }
 }
 
-/// Reads a boot's own lines into a census.
+/// Reads a boot's own lines into a census and its stack usage.
 ///
 /// Pure, so that every way an image can fail to say what it did is a case in
 /// `tests` rather than a QEMU run inside a test. Returns `None` when a required line is
 /// absent — which is what an image that exited zero having printed nothing looks like.
 #[must_use]
-pub fn parse(output: &str) -> Option<Census> {
+pub fn parse(output: &str) -> Option<(Census, StackUsage)> {
     let mut census = Census::default();
+    let mut stack = StackUsage::default();
     let mut cases = false;
     let mut rig = false;
+    let mut stack_seen = false;
     let mut ok = false;
     for line in output.lines() {
         let Some(rest) = line.trim().strip_prefix(PREFIX) else {
@@ -363,12 +439,16 @@ pub fn parse(output: &str) -> Option<Census> {
             census.verdicts = field(fields, "verdicts")?;
             census.dispatched = field(fields, "dispatched")?;
             rig = true;
+        } else if let Some(fields) = rest.strip_prefix("stack ") {
+            stack.used = field(fields, "used")?;
+            stack.available = field(fields, "available")?;
+            stack_seen = true;
         }
     }
-    // All three, and `ok` is not enough on its own: the image writes it last, so a truncated
+    // All four, and `ok` is not enough on its own: the image writes it last, so a truncated
     // run has the counts and not the word, and an image that printed only the word did not
     // run. Requiring the set is what makes a partial read a failure.
-    (cases && rig && ok).then_some(census)
+    (cases && rig && stack_seen && ok).then_some((census, stack))
 }
 
 /// Reads `name=<number>` out of a space-separated field list.
@@ -393,16 +473,16 @@ pub fn measure(root: &Path) -> Result<Report, String> {
     let mut rows = Vec::new();
     for machine in MACHINES {
         let outcome = match build(root, *machine).and_then(|image| start(*machine, &image)) {
-            Ok((census, output)) => {
+            Ok((parsed, output)) => {
                 rows.push(Row {
                     machine: *machine,
-                    outcome: census.map_or_else(
+                    outcome: parsed.map_or_else(
                         || {
                             Outcome::Unmeasurable(
                                 "the image ran and printed no census this gate can read, which is not a measurement that passed".to_owned(),
                             )
                         },
-                        Outcome::Ran,
+                        |(census, stack)| Outcome::Ran(census, stack),
                     ),
                     output,
                 });
@@ -485,7 +565,7 @@ fn build(root: &Path, machine: Machine) -> Result<PathBuf, String> {
 }
 
 /// Starts `image` on `machine` and reads what it wrote.
-fn start(machine: Machine, image: &Path) -> Result<(Option<Census>, String), String> {
+fn start(machine: Machine, image: &Path) -> Result<(Option<(Census, StackUsage)>, String), String> {
     let mut child = Command::new(EMULATOR)
         .args([
             "-machine",
@@ -563,14 +643,31 @@ pub const REQUIRED_ATTRIBUTES: &[&str] = &["#![no_std]", "#![no_main]"];
 
 /// The identifier the crate is allowed to name, and the keyword it is not.
 ///
-/// The whole of the exception this crate carries is that a *macro* it invokes expands to
+/// Most of the exception this crate carries is that a *macro* it invokes expands to
 /// `unsafe`: `#[cortex_m_rt::entry]` writes the exported symbol the reset vector points at,
 /// and `debug::exit` performs the semihosting call. Neither is hand-written here, and this is
 /// what says so — the crate may name the lint (`unsafe_code`, in the `allow` it declares) and
-/// may never write the keyword. Without it, `#![allow(unsafe_code)]` would be a licence for
-/// the whole crate rather than for two macro expansions, and the one place in this workspace
-/// where `unsafe` is permitted would be the one place nothing checks.
+/// may write the keyword only where [`PERMITTED_UNSAFE_FUNCTIONS`] names. Without it,
+/// `#![allow(unsafe_code)]` would be a licence for the whole crate rather than for two macro
+/// expansions and one measurement, and the one place in this workspace where `unsafe` is
+/// permitted would be the one place nothing checks.
 pub const PERMITTED_LINT_NAME: &str = "unsafe_code";
+
+/// The one file [`PERMITTED_UNSAFE_FUNCTIONS`] is read from.
+///
+/// A path suffix, matched the way `check_image_attributes` matches `main.rs`: a decoy file
+/// of the same name in a different directory is the same limit that check already carries,
+/// and is named again in `CLAUDE.md`'s "what is not checked" for the same reason.
+pub const STACK_MODULE: &str = "stack.rs";
+
+/// The only functions in [`STACK_MODULE`] that may write the `unsafe` keyword.
+///
+/// The reset vector and the semihosting exit are macro expansions; this is the third
+/// exception and the last, and it is hand-written rather than expanded, so it is pinned by
+/// name instead of being invisible to this scan the way a macro's own `unsafe` is. ADR 0041
+/// is the reason either function needs it at all: a raw fill and a raw read, over the region
+/// between the linker's `__ebss` and this boot's own marker.
+pub const PERMITTED_UNSAFE_FUNCTIONS: &[&str] = &["paint", "high_water_mark"];
 
 /// Fails a build in which the emulated image stops being the thing this gate started.
 ///
@@ -701,11 +798,12 @@ fn attribute_body<'a>(contents: &'a str, opener: &str) -> Option<&'a str> {
     rest.get(..end)
 }
 
-/// No file of the crate writes the `unsafe` keyword.
+/// No file of the crate writes the `unsafe` keyword outside [`PERMITTED_UNSAFE_FUNCTIONS`].
 fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate::Violation> {
     let mut violations = Vec::new();
     for source in files {
         let code = crate::source::code_only(&source.contents);
+        let is_stack_module = source.path.ends_with(STACK_MODULE);
         let bytes = code.as_bytes();
         let mut at = 0;
         while let Some(found) = code.get(at..).and_then(|rest| rest.find("unsafe")) {
@@ -716,14 +814,16 @@ fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate
                 .and_then(|index| bytes.get(index).copied());
             let after = bytes.get(end).copied();
             let is_word_start = before.is_none_or(|byte| !is_identifier_byte(byte));
-            // `unsafe_code` is the lint's name and the one thing this crate may say. The
+            // `unsafe_code` is the lint's name and the one thing every file may say. The
             // keyword is never followed by an identifier byte, so the two cannot be confused.
             let is_the_lint = after.is_some_and(is_identifier_byte);
-            if is_word_start && !is_the_lint {
+            let is_permitted = is_stack_module
+                && (is_extern_block(&code, end) || is_within_permitted_fn(&code, start));
+            if is_word_start && !is_the_lint && !is_permitted {
                 violations.push(crate::Violation::new(
                     RULE,
                     source.path.clone(),
-                    "writes the `unsafe` keyword. The exception this crate carries is for two macro expansions — the reset vector and the semihosting exit — and hand-written `unsafe` in the one place the workspace permits the attribute is the thing nothing else would catch",
+                    "writes the `unsafe` keyword. The exception this crate carries is for two macro expansions — the reset vector and the semihosting exit — and one measurement — the stack high-water mark, confined to the two functions PERMITTED_UNSAFE_FUNCTIONS names — and hand-written `unsafe` anywhere else is the thing nothing else would catch",
                 ));
                 break;
             }
@@ -736,6 +836,36 @@ fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate
 /// Whether `byte` can appear inside a Rust identifier.
 const fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether the `unsafe` ending at `after` in `code` opens an `unsafe extern` block.
+///
+/// The one occurrence of the keyword this crate needs outside a function body: naming the
+/// linker's `__ebss` symbol needs `unsafe extern "C" { .. }` under the 2024 edition, and that
+/// block declares no function this rule could pin instead.
+fn is_extern_block(code: &str, after: usize) -> bool {
+    code.get(after..)
+        .is_some_and(|rest| rest.trim_start().starts_with("extern"))
+}
+
+/// Whether the `unsafe` starting at `at` in `code` falls inside the body of a function
+/// [`PERMITTED_UNSAFE_FUNCTIONS`] names.
+fn is_within_permitted_fn(code: &str, at: usize) -> bool {
+    PERMITTED_UNSAFE_FUNCTIONS.iter().any(|name| {
+        crate::source::braced_body(code, &format!("fn {name}"))
+            .is_some_and(|body| span_contains(code, body, at))
+    })
+}
+
+/// Whether `at` — a byte offset into `code` — falls inside `body`, a substring of `code`.
+///
+/// `body` is always a slice of `code` here: [`crate::source::braced_body`] only ever returns
+/// one, so the subtraction below is two offsets into the one allocation, never a comparison
+/// of unrelated pointers.
+fn span_contains(code: &str, body: &str, at: usize) -> bool {
+    let start = body.as_ptr() as usize - code.as_ptr() as usize;
+    let end = start.saturating_add(body.len());
+    at >= start && at < end
 }
 
 /// The image declares the prefix the harness reads.
@@ -874,6 +1004,28 @@ pub mod tests_support {
             contents: clean_root(),
         }]
     }
+
+    /// A `stack.rs` carrying exactly the shape [`super::PERMITTED_UNSAFE_FUNCTIONS`] and the
+    /// linker-symbol block permit — the real module, minus its doc comments.
+    #[must_use]
+    pub fn clean_stack_module() -> String {
+        "unsafe extern \"C\" {\n    static __ebss: u8;\n}\n\
+         pub fn paint(depth_from: usize) {\n    unsafe {\n        core::ptr::write_volatile(depth_from as *mut u8, 0xA5);\n    }\n}\n\
+         pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned()
+    }
+
+    /// [`clean_sources`] with [`clean_stack_module`] added as `stack.rs`.
+    #[must_use]
+    pub fn sources_with_stack_module() -> Vec<crate::size::LayerSource> {
+        let mut sources = clean_sources();
+        sources.push(crate::size::LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/stack.rs"),
+            contents: clean_stack_module(),
+        });
+        sources
+    }
 }
 
 #[cfg(test)]
@@ -886,7 +1038,7 @@ mod tests {
     /// rather than about a string a test invented.
     fn clean_output() -> String {
         format!(
-            "{PREFIX} cases passed=21 exempt=2\n{PREFIX} rig iterations=12 cuts=12 resumes=12 unextendable=0 redeliveries=8 verdicts=24 dispatched=42\n{PREFIX} ok\n"
+            "{PREFIX} cases passed=21 exempt=2\n{PREFIX} rig iterations=12 cuts=12 resumes=12 unextendable=0 redeliveries=8 verdicts=24 dispatched=42\n{PREFIX} stack used=1024 available=12000\n{PREFIX} ok\n"
         )
     }
 
@@ -904,7 +1056,14 @@ mod tests {
         }
     }
 
-    fn ran(name: &'static str, census: Census) -> Row {
+    fn clean_stack_usage() -> StackUsage {
+        StackUsage {
+            used: 1024,
+            available: 12000,
+        }
+    }
+
+    fn ran(name: &'static str, census: Census, stack: StackUsage) -> Row {
         let machine = MACHINES
             .iter()
             .find(|machine| machine.name == name)
@@ -912,7 +1071,7 @@ mod tests {
             .unwrap_or(MACHINES[0]);
         Row {
             machine,
-            outcome: Outcome::Ran(census),
+            outcome: Outcome::Ran(census, stack),
             output: String::new(),
         }
     }
@@ -921,7 +1080,7 @@ mod tests {
         Report {
             rows: MACHINES
                 .iter()
-                .map(|machine| ran(machine.name, clean_census()))
+                .map(|machine| ran(machine.name, clean_census(), clean_stack_usage()))
                 .collect(),
         }
     }
@@ -951,7 +1110,10 @@ mod tests {
 
     #[test]
     fn a_complete_boot_parses_into_the_census_it_printed() {
-        assert_eq!(parse(&clean_output()), Some(clean_census()));
+        assert_eq!(
+            parse(&clean_output()),
+            Some((clean_census(), clean_stack_usage()))
+        );
     }
 
     #[test]
@@ -986,7 +1148,41 @@ mod tests {
     #[test]
     fn the_emulators_own_noise_is_ignored() {
         let noisy = format!("qemu: warning: something\n{}", clean_output());
-        assert_eq!(parse(&noisy), Some(clean_census()));
+        assert_eq!(parse(&noisy), Some((clean_census(), clean_stack_usage())));
+    }
+
+    #[test]
+    fn a_boot_with_no_stack_line_is_not_a_census() {
+        // The fourth required line, added beside `cases`, `rig` and `ok`: a run this gate
+        // cannot read a stack figure from is not a run that measured one.
+        let missing =
+            clean_output().replace(&format!("{PREFIX} stack used=1024 available=12000\n"), "");
+        assert_eq!(parse(&missing), None);
+    }
+
+    #[test]
+    fn a_clean_stack_usage_has_no_shortfall() {
+        assert_eq!(clean_stack_usage().shortfall(), None);
+    }
+
+    #[test]
+    fn a_stack_reported_empty_is_refused() {
+        let stack = StackUsage {
+            available: 0,
+            ..clean_stack_usage()
+        };
+        assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn a_stack_used_to_the_edge_of_what_was_painted_is_refused() {
+        // The paint was disturbed all the way down, so the true high-water mark — which may
+        // be deeper still — could not be read. Reported rather than assumed clean.
+        let stack = StackUsage {
+            used: 12000,
+            available: 12000,
+        };
+        assert!(stack.shortfall().is_some());
     }
 
     #[test]
@@ -1068,16 +1264,37 @@ mod tests {
         // the rig behaving differently on two instruction sets.
         let mut report = clean_report();
         if let Some(row) = report.rows.last_mut() {
-            row.outcome = Outcome::Ran(Census {
-                dispatched: 41,
-                ..clean_census()
-            });
+            row.outcome = Outcome::Ran(
+                Census {
+                    dispatched: 41,
+                    ..clean_census()
+                },
+                clean_stack_usage(),
+            );
         }
         let shortfall = report.shortfall().unwrap_or_default();
         assert!(
             shortfall.contains("disagree"),
             "the two cores disagreeing must be reported as such: {shortfall}"
         );
+    }
+
+    #[test]
+    fn two_cores_that_disagree_about_stack_used_still_pass_the_gate() {
+        // The comparison this gate must not make: a Cortex-M0 and a Cortex-M4 compile the
+        // same source into different instructions, so a different stack figure is expected
+        // and is not itself a finding. Only `Census` is compared across machines.
+        let mut report = clean_report();
+        if let Some(row) = report.rows.last_mut() {
+            row.outcome = Outcome::Ran(
+                clean_census(),
+                StackUsage {
+                    used: 2048,
+                    ..clean_stack_usage()
+                },
+            );
+        }
+        assert_eq!(report.shortfall(), None);
     }
 
     #[test]
@@ -1110,6 +1327,9 @@ mod tests {
             rendered.contains("does not establish is a board"),
             "{rendered}"
         );
+        // And says what the stack figure is not: a claim the two machines must agree on.
+        assert!(rendered.contains("not required to agree"), "{rendered}");
+        assert!(rendered.contains("stack 1024 of 12000"), "{rendered}");
     }
 
     #[test]
@@ -1237,6 +1457,66 @@ mod tests {
             contents: "unsafe fn peek() {}\n".to_owned(),
         });
         assert!(!check(&sources).is_empty());
+    }
+
+    #[test]
+    fn the_real_stack_module_passes() {
+        // ADR 0041's own shape: the linker-symbol block, and `unsafe` confined to the two
+        // functions `PERMITTED_UNSAFE_FUNCTIONS` names — nothing this rule should catch.
+        assert_eq!(
+            check(&tests_support::sources_with_stack_module()),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unsafe_in_paint_or_high_water_mark_is_permitted_only_in_stack_rs() {
+        // The exception is a (file, function) pair, not a function name alone: a decoy
+        // `fn paint` elsewhere in the crate must not borrow it.
+        let mut sources = tests_support::clean_sources();
+        sources.push(LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/nor.rs"),
+            contents: "pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0) };\n}\n".to_owned(),
+        });
+        assert!(!check(&sources).is_empty());
+    }
+
+    #[test]
+    fn unsafe_in_stack_rs_outside_the_two_named_functions_is_reported() {
+        // The exception is these two functions and no others: a third function in the same
+        // file, even one that looks like a helper the other two might plausibly call, still
+        // has to answer to this rule.
+        let mut sources = tests_support::clean_sources();
+        sources.push(LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/stack.rs"),
+            contents: format!(
+                "{}\npub fn extra() {{ unsafe {{ core::ptr::null::<u8>().read() }}; }}\n",
+                tests_support::clean_stack_module()
+            ),
+        });
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_stack_rs_in_another_directory_is_out_of_scope() {
+        // What the (file, function) pin cannot see, named here rather than left implied: a
+        // path suffix match, not a crate-root-relative one. `CLAUDE.md`'s "what is not
+        // checked" carries the same limit for `main.rs`.
+        let mut sources = tests_support::clean_sources();
+        sources.push(LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/elsewhere/stack.rs"),
+            contents: "pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0) };\n}\n".to_owned(),
+        });
+        assert_eq!(check(&sources), Vec::new());
     }
 
     #[test]

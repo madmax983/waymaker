@@ -49,6 +49,7 @@ be superseded.
 | [0038](0038-no-alloc-is-a-measurement-and-the-instruction-figure-is-a-comparison.md) | `no_alloc` is a measurement, and the instruction figure is a comparison | accepted |
 | [0039](0039-the-book-quotes-tests-and-the-matrix-is-derived.md) | The book quotes tests, and the matrix is derived | accepted |
 | [0040](0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) | The emulator runs the rig, and attests to no board | accepted |
+| [0041](0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
 
 ## Reading the numbers
 

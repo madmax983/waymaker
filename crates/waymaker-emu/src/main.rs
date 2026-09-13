@@ -32,30 +32,33 @@
 //!
 //! # Why there is `unsafe` here, and nowhere else
 //!
-//! `#[cortex_m_rt::entry]` expands to the exported symbol the reset vector points at, and
-//! `cortex_m_semihosting::debug::exit` is how a guest tells QEMU what to exit with. Neither
-//! can be written without the attribute the workspace denies. The workspace manifest names
-//! this exact escape — *"`deny` keeps a documented exception a reviewable one-line
-//! `#![allow(unsafe_code)]` plus an ADR"* — and this is the one crate that takes it. It is a
-//! crate nothing depends on, that is never published, and that no layer, test-support crate
-//! or firmware image links.
+//! Three reasons, and no more. `#[cortex_m_rt::entry]` expands to the exported symbol the
+//! reset vector points at, and `cortex_m_semihosting::debug::exit` is how a guest tells QEMU
+//! what to exit with — neither can be written without the attribute the workspace denies.
+//! [`crate::stack`] is the third: reading how far a run disturbed a painted stack needs a raw
+//! fill and a raw read, named by [ADR 0041]. The workspace manifest names this exact escape —
+//! *"`deny` keeps a documented exception a reviewable one-line `#![allow(unsafe_code)]` plus
+//! an ADR"* — and this is the one crate that takes it. It is a crate nothing depends on, that
+//! is never published, and that no layer, test-support crate or firmware image links.
 //!
 //! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
+//! [ADR 0041]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 
 #![no_std]
 #![no_main]
 #![warn(missing_docs)]
 // The one exception in the workspace, argued in the module documentation above and in
-// ADR 0040. `allow` rather than the `forbid` every other crate carries, because a reset
-// vector and a semihosting exit cannot be spelled without it — and scoped to a crate nothing
-// depends on and no image links.
+// ADR 0040 and ADR 0041. `allow` rather than the `forbid` every other crate carries, because
+// a reset vector, a semihosting exit and a stack high-water mark cannot be spelled without
+// it — and scoped to a crate nothing depends on and no image links.
 #![allow(
     unsafe_code,
-    reason = "the reset vector and the semihosting exit; see ADR 0040"
+    reason = "the reset vector, the semihosting exit, and the stack high-water mark; see ADR 0040 and ADR 0041"
 )]
 
 pub mod boot;
 pub mod nor;
+pub mod stack;
 
 use core::panic::PanicInfo;
 
@@ -76,15 +79,29 @@ pub const PREFIX: &str = "waymaker-emu:";
 
 #[entry]
 fn main() -> ! {
-    // Both locals, not statics: `cortex-m-rt` puts the stack at the top of the 16 KiB the
-    // memory map declares, and a `static` would need interior mutability this crate has no
-    // way to spell without more of the exception it already carries.
-    let mut part = Nor::new();
-    let mut page = [0_u8; Rig::PAGE_BYTES];
+    // Taken before anything else, so that every byte below it is unused stack at the moment
+    // `stack::paint` is called. `measured_run` is `#[inline(never)]` for the same reason:
+    // its locals — `part` and `page` among them — must sit in a frame of their own, below
+    // this one, and never share this function's frame with `marker`.
+    let marker = 0_u8;
+    let depth_from = core::ptr::addr_of!(marker) as usize;
+    let available = stack::available_bytes(depth_from);
+    if available == 0 {
+        hprintln!(
+            "{} failed the stack region between the linker's `__ebss` and this boot's own marker is empty; there is nothing to paint or measure",
+            PREFIX
+        );
+        debug::exit(debug::EXIT_FAILURE);
+        halt();
+    }
 
-    match boot::run(&mut part, &mut page) {
+    stack::paint(depth_from);
+    let outcome = measured_run();
+    let used = stack::high_water_mark(depth_from);
+
+    match outcome {
         Ok(census) => {
-            report(&census);
+            report(&census, used, available);
             hprintln!("{} ok", PREFIX);
             debug::exit(debug::EXIT_SUCCESS);
         }
@@ -103,8 +120,22 @@ fn main() -> ! {
     halt()
 }
 
-/// Writes the census as two lines the harness parses and a person can read.
-fn report(census: &Census) {
+/// Runs the boot's own locals in a frame of their own.
+///
+/// Both locals, not statics: `cortex-m-rt` puts the stack at the top of the 16 KiB the memory
+/// map declares, and a `static` would need interior mutability this crate has no way to
+/// spell without more of the exception it already carries. Kept out of `main`'s own frame,
+/// and marked so the compiler cannot fold it back in: `stack::paint` must not reach memory
+/// `main` still holds, and this function's frame is where `part` and `page` live instead.
+#[inline(never)]
+fn measured_run() -> Result<Census, Trouble> {
+    let mut part = Nor::new();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    boot::run(&mut part, &mut page)
+}
+
+/// Writes the census as three lines the harness parses and a person can read.
+fn report(census: &Census, stack_used: u32, stack_available: u32) {
     hprintln!(
         "{} cases passed={} exempt={}",
         PREFIX,
@@ -121,6 +152,12 @@ fn report(census: &Census) {
         census.redeliveries,
         census.verdicts_passed,
         census.dispatched
+    );
+    hprintln!(
+        "{} stack used={} available={}",
+        PREFIX,
+        stack_used,
+        stack_available
     );
 }
 
