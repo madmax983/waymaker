@@ -80,7 +80,10 @@ pub struct Session {
     /// sequence never fires — [`trace`](Self::trace) clamps it to the sequence's length, so
     /// the determinism check cannot see it — and neither does one the writer never reached.
     /// Both are refused as [`HarnessError::CrashPointNeverFired`] rather than reported as
-    /// runs, because a crash point that fired on nothing measured nothing.
+    /// runs, because a crash point that fired on nothing measured nothing. The one exception
+    /// is the terminal `Watchdog` sentinel — see
+    /// [`is_terminal_watchdog_sentinel`](Harness::is_terminal_watchdog_sentinel) — which
+    /// never fires either and is answered anyway, because its answer is the fault-free run.
     fired: bool,
 }
 
@@ -258,7 +261,8 @@ impl Session {
     /// Records that the crash point fired. [`Harness::run_one`](crate::Harness::run_one)
     /// takes a crash point a caller builds by hand, and a past-the-end `op` never reaches
     /// this function — which is exactly what makes it detectable, where the clamped trace
-    /// comparison is blind to it.
+    /// comparison is blind to it. `Harness::injected` answers three such never-fired
+    /// shapes anyway, as sentinels; every other one stays refused.
     fn armed_for(&mut self, index: usize) -> Option<Injection> {
         let armed = self.injection.filter(|injection| injection.op == index);
         if armed.is_some() {
@@ -723,14 +727,17 @@ impl Harness {
     /// operations before its crash point differ from the fault-free run's, and
     /// [`HarnessError::CrashPointNeverFired`] if the crash point never fired — an `op`
     /// past the end of the sequence, one the writer did not reach, or any hand-built
-    /// injection that is not one of the two crash points the enumeration lists for an
-    /// empty sequence. A crash point that fired on nothing measured nothing, so it is
-    /// refused rather than reported as a run.
+    /// injection that is not one of the three sentinels below. A crash point that fired
+    /// on nothing measured nothing, so it is refused rather than reported as a run.
     ///
-    /// The exception is the empty sequence's two sentinels — `(0, None, PowerLoss)` and
-    /// `(0, None, Watchdog)`, the crash points [`injections`](crate::injections)
-    /// enumerates when there is nothing to interrupt. They precede everything rather
-    /// than missing it, and the empty-sequence sweep is explicitly supported.
+    /// Three sentinels are the exception. Two are the empty sequence's —
+    /// `(0, None, PowerLoss)` and `(0, None, Watchdog)`, the crash points
+    /// [`injections`](crate::injections) enumerates when there is nothing to interrupt.
+    /// They precede everything rather than missing it, and the empty-sequence sweep is
+    /// explicitly supported. The third is `(ops.len(), None, Watchdog)`, on any sequence:
+    /// no operation follows the last one, so [`injections`](crate::injections) enumerates
+    /// no point there, and this call answers it with the fault-free run instead. See
+    /// ADR 0042.
     #[must_use = "the run is the result"]
     pub fn run_one<W, E>(&self, injection: Injection, mut writer: W) -> Result<Run, HarnessError>
     where
@@ -800,12 +807,17 @@ impl Harness {
         // it. `trace` clamps a past-the-end `op` to the sequence's length, so the
         // comparison below cannot tell it apart from a crash point on the last operation —
         // and "everything up to and including the crash point matches" is vacuous when
-        // no crash point fired in the run. The exception is the enumeration's sentinels:
-        // on an empty sequence `(0, None, PowerLoss)` and `(0, None, Watchdog)` precede
-        // everything rather than missing it, and the empty-sequence sweep is explicitly
-        // supported — but only those two, because a hand-built injection with any other
-        // shape never fired on an empty writer either.
-        if !session.fired && !Self::is_empty_sequence_sentinel(injection, baseline) {
+        // no crash point fired in the run. There are two exceptions, and only two: on an
+        // empty sequence, `(0, None, PowerLoss)` and `(0, None, Watchdog)` precede
+        // everything rather than missing it; on any sequence, `(ops.len(), None, Watchdog)`
+        // follows everything rather than missing it — see `injections`' own documentation,
+        // and ADR 0042, for why that point is not enumerated but is still answerable. Any
+        // other shape never fired for the reason it looks like it should have: a bug in the
+        // hand-built injection.
+        if !session.fired
+            && !Self::is_empty_sequence_sentinel(injection, baseline)
+            && !Self::is_terminal_watchdog_sentinel(injection, baseline)
+        {
             return Err(HarnessError::CrashPointNeverFired { injection });
         }
 
@@ -842,6 +854,23 @@ impl Harness {
                 Interruption::PowerLoss | Interruption::Watchdog
             )
     }
+
+    /// Whether `injection` asks "what if the core reset after the last operation".
+    ///
+    /// [`injections`](crate::injections) lists no `Watchdog` point there: no operation
+    /// follows the last one for such a point to name. This is the answer instead. A reset
+    /// with nothing left to interrupt changes nothing this crate can observe, so the answer
+    /// is the fault-free run — [`injected`](Self::injected) skips the `fired` check for
+    /// this one exact shape and lets the ordinary trace comparison confirm it. See ADR 0042.
+    ///
+    /// Only this one `op` value is accepted, not every value past the end. A past-the-end
+    /// `op` is usually a caller's mistake, and `crates/waymaker-fault/tests/harness.rs`
+    /// holds a regression for exactly that having once been silently accepted.
+    fn is_terminal_watchdog_sentinel(injection: Injection, baseline: &Session) -> bool {
+        injection.op == baseline.ops.len()
+            && injection.progress == Progress::None
+            && injection.interruption == Interruption::Watchdog
+    }
 }
 
 /// A refusal to report crash points that were not really enumerated.
@@ -857,9 +886,10 @@ pub enum HarnessError {
         /// The crash point whose run diverged.
         injection: Injection,
     },
-    /// The armed crash point never fired: its `op` is past the end of the write sequence,
-    /// the writer did not reach it, or — on an empty write sequence — it is not one of
-    /// the two sentinels [`injections`](crate::injections) enumerates there.
+    /// The armed crash point never fired: its `op` is past the end of the write sequence
+    /// and it is not `(ops.len(), None, Watchdog)`, the writer did not reach it, or — on
+    /// an empty write sequence — it is not one of the two sentinels
+    /// [`injections`](crate::injections) enumerates there.
     ///
     /// A crash point that fired on nothing measured nothing, so it is refused rather than
     /// reported as a run. This is not [`HarnessError::WriterIsNotDeterministic`]:

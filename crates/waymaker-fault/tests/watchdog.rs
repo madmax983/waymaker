@@ -527,6 +527,68 @@ fn the_enumeration_has_no_duplicates_and_every_cause_in_it() {
     }
 }
 
+#[test]
+fn the_enumeration_has_no_point_after_the_last_operation() {
+    // Issue #87 and ADR 0042. No operation follows the last one, so no `Watchdog` point
+    // can name it. A caller who wants "the writer finished and then the core reset" reads
+    // the fault-free run instead — see the test below.
+    for ops in [
+        vec![Op::Barrier],
+        vec![Op::Program { offset: 0, len: 8 }, Op::Barrier],
+        vec![
+            Op::Erase {
+                offset: 0,
+                len: 256,
+            },
+            Op::Program { offset: 0, len: 8 },
+            Op::Barrier,
+        ],
+    ] {
+        let points = injections(&ops, geometry());
+        assert!(
+            points.iter().all(|point| point.op < ops.len()),
+            "a crash point named an operation past the end of {ops:?}"
+        );
+    }
+}
+
+#[test]
+fn a_watchdog_reset_after_the_last_operation_is_the_fault_free_run() {
+    // Issue #87 and ADR 0042. No enumerated point lets `barrier()?` return and the code
+    // after it run and *then* a reset happen — every `Watchdog` point on the last
+    // operation makes the call return an error first. This is the answer: the one
+    // hand-built point at that position is the fault-free run, tagged so a caller can
+    // tell it was asked for. A reset with nothing left to interrupt changes nothing this
+    // crate can observe.
+    let harness = Harness::new(geometry());
+    let baseline = match harness.run_fault_free(one_program) {
+        Ok(run) => run,
+        Err(error) => unreachable!("{error}"),
+    };
+
+    let terminal = run_one(
+        Injection {
+            op: baseline.ops().len(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+
+    assert_eq!(terminal.image(), baseline.image());
+    assert_eq!(terminal.ops(), baseline.ops());
+    assert_eq!(terminal.ledger(), baseline.ledger());
+    assert_eq!(
+        terminal.injection(),
+        Some(Injection {
+            op: baseline.ops().len(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        }),
+        "the terminal point is tagged, unlike the fault-free run's own `None`"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // 4. The real writer, at every watchdog reset
 // ---------------------------------------------------------------------------------------
