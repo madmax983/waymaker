@@ -10356,6 +10356,54 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_gated_recovery_decoy_does_not_save_a_renamed_clone_from_failing_closed() {
+        // Found by Codex review of this change (PR #143): `#[cfg(any())] struct Recovery;`
+        // never compiles — `any()` with no arguments is always false — but this module
+        // does not evaluate `cfg`, so the first version of this check read it as a real,
+        // non-`Clone` declaration and never looked at the `Clone` `Scan` exported under
+        // the same name beside it. Only an unconditional declaration may answer for
+        // `Recovery`, so this must fail closed exactly as an outright rename does.
+        let cfg_gated_decoy = recovery_source_with_struct(
+            "#[cfg(any())]\npub struct Recovery;\n#[derive(Clone, Debug, PartialEq, Eq)]\npub \
+             struct Scan;\npub use self::Scan as Recovery;\n",
+        );
+        let violations = check_recovery_surface(&cfg_gated_decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_shadowed_derive_alias_from_a_nested_module_does_not_hide_clone() {
+        // Found by Codex review of this change (PR #143): `collect_item_aliases` walks
+        // the whole file and does not track which module an alias belongs to, so
+        // `resolve_segments` returns whichever alias of one local name it meets first in
+        // file order. A `mod earlier { use Debug as Klon; }` appearing before the
+        // top-level `use core::clone::Clone as Klon;` used to resolve `#[derive(Klon)]`
+        // to `Debug` instead of `Clone` — and a nested module's `use` cannot really reach
+        // a struct outside it, so only top-level aliases may answer for a top-level
+        // struct's derive.
+        let shadowed = recovery_source_with_struct(concat!(
+            "mod earlier {\n",
+            "    use core::default::Default as Klon;\n",
+            "}\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&shadowed);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

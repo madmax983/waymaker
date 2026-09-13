@@ -407,17 +407,36 @@ fn collect_trait_implementors(
 /// would let the decoy answer "declared, not `Clone`" for a struct nobody exported by
 /// that name.
 ///
+/// Two more things follow from that same top-level-only reading, both found by review of
+/// this change (issue #77, PR #143). Only a top-level declaration with **no** `#[cfg(..)]`
+/// at all may answer for `name`: this module does not evaluate a `cfg`'s condition, so a
+/// `#[cfg(any())] struct Recovery;` that never compiles would otherwise sit beside a real,
+/// `Clone`-deriving type exported under that name and answer "declared, not `Clone`" for
+/// it. And the aliases a derive resolves through are collected at the top level only, not
+/// through the crate-wide `use`-alias walk every other function in this module shares: an
+/// inner module's `use X as Klon;`, read before a top-level `use core::clone::Clone as
+/// Klon;` because it happens to sit earlier in the file, would otherwise resolve
+/// `#[derive(Klon)]` to `X` instead — and a nested module cannot shadow a name in the
+/// scope the pinned struct is declared in, so reading only the top level is the correct
+/// resolution here, not merely a narrower one.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>, syn::Error> {
     let file = parse_rust(contents)?;
     let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    for item in &file.items {
+        if let syn::Item::Use(use_item) = item {
+            if !has_any_cfg(item_attrs(item)) {
+                collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
+            }
+        }
+    }
     let mut derives = Vec::new();
     let mut declared = false;
     for item in &file.items {
-        if has_cfg_test(item_attrs(item)) {
+        if has_any_cfg(item_attrs(item)) {
             continue;
         }
         if let syn::Item::Struct(found) = item {
@@ -430,6 +449,18 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
         }
     }
     Ok(declared.then_some(derives))
+}
+
+/// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition.
+///
+/// Broader than [`has_cfg_test`]: this module does not evaluate a `cfg`'s condition (see
+/// the module doc's residual limits), so an item behind *any* `cfg` — not only
+/// `cfg(test)` — might not be the declaration that ships, in either direction. A pin that
+/// has to answer for one specific, unconditional type needs an unconditional declaration
+/// to point at; reading past an unevaluated condition either way is the shape of mistake
+/// [`struct_derives`] exists to catch, not something it can also fall into.
+fn has_any_cfg(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("cfg"))
 }
 
 /// The trait names `meta` derives, resolved through `aliases`: from a plain
