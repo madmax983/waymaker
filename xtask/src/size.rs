@@ -1436,12 +1436,20 @@ impl SizeReport {
             }
             // The two table candidates are the ones ADR 0010's decision turns on — a 0 B
             // reading here is the one number the whole section exists to report, missing.
-            if table.is_some() && candidate.rodata == 0 {
-                shortfalls.push(BudgetShortfall::Unmeasurable {
+            // And the other three are bitwise loops with no table at all, so a nonzero
+            // reading there is not a smaller table, it is a wrong one.
+            match (table.is_some(), candidate.rodata) {
+                (true, 0) => shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
                         "the checksum candidate `{name}` measures 0 B of `.rodata`, but ADR 0010's table names a lookup table for it"
                     ),
-                });
+                }),
+                (false, rodata) if rodata != 0 => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures {rodata} B of `.rodata`, but it is a bitwise loop with no table at all"
+                    ),
+                }),
+                _ => {}
             }
         }
 
@@ -5214,6 +5222,23 @@ mod tests {
         let message = rendered(&report.shortfalls());
         assert!(message.contains("crc32c-nibble-table"), "{message}");
         assert!(message.contains("0 B of `.rodata`"), "{message}");
+    }
+
+    #[test]
+    fn a_bitwise_candidate_with_nonzero_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the table-candidate check only ran one way. A report
+        // that claimed `.rodata` for a bitwise loop — which has no table at all — must be
+        // refused just as loudly as one that dropped a real table's figure.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-bitwise" {
+                candidate.rodata = 64;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("no table at all"), "{message}");
     }
 
     #[test]
