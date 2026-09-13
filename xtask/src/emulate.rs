@@ -673,11 +673,11 @@ pub const STACK_MODULE: &str = "crates/waymaker-emu/src/stack.rs";
 /// is the reason either function needs it at all: a raw fill and a raw read, over the region
 /// between the linker's `_stack_end` and a stack-pointer reading taken before either runs.
 ///
-/// A name alone is not the pin: [`check_no_handwritten_unsafe`] also requires each to be
-/// declared exactly once — [`crate::source::declaration_count`], `effect-protocol`'s own
+/// A name alone is not the pin: `check_no_handwritten_unsafe` also requires each to be
+/// declared exactly once — `crate::source::declaration_count`, `effect-protocol`'s own
 /// guard against "a decoy above the real one is what a first-match scan reads" — and requires
 /// every `unsafe` inside to sit at that function body's own nesting depth,
-/// [`crate::source::nesting_depth_at`], the guard `effect-protocol` also carries against a
+/// `crate::source::nesting_depth_at`, the guard `effect-protocol` also carries against a
 /// nested item or a closure hiding a second, unrelated `unsafe`.
 pub const PERMITTED_UNSAFE_FUNCTIONS: &[&str] = &["paint", "high_water_mark"];
 
