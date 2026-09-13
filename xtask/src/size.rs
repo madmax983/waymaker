@@ -5024,6 +5024,20 @@ mod tests {
     }
 
     #[test]
+    fn measure_checksum_candidates_skips_the_build_for_a_checkout_that_predates_the_feature() {
+        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`
+        // — every checkout before issue #61, base-branch worktrees included. A caller that
+        // tried to build it anyway would fail here, because neither path names a real
+        // workspace: the guard has to answer `None` before `build_variant` is ever reached.
+        let bogus = Path::new("/does/not/exist/waymaker-size-checksum-candidates-fixture");
+        let result = measure_checksum_candidates(bogus, bogus, &probe_graph());
+        assert_eq!(
+            result.expect("a checkout with no `crc-candidates` feature must not fail"),
+            None
+        );
+    }
+
+    #[test]
     fn a_report_with_no_checksum_candidate_section_has_no_shortfall_for_it() {
         // A checkout whose probe declares no `crc-candidates` feature — every checkout
         // before issue #61 — says nothing about the section rather than failing over it,
