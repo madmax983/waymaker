@@ -1714,9 +1714,12 @@ Stated so that nobody mistakes silence for coverage:
   alongside the three layers, so it is not the engine's share alone. Nor is it exact: painting
   the stack and reading back a high-water mark is a lower bound, not a ceiling — a frame can
   reserve bytes it never writes, and a byte like that still reads as the paint pattern
-  afterwards, so a run can use more than it reports. The guard margin still guarantees a
-  floor, never painted or scanned, so the figure is never *below* what a run actually used by
-  more than that margin. The two machines are not required to agree about the figure, unlike
+  afterwards, so a run can use more than it reports — by an amount the guard margin does
+  nothing to bound, since an unwritten reservation can sit anywhere below the scan's own
+  ceiling. What the guard margin guarantees is narrower: it is never painted or scanned, so
+  the reported figure itself can never read below the margin's own width, whatever a run
+  actually did. That is a floor on the *number*, not a ceiling on how far it can underestimate
+  real usage. The two machines are not required to agree about the figure, unlike
   their census: different cores compile the same source into different instructions. A decoy
   `stack.rs` reproducing the crate-relative path in a different, deeper directory is still
   read as the permitted module — narrower than a bare-file-name suffix would allow, not
