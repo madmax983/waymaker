@@ -105,6 +105,15 @@ enum Flaw {
     /// scribbles on any validation failure — so it can only be caught by a case that probes
     /// an offset misalignment specifically and then checks what it left behind.
     MisalignedProgramOffsetScribblesBeforeRefusing,
+    /// A misaligned offset is rounded *up* to the next unit and programmed there, before
+    /// refusing.
+    ///
+    /// Distinct from [`Flaw::MisalignedProgramOffsetScribblesBeforeRefusing`], which
+    /// scribbles at the offset the probe actually named: this rounds first, so the damage
+    /// lands up to half a unit past `base + unit` — inside the *next* block on a device
+    /// whose erase block is a single program unit, which the witness at the named offset
+    /// alone cannot see.
+    MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing,
     /// A program of more than one unit corrupts the program unit *before* the one it named.
     ///
     /// Distinct from [`Flaw::ProgramCorruptsThePrecedingUnit`], which fires on *every*
@@ -327,6 +336,15 @@ impl StableStorage for Broken {
                             && error == GeometryError::MisalignedOffset)
                     {
                         self.apply(offset, src);
+                    }
+                    if self.flaw == Flaw::MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing
+                        && error == GeometryError::MisalignedOffset
+                    {
+                        let unit = self.geometry.program_size();
+                        if unit > 0 {
+                            let rounded = offset.div_ceil(unit).saturating_mul(unit);
+                            self.apply(rounded, src);
+                        }
                     }
                     if self.flaw == Flaw::StraddlingMutationWipesTheValidPrefix
                         && error == GeometryError::OutOfBounds
@@ -671,6 +689,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         Failure::RefusedOperationTouchedMedia,
     ),
     (
+        Flaw::MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing,
+        CaseId::MisalignedProgramIsRefused,
+        Failure::RefusedOperationTouchedMedia,
+    ),
+    (
         Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
         CaseId::MultiUnitProgramIsLegal,
         Failure::MediaOutsideTheOperationChanged,
@@ -811,6 +834,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         Flaw::None
         | Flaw::NoValidation
         | Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
+        | Flaw::MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing
         | Flaw::PastCapacityIsClamped
         | Flaw::BoundsCheckedAtTheStartOnly
         | Flaw::WanderingGeometry
@@ -914,7 +938,8 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::RefusedProgramTouchesNoMedia,
             Failure::LegalOperationRefused,
         )),
-        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing => Some((
+        Flaw::MisalignedProgramOffsetScribblesBeforeRefusing
+        | Flaw::MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing => Some((
             CaseId::MisalignedProgramIsRefused,
             Failure::RefusedOperationTouchedMedia,
         )),
@@ -966,6 +991,7 @@ const ALL: &[Flaw] = &[
     Flaw::ProgramAlwaysFails,
     Flaw::EraseAlwaysFails,
     Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
+    Flaw::MisalignedProgramOffsetRoundsUpAndScribblesBeforeRefusing,
     Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
     Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
     Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock,

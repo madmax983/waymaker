@@ -416,6 +416,14 @@ impl<S: StableStorage> Run<'_, S> {
         if !self.program_a_unit(case, self.block_a()) {
             return;
         }
+        // A witness in the following block too, erased rather than patterned: both illegal
+        // probes name a range that reaches half a unit past `base + unit`, which is inside
+        // the *next* block on a device whose erase block is a single program unit. An
+        // adapter that rounds the misaligned offset up and programs there before refusing
+        // corrupts media this case would otherwise never look at.
+        if !self.erase_block(case, self.block_b()) {
+            return;
+        }
         let half = usize::try_from(unit >> 1).unwrap_or(1);
         let base = self.block_a();
         self.fill_source(self.unit + half, 0x00);
@@ -432,12 +440,25 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::IllegalOperationAccepted));
             return;
         }
-        let outcome = match self.media_matches(base, unit, |position| {
+        let Some(witness_ok) = self.media_matches(base, unit, |position| {
             pattern(usize::try_from(position).unwrap_or(0))
-        }) {
-            Some(true) => Outcome::Passed,
-            Some(false) => Outcome::Failed(Failure::RefusedOperationTouchedMedia),
-            None => Outcome::Failed(Failure::LegalOperationRefused),
+        }) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        // The program unit right after the witnessed one: inside `block_a` on a device
+        // whose block holds more than one unit, and `block_b`'s own first unit — already
+        // erased by the call above — on one whose block is a single unit. Either way it is
+        // erased before the probes run, and it is the unit either illegal range actually
+        // reaches.
+        let Some(neighbour_ok) = self.media_is_erased(base + unit, unit) else {
+            self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+            return;
+        };
+        let outcome = if witness_ok && neighbour_ok {
+            Outcome::Passed
+        } else {
+            Outcome::Failed(Failure::RefusedOperationTouchedMedia)
         };
         self.record(case, outcome);
     }
