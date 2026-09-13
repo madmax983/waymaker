@@ -90,6 +90,21 @@ pub const ENGINE_HEAP_BLOCKS: u64 = 0;
 /// where the file is the only thing that still names the crate that wrote the code.
 pub const FULL_PATHS: &str = "--fullpath-after=";
 
+/// How many times a workload's callgrind run is repeated when it comes back attributing
+/// nothing to any workspace crate while the workload itself completed real units.
+///
+/// That combination is a contradiction rather than a finding: `units` is read from the
+/// workload's own `println!`, reached only after code in the engine crates ran (an effect
+/// scheduled, a case run), so `cost.engine == 0` alongside `units > 0` cannot be the engine
+/// genuinely doing nothing — it is this run's callgrind trace failing to carry attributable
+/// debug info for reasons this gate does not model (a corrupted or incomplete symbol read
+/// under an otherwise successful, self-consistent `Ir` total). One retry re-runs the tool
+/// rather than the workload — the workload's own determinism is already checked against
+/// DHAT's unit count — and a persistent zero across every attempt still fails exactly as
+/// before: this does not soften the gate, it only stops a single bad trace from being read
+/// as the answer.
+const ATTRIBUTION_RETRIES: u32 = 2;
+
 /// Where the JSON report is written.
 pub const REPORT_PATH: &str = "target/waymaker-profile.json";
 
@@ -971,8 +986,46 @@ fn build_workload(root: &Path) -> Result<PathBuf, ProfileError> {
     }
 }
 
-/// One workload, under both tools.
+/// One workload, under both tools, retried when the answer contradicts the workload's own
+/// report of what it did.
+///
+/// See [`ATTRIBUTION_RETRIES`] for what "contradicts" means and why a retry does not weaken
+/// this gate: every attempt still has to pass the same determinism and unit checks, and a
+/// [`WorkloadProfile`] that comes back attributing nothing on the last attempt is returned
+/// exactly as it always was, for [`WorkloadProfile::verdict`] to fail on as `Unmeasurable`.
 fn measure_workload(
+    binary: &Path,
+    output: &Path,
+    workload: Workload,
+    workspace: &[WorkspaceCrate],
+) -> Result<WorkloadProfile, ProfileError> {
+    let mut profile = measure_workload_once(binary, output, workload, workspace)?;
+    let mut attempt = 0;
+    while should_retry_attribution(&profile, attempt) {
+        attempt += 1;
+        eprintln!(
+            "{}: callgrind attributed nothing to any workspace crate over {} completed {}(s); retrying the tool run ({attempt}/{ATTRIBUTION_RETRIES})",
+            workload.name, profile.units, workload.unit
+        );
+        profile = measure_workload_once(binary, output, workload, workspace)?;
+    }
+    Ok(profile)
+}
+
+/// Whether [`measure_workload`] should run the tools again for this row.
+///
+/// Only the contradiction [`ATTRIBUTION_RETRIES`] names — real units completed, nothing
+/// attributed — and only while attempts remain. A workload that completed no units, or one
+/// that already attributed something to the engine, is never retried: the first is
+/// [`WorkloadProfile::verdict`]'s own `Unmeasurable` to raise, and the second is a real
+/// answer, however small.
+#[must_use]
+const fn should_retry_attribution(profile: &WorkloadProfile, attempt: u32) -> bool {
+    profile.units > 0 && profile.cost.engine == 0 && attempt < ATTRIBUTION_RETRIES
+}
+
+/// One attempt at [`measure_workload`], with no retry of its own.
+fn measure_workload_once(
     binary: &Path,
     output: &Path,
     workload: Workload,
@@ -1937,5 +1990,40 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         }
         assert!(rendered.contains("no cycle count on any part"));
         assert!(report.shortfall_report().is_none());
+    }
+
+    #[test]
+    fn attribution_is_retried_only_for_the_contradiction_it_names() {
+        let profile = |units, engine| WorkloadProfile {
+            workload: "journal".to_owned(),
+            what: String::new(),
+            unit: "effect".to_owned(),
+            units,
+            reached: BTreeSet::new(),
+            heap: Heap::default(),
+            cost: Cost {
+                engine,
+                harness: 0,
+                runtime: 0,
+            },
+        };
+
+        // Real units, nothing attributed: retried up to the cap, then not.
+        assert!(should_retry_attribution(&profile(8, 0), 0));
+        assert!(should_retry_attribution(
+            &profile(8, 0),
+            ATTRIBUTION_RETRIES - 1
+        ));
+        assert!(!should_retry_attribution(
+            &profile(8, 0),
+            ATTRIBUTION_RETRIES
+        ));
+
+        // No units completed is `Unmeasurable`'s own case, not a contradiction this retries.
+        assert!(!should_retry_attribution(&profile(0, 0), 0));
+
+        // Any nonzero engine attribution is a real answer, however small, and is never
+        // retried away.
+        assert!(!should_retry_attribution(&profile(8, 1), 0));
     }
 }
