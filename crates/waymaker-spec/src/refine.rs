@@ -15,25 +15,28 @@
 //! 3. Does [`waymaker_fault::verify_recovery`] accept it? The oracle and the model are two
 //!    independent judgements of the same run, and they have to agree.
 //!
-//! # What is deliberately not abstracted
+//! # Banks
 //!
-//! Banks. Rung 0.1 has no two-bank adapter to drive, so [`Observation`] carries records and
-//! dispatched effects and nothing else, and the fourth guarantee is discharged against the
-//! model alone. That is a gap, it is owed at rung 0.2 where the banks arrive, and
-//! [`crate::obligation`] says so in a table rather than leaving it to be noticed.
+//! Issue [#22](https://github.com/madmax983/waymaker/issues/22) added the real two-bank
+//! adapter, `waymaker_flash::bank`, and issue
+//! [#73](https://github.com/madmax983/waymaker/issues/73) is this module abstracting it.
+//! [`bank_after_erase`] and [`bank_after_seal`] fold one crashed run's write sequence into a
+//! [`Bank`], and a caller with no bank to report — a record-only writer — passes
+//! `[Bank::Erased; BANKS]` and `false` into [`Journal::reconstructed`], matching this crate's
+//! behaviour before this issue.
 
-use waymaker_fault::{Durability, Ledger, RecordId};
+use waymaker_fault::{Durability, Injection, Ledger, Progress, RecordId, Run};
 
-use crate::model::{Journal, OnMedia, Record, Role};
+use crate::model::{BANKS, Bank, Journal, OnMedia, Record, Role};
 
 /// The part of a ghost state a crash harness can report.
 ///
 /// Not the whole state: [`Journal::powered`] is a fact about the run rather than about the
-/// media, and the banks are rung 0.2's. Comparing observations rather than states is what
-/// lets a real run be matched against the model without inventing the dimensions the harness
-/// has no answer for — the same reason [`waymaker_fault::Recovery`] makes its extra
-/// dimensions optional instead of defaulting them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// media. Comparing observations rather than states is what lets a real run be matched
+/// against the model without inventing the dimensions the harness has no answer for — the
+/// same reason [`waymaker_fault::Recovery`] makes its extra dimensions optional instead of
+/// defaulting them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Observation {
     /// Each record in declaration order, as `(id, role, state, torn)`.
     ///
@@ -43,6 +46,25 @@ pub struct Observation {
     pub records: Vec<(RecordId, Role, Durability, bool)>,
     /// The schedule records of effects the run really handed to the world.
     pub dispatched: Vec<RecordId>,
+    /// Both banks, read off the crashed run.
+    ///
+    /// `[Bank::Erased; BANKS]` for a writer that never touches a bank — see the module docs.
+    pub banks: [Bank; BANKS],
+    /// Whether either bank has *ever* carried a durable seal, over this run's whole history.
+    ///
+    /// `false` for a writer that never touches a bank.
+    pub sealed_once: bool,
+}
+
+impl Default for Observation {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            dispatched: Vec::new(),
+            banks: [Bank::Erased; BANKS],
+            sealed_once: false,
+        }
+    }
 }
 
 impl Journal {
@@ -63,26 +85,27 @@ impl Journal {
                 })
                 .collect(),
             dispatched: self.dispatched().to_vec(),
+            banks: *self.banks(),
+            sealed_once: self.has_sealed(),
         }
     }
 
     /// A state carrying `observation` and nothing else, for asking the model what a real run
     /// should have recovered.
     ///
-    /// Not a way into the state space: the power is off, both banks are erased, and nothing
-    /// here checks that the result is reachable. `tests/refinement.rs` does that separately,
-    /// against [`crate::explore`](mod@crate::explore)'s closed set, and it is the only reason building a state
-    /// outside [`Journal::step`] is legitimate at all.
+    /// Not a way into the state space: the power is off, and nothing here checks that the
+    /// result is reachable. `tests/refinement.rs` does that separately, against
+    /// [`crate::explore`](mod@crate::explore)'s closed set, and it is the only reason building
+    /// a state outside [`Journal::step`] is legitimate at all.
     ///
-    /// # The bank dimension is absent, and that makes one guarantee vacuous
+    /// # A caller with no bank to report answers the fourth guarantee vacuously
     ///
-    /// A reconstructed state has both banks erased and has never sealed, so
-    /// [`crate::invariant::Invariant::SingleAuthority`] holds of it *by construction* —
-    /// [`crate::invariant::check`] judges three guarantees here and reports the fourth as
-    /// satisfied without looking at anything. `tests/refinement.rs` asserts that in so many
-    /// words rather than leaving rung 0.2's bank adapter to discover it, and
-    /// [`crate::obligation`]'s `single-authority` row says the same thing in the place a
-    /// reader looks for what is owed.
+    /// `observation.banks` is `[Bank::Erased; BANKS]` for a record-only writer, so
+    /// [`crate::invariant::Invariant::SingleAuthority`] holds of the result *by construction*
+    /// — [`crate::invariant::check`] judges three guarantees over such a state and reports the
+    /// fourth as satisfied without looking at anything. A caller that read real banks off a
+    /// crashed device — see [`bank_after_erase`] and [`bank_after_seal`] — does not have this
+    /// gap; `tests/refinement.rs` is where each kind of writer is driven.
     ///
     /// # Errors
     ///
@@ -110,7 +133,12 @@ impl Journal {
                 acknowledged: *state == Durability::Acknowledged,
             });
         }
-        Ok(Self::from_parts(records, observation.dispatched.clone()))
+        Ok(Self::from_parts(
+            records,
+            observation.dispatched.clone(),
+            observation.banks,
+            observation.sealed_once,
+        ))
     }
 }
 
@@ -160,6 +188,9 @@ impl core::error::Error for Impossible {}
 /// rather than what media says about it, for the same reason
 /// [`waymaker_fault::Recovery::dispatched`] is: an oracle that only admitted an effect once
 /// its intent was durable could not describe the violation it exists to catch.
+///
+/// Reports no bank: a caller with one to report builds an [`Observation`] directly and folds
+/// [`bank_after_erase`] and [`bank_after_seal`] into its `banks` field instead.
 pub fn abstraction(
     ledger: &Ledger,
     dispatched: &[RecordId],
@@ -174,5 +205,78 @@ pub fn abstraction(
             .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
             .collect(),
         dispatched: sorted,
+        ..Observation::default()
+    }
+}
+
+/// Whether the call recorded at `run.ops()[op]` changed any cell of media at all.
+///
+/// `false` when `op` is past the end of `run.ops()` — the call was never issued — or when it
+/// is the one [`Run::injection`] names at [`Progress::None`].
+///
+/// # Why this and not "did the call return `Ok`"
+///
+/// `waymaker-fault`'s writes land synchronously, so bytes on media never depend on whether the
+/// caller's own `barrier` afterwards ran, or even on whether the call itself returned `Ok`: a
+/// watchdog reset finishes the program unit or erase block in flight and still answers `Err`.
+/// So a bank's state after a mutation is decided by how much of it reached media, which the
+/// caller reads back and passes to [`bank_after_erase`] or [`bank_after_seal`] — not by this
+/// module trying to infer "committed" from [`Run::injection`] alone, which cannot see a
+/// watchdog's rounding.
+#[must_use]
+pub fn call_touched(run: &Run, op: usize) -> bool {
+    if op >= run.ops().len() {
+        return false;
+    }
+    !matches!(
+        run.injection(),
+        Some(Injection { op: at, progress: Progress::None, .. }) if at == op
+    )
+}
+
+/// The bank state after the erase recorded at `run.ops()[op]`, given `prior`.
+///
+/// [`Bank::Erased`] if `erased`, [`Bank::Erasing`] if the call touched media without leaving
+/// it erased, and `prior` unchanged if it never touched media at all — which is also this
+/// run's answer for an erase never issued, since `op` is then past the end of `run.ops()`.
+///
+/// `erased` is the caller's own read of the bank after the run: whether the region is, in
+/// fact, fully erased. This module does not read bytes, for the reason [`call_touched`]
+/// gives.
+#[must_use]
+pub fn bank_after_erase(prior: Bank, run: &Run, op: usize, erased: bool) -> Bank {
+    if !call_touched(run, op) {
+        return prior;
+    }
+    if erased { Bank::Erased } else { Bank::Erasing }
+}
+
+/// The bank state after the seal program recorded at `run.ops()[op]`, given `prior`.
+///
+/// [`Bank::Sealed`] at `generation` if `sealed`, [`Bank::Sealing`] at `generation` if the call
+/// touched media without that, and `prior` unchanged if it never touched media at all.
+///
+/// `sealed` is the caller's own read of the bank after the run: whether its header and seal
+/// decode together at `generation` — see `waymaker_flash::bank::sealed_generation`. This
+/// module does not read bytes, for the reason [`call_touched`] gives.
+///
+/// # `generation` is the model's number, not `waymaker_flash::bank::Generation`'s
+///
+/// [`crate::model::Journal::step`]'s `begin_seal` numbers a device's first-ever seal `1`, so
+/// that a bank with no seal (`authoritative_generation() == None`) and a bank the model has
+/// not yet distinguished from one both read as "nothing sealed here". The real
+/// `Generation::FIRST` is `0`, because the firmware has a `Bank`-shaped `None` for that case
+/// and does not need the reservation. A caller passes `real_generation.0 + 1` here, and the
+/// two schemes agree from there: both increment by one per seal, so the shift is exact at
+/// every later generation too.
+#[must_use]
+pub fn bank_after_seal(prior: Bank, run: &Run, op: usize, generation: u32, sealed: bool) -> Bank {
+    if !call_touched(run, op) {
+        return prior;
+    }
+    if sealed {
+        Bank::Sealed(generation)
+    } else {
+        Bank::Sealing(generation)
     }
 }

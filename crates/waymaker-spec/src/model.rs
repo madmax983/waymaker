@@ -948,23 +948,31 @@ impl Journal {
         Ok(())
     }
 
-    /// The record and dispatch fields of a state, built without going through
-    /// [`step`](Self::step).
+    /// A state built without going through [`step`](Self::step).
     ///
     /// The abstraction function's codomain, and the only reason it is allowed to exist is
     /// that `tests/refinement.rs` requires every state it builds to match a state the search
     /// really reached. Crate-private so that no test can reach for it as a shortcut past the
     /// preconditions.
-    pub(crate) fn from_parts(records: Vec<Record>, dispatched: Vec<RecordId>) -> Self {
+    ///
+    /// `banks` and `sealed_once` are the caller's: a record-only abstraction passes
+    /// `[Bank::Erased; BANKS]` and `false`, matching this run before rung 0.2's bank refinement
+    /// existed; a bank-aware one passes what it read off a real crashed device.
+    pub(crate) fn from_parts(
+        records: Vec<Record>,
+        dispatched: Vec<RecordId>,
+        banks: [Bank; BANKS],
+        sealed_once: bool,
+    ) -> Self {
         let mut sorted = dispatched;
         sorted.sort_unstable();
         sorted.dedup();
         Self {
             records,
-            banks: [Bank::Erased; BANKS],
+            banks,
             dispatched: sorted,
             powered: false,
-            sealed_once: false,
+            sealed_once,
         }
     }
 
