@@ -769,6 +769,31 @@ fn decodes_sealed_at(image: &[u8], id: FlashBankId, generation: Generation) -> b
     bank::sealed_generation(header, seal) == Some(generation)
 }
 
+/// Refines `known` against what `id`'s region shows right now, for a fold that may end up
+/// reading it back as `prior`.
+///
+/// `known` is [`Bank::Erased`] at two points: before anything has happened to `id` at all,
+/// and right after [`bank_after_erase`] reports its erase committed. Both are followed by a
+/// header write with no checkpoint of its own — `install`'s and `swap_writer`'s header writes
+/// are not modelled, which is `obligation.rs`'s `single-authority` row's "banks hold no
+/// records" gap — so a crash that tears the header before the matching seal write is even
+/// reached leaves the *next* fold reading `known` as `prior`, unrefined. Claiming
+/// [`Bank::Erased`] regardless would be wrong the moment that header write left anything
+/// behind: [`Bank::Erased`] promises "nothing half-gone", and a torn header is exactly
+/// half-gone. This reads the region back and downgrades to [`Bank::Erasing`] when it no
+/// longer reads erased — not an erase, but the closest the model has: the same "not
+/// bootable, not safely writable" it already uses [`Bank::Erasing`] for.
+///
+/// Any other `known` is returned unchanged: [`Bank::Erasing`], [`Bank::Sealing`] and
+/// [`Bank::Sealed`] each already mean something a header write cannot take back by itself,
+/// and `swap_writer` never writes a header over a bank it has not just erased.
+fn ground_prior(image: &[u8], id: FlashBankId, known: Bank) -> Bank {
+    match known {
+        Bank::Erased if !is_erased(image, id) => Bank::Erasing,
+        other => other,
+    }
+}
+
 /// Whether `id`'s whole bank — header and seal both — is fully erased in `image`.
 ///
 /// Both regions, not the header alone: an erase interrupted after clearing the header but
@@ -834,7 +859,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
 
     let stale_sealed = decodes_sealed_at(run.image(), FlashBankId::B, STALE);
     let mut b = bank_after_seal(
-        Bank::Erased,
+        ground_prior(run.image(), FlashBankId::B, Bank::Erased),
         run,
         OP_SEAL_B_STALE,
         model_generation(STALE),
@@ -845,7 +870,7 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
 
     let current_sealed = decodes_sealed_at(run.image(), FlashBankId::A, CURRENT);
     let a_seal = bank_after_seal(
-        Bank::Erased,
+        ground_prior(run.image(), FlashBankId::A, Bank::Erased),
         run,
         OP_SEAL_A_CURRENT,
         model_generation(CURRENT),
@@ -859,7 +884,13 @@ fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
     assert_erase_matches_ground_truth(run, OP_ERASE_B, b, erased);
 
     let new_sealed = decodes_sealed_at(run.image(), FlashBankId::B, NEW);
-    b = bank_after_seal(b, run, OP_SEAL_B_NEW, model_generation(NEW), new_sealed);
+    b = bank_after_seal(
+        ground_prior(run.image(), FlashBankId::B, b),
+        run,
+        OP_SEAL_B_NEW,
+        model_generation(NEW),
+        new_sealed,
+    );
     assert_seal_matches_ground_truth(run, OP_SEAL_B_NEW, b, new_sealed);
     sealed_once |= matches!(b, Bank::Sealed(_));
 
