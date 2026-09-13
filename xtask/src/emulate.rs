@@ -1154,18 +1154,22 @@ pub mod tests_support {
         }]
     }
 
-    /// The literal, shipped `stack.rs` — not a caricature of its shape, the file itself, read
-    /// at compile time. A hand-written stand-in would drift from the real module the day
-    /// either changed without the other, and this is the one test in the suite that must
-    /// answer for the actual file the `emulate` stage links.
+    /// The literal, shipped `stack.rs`.
+    ///
+    /// Not a caricature of its shape — the file itself, read at compile time. A hand-written
+    /// stand-in would drift from the real module the day either changed without the other,
+    /// and this is the one test in the suite that must answer for the actual file the
+    /// `emulate` stage links.
     #[must_use]
     pub fn real_stack_module() -> String {
         include_str!("../../crates/waymaker-emu/src/stack.rs").to_owned()
     }
 
-    /// A minimal `stack.rs` carrying exactly the shape [`super::PERMITTED_UNSAFE_FUNCTIONS`]
-    /// and the linker-symbol block permit, for tests that construct a decoy beside it rather
-    /// than testing the shape itself — [`real_stack_module`] already does that.
+    /// A minimal `stack.rs` carrying exactly the shape this rule permits.
+    ///
+    /// [`super::PERMITTED_UNSAFE_FUNCTIONS`] and the linker-symbol block, for tests that
+    /// construct a decoy beside it rather than testing the shape itself —
+    /// [`real_stack_module`] already does that.
     #[must_use]
     pub fn clean_stack_module() -> String {
         "unsafe extern \"C\" {\n    static _stack_end: u8;\n}\n\
