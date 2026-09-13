@@ -14190,6 +14190,27 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_two_level_plain_directory_split_test_module_is_excluded() {
+        // Issue #59. `crc.rs` declares `mod table;`. `table.rs` declares
+        // `#[cfg(test)] mod tests;`. The gate reads from the child file, not
+        // from the root. The old code read the gate from the root file only.
+        // It did not see the child's test module. It reported the test
+        // fixture as a shipped table.
+        let parent = format!("{}\nmod table;\n", tests_support::clean_checksum_module());
+        let table = "//! Nibble tables.\n#[cfg(test)]\nmod tests;\n";
+        let table_tests = "//! Table tests.\nconst FIXTURE: [u8; 4] = [0; 4];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/table.rs", table),
+            layer("waymaker-flash/src/crc/table/tests.rs", table_tests),
+        ]);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("FIXTURE")),
+            "a test-only file two directories deep was scanned as production: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_missing_checksum_module_fails_closed() {
         let violations = check_integrity_check(&[]);
         assert_eq!(violations.len(), 1, "{violations:?}");
