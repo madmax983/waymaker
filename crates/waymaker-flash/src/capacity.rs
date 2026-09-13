@@ -219,10 +219,10 @@ pub enum CapacityError {
     WrongGranularity,
     /// The journal was priced against a different bank size than the reserve declares.
     ///
-    /// Issue [#84](https://github.com/madmax983/waymaker/issues/84) draws a line this crate's
-    /// three other `WrongDevice` variants sit on the other side of: those refuse a storage
-    /// *instance* that changed between two calls of one protocol, held to it by a borrow
-    /// rather than a comparison. This one refuses no instance at all — [`Reserve::for_layout`]
+    /// Issue [#84](https://github.com/madmax983/waymaker/issues/84) treats this variant
+    /// differently from this crate's three other `WrongDevice` variants: those refuse a
+    /// storage *instance* that changed between two calls of one protocol, held to it by a
+    /// borrow rather than a comparison. This one refuses no instance at all — [`Reserve::for_layout`]
     /// and [`Reserved::over`] take no `&mut S` argument between them, only a [`Journal`] and
     /// derived numbers, so there is no second device a caller could substitute here. What it
     /// catches is two *values* that disagree: the

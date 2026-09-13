@@ -1171,6 +1171,18 @@ Stated so that nobody mistakes silence for coverage:
   is the check working rather than the gap issue #84 named.
   [ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
   says which of the two shapes each `WrongDevice` variant is.
+- **That the device handed to the *first* call of a new protocol invocation is the right
+  one.** `Journal::stage`, `Recovery::new`/`with_integrity` and `Swap::prepare` are each
+  still the one place a caller introduces a device, and that introduction is still a
+  `Geometry` comparison — the same check issue #84 opens with, because there is no earlier
+  borrow yet to hold a first call to. Issue #84's fix ties one record's three steps, one
+  scan's many reads, and one swap's seven steps to a single device each; it does not tie one
+  journal's *many separate records* to one device, so a caller who calls `Journal::stage`
+  once per record over a journal's life can still hand two different same-model chips to two
+  separate calls with no refusal. That is a precondition on the caller, the same standing
+  `Swap::beginning`'s two unverified arguments already have, and
+  [ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  is where it is argued rather than implied closed.
 - **That a run id a swap installs is one the device has never used.** `SwapError::RunReused`
   compares the next run against the one being retired, which is the adjacent mistake and not
   a uniqueness check: a run id from any *earlier* run passes it, and the `(RunId, EffectSeq)`
@@ -2805,8 +2817,8 @@ re-accepting it at every step: `Journal::stage`, `Recovery::new`/`with_integrity
 `Staged`, `Sealable`, `Recovery` and `swap`'s own `Prepared`/`Staged`/`Sealable`/`Installed`
 all carry that borrow onward. A caller who wants to finish a record, a scan, or a swap on a
 second device does not meet `AppendError::WrongDevice` or `SwapStepError::WrongDevice` at
-run time — the call is not one the type lets it write, which a `compile_fail,E0061` doctest
-in each module proves of the code as it stands. `capacity`'s `WrongDevice` stays a value
+run time — the call is not one the type lets a caller write, which a `compile_fail,E0061`
+doctest in each module proves of the code as it stands. `capacity`'s `WrongDevice` stays a value
 comparison rather than moving to a borrow, and correctly: neither of its two entry points
 takes a `storage` argument at all, so there is no device instance there to bind, only a bank
 size and a program granularity that two devices of one model are right to agree on. Every

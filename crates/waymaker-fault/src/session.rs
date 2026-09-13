@@ -135,11 +135,11 @@ impl Session {
 
     /// How many operations this session has recorded so far.
     ///
-    /// Paired with [`begin_record`](Self::begin_record) and
-    /// [`end_record`](Self::end_record) at two points a caller can still reach `&mut Self`
-    /// from, this is what lets [`mark_operations`](Self::mark_operations) declare a record
-    /// after the fact — for a writer whose middle steps hold the device by borrow, such as
-    /// `waymaker_flash::append::Sealable`, and so cannot be told to open or close one live.
+    /// A caller reads this at two points where it can still reach `&mut Self` — before and
+    /// after a writer's middle steps, which for a typestate like
+    /// `waymaker_flash::append::Sealable` hold the device by borrow and take no `&mut Self`
+    /// of their own. [`mark_operations`](Self::mark_operations) is what turns the two counts
+    /// into a record declared after the fact, rather than opened and closed live.
     #[must_use]
     pub fn operations(&self) -> usize {
         self.ops.len()
@@ -148,10 +148,10 @@ impl Session {
     /// Declares that operations `range` belong to `id`, after they have already happened.
     ///
     /// [`begin_record`](Self::begin_record) and [`end_record`](Self::end_record) bracket a
-    /// record live, which needs `&mut Self` for the whole span — a typestate that carries
-    /// the device across several calls, such as `waymaker_flash::append::Sealable`, holds
-    /// exactly that borrow instead and leaves none for a caller to bracket with. This is the
-    /// same declaration made afterwards, from a range whose ends the caller counted with
+    /// record live, which needs `&mut Self` for the whole span. A typestate that carries the
+    /// device across several calls, such as `waymaker_flash::append::Sealable`, holds that
+    /// borrow itself instead, leaving no `&mut Self` for the caller to bracket with. This is
+    /// the same declaration made afterwards, from a range whose ends the caller counted with
     /// [`operations`](Self::operations) before and after the span.
     ///
     /// # Preconditions

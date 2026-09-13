@@ -479,7 +479,7 @@ pub enum RecoveryError<E> {
     /// begin with — a region carved from one [`Geometry`] hand-carried to `new` or
     /// `with_integrity` alongside a different one. Every bound this module keeps — that a
     /// read is aligned and inside the region, that a frame's padded stride lands where a
-    /// record may be written — was established against the region's own `Geometry`, and a
+    /// record may be written — was established against the region's own `Geometry`. A
     /// mismatched device answering that arithmetic is silent in the direction that matters:
     /// a region built where the program unit is one byte and walked on a device that
     /// programs eight reads perfectly well, reports a clean end, and hands back an append
@@ -490,7 +490,7 @@ pub enum RecoveryError<E> {
     /// first fallible point this mismatch can be reported at is here. Four integer
     /// comparisons against an anti-bricking guarantee, paid on every record rather than
     /// once, because a constructor that could fail would cost every caller a `Result` for a
-    /// mistake this one can only ever have been made once.
+    /// mismatch that, once `storage` is bound by a borrow, can only ever happen once.
     WrongDevice,
     /// The caller's page cannot hold what the next step has to stage.
     ///

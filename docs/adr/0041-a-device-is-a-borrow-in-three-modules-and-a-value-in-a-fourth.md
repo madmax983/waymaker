@@ -69,7 +69,8 @@ once, for the whole scan — but a `Recovery` can still be *constructed* from a 
 device that never matched to begin with, and the first fallible point that mismatch can be
 reported at is the first call to `next`. The check stays a per-step comparison rather than
 moving to a fallible constructor, because a constructor that could fail would cost every
-caller a `Result` for a mistake a borrowed device can now only ever have made once.
+caller a `Result` for a mismatch that, once `storage` is bound by a borrow, can only ever
+happen once.
 
 `capacity::CapacityError::WrongDevice` is not moved to a borrow, because it is not a
 device-instance check at all. `Reserve::for_layout` and `Reserved::over` take no `storage`
@@ -110,8 +111,8 @@ device has exactly one owner across the whole boot rather than two that would ha
 move to the new one. Two of `waymaker-fault`'s writers needed to interleave host-side
 bookkeeping — `Session::begin_record`/`end_record`, marking which operations belong to which
 record for the crash oracle — at a point in the protocol a borrowed `Sealable` now owns
-exclusively. `Session::operations()` and `Session::mark_operations()` are the fix: the
-bracket a writer used to open live, immediately before a fallible step, it now declares
+exclusively. `Session::operations()` and `Session::mark_operations()` are the fix: what a
+writer used to bracket live, opening it immediately before a fallible step, is now declared
 *before that step is attempted*, from a range computed off the pinned, fixed operation
 counts each step is known to spend. Declaring it only after the step succeeds was tried
 first and is wrong — a crash inside the step then leaves the declaration unmade in the
@@ -139,6 +140,21 @@ it does not touch the two arguments `Swap::beginning` still cannot verify (a sta
 a reused `run`) or the run-id uniqueness `SwapError::RunReused` still cannot make global —
 both remain preconditions on a future dispatcher, recorded in CLAUDE.md's "what is not
 checked" exactly as before.
+
+**What this closes is *within* one protocol invocation, and says nothing about the next
+one.** `Journal::stage`, `Recovery::new`/`with_integrity`, and `Swap::prepare` are still each
+the one place a caller introduces a device to a protocol, and that first introduction is
+still a `Geometry` comparison — the same check issue #84 opens with, because there is no
+earlier borrow yet to hold a first call to. A caller who calls `Journal::stage` once per
+record, across many records over a journal's life, can still hand a *different* same-model
+chip to two separate calls with no refusal — the borrow ties one record's three steps
+together, not one journal's many records to each other. That is not this issue's
+vulnerability restated: #84 is "prepare on one chip, commit on another chip, within the same
+operation", which no longer compiles; this is "start two unrelated operations on two
+different chips of one model", which no check in this codebase has ever refused, before or
+after this change, and which an identity witness would be needed to close — the same
+witness the Context above rejects. It is a precondition on the caller, the same standing
+`Swap::beginning`'s two unverified arguments already have.
 
 ## Alternatives considered
 

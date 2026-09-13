@@ -416,10 +416,10 @@ where
 /// # Why the device lives here rather than in a field of `Context`
 ///
 /// Issue [#84](https://github.com/madmax983/waymaker/issues/84) has [`Recovery`] hold the
-/// device for the whole of a scan rather than take it fresh at every call — which is exactly
-/// right for the scan, and exactly wrong for a `Context` that also wants the device for §07's
-/// writer: a struct cannot have one field borrow another field of the same instance. So the
-/// device travels with whichever state is using it — inside the [`Recovery`] while
+/// device for the whole of a scan rather than take it fresh at every call. That is right for
+/// the scan and wrong for a `Context` that also wants the device for §07's writer: a struct
+/// cannot have one field borrow another field of the same instance. So the device travels
+/// with whichever state is using it — inside the [`Recovery`] while
 /// [`Scanning`](Self::Scanning), inside this enum directly once there is a writer or none at
 /// all — and [`Context`] never holds it on its own.
 enum Source<'storage, S, C: IntegrityCheck> {
