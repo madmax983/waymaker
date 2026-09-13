@@ -1469,7 +1469,19 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // is one line, so a break means this item is not one; `collecting` drops
             // rather than being kept for `End(TagEnd::Item)` to still try matching what
             // was gathered before the break.
-            Event::SoftBreak | Event::HardBreak if collecting => collecting = false,
+            //
+            // Inline HTML disqualifies it the same way (Codex, round 23): a multi-line
+            // inline comment collapses to a single `InlineHtml` event with no
+            // `SoftBreak` around it at all, so `- Sta<!--\n-->tus: accepted` reaches
+            // `Event::Text` as two separate fragments, `Sta` and `tus: accepted`, with
+            // nothing between them to say a comment — real or not — ever sat there.
+            // Concatenating the two bare reconstructs `Status: accepted` out of a value
+            // that was never one line in the source. `Html` block, appearing only for
+            // a comment that outlived its own block, is excluded because it is handled
+            // separately above and cannot occur while a paragraph is still open.
+            Event::SoftBreak | Event::HardBreak | Event::InlineHtml(_) if collecting => {
+                collecting = false;
+            }
             _ => {}
         }
     }

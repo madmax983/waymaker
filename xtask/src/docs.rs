@@ -5715,6 +5715,18 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_multiline_inline_comment() {
+        // Codex, pull request #138, round 23: a multi-line inline comment collapses
+        // to a single `InlineHtml` event with no `SoftBreak` around it at all — `- Sta
+        // <!--\n--> tus: accepted` reaches `Event::Text` as two separate fragments,
+        // `Sta` and `tus: accepted`, with nothing between them to say a comment ever
+        // sat there. Concatenating the two bare reconstructs `Status: accepted` out of
+        // a decoy that was never a real one-line field.
+        let contents = "# ADR\n\n- Sta<!--\n-->tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
