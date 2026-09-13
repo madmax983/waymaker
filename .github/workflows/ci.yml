@@ -67,6 +67,11 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --no-default-features
 
+      # Firmware ships release, where overflow checks and debug assertions are off:
+      # this is the stage that catches a wrapping `+` the dev test above cannot see.
+      - name: Test (release)
+        run: cargo test --locked --workspace --no-default-features --release
+
       # Every stage above passes --no-default-features, so issue #37's optional codec
       # helpers are compiled by none of them.
       - name: Codec lint

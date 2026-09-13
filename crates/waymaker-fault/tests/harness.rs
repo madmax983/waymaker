@@ -6,6 +6,7 @@
 //! an acknowledged one."
 
 use std::cell::{Cell, RefCell};
+use std::convert::Infallible;
 
 use waymaker_fault::{
     Breach, Durability, FaultError, Harness, HarnessError, Injection, Interruption, Ledger,
@@ -551,6 +552,155 @@ fn a_writer_that_is_not_a_function_of_its_storage_is_refused() {
         matches!(outcome, Err(HarnessError::WriterIsNotDeterministic { .. })),
         "{:?}",
         outcome.map(|runs| runs.len())
+    );
+}
+
+#[test]
+fn a_crash_point_past_the_end_of_the_sequence_is_refused_as_never_fired() {
+    // `Session::trace` clamps a past-the-end `op` to the sequence's length, so the
+    // determinism check compares the whole sequence against itself and passes. Without
+    // the fired check this returns `Ok` with the injection armed on nothing — a
+    // measurement that did not happen, reported as one that passed.
+    let injection = Injection {
+        op: 4,
+        progress: Progress::Whole,
+        interruption: Interruption::PowerLoss,
+    };
+    let outcome = Harness::new(geometry()).run_one(injection, two_records);
+    assert_eq!(
+        outcome.err(),
+        Some(HarnessError::CrashPointNeverFired { injection }),
+        "a crash point past the end of the sequence must not read as a run"
+    );
+}
+
+#[test]
+fn a_crash_point_the_writer_did_not_reach_is_refused_as_never_fired() {
+    // The writer stops before the armed operation — here by giving up whenever anything
+    // is armed, standing in for a writer that returns early on the injected error. The
+    // crash point is in range of the fault-free sequence, but no run ever carried it.
+    let injection = Injection {
+        op: 1,
+        progress: Progress::None,
+        interruption: Interruption::PowerLoss,
+    };
+    let outcome = Harness::new(geometry()).run_one(injection, |session| {
+        if session.injection().is_some() {
+            return Ok::<(), FaultError>(());
+        }
+        two_records(session)
+    });
+    assert_eq!(
+        outcome.err(),
+        Some(HarnessError::CrashPointNeverFired { injection }),
+        "a crash point the writer never reached must not read as a run"
+    );
+}
+
+/// A writer that issues no storage call at all: the empty write sequence.
+///
+/// It returns nothing rather than a `Result`: a writer that cannot fail says so by
+/// having no error to wrap, and the [`Infallible`] at the call sites names the error
+/// type the harness's writer bound still asks for.
+const fn empty_writer(_session: &mut Session) {}
+
+#[test]
+fn a_past_the_end_crash_point_on_an_empty_sequence_is_refused() {
+    // The old exception accepted *every* hand-built injection on an empty writer, so
+    // `op: usize::MAX` returned `Ok` — a measurement that did not happen, reported as one
+    // that passed, despite the guarantee that past-the-end crash points are refused.
+    let injection = Injection {
+        op: usize::MAX,
+        progress: Progress::Whole,
+        interruption: Interruption::PowerLoss,
+    };
+    let outcome = Harness::new(geometry()).run_one(injection, |session| {
+        empty_writer(session);
+        Ok::<(), Infallible>(())
+    });
+    assert_eq!(
+        outcome.err(),
+        Some(HarnessError::CrashPointNeverFired { injection }),
+        "a past-the-end crash point on an empty writer must not read as a run"
+    );
+}
+
+#[test]
+fn a_non_sentinel_crash_point_on_an_empty_sequence_is_refused() {
+    // `Failure` needs an operation to fail, so the enumerator never lists it for an empty
+    // sequence — and neither does the exception. Only the two sentinels precede
+    // everything rather than missing it.
+    let injection = Injection {
+        op: 0,
+        progress: Progress::None,
+        interruption: Interruption::Failure,
+    };
+    let outcome = Harness::new(geometry()).run_one(injection, |session| {
+        empty_writer(session);
+        Ok::<(), Infallible>(())
+    });
+    assert_eq!(
+        outcome.err(),
+        Some(HarnessError::CrashPointNeverFired { injection }),
+        "a non-sentinel crash point on an empty writer must not read as a run"
+    );
+}
+
+#[test]
+fn the_empty_sequence_sentinels_still_run() {
+    // The exception the refusal keeps: the two crash points the enumerator lists for an
+    // empty sequence precede everything rather than missing it, so the empty-sequence
+    // sweep stays supported.
+    for interruption in [Interruption::PowerLoss, Interruption::Watchdog] {
+        let injection = Injection {
+            op: 0,
+            progress: Progress::None,
+            interruption,
+        };
+        let run = Harness::new(geometry())
+            .run_one(injection, |session| {
+                empty_writer(session);
+                Ok::<(), Infallible>(())
+            })
+            .unwrap_or_else(|error| {
+                panic!("the {interruption:?} sentinel on an empty writer must still run: {error}")
+            });
+        assert_eq!(run.injection(), Some(injection));
+    }
+}
+
+#[test]
+fn a_fault_free_run_is_the_control_with_no_crash_point_armed() {
+    // `run_one` refuses a crash point that never fired, so no hand-built injection can
+    // mean "no crash". The fault-free run says it plainly: the writer runs to
+    // completion, and the run carries no injection.
+    let run = Harness::new(geometry())
+        .run_fault_free(two_records)
+        .expect("the writer succeeds with nothing armed");
+    assert_eq!(
+        run.injection(),
+        None,
+        "the control run carries no crash point"
+    );
+    assert_eq!(
+        run.ops().len(),
+        4,
+        "the control run holds the whole write sequence"
+    );
+    assert!(
+        run.ops()
+            .iter()
+            .all(|op| matches!(op, Op::Program { .. } | Op::Barrier)),
+        "the control run recorded every operation the writer performed"
+    );
+}
+
+#[test]
+fn a_fault_free_run_reports_a_writer_that_fails_with_nothing_armed() {
+    let outcome = Harness::new(geometry()).run_fault_free(|_| Err::<(), _>(FaultError::PowerLoss));
+    assert!(
+        matches!(outcome, Err(HarnessError::WriterFailedWithNoFaultsArmed(_))),
+        "a writer that fails with nothing armed must not read as a control run"
     );
 }
 

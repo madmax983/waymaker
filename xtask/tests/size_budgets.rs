@@ -300,7 +300,7 @@ fn the_gated_figure_is_the_layers_share_rather_than_the_whole_image() {
     let report = measured();
     let delta = report.delta_of("default").expect("a default row");
     let probe = report
-        .probe_delta_of("default")
+        .probe_delta_signed_of("default")
         .expect("the symbol table names the probe's own code");
     let layers = report
         .layers_flash_of("default")
@@ -317,8 +317,8 @@ fn the_gated_figure_is_the_layers_share_rather_than_the_whole_image() {
         delta.flash
     );
     assert_eq!(
-        layers,
-        delta.flash - probe,
+        i128::from(layers),
+        i128::from(delta.flash) - probe,
         "the layers' share is the delta less the probe's own growth and nothing else"
     );
 }

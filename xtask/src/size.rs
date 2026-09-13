@@ -984,17 +984,22 @@ impl SizeReport {
     }
 
     /// How much more of `name`'s image the symbol table attributes to the probe than it
-    /// does of the baseline's.
+    /// does of the baseline's, with the sign kept.
     ///
-    /// A reported figure, and it saturates like every other delta here: a probe that got
-    /// *smaller* reads as 0 rather than as a negative cost. [`Self::layers_flash_of`] does
-    /// not go through it for that reason — it subtracts each image's non-probe bytes, so a
-    /// shrinking probe is counted as the layer growth it is.
+    /// A reported figure. It is signed where every other delta here saturates: a probe
+    /// that got *smaller* reads as a negative cost rather than as 0, because
+    /// [`Self::layers_flash_of`] counts that shrinkage as layer growth and the table has
+    /// to show both terms for `probe + layers` to reconcile with `Δflash`. A saturating
+    /// probe delta reported 0 for a shrinking probe — the same 0 an unmoved probe reads
+    /// as — while the layers' column carried the growth, and the row no longer added up.
+    /// The saturating form is gone with it: no gate ever read it, both printers read this
+    /// one, and two accessors differing only in which lies about shrinkage is how the
+    /// next reader misreads the row again.
     #[must_use]
-    pub fn probe_delta_of(&self, name: &str) -> Option<u64> {
+    pub fn probe_delta_signed_of(&self, name: &str) -> Option<i128> {
         let baseline = self.baseline()?;
         let row = self.row(name)?;
-        Some(row.probe_flash.saturating_sub(baseline.probe_flash))
+        Some(i128::from(row.probe_flash) - i128::from(baseline.probe_flash))
     }
 
     /// The layers' share of one row's flash delta, given the baseline it is measured
@@ -1390,7 +1395,9 @@ impl SizeReport {
             // The baseline's own row shows what a firmware with no Waymaker in it costs,
             // so its columns are absolute and everything else is a delta against it.
             let delta = self.delta_of(&row.name).unwrap_or(row.sizes);
-            let probe = self.probe_delta_of(&row.name).unwrap_or(row.probe_flash);
+            let probe = self
+                .probe_delta_signed_of(&row.name)
+                .unwrap_or_else(|| i128::from(row.probe_flash));
             let layers = self
                 .layers_flash_of(&row.name)
                 .unwrap_or_else(|| row.sizes.flash.saturating_sub(row.probe_flash));
@@ -1417,7 +1424,7 @@ impl SizeReport {
             "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B on `{DEFAULT_ROW}` and {FACADE_CODE_FLASH_BUDGET_BYTES} B on `{FACADE_ROW}`; runtime RAM {RUNTIME_RAM_BUDGET_BYTES} B, which is the one gated as a whole. Its sub-caps overlap rather than partition it and are read one at a time: engine statics {ENGINE_RAM_BUDGET_BYTES} B, context {CONTEXT_RAM_BUDGET_BYTES} B, kernel state {KERNEL_STATE_BUDGET_BYTES} B, after a {SCRATCH_PAGE_BYTES} B caller-owned scratch page\n"
         ));
         table.push(format!(
-            "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Both are deltas against the baseline image, whose own probe symbols are {} B. Every byte no symbol attributes to the probe stays in `layers`.\n",
+            "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Both are deltas against the baseline image, whose own probe symbols are {} B. `probe` keeps its sign — a probe that shrank reads negative — so that `probe` + `layers` reconciles with `\u{394}flash`. Every byte no symbol attributes to the probe stays in `layers`.\n",
             self.baseline().map_or(0, |row| row.probe_flash),
         ));
         table.push(self.runtime_ram_line());
@@ -1823,9 +1830,12 @@ pub struct RowDiff {
     /// call every public function a layer declares, so probe code grows whenever library
     /// code does. Without it a pull request that adds 2 KiB to each reads as `flash +4000,
     /// layers +0`, with the subtraction recoverable only by arithmetic.
-    pub before_probe: Option<u64>,
+    ///
+    /// Signed: a probe that shrank below the baseline reads negative, so that the split
+    /// reconciles with the image delta the same way the table's `probe` column does.
+    pub before_probe: Option<i128>,
     /// This branch's probe share, on the same terms.
-    pub after_probe: Option<u64>,
+    pub after_probe: Option<i128>,
     /// The base branch's layers' share, for a row the budget is held against.
     ///
     /// Only for a gated row. The layers' share is defined against the baseline image,
@@ -1895,7 +1905,7 @@ pub fn diff(base: &SizeReport, head: &SizeReport) -> Vec<RowDiff> {
     };
     let probe = |report: &SizeReport, name: &str| {
         gated(report, name)
-            .then(|| report.probe_delta_of(name))
+            .then(|| report.probe_delta_signed_of(name))
             .flatten()
     };
 
@@ -2037,7 +2047,7 @@ pub fn render_diff(diffs: &[RowDiff]) -> String {
             (Some(probe_before), Some(probe_after), Some(before), Some(after)) => format!(
                 ", probe {probe_before} -> {probe_after} ({}), layers {before} -> {after} ({})",
                 signed(probe_before, probe_after),
-                signed(before, after),
+                signed(i128::from(before), i128::from(after)),
             ),
             _ => String::new(),
         };
@@ -2047,7 +2057,7 @@ pub fn render_diff(diffs: &[RowDiff]) -> String {
 }
 
 /// How a figure moved, as `+40` or `-8`.
-fn signed(before: u64, after: u64) -> String {
+fn signed(before: i128, after: i128) -> String {
     format!(
         "{}{}",
         if after >= before { "+" } else { "-" },
@@ -4651,7 +4661,88 @@ mod tests {
             Some(fixture_runtime()),
         );
         assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(12_205));
-        assert_eq!(report.probe_delta_of(DEFAULT_ROW), Some(0));
+        assert_eq!(report.probe_delta_signed_of(DEFAULT_ROW), Some(-5));
+    }
+
+    #[test]
+    fn a_shrinking_probe_reads_as_negative_in_the_table_rather_than_zero() {
+        // The saturating delta reported a shrinking probe as 0 — the same 0 an unmoved
+        // probe reads as — while the layers' column carried the growth. The table could
+        // not tell "the probe got smaller" from "nothing moved", and the row did not
+        // add up.
+        let shrunk = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(12_200, 0, BASELINE_PROBE_FLASH - 5),
+            ],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let line = shrunk
+            .render()
+            .lines()
+            .find(|line| line.trim_start().starts_with(DEFAULT_ROW))
+            .expect("the default row")
+            .to_owned();
+        assert!(
+            line.contains("-5"),
+            "a shrinking probe must print its sign: {line}"
+        );
+        let unmoved = SizeReport::new(
+            vec![baseline_row(), default_row(12_200, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let still = unmoved
+            .render()
+            .lines()
+            .find(|line| line.trim_start().starts_with(DEFAULT_ROW))
+            .expect("the default row")
+            .to_owned();
+        assert!(
+            !still.contains('-'),
+            "an unmoved probe reads as 0, not as a negative: {still}"
+        );
+
+        // The reconciliation the issue is about: with the sign kept, `probe + layers`
+        // is the image delta again.
+        let delta = shrunk.delta_of(DEFAULT_ROW).expect("a default row").flash;
+        let layers = shrunk.layers_flash_of(DEFAULT_ROW).expect("a default row");
+        let probe = shrunk
+            .probe_delta_signed_of(DEFAULT_ROW)
+            .expect("a default row");
+        assert_eq!(
+            i128::from(delta),
+            probe + i128::from(layers),
+            "probe ({probe}) + layers ({layers}) must reconcile with Δflash ({delta})"
+        );
+    }
+
+    #[test]
+    fn a_diff_shows_a_probe_that_shrank_below_the_baseline_with_its_sign() {
+        // The same saturation in the base-branch diff: a probe that fell below the
+        // baseline read as 0 there too, so "400 -> 0" hid how far it really fell.
+        let base = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_000, 0, BASELINE_PROBE_FLASH + 400),
+            ],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let head = SizeReport::new(
+            vec![
+                baseline_row(),
+                default_row_with_probe(1_200, 0, BASELINE_PROBE_FLASH - 5),
+            ],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let rendered = render_diff(&diff(&base, &head));
+        assert!(
+            rendered.contains("probe 400 -> -5 (-405)"),
+            "a shrinking probe must keep its sign in the diff: {rendered}"
+        );
     }
 
     #[test]

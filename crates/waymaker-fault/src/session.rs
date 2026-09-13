@@ -73,6 +73,15 @@ pub struct Session {
     /// that meets one at its next call should be told which. Every call after it returns this
     /// error, records no operation, and touches no media.
     stopped: Option<FaultError>,
+    /// Whether the armed crash point has fired in this run.
+    ///
+    /// Set in [`armed_for`](Self::armed_for): the crash point fires when the writer records
+    /// the operation it is armed on. A hand-built crash point past the end of the write
+    /// sequence never fires — [`trace`](Self::trace) clamps it to the sequence's length, so
+    /// the determinism check cannot see it — and neither does one the writer never reached.
+    /// Both are refused as [`HarnessError::CrashPointNeverFired`] rather than reported as
+    /// runs, because a crash point that fired on nothing measured nothing.
+    fired: bool,
 }
 
 impl Session {
@@ -87,6 +96,7 @@ impl Session {
             barriers: Vec::new(),
             marks: Vec::new(),
             stopped: None,
+            fired: false,
         }
     }
 
@@ -244,8 +254,17 @@ impl Session {
     }
 
     /// The injection armed for the operation about to be recorded, if it is this one.
-    fn armed_for(&self, index: usize) -> Option<Injection> {
-        self.injection.filter(|injection| injection.op == index)
+    ///
+    /// Records that the crash point fired. [`Harness::run_one`](crate::Harness::run_one)
+    /// takes a crash point a caller builds by hand, and a past-the-end `op` never reaches
+    /// this function — which is exactly what makes it detectable, where the clamped trace
+    /// comparison is blind to it.
+    fn armed_for(&mut self, index: usize) -> Option<Injection> {
+        let armed = self.injection.filter(|injection| injection.op == index);
+        if armed.is_some() {
+            self.fired = true;
+        }
+        armed
     }
 
     /// How many bytes of an operation of `len` bytes `progress` describes.
@@ -653,9 +672,13 @@ impl Harness {
     /// # Errors
     ///
     /// [`HarnessError::WriterFailedWithNoFaultsArmed`] if the writer returned an error in
-    /// the run where nothing was injected, and
+    /// the run where nothing was injected,
     /// [`HarnessError::WriterIsNotDeterministic`] if some run's operations before its crash
-    /// point differ from the fault-free run's.
+    /// point differ from the fault-free run's, and
+    /// [`HarnessError::CrashPointNeverFired`] if a crash point never fired in its run —
+    /// against a deterministic writer that means the writer reacted to the injection by
+    /// not reaching it, because every enumerated crash point is in range of the sequence
+    /// it was enumerated from.
     ///
     /// Both are refusals rather than results, and that is the point. The enumeration is
     /// taken from the fault-free run's write sequence, so a writer that gives up early
@@ -695,10 +718,19 @@ impl Harness {
     ///
     /// # Errors
     ///
-    /// As [`run`](Self::run). A crash point that never fires — an `op` past the end of the
-    /// sequence, or one the writer did not reach — is reported as
-    /// [`HarnessError::WriterIsNotDeterministic`], because against a deterministic writer
-    /// that is the only way it can happen.
+    /// As [`run`](Self::run): [`HarnessError::WriterFailedWithNoFaultsArmed`] if the writer
+    /// failed with nothing armed, [`HarnessError::WriterIsNotDeterministic`] if a run's
+    /// operations before its crash point differ from the fault-free run's, and
+    /// [`HarnessError::CrashPointNeverFired`] if the crash point never fired — an `op`
+    /// past the end of the sequence, one the writer did not reach, or any hand-built
+    /// injection that is not one of the two crash points the enumeration lists for an
+    /// empty sequence. A crash point that fired on nothing measured nothing, so it is
+    /// refused rather than reported as a run.
+    ///
+    /// The exception is the empty sequence's two sentinels — `(0, None, PowerLoss)` and
+    /// `(0, None, Watchdog)`, the crash points [`injections`](crate::injections)
+    /// enumerates when there is nothing to interrupt. They precede everything rather
+    /// than missing it, and the empty-sequence sweep is explicitly supported.
     #[must_use = "the run is the result"]
     pub fn run_one<W, E>(&self, injection: Injection, mut writer: W) -> Result<Run, HarnessError>
     where
@@ -707,6 +739,30 @@ impl Harness {
     {
         let baseline = self.fault_free(&mut writer)?;
         self.injected(injection, &baseline, &mut writer)
+    }
+
+    /// One run with nothing armed: the control the crash runs are judged against.
+    ///
+    /// [`run_one`](Self::run_one) refuses a crash point that never fired, so no
+    /// hand-built [`Injection`] means "no crash" — a past-the-end `op` is a refusal,
+    /// not a control. This is that run, said plainly: the writer runs to completion
+    /// with no crash point, and the [`Run`] carries [`None`] for its
+    /// [`injection`](Run::injection). A sweep that needs the uncut sequence — to
+    /// enumerate the crash points it will then cut, or to say what the writer did
+    /// before anything went wrong — starts here.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::WriterFailedWithNoFaultsArmed`] if the writer returned an error
+    /// with nothing armed.
+    #[must_use = "the run is the result"]
+    pub fn run_fault_free<W, E>(&self, mut writer: W) -> Result<Run, HarnessError>
+    where
+        W: FnMut(&mut Session) -> Result<(), E>,
+        E: fmt::Debug,
+    {
+        let session = self.fault_free(&mut writer)?;
+        Ok(session.finish())
     }
 
     /// The run in which nothing is injected, which is where the write sequence comes from.
@@ -740,6 +796,19 @@ impl Harness {
         );
         drop(writer(&mut session));
 
+        // A crash point that never fired is refused before the determinism check, not by
+        // it. `trace` clamps a past-the-end `op` to the sequence's length, so the
+        // comparison below cannot tell it apart from a crash point on the last operation —
+        // and "everything up to and including the crash point matches" is vacuous when
+        // no crash point fired in the run. The exception is the enumeration's sentinels:
+        // on an empty sequence `(0, None, PowerLoss)` and `(0, None, Watchdog)` precede
+        // everything rather than missing it, and the empty-sequence sweep is explicitly
+        // supported — but only those two, because a hand-built injection with any other
+        // shape never fired on an empty writer either.
+        if !session.fired && !Self::is_empty_sequence_sentinel(injection, baseline) {
+            return Err(HarnessError::CrashPointNeverFired { injection });
+        }
+
         // Nothing has gone wrong yet at the moment the crash point fires, so everything up
         // to and including it — the operations, the bytes they carried, and the record
         // boundaries around them — must be what the enumeration was computed from. Where
@@ -755,6 +824,24 @@ impl Harness {
         }
         Ok(session.finish())
     }
+
+    /// Whether `injection` is one of the crash points the enumeration lists for an empty
+    /// write sequence.
+    ///
+    /// [`injections`](crate::injections) on an empty sequence returns exactly two points —
+    /// `(0, None, PowerLoss)` and `(0, None, Watchdog)` — and those are the only hand-built
+    /// injections an empty writer can carry without the crash point having fired on
+    /// nothing. Anything else, however close to the sequence's start, is refused by the
+    /// check in [`injected`](Self::injected).
+    fn is_empty_sequence_sentinel(injection: Injection, baseline: &Session) -> bool {
+        baseline.ops.is_empty()
+            && injection.op == 0
+            && injection.progress == Progress::None
+            && matches!(
+                injection.interruption,
+                Interruption::PowerLoss | Interruption::Watchdog
+            )
+    }
 }
 
 /// A refusal to report crash points that were not really enumerated.
@@ -768,6 +855,18 @@ pub enum HarnessError {
     /// A run's operations before its crash point differ from the fault-free run's.
     WriterIsNotDeterministic {
         /// The crash point whose run diverged.
+        injection: Injection,
+    },
+    /// The armed crash point never fired: its `op` is past the end of the write sequence,
+    /// the writer did not reach it, or — on an empty write sequence — it is not one of
+    /// the two sentinels [`injections`](crate::injections) enumerates there.
+    ///
+    /// A crash point that fired on nothing measured nothing, so it is refused rather than
+    /// reported as a run. This is not [`HarnessError::WriterIsNotDeterministic`]:
+    /// that says the writer's operations before the crash point changed, which claims
+    /// something about the writer; this says the crash point was never in the run at all.
+    CrashPointNeverFired {
+        /// The crash point that never fired.
         injection: Injection,
     },
 }
@@ -785,6 +884,12 @@ impl fmt::Display for HarnessError {
                 "the writer issued different operations before {injection:?} than it did \
                  with no faults armed, so the crash points are aimed at operations that are \
                  not there"
+            ),
+            Self::CrashPointNeverFired { injection } => write!(
+                formatter,
+                "the crash point {injection:?} never fired: its operation is past the end \
+                 of the write sequence or the writer did not reach it, so there is no run \
+                 to report"
             ),
         }
     }
