@@ -4,7 +4,7 @@
 //! reads back how far that byte was disturbed. This is the third and last reason this crate
 //! writes the `unsafe` keyword at all — after the two macro expansions `main.rs` names — and
 //! it is a raw fill and a raw read, both confined to the region the linker reserves for the
-//! stack. See [ADR 0042].
+//! stack. See [ADR 0043].
 //!
 //! # What this measures, and what it does not
 //!
@@ -25,7 +25,7 @@
 //! though. That is a property of stack painting in general, not a defect of this
 //! implementation, and no rule in this workspace has ever asked it to be more.
 //!
-//! [ADR 0042]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+//! [ADR 0043]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0043-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 //! [budgets]: https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#budgets
 
 /// The byte [`paint`] fills unused stack with.
