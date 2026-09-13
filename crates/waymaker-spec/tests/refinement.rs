@@ -26,13 +26,17 @@ use std::collections::BTreeSet;
 
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_fault::{Durability, FaultError, Harness, RecordId, Run, Session, verify_recovery};
-use waymaker_flash::bank::{self, BankHeader, BankId as FlashBankId, BankLayout, Generation};
+use waymaker_flash::bank::{
+    self, BankHeader, BankId as FlashBankId, BankLayout, BankRegion, Generation,
+};
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_spec::explore::explore;
+use waymaker_spec::explore::{BankShape, explore};
 use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
-use waymaker_spec::refine::{Observation, abstraction, bank_after_erase, bank_after_seal};
+use waymaker_spec::refine::{
+    Observation, abstraction, bank_after_erase, bank_after_seal, call_touched,
+};
 
 /// The activity every schedule record below names.
 const DOWNLOAD: ActivityKind = ActivityKind(1);
@@ -715,30 +719,38 @@ const OP_SEAL_A_CURRENT: usize = 6;
 const OP_ERASE_B: usize = 8;
 const OP_SEAL_B_NEW: usize = 12;
 
-/// Asserts the op indices above still name what they say.
+/// Asserts the op indices above still name what they say — the *offset* as well as the
+/// *kind*, so a reordering of `program_header` and `program_seal` inside `install` (which
+/// would leave every op's kind unchanged) fails here rather than downstream.
 fn check_bank_shape(clean: &Run) {
     use waymaker_fault::Op;
     let ops = clean.ops();
-    assert!(
-        matches!(ops.get(OP_SEAL_B_STALE), Some(Op::Program { .. })),
-        "op {OP_SEAL_B_STALE} is no longer the stale bank's seal write: {ops:?}"
-    );
-    assert!(
-        matches!(ops.get(OP_SEAL_A_CURRENT), Some(Op::Program { .. })),
-        "op {OP_SEAL_A_CURRENT} is no longer the current bank's seal write: {ops:?}"
-    );
-    assert!(
-        matches!(ops.get(OP_ERASE_B), Some(Op::Erase { .. })),
+    let bank_a = bank_layout().bank(FlashBankId::A);
+    let bank_b = bank_layout().bank(FlashBankId::B);
+    let assert_seal_op = |op: usize, region: BankRegion, label: &str| {
+        assert_eq!(
+            ops.get(op),
+            Some(&Op::Program {
+                offset: region.seal_offset(),
+                len: region.seal_bytes()
+            }),
+            "op {op} is no longer {label}'s seal write: {ops:?}"
+        );
+    };
+    assert_seal_op(OP_SEAL_B_STALE, bank_b, "the stale bank");
+    assert_seal_op(OP_SEAL_A_CURRENT, bank_a, "the current bank");
+    assert_eq!(
+        ops.get(OP_ERASE_B),
+        Some(&Op::Erase {
+            offset: bank_b.base(),
+            len: bank_b.bytes()
+        }),
         "op {OP_ERASE_B} is no longer the spare bank's erase: {ops:?}"
     );
-    assert!(
-        matches!(ops.get(OP_SEAL_B_NEW), Some(Op::Program { .. })),
-        "op {OP_SEAL_B_NEW} is no longer the new seal write: {ops:?}"
-    );
+    assert_seal_op(OP_SEAL_B_NEW, bank_b, "the new bank");
     assert_eq!(ops.len(), 14, "the writer's shape changed: {ops:?}");
 }
 
-/// Folds one crashed run into `[Bank; BANKS]` and whether either bank has ever sealed.
 /// One bank's header and seal regions of `image`.
 fn regions(image: &[u8], id: FlashBankId) -> (&[u8], &[u8]) {
     let region = bank_layout().bank(id);
@@ -773,6 +785,41 @@ fn is_erased(image: &[u8], id: FlashBankId) -> bool {
     whole.iter().all(|byte| *byte == 0xFF)
 }
 
+/// Asserts that `bank_after_erase`'s answer agrees with `erased` — the same ground truth it
+/// was handed — whenever the erase actually touched media.
+///
+/// Why this earns its keep: [`Bank::Erased`] and [`Bank::Erasing`] are both non-authoritative,
+/// so neither the reachability check nor the real-selection cross-check in the test below can
+/// tell one from the other — a build with the two branches of `bank_after_erase` swapped
+/// passes both unchanged. This is the check that actually pins the branch.
+fn assert_erase_matches_ground_truth(run: &Run, op: usize, bank: Bank, erased: bool) {
+    if !call_touched(run, op) {
+        return;
+    }
+    assert_eq!(
+        matches!(bank, Bank::Erased),
+        erased,
+        "at {:?}: bank_after_erase reported {bank:?}, but the region reads erased: {erased}",
+        run.injection()
+    );
+}
+
+/// Asserts that `bank_after_seal`'s answer agrees with `sealed` — the same ground truth it
+/// was handed — whenever the seal write actually touched media. See
+/// [`assert_erase_matches_ground_truth`] for why this, and not the checks below, is what
+/// pins [`Bank::Sealed`] against [`Bank::Sealing`].
+fn assert_seal_matches_ground_truth(run: &Run, op: usize, bank: Bank, sealed: bool) {
+    if !call_touched(run, op) {
+        return;
+    }
+    assert_eq!(
+        matches!(bank, Bank::Sealed(_)),
+        sealed,
+        "at {:?}: bank_after_seal reported {bank:?}, but the region reads sealed: {sealed}",
+        run.injection()
+    );
+}
+
 /// Folds one crashed run's final image into `[Bank; BANKS]` and whether either bank has ever
 /// sealed.
 ///
@@ -785,32 +832,35 @@ fn is_erased(image: &[u8], id: FlashBankId) -> bool {
 fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
     let mut sealed_once = false;
 
+    let stale_sealed = decodes_sealed_at(run.image(), FlashBankId::B, STALE);
     let mut b = bank_after_seal(
         Bank::Erased,
         run,
         OP_SEAL_B_STALE,
         model_generation(STALE),
-        decodes_sealed_at(run.image(), FlashBankId::B, STALE),
+        stale_sealed,
     );
+    assert_seal_matches_ground_truth(run, OP_SEAL_B_STALE, b, stale_sealed);
     sealed_once |= matches!(b, Bank::Sealed(_));
 
+    let current_sealed = decodes_sealed_at(run.image(), FlashBankId::A, CURRENT);
     let a_seal = bank_after_seal(
         Bank::Erased,
         run,
         OP_SEAL_A_CURRENT,
         model_generation(CURRENT),
-        decodes_sealed_at(run.image(), FlashBankId::A, CURRENT),
+        current_sealed,
     );
+    assert_seal_matches_ground_truth(run, OP_SEAL_A_CURRENT, a_seal, current_sealed);
     sealed_once |= matches!(a_seal, Bank::Sealed(_));
 
-    b = bank_after_erase(b, run, OP_ERASE_B, is_erased(run.image(), FlashBankId::B));
-    b = bank_after_seal(
-        b,
-        run,
-        OP_SEAL_B_NEW,
-        model_generation(NEW),
-        decodes_sealed_at(run.image(), FlashBankId::B, NEW),
-    );
+    let erased = is_erased(run.image(), FlashBankId::B);
+    b = bank_after_erase(b, run, OP_ERASE_B, erased);
+    assert_erase_matches_ground_truth(run, OP_ERASE_B, b, erased);
+
+    let new_sealed = decodes_sealed_at(run.image(), FlashBankId::B, NEW);
+    b = bank_after_seal(b, run, OP_SEAL_B_NEW, model_generation(NEW), new_sealed);
+    assert_seal_matches_ground_truth(run, OP_SEAL_B_NEW, b, new_sealed);
     sealed_once |= matches!(b, Bank::Sealed(_));
 
     ([a_seal, b], sealed_once)
@@ -890,6 +940,8 @@ fn the_bank_swap_refines_the_specification_at_every_crash_point() {
     let mut still_current = 0_usize;
     let mut still_stale = 0_usize;
     let mut neither = 0_usize;
+    let mut erasing_seen = 0_usize;
+    let mut sealing_seen = 0_usize;
 
     for run in &runs {
         let (banks, sealed_once) = reconstruct_banks(run);
@@ -944,7 +996,12 @@ fn the_bank_swap_refines_the_specification_at_every_crash_point() {
                 run.injection()
             ),
         }
-        shapes.insert(banks.map(waymaker_spec::BankShape::of));
+        erasing_seen += banks.iter().filter(|bank| **bank == Bank::Erasing).count();
+        sealing_seen += banks
+            .iter()
+            .filter(|bank| matches!(bank, Bank::Sealing(_)))
+            .count();
+        shapes.insert(banks.map(BankShape::of));
     }
 
     assert!(
@@ -958,4 +1015,11 @@ fn the_bank_swap_refines_the_specification_at_every_crash_point() {
          question 1 to be a check rather than a formality",
         shapes.len()
     );
+    // `Bank::Erasing` and `Bank::Sealing` are the two shapes the authority cross-check above
+    // cannot see either side of — a bank in either is as non-authoritative as one that is
+    // `Erased` or was never touched. Without this, a fold that never actually produced one of
+    // them (a mistake with the same shape as `bank_after_erase`/`bank_after_seal` always
+    // taking the "committed" branch) would still pass every assertion above.
+    assert!(erasing_seen > 0, "no crash point ever left a bank Erasing");
+    assert!(sealing_seen > 0, "no crash point ever left a bank Sealing");
 }
