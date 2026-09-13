@@ -60,6 +60,15 @@ const ENTRY_MAGIC: u16 = 0x4752;
 /// How many bytes of an entry the check covers.
 const ENTRY_BODY_BYTES: usize = ENTRY_BYTES - 4;
 
+/// How many bytes a v1 entry occupied, before issue #81 widened the witness's mark count.
+///
+/// The one older length this build knows well enough to verify. A build only ever wrote at
+/// one version until this one, so this is the whole of the read set's history so far.
+const V1_ENTRY_BYTES: usize = 92;
+
+/// How many bytes of a v1 entry its own check covered.
+const V1_ENTRY_BODY_BYTES: usize = V1_ENTRY_BYTES - 4;
+
 /// The text every rendered line opens with.
 const LINE_PREFIX: &str = "waymaker-rig ";
 
@@ -510,16 +519,14 @@ impl Entry {
     /// As [`decode`](Self::decode).
     pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Self, LogError> {
         let Some(slot) = bytes.get(..ENTRY_BYTES) else {
-            // Too short for this build's own length. The magic and the version sit at the
-            // same two offsets in every format this build has known, so read only those
-            // before giving up. A real line from another version then reads as
-            // `UnknownVersion`, not as a buffer that is merely short.
-            return match Self::decode_version(bytes) {
-                Ok(version) if version != Self::FORMAT_VERSION => {
-                    Err(LogError::UnknownVersion { version })
-                }
-                Ok(_) | Err(_) => Err(LogError::ShortBuffer),
-            };
+            // Too short for this build's own length. A real v1 line is genuinely 92 bytes,
+            // not merely short for a 95-byte read, so check for one on its own sealed
+            // length before giving up on the buffer as too short to be anything.
+            return Err(
+                v1_version::<C>(bytes).map_or(LogError::ShortBuffer, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         };
         let (body, seal) = slot.split_at(ENTRY_BODY_BYTES);
         let Ok(seal) = <[u8; 4]>::try_from(seal) else {
@@ -674,16 +681,13 @@ impl Entry {
                 rest.get(position.saturating_add(1)..).unwrap_or_default()
             });
         if tail.len() != 2 * ENTRY_BYTES {
-            // The wrong length for this build. The magic and the version sit at the same
-            // hex offset in every format this build has known, so decode only those before
-            // giving up. A real line from another version then reads as `UnknownVersion`,
-            // not as a line this build does not recognise at all.
-            return match version_from_hex(tail) {
-                Ok(version) if version != Self::FORMAT_VERSION => {
-                    Err(LogError::UnknownVersion { version })
-                }
-                Ok(_) | Err(_) => Err(LogError::NotAnEntry),
-            };
+            // The wrong length for this build. A real v1 line hex-decodes to its own
+            // sealed, 92-byte length, so check for one before giving up on the line.
+            return Err(
+                v1_version_from_hex(tail).map_or(LogError::NotAnEntry, |version| {
+                    LogError::UnknownVersion { version }
+                }),
+            );
         }
         let mut bytes = [0_u8; ENTRY_BYTES];
         for (slot, pair) in bytes.iter_mut().zip(tail.chunks_exact(2)) {
@@ -721,26 +725,47 @@ const fn unnibble(digit: u8) -> Option<u8> {
     }
 }
 
-/// The format version a hex tail declares, decoding only the magic and the version.
+/// The version of a genuine, correctly sealed v1 entry, or `None`.
 ///
-/// [`Entry::parse`] calls this when `tail` is not this build's own length. It decodes the
-/// first three bytes only, then hands them to [`Entry::decode_version`], so a line's version
-/// is readable even when the rest of it is a length this build has never written.
-fn version_from_hex(tail: &[u8]) -> Result<u8, LogError> {
-    if tail.len() < 6 {
-        return Err(LogError::NotAnEntry);
+/// A magic and a version byte that merely *look* like a v1 line are not evidence of one:
+/// issue #81, round 2, found that any length with that three-byte prefix was accepted, so
+/// noise or a truncated buffer with a coincidental match read as a real historical line.
+/// This checks the length and the seal a v1 writer actually produced. Corrupted data would
+/// then also have to collide with a 32-bit check, the same odds every other refusal in this
+/// file already rests on.
+fn v1_version<C: IntegrityCheck>(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() != V1_ENTRY_BYTES {
+        return None;
     }
-    let mut prefix = [0_u8; 3];
-    for (slot, pair) in prefix.iter_mut().zip(tail.chunks_exact(2)) {
+    let (body, seal) = bytes.split_at(V1_ENTRY_BODY_BYTES);
+    let seal = <[u8; 4]>::try_from(seal).ok()?;
+    if C::frame_check(body) != u32::from_le_bytes(seal) {
+        return None;
+    }
+    let magic = <[u8; 2]>::try_from(body.get(..2)?).ok()?;
+    if u16::from_le_bytes(magic) != ENTRY_MAGIC {
+        return None;
+    }
+    let version = *body.get(2)?;
+    (version == 1).then_some(version)
+}
+
+/// The same, for [`Entry::parse`]'s hex tail.
+fn v1_version_from_hex(tail: &[u8]) -> Option<u8> {
+    if tail.len() != 2 * V1_ENTRY_BYTES {
+        return None;
+    }
+    let mut bytes = [0_u8; V1_ENTRY_BYTES];
+    for (slot, pair) in bytes.iter_mut().zip(tail.chunks_exact(2)) {
         let (Some(high), Some(low)) = (pair.first(), pair.get(1)) else {
-            return Err(LogError::NotAnEntry);
+            return None;
         };
         let (Some(high), Some(low)) = (unnibble(*high), unnibble(*low)) else {
-            return Err(LogError::NotAnEntry);
+            return None;
         };
         *slot = (high << 4) | low;
     }
-    Entry::decode_version(&prefix)
+    v1_version::<Catalogued>(&bytes)
 }
 
 /// `line` without leading or trailing ASCII whitespace.
