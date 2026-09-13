@@ -150,6 +150,21 @@ soundness — but in the ordinary case a call given an already-resolved bound fi
 reading no smaller, so the clamp is a no-op, and the two figures are measured against the one
 bound `paint` actually used.
 
+**Reusing one bound closes the gap between two independent readings, but not the gap
+`paint`'s own guard margin leaves on purpose, and review found that one too.** `paint` writes
+nothing at all once the region between `_stack_end` and its resolved bound is no wider than
+`GUARD_BYTES` — `high_water_mark` then reports `used = 0` over the same region, honestly, but
+`available_bytes` does not know about `GUARD_BYTES` and reports the region's full width
+regardless. A resolved bound 50 bytes wide is therefore a report of `used=0 available=50`,
+which the shortfall check's original `available == 0` line did not catch, even though nothing
+was painted and nothing was measured. `xtask::emulate::StackUsage::shortfall` now refuses any
+`available` no wider than `STACK_GUARD_BYTES` — a duplicate of `stack::GUARD_BYTES`, since
+`xtask` has no dependency on `waymaker-emu` to import it through, held to the real constant by
+`the_duplicated_guard_bytes_matches_the_real_stack_module`, which reads the literal back out of
+the shipped file rather than trusting the two copies to stay in step on their own.
+`a_stack_region_no_wider_than_the_guard_is_refused_even_when_not_empty` is the test watched
+failing against the `== 0` check before this closed it.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -179,8 +194,9 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the three hardenings changed what the figure means, only what a wrong caller could do
-to it, and how the one real caller is sequenced.** `clamp_to_stack_region` is a floor-and-ceiling
+**None of the four hardenings changed what the figure means, only what a wrong caller could do
+to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate
+report.** `clamp_to_stack_region` is a floor-and-ceiling
 clamp plus a live-stack-pointer clamp, not a new measurement path, and what changed is the
 *worst case* for an argument this ADR's own text had already named as an obligation on the
 caller rather than a check: it is now a check too. `main` now reads `available_bytes` twice —

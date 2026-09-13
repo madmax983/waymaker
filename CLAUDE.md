@@ -2849,7 +2849,14 @@ since `main`'s own reading — tends to disagree in the wrong direction: a run t
 every painted byte could report `used` a few bytes short of `available`, which is exactly the
 case `StackUsage::shortfall`'s `used >= available` check exists to catch. `paint` now returns
 the bound it resolved, and `main` passes that same value to `high_water_mark` and to a second,
-later `available_bytes` call rather than letting either re-derive its own reading. See
+later `available_bytes` call rather than letting either re-derive its own reading. A region no
+wider than `GUARD_BYTES` is one `paint` writes nothing into at all, and `high_water_mark`
+honestly reports `used = 0` over it — but `available_bytes` does not know about `GUARD_BYTES`
+and reports the region's full width regardless, so a resolved bound 50 bytes wide read as
+`used=0 available=50`, which the shortfall check's original `available == 0` line did not
+catch even though nothing was measured. `emulate::StackUsage::shortfall` now refuses any
+`available` no wider than a duplicated `STACK_GUARD_BYTES`, held to the real constant by a
+test that reads the literal back out of the shipped file. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

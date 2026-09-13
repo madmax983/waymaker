@@ -240,20 +240,33 @@ pub struct StackUsage {
     pub available: u32,
 }
 
+/// A duplicate of `waymaker_emu::stack::GUARD_BYTES`, kept as a literal rather than an import
+/// because nothing in this workspace depends on `waymaker-emu` — it is firmware, outside
+/// `default-members`, and no layer, test-support crate or host tool links it.
+///
+/// [`StackUsage::shortfall`] needs the value: `paint` declines to write anything at all once
+/// the region between the linker's `_stack_end` and its resolved bound is no wider than this
+/// margin, and a report reflecting that is not a measurement — but a reported `available` of,
+/// say, 50 is not `0` either, so a check that only refused an *empty* region would miss it.
+/// `the_duplicated_guard_bytes_matches_the_real_stack_module` reads the literal back out of
+/// [`tests_support::real_stack_module`] and fails if the two ever drift apart.
+const STACK_GUARD_BYTES: u32 = 128;
+
 impl StackUsage {
     /// Why this is not a measurement, if it is not.
     ///
-    /// Two ways, both "a measurement that did not happen is not a measurement that passed":
-    /// a region reported as empty painted nothing and scanned nothing, and a region disturbed
-    /// all the way down could not tell a run that used every byte from one that used one more
-    /// than this image could see.
+    /// Three ways, all "a measurement that did not happen is not a measurement that passed":
+    /// a region no wider than [`STACK_GUARD_BYTES`] is one `paint` declines to write anything
+    /// into at all, so nothing was painted and nothing was measured whether or not the report
+    /// happens to read as `0`; and a region disturbed all the way down could not tell a run
+    /// that used every byte from one that used one more than this image could see.
     #[must_use]
     pub fn shortfall(&self) -> Option<String> {
-        if self.available == 0 {
-            return Some(
-                "the stack region reported as empty, so nothing was painted and nothing was measured"
-                    .to_owned(),
-            );
+        if self.available <= STACK_GUARD_BYTES {
+            return Some(format!(
+                "{} available bytes is no wider than the {} this image never paints, so nothing was painted and nothing was measured",
+                self.available, STACK_GUARD_BYTES
+            ));
         }
         if self.used >= self.available {
             return Some(format!(
@@ -1391,6 +1404,37 @@ mod tests {
             available: 12000,
         };
         assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn a_stack_region_no_wider_than_the_guard_is_refused_even_when_not_empty() {
+        // `paint` declines to write anything once the region is no wider than
+        // `STACK_GUARD_BYTES`, so a report reading `used=0 available=50` is not a clean
+        // measurement — it is one that never happened, exactly as an empty region is. Only
+        // checking `available == 0` would have missed this, and did before this test existed.
+        let stack = StackUsage {
+            used: 0,
+            available: STACK_GUARD_BYTES - 1,
+        };
+        assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn the_duplicated_guard_bytes_matches_the_real_stack_module() {
+        // `xtask` cannot depend on `waymaker-emu` to import `stack::GUARD_BYTES` directly, so
+        // `STACK_GUARD_BYTES` is a literal copy of it. This reads the real constant back out
+        // of the shipped file and fails if the two are ever declared with different numbers.
+        let needle = "pub const GUARD_BYTES: usize = ";
+        let module = tests_support::real_stack_module();
+        let after = module
+            .find(needle)
+            .map(|index| &module[index + needle.len()..])
+            .expect("stack.rs declares GUARD_BYTES");
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let real: u32 = digits
+            .parse()
+            .expect("GUARD_BYTES is a plain integer literal");
+        assert_eq!(real, STACK_GUARD_BYTES);
     }
 
     #[test]
