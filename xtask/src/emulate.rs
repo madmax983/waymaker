@@ -834,9 +834,7 @@ fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate
             // `unsafe_code` is the lint's name and the one thing every file may say. The
             // keyword is never followed by an identifier byte, so the two cannot be confused.
             let is_the_lint = after.is_some_and(is_identifier_byte);
-            let is_permitted = permitted
-                .as_ref()
-                .is_some_and(|spans| spans.covers(&code, start, end));
+            let is_permitted = permitted.as_ref().is_some_and(|spans| spans.covers(start));
             if is_word_start && !is_the_lint && !is_permitted {
                 violations.push(crate::Violation::new(
                     RULE,
@@ -856,7 +854,8 @@ const fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The linker symbol the one permitted `unsafe extern "C"` block may name.
+/// The linker symbol naming the stack's lowest address, and the one the extern block must
+/// name.
 ///
 /// `_stack_end`, not `__ebss`: naming the wrong one would be invisible to every rule here, so
 /// this is the one place the correct symbol is written down and checked rather than only
@@ -864,11 +863,29 @@ const fn is_identifier_byte(byte: u8) -> bool {
 /// have; the name is repeated for the reader who reaches this file first.
 const STACK_FLOOR_SYMBOL: &str = "_stack_end";
 
+/// The linker symbol naming the stack's highest address, and the extern block's other
+/// permitted name.
+///
+/// Named so `crate::stack::clamp_to_stack_region` can hold a caller's reading inside memory
+/// this image actually owns, whatever the reading says — [ADR 0041]'s soundness fix for
+/// `paint` and `high_water_mark` being safe `pub fn`s over a caller-supplied bound.
+///
+/// [ADR 0041]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+const STACK_CEILING_SYMBOL: &str = "_stack_start";
+
 /// Every place [`PERMITTED_UNSAFE_FUNCTIONS`] and the one linker-symbol block permit `unsafe`
 /// in a `stack.rs`, computed once per file rather than re-derived per occurrence.
 struct PermittedStackSpans {
-    /// Byte ranges of the two permitted functions' own bodies, each declared exactly once.
-    function_bodies: Vec<(usize, usize)>,
+    /// The absolute byte offset of the one legitimate `unsafe` keyword in each permitted
+    /// function that has exactly one, at that function's own nesting depth zero.
+    ///
+    /// A single offset per function, not a body range: `covers` checking containment alone
+    /// would permit a *second*, unrelated `unsafe` statement placed beside the legitimate one
+    /// at the same depth — a sibling rather than a nested decoy, and one nesting depth cannot
+    /// tell apart on its own. Requiring exactly one such offset and matching it exactly closes
+    /// that: a function with two depth-zero `unsafe` keywords permits neither, because which
+    /// one is real would be a guess.
+    function_unsafe_at: Vec<usize>,
     /// The byte range of the one well-formed `unsafe extern "C" { .. }` block, if the file
     /// has one — declaring only [`STACK_FLOOR_SYMBOL`] and nothing else.
     extern_block: Option<(usize, usize)>,
@@ -878,7 +895,7 @@ impl PermittedStackSpans {
     /// Reads every permitted span out of `code`, a `stack.rs` already through
     /// [`crate::source::code_only`].
     fn collect(code: &str) -> Self {
-        let function_bodies = PERMITTED_UNSAFE_FUNCTIONS
+        let function_unsafe_at = PERMITTED_UNSAFE_FUNCTIONS
             .iter()
             .filter_map(|name| {
                 let header = format!("fn {name}");
@@ -891,39 +908,66 @@ impl PermittedStackSpans {
                 // guess, and this rule does not guess. Neither check alone is enough: a lone
                 // bodiless signature has a `declaration_count` of exactly one too, so
                 // `has_a_body` is what actually tells the two apart.
-                (crate::source::declaration_count(code, &header) == 1 && has_a_body(code, &header))
-                    .then(|| crate::source::braced_body(code, &header))
-                    .flatten()
-                    .map(|body| span_of(code, body))
+                if crate::source::declaration_count(code, &header) != 1
+                    || !has_a_body(code, &header)
+                {
+                    return None;
+                }
+                let body = crate::source::braced_body(code, &header)?;
+                let (from, _) = span_of(code, body);
+                sole_depth_zero_unsafe(body).map(|offset| from.saturating_add(offset))
             })
             .collect();
         Self {
-            function_bodies,
+            function_unsafe_at,
             extern_block: extern_block_span(code),
         }
     }
 
-    /// Whether the `unsafe` spanning `[start, end)` in `code` is one of the spans this file
+    /// Whether the `unsafe` starting at `start` in `code` is one of the spans this file
     /// permits.
-    fn covers(&self, code: &str, start: usize, end: usize) -> bool {
+    fn covers(&self, start: usize) -> bool {
         if self
             .extern_block
-            .is_some_and(|(from, to)| start >= from && end <= to)
+            .is_some_and(|(from, to)| start >= from && start < to)
         {
             return true;
         }
-        self.function_bodies.iter().any(|&(from, to)| {
-            start >= from
-                && end <= to
-                // Depth zero of the function's *own* body: not inside a nested `fn`, `impl`
-                // or `mod` declared within it, and not inside a closure or a call argument
-                // list either, which is `effect-protocol`'s own guard against a step "in a
-                // closure nothing runs" — the same shape of decoy, met here for the same
-                // reason. A body with two `unsafe` keywords therefore only permits the one
-                // that reads as the fill loop or the scan loop, not a second hidden beside it.
-                && crate::source::nesting_depth_at(&code[from..to], start - from) == 0
-        })
+        self.function_unsafe_at.contains(&start)
     }
+}
+
+/// The byte offset of the one `unsafe` keyword in `body` that sits at the body's own nesting
+/// depth zero, if there is exactly one.
+///
+/// Depth zero: not inside a nested `fn`, `impl` or `mod` declared within the body, and not
+/// inside a closure or a call argument list either — `effect-protocol`'s own guard against a
+/// step "in a closure nothing runs", the same shape of decoy met here for the same reason.
+/// Two or more such occurrences is refused rather than picking the first: a sibling `unsafe`
+/// placed beside the legitimate one is a decoy depth alone cannot tell from the real one, so
+/// requiring exactly one is what actually closes it.
+fn sole_depth_zero_unsafe(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    let mut found = None;
+    while let Some(offset) = body.get(at..).and_then(|rest| rest.find("unsafe")) {
+        let start = at.saturating_add(offset);
+        let end = start.saturating_add("unsafe".len());
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index).copied());
+        let after = bytes.get(end).copied();
+        let is_word_start = before.is_none_or(|byte| !is_identifier_byte(byte));
+        let is_the_lint = after.is_some_and(is_identifier_byte);
+        if is_word_start && !is_the_lint && crate::source::nesting_depth_at(body, start) == 0 {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(start);
+        }
+        at = end;
+    }
+    found
 }
 
 /// Whether `code`'s one declaration of `header` — a token-boundary match, as
@@ -1003,9 +1047,10 @@ fn extern_block_span(code: &str) -> Option<(usize, usize)> {
                 let (from, to) = span_of(code, body);
                 let inner = &code[from..to];
                 let names_floor = crate::source::names_identifier(inner, STACK_FLOOR_SYMBOL);
-                let one_static = crate::source::declaration_count(inner, "static") == 1;
+                let names_ceiling = crate::source::names_identifier(inner, STACK_CEILING_SYMBOL);
+                let two_statics = crate::source::declaration_count(inner, "static") == 2;
                 let no_fn = crate::source::declaration_count(inner, "fn") == 0;
-                if names_floor && one_static && no_fn {
+                if names_floor && names_ceiling && two_statics && no_fn {
                     // The span offered to callers starts at the `unsafe` keyword itself, so a
                     // `covers` check against the keyword's own occurrence succeeds.
                     return Some((keyword_start, to));
@@ -1172,7 +1217,7 @@ pub mod tests_support {
     /// [`real_stack_module`] already does that.
     #[must_use]
     pub fn clean_stack_module() -> String {
-        "unsafe extern \"C\" {\n    static _stack_end: u8;\n}\n\
+        "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
          pub fn paint(depth_from: usize) {\n    unsafe {\n        core::ptr::write_volatile(depth_from as *mut u8, 0xA5);\n    }\n}\n\
          pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
             .to_owned()
@@ -1690,7 +1735,7 @@ mod tests {
         // is the check that tells a real function from a signature with no braces of its own.
         let decoy = "pub trait Depth {\n    fn high_water_mark(depth_from: usize) -> u32;\n}\n\
              mod guts {\n    pub static X: u32 = unsafe { core::mem::transmute(0u32) };\n}\n\
-             unsafe extern \"C\" {\n    static _stack_end: u8;\n}\n\
+             unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
              pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n}\n"
             .to_owned();
         let sources = tests_support::sources_with_stack_module(decoy);
@@ -1748,7 +1793,7 @@ mod tests {
         // paint`'s outer braces, including a nested item declared within it — the same shape
         // of decoy `effect-protocol` refuses inside its own pinned bodies. Nesting depth,
         // measured from the permitted function's own body, is what tells the two apart.
-        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n}\n\
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
              pub fn paint(depth_from: usize) {\n    \
                  fn reconfigure_mpu() {\n        unsafe { core::arch::asm!(\"nop\") };\n    }\n    \
                  reconfigure_mpu();\n    \
@@ -1764,6 +1809,39 @@ mod tests {
                 .any(|violation| violation.detail.contains("`unsafe` keyword")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn a_sibling_unsafe_beside_the_legitimate_one_is_reported() {
+        // Containment plus depth-zero is not uniqueness: a *second*, unrelated `unsafe`
+        // statement placed beside the legitimate fill — not nested inside it — sits at the
+        // same nesting depth and would pass a check that only asked "is this contained in the
+        // permitted function, at depth zero". `sole_depth_zero_unsafe` refuses the whole
+        // function once it finds two, because which one is real would be a guess.
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
+             pub fn paint(depth_from: usize) {\n    \
+                 unsafe { core::ptr::write_volatile(0x4000_0000 as *mut u8, 0) };\n    \
+                 unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n\
+             }\n\
+             pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned();
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_stack_module_with_two_linker_symbols_passes() {
+        // The positive twin of the sibling-unsafe test above: exactly one `unsafe` per
+        // permitted function, and an extern block naming both `_stack_end` and `_stack_start`
+        // — the shape `clamp_to_stack_region` needs — is not itself a violation.
+        let sources = tests_support::sources_with_stack_module(tests_support::clean_stack_module());
+        assert_eq!(check(&sources), Vec::new());
     }
 
     #[test]

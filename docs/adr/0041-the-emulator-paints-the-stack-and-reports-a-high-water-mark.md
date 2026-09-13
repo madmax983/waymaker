@@ -86,7 +86,7 @@ more than a name check.** Before this, the rule read: no file of `waymaker-emu` 
 own source at all. `paint` and `high_water_mark` are hand-written, so the rule now also
 permits the keyword inside the braced body of a function named in
 `xtask::emulate::PERMITTED_UNSAFE_FUNCTIONS`, and inside the one `unsafe extern "C" { .. }`
-block the 2024 edition requires to name the linker symbol — both confined to the one file
+block the 2024 edition requires to name the linker symbols — both confined to the one file
 `xtask::emulate::STACK_MODULE` now names by its crate-relative path rather than a bare file
 name. A name alone proved not to be enough: a bodiless signature — a trait method — has a
 `declaration_count` of exactly one too and would still resolve onto whatever block happens to
@@ -94,9 +94,32 @@ follow it, so the rule also requires the header to reach a `{` before a `;`
 (`crate::emulate::has_a_body`), the found body to be scanned at its own nesting depth so a
 nested item or a closure cannot hide a second `unsafe` inside it
 (`crate::source::nesting_depth_at`), and the one permitted extern block to declare
-`_stack_end` and nothing else — which is what tells it apart from
+`_stack_end` and `_stack_start` and nothing else — which is what tells it apart from
 `unsafe extern "C" fn trap_handler() { .. }`, a foreign function whose `unsafe` is also
 immediately followed by the word `extern`.
+
+**Depth zero is not uniqueness, and a fourth round of review found the gap.** A second,
+unrelated `unsafe` statement placed *beside* the legitimate fill — a sibling rather than a
+nested decoy — sits at the same nesting depth as the real one, so a check that only asked
+"is this `unsafe` contained in the permitted function, at depth zero" would have permitted
+both. `crate::emulate::sole_depth_zero_unsafe` closes it: it collects every depth-zero
+`unsafe` in a permitted function's body and returns the one offset only when there is
+exactly one. Two or more refuses the whole function, because which one is the legitimate
+fill would be a guess, and this rule does not guess. `a_sibling_unsafe_beside_the_legitimate_one_is_reported`
+is the test watched failing against the old containment-only check before this closed it,
+and `a_clean_stack_module_with_two_linker_symbols_passes` is its positive twin.
+
+**A safe `pub fn` must be sound for every input, and a fourth finding said this one was not.**
+`paint`, `high_water_mark` and `available_bytes` took `depth_from` from their caller with no
+validation, so a stale or otherwise wrong reading — the one path this ADR's own module
+documentation says a caller must not take, but nothing stopped a future caller from taking it
+anyway — could carry every pointer either function computes outside the stack region this
+image owns. A safe function has to stay sound for any argument, not only the one a
+well-behaved caller passes today. `_stack_start`, the other linker-provided bound, is now
+named beside `_stack_end`, and `crate::stack::clamp_to_stack_region` holds `depth_from` to
+`[_stack_end, _stack_start]` before either function computes a single pointer from it. The
+cost of a wrong reading is now a wrong *measurement* — the same lower-bound honesty this ADR
+already states — never an out-of-bounds access.
 
 ## Consequences
 
@@ -115,15 +138,24 @@ implied, which is a sharper answer than folding one into the other would have be
 
 **The exception surface grows by two named functions and one linker-symbol block, not by a
 crate**, and closing the surface took more than pinning a name: `has_a_body`,
-`nesting_depth_at` and the extern block's own content check are each answers to a concrete
-adversarial file constructed against an earlier version of this rule and found to pass it —
+`nesting_depth_at`, `sole_depth_zero_unsafe` and the extern block's own content check are
+each answers to a concrete adversarial file constructed against an earlier version of this
+rule and found to pass it —
 `a_bodiless_signature_above_the_real_function_does_not_borrow_its_exemption`,
-`a_nested_function_inside_paint_does_not_inherit_its_exemption` and
-`a_foreign_function_item_is_not_the_permitted_extern_block` are the three that were watched
+`a_nested_function_inside_paint_does_not_inherit_its_exemption`,
+`a_sibling_unsafe_beside_the_legitimate_one_is_reported` and
+`a_foreign_function_item_is_not_the_permitted_extern_block` are the four that were watched
 failing before the checks that close them existed. `hand_written_unsafe_is_reported` and
 `hand_written_unsafe_in_a_sibling_module_is_reported` still pass unmodified, and
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
+
+**Neither hardening changed what the figure means, only what a wrong caller could do to it.**
+`clamp_to_stack_region` is a floor-and-ceiling clamp, not a new measurement path: a
+`depth_from` inside the real stack region is unaffected, and the reported figure for the one
+caller this crate has — `main`, reading `current_stack_pointer()` first — is identical before
+and after. What changed is the *worst case* for an argument this ADR's own text had already
+named as an obligation on the caller rather than a check: it is now a check too.
 
 **What is still owed.** A decoy `stack.rs` reproducing the whole crate-relative suffix in a
 different, deeper directory would still be read as the permitted module — narrower than the

@@ -56,11 +56,34 @@ unsafe extern "C" {
     /// Naming it only takes its address — nothing here reads or writes through it directly,
     /// only through the bounds [`paint`] and [`high_water_mark`] compute from it.
     static _stack_end: u8;
+    /// The top of the stack region: the highest address this image's stack may reach.
+    ///
+    /// The other linker-provided bound, named so [`clamp_to_stack_region`] can hold a caller's
+    /// reading to memory this image actually owns regardless of what the reading says. Naming
+    /// it only takes its address, exactly as `_stack_end` above.
+    static _stack_start: u8;
 }
 
 /// The lowest address this image's stack may reach.
 fn stack_floor() -> usize {
     core::ptr::addr_of!(_stack_end) as usize
+}
+
+/// The highest address this image's stack may reach.
+fn stack_ceiling() -> usize {
+    core::ptr::addr_of!(_stack_start) as usize
+}
+
+/// Holds `depth_from` to `[stack_floor(), stack_ceiling()]`.
+///
+/// [`paint`] and [`high_water_mark`] are `pub fn`, not `unsafe fn`: a safe function must stay
+/// sound for every input, not only the one reading `main` actually passes. Without this, a
+/// stale or otherwise wrong `depth_from` would let `paint` write above the stack this image
+/// owns. Clamping first means every pointer either function computes afterwards stays inside
+/// `[_stack_end, _stack_start]` — real memory this image owns — whatever `depth_from` was.
+/// The cost of a wrong reading is a wrong *measurement*, never an out-of-bounds access.
+fn clamp_to_stack_region(depth_from: usize) -> usize {
+    depth_from.clamp(stack_floor(), stack_ceiling())
 }
 
 /// The stack pointer, read from the core rather than inferred from a local's address.
@@ -75,15 +98,19 @@ pub fn current_stack_pointer() -> usize {
 
 /// Fills unused stack with [`POISON`], from the linker's `_stack_end` up to `depth_from`.
 ///
-/// `depth_from` must be a stack pointer reading taken before the caller does anything else —
-/// [`current_stack_pointer`], called first — so everything below it is unused at the moment
-/// of the call. Painting less than the true free region is safe; painting more is not, which
-/// is why the caller must read `depth_from` first and use nothing below it afterwards until
-/// the run this call is measuring has finished.
+/// `depth_from` should be a stack pointer reading taken before the caller does anything else
+/// — [`current_stack_pointer`], called first — so everything below it is unused at the
+/// moment of the call. Painting less than the true free region is safe; painting more is
+/// not, which is why the caller should read `depth_from` first and use nothing below it
+/// afterwards until the run this call is measuring has finished. A wrong or stale reading
+/// still cannot reach memory this image does not own: [`clamp_to_stack_region`] holds
+/// `depth_from` inside the stack region first, so the cost of a wrong reading is a wrong
+/// measurement, never an out-of-bounds write.
 ///
 /// Call this once per boot. A second call would paint over whatever the first call's own
 /// caller had already done, and report on the wrong run.
 pub fn paint(depth_from: usize) {
+    let depth_from = clamp_to_stack_region(depth_from);
     let bottom = stack_floor();
     let Some(top) = depth_from.checked_sub(GUARD_BYTES) else {
         return;
@@ -93,10 +120,10 @@ pub fn paint(depth_from: usize) {
     }
     // SAFETY: `bottom` is the linker's own `_stack_end`, the lowest address this image's
     // stack ever reaches. `top` is `depth_from` less a margin this function never touches,
-    // and `depth_from` is a stack pointer reading taken before the caller used any of the
-    // memory below it — the caller's obligation, stated above, not this function's. Every
-    // byte in `[bottom, top)` is therefore stack this image owns and has not yet used. The
-    // fill goes through a volatile write so it cannot be optimised away as dead.
+    // and `clamp_to_stack_region` has already held `depth_from` inside
+    // `[_stack_end, _stack_start]` — real memory this image owns — whatever the caller
+    // passed in. Every byte in `[bottom, top)` is therefore stack this image owns. The fill
+    // goes through a volatile write so it cannot be optimised away as dead.
     unsafe {
         let mut at = bottom as *mut u8;
         let end = top as *mut u8;
@@ -119,6 +146,7 @@ pub fn paint(depth_from: usize) {
 /// fill closes that off.
 #[must_use]
 pub fn high_water_mark(depth_from: usize) -> u32 {
+    let depth_from = clamp_to_stack_region(depth_from);
     let bottom = stack_floor();
     let Some(ceiling) = depth_from.checked_sub(GUARD_BYTES) else {
         return 0;
@@ -126,9 +154,10 @@ pub fn high_water_mark(depth_from: usize) -> u32 {
     if ceiling <= bottom {
         return 0;
     }
-    // SAFETY: reads only bytes in `[bottom, ceiling)`, exactly the range `paint` was called
-    // with this same `depth_from` to fill. Every byte read here is therefore either still
-    // `POISON` or was legitimately written by the run being measured.
+    // SAFETY: `clamp_to_stack_region` holds `depth_from` inside `[_stack_end, _stack_start]`
+    // first, so `[bottom, ceiling)` is real memory this image owns. It is also the same
+    // range `paint` fills when called with the same `depth_from`, so every byte read here is
+    // either still `POISON` or was legitimately written by the run being measured.
     let deepest = unsafe {
         let mut at = bottom as *const u8;
         let end = ceiling as *const u8;
@@ -158,6 +187,7 @@ fn used_bytes(bottom: usize, top: usize, deepest: usize) -> u32 {
 /// The size of the region [`paint`] fills and [`high_water_mark`] scans.
 #[must_use]
 pub fn available_bytes(depth_from: usize) -> u32 {
+    let depth_from = clamp_to_stack_region(depth_from);
     let bottom = stack_floor();
     if depth_from <= bottom {
         0
