@@ -829,6 +829,25 @@ impl<S: StableStorage> Run<'_, S> {
         let base = self.block_a();
         let second = self.block_d();
 
+        // The capacity itself is safe to name here too, but only when the region reaches
+        // it: a clamp a broken adapter applies then lands inside the region the caller
+        // declared expendable, rather than past it — which is exactly the case a
+        // whole-device run is for. The block that clamp would land in is the region's own
+        // last block, which is `second` only when the region is the required minimum of
+        // four blocks; on a wider region it is a block neither existing witness reaches, so
+        // it needs one of its own.
+        let at_capacity = self.region.end() == self.capacity();
+        let edge = self.capacity().checked_sub(self.erase_size());
+        if at_capacity {
+            let Some(edge) = edge else {
+                self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+                return;
+            };
+            if !self.program_a_unit(case, edge) {
+                return;
+            }
+        }
+
         // A caller with nothing to write is not a caller with a bug, and an adapter that
         // refused would push the empty case into every call site above it.
         let mut legal = self.storage.read(base, &mut []).is_ok()
@@ -837,12 +856,7 @@ impl<S: StableStorage> Run<'_, S> {
             && self.storage.read(second, &mut []).is_ok()
             && self.storage.program(second, &[]).is_ok()
             && self.storage.erase(second, 0).is_ok();
-
-        // The capacity itself is safe to name here too, but only when the region reaches
-        // it: a clamp a broken adapter applies then lands inside the region the caller
-        // declared expendable, rather than past it — which is exactly the case a
-        // whole-device run is for.
-        if self.region.end() == self.capacity() {
+        if at_capacity {
             let capacity = self.capacity();
             legal = legal
                 && self.storage.read(capacity, &mut []).is_ok()
@@ -860,7 +874,16 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         };
-        let outcome = if first_untouched && second_untouched {
+        let edge_untouched = if at_capacity {
+            let Some(result) = edge.and_then(|edge| self.block_holds_the_pattern(edge)) else {
+                self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
+                return;
+            };
+            result
+        } else {
+            true
+        };
+        let outcome = if first_untouched && second_untouched && edge_untouched {
             Outcome::Passed
         } else {
             Outcome::Failed(Failure::MediaOutsideTheOperationChanged)

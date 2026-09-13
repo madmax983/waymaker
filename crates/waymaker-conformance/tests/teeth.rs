@@ -117,6 +117,12 @@ enum Flaw {
     /// this one only fires on a multi-block erase, so it can only be caught by the case that
     /// actually issues one.
     MultiBlockEraseCorruptsThePrecedingBlock,
+    /// A zero-length erase named at the capacity clamps to the block right before it.
+    ///
+    /// The block a clamp at the capacity would land in is the region's own last block,
+    /// which is not one of the two fixed witnesses this case otherwise keeps — on a region
+    /// wider than the required minimum, neither ever looks there.
+    ZeroLengthAtCapacityClampsToThePrecedingBlock,
 }
 
 const ERASED: u8 = 0xFF;
@@ -417,6 +423,15 @@ impl StableStorage for Broken {
                     }
                 }
             }
+            Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock => {
+                self.fill(offset, len, |_| ERASED);
+                if len == 0 && offset == self.geometry.capacity() {
+                    let block = self.geometry.erase_size();
+                    if let Some(previous) = offset.checked_sub(block) {
+                        self.fill(previous, block, |_| 0x00);
+                    }
+                }
+            }
             _ => self.fill(offset, len, |_| ERASED),
         }
         Ok(())
@@ -645,6 +660,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         CaseId::MultiBlockEraseIsLegal,
         Failure::MediaOutsideTheOperationChanged,
     ),
+    (
+        Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock,
+        CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
 ];
 
 #[test]
@@ -757,6 +777,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::ProgramCorruptsThePrecedingUnit
         | Flaw::MultiUnitProgramCorruptsThePrecedingUnit
         | Flaw::MultiBlockEraseCorruptsThePrecedingBlock
+        | Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock
         | Flaw::ReadCorruptsWhatFollows
         | Flaw::BarrierScribbles
         | Flaw::BarrierScribblesInTheMiddleBlock
@@ -879,6 +900,10 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::MultiBlockEraseIsLegal,
             Failure::MediaOutsideTheOperationChanged,
         )),
+        Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock => Some((
+            CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
+            Failure::MediaOutsideTheOperationChanged,
+        )),
     }
 }
 
@@ -916,6 +941,7 @@ const ALL: &[Flaw] = &[
     Flaw::MisalignedProgramOffsetScribblesBeforeRefusing,
     Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
     Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
+    Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock,
 ];
 
 #[test]
