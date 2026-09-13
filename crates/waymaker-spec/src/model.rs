@@ -492,15 +492,19 @@ pub struct Journal {
     dispatched: Vec<RecordId>,
     powered: bool,
     sealed_once: bool,
-    /// The next id [`declare`](Self::declare) will hand out.
+    /// The next id [`declare`](Self::declare) will hand out, or `None` once `RecordId(u32::MAX)`
+    /// has already been issued and there is no id left to give the one after it.
     ///
     /// Issue [#67](https://github.com/madmax983/waymaker/issues/67)'s identity scheme: a
     /// counter that only grows, rather than `records.len()`. Once [`begin_erase`](Self::begin_erase)
     /// can drop records from the middle of `records`, length is no longer a record's position
     /// in history, and reusing it would let a record dropped by an erase be reissued to a
     /// record that means something else — the one thing a reboot's redelivery proof cannot
-    /// survive.
-    next_id: u32,
+    /// survive. `Option` rather than a plain `u32` so `RecordId(u32::MAX)` is still one this
+    /// counter can hand out — Codex found, on review of issue #67's pull request, that an
+    /// earlier version of this fix folded "the next id" and "there is no next id" into the
+    /// same `u32::MAX` value and so refused the last id along with the first one past it.
+    next_id: Option<u32>,
 }
 
 impl Default for Journal {
@@ -519,7 +523,7 @@ impl Journal {
             dispatched: Vec::new(),
             powered: true,
             sealed_once: false,
-            next_id: 0,
+            next_id: Some(0),
         }
     }
 
@@ -873,15 +877,20 @@ impl Journal {
     ///
     /// The counter's own ceiling is refused independently of `bound.records`. No exhaustive
     /// search reaches it — `Bound::PROOF` declares at most 3 — but
-    /// [`Journal::reconstructed`] builds `next_id` from a real observation's own record ids
-    /// via `saturating_add`, so a
-    /// crash harness reporting `RecordId(u32::MAX)` under a caller-chosen `bound.records` wide
-    /// enough to admit it would have overflowed the plain `+= 1` this used to be — a panic in
-    /// a build with overflow checks, and a wrapped, *reused* id everywhere else, which is the
-    /// one thing the identity scheme above promises never happens. Codex found it on review of
-    /// issue #67's pull request.
+    /// [`Journal::reconstructed`] builds `next_id` from a real observation's own record ids,
+    /// so a crash harness reporting `RecordId(u32::MAX)` under a caller-chosen `bound.records`
+    /// wide enough to admit it would have overflowed the plain `+= 1` this used to be — a
+    /// panic in a build with overflow checks, and a wrapped, *reused* id everywhere else,
+    /// which is the one thing the identity scheme above promises never happens. Codex found it
+    /// on review of issue #67's pull request. `next_id` is refused *before* this reads it
+    /// rather than after this advances it, so `RecordId(u32::MAX)` is still one this hands
+    /// out — only the id after it is refused, which Codex's second look caught an earlier
+    /// version of this fix folding together.
     fn declare(&mut self, role: Role, bound: Bound) -> Result<(), Illegal> {
-        if self.next_id as usize >= bound.records {
+        let Some(next_id) = self.next_id else {
+            return Err(Illegal::CapacityReached);
+        };
+        if next_id as usize >= bound.records {
             return Err(Illegal::CapacityReached);
         }
         let bank = self.current_bank();
@@ -889,11 +898,8 @@ impl Journal {
         if (role == Role::Schedule) == unresolved {
             return Err(Illegal::OutOfProtocolOrder);
         }
-        let id = RecordId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(Illegal::CapacityReached)?;
+        let id = RecordId(next_id);
+        self.next_id = next_id.checked_add(1);
         self.records.push(Record {
             id,
             role,
@@ -1095,8 +1101,22 @@ impl Journal {
     /// are durable". With [`Guard::StrictGeneration`] enforced the pending generation
     /// strictly outranks the other bank's, which `a_new_seal_is_strictly_newer_than_the_bank_it_replaces`
     /// holds over every edge and which is what makes the two never tie.
+    ///
+    /// `Bank::Erased` alone is not enough: a bank whose *seal* was never touched still reads
+    /// `Erased` even after records were declared into it as the pre-seal implicit current bank
+    /// and a later seal on the *other* bank retired it without ever erasing it —
+    /// `Journal::begin_erase` is the only thing that drops a bank's records, and this bank
+    /// never went through it. Sealing it anyway would reseal a superseded run's leftover
+    /// bytes at a higher generation than the bank that retired it, recovering exactly the old
+    /// run §14's failure table forbids. The one bank allowed to carry records into its own
+    /// seal is the one still being written to — `current_bank()` — which is the ordinary,
+    /// intended shape of a device's very first seal. Codex found the gap on review of issue
+    /// #67's pull request.
     fn begin_seal(&mut self, bank: BankId, guards: Guards, bound: Bound) -> Result<(), Illegal> {
         if self.bank(bank) != Bank::Erased {
+            return Err(Illegal::BankNotErased);
+        }
+        if bank != self.current_bank() && self.records.iter().any(|record| record.bank == bank) {
             return Err(Illegal::BankNotErased);
         }
         if matches!(self.bank(bank.other()), Bank::Sealing(_)) {
@@ -1211,15 +1231,18 @@ impl Journal {
     /// [`recovering_bank`](Self::recovering_bank) already answers `Some(BankId::A)` by the
     /// same convention. `next_id` is set past every id `records` carries so a caller that went
     /// on to call [`step`](Self::step) — nothing in this crate does — could not reissue one.
+    /// `checked_add` rather than `saturating_add`: an observation whose highest id is already
+    /// `RecordId(u32::MAX)` has no id left to set `next_id` *to*, and saturating back to
+    /// `u32::MAX` would have handed that same id out a second time.
     pub(crate) fn from_parts(records: Vec<Record>, dispatched: Vec<RecordId>) -> Self {
         let mut sorted = dispatched;
         sorted.sort_unstable();
         sorted.dedup();
         let next_id = records
             .iter()
-            .map(|record| record.id.0.saturating_add(1))
+            .map(|record| record.id.0)
             .max()
-            .unwrap_or(0);
+            .map_or(Some(0), |highest| highest.checked_add(1));
         Self {
             records,
             banks: [Bank::Erased; BANKS],
@@ -1276,7 +1299,7 @@ mod tests {
             dispatched: Vec::new(),
             powered: true,
             sealed_once: true,
-            next_id: 0,
+            next_id: Some(0),
         };
         let bound = Bound {
             records: 3,
@@ -1310,33 +1333,65 @@ mod tests {
     }
 
     /// Codex, PR #135 round 5: `Journal::from_parts` (which `Journal::reconstructed` calls)
-    /// takes `next_id` from a real observation's own record ids via `saturating_add`, so an
+    /// took `next_id` from a real observation's own record ids via `saturating_add`, so an
     /// observation naming `RecordId(u32::MAX)` — implausible from this crate's own bounded
-    /// search, entirely plausible from a real crash harness fuzzing wider ids — leaves
-    /// `next_id` at the ceiling. `declare`'s old plain `+= 1` then overflowed on the very next
+    /// search, entirely plausible from a real crash harness fuzzing wider ids — left `next_id`
+    /// at the ceiling. `declare`'s old plain `+= 1` then overflowed on the very next
     /// declaration once `bound.records` was wide enough to admit it, panicking in a build with
     /// overflow checks and silently reusing `RecordId(0)` in one without — which is the one
     /// thing issue #67's identity scheme promises never happens. A hand-built state for the
     /// same reason as the test above: nothing outside this crate has a legitimate reason to
     /// build a journal that has already issued four billion ids.
     #[test]
-    fn a_record_id_at_the_ceiling_is_refused_rather_than_reused() {
-        let near_ceiling = Journal {
+    fn declaring_past_the_last_record_id_is_refused_rather_than_reused() {
+        let exhausted = Journal {
             records: Vec::new(),
             banks: [Bank::Erased; BANKS],
             dispatched: Vec::new(),
             powered: true,
             sealed_once: false,
-            next_id: u32::MAX,
+            next_id: None,
         };
         let bound = Bound {
             records: usize::MAX,
             generations: 3,
         };
         assert_eq!(
-            near_ceiling.step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound),
+            exhausted.step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound),
             Err(Illegal::CapacityReached),
-            "declaring past the last id either panicked or reused RecordId(0)"
+            "declaring with no id left either panicked or reused RecordId(0)"
+        );
+    }
+
+    /// Codex's second look at the fix above, same round: folding "the next id" and "there is
+    /// no next id" into one `u32::MAX` sentinel refused `RecordId(u32::MAX)` itself along with
+    /// the id after it, even though `u32::MAX` had never been issued and was still a legitimate
+    /// id to hand out. `next_id: Option<u32>` fixes both at once — this is the positive half,
+    /// that the last representable id is still allocated exactly once, and
+    /// `declaring_past_the_last_record_id_is_refused_rather_than_reused` above is the negative
+    /// half, that the id after it is refused rather than reused.
+    #[test]
+    fn the_last_record_id_is_still_allocated_exactly_once() {
+        let one_left = Journal {
+            records: Vec::new(),
+            banks: [Bank::Erased; BANKS],
+            dispatched: Vec::new(),
+            powered: true,
+            sealed_once: false,
+            next_id: Some(u32::MAX),
+        };
+        let bound = Bound {
+            records: usize::MAX,
+            generations: 3,
+        };
+        let declared = one_left
+            .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+            .expect("RecordId(u32::MAX) has never been issued and is still available");
+        assert_eq!(declared.records()[0].id, RecordId(u32::MAX));
+        assert_eq!(
+            declared.step(Transition::Declare(Role::Outcome), Guards::ENFORCED, bound),
+            Err(Illegal::CapacityReached),
+            "declaring a second record reused an id or overflowed instead of refusing"
         );
     }
 }

@@ -130,10 +130,16 @@ importing it from a theorem about a different type (`tests/machine.rs`'s, about 
 ## Consequences
 
 The reachable state space at `Bound::PROOF` grew from 2,576 states, and every transition's
-edge count moved with it, then shrank again once `protects_current_run` closed the pre-seal
-gap: a whole family of states in which a fresh device erased its only writable bank stopped
-being reachable (`tests/census.rs`, whose pinned numbers are the number to read — this
-paragraph is not). Two spine claims that used to be statements about `state.records()`
+edge count moved with it (`tests/census.rs`, whose pinned numbers are the number to read —
+this paragraph is not). It shrank once `protects_current_run` closed the pre-seal gap: a
+whole family of states in which a fresh device erased its only writable bank stopped being
+reachable. It shrank a third time once `begin_seal` refused a bank that still held records
+unless that bank was the one currently being written to: a whole family of states in which a
+superseded run's leftover, un-erased bytes got resealed at a higher generation than the bank
+that retired them stopped being reachable. `tests/compaction.rs`'s surviving-bank witness
+search had to look for a bank with no records rather than trusting its `Erased` tag, because
+the tag-only search had been finding this bug's own witness and calling it a demonstration.
+Two spine claims that used to be statements about `state.records()`
 as one sequence —
 `a_torn_record_is_always_the_last_one_on_media_in_its_own_bank` and
 `an_acknowledged_record_is_never_behind_a_gap_in_its_own_bank`

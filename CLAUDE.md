@@ -2902,3 +2902,27 @@ every record is in `BankId::A` before projecting;
 `no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave` asserts the filtered
 set is clean, verified to fail without the filter (488 of the run's reachable states leaked
 an impossible shape) and pass with it.
+
+An eighth finding was the sharpest of the round: `Declare -> Program -> Barrier` in bank A
+(pre-seal, current), then `BeginSeal(B) -> CommitSeal(B)` as the device's very first seal,
+left A's `Bank` tag at `Erased` — it was never touched — while A still held the record it
+declared before B took over. `Journal::begin_seal` read only that tag, so `BeginSeal(A)`
+afterward saw nothing wrong and resealed A's stale record at a higher generation than B, with
+no erase anywhere in the trace — recovering a superseded run as current, exactly what §14's
+failure table forbids. `begin_seal` now also refuses a bank that still holds records unless
+that bank is the one currently being written to (`current_bank()`), which is the ordinary
+shape of a device's very first seal and the only case a bank may carry records into its own
+seal. `tests/machine.rs`'s `a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase`
+drives the trace end to end; `REACHABLE_STATES` and `TRANSITION_EDGES` moved down a third
+time, and `tests/compaction.rs`'s surviving-bank test needed its witness search corrected to
+look for a bank with no records rather than an `Erased` tag alone — the tag-only search had
+been finding this same bug's witness and calling it a demonstration.
+
+A ninth, in the same round, was in the previous round's own fix: `next_id`'s `checked_add`
+refused *before* advancing, so a `Journal` reconstructed with `RecordId(u32::MAX)` already
+the highest id in it refused `RecordId(u32::MAX)` itself rather than only the id after it —
+the last representable id was never allocatable, not just the one past the ceiling.
+`next_id: Option<u32>` fixes it: `None` means no id is left, `Some(u32::MAX)` still hands out
+the last one and then becomes `None`. `the_last_record_id_is_still_allocated_exactly_once`
+and `declaring_past_the_last_record_id_is_refused_rather_than_reused` are the positive and
+negative halves.

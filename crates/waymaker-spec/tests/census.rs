@@ -38,8 +38,11 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// carrying a `bank` lets `Journal::begin_erase` produce states two banks could not
 /// distinguish before. It moved again once `BeginErase` stopped being legal on the pre-seal
 /// implicit current bank (`Journal::protects_current_run`): a whole family of states in which
-/// a fresh device erased the only bank it could ever write into stopped being reachable.
-const REACHABLE_STATES: usize = 6_598;
+/// a fresh device erased the only bank it could ever write into stopped being reachable. It
+/// moved a third time once `BeginSeal` refused a bank that still held records from before it
+/// was retired without ever being erased: a whole family of states in which a superseded run's
+/// leftover bytes got resealed at a higher generation stopped being reachable.
+const REACHABLE_STATES: usize = 5_420;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -62,18 +65,18 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
 /// led to is reachable by some other path. Every invariant, every mutant verdict and every
 /// necessity proof stays green through all three. The edge counts do not.
 const TRANSITION_EDGES: [(TransitionKind, usize); 12] = [
-    (TransitionKind::Declare, 905),
-    (TransitionKind::Program, 1193),
-    (TransitionKind::FailedProgram, 1193),
-    (TransitionKind::Barrier, 3299),
-    (TransitionKind::Dispatch, 444),
-    (TransitionKind::BeginErase, 2765),
-    (TransitionKind::CommitErase, 534),
-    (TransitionKind::BeginSeal, 636),
-    (TransitionKind::CommitSeal, 636),
-    (TransitionKind::Tear, 782),
-    (TransitionKind::PowerLoss, 3299),
-    (TransitionKind::Reboot, 3299),
+    (TransitionKind::Declare, 817),
+    (TransitionKind::Program, 944),
+    (TransitionKind::FailedProgram, 944),
+    (TransitionKind::Barrier, 2710),
+    (TransitionKind::Dispatch, 338),
+    (TransitionKind::BeginErase, 2212),
+    (TransitionKind::CommitErase, 498),
+    (TransitionKind::BeginSeal, 400),
+    (TransitionKind::CommitSeal, 400),
+    (TransitionKind::Tear, 651),
+    (TransitionKind::PowerLoss, 2710),
+    (TransitionKind::Reboot, 2710),
 ];
 
 #[test]

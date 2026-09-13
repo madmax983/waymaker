@@ -13,7 +13,7 @@
 use waymaker_fault::Durability;
 use waymaker_spec::explore::explore;
 use waymaker_spec::model::{
-    Bank, BankId, Bound, Guards, Illegal, Journal, OnMedia, Record, Transition,
+    Bank, BankId, Bound, Guards, Illegal, Journal, OnMedia, Record, Role, Transition,
 };
 
 const CEILING: usize = 200_000;
@@ -472,5 +472,55 @@ fn a_record_programmed_while_the_pre_seal_current_bank_erases_can_never_be_seale
         ),
         Err(Illegal::WouldEraseTheAuthority),
         "a fresh device let its only writable bank start erasing"
+    );
+}
+
+#[test]
+fn a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase() {
+    // Codex, PR #135 round 7: `Declare(Schedule) -> Program -> Barrier` in A (pre-seal,
+    // current), then `BeginSeal(B) -> CommitSeal(B)` as the device's very first seal, leaves
+    // A's `Bank` tag at `Erased` — it was never touched — while A still holds the record it
+    // declared before B took over. Without the fix, `BeginSeal(A)` reads that tag and sees
+    // nothing wrong, resealing A's stale record at a higher generation than B and recovering
+    // a superseded run as current with no erase anywhere in the trace.
+    let mut state = Journal::default();
+    state = state
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("declare in A");
+    let id = state.records()[0].id;
+    state = state
+        .step(Transition::Program(id), Guards::ENFORCED, Bound::PROOF)
+        .expect("program");
+    state = state
+        .step(Transition::Barrier, Guards::ENFORCED, Bound::PROOF)
+        .expect("barrier");
+    state = state
+        .step(
+            Transition::BeginSeal(BankId::B),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("begin seal B, the device's first seal");
+    state = state
+        .step(
+            Transition::CommitSeal(BankId::B),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("commit seal B");
+    assert_eq!(state.recovering_bank(), Some(BankId::B));
+
+    assert_eq!(
+        state.step(
+            Transition::BeginSeal(BankId::A),
+            Guards::ENFORCED,
+            Bound::PROOF
+        ),
+        Err(Illegal::BankNotErased),
+        "A was resealed with a stale record still in it and no erase in the trace"
     );
 }

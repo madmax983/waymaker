@@ -77,10 +77,12 @@ fn a_live_device_can_swap_banks_behind_a_torn_record_with_no_power_loss() {
 
 #[test]
 fn a_seal_on_the_surviving_bank_is_legal_with_a_torn_record_still_on_the_other_one() {
-    // Compaction needed no `Transition::Compact` of its own because `Journal::begin_seal`
-    // never looked at the *other* bank's records — this is that fact, demonstrated rather
-    // than argued: a `BeginSeal` on the blank bank stays legal even from a state where a live,
-    // still-powered device has a torn record sitting in the bank it is about to abandon.
+    // Compaction needed no `Transition::Compact` of its own: `Journal::begin_seal` never
+    // looked at the torn record's *own* bank, only at the one it is about to seal — this is
+    // that fact, demonstrated rather than argued. A genuinely blank bank (no records of its
+    // own, not merely an `Erased` tag — `Journal::begin_seal` now refuses the tag alone, per
+    // issue #67's fourth gap) stays sealable from a state where a live, still-powered device
+    // has a torn record sitting in the bank it is about to abandon.
     let explored = proof_space();
     let witness = explored.states().iter().find_map(|state| {
         if !(state.powered() && state.has_torn_record()) {
@@ -96,18 +98,21 @@ fn a_seal_on_the_surviving_bank_is_legal_with_a_torn_record_still_on_the_other_o
         if state.bank(blank) != waymaker_spec::model::Bank::Erased {
             return None;
         }
+        if state.records().iter().any(|record| record.bank == blank) {
+            return None;
+        }
         let sealed = state
             .step(
                 waymaker_spec::model::Transition::BeginSeal(blank),
                 Guards::ENFORCED,
                 Bound::PROOF,
             )
-            .expect("sealing the blank bank does not consult the torn record elsewhere");
+            .expect("sealing a genuinely blank bank does not consult the torn record elsewhere");
         Some((state.bank(torn_bank), sealed.bank(torn_bank)))
     });
     let (before, after) = witness.expect(
-        "no reachable, still-powered, torn-record state had a blank bank to seal — this test \
-         is about nothing",
+        "no reachable, still-powered, torn-record state had a genuinely blank bank to seal — \
+         this test is about nothing",
     );
     assert_eq!(before, after, "sealing changed the other bank");
 }
