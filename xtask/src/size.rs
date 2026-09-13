@@ -2771,7 +2771,7 @@ fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Bloc
         // makes its unmarked methods callable from outside, and only while `Storage` is
         // itself a trait the probe has a path to.
         return Some(match impl_trait_name(line) {
-            Some(name) if private_traits.contains(name) => Block::Other,
+            Some((name, true)) if private_traits.contains(name) => Block::Other,
             Some(_) => Block::TraitImpl,
             None => Block::Other,
         });
@@ -2852,39 +2852,57 @@ fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<Str
     names
 }
 
-/// The trait name an `impl <Trait> for <Type>` line names. Returns `None` for an
-/// inherent `impl` with no `for`.
+/// The trait name an `impl <Trait> for <Type>` line names. Also whether that name can
+/// resolve to a trait this crate declares. Returns `None` for an inherent `impl` with
+/// no `for`.
 ///
 /// `line` is the item's declaration line, the same line [`declaration_kind`] reads.
 /// Two things are stripped before the name is read. First, the impl's own generic
 /// parameters — `impl<T: Copy> Storage<T> for Bank<T>` — as one balanced `<...>`
-/// group, since a bound can carry a nested `<...>` of its own. Second, a path
-/// qualifier and the trait's own generic arguments, so `crate::sealed::Sealed<T>`
-/// names `Sealed`, not `crate`.
-fn impl_trait_name(line: &str) -> Option<&str> {
+/// group, since a bound can carry a nested `<...>` of its own. Second, the trait's
+/// own generic arguments, so `Storage<T>` names `Storage`.
+///
+/// A path names its last segment: `crate::sealed::Sealed` names `Sealed`. The second
+/// field is `false` when the path is qualified by anything but `crate`, `self`, or
+/// `super`. `core::fmt::Debug` names an external trait, and its last segment must
+/// never be checked against this crate's own private trait names — a private trait
+/// happening to share that name is a different trait, in a different crate.
+fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
     let (before, _after) = line.split_once(" for ")?;
     let before = before.strip_prefix("impl").unwrap_or(before);
     let before = skip_leading_generic_params(before);
-    // The trait's own generic arguments, if any: `Storage<T>` names `Storage`.
     let path = before.split('<').next().unwrap_or(before);
-    // The last path segment: `crate::sealed::Sealed` names `Sealed`.
-    path.rsplit("::")
+
+    let mut segments = path
+        .split("::")
         .map(str::trim)
-        .find(|segment| !segment.is_empty())
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next()?;
+    let mut name = first;
+    let mut qualified = false;
+    for segment in segments {
+        name = segment;
+        qualified = true;
+    }
+    let local = !qualified || matches!(first, "crate" | "self" | "super");
+    Some((name, local))
 }
 
 /// Removes one leading `<...>` group from `text`, balanced across any nested pair.
 ///
-/// Returns `text` unchanged if it has no leading `<`.
+/// Returns `text` unchanged if it has no leading `<`. A `>` that closes a return
+/// type — `Fn() -> u32` in a bound — closes no bracket and is not counted.
 fn skip_leading_generic_params(text: &str) -> &str {
     let trimmed = text.trim_start();
     let Some(rest) = trimmed.strip_prefix('<') else {
         return trimmed;
     };
     let mut depth: u32 = 1;
+    let mut previous: Option<char> = None;
     for (index, character) in rest.char_indices() {
         match character {
             '<' => depth = depth.saturating_add(1),
+            '>' if previous == Some('-') => {}
             '>' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
@@ -2896,6 +2914,7 @@ fn skip_leading_generic_params(text: &str) -> &str {
             }
             _ => {}
         }
+        previous = Some(character);
     }
     // Unbalanced: the header spans lines. `public_functions`'s own `pending` state
     // handles the line that opens the block instead. Report no trait name here.
@@ -5973,6 +5992,55 @@ mod tests {
             \x20   fn fmt(&self) {}\n\
              }\n",
         ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_return_arrow_inside_a_generic_bound_does_not_close_the_bracket_early() {
+        // `Fn() -> u32`'s `>` is not a generic close. Counting it as one truncates
+        // the scan before the real trait name and reads garbage in its place —
+        // garbage that then fails to match the private name and is misread as
+        // reachable. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents:
+                    "impl<F: Fn() -> u32> Internal for Bank<F> {\n    fn hidden(&self) {}\n}\n"
+                        .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_qualified_external_trait_is_not_hidden_by_a_same_named_private_trait() {
+        // A private trait and an external one can share a name. The qualified
+        // path to the external trait must not be judged by that collision.
+        // Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Debug {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
         let names: Vec<&str> = functions
             .iter()
             .map(|function| function.name.as_str())
