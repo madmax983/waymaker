@@ -84,8 +84,8 @@ fn main() -> ! {
     // reason: its locals, `part` and `page` among them, must sit in a frame of their own,
     // below this one, and must never share this frame with anything read here.
     let depth_from = stack::current_stack_pointer();
-    let available = stack::available_bytes(depth_from);
-    if available <= u32::try_from(stack::GUARD_BYTES).unwrap_or(u32::MAX) {
+    let headroom = stack::available_bytes(depth_from);
+    if headroom <= u32::try_from(stack::GUARD_BYTES).unwrap_or(u32::MAX) {
         hprintln!(
             "{} failed the stack region between the linker's `_stack_end` and the current stack pointer leaves no room to paint or measure",
             PREFIX
@@ -94,9 +94,14 @@ fn main() -> ! {
         halt();
     }
 
-    stack::paint(depth_from);
+    let resolved = stack::paint(depth_from);
     let outcome = measured_run();
-    let used = stack::high_water_mark(depth_from);
+    // Read against `resolved` — the bound `paint` actually used — rather than the original
+    // `depth_from` or a fresh reading of its own. Either of those would let this figure and
+    // `used` below disagree by the few bytes each call's own frame costs, which could report
+    // `used` short of `available` even where a run disturbed every byte `paint` painted.
+    let used = stack::high_water_mark(resolved);
+    let available = stack::available_bytes(resolved);
 
     match outcome {
         Ok(census) => {

@@ -134,6 +134,22 @@ stack genuinely is. The two functions' own live readings can differ by the few b
 one's own call frame costs — `GUARD_BYTES` is what already exists to absorb exactly that kind
 of variance, so no new margin was needed.
 
+**Reading the live stack pointer independently at three different points in the boot is itself
+the next gap, and it is sharper than a rounding error.** `available_bytes` runs once before
+`paint`, and `high_water_mark` runs once after the measured boot returns; each took its own
+fresh live reading, so the two could disagree by the few bytes their own call frames cost —
+and, because `available_bytes` runs earliest, with the least stack consumed since `main`'s own
+reading, its bound tends to be the *largest* of the three, which is exactly the wrong direction
+for a safety net: a run that genuinely disturbed every byte `paint` painted could still report
+`used` a few bytes short of `available`, and `StackUsage::shortfall`'s `used >= available` check
+— the one line meant to catch that exact case — would not fire. `paint` now returns the bound
+it resolved, and `main` passes that same value on to `high_water_mark` and to a *second*,
+later call to `available_bytes`, rather than letting either re-derive an independent reading
+of its own. Each still clamps defensively, so neither depends on the other for its own
+soundness — but in the ordinary case a call given an already-resolved bound finds its own live
+reading no smaller, so the clamp is a no-op, and the two figures are measured against the one
+bound `paint` actually used.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -163,13 +179,15 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**Neither hardening changed what the figure means, only what a wrong caller could do to it.**
-`clamp_to_stack_region` is a floor-and-ceiling clamp plus a live-stack-pointer clamp, not a new
-measurement path, and what changed is the *worst case* for an argument this ADR's own text had
-already named as an obligation on the caller rather than a check: it is now a check too. The
-one caller this crate has — `main`, reading `current_stack_pointer()` before calling anything
-else — sees the figure move by at most the handful of bytes `clamp_to_stack_region`'s own call
-frame costs against `main`'s original reading, which is inside the noise `GUARD_BYTES` already
+**None of the three hardenings changed what the figure means, only what a wrong caller could do
+to it, and how the one real caller is sequenced.** `clamp_to_stack_region` is a floor-and-ceiling
+clamp plus a live-stack-pointer clamp, not a new measurement path, and what changed is the
+*worst case* for an argument this ADR's own text had already named as an obligation on the
+caller rather than a check: it is now a check too. `main` now reads `available_bytes` twice —
+once on its own original reading, to decide whether to attempt a measurement at all, and once
+more on the bound `paint` returned, to report a figure measured against the same bound
+`high_water_mark` used — and both readings sit within the handful of bytes each call's own
+frame costs of `main`'s original reading, which is inside the noise `GUARD_BYTES` already
 exists to absorb and smaller than what the ADR's own lower-bound honesty already asks a reader
 to expect.
 

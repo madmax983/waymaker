@@ -2842,7 +2842,14 @@ either function computes a pointer from it. Being inside that range is not being
 the lower of the region-clamped value and a fresh stack-pointer reading of its own, taken at
 the moment either function is called; a stale or wrong reading is now a wrong measurement,
 never an out-of-bounds access, and a caller's `depth_from` can only narrow what gets touched,
-never widen it past where the stack genuinely is. See
+never widen it past where the stack genuinely is. Three independent live readings taken at
+three different points in the boot can still disagree with each other by those same few
+bytes, and `available_bytes` — called earliest, before `paint`, with the least stack consumed
+since `main`'s own reading — tends to disagree in the wrong direction: a run that disturbed
+every painted byte could report `used` a few bytes short of `available`, which is exactly the
+case `StackUsage::shortfall`'s `used >= available` check exists to catch. `paint` now returns
+the bound it resolved, and `main` passes that same value to `high_water_mark` and to a second,
+later `available_bytes` call rather than letting either re-derive its own reading. See
 [ADR 0041](docs/adr/0041-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
