@@ -1863,10 +1863,12 @@ pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Viola
 /// comparison and this is a shape, and a reader chasing one does not have to read the
 /// other.
 ///
-/// Fails closed three ways, each reported rather than read as a pass: the file does not
-/// parse, so neither half below can be checked; the file parses but declares no
-/// `Recovery` struct at all, which is a rename this pin must not read as "no `Clone`
-/// found"; or it declares one that is `Clone`, by a derive or by a handwritten `impl`.
+/// Fails closed four ways, each reported rather than read as a pass: the file does not
+/// parse, so none of the checks below can be run; the file invokes a macro at module
+/// scope, which could expand to a `Clone` impl this scan cannot see; the file parses but
+/// declares no `Recovery` struct at all, which is a rename this pin must not read as "no
+/// `Clone` found"; or it declares one that is `Clone`, by a derive or by a handwritten
+/// `impl`.
 fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
     const RULE: &str = "recovery-surface";
     const ADAPTER: &str = "waymaker-flash";
@@ -1875,6 +1877,31 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
         // `check_pinned_surface`, called just above, already reports a missing module.
         return Vec::new();
     };
+    match crate::parse::declares_item_macro(&source.contents) {
+        Ok(false) => {}
+        Ok(true) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} invokes a macro at module scope: this scan \
+                     cannot expand it, so whether it generates a `Clone` impl for \
+                     `{RECOVERY_TYPE}` cannot be ruled out"
+                ),
+            )];
+        }
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} does not parse, so whether it invokes a \
+                     macro that could generate `Clone` for `{RECOVERY_TYPE}` cannot be \
+                     checked: {error}"
+                ),
+            )];
+        }
+    }
     let derived = match crate::parse::struct_derives(&source.contents, RECOVERY_TYPE) {
         Ok(Some(derived)) => derived,
         Ok(None) => {
@@ -10608,6 +10635,29 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_module_scope_macro_invocation_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 9: an item-level macro
+        // invocation in this file — defined here or, as the finding's example has it, in
+        // a sibling file like `lib.rs` and only invoked here — could expand to anything
+        // at all, including a `#[derive(Clone)]` or a handwritten `impl Clone`, and
+        // neither `struct_derives` nor `trait_implementors` can expand a macro to see
+        // what it generates. Mirrors `ctx-facade`'s ban on a declared `macro_rules!`,
+        // generalized to any invocation rather than only a local definition.
+        let macro_invocation = recovery_source_with_struct(concat!(
+            "generate_clone_impl!(Recovery);\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&macro_invocation);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
             "{}",
             violations[0].detail
         );

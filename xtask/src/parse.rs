@@ -601,6 +601,34 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     Ok(declared.then_some(derives))
 }
 
+/// Whether `contents` invokes any macro at the top level — `Item::Macro`, which covers
+/// both a `macro_rules!` definition and an invocation of one defined elsewhere
+/// (`generate_clone_impl!(Recovery);`).
+///
+/// Reads only the top level for the same reason [`struct_derives`] does: an item a macro
+/// like this one expands to would land at module scope, next to the struct it names, not
+/// inside some unrelated nested `mod`.
+///
+/// This module cannot expand a macro (see the module doc's residual limits), so an
+/// item-level invocation could expand to anything — a `#[derive(Clone)]`, a handwritten
+/// `impl Clone`, or nothing at all — and neither [`struct_derives`] nor
+/// [`trait_implementors`] can tell which. Found by Codex review of this change (PR #143),
+/// round 9: mirrors the ban `names_identifier(&code, "macro_rules")` already places on a
+/// **declared** macro elsewhere in this file, generalized to any invocation rather than
+/// only a local definition, because the macro doing the expanding does not have to be
+/// declared in the file it expands into.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
+    let file = parse_rust(contents)?;
+    Ok(file
+        .items
+        .iter()
+        .any(|item| matches!(item, syn::Item::Macro(_)) && !has_cfg_test(item_attrs(item))))
+}
+
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one
 /// reached only by expanding a `#[cfg_attr(.., cfg(..))]` however many levels deep.
 ///
