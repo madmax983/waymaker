@@ -116,7 +116,22 @@ pub const CLAUSES: &[Clause] = &[
         discharge: Discharge::Model,
         proof: "tests/spine.rs",
         falsifier: "tests/necessity.rs",
-        owed: None,
+        owed: Some(
+            "the composition of record scanning and bank selection, against a real device. \
+             `tests/refinement.rs`'s record writers never touch a bank and its bank-swap \
+             writer never declares a record — `BANK_REFINEMENT.records` is `0`, and every \
+             `Observation` the swap sweep builds is `records: Vec::new()` — so the real \
+             firmware has never been driven through a crash that leaves it with an \
+             authoritative bank *and* a record for `single_authority`'s bank check to judge. \
+             `Invariant::SingleAuthority` is exhaustively proved and falsified over the \
+             model, and `Journal::bank_of` is unit-tested directly against a hand-built \
+             multi-bank `Observation`, but the two have never been exercised together \
+             through a real crashed device. Codex found this on review of the pull request \
+             that closed issue #67's bank dimension. Closing it needs a writer that both \
+             declares records and performs a real two-bank swap, refined the way \
+             `crates/waymaker-fault/tests/banks.rs` and `tests/refinement.rs`'s existing \
+             halves each are on their own.",
+        ),
     },
     Clause {
         id: "stable-redelivery",

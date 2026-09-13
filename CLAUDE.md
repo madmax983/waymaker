@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`, and refined against a real two-bank swap since issue #73's `tests/refinement.rs` abstraction of `waymaker_flash::bank` |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`, and refined against a real two-bank swap since issue #73's `tests/refinement.rs` abstraction of `waymaker_flash::bank` — though that refinement and the record refinement beside it have never been driven by one writer, so the bank check itself is still owed against a real device with a record on it |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -1044,10 +1044,16 @@ Stated so that nobody mistakes silence for coverage:
   `crates/waymaker-fault/tests/banks.rs`'s own, is folded into `[Bank; 2]` at every crash
   point and checked against the model's reachable set. Issue #67 gave the *model* the
   dimension that made a bank-aware refinement possible in the first place — a `Record`'s
-  `BankId`, and recovery scoped to the one a reader would boot from — so `single-authority` is
-  now proved about a device rather than only about a model, and `obligation.rs`'s row says so.
+  `BankId`, and recovery scoped to the one a reader would boot from. What it has not made
+  possible yet is a *joint* refinement: the record writers never touch a bank and the
+  bank-swap writer never declares a record, so `single_authority`'s own bank check — that a
+  recovered record's bank is the sole authoritative one — has been refined only against
+  `recovered: &[]`, never against a real crash that leaves a device with both an authority
+  and a record on it. `obligation.rs`'s row says so rather than the earlier, wider claim that
+  `single-authority` was fully proved about a device; Codex found the gap between the claim
+  and the two sweeps' actual coverage on review of the pull request that closed issue #67.
   What is not covered is every bank sequence a firmware could produce, only the one swap this
-  file drives. See
+  file drives — and, until the two sweeps compose, no sequence with a record in it. See
   [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md) and
   [ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
@@ -3096,3 +3102,25 @@ generation is an unbounded integer, where the firmware refuses at the ceiling ra
 proving the refusal unnecessary" — one integer narrower than stated there, in both
 `refine::bank_after_seal`'s doc comment and beside `begin_seal`'s own `checked_add`, rather
 than moving the census for a boundary no proof or refinement test comes near.
+
+The same round's next pass on the pull request that closed issue #67 found that the "nothing
+is owed" `single-authority` row itself overclaimed. `tests/refinement.rs`'s two refinements
+never compose: the record writers (`journal`, `effect_protocol`, and the one that survives a
+failed program) never touch a bank, and the bank-swap writer's own bound —
+`BANK_REFINEMENT.records: 0` — never declares one, so every `Observation` the swap sweep
+builds is `records: Vec::new()` and `single_authority` is checked there against
+`recovered: &[]`. `Invariant::SingleAuthority`'s bank check — that a recovered record's bank
+is the sole authoritative one, the very thing this round's earlier finding fixed `bank_of`
+over — has therefore never been refined against a real crashed device that both wrote a
+record and swapped banks, only proved exhaustively over the model and unit-tested directly
+against a hand-built multi-bank `Observation`. `obligation.rs`'s `single-authority` row now
+names this gap in its `owed` field instead of `None`, matching the standing every other
+partly-discharged clause here already has;
+`what_is_still_owed_is_written_down_rather_than_left_out` in `tests/obligations.rs` pins the
+exact set of clauses with something owed, which is now `single-authority` and
+`bounded-decoding` rather than `bounded-decoding` alone. CLAUDE.md's own guarantees table and
+its "that the ghost model is a model of *this* firmware" bullet are corrected the same way,
+rather than left to read as though the earlier, wider claim still held. Closing it for real
+needs a writer that both declares records and performs a real two-bank swap — the two things
+`crates/waymaker-fault/tests/banks.rs` and `tests/refinement.rs`'s two existing halves each
+do on their own — refined together the way each already is separately.
