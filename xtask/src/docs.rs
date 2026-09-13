@@ -5990,6 +5990,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unterminated_comment_nested_in_html_hides_everything_after_it() {
+        // Codex, pull request #138, round 14: CommonMark never renders an HTML comment
+        // with no closing `-->`, and treats everything after it the same way — the old
+        // `without_html_comments` already discarded the remainder for this case
+        // (`return kept;` on no match), and the per-block scan has to match that rather
+        // than stopping at the enclosing `<div>` block's own boundary, which ends at the
+        // blank line before the real link and has nothing to do with where the comment
+        // itself gives up looking for its close.
+        let index = "<div>\n<!-- unterminated\n</div>\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "0001-one.md"
+                && v.detail.contains("no link in the index points at it")),
+            "an unterminated comment did not hide the real link after it: {violations:?}"
+        );
+    }
+
+    #[test]
     fn an_inline_comment_does_not_vouch_for_the_link_inside_it() {
         // Codex, pull request #138: an HTML comment sitting on its own line is
         // `Event::Html`, but one mid-paragraph — `text <!-- ... --> text` — is
@@ -6614,6 +6636,29 @@ mod tests {
                 .iter()
                 .any(|violation| violation.subject == clause.id
                     && violation.detail.contains("no table row")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_descriptive_link_still_counts() {
+        // Codex, pull request #138, round 14: a descriptive link renders only its label
+        // through `Event::Text` — the destination lives on `Tag::Link`, which the cell
+        // collector did not read. A row that names its discharge as
+        // `[recovery proof](tests/spine.rs)` shows a reader "recovery proof" and links it
+        // to the real path, and `table_rows` must still find the path itself.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| [recovery proof]({}) |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
             "{violations:?}"
         );
     }

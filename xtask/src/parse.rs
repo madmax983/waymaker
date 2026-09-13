@@ -1118,18 +1118,25 @@ pub fn visible_source(contents: &str) -> String {
                     // pull request #138, round 13). One `HtmlBlock` event covers the
                     // whole block, real tags and nested comments alike, so each
                     // `<!--` ... `-->` span inside it is hidden on its own rather than
-                    // requiring the block to be nothing but a comment. HTML comments do
-                    // not nest, so the first `-->` always closes the `<!--` before it;
-                    // an unterminated `<!--` hides nothing, the same as before.
-                    let block = &contents[start..range.end];
-                    let mut cursor = 0usize;
-                    while let Some(open) = block[cursor..].find("<!--") {
+                    // requiring the block to be nothing but a comment.
+                    //
+                    // The close is searched for from the opener to the end of the whole
+                    // document, not only to the end of this block (Codex, round 14): an
+                    // unterminated `<!--` is not rendered, so everything after it is as
+                    // hidden as a matched comment's body, matching the fail-closed
+                    // behaviour `without_html_comments` already had for this case. HTML
+                    // comments do not nest, so the first `-->` found always closes the
+                    // `<!--` before it.
+                    let mut cursor = start;
+                    while let Some(open) = contents[cursor..range.end].find("<!--") {
                         let open = cursor + open;
-                        let Some(close) = block[open..].find("-->") else {
+                        let end = contents[open..]
+                            .find("-->")
+                            .map_or(contents.len(), |close| open + close + "-->".len());
+                        hidden.push((open, end));
+                        if end >= range.end {
                             break;
-                        };
-                        let end = open + close + "-->".len();
-                        hidden.push((start + open, start + end));
+                        }
                         cursor = end;
                     }
                 }
@@ -1307,6 +1314,16 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                 cell.push('`');
                 cell.push_str(&code);
                 cell.push('`');
+            }
+            // A descriptive link, `[recovery proof](tests/spine.rs)`, renders only its
+            // label through `Event::Text`; the destination is the `Tag::Link` this cell
+            // is now inside (Codex, pull request #138, round 14). The old row scan read
+            // raw source text and saw the destination along with the label, so a cell
+            // whose required value is the link target rather than its label must still
+            // carry that value for `.contains` to find.
+            Event::Start(Tag::Link { dest_url, .. }) if in_row => {
+                cell.push_str(&dest_url);
+                cell.push(' ');
             }
             _ => {}
         }
