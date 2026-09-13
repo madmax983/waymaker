@@ -10404,6 +10404,45 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_hidden_behind_a_nested_cfg_attr_cfg_decoy_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `#[cfg_attr(all(), cfg(any()))]`
+        // is valid Rust that removes the item exactly as a bare `#[cfg(any())]` would, but
+        // the first version of `has_any_cfg` only read an item's own attribute paths and
+        // never unwrapped a `cfg_attr` to find a `cfg` nested inside it.
+        let cfg_attr_gated_decoy = recovery_source_with_struct(
+            "#[cfg_attr(all(), cfg(any()))]\npub struct Recovery;\n#[derive(Clone, Debug, \
+             PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as Recovery;\n",
+        );
+        let violations = check_recovery_surface(&cfg_attr_gated_decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_chained_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `use core::clone::Clone as C;
+        // use self::C as Klon;` is a two-hop rename, and the first version of this check
+        // only substituted one hop, reporting the derive as `C` instead of `Clone`.
+        let chained = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as C;\n",
+            "use self::C as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&chained);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

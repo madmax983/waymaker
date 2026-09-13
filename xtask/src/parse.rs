@@ -313,6 +313,38 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     segments
 }
 
+/// [`resolve_segments`], chasing a `self::name` result whose `name` is itself an alias.
+///
+/// `resolve_segments` substitutes once: `use core::clone::Clone as C; use self::C as
+/// Klon;` resolves `Klon` to `[self, C]` and stops there, because `self` is never itself a
+/// registered alias and the substitution logic has nowhere else to look. But `self::C`
+/// means "this module's own `C`", and if `C` names a second alias, that is what `Klon`
+/// ultimately refers to — here, `core::clone::Clone`. Bounded by `aliases.len()` hops
+/// rather than run to a fixed point, so a `use A as B; use B as A;` cycle — not something
+/// real Rust name resolution could produce, but something a text file can still spell —
+/// terminates instead of looping.
+///
+/// What this does not chase: a chain that leaves the `self::` shape after its first hop,
+/// such as one running back through a grouped import (`use a::{B as C};`) whose own target
+/// already has more than one segment. Real multi-hop resolution needs the crate's full
+/// module tree, which is outside what this file's syntax-only reading can ever have.
+fn resolve_segments_transitively(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
+    let mut segments = resolve_segments(path, aliases);
+    for _ in 0..aliases.len() {
+        let [first, second] = segments.as_slice() else {
+            break;
+        };
+        if first != "self" {
+            break;
+        }
+        let Some(alias) = aliases.iter().find(|candidate| &candidate.local == second) else {
+            break;
+        };
+        segments = alias.target.clone();
+    }
+    segments
+}
+
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
 ///
 /// The trait is matched on its resolved last segment, so `Future` imported under
@@ -451,16 +483,58 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     Ok(declared.then_some(derives))
 }
 
-/// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition.
+/// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one
+/// reached only by expanding a `#[cfg_attr(.., cfg(..))]` however many levels deep.
 ///
 /// Broader than [`has_cfg_test`]: this module does not evaluate a `cfg`'s condition (see
 /// the module doc's residual limits), so an item behind *any* `cfg` — not only
 /// `cfg(test)` — might not be the declaration that ships, in either direction. A pin that
 /// has to answer for one specific, unconditional type needs an unconditional declaration
 /// to point at; reading past an unevaluated condition either way is the shape of mistake
-/// [`struct_derives`] exists to catch, not something it can also fall into.
+/// [`struct_derives`] exists to catch, not something it can also fall into. The recursion
+/// mirrors [`collect_derive_names_from_meta`]'s: `#[cfg_attr(all(), cfg(any()))]` is valid
+/// Rust that removes the item exactly as a bare `#[cfg(any())]` would, and a check that
+/// only read the outer attribute's own path would call it unconditional.
 fn has_any_cfg(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| attr.path().is_ident("cfg"))
+    attrs.iter().any(attr_introduces_cfg)
+}
+
+/// Whether `attr` is a `#[cfg(..)]`, or a `#[cfg_attr(.., ..)]` that expands to one at any
+/// depth. Unreadable `cfg_attr` arguments answer `true`: an attribute this scan cannot
+/// read is not evidence of an unconditional declaration.
+fn attr_introduces_cfg(attr: &syn::Attribute) -> bool {
+    if attr.path().is_ident("cfg") {
+        return true;
+    }
+    if !attr.path().is_ident("cfg_attr") {
+        return false;
+    }
+    let Ok(metas) = attr.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return true;
+    };
+    metas.iter().skip(1).any(meta_introduces_cfg)
+}
+
+/// [`attr_introduces_cfg`], over one argument of a `cfg_attr` rather than over a whole
+/// attribute.
+fn meta_introduces_cfg(meta: &syn::Meta) -> bool {
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    if list.path.is_ident("cfg") {
+        return true;
+    }
+    if !list.path.is_ident("cfg_attr") {
+        return false;
+    }
+    let Ok(nested) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return true;
+    };
+    nested.iter().skip(1).any(meta_introduces_cfg)
 }
 
 /// The trait names `meta` derives, resolved through `aliases`: from a plain
@@ -508,7 +582,7 @@ fn push_resolved_names(
     derives: &mut Vec<String>,
 ) {
     for path in paths {
-        if let Some(name) = resolve_segments(path, aliases).pop() {
+        if let Some(name) = resolve_segments_transitively(path, aliases).pop() {
             derives.push(name);
         }
     }
