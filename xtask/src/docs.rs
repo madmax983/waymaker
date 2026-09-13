@@ -5591,6 +5591,15 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_does_not_normalize_an_asterisk_bullet_into_the_real_marker() {
+        // Codex, pull request #138: `markdown_prose` rendered every unordered item
+        // with `- ` regardless of the source marker, so `* Status: accepted` shown
+        // as an example became indistinguishable from a real `- ` bullet.
+        let contents = "# ADR\n\n* Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {

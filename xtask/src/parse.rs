@@ -930,7 +930,7 @@ pub enum InlineCode {
 pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-    let parser = Parser::new_ext(contents, Options::empty());
+    let parser = Parser::new_ext(contents, Options::empty()).into_offset_iter();
     let mut out = String::new();
     let mut in_fence = false;
     // A quoted example is an example: `> - Status: accepted` shown as a worked case
@@ -942,7 +942,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // `- ` marker, and reconstructing every item with it regardless of list kind
     // would let an ordered-list example stand in for the real bullet.
     let mut ordered_lists: Vec<bool> = Vec::new();
-    for event in parser {
+    for (event, range) in parser {
         let hidden = in_fence || blockquote_depth > 0;
         match event {
             Event::Start(Tag::List(kind)) => {
@@ -1013,13 +1013,20 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    // Only an unordered item renders as `- `; an ordered one renders
-                    // as `1. ` so it can never be mistaken for the marker a field or
-                    // claim scan matches on.
                     if ordered_lists.last().copied().unwrap_or(false) {
+                        // An ordered item renders as `1. ` so it can never be
+                        // mistaken for the marker a field or claim scan matches on.
                         out.push_str("1. ");
                     } else {
-                        out.push_str("- ");
+                        // CommonMark allows `-`, `*` or `+` for an unordered item,
+                        // and normalizing every one of them to `-` would make an
+                        // example written with a different marker indistinguishable
+                        // from the real bullet a scan matches on. The item's own
+                        // range starts at its marker, so read the real one back from
+                        // the source rather than guessing.
+                        let marker = contents[range.start..].chars().next().unwrap_or('-');
+                        out.push(marker);
+                        out.push(' ');
                     }
                 }
             }
