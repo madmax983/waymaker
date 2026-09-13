@@ -1069,6 +1069,13 @@ impl Rig {
     }
 
     /// Erases the instrument area, as the rig's own traffic, and waits for it.
+    ///
+    /// # Errors
+    ///
+    /// [`RigError::Storage`] when the driver refuses the erase or the barrier.
+    /// [`instrument`](Self::instrument) already checked the window, so a window error cannot
+    /// happen here. [`unwindow`] still reports a real driver failure as `RigError::Storage`,
+    /// not as `RigError::Witness`.
     fn erase_instrument<S: StableStorage>(
         &self,
         part: &mut Metered<'_, S>,
@@ -1082,7 +1089,7 @@ impl Rig {
                 .and_then(|()| instrument.barrier())
         };
         part.set_traffic(Traffic::Engine);
-        outcome.map_err(|_| RigError::Witness(WitnessError::Region))
+        outcome.map_err(unwindow)
     }
 
     /// The witness as the reset left it, positioned to append, and what it claims.
