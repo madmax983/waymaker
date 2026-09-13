@@ -469,18 +469,28 @@ pub enum RecoveryError<E> {
     Storage(E),
     /// A frame was not the record it claimed to be.
     Decode(DecodeError),
-    /// The storage handed to a step is not the device the region was validated against.
+    /// The device this reader was constructed with is not the one the region was validated
+    /// against.
     ///
-    /// Every bound this module keeps — that a read is aligned and inside the region, that a
-    /// frame's padded stride lands where a record may be written — was established against
-    /// one [`Geometry`], at construction. A step given a different device would be answering
-    /// about that device with arithmetic proved about another, and the failure is silent in
-    /// the direction that matters: a region built where the program unit is one byte and
-    /// walked on a device that programs eight reads perfectly well, reports a clean end, and
-    /// hands back an append offset the second device must refuse.
+    /// Issue [#84](https://github.com/madmax983/waymaker/issues/84)'s device-swap is already
+    /// closed here by construction: [`Recovery`] borrows `storage` for its whole life, so
+    /// there is no second call for a second device to arrive on. What this refusal still
+    /// catches is a [`Recovery`] built from a region and a device that never matched to
+    /// begin with — a region carved from one [`Geometry`] hand-carried to `new` or
+    /// `with_integrity` alongside a different one. Every bound this module keeps — that a
+    /// read is aligned and inside the region, that a frame's padded stride lands where a
+    /// record may be written — was established against the region's own `Geometry`, and a
+    /// mismatched device answering that arithmetic is silent in the direction that matters:
+    /// a region built where the program unit is one byte and walked on a device that
+    /// programs eight reads perfectly well, reports a clean end, and hands back an append
+    /// offset the device must refuse.
     ///
-    /// So the two are compared rather than assumed equal, on every step. It is four integer
-    /// comparisons against an anti-bricking guarantee.
+    /// So the two are compared rather than assumed equal, and on every step rather than only
+    /// at construction: `new` and `with_integrity` are `const fn` and cannot fail, so the
+    /// first fallible point this mismatch can be reported at is here. Four integer
+    /// comparisons against an anti-bricking guarantee, paid on every record rather than
+    /// once, because a constructor that could fail would cost every caller a `Result` for a
+    /// mistake this one can only ever have been made once.
     WrongDevice,
     /// The caller's page cannot hold what the next step has to stage.
     ///
@@ -515,11 +525,23 @@ pub enum RecoveryError<E> {
 /// * [`append_offset`](Self::append_offset) answers [`Some`] only for a scan that ended in
 ///   erased media.
 ///
+/// # Why it holds `storage` rather than taking it at every call
+///
+/// Issue [#84](https://github.com/madmax983/waymaker/issues/84): [`next`](Self::next) is
+/// pumped once per record over a whole scan, and a `storage: &mut S` argument accepted anew
+/// at every call cannot tell two devices of one model apart — [`StableStorage::geometry`]
+/// answers the same for both. A caller that alternated between two devices mid-scan would
+/// interleave reads from two chips into one offset-tracking position, and no per-call check
+/// can see it: each read would validate cleanly against its own device and disagree only in
+/// its bytes. Taking `storage` once, at [`new`](Self::new), makes that not a thing a caller
+/// can write: there is one device for the scan's whole life, because there is one field.
+///
 /// # Why it is not `Copy`
 ///
 /// A position, and a copied position is two readers of one journal that each believe they
-/// are the only one. `Clone` stays, because forking a scan deliberately is a thing a caller
-/// may want to write down.
+/// are the only one. `Clone` is not derived either, now that a copy would also be a second
+/// exclusive borrow of one device — the same reason [`crate::append::Journal`] gives up
+/// `Clone` for two writers over one offset.
 ///
 /// # Why the integrity check is a type parameter
 ///
@@ -527,8 +549,19 @@ pub enum RecoveryError<E> {
 /// is walking. It defaults to [`Catalogued`], so `Recovery` is the shipped check and a
 /// caller that wants another writes it down at the type, where it is visible in every
 /// signature the value passes through.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Recovery<C: IntegrityCheck = Catalogued> {
+///
+/// # Why `S` is not a bound on the struct itself
+///
+/// Every other bounded type in this crate puts the bound on the declaration
+/// (`Journal<C: IntegrityCheck>` and so on), because the bound costs nothing —
+/// [`IntegrityCheck`]'s implementations carry no data. `StableStorage` is different: this
+/// type's size is a fact §04's runtime-RAM budget is stated against, and the assertion below
+/// has to name a concrete type to measure. Leaving the bound off the struct and putting it on
+/// the `impl` blocks that need it is what lets the assertion instantiate `S` with `()`
+/// instead of inventing a driver nobody ships to satisfy a trait nothing here calls.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Recovery<'storage, S, C: IntegrityCheck = Catalogued> {
+    storage: &'storage mut S,
     region: JournalRegion,
     offset: u32,
     ending: Option<Ending>,
@@ -548,25 +581,29 @@ struct Staged {
     stride: u32,
 }
 
-impl Recovery<Catalogued> {
-    /// A recovery of `region`, verifying with the shipped integrity check.
+impl<'storage, S> Recovery<'storage, S, Catalogued> {
+    /// A recovery of `region` over `storage`, verifying with the shipped integrity check.
+    ///
+    /// `storage` is borrowed for the whole life of this value: see "why it holds `storage`
+    /// rather than taking it at every call" above.
     #[must_use]
     #[inline]
-    pub const fn new(region: JournalRegion) -> Self {
-        Self::with_integrity(region)
+    pub const fn new(region: JournalRegion, storage: &'storage mut S) -> Self {
+        Self::with_integrity(region, storage)
     }
 }
 
-impl<C: IntegrityCheck> Recovery<C> {
-    /// A recovery of `region`, verifying with `C`.
+impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
+    /// A recovery of `region` over `storage`, verifying with `C`.
     ///
     /// [`new`](Recovery::new) is this at `C = Catalogued`. A recovery with the wrong `C`
     /// does not misread a journal: it stops at the first frame with
     /// [`DecodeError::IntegrityFailed`], because a seal computed by one algorithm is
     /// overwhelmingly unlikely to verify under another.
     #[must_use]
-    pub const fn with_integrity(region: JournalRegion) -> Self {
+    pub const fn with_integrity(region: JournalRegion, storage: &'storage mut S) -> Self {
         Self {
+            storage,
             region,
             offset: 0,
             ending: None,
@@ -633,6 +670,23 @@ impl<C: IntegrityCheck> Recovery<C> {
         }
     }
 
+    /// The device this scan read, given back once nothing else needs the scan itself.
+    ///
+    /// For a caller whose only handle to the device lived inside this value — issue
+    /// [#84](https://github.com/madmax983/waymaker/issues/84) is why that can happen at all —
+    /// and who now wants to do something with the device that has nothing to do with this
+    /// scan. [`crate::append::Journal::after`] is the call for a caller that wants a *writer*
+    /// positioned where the scan ended; this is for everything else, and it says nothing
+    /// about how the scan ended.
+    ///
+    /// It cannot be used to reach a second `Recovery` over the same device at the same
+    /// position: this consumes the scan's own state along with the borrow, so the offset and
+    /// ending this value tracked are gone with it.
+    #[must_use]
+    pub const fn into_storage(self) -> &'storage mut S {
+        self.storage
+    }
+
     /// The next committed record, staged into `page`.
     ///
     /// The caller pumps: it owns the page, it may overwrite it the moment it has dealt with
@@ -650,17 +704,19 @@ impl<C: IntegrityCheck> Recovery<C> {
     /// against the region, unsealed — [`DecodeError::Unsealed`], §09's first stop condition
     /// and the one that says the writer never reached §07 step 3 — or wearing a record kind
     /// this firmware does not know; [`RecoveryError::Storage`] when a read fails;
-    /// [`RecoveryError::WrongDevice`] when `storage` is not the device the region was
-    /// validated against; and [`RecoveryError::PageTooSmall`] when `page` cannot hold the
-    /// next record. Every one of them ends the scan.
-    pub fn next<'page, S: StableStorage>(
+    /// [`RecoveryError::WrongDevice`] when the storage this recovery was built over is not
+    /// the device the region was validated against; and [`RecoveryError::PageTooSmall`] when
+    /// `page` cannot hold the next record. Every one of them ends the scan.
+    pub fn next<'page>(
         &mut self,
-        storage: &mut S,
         page: &'page mut [u8],
-    ) -> Option<Result<RecordRef<'page>, RecoveryError<S::Error>>> {
+    ) -> Option<Result<RecordRef<'page>, RecoveryError<S::Error>>>
+    where
+        S: StableStorage,
+    {
         // Split in two so that every mutable use of the page is behind us before the record
         // borrows it: `stage` fills the page, and nothing below writes to it.
-        let staged = match self.stage(storage, &mut *page)? {
+        let staged = match self.stage(&mut *page)? {
             Ok(staged) => staged,
             Err(error) => return Some(Err(error)),
         };
@@ -737,11 +793,10 @@ impl<C: IntegrityCheck> Recovery<C> {
         reason = "one frame's worth of stop conditions, each of which is a different \
                   ending; splitting them would hide which branch sets which"
     )]
-    fn stage<S: StableStorage>(
-        &mut self,
-        storage: &mut S,
-        page: &mut [u8],
-    ) -> Option<Result<Staged, RecoveryError<S::Error>>> {
+    fn stage(&mut self, page: &mut [u8]) -> Option<Result<Staged, RecoveryError<S::Error>>>
+    where
+        S: StableStorage,
+    {
         if self.ending.is_some() {
             return None;
         }
@@ -749,7 +804,13 @@ impl<C: IntegrityCheck> Recovery<C> {
         // more than bookkeeping: a step on any other device is refused before a byte is read.
         // Codex found the half that survived carrying the geometry — reads that all succeed,
         // a clean ending, and an append offset the *caller's* device cannot program at.
-        if storage.geometry() != self.region.geometry {
+        //
+        // Checked on every call rather than once at construction, unlike `append` and `swap`'s
+        // short commit chains: `self.storage` never changes over this scan's life, so this is
+        // one comparison per record rather than one per protocol step, and moving it to
+        // construction would only trade a cheap repeated check for a fallible `new` every
+        // caller of this crate would have to handle. See issue #84.
+        if self.storage.geometry() != self.region.geometry {
             return Some(Err(self.incomplete(RecoveryError::WrongDevice)));
         }
         let read_unit = self.region.geometry.read_size();
@@ -791,7 +852,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 self.incomplete(RecoveryError::PageTooSmall { needed: usize::MAX })
             ));
         };
-        if let Err(error) = self.read(storage, page, self.offset, want_bytes) {
+        if let Err(error) = self.read(page, self.offset, want_bytes) {
             return Some(Err(self.incomplete(error)));
         }
 
@@ -836,7 +897,7 @@ impl<C: IntegrityCheck> Recovery<C> {
             // remainder strictly between `HEADER_BYTES` and `header_need`: `remaining` is a
             // whole number of program units and a program unit is whole read units. So
             // `want == header_need >= read_unit` here, and `capacity >= want`.
-            return match self.erased_to_end(storage, page, capacity) {
+            return match self.erased_to_end(page, capacity) {
                 Ok(true) => {
                     self.ending = Some(Ending::Clean {
                         append_at: self.offset,
@@ -890,7 +951,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 self.incomplete(RecoveryError::PageTooSmall { needed: need_bytes })
             ));
         }
-        if let Err(error) = self.read(storage, page, self.offset, need_bytes) {
+        if let Err(error) = self.read(page, self.offset, need_bytes) {
             return Some(Err(self.incomplete(error)));
         }
         Some(Ok(Staged {
@@ -910,17 +971,19 @@ impl<C: IntegrityCheck> Recovery<C> {
     /// frame staged: a whole frame, with both seals holding, which the caller would decode
     /// and yield as a duplicate record. "Never a record invented out of stale bytes" has to
     /// include stale bytes this module put there itself.
-    fn read<S: StableStorage>(
-        &self,
-        storage: &mut S,
+    fn read(
+        &mut self,
         page: &mut [u8],
         offset: u32,
         len: usize,
-    ) -> Result<(), RecoveryError<S::Error>> {
+    ) -> Result<(), RecoveryError<S::Error>>
+    where
+        S: StableStorage,
+    {
         let Some(target) = page.get_mut(..len) else {
             return Err(RecoveryError::PageTooSmall { needed: len });
         };
-        storage
+        self.storage
             .read(self.region.base.saturating_add(offset), target)
             .map_err(RecoveryError::Storage)
     }
@@ -931,12 +994,14 @@ impl<C: IntegrityCheck> Recovery<C> {
     /// reads this costs are bounded by the region rather than by history. It is paid once,
     /// at the end of a scan, and it is what stops a hole from reading as the end of a
     /// journal.
-    fn erased_to_end<S: StableStorage>(
-        &self,
-        storage: &mut S,
+    fn erased_to_end(
+        &mut self,
         page: &mut [u8],
         capacity: u32,
-    ) -> Result<bool, RecoveryError<S::Error>> {
+    ) -> Result<bool, RecoveryError<S::Error>>
+    where
+        S: StableStorage,
+    {
         let mut at = self.offset;
         while at < self.region.bytes {
             let want = capacity.min(self.region.bytes.saturating_sub(at));
@@ -945,7 +1010,7 @@ impl<C: IntegrityCheck> Recovery<C> {
                 // answer: it reports damage rather than a clean end, so nothing is appended.
                 return Ok(false);
             };
-            self.read(storage, page, at, want_bytes)?;
+            self.read(page, at, want_bytes)?;
             let Some(chunk) = page.get(..want_bytes) else {
                 return Ok(false);
             };
@@ -1017,12 +1082,20 @@ const fn round_up(len: u32, unit: u32) -> Option<u32> {
 // has no room for a second one. Checked where a mistake is a compile error, the way
 // `ReplayCursor`'s size is: the equality is the point, because a `<=` leaves room to hide a
 // buffer in.
+//
+// `()` stands in for `S` here: a reference's size does not depend on what it points to, so
+// this measures the one thing issue #84 added — a borrow, one pointer wide on any target —
+// without inventing a driver nobody ships to satisfy a trait this assertion never calls. See
+// "why `S` is not a bound on the struct itself" above.
 const _: () = assert!(size_of::<JournalRegion>() == 28);
-const _: () = assert!(size_of::<Recovery>() == 40);
-// And the whole of it is the region, the offset and the verdict: no fourth field, and in
-// particular no page. A `<=` here would leave room to hide one in, which is why the two above
-// are equalities and why this restates the sum rather than trusting them separately.
-const _: () = assert!(size_of::<Recovery>() == size_of::<JournalRegion>() + 4 + 8);
+const _: () = assert!(size_of::<Recovery<'_, ()>>() == 40 + size_of::<usize>());
+// And the whole of it is the borrow, the region, the offset and the verdict: no fifth field,
+// and in particular no page. A `<=` here would leave room to hide one in, which is why the
+// two above are equalities and why this restates the sum rather than trusting them
+// separately.
+const _: () = assert!(
+    size_of::<Recovery<'_, ()>>() == size_of::<usize>() + size_of::<JournalRegion>() + 4 + 8
+);
 
 #[cfg(test)]
 mod tests {
@@ -1072,12 +1145,17 @@ mod tests {
         let geometry = Geometry::new(64, 32, 1, 1).expect("two whole blocks");
         let region = JournalRegion::spanning(geometry, 0, 32, ProgramAlign::BYTE)
             .expect("this region is a legal program");
+        // None of `append_offset` or `ending` touches storage, so `()` stands in for a
+        // device: `S` carries no `StableStorage` bound on the struct itself. See "why `S` is
+        // not a bound on the struct itself" above.
+        let mut device = ();
         for (ending, expected) in [
             (Ending::Clean { append_at: 8 }, Some(8)),
             (Ending::Damaged { at: 8 }, None),
             (Ending::Incomplete { at: 8 }, None),
         ] {
-            let recovery = Recovery::<Catalogued> {
+            let recovery = Recovery::<(), Catalogued> {
+                storage: &mut device,
                 region,
                 offset: 8,
                 ending: Some(ending),
@@ -1085,7 +1163,7 @@ mod tests {
             };
             assert_eq!(recovery.append_offset(), expected);
         }
-        let running = Recovery::new(region);
+        let running = Recovery::new(region, &mut device);
         assert_eq!(running.ending(), None);
         assert_eq!(running.append_offset(), None);
     }

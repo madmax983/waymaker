@@ -592,21 +592,24 @@ fn unwind(error: AppendError<FaultError>) -> FaultError {
 /// The real thing: design document §07's two barriers per record.
 fn journal_writer(session: &mut Session) -> Result<(), FaultError> {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region());
-    while recovery.next(session, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region(), session);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly at its first byte")
     };
 
     for index in 0..RECORDS {
         let mut staging = [0_u8; PAGE];
-        let sealable = journal
+        let before = session.operations();
+        // Declared before any of this record's operations are attempted — see the same
+        // comment in `tests/commit_discipline.rs` — over the two operations `commit` is
+        // pinned to spend once `stage` and `payload_barrier` have spent theirs.
+        session.mark_operations(id(index), (before + 2)..(before + 4));
+        journal
             .stage(session, &record(index), &mut staging)
-            .and_then(|staged| staged.payload_barrier(session))
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
             .map_err(unwind)?;
-        session.begin_record(id(index));
-        sealable.commit(session).map_err(unwind)?;
-        session.end_record();
     }
     Ok(())
 }
@@ -620,9 +623,9 @@ fn recovered(run: &Run) -> Vec<RecordId> {
         unreachable!("the image came from a device of this geometry")
     };
     let mut page = [0_u8; PAGE];
-    let mut reader = Recovery::new(region());
+    let mut reader = Recovery::new(region(), &mut device);
     let mut history = Vec::new();
-    while let Some(step) = reader.next(&mut device, &mut page) {
+    while let Some(step) = reader.next(&mut page) {
         if step.is_err() {
             break;
         }

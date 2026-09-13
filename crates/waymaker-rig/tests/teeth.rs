@@ -91,8 +91,8 @@ fn wrong_writer(flaw: Flaw, session: &mut Session) -> Result<(), ()> {
     let mut journal = {
         let mut engine =
             Window::new(&mut part, 0, rig.layout().geometry().capacity()).map_err(|_| ())?;
-        let mut recovery = Recovery::new(region);
-        while let Some(step) = recovery.next(&mut engine, &mut page) {
+        let mut recovery = Recovery::new(region, &mut engine);
+        while let Some(step) = recovery.next(&mut page) {
             step.map_err(|_| ())?;
         }
         Journal::after(recovery).ok_or(())?
@@ -128,18 +128,13 @@ fn wrong_writer(flaw: Flaw, session: &mut Session) -> Result<(), ()> {
             &mut mark_page,
         )?;
 
-        let mut engine =
-            Window::new(&mut part, 0, rig.layout().geometry().capacity()).map_err(|_| ())?;
-        let record = workload.record(index, &mut record_page).ok_or(())?;
-        let staged = journal
-            .stage(&mut engine, &record, &mut page)
-            .map_err(|_| ())?;
-        let sealable = staged.payload_barrier(&mut engine).map_err(|_| ())?;
-        // The window is a borrow of `part`, and the marks below need it back. Ended with a
-        // scope rather than a `drop`, because a `Window` has no destructor and dropping one
-        // only extends the borrow it holds.
-
-        // The flaw: a mark that belongs after the commit seal, written before it.
+        // The flaw: a mark that belongs after the commit seal, written before it. `Sealable`
+        // holds the device for the whole two-phase commit — see "why the two later steps
+        // take no `storage` argument" in `waymaker_flash::append` — so the wrong mark cannot
+        // be interleaved between the payload barrier and the seal; it goes down here
+        // instead, before the frame is even staged, which is earlier still and breaks the
+        // same guarantee: a crash before the seal now has more ways to land between this
+        // mark and it, not fewer.
         match (flaw, role) {
             (Flaw::AcknowledgeBeforeCommit, _) => {
                 mark(
@@ -158,11 +153,18 @@ fn wrong_writer(flaw: Flaw, session: &mut Session) -> Result<(), ()> {
             (Flaw::DispatchBeforeCommit, _) => {}
         }
 
-        {
-            let mut engine =
-                Window::new(&mut part, 0, rig.layout().geometry().capacity()).map_err(|_| ())?;
-            sealable.commit(&mut engine).map_err(|_| ())?;
-        }
+        let mut engine =
+            Window::new(&mut part, 0, rig.layout().geometry().capacity()).map_err(|_| ())?;
+        let record = workload.record(index, &mut record_page).ok_or(())?;
+        let staged = journal
+            .stage(&mut engine, &record, &mut page)
+            .map_err(|_| ())?;
+        let sealable = staged.payload_barrier().map_err(|_| ())?;
+        // The window is a borrow of `part`, and the mark below needs it back. Ended with a
+        // scope rather than a `drop`, because a `Window` has no destructor and dropping one
+        // only extends the borrow it holds.
+
+        sealable.commit().map_err(|_| ())?;
 
         if flaw == Flaw::DispatchBeforeCommit {
             mark(

@@ -1159,17 +1159,18 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
-- **That a device is an *instance* rather than a geometry.** Four modules refuse storage that
-  is "not the device this was validated against" — `append` at three steps, `recovery`,
-  `capacity` and `swap` at all five — and all four decide it by comparing a `Geometry`. Two
-  parts of the same model have the same one, so none of them can tell two instances apart: a
-  caller holding two chips can prepare a swap on one and commit it on the other, sealing a
-  bank whose erase happened elsewhere or erasing an unrelated device's active bank. Codex
-  found it on issue #26's second review round. It is stated rather than closed because it is
-  one contract in four places and a `swap` that bound an instance while the writer beside it
-  did not would be the one module whose `WrongDevice` meant something else; binding the
-  storage with a borrow instead of a comparison is issue
-  [#84](https://github.com/madmax983/waymaker/issues/84).
+- **That a device is an *instance* rather than a geometry, in `capacity`.** Issue
+  [#84](https://github.com/madmax983/waymaker/issues/84) closed this for `append`,
+  `recovery` and `swap`: each now borrows `storage` for the whole life of its protocol, so a
+  caller holding two chips of one model cannot start on one and finish on the other — the
+  call to do so does not exist, rather than being refused at runtime.
+  `capacity::CapacityError::WrongDevice` stays a value comparison, and deliberately: neither
+  `Reserve::for_layout` nor `Reserved::over` takes a `storage` argument at all, so there is
+  no device instance here to bind — what disagrees is a bank size and a program granularity,
+  both plain numbers a `BankLayout` derived, and two devices of one model agreeing on those
+  is the check working rather than the gap issue #84 named.
+  [ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  says which of the two shapes each `WrongDevice` variant is.
 - **That a run id a swap installs is one the device has never used.** `SwapError::RunReused`
   compares the next run against the one being retired, which is the adjacent mistake and not
   a uniqueness check: a run id from any *earlier* run passes it, and the `(RunId, EffectSeq)`
@@ -2793,3 +2794,42 @@ async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's 
 criterion are here — issues #35, #36, #37, #38 and #39, above — and in-boot sleep is the
 rest of 0.4. The gates went in before the code they govern, which is the point: a gate
 retrofitted after coverage has slipped is a gate that ratifies the slip.
+
+Issue #84 then closes a gap the second review round of issue #26 had only stated: four
+modules refused storage that was "not the device this was validated against", and all four
+decided it by comparing a `Geometry` — a description of a part number, which two chips of
+one model share, so none of the four could tell two *instances* apart. `append`,
+`recovery` and `swap` now borrow `storage` for the whole life of their protocol instead of
+re-accepting it at every step: `Journal::stage`, `Recovery::new`/`with_integrity` and
+`Swap::prepare` are the one call each protocol still takes a `storage` argument at, and
+`Staged`, `Sealable`, `Recovery` and `swap`'s own `Prepared`/`Staged`/`Sealable`/`Installed`
+all carry that borrow onward. A caller who wants to finish a record, a scan, or a swap on a
+second device does not meet `AppendError::WrongDevice` or `SwapStepError::WrongDevice` at
+run time — the call is not one the type lets it write, which a `compile_fail,E0061` doctest
+in each module proves of the code as it stands. `capacity`'s `WrongDevice` stays a value
+comparison rather than moving to a borrow, and correctly: neither of its two entry points
+takes a `storage` argument at all, so there is no device instance there to bind, only a bank
+size and a program granularity that two devices of one model are right to agree on. Every
+`WrongDevice` variant's documentation now says which of the two shapes it is, and
+[ADR 0041](docs/adr/0041-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+is where the choice is argued end to end.
+
+Closing the gap by construction rather than by a wider comparison cost two new functions —
+`Journal::after_taking_storage` and `Recovery::into_storage` — because a `Recovery` that no
+longer hands `storage` back at every call still has to hand it back *once*, to the writer a
+finished scan starts. Both are on `APPEND_SURFACE` and `RECOVERY_SURFACE`, both are linked
+from `waymaker-size-probe`, and both are why `waymaker-drive`'s `Context` changed shape:
+a struct cannot have one field borrow another field of the same instance, so once `Recovery`
+holds the device itself, `Context` cannot hold `storage` as an independent field beside it.
+`Source<'storage, S, C>` is the fix — the device lives in every state of it, `Scanning`,
+`Writing`, `Spent`, and a `Taken` sentinel for the one `mem::replace` needs — so the boot has
+exactly one owner of the device rather than two that would have to stay in step. The test
+suites that drove the old per-call API — `waymaker-fault`'s crash sweeps,
+`waymaker-rig`'s writers under test, and the size probe's linked calls — moved to the new
+one; two of `waymaker-fault`'s writers needed a way to declare a record's operations after
+the fact rather than live, since a borrowed `Sealable` now owns the device for the span they
+used to bracket, which is `Session::operations` and `Session::mark_operations`. Nothing
+about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline` and
+`swap-discipline` both still hold "the one type that may program a seal should do nothing
+else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
+that reason.

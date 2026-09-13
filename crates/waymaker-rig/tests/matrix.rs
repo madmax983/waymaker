@@ -136,8 +136,8 @@ fn ending_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Ending> 
     engine.read(region.base(), page.get_mut(..want)?).ok()?;
     let header = bank::decode_header(page.get(..want)?).ok()?;
     let journal = JournalRegion::of(layout, Rig::BANK, &header).ok()?;
-    let mut recovery = Recovery::new(journal);
-    while let Some(step) = recovery.next(&mut engine, page) {
+    let mut recovery = Recovery::new(journal, &mut engine);
+    while let Some(step) = recovery.next(page) {
         if step.is_err() {
             break;
         }
@@ -927,11 +927,11 @@ fn blank_last_record(rig: &Rig, device: &mut Device, page: &mut [u8]) {
         let Ok(journal) = JournalRegion::of(layout, Rig::BANK, &header) else {
             unreachable!("a journal region")
         };
-        let mut recovery = Recovery::new(journal);
+        let mut recovery = Recovery::new(journal, &mut engine);
         let mut start = None;
         loop {
             let at = recovery.offset();
-            match recovery.next(&mut engine, page) {
+            match recovery.next(page) {
                 Some(Ok(_)) => start = Some(at),
                 Some(Err(_)) | None => break,
             }

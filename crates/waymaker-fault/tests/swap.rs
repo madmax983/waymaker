@@ -250,7 +250,7 @@ fn current_region() -> JournalRegion {
 /// The retired reader is an unscanned [`Recovery`], which is deliberate and costs the sweep
 /// nothing: a scan is reads, reads move no bytes, and the injector's crash points are
 /// mutations. What is being swept is what the swap *writes*.
-fn planned() -> Result<Swap<'static>, SwapError> {
+fn planned(session: &mut Session) -> Result<Swap<'static>, SwapError> {
     Swap::beginning(
         layout(),
         Authority::Bank {
@@ -258,7 +258,7 @@ fn planned() -> Result<Swap<'static>, SwapError> {
             generation: CURRENT,
         },
         RUN,
-        Retired::Recovery(Recovery::new(current_region())),
+        Retired::Recovery(Recovery::new(current_region(), session)),
         next_header(),
     )
 }
@@ -266,31 +266,35 @@ fn planned() -> Result<Swap<'static>, SwapError> {
 /// §10's seven steps, by the real writer.
 fn swap(session: &mut Session) -> Result<(), Failed> {
     previous_life(session)?;
+    let before = session.operations();
+
+    // Steps 5 and 6, declared before step 1 is even attempted. The seal is the only
+    // separately recoverable thing in a swap, so it is the whole of the record: §10's "a
+    // crash after step 6 recovers the new run" is this barrier and nothing before it.
+    // `Prepared`, `Staged`, `Sealable` and `Installed` hold `session` for the rest of the
+    // swap — see "why the later steps take no `storage` argument" in
+    // `waymaker_flash::swap` — so `session` cannot be reached to bracket the record live,
+    // and a call made only after the seven steps below succeed would be a call a crash
+    // inside them also skips, disagreeing with the fault-free run at every one of the
+    // interesting crash points. The range is the two operations `prepare` is pinned to
+    // spend (one erase, one barrier), the one `stage` spends and the one `payload_barrier`
+    // spends, and the two `commit` spends after them.
+    session.mark_operations(SWAP, (before + 4)..(before + 6));
 
     // Steps 1 and 2. The erase and its barrier are not a record: an erased bank is not a
     // swap, and a record declared here would be acknowledged by a barrier after which
     // nothing of the new run is on media — obliging recovery to produce a swap the device is
     // right to have no trace of.
-    let prepared = planned()?.prepare(session)?;
+    let prepared = planned(session)?.prepare(session)?;
 
     // Steps 3 and 4. Not a record either, and for the same reason §10 gives: "a crash before
     // step 5 recovers the old run", so a header with no seal over it is not a swap that
     // happened.
     let mut page = [0_u8; 64];
-    let sealable = prepared
-        .stage(session, &mut page)?
-        .payload_barrier(session)?;
+    let sealable = prepared.stage(&mut page)?.payload_barrier()?;
 
-    // Steps 5 and 6. The seal is the only separately recoverable thing in a swap, so it is
-    // the whole of the record: §10's "a crash after step 6 recovers the new run" is this
-    // barrier and nothing before it.
-    session.begin_record(SWAP);
-    let installed = sealable.commit(session)?;
-    session.end_record();
-
-    // Step 7, outside the record: the old bank is already beaten by a higher generation, so
-    // erasing it changes no answer that recovery gives.
-    installed.reclaim(session)?;
+    let installed = sealable.commit()?;
+    installed.reclaim()?;
     Ok(())
 }
 

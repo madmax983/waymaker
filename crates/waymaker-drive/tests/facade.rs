@@ -197,9 +197,9 @@ fn a_caller_that_ends_the_run_with_an_effect_outstanding_is_refused_by_name() {
 
     assert_eq!(progress, Err(DriveError::EffectOutstanding));
     // No terminal record: the run really is unfinished, and history says so.
-    let mut recovery = waymaker_flash::recovery::Recovery::new(region());
+    let mut recovery = waymaker_flash::recovery::Recovery::new(region(), &mut device);
     let mut records = 0_usize;
-    while recovery.next(&mut device, &mut page).is_some() {
+    while recovery.next(&mut page).is_some() {
         records += 1;
     }
     assert_eq!(records, 2, "the run's record and the schedule record");
@@ -222,9 +222,9 @@ fn a_refused_misuse_writes_no_effect_record() {
         },
     );
 
-    let mut recovery = waymaker_flash::recovery::Recovery::new(region());
+    let mut recovery = waymaker_flash::recovery::Recovery::new(region(), &mut device);
     let mut records = 0_usize;
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         assert!(step.is_ok(), "the journal this boot wrote is legal");
         records += 1;
     }
