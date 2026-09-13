@@ -5688,6 +5688,19 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_hides_everything_after_an_unterminated_comment_that_outlived_its_block() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed, so both items after it
+        // — including the one that would otherwise be the real status — read as
+        // ordinary, structurally separate list items. By real HTML rules everything
+        // after the unclosed `<!--` is still inside the comment, so neither counts and
+        // the ADR has no readable status at all.
+        let contents = "# ADR\n\n<div>\n<!--\n</div>\n\n\
+                         - Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents), None);
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -6168,6 +6181,35 @@ mod tests {
         assert!(
             violations.iter().any(|v| v.subject == second.id),
             "a decision hidden in a comment embedded in real HTML still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_placed_after_an_unterminated_comment_that_outlived_its_block_does_not_count() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed — `<div>\n<!--\n</div>`
+        // is one complete `HtmlBlock`, its comment still open — so the paragraph right
+        // after reads as ordinary, structurally separate prose. By real HTML rules it is
+        // still inside the comment until an actual `-->` appears, and `hidden` has to
+        // say so for every later event, not only for more `Event::Html` lines.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n{} {}\n",
+                    third.id, third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == third.id),
+            "content after an unterminated comment that outlived its block still counted: \
+             {violations:?}"
         );
     }
 
@@ -6807,6 +6849,31 @@ mod tests {
                 .any(|violation| violation.subject == clause.id
                     && violation.detail.contains("no table row")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_after_an_unterminated_comment_that_outlived_its_block_does_not_count() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed, so a table right after
+        // reads as an ordinary, structurally separate one. By real HTML rules it is
+        // still inside the comment until an actual `-->` appears, so `table_rows` must
+        // not read it as real either.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "<div>\n<!--\n</div>\n\n\
+             | Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | {} | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "a table after an unterminated comment that outlived its block still counted: \
+             {violations:?}"
         );
     }
 

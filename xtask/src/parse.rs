@@ -953,7 +953,13 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
     for (event, range) in parser {
-        let hidden = in_fence || blockquote_depth > 0;
+        // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
+        // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
+        // so ordinary `Text`/`Item`/`Heading` events resume right after — structurally
+        // separate from the comment, but still inside it by real HTML rules, until an
+        // actual `-->` appears. Without this, a decoy placed after the blank line reads as
+        // ordinary visible prose.
+        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
         match event {
             Event::Start(Tag::List(kind)) => {
                 ordered_lists.push(kind.is_some());
@@ -1275,13 +1281,25 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // one closes disqualifies the item, whatever kind of block it is.
     let mut paragraph_closed = false;
     let mut item = String::new();
+    // Whether an HTML comment opened earlier is still open (Codex, pull request #138,
+    // round 20): `pulldown-cmark` ends an `HtmlBlock` at a blank line even when a
+    // comment inside it never closed, so an item appearing right after reads as an
+    // ordinary, visible one — structurally separate from the comment, but still
+    // inside it by real HTML rules until an actual `-->` appears. `append_visible_html_line`
+    // is reused for the state transition alone: called with `hidden: true`, it never
+    // writes to the discarded scratch buffer, only advances `in_html_comment`.
+    let mut in_html_comment = false;
+    let mut html_scratch = String::new();
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
-        let hidden = in_fence || blockquote_depth > 0;
+        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
         if collecting && paragraph_closed && matches!(event, Event::Start(_)) {
             collecting = false;
         }
         match event {
+            Event::Html(html) => {
+                append_visible_html_line(&html, true, &mut in_html_comment, &mut html_scratch);
+            }
             // A fenced block or blockquote opening while an item is being collected
             // disqualifies it, the same way a line break does (Codex, pull request
             // #138, round 15): `- Status:` followed by a nested fenced or quoted
@@ -1365,10 +1383,22 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     let mut in_row = false;
     let mut row = String::new();
     let mut cell = String::new();
+    // Whether an HTML comment opened earlier is still open (Codex, pull request #138,
+    // round 20): `pulldown-cmark` ends an `HtmlBlock` at a blank line even when a
+    // comment inside it never closed, so a table appearing right after reads as an
+    // ordinary, visible one — structurally separate from the comment, but still inside
+    // it by real HTML rules until an actual `-->` appears. `append_visible_html_line` is
+    // reused for the state transition alone: called with `hidden: true`, it never
+    // writes to the discarded scratch buffer, only advances `in_html_comment`.
+    let mut in_html_comment = false;
+    let mut html_scratch = String::new();
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
-        let hidden = in_fence || blockquote_depth > 0;
+        let hidden = in_fence || blockquote_depth > 0 || in_html_comment;
         match event {
+            Event::Html(html) => {
+                append_visible_html_line(&html, true, &mut in_html_comment, &mut html_scratch);
+            }
             Event::Start(Tag::CodeBlock(kind)) => {
                 if matches!(kind, CodeBlockKind::Fenced(_)) {
                     in_fence = true;
