@@ -68,6 +68,15 @@ pub const ENGINE_FEATURE: &str = "engine";
 /// The probe feature that also links the Embassy façade.
 pub const FACADE_FEATURE: &str = "facade";
 
+/// The probe feature that links ADR 0010's five checksum candidates.
+///
+/// Independent of every layer: no `dep:` entry, so it needs no mirror and
+/// `check_probe_mirrors` does not iterate it. Issue #61.
+pub const CRC_CANDIDATES_FEATURE: &str = "crc-candidates";
+
+/// The row the checksum-candidate section is measured from.
+pub const CRC_CANDIDATES_ROW: &str = "crc-candidates";
+
 /// Where `cargo xtask size` writes the report it then gates and uploads.
 pub const REPORT_PATH: &str = "target/waymaker-size.json";
 
@@ -510,6 +519,129 @@ fn identifier(rest: &str) -> Option<&str> {
     (starts && continues).then_some(name)
 }
 
+/// One checksum candidate ADR 0010 weighed, measured as a symbol rather than typed by hand.
+///
+/// Design document §16's first deferred question is settled by
+/// [ADR 0010](../../../docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+/// on numbers nothing in this repository reproduced. Issue #61 closes that gap:
+/// `waymaker-size-probe`'s `crc-candidates` feature links all five loops into one image,
+/// and each row here is one candidate's own symbol in it. Reported, never gated — ADR 0010
+/// is a comparison between candidates, not a cost this firmware pays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumCandidate {
+    /// The candidate's name, as ADR 0010's table names it.
+    pub name: String,
+    /// Whether Waymaker ships this candidate.
+    pub shipped: bool,
+    /// `.text` bytes: the loop body.
+    pub text: u64,
+    /// `.rodata` bytes: a lookup table. Zero for a bitwise loop.
+    pub rodata: u64,
+}
+
+/// One candidate: its report name, whether it ships, its function's identifier, and its
+/// table's identifier where it has one.
+///
+/// The identifiers are `crates/waymaker-size-probe/src/checksum_candidates.rs`'s, which
+/// copies each body from an already-tested one — the two shipped algorithms from
+/// `waymaker-flash/src/crc.rs`, and the three rejected candidates from
+/// `waymaker-flash/tests/integrity.rs`.
+const CHECKSUM_CANDIDATES: &[(&str, bool, &str, Option<&str>)] = &[
+    (
+        "crc32-iso-hdlc-bitwise",
+        true,
+        "crc32_iso_hdlc_bitwise_candidate",
+        None,
+    ),
+    ("crc32c-bitwise", false, "crc32c_bitwise_candidate", None),
+    (
+        "crc32c-nibble-table",
+        false,
+        "crc32c_nibble_table_candidate",
+        Some("CRC32C_NIBBLE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc32c-byte-table",
+        false,
+        "crc32c_byte_table_candidate",
+        Some("CRC32C_BYTE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc16-ccitt-false-bitwise",
+        true,
+        "crc16_ccitt_false_bitwise_candidate",
+        None,
+    ),
+];
+
+/// Whether `mangled` names the item `identifier`, declared in `crate_name`.
+///
+/// A length-prefixed substring search — [`identifier`]'s own technique for reading one out
+/// of a `v0` path — rather than a full demangler. Every identifier
+/// [`CHECKSUM_CANDIDATES`] names is written to be unique on its own, so this cannot match
+/// the wrong body by chance: nothing else in a `crc-candidates` image is a fold table or a
+/// checksum loop named after one.
+#[must_use]
+fn names_item(mangled: &str, crate_name: &str, identifier: &str) -> bool {
+    defining_crate(mangled) == Some(crate_name)
+        && mangled.contains(&format!("{}{identifier}", identifier.len()))
+}
+
+/// `identifier`'s own size in `symbols`, read out of `crate_name`'s code.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if no symbol names `identifier`, or more than one does — both mean
+/// the identifier cannot be attributed to one body.
+fn candidate_symbol_bytes(
+    symbols: &[elf::Symbol],
+    crate_name: &str,
+    identifier: &str,
+) -> Result<u64, SizeError> {
+    let mut found = symbols
+        .iter()
+        .filter(|symbol| symbol.size > 0 && names_item(&symbol.name, crate_name, identifier));
+    let Some(first) = found.next() else {
+        return Err(SizeError::new(format!(
+            "no symbol names `{identifier}`; the crc-candidates image did not retain it"
+        )));
+    };
+    if found.next().is_some() {
+        return Err(SizeError::new(format!(
+            "more than one symbol names `{identifier}`, so its size cannot be attributed to one body"
+        )));
+    }
+    Ok(first.size)
+}
+
+/// Every checksum candidate's size, read out of one `crc-candidates` image.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if a candidate's function or table cannot be found by name, or is
+/// not uniquely named.
+pub fn checksum_candidate_sizes(
+    symbols: &[elf::Symbol],
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
+    let crate_name = probe_crate_name();
+    CHECKSUM_CANDIDATES
+        .iter()
+        .map(|&(name, shipped, function, table)| {
+            let text = candidate_symbol_bytes(symbols, &crate_name, function)?;
+            let rodata = table
+                .map(|table| candidate_symbol_bytes(symbols, &crate_name, table))
+                .transpose()?
+                .unwrap_or(0);
+            Ok(ChecksumCandidate {
+                name: name.to_owned(),
+                shipped,
+                text,
+                rodata,
+            })
+        })
+        .collect()
+}
+
 /// How many of the image's stored bytes the symbol table attributes to `crate_name`.
 ///
 /// Only symbols in a section that costs flash, because that is the budget being read: a
@@ -893,6 +1025,7 @@ pub struct SizeReport {
     rows: Vec<Row>,
     kernel_state: Option<KernelState>,
     runtime: Option<RuntimeRam>,
+    checksum_candidates: Option<Vec<ChecksumCandidate>>,
 }
 
 impl SizeReport {
@@ -907,7 +1040,31 @@ impl SizeReport {
             rows,
             kernel_state,
             runtime,
+            checksum_candidates: None,
         }
+    }
+
+    /// Attaches ADR 0010's checksum-candidate measurement to an existing report.
+    ///
+    /// A builder rather than a fourth [`Self::new`] parameter, so every report built before
+    /// issue #61 existed — every call site in this file's own tests — keeps compiling
+    /// unchanged.
+    #[must_use]
+    pub fn with_checksum_candidates(
+        mut self,
+        checksum_candidates: Option<Vec<ChecksumCandidate>>,
+    ) -> Self {
+        self.checksum_candidates = checksum_candidates;
+        self
+    }
+
+    /// ADR 0010's checksum candidates, where this checkout could take the reading.
+    ///
+    /// `None` for a checkout whose probe declares no `crc-candidates` feature, for
+    /// [`Self::kernel_state`]'s reason.
+    #[must_use]
+    pub fn checksum_candidates(&self) -> Option<&[ChecksumCandidate]> {
+        self.checksum_candidates.as_deref()
     }
 
     /// Every measured row, in matrix order.
@@ -1197,6 +1354,105 @@ impl SizeReport {
         }
 
         shortfalls.extend(self.runtime_shortfalls());
+        shortfalls.extend(self.checksum_candidate_shortfalls());
+        shortfalls
+    }
+
+    /// ADR 0010's five candidates, checked for existence rather than for a ceiling.
+    ///
+    /// Issue #61 asks this section not to be gated against design document §04's budget: it
+    /// is a comparison between candidates, not a cost this firmware pays. What it must not
+    /// do is go quiet — an empty, duplicated, or zero-byte candidate is a measurement that
+    /// did not happen, the same rule every other section in this file holds to.
+    fn checksum_candidate_shortfalls(&self) -> Vec<BudgetShortfall> {
+        let mut shortfalls = Vec::new();
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            return shortfalls;
+        };
+
+        if candidates.is_empty() {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report declares the `crc-candidates` feature but names no candidate; ADR 0010 measured five".to_owned(),
+            });
+            return shortfalls;
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidates
+                .iter()
+                .take(index)
+                .any(|earlier| earlier.name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names the checksum candidate `{}` twice",
+                        candidate.name
+                    ),
+                });
+            }
+            // `.rodata` is legitimately zero for three of the five: a bitwise loop has no
+            // table. `.text` is not — every candidate is a loop, and a loop compiles to
+            // some code.
+            if candidate.text == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{}` measures 0 B of `.text`, which no checksum loop does",
+                        candidate.name
+                    ),
+                });
+            }
+            if !CHECKSUM_CANDIDATES
+                .iter()
+                .any(|&(name, ..)| name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names a checksum candidate `{}`, which ADR 0010 never measured",
+                        candidate.name
+                    ),
+                });
+            }
+        }
+
+        // A report can name every candidate it has correctly and still be missing most of
+        // ADR 0010's table — `--report` reads a document this process did not produce, and
+        // a section with one valid entry passed every check above it until this one.
+        for &(name, shipped, _function, table) in CHECKSUM_CANDIDATES {
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) else {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names no checksum candidate `{name}`; ADR 0010 measured it"
+                    ),
+                });
+                continue;
+            };
+            if candidate.shipped != shipped {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
+                        candidate.shipped
+                    ),
+                });
+            }
+            // The two table candidates are the ones ADR 0010's decision turns on — a 0 B
+            // reading here is the one number the whole section exists to report, missing.
+            // And the other three are bitwise loops with no table at all, so a nonzero
+            // reading there is not a smaller table, it is a wrong one.
+            match (table.is_some(), candidate.rodata) {
+                (true, 0) => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures 0 B of `.rodata`, but ADR 0010's table names a lookup table for it"
+                    ),
+                }),
+                (false, rodata) if rodata != 0 => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures {rodata} B of `.rodata`, but it is a bitwise loop with no table at all"
+                    ),
+                }),
+                _ => {}
+            }
+        }
+
         shortfalls
     }
 
@@ -1437,6 +1693,7 @@ impl SizeReport {
             ),
         ));
         table.push(self.workflow_future_lines());
+        table.push(self.checksum_candidate_lines());
         for notice in self.notices() {
             table.push(format!("\nnotice: {notice}\n"));
         }
@@ -1476,6 +1733,56 @@ impl SizeReport {
             lines.push(format!("  {name:<24}  {size:>9} B\n"));
         }
         lines.concat()
+    }
+
+    /// ADR 0010's five checksum candidates, in a section of their own.
+    ///
+    /// Not gated, for [`Self::checksum_candidate_shortfalls`]'s reason. Empty for a
+    /// checkout whose probe declares no `crc-candidates` feature.
+    fn checksum_candidate_lines(&self) -> String {
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            return String::new();
+        };
+        let mut lines = vec![format!(
+            "\nchecksum candidates: design document \u{a7}16's first deferred question, settled by ADR 0010 and measured rather than typed in by hand. Informational, not gated against any budget above.\n  {:<28} {:>9} {:>9}\n",
+            "candidate", "text", "rodata"
+        )];
+        for candidate in candidates {
+            lines.push(format!(
+                "  {:<28} {:>7} B {:>7} B{}\n",
+                candidate.name,
+                candidate.text,
+                candidate.rodata,
+                if candidate.shipped { "  shipped" } else { "" },
+            ));
+        }
+        lines.concat()
+    }
+
+    /// [`RuntimeRam`] as [`Self::to_json`] writes it.
+    ///
+    /// A method of its own rather than inline in [`Self::to_json`], which clippy's line
+    /// budget refuses with this section folded in.
+    fn runtime_json(&self) -> Value {
+        self.runtime.as_ref().map_or(Value::Null, |runtime| {
+            let futures: Vec<Value> = runtime
+                .workflow_futures
+                .iter()
+                .map(|(name, size)| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(name.clone()));
+                    entry.insert("size".to_owned(), Value::from(*size));
+                    Value::Object(entry)
+                })
+                .collect();
+            let mut object = Map::new();
+            object.insert("context".to_owned(), Value::from(runtime.context));
+            object.insert("workflow_futures".to_owned(), Value::Array(futures));
+            if let Some(total) = self.runtime_ram_total() {
+                object.insert("total".to_owned(), Value::from(total));
+            }
+            Value::Object(object)
+        })
     }
 
     /// The report as JSON, for the CI artifact and for the base-branch diff.
@@ -1536,25 +1843,8 @@ impl SizeReport {
             Value::Object(object)
         });
 
-        let runtime = self.runtime.as_ref().map_or(Value::Null, |runtime| {
-            let futures: Vec<Value> = runtime
-                .workflow_futures
-                .iter()
-                .map(|(name, size)| {
-                    let mut entry = Map::new();
-                    entry.insert("name".to_owned(), Value::from(name.clone()));
-                    entry.insert("size".to_owned(), Value::from(*size));
-                    Value::Object(entry)
-                })
-                .collect();
-            let mut object = Map::new();
-            object.insert("context".to_owned(), Value::from(runtime.context));
-            object.insert("workflow_futures".to_owned(), Value::Array(futures));
-            if let Some(total) = self.runtime_ram_total() {
-                object.insert("total".to_owned(), Value::from(total));
-            }
-            Value::Object(object)
-        });
+        let runtime = self.runtime_json();
+        let checksum_candidates = checksum_candidates_json(self.checksum_candidates.as_deref());
 
         let mut budgets = Map::new();
         budgets.insert(
@@ -1588,6 +1878,7 @@ impl SizeReport {
         document.insert("budgets".to_owned(), Value::Object(budgets));
         document.insert("kernel_state".to_owned(), kernel_state);
         document.insert("runtime".to_owned(), runtime);
+        document.insert("checksum_candidates".to_owned(), checksum_candidates);
         document.insert("rows".to_owned(), Value::Array(rows));
 
         format!("{:#}\n", Value::Object(document))
@@ -1681,6 +1972,7 @@ impl SizeReport {
             rows,
             kernel_state: parse_kernel_state(&document)?,
             runtime: parse_runtime(&document)?,
+            checksum_candidates: parse_checksum_candidates(&document)?,
         })
     }
 }
@@ -1767,6 +2059,65 @@ fn parse_runtime(document: &Value) -> Result<Option<RuntimeRam>, SizeError> {
         context: number(runtime, "context")?,
         workflow_futures,
     }))
+}
+
+/// [`ChecksumCandidate`]s as [`SizeReport::to_json`] writes them.
+///
+/// A function of its own rather than inline in [`SizeReport::to_json`], which clippy's line
+/// budget refuses with this section folded in.
+fn checksum_candidates_json(candidates: Option<&[ChecksumCandidate]>) -> Value {
+    candidates.map_or(Value::Null, |candidates| {
+        Value::Array(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(candidate.name.clone()));
+                    entry.insert("shipped".to_owned(), Value::from(candidate.shipped));
+                    entry.insert("text".to_owned(), Value::from(candidate.text));
+                    entry.insert("rodata".to_owned(), Value::from(candidate.rodata));
+                    Value::Object(entry)
+                })
+                .collect(),
+        )
+    })
+}
+
+/// The checksum-candidate section of a report, or `None` where the document has none.
+///
+/// Absent and `null` both read as `None`, [`parse_runtime`]'s reason: a report taken before
+/// issue #61 existed, or of a checkout whose probe declares no `crc-candidates` feature,
+/// says nothing about it rather than nothing.
+fn parse_checksum_candidates(
+    document: &Value,
+) -> Result<Option<Vec<ChecksumCandidate>>, SizeError> {
+    let Some(candidates) = document
+        .get("checksum_candidates")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    candidates
+        .as_array()
+        .ok_or_else(|| SizeError::new("the size report's `checksum_candidates` is not an array"))?
+        .iter()
+        .map(|entry| {
+            Ok(ChecksumCandidate {
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `name`"))?
+                    .to_owned(),
+                shipped: entry
+                    .get("shipped")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `shipped` flag"))?,
+                text: number(entry, "text")?,
+                rodata: number(entry, "rodata")?,
+            })
+        })
+        .collect::<Result<Vec<ChecksumCandidate>, SizeError>>()
+        .map(Some)
 }
 
 /// Rule: no two rows of a report carry one name.
@@ -2203,31 +2554,9 @@ pub fn measure_into(
     let mut rows = Vec::with_capacity(variants.len());
     for variant in variants {
         let image = build_variant(root, build_dir, &variant)?;
-        let bytes = std::fs::read(&image).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the linked image at {}: {err}",
-                image.display()
-            ))
-        })?;
-        let machine = elf::machine(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
-        if machine != elf::EM_ARM {
-            return Err(SizeError::new(format!(
-                "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
-                image.display(),
-                elf::EM_ARM
-            )));
-        }
-        let sections = elf::sections(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+        let (sections, symbols) = linked_image(&image)?;
         check_symbols_are_not_measured(&sections).map_err(|err| {
             SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
-        })?;
-        let symbols = elf::symbols(&bytes).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the symbols of {}: {err}",
-                image.display()
-            ))
         })?;
         rows.push(Row {
             name: variant.name,
@@ -2239,7 +2568,98 @@ pub fn measure_into(
         });
     }
 
-    Ok(SizeReport::new(rows, kernel_state, runtime))
+    // Only for the checkout `xtask` was built from, [`KernelState::measured`]'s own
+    // reason and its own signal: `CHECKSUM_CANDIDATES` names identifiers this binary's
+    // source declares, so reading them out of a *base-branch* image is reading this
+    // binary's expectations against another commit's code. A rename on either side would
+    // turn a base-branch worktree's checksum-candidate section into a hard error — and
+    // since that section carries no row `diff` ever reads, failing the base measurement
+    // over it would cost every other row's comparison for a section nobody compares.
+    let checksum_candidates = if kernel_state.is_some() || runtime.is_some() {
+        measure_checksum_candidates(root, build_dir, &graph)?
+    } else {
+        None
+    };
+
+    Ok(SizeReport::new(rows, kernel_state, runtime).with_checksum_candidates(checksum_candidates))
+}
+
+/// Reads and validates one linked image: its sections and its symbols.
+///
+/// Shared by the matrix loop above and [`measure_checksum_candidates`], which both read an
+/// image the same way and differ only in what they do with it.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the image cannot be read, is not built for ARM, or its symbol
+/// table cannot be read.
+fn linked_image(image: &Path) -> Result<(Vec<Section>, Vec<elf::Symbol>), SizeError> {
+    let bytes = std::fs::read(image).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the linked image at {}: {err}",
+            image.display()
+        ))
+    })?;
+    let machine = elf::machine(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    if machine != elf::EM_ARM {
+        return Err(SizeError::new(format!(
+            "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
+            image.display(),
+            elf::EM_ARM
+        )));
+    }
+    let sections = elf::sections(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    let symbols = elf::symbols(&bytes).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the symbols of {}: {err}",
+            image.display()
+        ))
+    })?;
+    Ok((sections, symbols))
+}
+
+/// ADR 0010's five checksum candidates, measured rather than typed by hand.
+///
+/// `None` for a checkout whose probe declares no [`CRC_CANDIDATES_FEATURE`] — a checkout
+/// that predates issue #61. Callers measuring a checkout other than the one `xtask` was
+/// built from should not reach this at all, for [`measure_into`]'s reason: the identifiers
+/// this function searches for are compiled into *this* binary from *this* checkout's
+/// source, and matching them against another commit's image is a comparison that means
+/// nothing and can fail on a rename neither side made wrong.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the checkout declares the feature but the image cannot be
+/// built, read, or attributed candidate by candidate.
+fn measure_checksum_candidates(
+    root: &Path,
+    build_dir: &Path,
+    graph: &PackageGraph,
+) -> Result<Option<Vec<ChecksumCandidate>>, SizeError> {
+    let declared = graph.find(PROBE_PACKAGE).is_some_and(|package| {
+        package
+            .features
+            .iter()
+            .any(|feature| feature == CRC_CANDIDATES_FEATURE)
+    });
+    if !declared {
+        return Ok(None);
+    }
+
+    let variant = Variant {
+        name: CRC_CANDIDATES_ROW.to_owned(),
+        features: vec![PROBE_FEATURE.to_owned(), CRC_CANDIDATES_FEATURE.to_owned()],
+        measured_against: BASELINE_ROW.to_owned(),
+        gated: false,
+    };
+    let image = build_variant(root, build_dir, &variant)?;
+    let (sections, symbols) = linked_image(&image)?;
+    check_symbols_are_not_measured(&sections).map_err(|err| {
+        SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
+    })?;
+    checksum_candidate_sizes(&symbols).map(Some)
 }
 
 /// Links one image and returns the path to it.
@@ -4523,6 +4943,365 @@ mod tests {
         let change = runtime_ram_change(&parsed, &full_report(512, 32, 700, 32))
             .expect("an unreadable base should be said out loud");
         assert!(change.contains("not compared"), "{change}");
+    }
+
+    /// A symbol shaped like one `checksum_candidates.rs` really produces, at a given size.
+    fn candidate_symbol(identifier: &str, size: u64) -> crate::elf::Symbol {
+        symbol(
+            &format!(
+                "_RNvNtCs1_19waymaker_size_probe19checksum_candidates{}{identifier}",
+                identifier.len()
+            ),
+            0x1000,
+            size,
+            1,
+        )
+    }
+
+    /// The five real identifiers, each a plausible size.
+    fn candidate_symbols() -> Vec<crate::elf::Symbol> {
+        vec![
+            candidate_symbol("crc32_iso_hdlc_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_nibble_table_candidate", 76),
+            candidate_symbol("CRC32C_NIBBLE_TABLE_CANDIDATE", 64),
+            candidate_symbol("crc32c_byte_table_candidate", 44),
+            candidate_symbol("CRC32C_BYTE_TABLE_CANDIDATE", 1_024),
+            candidate_symbol("crc16_ccitt_false_bitwise_candidate", 60),
+        ]
+    }
+
+    /// Five candidates of known size, [`fixture_kernel_state`]'s reason.
+    fn fixture_checksum_candidates() -> Vec<ChecksumCandidate> {
+        checksum_candidate_sizes(&candidate_symbols()).expect("the fixture symbols are complete")
+    }
+
+    #[test]
+    fn names_item_finds_a_probe_symbol_by_its_plain_identifier() {
+        let mangled =
+            "_RNvNtCs1_19waymaker_size_probe19checksum_candidates24crc32c_bitwise_candidate";
+        assert!(names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_bitwise_candidate"
+        ));
+        // A different candidate's name is not a match, even though both share a crate and
+        // a module: the length prefix has to agree with the identifier that follows it.
+        assert!(!names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_byte_table_candidate"
+        ));
+        // A symbol from another crate names nothing here, whatever it is called.
+        assert!(!names_item(
+            "_RNvCs1_14waymaker_flash5frame",
+            "waymaker_size_probe",
+            "frame"
+        ));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_reads_the_one_matching_symbol() {
+        let symbols = candidate_symbols();
+        assert_eq!(
+            candidate_symbol_bytes(
+                &symbols,
+                "waymaker_size_probe",
+                "crc32c_byte_table_candidate"
+            )
+            .expect("the symbol exists"),
+            44
+        );
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_a_name_the_image_never_retained() {
+        let error = candidate_symbol_bytes(&[], "waymaker_size_probe", "crc32c_bitwise_candidate")
+            .expect_err("an empty image names nothing");
+        assert!(error.to_string().contains("crc32c_bitwise_candidate"));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_an_identifier_that_is_not_unique() {
+        let symbols = vec![
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+        ];
+        let error =
+            candidate_symbol_bytes(&symbols, "waymaker_size_probe", "crc32c_bitwise_candidate")
+                .expect_err("two symbols of one name cannot be attributed to one body");
+        assert!(error.to_string().contains("more than one"));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_reads_all_five_by_name() {
+        let candidates = fixture_checksum_candidates();
+        assert_eq!(candidates.len(), 5);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .unwrap_or_else(|| panic!("no candidate named `{name}`"))
+        };
+
+        let bitwise = by_name("crc32-iso-hdlc-bitwise");
+        assert_eq!(
+            (bitwise.text, bitwise.rodata, bitwise.shipped),
+            (52, 0, true)
+        );
+
+        let rejected = by_name("crc32c-bitwise");
+        assert_eq!(
+            (rejected.text, rejected.rodata, rejected.shipped),
+            (52, 0, false)
+        );
+
+        let nibble = by_name("crc32c-nibble-table");
+        assert_eq!(
+            (nibble.text, nibble.rodata, nibble.shipped),
+            (76, 64, false)
+        );
+
+        let byte = by_name("crc32c-byte-table");
+        assert_eq!((byte.text, byte.rodata, byte.shipped), (44, 1_024, false));
+
+        let crc16 = by_name("crc16-ccitt-false-bitwise");
+        assert_eq!((crc16.text, crc16.rodata, crc16.shipped), (60, 0, true));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_refuses_an_image_missing_a_candidate() {
+        let symbols: Vec<crate::elf::Symbol> = candidate_symbols()
+            .into_iter()
+            .filter(|symbol| !symbol.name.contains("crc16_ccitt_false_bitwise_candidate"))
+            .collect();
+        let error = checksum_candidate_sizes(&symbols)
+            .expect_err("a missing candidate must fail the measurement rather than read as 0 B");
+        assert!(
+            error
+                .to_string()
+                .contains("crc16_ccitt_false_bitwise_candidate")
+        );
+    }
+
+    #[test]
+    fn measure_checksum_candidates_skips_the_build_for_a_checkout_that_predates_the_feature() {
+        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`
+        // — every checkout before issue #61, base-branch worktrees included. A caller that
+        // tried to build it anyway would fail here, because neither path names a real
+        // workspace: the guard has to answer `None` before `build_variant` is ever reached.
+        let bogus = Path::new("/does/not/exist/waymaker-size-checksum-candidates-fixture");
+        let result = measure_checksum_candidates(bogus, bogus, &probe_graph());
+        assert_eq!(
+            result.expect("a checkout with no `crc-candidates` feature must not fail"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidate_section_has_no_shortfall_for_it() {
+        // A checkout whose probe declares no `crc-candidates` feature — every checkout
+        // before issue #61 — says nothing about the section rather than failing over it,
+        // [`KernelState::measured`]'s reason for the same `None`.
+        let report = full_report(1_024, 0, 1_024, 0);
+        assert_eq!(report.checksum_candidates(), None);
+        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+    }
+
+    #[test]
+    fn an_empty_checksum_candidate_section_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(Vec::new()));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("names no candidate"), "{message}");
+    }
+
+    #[test]
+    fn two_checksum_candidates_under_one_name_are_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("twice"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_that_measures_no_text_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 0,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("0 B"), "{message}");
+    }
+
+    #[test]
+    fn a_section_missing_four_of_the_five_candidates_is_not_a_pass() {
+        // Codex review on PR #133: a nonempty section with one valid, uniquely-named,
+        // nonzero candidate passed every check above. ADR 0010 measured five, and a
+        // report naming only one is a measurement that mostly did not happen.
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        for missing in [
+            "crc32-iso-hdlc-bitwise",
+            "crc32c-nibble-table",
+            "crc32c-byte-table",
+            "crc16-ccitt-false-bitwise",
+        ] {
+            assert!(message.contains(missing), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_candidate_adr_0010_never_named_is_not_a_pass() {
+        // A renamed, substituted, or invented candidate must be refused by name, not
+        // waved through because it happens to be unique and nonzero.
+        let mut candidates = fixture_checksum_candidates();
+        candidates.push(ChecksumCandidate {
+            name: "crc32-koopman".to_owned(),
+            shipped: false,
+            text: 52,
+            rodata: 0,
+        });
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-koopman"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_with_the_wrong_shipped_flag_is_not_a_pass() {
+        // ADR 0010 says exactly two of the five ship. A report that flipped the flag on
+        // one is not the measurement it claims to be.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32-iso-hdlc-bitwise" {
+                candidate.shipped = false;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
+        assert!(message.contains("shipped"), "{message}");
+    }
+
+    #[test]
+    fn a_table_candidate_that_measures_no_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the `.text` check alone let a truncated report set
+        // `rodata: 0` on either table candidate — dropping the 64 B / 1024 B figures ADR
+        // 0010's decision turns on — and still pass.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-nibble-table" {
+                candidate.rodata = 0;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-nibble-table"), "{message}");
+        assert!(message.contains("0 B of `.rodata`"), "{message}");
+    }
+
+    #[test]
+    fn a_bitwise_candidate_with_nonzero_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the table-candidate check only ran one way. A report
+        // that claimed `.rodata` for a bitwise loop — which has no table at all — must be
+        // refused just as loudly as one that dropped a real table's figure.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-bitwise" {
+                candidate.rodata = 64;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("no table at all"), "{message}");
+    }
+
+    #[test]
+    fn checksum_candidates_are_reported_and_charged_to_no_budget() {
+        let report = full_report(1_024, 0, 1_024, 0)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+
+        let table = report.render();
+        assert!(table.contains("checksum candidates"), "{table}");
+        assert!(table.contains("crc32c-byte-table"), "{table}");
+        assert!(table.contains("1024"), "{table}");
+        assert!(table.contains("shipped"), "{table}");
+        assert!(table.contains("ADR 0010"), "{table}");
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_renders_no_section_for_them() {
+        let table = full_report(1_024, 0, 1_024, 0).render();
+        assert!(!table.contains("checksum candidates"), "{table}");
+    }
+
+    #[test]
+    fn the_checksum_candidate_section_survives_a_json_round_trip() {
+        let original = full_report(512, 32, 700, 32)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        let json = original.to_json();
+        let parsed = SizeReport::from_json(&json).expect("the report should round-trip");
+        assert_eq!(parsed.checksum_candidates(), original.checksum_candidates());
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_key_is_read_as_none() {
+        // A report written before issue #61 existed has no `checksum_candidates` key at
+        // all, not a `null` one — and it must still read, the same way an older report with
+        // no `runtime` key does.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .remove("checksum_candidates");
+        let parsed = SizeReport::from_json(&document.to_string())
+            .expect("a report with no checksum-candidates key should still read");
+        assert_eq!(parsed.checksum_candidates(), None);
+    }
+
+    #[test]
+    fn a_malformed_checksum_candidate_is_refused_rather_than_silently_dropped() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .insert(
+                "checksum_candidates".to_owned(),
+                serde_json::json!([{"name": "crc32c-bitwise"}]),
+            );
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("a candidate with no `shipped` flag must not be read");
+        assert!(refusal.to_string().contains("shipped"), "{refusal}");
     }
 
     #[test]

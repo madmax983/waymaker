@@ -82,6 +82,79 @@ fn the_matrix_links_a_baseline_a_default_and_a_facade_image() {
 }
 
 #[test]
+fn adr_0010s_five_checksum_candidates_are_measured_rather_than_typed_by_hand() {
+    // Issue #61: ADR 0010's numbers were typed into the ADR by hand, from a build this
+    // repository did not run. `waymaker-size-probe`'s `crc-candidates` feature links all
+    // five loops for real, and this is the one test that proves the whole chain — the
+    // feature, the module, the symbol names, and `xtask::size`'s reading of them — links
+    // and reads a real `thumbv6m-none-eabi` image rather than only a synthetic fixture.
+    let report = measured();
+    let candidates = report
+        .checksum_candidates()
+        .expect("this checkout declares the `crc-candidates` feature");
+    assert_eq!(candidates.len(), 5, "{candidates:?}");
+
+    let shipped: Vec<&str> = candidates
+        .iter()
+        .filter(|candidate| candidate.shipped)
+        .map(|candidate| candidate.name.as_str())
+        .collect();
+    assert_eq!(
+        shipped,
+        vec!["crc32-iso-hdlc-bitwise", "crc16-ccitt-false-bitwise"],
+        "{candidates:?}"
+    );
+
+    for candidate in candidates {
+        assert!(
+            candidate.text > 0,
+            "`{}` measures 0 B of `.text`; no checksum loop compiles to nothing",
+            candidate.name
+        );
+    }
+
+    // The two table candidates are the ones ADR 0010's decision turns on: a nibble table
+    // and a byte table cost `.rodata` a bitwise loop does not.
+    let rodata = |name: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .unwrap_or_else(|| panic!("no candidate named `{name}`"))
+            .rodata
+    };
+    assert!(rodata("crc32c-nibble-table") > 0, "{candidates:?}");
+    assert!(
+        rodata("crc32c-byte-table") > rodata("crc32c-nibble-table"),
+        "{candidates:?}"
+    );
+    assert_eq!(rodata("crc32-iso-hdlc-bitwise"), 0, "{candidates:?}");
+    assert_eq!(rodata("crc32c-bitwise"), 0, "{candidates:?}");
+    assert_eq!(rodata("crc16-ccitt-false-bitwise"), 0, "{candidates:?}");
+}
+
+#[test]
+fn a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image() {
+    // Codex review on PR #133: `measure_baseline` measures the base branch by running
+    // *this* `xtask`'s `measure_into` against that checkout, passing `None` for both
+    // registries because their figures belong to whatever crate this binary was compiled
+    // from. `CHECKSUM_CANDIDATES` is exactly such a figure — a table of identifiers this
+    // binary's own source declares — so a future rename on either side of a diff would
+    // turn the base half into a hard error, failing the whole comparison over a section
+    // `diff` never reads. `measure_into` skips the checksum-candidates build whenever
+    // both registries are `None`, and this is the real workspace proving it: the probe
+    // really does declare `crc-candidates` here, so a naive implementation would attempt
+    // the build and this would still pass — the point is that it does not even try.
+    let report = size::measure_into(
+        &workspace_root(),
+        &scratch("checksum-candidates-base-shape"),
+        None,
+        None,
+    )
+    .expect("a base-branch-shaped measurement of the real workspace should still link");
+    assert_eq!(report.checksum_candidates(), None);
+}
+
+#[test]
 fn the_engine_costs_more_flash_than_the_baseline() {
     // The whole gate rests on the probe actually linking the layers rather than the
     // linker discarding them: a probe whose engine is dead-stripped reports a delta of
