@@ -1377,39 +1377,54 @@ fn without_blockquote_marker(line: &str) -> &str {
 
 /// `contents` with every fenced code block removed.
 ///
-/// Used only by [`linked_markdown_files`]'s caller, which needs the raw link syntax a
-/// rendered-prose pass would strip along with the markup — [`crate::parse::markdown_prose`]
-/// is what every other rule in this file uses instead, and does not have this limit.
+/// Used only by rules that need the raw Markdown syntax a rendered-prose pass would
+/// strip along with the markup — [`crate::parse::markdown_prose`] is what every other
+/// rule in this file uses instead, and does not have this limit.
 ///
 /// A fence is found under one level of blockquote too — `> ` ```` ``` ```` — because an
-/// example quoted in a reply is still an example. Nested quoting beyond one level is not
-/// unwrapped, which only narrows what this function catches, never what it wrongly hides.
+/// example quoted in a reply is still an example. A closing line has to match the
+/// opener's own quoting as well as its marker and width: a bare ` ``` ` inside a
+/// *quoted* fence is quoted content, not a closer, and a `> ` ```` ``` ```` inside a
+/// *top-level* fence is the same content quoted the other way — both were reachable
+/// before this line was tracked, one as the original gap and one as its converse.
+/// Nested quoting beyond one level is not unwrapped, which only narrows what this
+/// function catches, never what it wrongly hides.
 ///
-/// Not fully robust against a comment that itself contains a fence-looking line: this is a
-/// textual scanner, not a parser, and the two constructs are not tracked against each
-/// other. `linked_markdown_files`'s own content is index prose rather than an adversarial
-/// input, which is why this is accepted here and nowhere else.
+/// Not fully robust against a comment that itself contains a fence-looking line: this is
+/// a textual scanner, not a parser, and the two constructs are not tracked against each
+/// other. The content this reads is index and specification prose rather than an
+/// adversarial input, which is why this is accepted here and nowhere else.
 #[must_use]
 fn without_fenced_code(contents: &str) -> String {
     let mut kept = Vec::new();
-    let mut open_fence: Option<(u8, usize)> = None;
+    let mut open_fence: Option<(u8, usize, bool)> = None;
     for line in contents.lines() {
-        let trimmed = without_blockquote_marker(line.trim());
-        let fence = fence_length(trimmed);
+        let trimmed = line.trim();
+        let unquoted = without_blockquote_marker(trimmed);
+        let quoted = unquoted.len() != trimmed.len();
+        let fence = fence_length(unquoted);
         match open_fence {
-            // A closing fence carries nothing but its own characters: a line with an
-            // info string, like an inner ` ```rust `, is quoted content, not a closer.
-            // `mermaid_blocks` already holds fences to this; this is the same rule.
-            Some((marker, width))
-                if fence.is_some_and(|(found, length)| {
-                    found == marker && length >= width && trimmed.len() == length
-                }) =>
+            // A closing fence carries nothing but its own characters, and is quoted
+            // exactly as its opener was: a line with an info string, like an inner
+            // ` ```rust `, is quoted content, not a closer (`mermaid_blocks` already
+            // holds fences to this); and a bare closer cannot end a fence a `>` opened,
+            // or the other way round, because each is content inside the other's fence.
+            Some((marker, width, opener_quoted))
+                if quoted == opener_quoted
+                    && fence.is_some_and(|(found, length)| {
+                        found == marker && length >= width && unquoted.len() == length
+                    }) =>
             {
                 open_fence = None;
             }
             Some(_) => {}
-            None if fence.is_some() => open_fence = fence,
-            None => kept.push(line),
+            None => {
+                if let Some((marker, width)) = fence {
+                    open_fence = Some((marker, width, quoted));
+                } else {
+                    kept.push(line);
+                }
+            }
         }
     }
     kept.join("\n")
@@ -3936,7 +3951,10 @@ fn check_wire_format_is_documented(
     }
 
     if let Some(claude_md) = claude_md {
-        let claude_md = crate::parse::markdown_prose(claude_md, crate::parse::InlineCode::Keep);
+        // Not `markdown_prose`: a descriptive link's destination, `[wire-format
+        // specification](docs/format/wire-format-v1.md)`, is exactly what rendered
+        // prose strips, and this only asks whether the path is written down somewhere.
+        let claude_md = without_html_comments(&without_fenced_code(claude_md));
         if !claude_md.contains(WIRE_FORMAT_SPEC_PATH) {
             violations.push(Violation::new(
                 RULE,
@@ -5871,6 +5889,39 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_looking_closer_inside_a_top_level_example_fence_does_not_leak_or_hide_links() {
+        // Codex, pull request #138: the converse of the blockquoted-fence case, now
+        // found through `check_adr_index`, the one remaining caller of
+        // `without_fenced_code`. Inside a top-level (unquoted) example fence, a line
+        // like `> ``` ` is quoted content, not a closer. The old bug closed the fence
+        // there, exposing a link inside the example as if it were real, and then read
+        // the real closing fence as a fresh opener — hiding the real link that follows
+        // it.
+        let index =
+            "```text\n> ```\n[0002-two.md](0002-two.md)\n```\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the example was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link quoted only inside the example counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_settled_decision_missing_from_the_adr_is_reported() {
         let mut inputs = clean_inputs(RULES);
         let first = SETTLED_DECISIONS[0];
@@ -7175,6 +7226,33 @@ mod tests {
                 &inputs.wire_format_corpus,
             ),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_descriptively_labelled_link_to_the_spec_still_counts() {
+        // Codex, pull request #138: a check that only asks whether a path is written
+        // down somewhere must read raw Markdown syntax, not rendered prose — a link's
+        // destination, `[wire-format specification](docs/format/wire-format-v1.md)`,
+        // is exactly what a real parser drops in favour of the visible label.
+        let mut inputs = wire_format_inputs();
+        inputs.claude_md = inputs.claude_md.map(|claude_md| {
+            claude_md.replace(
+                WIRE_FORMAT_SPEC_PATH,
+                &format!("[wire-format specification]({WIRE_FORMAT_SPEC_PATH})"),
+            )
+        });
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not link")),
+            "a descriptively labelled link was read as missing: {violations:?}"
         );
     }
 
