@@ -870,6 +870,16 @@ impl Journal {
     /// no other state. `bound.records` caps how many records this run may ever declare in
     /// total, not how many are resident at once, so an erased bank does not reopen capacity a
     /// swap already spent.
+    ///
+    /// The counter's own ceiling is refused independently of `bound.records`. No exhaustive
+    /// search reaches it — `Bound::PROOF` declares at most 3 — but
+    /// [`Journal::reconstructed`] builds `next_id` from a real observation's own record ids
+    /// via `saturating_add`, so a
+    /// crash harness reporting `RecordId(u32::MAX)` under a caller-chosen `bound.records` wide
+    /// enough to admit it would have overflowed the plain `+= 1` this used to be — a panic in
+    /// a build with overflow checks, and a wrapped, *reused* id everywhere else, which is the
+    /// one thing the identity scheme above promises never happens. Codex found it on review of
+    /// issue #67's pull request.
     fn declare(&mut self, role: Role, bound: Bound) -> Result<(), Illegal> {
         if self.next_id as usize >= bound.records {
             return Err(Illegal::CapacityReached);
@@ -880,7 +890,10 @@ impl Journal {
             return Err(Illegal::OutOfProtocolOrder);
         }
         let id = RecordId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(Illegal::CapacityReached)?;
         self.records.push(Record {
             id,
             role,
@@ -1293,6 +1306,37 @@ mod tests {
         assert_eq!(
             erased.step(Transition::BeginSeal(BankId::A), Guards::ENFORCED, bound),
             Err(Illegal::GenerationExhausted)
+        );
+    }
+
+    /// Codex, PR #135 round 5: `Journal::from_parts` (which `Journal::reconstructed` calls)
+    /// takes `next_id` from a real observation's own record ids via `saturating_add`, so an
+    /// observation naming `RecordId(u32::MAX)` — implausible from this crate's own bounded
+    /// search, entirely plausible from a real crash harness fuzzing wider ids — leaves
+    /// `next_id` at the ceiling. `declare`'s old plain `+= 1` then overflowed on the very next
+    /// declaration once `bound.records` was wide enough to admit it, panicking in a build with
+    /// overflow checks and silently reusing `RecordId(0)` in one without — which is the one
+    /// thing issue #67's identity scheme promises never happens. A hand-built state for the
+    /// same reason as the test above: nothing outside this crate has a legitimate reason to
+    /// build a journal that has already issued four billion ids.
+    #[test]
+    fn a_record_id_at_the_ceiling_is_refused_rather_than_reused() {
+        let near_ceiling = Journal {
+            records: Vec::new(),
+            banks: [Bank::Erased; BANKS],
+            dispatched: Vec::new(),
+            powered: true,
+            sealed_once: false,
+            next_id: u32::MAX,
+        };
+        let bound = Bound {
+            records: usize::MAX,
+            generations: 3,
+        };
+        assert_eq!(
+            near_ceiling.step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound),
+            Err(Illegal::CapacityReached),
+            "declaring past the last id either panicked or reused RecordId(0)"
         );
     }
 }
