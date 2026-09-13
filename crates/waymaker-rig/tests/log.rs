@@ -161,6 +161,45 @@ fn a_version_the_reader_does_not_know_is_refused() {
 }
 
 #[test]
+fn a_shorter_older_version_is_refused_by_name_not_by_length() {
+    // Codex, round 2 of issue #81: `ENTRY_BYTES` grew from 92 to 95 with the version bump.
+    // A real v1 line is 92 bytes, so it failed the new length gate before its version byte
+    // was ever read, and was reported as `ShortBuffer` rather than `UnknownVersion { version:
+    // 1 }`. The two must stay distinguishable: one is corruption, the other is a known old
+    // format.
+    let mut old = [0x11_u8; 92];
+    old[0] = 0x52; // ENTRY_MAGIC low byte, unchanged across versions
+    old[1] = 0x47; // ENTRY_MAGIC high byte
+    old[2] = 1; // the version a v1 build wrote
+    assert_eq!(Entry::decode_version(&old), Ok(1));
+    assert_eq!(
+        Entry::decode(&old),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
+fn a_rendered_line_at_a_shorter_older_version_is_refused_by_name() {
+    use std::fmt::Write as _;
+
+    // The same fix, through `Entry::parse`'s hex tail: a rendered v1 line is a different
+    // length in hex too, and has to be told apart from a line this build cannot read at all.
+    let mut old = [0x11_u8; 92];
+    old[0] = 0x52;
+    old[1] = 0x47;
+    old[2] = 1;
+    let mut hex = String::new();
+    for byte in old {
+        write!(hex, "{byte:02x}").expect("writing to a String never fails");
+    }
+    let line = format!("waymaker-rig x {hex}");
+    assert_eq!(
+        Entry::parse(line.as_bytes()),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
 fn an_entry_renders_a_line_a_host_can_read_back() {
     // Not a convenience. The rig's transport is a serial port, so the line a board prints has
     // to be the line a host parses, and a renderer whose output the parser did not accept

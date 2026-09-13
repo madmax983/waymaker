@@ -296,8 +296,8 @@ pub struct Entry {
 impl Entry {
     /// The format version this build writes and reads.
     ///
-    /// This is 2. Issue #81 widened [`Progress`]'s mark count from one byte to four. A line
-    /// from the other version is refused as [`LogError::UnknownVersion`], never misread.
+    /// This is 2. Issue #81 widened [`Progress`]'s mark count from one byte to four. The
+    /// reader refuses a line from another version. It never misreads one.
     pub const FORMAT_VERSION: u8 = 2;
 
     /// The longest line [`render`](Self::render) produces.
@@ -510,7 +510,16 @@ impl Entry {
     /// As [`decode`](Self::decode).
     pub fn decode_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<Self, LogError> {
         let Some(slot) = bytes.get(..ENTRY_BYTES) else {
-            return Err(LogError::ShortBuffer);
+            // Too short for this build's own length. The magic and the version sit at the
+            // same two offsets in every format this build has known, so read only those
+            // before giving up. A real line from another version then reads as
+            // `UnknownVersion`, not as a buffer that is merely short.
+            return match Self::decode_version(bytes) {
+                Ok(version) if version != Self::FORMAT_VERSION => {
+                    Err(LogError::UnknownVersion { version })
+                }
+                Ok(_) | Err(_) => Err(LogError::ShortBuffer),
+            };
         };
         let (body, seal) = slot.split_at(ENTRY_BODY_BYTES);
         let Ok(seal) = <[u8; 4]>::try_from(seal) else {
@@ -646,7 +655,8 @@ impl Entry {
     ///
     /// # Errors
     ///
-    /// [`LogError::NotAnEntry`] for a line that is not one, and whatever
+    /// [`LogError::NotAnEntry`] for a line that is not one, [`LogError::UnknownVersion`] for
+    /// a line at a length this build has never written, and whatever
     /// [`decode`](Self::decode) refuses the bytes with.
     pub fn parse(line: &[u8]) -> Result<Self, LogError> {
         // Trimmed at both ends before anything else. A rig's transport is a serial port and a
@@ -664,7 +674,16 @@ impl Entry {
                 rest.get(position.saturating_add(1)..).unwrap_or_default()
             });
         if tail.len() != 2 * ENTRY_BYTES {
-            return Err(LogError::NotAnEntry);
+            // The wrong length for this build. The magic and the version sit at the same
+            // hex offset in every format this build has known, so decode only those before
+            // giving up. A real line from another version then reads as `UnknownVersion`,
+            // not as a line this build does not recognise at all.
+            return match version_from_hex(tail) {
+                Ok(version) if version != Self::FORMAT_VERSION => {
+                    Err(LogError::UnknownVersion { version })
+                }
+                Ok(_) | Err(_) => Err(LogError::NotAnEntry),
+            };
         }
         let mut bytes = [0_u8; ENTRY_BYTES];
         for (slot, pair) in bytes.iter_mut().zip(tail.chunks_exact(2)) {
@@ -700,6 +719,28 @@ const fn unnibble(digit: u8) -> Option<u8> {
         b'A'..=b'F' => Some(10 + digit - b'A'),
         _ => None,
     }
+}
+
+/// The format version a hex tail declares, decoding only the magic and the version.
+///
+/// [`Entry::parse`] calls this when `tail` is not this build's own length. It decodes the
+/// first three bytes only, then hands them to [`Entry::decode_version`], so a line's version
+/// is readable even when the rest of it is a length this build has never written.
+fn version_from_hex(tail: &[u8]) -> Result<u8, LogError> {
+    if tail.len() < 6 {
+        return Err(LogError::NotAnEntry);
+    }
+    let mut prefix = [0_u8; 3];
+    for (slot, pair) in prefix.iter_mut().zip(tail.chunks_exact(2)) {
+        let (Some(high), Some(low)) = (pair.first(), pair.get(1)) else {
+            return Err(LogError::NotAnEntry);
+        };
+        let (Some(high), Some(low)) = (unnibble(*high), unnibble(*low)) else {
+            return Err(LogError::NotAnEntry);
+        };
+        *slot = (high << 4) | low;
+    }
+    Entry::decode_version(&prefix)
 }
 
 /// `line` without leading or trailing ASCII whitespace.

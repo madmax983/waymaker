@@ -982,8 +982,9 @@ impl Rig {
     /// # Errors
     ///
     /// [`RigError::Storage`] when the driver refuses the erase or the barrier.
-    /// [`instrument`](Self::instrument) already validated the window, so that refusal cannot
-    /// occur here; [`unwindow`] keeps a real driver failure from being reported as one.
+    /// [`instrument`](Self::instrument) already checked the window, so a window error cannot
+    /// happen here. [`unwindow`] still reports a real driver failure as `RigError::Storage`,
+    /// not as `RigError::Witness`.
     fn erase_instrument<S: StableStorage>(
         &self,
         part: &mut Metered<'_, S>,
