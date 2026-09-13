@@ -937,9 +937,20 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // must not read as the real thing, so nothing inside a blockquote is emitted,
     // at any nesting depth — the same treatment a fence already gets.
     let mut blockquote_depth: u32 = 0;
+    // Whether each list currently open is ordered, innermost last. `1. Status:
+    // accepted` is not `- Status: accepted`: a field or claim scan matches on the
+    // `- ` marker, and reconstructing every item with it regardless of list kind
+    // would let an ordered-list example stand in for the real bullet.
+    let mut ordered_lists: Vec<bool> = Vec::new();
     for event in parser {
         let hidden = in_fence || blockquote_depth > 0;
         match event {
+            Event::Start(Tag::List(kind)) => {
+                ordered_lists.push(kind.is_some());
+            }
+            Event::End(TagEnd::List(_)) => {
+                ordered_lists.pop();
+            }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
             }
@@ -1002,7 +1013,14 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    out.push_str("- ");
+                    // Only an unordered item renders as `- `; an ordered one renders
+                    // as `1. ` so it can never be mistaken for the marker a field or
+                    // claim scan matches on.
+                    if ordered_lists.last().copied().unwrap_or(false) {
+                        out.push_str("1. ");
+                    } else {
+                        out.push_str("- ");
+                    }
                 }
             }
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item)
@@ -1015,6 +1033,83 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             _ => {}
         }
     }
+    out
+}
+
+/// `contents` with every fenced code block, blockquote and HTML block or comment
+/// removed, keeping the exact source bytes of everything else — link syntax, code
+/// span backticks, and all.
+///
+/// [`markdown_prose`] answers "what does a reader see", which is the wrong question
+/// for a rule that needs raw Markdown syntax rather than rendered text: a link's
+/// destination, `[label](target)`, is exactly what rendered prose strips down to its
+/// visible label. This answers "what raw source is not inside one of these three
+/// containers" instead, by finding their spans structurally — with `pulldown-cmark`'s
+/// own byte offsets, not by re-deriving them from rendered output — and cutting
+/// those spans out of the original text. A span nested inside another already-hidden
+/// span is skipped rather than double-hidden, so a fence inside a blockquote (or the
+/// reverse) removes it once. Structural, not textual: nesting any of the three inside
+/// any other cannot defeat this the way composing two independent line scanners
+/// could, because there is one parse producing one consistent set of spans rather
+/// than two scans that disagree about what is inside what.
+#[must_use]
+pub fn visible_source(contents: &str) -> String {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    let mut fence_start: Option<usize> = None;
+    let mut quote_start: Option<usize> = None;
+    let mut quote_depth: u32 = 0;
+    for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                // Only fenced blocks, matching markdown_prose's own distinction: an
+                // indented block is not a construct either of these rules quotes an
+                // example in, and hiding one would blind the scan to prose it reads.
+                if matches!(kind, CodeBlockKind::Fenced(_)) {
+                    fence_start.get_or_insert(range.start);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(start) = fence_start.take() {
+                    hidden.push((start, range.end));
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                if quote_depth == 0 {
+                    quote_start = Some(range.start);
+                }
+                quote_depth = quote_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                quote_depth = quote_depth.saturating_sub(1);
+                if quote_depth == 0
+                    && let Some(start) = quote_start.take()
+                {
+                    hidden.push((start, range.end));
+                }
+            }
+            Event::Html(_) => hidden.push((range.start, range.end)),
+            _ => {}
+        }
+    }
+    hidden.sort_unstable();
+
+    let mut out = String::with_capacity(contents.len());
+    let mut cursor = 0usize;
+    for (start, end) in hidden {
+        if start < cursor {
+            // Nested inside a span already cut out (a fence inside a blockquote, or
+            // the reverse): already covered, nothing new to remove.
+            continue;
+        }
+        out.push_str(&contents[cursor..start]);
+        // A fusion guard, for the reason `without_html_comments` inserts one: text
+        // on either side of a removed span must not read as one token.
+        out.push(' ');
+        cursor = end.max(cursor);
+    }
+    out.push_str(&contents[cursor..]);
     out
 }
 

@@ -1365,71 +1365,6 @@ fn without_html_comments(contents: &str) -> String {
     kept
 }
 
-/// `line` with one leading `>` blockquote marker removed, if it has one.
-///
-/// `CommonMark` allows one optional space after the `>`. Used only to look for a fence
-/// underneath a quote: a quoted line that is not a fence stays in [`without_fenced_code`]'s
-/// kept output exactly as written, marker and all, because a reader still sees it.
-fn without_blockquote_marker(line: &str) -> &str {
-    line.strip_prefix('>')
-        .map_or(line, |rest| rest.strip_prefix(' ').unwrap_or(rest))
-}
-
-/// `contents` with every fenced code block removed.
-///
-/// Used only by rules that need the raw Markdown syntax a rendered-prose pass would
-/// strip along with the markup — [`crate::parse::markdown_prose`] is what every other
-/// rule in this file uses instead, and does not have this limit.
-///
-/// A fence is found under one level of blockquote too — `> ` ```` ``` ```` — because an
-/// example quoted in a reply is still an example. A closing line has to match the
-/// opener's own quoting as well as its marker and width: a bare ` ``` ` inside a
-/// *quoted* fence is quoted content, not a closer, and a `> ` ```` ``` ```` inside a
-/// *top-level* fence is the same content quoted the other way — both were reachable
-/// before this line was tracked, one as the original gap and one as its converse.
-/// Nested quoting beyond one level is not unwrapped, which only narrows what this
-/// function catches, never what it wrongly hides.
-///
-/// Not fully robust against a comment that itself contains a fence-looking line: this is
-/// a textual scanner, not a parser, and the two constructs are not tracked against each
-/// other. The content this reads is index and specification prose rather than an
-/// adversarial input, which is why this is accepted here and nowhere else.
-#[must_use]
-fn without_fenced_code(contents: &str) -> String {
-    let mut kept = Vec::new();
-    let mut open_fence: Option<(u8, usize, bool)> = None;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        let unquoted = without_blockquote_marker(trimmed);
-        let quoted = unquoted.len() != trimmed.len();
-        let fence = fence_length(unquoted);
-        match open_fence {
-            // A closing fence carries nothing but its own characters, and is quoted
-            // exactly as its opener was: a line with an info string, like an inner
-            // ` ```rust `, is quoted content, not a closer (`mermaid_blocks` already
-            // holds fences to this); and a bare closer cannot end a fence a `>` opened,
-            // or the other way round, because each is content inside the other's fence.
-            Some((marker, width, opener_quoted))
-                if quoted == opener_quoted
-                    && fence.is_some_and(|(found, length)| {
-                        found == marker && length >= width && unquoted.len() == length
-                    }) =>
-            {
-                open_fence = None;
-            }
-            Some(_) => {}
-            None => {
-                if let Some((marker, width)) = fence {
-                    open_fence = Some((marker, width, quoted));
-                } else {
-                    kept.push(line);
-                }
-            }
-        }
-    }
-    kept.join("\n")
-}
-
 /// The two phrases CLAUDE.md states the gate's rule count in.
 ///
 /// # Why this is a pin and not a scan
@@ -2472,11 +2407,11 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
 
     // Both directions read the same parsed link list. Asking only whether the file
     // *name* appears would accept `[0001-one.md](../architecture.md)`, where the ADR is
-    // mentioned and not linked; and a link inside an HTML comment or a fenced example is
-    // text about a link rather than one — which is the whole of what an index is for.
-    // Not `markdown_prose`: the raw `](target)` syntax this needs is exactly what
-    // rendered prose strips.
-    let linked = linked_markdown_files(&without_html_comments(&without_fenced_code(index)));
+    // mentioned and not linked; and a link inside an HTML comment, a blockquote or a
+    // fenced example is text about a link rather than one — which is the whole of what
+    // an index is for. Not `markdown_prose`: the raw `](target)` syntax this needs is
+    // exactly what rendered prose strips.
+    let linked = linked_markdown_files(&crate::parse::visible_source(index));
 
     let mut violations: Vec<Violation> = adrs
         .iter()
@@ -3916,7 +3851,7 @@ fn check_wire_format_is_documented(
         ));
         return violations;
     };
-    // No `without_fenced_code` here, on purpose: the frozen values live inside fenced
+    // Not `visible_source`, on purpose: the frozen values live inside fenced
     // byte-layout blocks in this document, not in prose beside them. Stripping fences
     // would blind this check to the content it exists to read.
     let spec = without_html_comments(spec);
@@ -3954,7 +3889,7 @@ fn check_wire_format_is_documented(
         // Not `markdown_prose`: a descriptive link's destination, `[wire-format
         // specification](docs/format/wire-format-v1.md)`, is exactly what rendered
         // prose strips, and this only asks whether the path is written down somewhere.
-        let claude_md = without_html_comments(&without_fenced_code(claude_md));
+        let claude_md = crate::parse::visible_source(claude_md);
         if !claude_md.contains(WIRE_FORMAT_SPEC_PATH) {
             violations.push(Violation::new(
                 RULE,
@@ -5647,6 +5582,15 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_does_not_read_an_ordered_list_item_as_a_bulleted_field() {
+        // Codex, pull request #138: `markdown_prose` reconstructed every list item
+        // with `- `, ordered or not, so `1. Status: accepted` shown as a worked
+        // example rendered exactly like the real `- Status: proposed` bullet.
+        let contents = "# ADR\n\n1. Status: accepted\n2. Something else\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -5890,13 +5834,14 @@ mod tests {
 
     #[test]
     fn a_quoted_looking_closer_inside_a_top_level_example_fence_does_not_leak_or_hide_links() {
-        // Codex, pull request #138: the converse of the blockquoted-fence case, now
-        // found through `check_adr_index`, the one remaining caller of
-        // `without_fenced_code`. Inside a top-level (unquoted) example fence, a line
-        // like `> ``` ` is quoted content, not a closer. The old bug closed the fence
-        // there, exposing a link inside the example as if it were real, and then read
-        // the real closing fence as a fresh opener — hiding the real link that follows
-        // it.
+        // Codex, pull request #138: the converse of the blockquoted-fence case, found
+        // through `check_adr_index` when it was still on the textual scanners. Inside
+        // a top-level (unquoted) example fence, a line like `> ``` ` is quoted
+        // content, not a closer. The textual scanner's bug closed the fence there,
+        // exposing a link inside the example as if it were real, and then read the
+        // real closing fence as a fresh opener — hiding the real link that follows
+        // it. `check_adr_index` now reads through `visible_source`, a real parser,
+        // which does not have this failure mode; this pins the scenario against it.
         let index =
             "```text\n> ```\n[0002-two.md](0002-two.md)\n```\n- [0001-one.md](0001-one.md)\n";
         let adrs = vec![
@@ -5919,6 +5864,24 @@ mod tests {
                 && v.detail.contains("no link in the index points at it")),
             "a link quoted only inside the example counted as a real one: {violations:?}"
         );
+    }
+
+    #[test]
+    fn a_fence_looking_line_inside_a_comment_does_not_hide_the_real_links() {
+        // Codex, pull request #138: composing the two textual scanners in either
+        // order was reachable through `check_adr_index` too — an HTML comment
+        // containing a fence-looking line let the fence scanner consume the
+        // comment's own terminator (and the real links after it) before the comment
+        // scanner ever ran. `visible_source` finds both constructs in one real
+        // parse, so an HTML comment's own `-->` ends it regardless of what looks
+        // like a fence inside it.
+        let index = "<!--\n```\n-->\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
