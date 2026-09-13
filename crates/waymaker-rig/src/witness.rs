@@ -517,7 +517,7 @@ impl Progress {
     }
 
     /// How many bytes [`encode`](Self::encode) writes.
-    pub const ENCODED_BYTES: usize = 12;
+    pub const ENCODED_BYTES: usize = 15;
 
     /// A high water, as two bytes, with `0xFFFF` for "none".
     ///
@@ -546,10 +546,15 @@ impl Progress {
     /// third "done when" true rather than nearly true. A log line carrying a seed, an
     /// iteration and a geometry can rebuild the *run*; it cannot rebuild what the rig
     /// **knew**, and the obligations §14 puts on a recovery are entirely statements about
-    /// that. Without these twelve bytes a violation is reproducible only if the host still
+    /// that. Without these fifteen bytes a violation is reproducible only if the host still
     /// has the device.
     ///
-    /// The mark count and the tear flag travel too, because `Audit::finish` reads both.
+    /// The mark count and the tear flag travel too, because `Audit::finish` reads both. The
+    /// count uses four bytes, not one. Issue
+    /// [#81](https://github.com/madmax983/waymaker/issues/81) found a one-byte count that
+    /// silently narrowed on a run of 51 or more effects. Two bytes would not be enough
+    /// either: see [`Rig::marks_per_run`](crate::run::Rig::marks_per_run) for the largest
+    /// legal run's mark count.
     ///
     /// # Errors
     ///
@@ -565,11 +570,8 @@ impl Progress {
         acknowledged.copy_from_slice(&Self::word(self.acknowledged));
         let (dispatched, rest) = rest.split_at_mut(2);
         dispatched.copy_from_slice(&Self::word(self.dispatched));
-        let (marks, flags) = rest.split_at_mut(1);
-        // Saturating: the count is a figure in a report, and a wrapped one would read as an
-        // empty witness — which `Audit::finish` treats as "the run never began".
-        let count = u8::try_from(self.marks.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
-        marks.fill(count);
+        let (marks, flags) = rest.split_at_mut(4);
+        marks.copy_from_slice(&self.marks.to_le_bytes());
         // Presence is a flag rather than a reserved iteration number. `u32::MAX` is a legal
         // iteration — `Plan::cut` answers for it and a rig can be asked to run it — so a
         // sentinel would make a real witness from that iteration decode as *no* witness, and
@@ -599,7 +601,7 @@ impl Progress {
         let (attempted, rest) = rest.split_at(2);
         let (acknowledged, rest) = rest.split_at(2);
         let (dispatched, rest) = rest.split_at(2);
-        let (marks, flags) = rest.split_at(1);
+        let (marks, flags) = rest.split_at(4);
         let iteration = u32::from_le_bytes(<[u8; 4]>::try_from(iteration).ok()?);
         let bits = flags.first().copied()?;
         if bits & !(FLAG_TORN | FLAG_ITERATION) != 0 {
@@ -613,7 +615,7 @@ impl Progress {
             attempted: Self::unword(<[u8; 2]>::try_from(attempted).ok()?),
             acknowledged: Self::unword(<[u8; 2]>::try_from(acknowledged).ok()?),
             dispatched: Self::unword(<[u8; 2]>::try_from(dispatched).ok()?),
-            marks: u32::from(marks.first().copied()?),
+            marks: u32::from_le_bytes(<[u8; 4]>::try_from(marks).ok()?),
             torn: bits & FLAG_TORN != 0,
         })
     }
@@ -758,6 +760,13 @@ impl Witness {
     }
 
     /// Every slot, and the index of the first erased one after the last used one.
+    ///
+    /// Marks are appended in order, so the first slot that reads as erased ends the marks:
+    /// every slot from there to the end of the region must be erased too, or this is a
+    /// [`WitnessError::Hole`], and nothing past that point can still be a mark. Once that
+    /// slot is found, [`verify_erased_to_end`](Self::verify_erased_to_end) confirms it a
+    /// page at a time rather than reading and decoding one twelve-byte slot at a time for
+    /// however much of the region is capacity nothing has used yet.
     fn read<S: StableStorage>(
         self,
         storage: &mut S,
@@ -765,7 +774,6 @@ impl Witness {
     ) -> Result<(Progress, u32), WitnessError<S::Error>> {
         let slot_bytes = self.check(storage, page)?;
         let mut progress = Progress::default();
-        let mut ended = false;
         let mut next = 0_u32;
 
         for index in 0..self.region.capacity() {
@@ -777,21 +785,15 @@ impl Witness {
             };
             storage.read(offset, slot).map_err(WitnessError::Driver)?;
 
-            let erased = slot.iter().all(|byte| *byte == 0xFF);
             match Mark::decode(slot) {
-                Ok(mark) if !ended => {
+                Ok(mark) => {
                     progress = progress.accept(mark).map_err(promote)?;
                     next = index.saturating_add(1);
                 }
-                Ok(_) => return Err(WitnessError::Hole),
-                // Everything past the end must be erased. Anything else is a second region
-                // of writing, which marks are never appended as.
-                Err(_) if ended => {
-                    if !erased {
-                        return Err(WitnessError::Hole);
-                    }
+                Err(_) if slot.iter().all(|byte| *byte == 0xFF) => {
+                    self.verify_erased_to_end(storage, page, offset)?;
+                    return Ok((progress, next));
                 }
-                Err(_) if erased => ended = true,
                 // A mark the reset tore. The next boot appends after it.
                 Err(_) => {
                     progress.torn = true;
@@ -800,6 +802,60 @@ impl Witness {
             }
         }
         Ok((progress, next))
+    }
+
+    /// Confirms every byte from `from` to the end of the region reads as erased.
+    ///
+    /// The caller has already found the first erased slot at `from`; what is left is a
+    /// region that, by construction, is either wholly erased or a [`WitnessError::Hole`] —
+    /// nothing in it can still decode as a mark, because marks are appended in order and
+    /// this is the first slot that was not one. So this reads `page`'s worth of the region
+    /// at a time rather than one slot at a time, which is the same trade
+    /// `waymaker_flash::recovery`'s own erased-tail walk makes over the same shape of cost.
+    fn verify_erased_to_end<S: StableStorage>(
+        self,
+        storage: &mut S,
+        page: &mut [u8],
+        from: u32,
+    ) -> Result<(), WitnessError<S::Error>> {
+        let region = self.region;
+        let Some(end) = region
+            .capacity()
+            .checked_mul(region.slot_bytes())
+            .and_then(|span| region.base().checked_add(span))
+        else {
+            return Err(WitnessError::Region);
+        };
+        let read_unit = region.geometry().read_size();
+        let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
+        // Rounded down to a whole number of read units, the same arithmetic
+        // `waymaker_flash::recovery`'s page-bounded reader uses for the same reason: every
+        // read this issues has to be one `StableStorage::read` may accept.
+        let chunk = page_bytes & !read_unit.wrapping_sub(1);
+        if chunk == 0 {
+            return Err(WitnessError::ShortBuffer);
+        }
+
+        let mut at = from;
+        while at < end {
+            let want = chunk.min(end - at);
+            let Ok(want_bytes) = usize::try_from(want) else {
+                return Err(WitnessError::ShortBuffer);
+            };
+            let Some(slice) = page.get_mut(..want_bytes) else {
+                return Err(WitnessError::ShortBuffer);
+            };
+            storage.read(at, slice).map_err(WitnessError::Driver)?;
+            if !slice.iter().all(|byte| *byte == 0xFF) {
+                return Err(WitnessError::Hole);
+            }
+            // `want` is at least one read unit whenever `at < end`, so this always advances.
+            let Some(next) = at.checked_add(want) else {
+                return Err(WitnessError::Region);
+            };
+            at = next;
+        }
+        Ok(())
     }
 }
 

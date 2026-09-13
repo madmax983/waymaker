@@ -1,11 +1,12 @@
-# ADR 0041: The model gains banked records, a reboot, and a live compaction
+# ADR 0042: The model gains banked records, a reboot, and a live compaction
 
 - Status: accepted
 - Date: 2026-09-13
 - Issue: [#67](https://github.com/madmax983/waymaker/issues/67)
 - Supersedes: nothing
 - Related: [ADR 0015](0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md),
-  [ADR 0017](0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md)
+  [ADR 0017](0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md),
+  [ADR 0041](0041-the-bank-refinement-abstracts-a-real-swap.md)
 
 ## Context
 
@@ -148,13 +149,11 @@ once without either interruption being impossible. The record-history-shapes cen
 likewise now a per-bank claim rather than a claim about the concatenation of both banks'
 records.
 
-What remains owed, and is written down as such in `obligation.rs`'s `single-authority` row:
-the refinement against a real two-bank writer. `tests/refinement.rs` still drives no writer
-across `waymaker_flash::bank`'s real swap, so a reconstructed state still has no banks and
-`single-authority` is still discharged against the model alone —
-`a_reconstructed_state_cannot_falsify_the_fourth_guarantee` says so directly. Closing that is
-issue #22's adapter, refined the way the record codec already is; it is a project of its own
-rather than a corollary of this one.
+[ADR 0041](0041-the-bank-refinement-abstracts-a-real-swap.md) closes the other half of
+`single-authority`'s gap: issue #73's `tests/refinement.rs` now drives a real writer across
+`waymaker_flash::bank`'s swap and checks it against this machine's reachable set, so a
+reconstructed state is no longer limited to the record dimension alone. Between the two
+issues, `obligation.rs`'s `single-authority` row now says nothing is owed.
 
 Issue #95's gap — that `continue_as_new` does not carry an effect's identity across a
 swap — is unaffected by this change and is not what

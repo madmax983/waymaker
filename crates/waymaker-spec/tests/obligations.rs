@@ -133,15 +133,18 @@ fn a_clause_discharged_against_the_model_is_falsified_somewhere_other_than_its_o
 
 #[test]
 fn what_is_still_owed_is_written_down_rather_than_left_out() {
-    // Two clauses are only partly discharged, and both say so. This asserts the count so
-    // that a third gap has to be declared rather than absorbed, and that a gap closed is a
-    // row edited rather than a note quietly left behind.
+    // One clause is only partly discharged, and says so. `single-authority` used to be a
+    // second: issue #67 gave the model the bank expressiveness it lacked and issue #73
+    // closed the refinement against a real two-bank writer, so between the two nothing is
+    // owed there any longer. This asserts the count so that a new gap has to be declared
+    // rather than absorbed, and that a gap closed is a row edited rather than a note quietly
+    // left behind.
     let owed: Vec<&str> = CLAUSES
         .iter()
         .filter(|entry| entry.owed.is_some())
         .map(|entry| entry.id)
         .collect();
-    assert_eq!(owed, vec!["single-authority", "bounded-decoding"]);
+    assert_eq!(owed, vec!["bounded-decoding"]);
     for entry in CLAUSES {
         if let Some(note) = entry.owed {
             assert!(

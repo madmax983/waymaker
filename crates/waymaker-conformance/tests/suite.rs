@@ -38,7 +38,7 @@ fn block_is_one_unit() -> Geometry {
 
 fn whole(geometry: Geometry) -> Region {
     let Ok(region) = Region::whole_device(geometry) else {
-        unreachable!("every geometry here has at least three erase blocks")
+        unreachable!("every geometry here has at least four erase blocks")
     };
     region
 }
@@ -130,9 +130,11 @@ fn a_block_that_is_one_program_unit_exempts_the_rest_of_the_block_case() {
         report.outcome(CaseId::ProgramLeavesTheRestOfTheBlockAlone),
         Outcome::NotApplicable(NotApplicable::TheBlockIsOneProgramUnit)
     );
+    // `validate_program` says nothing about erase-block containment, so a two-unit program
+    // is still legal here — it just spans two erase blocks.
     assert_eq!(
         report.outcome(CaseId::MultiUnitProgramIsLegal),
-        Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit)
+        Outcome::Passed
     );
 }
 
@@ -176,7 +178,7 @@ fn a_device_with_byte_granular_erase_exempts_every_misalignment_case() {
     );
     assert_eq!(
         report.outcome(CaseId::MultiUnitProgramIsLegal),
-        Outcome::NotApplicable(NotApplicable::TheBlockHoldsOneProgramUnit)
+        Outcome::Passed
     );
 }
 
@@ -209,10 +211,10 @@ fn the_suite_refuses_a_region_checked_against_another_device() {
 }
 
 #[test]
-fn a_region_must_be_erase_aligned_bounded_and_three_blocks_long() {
+fn a_region_must_be_erase_aligned_bounded_and_four_blocks_long() {
     let geometry = nested();
     assert_eq!(
-        Region::new(geometry, 1, 192),
+        Region::new(geometry, 1, 256),
         Err(RegionError::NotEraseAligned)
     );
     assert_eq!(
@@ -220,26 +222,26 @@ fn a_region_must_be_erase_aligned_bounded_and_three_blocks_long() {
         Err(RegionError::NotEraseAligned)
     );
     assert_eq!(
-        Region::new(geometry, 1024, 192),
+        Region::new(geometry, 1024, 256),
         Err(RegionError::OutOfBounds)
     );
     assert_eq!(
-        Region::new(geometry, 0, 128),
+        Region::new(geometry, 0, 192),
         Err(RegionError::TooFewEraseBlocks)
     );
-    assert!(Region::new(geometry, 64, 192).is_ok());
+    assert!(Region::new(geometry, 64, 256).is_ok());
 }
 
 #[test]
 fn a_device_with_too_few_erase_blocks_cannot_be_conformance_tested() {
-    // Told, rather than discovered from a suite that passed. Three blocks is what the
-    // neighbour case and the across-reset witness need.
-    let Ok(two_blocks) = Geometry::new(128, 64, 4, 2) else {
-        unreachable!("128 is two 64-byte blocks")
+    // Told, rather than discovered from a suite that passed. Four blocks is what the
+    // two-block bulk erase's bidirectional witness and the across-reset witness need.
+    let Ok(three_blocks) = Geometry::new(192, 64, 4, 2) else {
+        unreachable!("192 is three 64-byte blocks")
     };
-    assert_eq!(two_blocks.erase_blocks(), REQUIRED_ERASE_BLOCKS - 1);
+    assert_eq!(three_blocks.erase_blocks(), REQUIRED_ERASE_BLOCKS - 1);
     assert_eq!(
-        Region::whole_device(two_blocks),
+        Region::whole_device(three_blocks),
         Err(RegionError::TooFewEraseBlocks)
     );
 }
@@ -280,16 +282,17 @@ fn the_suite_runs_inside_the_region_it_was_given() {
 #[test]
 fn a_region_reports_the_window_it_was_built_from() {
     let geometry = nested();
-    let Ok(region) = Region::new(geometry, 128, 192) else {
-        unreachable!("128 and 192 are whole 64-byte blocks inside 1024 bytes")
+    let Ok(region) = Region::new(geometry, 128, 256) else {
+        unreachable!("128 and 256 are whole 64-byte blocks inside 1024 bytes")
     };
     assert_eq!(region.geometry(), geometry);
     assert_eq!(region.offset(), 128);
-    assert_eq!(region.len(), 192);
-    assert_eq!(region.end(), 320);
+    assert_eq!(region.len(), 256);
+    assert_eq!(region.end(), 384);
     assert!(!region.is_empty());
     assert_eq!(region.block(0), Some(128));
     assert_eq!(region.block(2), Some(256));
-    assert_eq!(region.block(3), None);
+    assert_eq!(region.block(3), Some(320));
+    assert_eq!(region.block(4), None);
     assert_eq!(region.block(u32::MAX), None);
 }

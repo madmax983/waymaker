@@ -160,6 +160,109 @@ fn a_version_the_reader_does_not_know_is_refused() {
     );
 }
 
+/// A 92-byte buffer shaped exactly like a real v1 entry: the magic, version 1, filler, and
+/// the check a v1 writer would really have sealed it with.
+///
+/// Not a fake. Issue #81's second review round found that a buffer merely *shaped* like the
+/// three-byte prefix was accepted regardless of the rest of it, so this is what a genuine
+/// line looks like: a real `Catalogued` check over the first 88 bytes.
+fn genuine_v1_bytes() -> [u8; 92] {
+    let mut bytes = [0x11_u8; 92];
+    bytes[0] = 0x52; // ENTRY_MAGIC low byte, unchanged across versions
+    bytes[1] = 0x47; // ENTRY_MAGIC high byte
+    bytes[2] = 1; // the version a v1 build wrote
+    bytes[18] = 0; // reserved, at the same offset in both formats; a real writer zeroed it
+    bytes[19] = 0;
+    let check =
+        <waymaker_flash::integrity::Catalogued as waymaker_flash::integrity::IntegrityCheck>::frame_check(
+            &bytes[..88],
+        );
+    bytes[88..].copy_from_slice(&check.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn a_shorter_older_version_is_refused_by_name_not_by_length() {
+    // Codex, round 2 of issue #81: `ENTRY_BYTES` grew from 92 to 95 with the version bump.
+    // A real v1 line is 92 bytes, so it failed the new length gate before its version byte
+    // was ever read, and was reported as `ShortBuffer` rather than `UnknownVersion { version:
+    // 1 }`. The two must stay distinguishable: one is corruption, the other is a known old
+    // format.
+    let old = genuine_v1_bytes();
+    assert_eq!(
+        Entry::decode(&old),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
+fn a_v1_line_at_the_front_of_a_current_sized_buffer_is_still_named() {
+    // Codex, round 5 of issue #81: `decode_with` already tolerates a buffer longer than
+    // `ENTRY_BYTES`, taking only the front of it -- that is the whole reason it slices
+    // with `bytes.get(..ENTRY_BYTES)` rather than requiring an exact length. A caller
+    // holding a scratch page sized for this build's own entries, but carrying a v1 line
+    // from before an upgrade, gets the same answer either way.
+    let mut padded = [0_u8; ENTRY_BYTES];
+    let old = genuine_v1_bytes();
+    padded[..old.len()].copy_from_slice(&old);
+    assert_eq!(
+        Entry::decode(&padded),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
+fn a_rendered_line_at_a_shorter_older_version_is_refused_by_name() {
+    use std::fmt::Write as _;
+
+    // The same fix, through `Entry::parse`'s hex tail: a rendered v1 line is a different
+    // length in hex too, and has to be told apart from a line this build cannot read at all.
+    let old = genuine_v1_bytes();
+    let mut hex = String::new();
+    for byte in old {
+        write!(hex, "{byte:02x}").expect("writing to a String never fails");
+    }
+    let line = format!("waymaker-rig x {hex}");
+    assert_eq!(
+        Entry::parse(line.as_bytes()),
+        Err(LogError::UnknownVersion { version: 1 })
+    );
+}
+
+#[test]
+fn a_buffer_that_only_looks_like_a_v1_prefix_is_not_misread_as_one() {
+    // Codex, round 3 of issue #81: the magic and a version byte of 1 are not evidence of a
+    // real v1 line on their own. Ninety-two bytes with the right three-byte prefix and
+    // arbitrary, unsealed filler must still be refused, not read as history.
+    let mut fake = [0x11_u8; 92];
+    fake[0] = 0x52;
+    fake[1] = 0x47;
+    fake[2] = 1;
+    assert_ne!(
+        fake,
+        genuine_v1_bytes(),
+        "the fixture must not be a real seal by accident"
+    );
+    assert_eq!(Entry::decode(&fake), Err(LogError::ShortBuffer));
+}
+
+#[test]
+fn a_sealed_buffer_with_a_dirty_reserved_word_is_not_misread_as_v1() {
+    // Codex, round 4 of issue #81: a checksum that matches its own bytes is not evidence
+    // that those bytes are a real v1 entry. A genuine v1 writer zeroed the reserved word at
+    // the same offset a v2 writer does. This buffer reseals itself with that word dirty, so
+    // the check passes and the version claim must still be refused.
+    let mut dirty = genuine_v1_bytes();
+    dirty[18] = 0x11;
+    dirty[19] = 0x11;
+    let check =
+        <waymaker_flash::integrity::Catalogued as waymaker_flash::integrity::IntegrityCheck>::frame_check(
+            &dirty[..88],
+        );
+    dirty[88..].copy_from_slice(&check.to_le_bytes());
+    assert_eq!(Entry::decode(&dirty), Err(LogError::ShortBuffer));
+}
+
 #[test]
 fn an_entry_renders_a_line_a_host_can_read_back() {
     // Not a convenience. The rig's transport is a serial port, so the line a board prints has

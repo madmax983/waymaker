@@ -102,7 +102,7 @@ fn nested() -> Geometry {
 
 fn whole(geometry: Geometry) -> Region {
     let Ok(region) = Region::whole_device(geometry) else {
-        unreachable!("sixteen erase blocks is more than three")
+        unreachable!("sixteen erase blocks is more than four")
     };
     region
 }

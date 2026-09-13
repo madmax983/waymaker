@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`; there is still a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`, and refined against a real two-bank swap since issue #73's `tests/refinement.rs` abstraction of `waymaker_flash::bank` |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -1040,11 +1040,16 @@ Stated so that nobody mistakes silence for coverage:
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers
-  records; it does not cover banks, because rung 0.2 owns the two-bank adapter and there is
-  nothing yet to abstract — issue #67 gave the *model* a bank dimension (a `Record`'s
-  `BankId`, and recovery scoped to the one a reader would boot from), which is a different
-  thing from refining a real two-bank writer against it. `single-authority` is therefore
-  still proved about a model and not about a device, and its row in `obligation.rs` says so.
+  records, and — since issue #73 — banks: a real swap writer, styled on
+  `crates/waymaker-fault/tests/banks.rs`'s own, is folded into `[Bank; 2]` at every crash
+  point and checked against the model's reachable set. Issue #67 gave the *model* the
+  dimension that made a bank-aware refinement possible in the first place — a `Record`'s
+  `BankId`, and recovery scoped to the one a reader would boot from — so `single-authority` is
+  now proved about a device rather than only about a model, and `obligation.rs`'s row says so.
+  What is not covered is every bank sequence a firmware could produce, only the one swap this
+  file drives. See
+  [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md) and
+  [ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
@@ -2808,6 +2813,24 @@ and a Cortex-M0 is not a Cortex-M0+. ADR 0040 carries no attestation marker, so
 `hardware-attestation` fails a build in which somebody moves a row and cites it. See
 [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
+Issue #73 then closes the refinement half of `single-authority`'s gap. Issue #22 added the
+real two-bank adapter; nothing had abstracted it into the ghost model yet, so a state rebuilt
+from a real crashed run had no banks and answered the guarantee vacuously.
+`waymaker-spec`'s `refine` module gains two functions, `bank_after_erase` and
+`bank_after_seal`, each folding one crash into a `Bank` from what the bank's own region shows
+afterwards — not from whether the writer's call returned `Ok`, because `waymaker-fault`'s
+writes land synchronously and a watchdog reset can finish a unit in flight and still answer
+`Err`. `tests/refinement.rs` drives a swap writer styled on
+`crates/waymaker-fault/tests/banks.rs`'s own, and checks every crash point three ways: is the
+reconstructed state one the model's search reaches, does the guarantee hold of it, and does
+`waymaker_flash::bank::select` over the real bytes agree with it. `obligation.rs`'s row for
+`single-authority` no longer says the refinement is missing. What is left owed is the model's
+own expressiveness, unchanged by this issue: a bank holds no record, so "never recover the
+old run as current" is not a statement the machine can make, only "exactly one bank is
+bootable"; and a generation is an unbounded integer, where the firmware refuses at the
+ceiling rather than proving the refusal unnecessary. See
+[ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md).
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
 async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's exit
@@ -2852,10 +2875,10 @@ whose failed middle record is skipped over, which the oracle's committed-history
 what makes acceptable, so the circularity issue #67 named is closed by a test that checks the
 claim directly against the `Ledger` the agreement tests build
 (`tests/oracle.rs`'s `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history`)
-rather than by a stricter oracle. What remains owed is written down in `obligation.rs`'s
-`single-authority` row rather than left to be noticed: the refinement against a real
-two-bank writer, which is issue #22's adapter and a project of its own. See
-[ADR 0041](docs/adr/0041-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+rather than by a stricter oracle. Issue #73 had already closed the refinement half of this
+guarantee's gap — the paragraph above — and this issue closes the other half, the model's
+own expressiveness, so `obligation.rs`'s `single-authority` row now says nothing is owed. See
+[ADR 0042](docs/adr/0042-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 
 Review of the pull request that closed issue #67 then found a fourth gap `Guard::
 NeverEraseTheAuthority` left open: `authoritative()` is always empty before the first seal,
@@ -2878,7 +2901,7 @@ unchanged, because every state a post-retirement dispatch could reach is also re
 dispatching while the bank is still current and retiring it afterward — a `Journal` is a
 snapshot rather than a log, so the two are one state, not two. `tests/necessity.rs`'s
 `a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
-constructs that legitimate trace by hand; no guard was added, and ADR 0041's alternatives
+constructs that legitimate trace by hand; no guard was added, and ADR 0042's alternatives
 section says why.
 
 A sixth found a real bug: `Journal::from_parts` (which `Journal::reconstructed` uses to turn
