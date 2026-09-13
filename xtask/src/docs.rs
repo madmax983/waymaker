@@ -6285,6 +6285,36 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
+        // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
+        // containing `<!--`, but a real, unescaped one is always recognized by
+        // `pulldown-cmark`'s own inline scanner first and reaches this module as
+        // `Event::InlineHtml` or inside an `Event::Html` block — never as
+        // `Event::Text`. So one that does reach `Event::Text` can only be an escape or
+        // a decoded entity, and a renderer shows both as plain visible characters, not
+        // as a comment. Treating the decoded text as a real opener hid every decision
+        // after a decoy meant to display literally.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\\<!-- looks like a comment but renders literally\n\n{} {}\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == sixth.id),
+            "a decision after an escaped comment-marker decoy was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
     fn ids_hidden_in_an_html_comment_do_not_record_a_decision() {
         // Otherwise an ADR reduced to a title and a block of ids in a comment passes.
         let mut ids = String::new();
@@ -6945,6 +6975,29 @@ mod tests {
                     && violation.detail.contains("no table row")),
             "a table after an unterminated comment that outlived its block still counted: \
              {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_after_a_comment_closed_as_plain_prose_still_counts() {
+        // Codex, pull request #138, round 22: `table_rows` tracked `in_html_comment`
+        // only from `Event::Html`, so a comment that outlived its own `HtmlBlock`
+        // across a blank line and then closed via a standalone `-->` — emitted as
+        // ordinary `Event::Text`, not `Event::Html` — left the state stuck open,
+        // hiding every table after it for good, whatever came later.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "<div>\n<!--\n</div>\n\n-->\n\n\
+             | Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | {} | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id),
+            "a table after a comment closed as plain prose was still hidden: {violations:?}"
         );
     }
 
