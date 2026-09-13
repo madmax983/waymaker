@@ -252,13 +252,21 @@ impl<S: StableStorage> Run<'_, S> {
     ///
     /// Chunked through the caller's buffer, so a case can check an erase block far wider
     /// than the buffer without holding a copy of it. `None` if a legal read was refused.
+    ///
+    /// The chunk is the widest whole number of program units the buffer holds rather than
+    /// one unit at a time: [`run`] refuses a buffer under [`REQUIRED_BUFFER_UNITS`] units, so
+    /// this is always at least one, and a whole number of units is always a whole number of
+    /// [`read_size`](Self::read_size)s too, `program_size` nesting inside it by construction
+    /// (see [`Geometry::new`](waymaker_flash::storage::Geometry::new)). A caller with a
+    /// 256-byte page and a 4-byte program unit was, before this, still reading and
+    /// comparing four bytes at a time.
     fn media_matches(
         &mut self,
         offset: u32,
         len: u32,
         expected: impl Fn(u32) -> u8,
     ) -> Option<bool> {
-        let step = self.unit;
+        let step = self.buffer.len() / self.unit * self.unit;
         let mut seen = 0_u32;
         while seen < len {
             let chunk = core::cmp::min(step, usize::try_from(len - seen).ok()?);
