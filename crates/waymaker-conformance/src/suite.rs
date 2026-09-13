@@ -826,6 +826,13 @@ impl<S: StableStorage> Run<'_, S> {
         if !self.program_a_unit(case, self.block_d()) {
             return;
         }
+        // A witness immediately before `second` too: a broken adapter that answers a
+        // zero-length operation there by clamping to the preceding block would otherwise
+        // corrupt it with nothing here to notice, on any region — reaching the capacity or
+        // not.
+        if !self.program_a_unit(case, self.block_c()) {
+            return;
+        }
         let base = self.block_a();
         let second = self.block_d();
 
@@ -867,9 +874,10 @@ impl<S: StableStorage> Run<'_, S> {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
         }
-        let (Some(first_untouched), Some(second_untouched)) = (
+        let (Some(first_untouched), Some(second_untouched), Some(before_second_untouched)) = (
             self.block_holds_the_pattern(base),
             self.block_holds_the_pattern(second),
+            self.block_holds_the_pattern(self.block_c()),
         ) else {
             self.record(case, Outcome::Failed(Failure::LegalOperationRefused));
             return;
@@ -883,11 +891,12 @@ impl<S: StableStorage> Run<'_, S> {
         } else {
             true
         };
-        let outcome = if first_untouched && second_untouched && edge_untouched {
-            Outcome::Passed
-        } else {
-            Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
-        };
+        let outcome =
+            if first_untouched && second_untouched && before_second_untouched && edge_untouched {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(Failure::MediaOutsideTheOperationChanged)
+            };
         self.record(case, outcome);
     }
 
@@ -1204,6 +1213,13 @@ impl<S: StableStorage> Run<'_, S> {
         if !self.program_a_unit(case, self.block_a()) {
             return;
         }
+        // A witness in the following block too: on a device whose erase block is a single
+        // program unit, `block_holds_the_pattern` has no erased tail left to inspect, so a
+        // read that corrupts the unit right after the one it returned lands entirely outside
+        // this case's own block with nothing here to notice it.
+        if !self.program_a_unit(case, self.block_b()) {
+            return;
+        }
         let base = self.block_a();
         for _ in 0..2 {
             match self.block_holds_the_pattern(base) {
@@ -1218,7 +1234,12 @@ impl<S: StableStorage> Run<'_, S> {
                 }
             }
         }
-        self.record(case, Outcome::Passed);
+        let outcome = match self.block_holds_the_pattern(self.block_b()) {
+            Some(true) => Outcome::Passed,
+            Some(false) => Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
+            None => Outcome::Failed(Failure::LegalOperationRefused),
+        };
+        self.record(case, outcome);
     }
 }
 

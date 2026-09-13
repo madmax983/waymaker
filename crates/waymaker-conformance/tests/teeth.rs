@@ -123,6 +123,13 @@ enum Flaw {
     /// which is not one of the two fixed witnesses this case otherwise keeps — on a region
     /// wider than the required minimum, neither ever looks there.
     ZeroLengthAtCapacityClampsToThePrecedingBlock,
+    /// A zero-length erase named anywhere clamps to the block right before it.
+    ///
+    /// Distinct from [`Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock`]: this fires on
+    /// the *interior* zero-length probe too, which names the region's fourth designated
+    /// block rather than the capacity — a block whose own preceding neighbour is not one of
+    /// this case's two original witnesses either.
+    ZeroLengthEraseClampsToThePrecedingBlock,
 }
 
 const ERASED: u8 = 0xFF;
@@ -432,6 +439,19 @@ impl StableStorage for Broken {
                     }
                 }
             }
+            Flaw::ZeroLengthEraseClampsToThePrecedingBlock => {
+                self.fill(offset, len, |_| ERASED);
+                // Scoped away from the capacity so this is an independent tooth from
+                // `ZeroLengthAtCapacityClampsToThePrecedingBlock`: without the exclusion,
+                // both fire on the same `erase(capacity, 0)` call and this row's own
+                // witness is never what catches it.
+                if len == 0 && offset != self.geometry.capacity() {
+                    let block = self.geometry.erase_size();
+                    if let Some(previous) = offset.checked_sub(block) {
+                        self.fill(previous, block, |_| 0x00);
+                    }
+                }
+            }
             _ => self.fill(offset, len, |_| ERASED),
         }
         Ok(())
@@ -665,6 +685,11 @@ const TEETH: &[(Flaw, CaseId, Failure)] = &[
         CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
         Failure::MediaOutsideTheOperationChanged,
     ),
+    (
+        Flaw::ZeroLengthEraseClampsToThePrecedingBlock,
+        CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
+        Failure::MediaOutsideTheOperationChanged,
+    ),
 ];
 
 #[test]
@@ -778,6 +803,7 @@ const fn runs_wild_on_a_legal_operation(flaw: Flaw) -> bool {
         | Flaw::MultiUnitProgramCorruptsThePrecedingUnit
         | Flaw::MultiBlockEraseCorruptsThePrecedingBlock
         | Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock
+        | Flaw::ZeroLengthEraseClampsToThePrecedingBlock
         | Flaw::ReadCorruptsWhatFollows
         | Flaw::BarrierScribbles
         | Flaw::BarrierScribblesInTheMiddleBlock
@@ -900,7 +926,8 @@ const fn expected(flaw: Flaw) -> Option<(CaseId, Failure)> {
             CaseId::MultiBlockEraseIsLegal,
             Failure::MediaOutsideTheOperationChanged,
         )),
-        Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock => Some((
+        Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock
+        | Flaw::ZeroLengthEraseClampsToThePrecedingBlock => Some((
             CaseId::ZeroLengthOperationsAreLegalAndChangeNothing,
             Failure::MediaOutsideTheOperationChanged,
         )),
@@ -942,6 +969,7 @@ const ALL: &[Flaw] = &[
     Flaw::MultiUnitProgramCorruptsThePrecedingUnit,
     Flaw::MultiBlockEraseCorruptsThePrecedingBlock,
     Flaw::ZeroLengthAtCapacityClampsToThePrecedingBlock,
+    Flaw::ZeroLengthEraseClampsToThePrecedingBlock,
 ];
 
 #[test]
@@ -1047,6 +1075,26 @@ fn a_multi_unit_program_that_corrupts_the_preceding_unit_is_caught_when_it_cross
 
     assert_eq!(
         report.outcome(CaseId::MultiUnitProgramIsLegal),
+        Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_read_that_corrupts_the_next_block_is_caught_when_the_block_is_one_unit() {
+    // On `nested()` the unit `ReadingChangesNoMedia` reads is far short of the block, so
+    // `ReadCorruptsWhatFollows`'s corrupted unit lands in this case's own erased tail and
+    // its `block_holds_the_pattern` check already sees it. Here the block *is* the unit, so
+    // the corrupted unit is the first one of the *next* block — outside this case's own
+    // window unless it keeps a witness there.
+    let geometry = block_is_one_unit();
+    let mut device = Broken::new(geometry, Flaw::ReadCorruptsWhatFollows);
+    let mut buffer = [0_u8; 64];
+
+    let report = run(&mut device, whole(geometry), &mut buffer).expect("the run starts");
+
+    assert_eq!(
+        report.outcome(CaseId::ReadingChangesNoMedia),
         Outcome::Failed(Failure::MediaOutsideTheOperationChanged),
         "{report:?}"
     );
