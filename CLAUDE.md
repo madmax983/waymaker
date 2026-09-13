@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — there is now a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — refined against a real swap since issue #73, but the model's own gaps (a bank holds no record, and a generation is unbounded) are still owed |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -1033,9 +1033,14 @@ Stated so that nobody mistakes silence for coverage:
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers
-  records; it does not cover banks, because rung 0.2 owns the two-bank adapter and there is
-  nothing yet to abstract. `single-authority` is therefore proved about a model and not about
-  a device, and its row in `obligation.rs` says so.
+  records, and — since issue #73 — banks: a real swap writer, styled on
+  `crates/waymaker-fault/tests/banks.rs`'s own, is folded into `[Bank; 2]` at every crash
+  point and checked against the model's reachable set. What is not covered is every bank
+  sequence a firmware could produce, only the one swap this file drives; and
+  `single-authority`'s two remaining gaps — a bank holding no record, and an unbounded
+  generation — are the model's own limits rather than a refinement question, and
+  `obligation.rs`'s row says so. See
+  [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
@@ -2786,6 +2791,24 @@ neither machine has a NOR part, a supply to remove, a reset-cause register or a 
 and a Cortex-M0 is not a Cortex-M0+. ADR 0040 carries no attestation marker, so
 `hardware-attestation` fails a build in which somebody moves a row and cites it. See
 [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+
+Issue #73 then closes the refinement half of `single-authority`'s gap. Issue #22 added the
+real two-bank adapter; nothing had abstracted it into the ghost model yet, so a state rebuilt
+from a real crashed run had no banks and answered the guarantee vacuously.
+`waymaker-spec`'s `refine` module gains two functions, `bank_after_erase` and
+`bank_after_seal`, each folding one crash into a `Bank` from what the bank's own region shows
+afterwards — not from whether the writer's call returned `Ok`, because `waymaker-fault`'s
+writes land synchronously and a watchdog reset can finish a unit in flight and still answer
+`Err`. `tests/refinement.rs` drives a swap writer styled on
+`crates/waymaker-fault/tests/banks.rs`'s own, and checks every crash point three ways: is the
+reconstructed state one the model's search reaches, does the guarantee hold of it, and does
+`waymaker_flash::bank::select` over the real bytes agree with it. `obligation.rs`'s row for
+`single-authority` no longer says the refinement is missing. What is left owed is the model's
+own expressiveness, unchanged by this issue: a bank holds no record, so "never recover the
+old run as current" is not a statement the machine can make, only "exactly one bank is
+bootable"; and a generation is an unbounded integer, where the firmware refuses at the
+ceiling rather than proving the refusal unnecessary. See
+[ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The

@@ -14,21 +14,29 @@
 //!    claim that makes the model load-bearing rather than decorative.
 //! 3. **Does design document §15's oracle agree?** Three independent judgements of one run.
 //!
-//! What this does not cover is banks: no writer in this file drives the two-bank adapter issue #22 added, so the
-//! fourth guarantee is discharged against the model alone and
-//! [`waymaker_spec::obligation`] says so in a row rather than leaving it to be noticed.
+//! The first ten tests drive record-only writers, over the record dimension alone: each
+//! passes `[Bank::Erased; BANKS]` into its [`Observation`] and asks nothing of the fourth
+//! guarantee. The bank-swap tests near the end of the file are issue
+//! [#73](https://github.com/madmax983/waymaker/issues/73)'s answer to that gap: they drive
+//! `waymaker_flash::bank`'s real writer and ask question 1 of *its* real output.
+//! [`waymaker_spec::obligation`] says what is still owed after that.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_fault::{Durability, FaultError, Harness, RecordId, Run, Session, verify_recovery};
+use waymaker_flash::bank::{
+    self, BankHeader, BankId as FlashBankId, BankLayout, BankRegion, Generation,
+};
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bound, Guards, Journal, Role};
+use waymaker_spec::explore::{BankShape, explore};
+use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
-use waymaker_spec::refine::{Observation, abstraction};
+use waymaker_spec::refine::{
+    Observation, abstraction, bank_after_erase, bank_after_seal, call_touched,
+};
 
 /// The activity every schedule record below names.
 const DOWNLOAD: ActivityKind = ActivityKind(1);
@@ -512,6 +520,7 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     let impossible = Observation {
         records: vec![(RecordId(0), Role::Schedule, Durability::Acknowledged, true)],
         dispatched: Vec::new(),
+        ..Observation::default()
     };
     let error = Journal::reconstructed(&impossible).expect_err("torn and acknowledged");
     assert!(
@@ -522,6 +531,7 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     let also_impossible = Observation {
         records: vec![(RecordId(0), Role::Schedule, Durability::Attempted, true)],
         dispatched: Vec::new(),
+        ..Observation::default()
     };
     let error = Journal::reconstructed(&also_impossible).expect_err("torn and absent");
     assert!(error.to_string().contains("never reached media"), "{error}");
@@ -547,4 +557,503 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             "the abstraction did not deduplicate the dispatch log"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Bank refinement: issue #73
+// ---------------------------------------------------------------------------------------
+
+/// The run the bank-swap writer below records.
+const BANK_RUN: RunId = RunId(0x0000_0000_0000_00B7);
+
+/// The generation the device's stale bank carries when the sweep starts.
+const STALE: Generation = Generation(0);
+
+/// The generation the device is booting from when the swap starts.
+const CURRENT: Generation = Generation(1);
+
+/// The generation the swap installs.
+const NEW: Generation = match CURRENT.successor() {
+    Some(next) => next,
+    None => unreachable!(),
+};
+
+/// The bound the bank sweep is checked against.
+///
+/// No records: this writer declares none. Three generations, because the swap mints one
+/// (`NEW`) past `CURRENT`, and the model's own numbering — see [`bank_after_seal`]'s docs —
+/// starts one higher than the firmware's, so the highest model generation this run reaches is
+/// three.
+const BANK_REFINEMENT: Bound = Bound {
+    records: 0,
+    generations: 3,
+};
+
+/// Eight erase blocks: two banks of four, so an erase interrupted at a block boundary can
+/// leave a bank half-erased. Styled on `crates/waymaker-fault/tests/banks.rs`'s own geometry,
+/// since that file's `swap` is what this one abstracts.
+fn bank_geometry() -> Geometry {
+    let Ok(geometry) = Geometry::new(256, 32, 4, 1) else {
+        unreachable!("256 is eight whole 32-byte blocks of 4-byte units of single bytes")
+    };
+    geometry
+}
+
+fn bank_layout() -> BankLayout {
+    let Ok(layout) = BankLayout::new(bank_geometry()) else {
+        unreachable!("eight erase blocks is four per bank")
+    };
+    layout
+}
+
+fn bank_align() -> ProgramAlign {
+    let Some(align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a power of two within the program-size range")
+    };
+    align
+}
+
+/// The model's generation number for a real one. See [`bank_after_seal`]'s docs.
+const fn model_generation(generation: Generation) -> u32 {
+    generation.0.saturating_add(1)
+}
+
+fn header_of(generation: Generation) -> BankHeader<'static> {
+    BankHeader {
+        run: BANK_RUN,
+        align: bank_align(),
+        workflow_kind: 7,
+        workflow_version: 1,
+        input_schema: 1,
+        input: match generation.0 {
+            0 => b"stale",
+            1 => b"current",
+            _ => b"next",
+        },
+    }
+}
+
+/// Programs `id`'s bank header, padded to the program unit.
+fn program_header(
+    session: &mut Session,
+    id: FlashBankId,
+    generation: Generation,
+) -> Result<(), FaultError> {
+    let region = bank_layout().bank(id);
+    let mut page = [0_u8; 64];
+    let Ok(written) = bank::encode_header(&header_of(generation), &mut page) else {
+        unreachable!("a bank header of this shape fits 64 bytes")
+    };
+    let Some(bytes) = page.get(..written) else {
+        unreachable!("`encode_header` reports what it wrote")
+    };
+    session.program(region.base(), bytes)
+}
+
+/// Programs `id`'s generation seal, naming the header already on media.
+fn program_seal(
+    session: &mut Session,
+    id: FlashBankId,
+    generation: Generation,
+) -> Result<(), FaultError> {
+    let region = bank_layout().bank(id);
+    let mut page = [0_u8; 64];
+    let Some(read_back) = page.get_mut(..region.payload_bytes().min(64) as usize) else {
+        unreachable!("64 bytes is within a bank's payload")
+    };
+    session.read(region.base(), read_back)?;
+    let Ok(seal) = bank::seal_for(read_back, generation) else {
+        // The header on media does not decode, so there is no seal to write.
+        return Ok(());
+    };
+    let mut sealed = [0_u8; 16];
+    let Ok(written) = bank::encode_seal(&seal, bank_align(), &mut sealed) else {
+        unreachable!("a seal fits 16 bytes at a 4-byte program unit")
+    };
+    let Some(bytes) = sealed.get(..written) else {
+        unreachable!("`encode_seal` reports what it wrote")
+    };
+    session.program(region.seal_offset(), bytes)
+}
+
+/// Installs a whole bank: the header, its barrier, the seal, its barrier. §10 steps 3 to 6.
+fn install(
+    session: &mut Session,
+    id: FlashBankId,
+    generation: Generation,
+) -> Result<(), FaultError> {
+    program_header(session, id, generation)?;
+    session.barrier()?;
+    program_seal(session, id, generation)?;
+    session.barrier()
+}
+
+/// The device as a previous life left it: a stale bank, then the one in use.
+fn previous_life(session: &mut Session) -> Result<(), FaultError> {
+    install(session, FlashBankId::B, STALE)?;
+    install(session, FlashBankId::A, CURRENT)
+}
+
+/// The honest swap: never erase the bank you are booting from. Mirrors
+/// `crates/waymaker-fault/tests/banks.rs`'s `swap`.
+fn swap_writer(session: &mut Session) -> Result<(), FaultError> {
+    previous_life(session)?;
+
+    let spare = bank_layout().bank(FlashBankId::B);
+    session.erase(spare.base(), spare.bytes())?;
+    session.barrier()?;
+
+    program_header(session, FlashBankId::B, NEW)?;
+    session.barrier()?;
+
+    program_seal(session, FlashBankId::B, NEW)?;
+    session.barrier()
+}
+
+/// The op index of each mutation [`reconstruct_banks`] reads, in the order `swap_writer`
+/// issues them: the stale bank's seal, the current bank's seal, the spare bank's erase, and
+/// the new seal. Named rather than searched for, so a shape change to `install` or
+/// `swap_writer` is caught by [`check_bank_shape`] rather than by a silent misclassification.
+const OP_SEAL_B_STALE: usize = 2;
+const OP_SEAL_A_CURRENT: usize = 6;
+const OP_ERASE_B: usize = 8;
+const OP_SEAL_B_NEW: usize = 12;
+
+/// Asserts the op indices above still name what they say — the *offset* as well as the
+/// *kind*, so a reordering of `program_header` and `program_seal` inside `install` (which
+/// would leave every op's kind unchanged) fails here rather than downstream.
+fn check_bank_shape(clean: &Run) {
+    use waymaker_fault::Op;
+    let ops = clean.ops();
+    let bank_a = bank_layout().bank(FlashBankId::A);
+    let bank_b = bank_layout().bank(FlashBankId::B);
+    let assert_seal_op = |op: usize, region: BankRegion, label: &str| {
+        assert_eq!(
+            ops.get(op),
+            Some(&Op::Program {
+                offset: region.seal_offset(),
+                len: region.seal_bytes()
+            }),
+            "op {op} is no longer {label}'s seal write: {ops:?}"
+        );
+    };
+    assert_seal_op(OP_SEAL_B_STALE, bank_b, "the stale bank");
+    assert_seal_op(OP_SEAL_A_CURRENT, bank_a, "the current bank");
+    assert_eq!(
+        ops.get(OP_ERASE_B),
+        Some(&Op::Erase {
+            offset: bank_b.base(),
+            len: bank_b.bytes()
+        }),
+        "op {OP_ERASE_B} is no longer the spare bank's erase: {ops:?}"
+    );
+    assert_seal_op(OP_SEAL_B_NEW, bank_b, "the new bank");
+    assert_eq!(ops.len(), 14, "the writer's shape changed: {ops:?}");
+}
+
+/// One bank's header and seal regions of `image`.
+fn regions(image: &[u8], id: FlashBankId) -> (&[u8], &[u8]) {
+    let region = bank_layout().bank(id);
+    let header = image
+        .get(region.base() as usize..(region.base() + region.payload_bytes()) as usize)
+        .unwrap_or_default();
+    let seal = image
+        .get(region.seal_offset() as usize..(region.seal_offset() + region.seal_bytes()) as usize)
+        .unwrap_or_default();
+    (header, seal)
+}
+
+/// Whether `id`'s region of `image` decodes as sealed at exactly `generation`.
+fn decodes_sealed_at(image: &[u8], id: FlashBankId, generation: Generation) -> bool {
+    let (header, seal) = regions(image, id);
+    bank::sealed_generation(header, seal) == Some(generation)
+}
+
+/// Refines `known` against what `id`'s region shows right now, for a fold that may end up
+/// reading it back as `prior`.
+///
+/// `known` is [`Bank::Erased`] at two points: before anything has happened to `id` at all,
+/// and right after [`bank_after_erase`] reports its erase committed. Both are followed by a
+/// header write with no checkpoint of its own — `install`'s and `swap_writer`'s header writes
+/// are not modelled, which is `obligation.rs`'s `single-authority` row's "banks hold no
+/// records" gap — so a crash that tears the header before the matching seal write is even
+/// reached leaves the *next* fold reading `known` as `prior`, unrefined. Claiming
+/// [`Bank::Erased`] regardless would be wrong the moment that header write left anything
+/// behind: [`Bank::Erased`] promises "nothing half-gone", and a torn header is exactly
+/// half-gone. This reads the region back and downgrades to [`Bank::Erasing`] when it no
+/// longer reads erased — not an erase, but the closest the model has: the same "not
+/// bootable, not safely writable" it already uses [`Bank::Erasing`] for.
+///
+/// Any other `known` is returned unchanged: [`Bank::Erasing`], [`Bank::Sealing`] and
+/// [`Bank::Sealed`] each already mean something a header write cannot take back by itself,
+/// and `swap_writer` never writes a header over a bank it has not just erased.
+fn ground_prior(image: &[u8], id: FlashBankId, known: Bank) -> Bank {
+    match known {
+        Bank::Erased if !is_erased(image, id) => Bank::Erasing,
+        other => other,
+    }
+}
+
+/// Whether `id`'s whole bank — header and seal both — is fully erased in `image`.
+///
+/// Both regions, not the header alone: an erase interrupted after clearing the header but
+/// before reaching the seal's own block leaves an old seal standing over an erased header,
+/// which is a bank still *in flight*, not one this run has finished erasing. Checking the
+/// header alone would call that `erased` too, since a cleared header cannot decode either
+/// way — and [`bank_after_erase`] would then report [`Bank::Erased`] for a bank a later crash
+/// could still boot from its stale seal.
+fn is_erased(image: &[u8], id: FlashBankId) -> bool {
+    let region = bank_layout().bank(id);
+    let whole = image
+        .get(region.base() as usize..(region.base() + region.bytes()) as usize)
+        .unwrap_or_default();
+    whole.iter().all(|byte| *byte == 0xFF)
+}
+
+/// Asserts that `bank_after_erase`'s answer agrees with `erased` — the same ground truth it
+/// was handed — whenever the erase actually touched media.
+///
+/// Why this earns its keep: [`Bank::Erased`] and [`Bank::Erasing`] are both non-authoritative,
+/// so neither the reachability check nor the real-selection cross-check in the test below can
+/// tell one from the other — a build with the two branches of `bank_after_erase` swapped
+/// passes both unchanged. This is the check that actually pins the branch.
+fn assert_erase_matches_ground_truth(run: &Run, op: usize, bank: Bank, erased: bool) {
+    if !call_touched(run, op, bank_geometry()) {
+        return;
+    }
+    assert_eq!(
+        matches!(bank, Bank::Erased),
+        erased,
+        "at {:?}: bank_after_erase reported {bank:?}, but the region reads erased: {erased}",
+        run.injection()
+    );
+}
+
+/// Asserts that `bank_after_seal`'s answer agrees with `sealed` — the same ground truth it
+/// was handed — whenever the seal write actually touched media. See
+/// [`assert_erase_matches_ground_truth`] for why this, and not the checks below, is what
+/// pins [`Bank::Sealed`] against [`Bank::Sealing`].
+fn assert_seal_matches_ground_truth(run: &Run, op: usize, bank: Bank, sealed: bool) {
+    if !call_touched(run, op, bank_geometry()) {
+        return;
+    }
+    assert_eq!(
+        matches!(bank, Bank::Sealed(_)),
+        sealed,
+        "at {:?}: bank_after_seal reported {bank:?}, but the region reads sealed: {sealed}",
+        run.injection()
+    );
+}
+
+/// Folds one crashed run's final image into `[Bank; BANKS]` and whether either bank has ever
+/// sealed.
+///
+/// One fold per phase, in the order `swap_writer` issues them: the stale install, the current
+/// install, then the swap's erase and reseal of the spare bank. `erased`/`sealed` are read off
+/// the *final* image — safe here because whenever a later phase touches a bank again, that
+/// phase's own fold overrides this one regardless of what it decided; a phase's own read of
+/// the final image is accurate exactly when nothing later touches that bank, which is the one
+/// case where it matters.
+fn reconstruct_banks(run: &Run) -> ([Bank; BANKS], bool) {
+    let mut sealed_once = false;
+
+    let stale_sealed = decodes_sealed_at(run.image(), FlashBankId::B, STALE);
+    let mut b = bank_after_seal(
+        ground_prior(run.image(), FlashBankId::B, Bank::Erased),
+        run,
+        OP_SEAL_B_STALE,
+        bank_geometry(),
+        model_generation(STALE),
+        stale_sealed,
+    );
+    assert_seal_matches_ground_truth(run, OP_SEAL_B_STALE, b, stale_sealed);
+    sealed_once |= matches!(b, Bank::Sealed(_));
+
+    let current_sealed = decodes_sealed_at(run.image(), FlashBankId::A, CURRENT);
+    let a_seal = bank_after_seal(
+        ground_prior(run.image(), FlashBankId::A, Bank::Erased),
+        run,
+        OP_SEAL_A_CURRENT,
+        bank_geometry(),
+        model_generation(CURRENT),
+        current_sealed,
+    );
+    assert_seal_matches_ground_truth(run, OP_SEAL_A_CURRENT, a_seal, current_sealed);
+    sealed_once |= matches!(a_seal, Bank::Sealed(_));
+
+    let erased = is_erased(run.image(), FlashBankId::B);
+    b = bank_after_erase(b, run, OP_ERASE_B, bank_geometry(), erased);
+    assert_erase_matches_ground_truth(run, OP_ERASE_B, b, erased);
+
+    let new_sealed = decodes_sealed_at(run.image(), FlashBankId::B, NEW);
+    b = bank_after_seal(
+        ground_prior(run.image(), FlashBankId::B, b),
+        run,
+        OP_SEAL_B_NEW,
+        bank_geometry(),
+        model_generation(NEW),
+        new_sealed,
+    );
+    assert_seal_matches_ground_truth(run, OP_SEAL_B_NEW, b, new_sealed);
+    sealed_once |= matches!(b, Bank::Sealed(_));
+
+    ([a_seal, b], sealed_once)
+}
+
+/// Which bank a reader boots, in a form comparable across the model and the firmware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealAuthority {
+    /// Neither bank carries a valid seal.
+    None,
+    /// Exactly one bank does.
+    One(FlashBankId, Generation),
+    /// Both do, at the same generation.
+    Ambiguous(Generation),
+}
+
+/// Which bank the real selection boots, read straight off `image`.
+fn real_authority_of(image: &[u8]) -> RealAuthority {
+    let generations = FlashBankId::ALL.map(|id| {
+        let (header, seal) = regions(image, id);
+        bank::sealed_generation(header, seal)
+    });
+    match bank::select(generations) {
+        bank::Authority::Unsealed => RealAuthority::None,
+        bank::Authority::Bank { id, generation } => RealAuthority::One(id, generation),
+        bank::Authority::Ambiguous { generation } => RealAuthority::Ambiguous(generation),
+    }
+}
+
+/// Which bank the reconstructed model state says a reader boots.
+fn model_authority(state: &Journal) -> RealAuthority {
+    let flash_id = |id: BankId| match id {
+        BankId::A => FlashBankId::A,
+        BankId::B => FlashBankId::B,
+    };
+    let real_generation = |id: BankId| {
+        let model = state
+            .bank(id)
+            .authoritative_generation()
+            .unwrap_or_default();
+        Generation(model.saturating_sub(1))
+    };
+    match state.authoritative().as_slice() {
+        [] => RealAuthority::None,
+        [only] => RealAuthority::One(flash_id(*only), real_generation(*only)),
+        [first, ..] => RealAuthority::Ambiguous(real_generation(*first)),
+    }
+}
+
+#[test]
+fn the_bank_swap_refines_the_specification_at_every_crash_point() {
+    let runs = drive_on(bank_geometry(), swap_writer);
+    let Some(clean) = runs.first() else {
+        unreachable!("the fault-free run is always first")
+    };
+    check_bank_shape(clean);
+    assert!(runs.len() > 100, "only {} runs", runs.len());
+    assert_eq!(
+        real_authority_of(clean.image()),
+        RealAuthority::One(FlashBankId::B, NEW)
+    );
+
+    let reachable = {
+        let explored = match explore(BANK_REFINEMENT, Guards::ENFORCED, CEILING) {
+            Ok(explored) => explored,
+            Err(error) => unreachable!("{error}"),
+        };
+        explored
+            .states()
+            .iter()
+            .map(Journal::observation)
+            .collect::<BTreeSet<_>>()
+    };
+
+    let mut shapes = BTreeSet::new();
+    let mut installed = 0_usize;
+    let mut still_current = 0_usize;
+    let mut still_stale = 0_usize;
+    let mut neither = 0_usize;
+    let mut erasing_seen = 0_usize;
+    let mut sealing_seen = 0_usize;
+
+    for run in &runs {
+        let (banks, sealed_once) = reconstruct_banks(run);
+        let observed = Observation {
+            banks,
+            sealed_once,
+            ..Observation::default()
+        };
+        assert!(
+            reachable.contains(&observed),
+            "at {:?}: {banks:?} (sealed_once: {sealed_once}) is not a state the model reaches",
+            run.injection()
+        );
+
+        let Ok(state) = Journal::reconstructed(&observed) else {
+            unreachable!("a bank-only observation is never torn")
+        };
+        assert!(
+            waymaker_spec::invariant::holds(
+                waymaker_spec::invariant::Invariant::SingleAuthority,
+                &state,
+                &[],
+            )
+            .is_ok(),
+            "at {:?}: {banks:?} breaks single authority",
+            run.injection()
+        );
+
+        // Two independent judgements of the same crash: `waymaker_flash::bank::select` over
+        // the real bytes, and `Journal::authoritative` over the state this abstraction built.
+        // A wrong fold could still land on a reachable state and pass the check above; it
+        // could not also agree with the real selection by accident on every crash point.
+        let real_authority = real_authority_of(run.image());
+        assert_eq!(
+            model_authority(&state),
+            real_authority,
+            "at {:?}: the reconstructed state and the real selection disagree",
+            run.injection()
+        );
+
+        match real_authority {
+            RealAuthority::One(FlashBankId::B, generation) if generation == NEW => installed += 1,
+            RealAuthority::One(FlashBankId::A, generation) if generation == CURRENT => {
+                still_current += 1;
+            }
+            RealAuthority::One(FlashBankId::B, generation) if generation == STALE => {
+                still_stale += 1;
+            }
+            RealAuthority::None => neither += 1,
+            other => unreachable!(
+                "at {:?}: a device in state {other:?} was never written",
+                run.injection()
+            ),
+        }
+        erasing_seen += banks.iter().filter(|bank| **bank == Bank::Erasing).count();
+        sealing_seen += banks
+            .iter()
+            .filter(|bank| matches!(bank, Bank::Sealing(_)))
+            .count();
+        shapes.insert(banks.map(BankShape::of));
+    }
+
+    assert!(
+        installed > 0 && still_current > 0 && still_stale > 0 && neither > 0,
+        "{installed} installed, {still_current} kept current, {still_stale} kept stale, \
+         {neither} had no authority at all"
+    );
+    assert!(
+        shapes.len() >= 4,
+        "only {} distinct bank-shape combinations were reached, which is too few for \
+         question 1 to be a check rather than a formality",
+        shapes.len()
+    );
+    // `Bank::Erasing` and `Bank::Sealing` are the two shapes the authority cross-check above
+    // cannot see either side of — a bank in either is as non-authoritative as one that is
+    // `Erased` or was never touched. Without this, a fold that never actually produced one of
+    // them (a mistake with the same shape as `bank_after_erase`/`bank_after_seal` always
+    // taking the "committed" branch) would still pass every assertion above.
+    assert!(erasing_seen > 0, "no crash point ever left a bank Erasing");
+    assert!(sealing_seen > 0, "no crash point ever left a bank Sealing");
 }
