@@ -26,7 +26,7 @@ use waymaker_fault::{Durability, FaultError, Harness, RecordId, Run, Session, ve
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bound, Guards, Journal, Role};
+use waymaker_spec::model::{BankId, Bound, Guards, Journal, Role};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
 use waymaker_spec::refine::{Observation, abstraction};
 
@@ -276,12 +276,35 @@ where
 }
 
 /// Every observation the model says a run can end in.
+///
+/// Scoped to states where every record is in `BankId::A` — matching `Journal::reconstructed`'s
+/// hardcoded convention and this file's own claim that "no writer here touches a bank" — rather
+/// than every explored state. `explore` does not know that claim: nothing here stops the
+/// model's *first* seal landing on bank B while records already sit in A, so `REFINEMENT`'s
+/// reachable set includes states whose records are split across both banks. `Observation`
+/// carries no bank identity, so flattening one of those through `Journal::observation` in
+/// declaration order can produce a shape no single-bank writer could ever leave — `Whole`
+/// following a gap, which `Guard::AppendOnly` forbids within one bank — and including it here
+/// would make assertion 1 below accept an impossible history merely because it happens to
+/// match a real, multi-bank state's flattened shape. Codex found this on review of issue #67's
+/// pull request, which is what gave the model a bank dimension to split across in the first
+/// place.
 fn reachable_observations() -> BTreeSet<Observation> {
     let explored = match explore(REFINEMENT, Guards::ENFORCED, CEILING) {
         Ok(explored) => explored,
         Err(error) => unreachable!("{error}"),
     };
-    explored.states().iter().map(Journal::observation).collect()
+    explored
+        .states()
+        .iter()
+        .filter(|state| {
+            state
+                .records()
+                .iter()
+                .all(|record| record.bank == BankId::A)
+        })
+        .map(Journal::observation)
+        .collect()
 }
 
 /// Runs the three refinement questions over `runs`, and reports what it saw.
@@ -551,5 +574,35 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             vec![RecordId(0)],
             "the abstraction did not deduplicate the dispatch log"
         );
+    }
+}
+
+#[test]
+fn no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave() {
+    // Codex, PR #135 round 6: nothing stops `REFINEMENT`'s exploration reaching a state whose
+    // first-ever seal lands on bank B while records already sit in A — `Observation` carries
+    // no bank identity, so flattening one of those in declaration order can produce a `Whole`
+    // record following a gap, a shape `Guard::AppendOnly` forbids within a single bank and no
+    // writer this file drives (all single-bank) could ever leave. `reachable_observations`
+    // filters those states out before projecting; this is the check that it actually works,
+    // over every observation the filtered set contains rather than over one example.
+    for observation in reachable_observations() {
+        let mut saw_gap = false;
+        for (id, _, state, torn) in &observation.records {
+            let whole = matches!(
+                state,
+                Durability::PossiblyDurable | Durability::Acknowledged
+            ) && !torn;
+            if whole {
+                assert!(
+                    !saw_gap,
+                    "record {} is whole after a gap in {observation:?}, which no single-bank \
+                     writer could have left",
+                    id.0
+                );
+            } else {
+                saw_gap = true;
+            }
+        }
     }
 }

@@ -2869,3 +2869,36 @@ device writes into. `tests/machine.rs`'s
 proof, over every pre-seal reachable state; `REACHABLE_STATES` and `TRANSITION_EDGES` in
 `tests/census.rs` moved again, down rather than up, because a whole family of states in
 which a fresh device erased its only writable bank stopped being reachable.
+
+A fifth finding asked for a guard refusing `Dispatch` against a bank a swap has since
+retired, arguing a dispatch happening *after* retirement is a physical effect with no run
+behind it rather than merely an old run's forfeited one. Investigated directly: restricting
+`Dispatch` to `current_bank()` moves `TRANSITION_EDGES` and leaves `REACHABLE_STATES`
+unchanged, because every state a post-retirement dispatch could reach is also reachable by
+dispatching while the bank is still current and retiring it afterward — a `Journal` is a
+snapshot rather than a log, so the two are one state, not two. `tests/necessity.rs`'s
+`a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
+constructs that legitimate trace by hand; no guard was added, and ADR 0041's alternatives
+section says why.
+
+A sixth found a real bug: `Journal::from_parts` (which `Journal::reconstructed` uses to turn
+a crash harness's observation into a state) takes `next_id` from the observation's own record
+ids via `saturating_add`, so an observation naming `RecordId(u32::MAX)` left `next_id` at the
+ceiling, and `declare`'s plain `+= 1` then overflowed on the next declaration — a panic with
+overflow checks, a reused `RecordId(0)` without them. `next_id` now advances with
+`checked_add`, refusing with `Illegal::CapacityReached` instead;
+`a_record_id_at_the_ceiling_is_refused_rather_than_reused` is a hand-built unit test beside
+the existing generation-ceiling one, since no exhaustive search reaches either ceiling.
+
+A seventh found that `tests/refinement.rs`'s own `REFINEMENT` bound — one generation, because
+its own comment says no writer there touches a bank — was reachable in states split across
+both banks anyway, since nothing stops the model's first-ever seal landing on bank B while
+bank A already holds records. `Observation` carries no bank identity, so
+`reachable_observations` flattening one of those states in declaration order could produce a
+`Whole` record following a gap, a shape no single-bank writer this file drives could ever
+leave, and the refinement check's first assertion ("is this a state the model says is
+reachable") would have accepted it. `reachable_observations` now filters to states where
+every record is in `BankId::A` before projecting;
+`no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave` asserts the filtered
+set is clean, verified to fail without the filter (488 of the run's reachable states leaked
+an impossible shape) and pass with it.
