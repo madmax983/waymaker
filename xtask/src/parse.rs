@@ -518,6 +518,20 @@ fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
     }
 }
 
+/// Strips any number of redundant `(..)` wrappers from a type, so `(Recovery)` and
+/// `((Recovery))` read the same as `Recovery`.
+///
+/// `#[allow(unused_parens)] impl Clone for (Recovery) { .. }` is legal Rust — `syn`
+/// parses the parenthesized form as `Type::Paren`, never `Type::Path` — so a scan that
+/// only matched `Type::Path` directly would silently skip it (round 14 of Codex review
+/// on this change, PR #143).
+fn unwrap_type_parens(mut ty: &syn::Type) -> &syn::Type {
+    while let syn::Type::Paren(paren) = ty {
+        ty = paren.elem.as_ref();
+    }
+    ty
+}
+
 fn collect_trait_implementors(
     items: &[syn::Item],
     aliases: &[UseAlias],
@@ -542,7 +556,14 @@ fn collect_trait_implementors(
                         .iter()
                         .any(|name| name == trait_name || name == UNRESOLVED_DERIVE);
                     if names_trait {
-                        if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
+                        // `unwrap_type_parens` first: `impl Clone for (Recovery)` is
+                        // legal Rust under `#[allow(unused_parens)]` (round 14's
+                        // finding), and `syn` parses the parenthesized form as
+                        // `Type::Paren`, not `Type::Path` — a bare `if let` on the
+                        // unwrapped variant alone would silently skip it.
+                        if let syn::Type::Path(self_type) =
+                            unwrap_type_parens(implementation.self_ty.as_ref())
+                        {
                             // `every_resolution` again: the self-type can be a local
                             // type alias (round 13's first finding), and an
                             // `UNRESOLVED_DERIVE` here is pushed through unchanged so
@@ -1655,11 +1676,16 @@ fn normalize_path(path: &str) -> String {
 ///
 /// Inline modules have no file and are not returned, but the walk descends into them: a
 /// `mod data;` inside `mod tests { ... }` lives under `tests/`, and inherits the outer
-/// module's test-gating.
+/// module's test-gating. The walk also descends into a function, method, or default
+/// trait-method body one level, because a `mod` declared as a local item there resolves
+/// to a file the same way a module-scope one does (issue #77's PR #143, round 14: Codex
+/// found `#[path = "recovery/clone_impl.rs"] mod clone_impl;` written inside an ordinary
+/// method, reaching a file the old function-body blind spot let go unscanned).
 ///
-/// Residual limit: `mod` declarations inside function bodies are not descended into.
-/// They are legal Rust but vanishingly rare, and the enclosing file's own array scan
-/// still reads whatever they declare.
+/// Residual limit: a `mod` nested one block deeper than that — inside an `if`, a `match`
+/// arm, or a loop within a function body — is not descended into. Legal Rust, and
+/// unlike the case above, not a shape review of this change found a working example of;
+/// the enclosing file's own array scan still reads whatever such a module declares.
 ///
 /// # Errors
 ///
@@ -1686,48 +1712,109 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
     Ok(found)
 }
 
+/// The items a block declares as local items — `Stmt::Item`, the shape `mod`, `fn` and
+/// `struct` all take when written inside a function or method body — in source order.
+fn block_items(block: &syn::Block) -> impl Iterator<Item = &syn::Item> {
+    block.stmts.iter().filter_map(|stmt| match stmt {
+        syn::Stmt::Item(item) => Some(item),
+        _ => None,
+    })
+}
+
 /// The out-of-line `mod`s in `items`, appending to `found` in source order.
 ///
 /// `parent_dir` is the declaring file's directory and `child_dir` the directory its
 /// children live in; `gated` is whether an enclosing inline module is `#[cfg(test)]`.
-fn collect_child_modules(
-    items: &[syn::Item],
+fn collect_child_modules<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
     parent_dir: &str,
     child_dir: &str,
     gated: bool,
     found: &mut Vec<ChildModule>,
 ) {
     for item in items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        let name = module.ident.to_string();
-        let item_gated = gated || has_cfg_test(&module.attrs);
-        if let Some((_, nested)) = module.content.as_ref() {
-            // Inline: no file of its own, but its out-of-line children live under it.
-            collect_child_modules(
-                nested,
-                parent_dir,
-                &format!("{child_dir}{name}/"),
-                item_gated,
-                found,
-            );
-        } else {
-            let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
-                || {
-                    vec![
-                        format!("{child_dir}{name}.rs"),
-                        format!("{child_dir}{name}/mod.rs"),
-                    ]
-                },
-                // `rustc` consults exactly this one path (see above): no fallback.
-                |path| vec![normalize_path(&format!("{parent_dir}{path}"))],
-            );
-            found.push(ChildModule {
-                name,
-                candidates,
-                test_gated: item_gated,
-            });
+        match item {
+            syn::Item::Mod(module) => {
+                let name = module.ident.to_string();
+                let item_gated = gated || has_cfg_test(&module.attrs);
+                if let Some((_, nested)) = module.content.as_ref() {
+                    // Inline: no file of its own, but its out-of-line children live
+                    // under it.
+                    collect_child_modules(
+                        nested,
+                        parent_dir,
+                        &format!("{child_dir}{name}/"),
+                        item_gated,
+                        found,
+                    );
+                } else {
+                    let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
+                        || {
+                            vec![
+                                format!("{child_dir}{name}.rs"),
+                                format!("{child_dir}{name}/mod.rs"),
+                            ]
+                        },
+                        // `rustc` consults exactly this one path (see above): no
+                        // fallback.
+                        |path| vec![normalize_path(&format!("{parent_dir}{path}"))],
+                    );
+                    found.push(ChildModule {
+                        name,
+                        candidates,
+                        test_gated: item_gated,
+                    });
+                }
+            }
+            // The three shapes a function-like body comes in: a free function, a method
+            // in an `impl` block, and a trait's own default method. Each is gated the
+            // same way an inline module is — an enclosing `#[cfg(test)]`, on the
+            // function itself or inherited from `gated`, marks whatever `mod` it
+            // declares as test-only rather than hiding it from the walk entirely, for
+            // the reason the module doc gives.
+            syn::Item::Fn(function) => {
+                let item_gated = gated || has_cfg_test(&function.attrs);
+                collect_child_modules(
+                    block_items(&function.block),
+                    parent_dir,
+                    child_dir,
+                    item_gated,
+                    found,
+                );
+            }
+            syn::Item::Impl(implementation) => {
+                let impl_gated = gated || has_cfg_test(&implementation.attrs);
+                for member in &implementation.items {
+                    if let syn::ImplItem::Fn(method) = member {
+                        let method_gated = impl_gated || has_cfg_test(&method.attrs);
+                        collect_child_modules(
+                            block_items(&method.block),
+                            parent_dir,
+                            child_dir,
+                            method_gated,
+                            found,
+                        );
+                    }
+                }
+            }
+            syn::Item::Trait(trait_item) => {
+                let trait_gated = gated || has_cfg_test(&trait_item.attrs);
+                for member in &trait_item.items {
+                    if let syn::TraitItem::Fn(method) = member {
+                        if let Some(block) = &method.default {
+                            let method_gated = trait_gated || has_cfg_test(&method.attrs);
+                            collect_child_modules(
+                                block_items(block),
+                                parent_dir,
+                                child_dir,
+                                method_gated,
+                                found,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

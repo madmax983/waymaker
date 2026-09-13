@@ -10951,6 +10951,78 @@ mod tests {
     }
 
     #[test]
+    fn a_path_module_declared_inside_a_method_body_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 14: `child_modules`
+        // used to document walking into a function body as a residual limit —
+        // "legal Rust but vanishingly rare" — and this is the example that made it
+        // worth closing: `#[path = "recovery/clone_impl.rs"] mod clone_impl;` written
+        // as a local item inside an ordinary method reaches the same file a
+        // module-scope declaration would, and the old scan's blind spot there let the
+        // whole module-tree walk (round 12's fix) miss it entirely.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated_method() {\n",
+            "        #[path = \"recovery/clone_impl.rs\"]\n",
+            "        mod clone_impl;\n",
+            "    }\n",
+            "}\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_parenthesized_self_type_is_still_matched() {
+        // Found by Codex review of this change (PR #143), round 14:
+        // `#[allow(unused_parens)] impl Clone for (Recovery) { .. }` is legal Rust, but
+        // `syn` parses a parenthesized type as `Type::Paren` rather than `Type::Path`,
+        // and the first version of this scan matched `Type::Path` alone, silently
+        // skipping the impl.
+        let parenthesized = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[allow(unused_parens)]\n",
+            "impl Clone for (Recovery) {\n",
+            "    fn clone(&self) -> Self {\n",
+            "        Recovery\n",
+            "    }\n",
+            "}\n",
+        ));
+        // `clone` also lands as a new name on the surface pin, the same way
+        // `a_recovery_with_a_handwritten_clone_impl_is_rejected` above already
+        // documents for the unparenthesized shape.
+        let violations = check_recovery_surface(&parenthesized);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Clone")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
