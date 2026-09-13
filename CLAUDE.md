@@ -2856,3 +2856,16 @@ rather than by a stricter oracle. What remains owed is written down in `obligati
 `single-authority` row rather than left to be noticed: the refinement against a real
 two-bank writer, which is issue #22's adapter and a project of its own. See
 [ADR 0041](docs/adr/0041-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+
+Review of the pull request that closed issue #67 then found a fourth gap `Guard::
+NeverEraseTheAuthority` left open: `authoritative()` is always empty before the first seal,
+so the guard protected nothing pre-seal — `BeginErase(A)` was legal on a fresh device even
+though `A` is where `declare` puts every record, letting a live `Declare`-`Program` land
+inside a bank already `Erasing` and survive `CommitErase`, which never touches `records`.
+`Journal::protects_current_run(bank)` closes it: post-seal it is `authoritative().contains`
+exactly as before, and pre-seal it is `bank == current_bank()`, the implicit bank a fresh
+device writes into. `tests/machine.rs`'s
+`erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority` is the
+proof, over every pre-seal reachable state; `REACHABLE_STATES` and `TRANSITION_EDGES` in
+`tests/census.rs` moved again, down rather than up, because a whole family of states in
+which a fresh device erased its only writable bank stopped being reachable.

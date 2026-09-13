@@ -100,6 +100,22 @@ became `seen.checked_add(1).ok_or(Illegal::GenerationExhausted)?`, matching
 No bound small enough to explore ever reaches the ceiling, so this is proved by a hand-built
 state in `model.rs`'s own `#[cfg(test)]` module rather than by the exhaustive search.
 
+**`Guard::NeverEraseTheAuthority` now protects the pre-seal bank too.** Codex's review of the
+pull request found a fourth gap: `authoritative()` is always empty before the first seal, so
+the guard's original check — `self.authoritative().contains(&bank)` — protected nothing
+pre-seal. `BeginErase(A)` was legal on a fresh device even though `A` is where `declare`
+puts every record, so `BeginErase(A)` → `Declare` → `Program` → `CommitErase(A)` left a
+record behind that a real erase should have destroyed — `CommitErase` never touches
+`records` — and sealing `A` afterward recovered those bytes as current history.
+`Journal::protects_current_run(bank)` replaces the direct `authoritative()` check inside
+`begin_erase`: post-seal it is unchanged, and pre-seal it is `bank == current_bank()`, the
+implicit bank a fresh device writes into. `tests/machine.rs`'s
+`erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority` proves the
+refusal over every pre-seal reachable state, and
+`a_record_programmed_while_the_pre_seal_current_bank_erases_can_never_be_sealed_in` drives
+the exact sequence Codex named end to end and shows the first step alone is now enough to
+block it.
+
 **The oracle was not made stricter.** A direct "no gap before committed history" check in
 `waymaker_fault::verify_oracle` was tried and reverted: `waymaker-fault`'s own
 `tests/harness.rs` drives a writer whose middle record's program call fails outright and who
@@ -114,8 +130,10 @@ importing it from a theorem about a different type (`tests/machine.rs`'s, about 
 ## Consequences
 
 The reachable state space at `Bound::PROOF` grew from 2,576 states, and every transition's
-edge count moved with it (`tests/census.rs`, whose pinned numbers are the number to read —
-this paragraph is not). Two spine claims that used to be statements about `state.records()`
+edge count moved with it, then shrank again once `protects_current_run` closed the pre-seal
+gap: a whole family of states in which a fresh device erased its only writable bank stopped
+being reachable (`tests/census.rs`, whose pinned numbers are the number to read — this
+paragraph is not). Two spine claims that used to be statements about `state.records()`
 as one sequence —
 `a_torn_record_is_always_the_last_one_on_media_in_its_own_bank` and
 `an_acknowledged_record_is_never_behind_a_gap_in_its_own_bank`

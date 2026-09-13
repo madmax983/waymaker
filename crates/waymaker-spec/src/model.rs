@@ -299,8 +299,10 @@ pub enum Illegal {
     EraseAlreadyInFlight,
     /// The bank has no seal in flight to commit.
     BankNotSealing,
-    /// This is the bank a reader would boot from, so erasing it would either strand the
-    /// device or hand it back an older run.
+    /// This is the run currently being written to — the bank a reader would boot from, or,
+    /// before the first seal, the bank a fresh device writes into — so erasing it would
+    /// strand the device, hand it back an older run, or let a record written during the
+    /// erase survive it.
     WouldEraseTheAuthority,
     /// The model's generation bound is reached.
     GenerationExhausted,
@@ -328,7 +330,7 @@ impl Illegal {
             Self::BankNotErasing => "the bank has no erase in flight",
             Self::EraseAlreadyInFlight => "the bank already has an erase in flight",
             Self::BankNotSealing => "the bank has no seal in flight",
-            Self::WouldEraseTheAuthority => "this is the bank a reader would boot from",
+            Self::WouldEraseTheAuthority => "this is the run currently being written to",
             Self::GenerationExhausted => "the model's generation bound is reached",
             Self::AlreadyPowered => "the device is already powered",
         }
@@ -374,12 +376,17 @@ pub enum Guard {
     /// world was changed, so a recovery holding it has already lost the ordering the
     /// decision exists to create.
     DispatchNeedsASchedule,
-    /// The bank a reader would boot from may not have its erase begun.
+    /// The run currently being written to may not have its bank's erase begun — the sole
+    /// authoritative bank once one exists, or, before the first seal, the implicit bank a
+    /// fresh device writes into.
     ///
     /// Design document §14's failure table, on the two-bank swap: "never recover the old run
     /// as current". Erasing the authoritative bank does exactly that — authority falls back
     /// to whatever older generation the other bank still carries, or to nothing at all. The
-    /// swap recycles the *inactive* bank, which is what makes it atomic.
+    /// swap recycles the *inactive* bank, which is what makes it atomic. The pre-seal half is
+    /// the same rule one boundary earlier: a fresh device's first run has no seal to be
+    /// "the authority" yet, but it is still the run a `Declare` would otherwise still be
+    /// writing into mid-erase — see `Journal::protects_current_run`.
     NeverEraseTheAuthority,
     /// A new seal's generation must be strictly greater than the other bank's.
     StrictGeneration,
@@ -524,6 +531,28 @@ impl Journal {
     /// rather than an `Option`.
     fn current_bank(&self) -> BankId {
         self.recovering_bank().unwrap_or(BankId::A)
+    }
+
+    /// Whether erasing `bank` would take away the run currently being written.
+    ///
+    /// Once any bank has sealed, that is [`authoritative`](Self::authoritative) exactly as
+    /// [`Guard::NeverEraseTheAuthority`] always checked it — including both banks of an
+    /// ambiguous tie, which [`current_bank`](Self::current_bank) alone cannot see. Before the
+    /// first seal, `authoritative()` is always empty, so that check used to protect nothing
+    /// at all: `BeginErase(A)` was legal on a fresh device even though `A` is where
+    /// [`declare`](Self::declare) puts every record — Codex found the run this let through
+    /// during a pull request review of issue [#67](https://github.com/madmax983/waymaker/issues/67):
+    /// erase `A`, declare and program a record into it while it is `Erasing`,
+    /// `CommitErase(A)` — which does not touch `records` — leaves that record behind, and
+    /// sealing `A` afterward recovers bytes an erase should have destroyed. Checking
+    /// `current_bank()` before the first seal closes it the same way `authoritative()`
+    /// already closes the case after one.
+    fn protects_current_run(&self, bank: BankId) -> bool {
+        if self.sealed_once {
+            self.authoritative().contains(&bank)
+        } else {
+            bank == self.current_bank()
+        }
     }
 
     /// Which bank a reader would recover from right now, or `None` if there is nothing safe
@@ -998,14 +1027,17 @@ impl Journal {
     /// [#67](https://github.com/madmax983/waymaker/issues/67)'s first gap, "erasing a bank
     /// destroys the journal in it" — and so is every dispatched id that pointed at one of
     /// them, so [`dispatched`](Self::dispatched) never outlives the record it names. With
-    /// [`Guard::NeverEraseTheAuthority`] enforced the named bank was not the one a reader
-    /// would boot from, so the authoritative generation does not fall —
-    /// `the_authoritative_generation_never_goes_backwards`, over every edge.
+    /// [`Guard::NeverEraseTheAuthority`] enforced the named bank was not the run currently
+    /// being written to — the sole authoritative bank once one exists, or, before the first
+    /// seal, the implicit [`current_bank`](Self::current_bank) — so a later `Declare` can
+    /// never target a bank this transition just started erasing, and the authoritative
+    /// generation does not fall — `the_authoritative_generation_never_goes_backwards`, over
+    /// every edge.
     fn begin_erase(&mut self, bank: BankId, guards: Guards) -> Result<(), Illegal> {
         if self.bank(bank) == Bank::Erasing {
             return Err(Illegal::EraseAlreadyInFlight);
         }
-        if guards.enforces(Guard::NeverEraseTheAuthority) && self.authoritative().contains(&bank) {
+        if guards.enforces(Guard::NeverEraseTheAuthority) && self.protects_current_run(bank) {
             return Err(Illegal::WouldEraseTheAuthority);
         }
         self.records.retain(|record| record.bank != bank);

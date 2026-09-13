@@ -12,7 +12,9 @@
 
 use waymaker_fault::Durability;
 use waymaker_spec::explore::explore;
-use waymaker_spec::model::{Bank, BankId, Bound, Guards, Journal, OnMedia, Record, Transition};
+use waymaker_spec::model::{
+    Bank, BankId, Bound, Guards, Illegal, Journal, OnMedia, Record, Transition,
+};
 
 const CEILING: usize = 200_000;
 
@@ -410,5 +412,65 @@ fn a_reboot_behind_a_torn_record_still_cannot_write_past_it() {
         checked > 0,
         "no reboot ever landed behind a torn record in the bank still being written to, so \
          this claim is about nothing"
+    );
+}
+
+#[test]
+fn erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority() {
+    // Before the first seal, `authoritative()` is always empty, so
+    // `Guard::NeverEraseTheAuthority`'s original check protected nothing: `BeginErase(A)` was
+    // legal on a fresh device even though `A` is where `Journal::declare` puts every record.
+    // Codex found the run this let through during review of issue #67: erase `A`, declare and
+    // program a record into it while it is `Erasing`, `CommitErase(A)` — which never touches
+    // `records` — leaves that record behind, and sealing `A` afterward recovers bytes an
+    // erase should have destroyed. `Journal::protects_current_run` closes it by checking the
+    // implicit current bank before the first seal the same way `authoritative()` already
+    // closes the case after one.
+    let mut checked = 0_usize;
+    for state in proof_space().states() {
+        if state.has_sealed() || !state.powered() {
+            continue;
+        }
+        let current = state
+            .recovering_bank()
+            .expect("recovering_bank is always Some before the first seal");
+        checked += 1;
+        assert_eq!(
+            state.step(
+                Transition::BeginErase(current),
+                Guards::ENFORCED,
+                Bound::PROOF
+            ),
+            Err(Illegal::WouldEraseTheAuthority),
+            "erasing the pre-seal current bank {current:?} was not refused in {state:?}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reachable state was ever pre-seal, so this claim is about nothing"
+    );
+}
+
+#[test]
+fn a_record_programmed_while_the_pre_seal_current_bank_erases_can_never_be_sealed_in() {
+    // The scenario the previous test's refusal exists to prevent, driven end to end: without
+    // the fix, `BeginErase(A) -> Declare -> Program -> CommitErase(A) -> BeginSeal(A) ->
+    // CommitSeal(A)` would recover a record from a bank that was supposed to have been wiped.
+    // With `Journal::protects_current_run` in place the very first step is refused, so the
+    // rest of the sequence is unreachable — checked here directly, rather than trusted from
+    // the single-step refusal alone.
+    let fresh = Journal::default();
+    assert!(!fresh.has_sealed());
+    let current = fresh
+        .recovering_bank()
+        .expect("a fresh device has a current bank");
+    assert_eq!(
+        fresh.step(
+            Transition::BeginErase(current),
+            Guards::ENFORCED,
+            Bound::PROOF
+        ),
+        Err(Illegal::WouldEraseTheAuthority),
+        "a fresh device let its only writable bank start erasing"
     );
 }
