@@ -256,6 +256,21 @@ fn durable_intent(state: &Journal, recovered: &[RecordId]) -> Option<String> {
 /// checked here, over `recovered`, rather than left to `PrefixSafety` alone — a reader wrong
 /// in this one way has to be caught by *this* clause for `tests/teeth.rs` to show the
 /// guarantee is falsifiable on its own, not only in the company of another.
+///
+/// # What this cannot see
+///
+/// A reader that consulted the wrong bank and got an empty answer, because that bank happens
+/// to have nothing on it. `recovered` is the only thing this clause is handed — a `Reader`
+/// reports what it produced and not which bank it asked, matching every other guarantee here
+/// — and an empty answer from the wrong bank is byte-for-byte the same `Vec` an empty answer
+/// from the *right* bank would be. Flagging every empty `recovered` as suspicious is not a
+/// fix: `legal_recoveries` already treats stopping before anything is required as a correct
+/// reader's prerogative, so that would make this clause reject readers that broke no rule.
+/// This is the same shape of gap `tests/teeth.rs`'s `SkipsGaps`/`AppendOnly` pairing already
+/// names for a different mutant: a reader wrong in one way can coincide with a legal answer
+/// in *some* states without being right, and what a falsifier owes is one state where the two
+/// diverge, not every state — which `Mutant::BootsTheRetiredBank`'s teeth test already
+/// supplies.
 fn single_authority(state: &Journal, recovered: &[RecordId]) -> Option<String> {
     if !state.has_sealed() {
         return None;

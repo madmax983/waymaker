@@ -67,11 +67,24 @@ run may ever declare in total (matching its own doc comment), not how many are r
 once, which is what keeps the state space finite once erase can free capacity back up.
 
 **`Transition::Reboot`** is the one transition legal while `Journal::powered` is `false`, and
-legal only then. It reseeds `records` and `dispatched` with exactly `recover()`'s answer and
-sets `powered` back to `true` — a device on its second or third boot is now a state this
-machine reaches, and `tests/machine.rs`'s
-`a_reboot_keeps_exactly_the_recovered_prefix_and_nothing_it_declared_after` is the claim that
-it reseeds with nothing more forgiving.
+legal only then. It sets `powered` back to `true` and changes nothing else — a reboot
+restores power, it does not erase anything, so `records`, `dispatched` and every bank's seal
+survive untouched, and `recover()` computes the recovered prefix fresh from those same bytes
+rather than needing the transition to prune anything toward it. A device on its second or
+third boot is now a state this machine reaches, and `tests/machine.rs`'s
+`a_reboot_changes_nothing_but_the_power` is that claim.
+
+An earlier version of this transition pruned `records` down to `recover()`'s own answer, on
+the reasoning that a reboot should carry forward "nothing more forgiving" than what recovery
+already permits. Codex's review of the pull request caught the defect that reasoning hid: the
+prune is scoped to `recovering_bank()`, so it silently erased the *other* bank's own history
+too — not only a torn tail in the current bank — which only `begin_erase` may do, and which
+let a live write land right back in a bank a crash had just left with no legal append point
+([ADR 0018](0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s rule,
+reachable again one transition later). Leaving every record in place fixes both: recovery
+still answers correctly, because it already scopes and stops at the right place, and
+`whole_before` still refuses a write past the torn record until an erase — not a reboot —
+clears it.
 
 **Compaction needed no transition of its own.** `begin_seal` and `begin_erase` never
 consulted the *other* bank's record state, so once records carried a bank, a live device
@@ -100,10 +113,12 @@ importing it from a theorem about a different type (`tests/machine.rs`'s, about 
 
 ## Consequences
 
-The reachable state space at `Bound::PROOF` grew from 2,576 states to 10,104, and every
-transition's edge count moved with it (`tests/census.rs`). Two spine claims that used to be
-statements about `state.records()` as one sequence —
-`a_torn_record_is_always_the_last_one_on_media` and `an_acknowledged_record_is_never_behind_a_gap`
+The reachable state space at `Bound::PROOF` grew from 2,576 states, and every transition's
+edge count moved with it (`tests/census.rs`, whose pinned numbers are the number to read —
+this paragraph is not). Two spine claims that used to be statements about `state.records()`
+as one sequence —
+`a_torn_record_is_always_the_last_one_on_media_in_its_own_bank` and
+`an_acknowledged_record_is_never_behind_a_gap_in_its_own_bank`
 — are now per-bank claims, because two banks can each independently hold one torn record at
 once without either interruption being impossible. The record-history-shapes census is
 likewise now a per-bank claim rather than a claim about the concatenation of both banks'

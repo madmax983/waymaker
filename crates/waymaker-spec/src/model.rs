@@ -835,7 +835,8 @@ impl Journal {
     /// [`OnMedia::Absent`] and unacknowledged, its id comes from a counter that only grows —
     /// issue [#67](https://github.com/madmax983/waymaker/issues/67)'s identity scheme, rather
     /// than a position an erase could later reuse — and no earlier record changes. Held over
-    /// every edge by `tests/machine.rs`'s `a_declared_record_is_never_renumbered_or_removed`
+    /// every edge by `tests/machine.rs`'s
+    /// `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank`
     /// and by the census's requirement that a record arrive [`Durability::Attempted`] and in
     /// no other state. `bound.records` caps how many records this run may ever declare in
     /// total, not how many are resident at once, so an erased bank does not reopen capacity a
@@ -1115,23 +1116,26 @@ impl Journal {
         Ok(())
     }
 
-    /// The device powers back on. History is exactly what recovery would produce; anything
-    /// declared but not fully durable at the crash is gone, which is what makes reboot a
-    /// genuine restart rather than a resumed write.
+    /// The device powers back on. A reboot restores power; it does not erase anything, so
+    /// nothing about the media changes.
     ///
     /// # Postconditions
     ///
-    /// [`powered`](Self::powered) is `true`; [`records`](Self::records) is
-    /// [`recover`](Self::recover)'s answer, unchanged, so every id it carries keeps the
-    /// acknowledgment and media state it crossed the crash with; [`dispatched`](Self::dispatched)
-    /// keeps only ids that still have a record. `next_id` and every bank's seal survive
-    /// untouched — a reboot learns nothing new about either, and a record dropped here can
-    /// never be reissued, which is issue [#67](https://github.com/madmax83/waymaker/issues/67)'s
-    /// identity scheme doing its job.
-    fn reboot(&mut self) {
-        let kept = self.recover();
-        self.records.retain(|record| kept.contains(&record.id));
-        self.dispatched.retain(|id| kept.contains(id));
+    /// [`powered`](Self::powered) is `true`, and nothing else is. `records`, `dispatched` and
+    /// every bank's seal are exactly what they were the instant before — [`recover`](Self::recover)
+    /// already answers with the right prefix computed fresh from those bytes, so this
+    /// transition does not need to, and must not, prune anything to make that true.
+    ///
+    /// Codex found the bug this replaced: dropping every record `recover()` did not name
+    /// used to remove a torn record's bytes from the model along with it, which let a
+    /// `Declare`/`Program` right back into the bank a crash had just left with no legal
+    /// append point — [ADR 0018](https://github.com/madmax983/waymaker/blob/main/docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)'s
+    /// rule, restated for a live device rather than for the reader. It also silently erased
+    /// the *other* bank's own history, which only [`begin_erase`](Self::begin_erase) may do.
+    /// Leaving every record in place means [`whole_before`](Self::whole_before) still sees
+    /// the torn record and keeps refusing a write past it, exactly as it did before the
+    /// crash, until a real `Transition::BeginErase` clears that bank.
+    const fn reboot(&mut self) {
         self.powered = true;
     }
 

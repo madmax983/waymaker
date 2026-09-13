@@ -1049,6 +1049,18 @@ Stated so that nobody mistakes silence for coverage:
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
   order of edits inside one commit is not a thing a rule can read.
+- **A wrong-bank reader whose wrong bank happens to be empty.** `Invariant::SingleAuthority`'s
+  bank check — issue #67 — is handed `recovered` and nothing else, matching every other
+  guarantee here: a `Reader` reports what it produced, not which bank it consulted. An empty
+  answer from the retired bank is byte-for-byte the same `Vec` an empty answer from the
+  authoritative one would be, and `legal_recoveries` already treats stopping before anything
+  is required as correct, so flagging every empty `recovered` would reject readers that broke
+  no rule. Codex's review of the pull request that added this clause asked for exactly this
+  fix and it is not one: it is the same shape of gap `tests/teeth.rs`'s `Mutant::SkipsGaps`
+  already lives with under `Guard::AppendOnly` — a wrong reader coinciding with a legal
+  answer in *some* states without being right everywhere — and that file's
+  `Mutant::BootsTheRetiredBank` already supplies the one state where this mutant and a
+  correct reader diverge, which is what a falsifier owes rather than every state.
 - **Allocation, as a measurement — no longer.** This bullet used to end "a global allocator
   that counted allocations would need the `unsafe` this workspace denies", and that was true
   of the only mechanism it considered. `cargo xtask profile` needs no allocator at all:
@@ -2816,8 +2828,12 @@ falsifiable by a reader instead of only by deleting a guard — issue #67's own 
 met by name. Record identity moved off `records.len()` onto a counter that only grows, which
 is what let `begin_erase` drop a record from the middle of history without a later `declare`
 reissuing its id to something else; `Transition::Reboot` is the transition that identity
-scheme exists for, legal only while unpowered, reseeding a live device with exactly what
-`recover()` says survived the crash. Compaction — the obvious firmware response to
+scheme exists for, legal only while unpowered, restoring power and changing nothing else —
+`recover()` already computes the survived prefix fresh from the same bytes, and an earlier
+version that pruned `records` toward that answer was a real bug review caught: the prune was
+scoped to one bank and silently erased the *other* bank's own history too, which only
+`begin_erase` may do, and let a live write land back in a bank a crash had left with no legal
+append point. Compaction — the obvious firmware response to
 `Interruption::Failure`, retrying elsewhere rather than being stuck behind a torn record —
 turned out to need no transition of its own: `begin_seal` and `begin_erase` never consulted
 the other bank's records, so a live device behind a torn tail could already seal the blank

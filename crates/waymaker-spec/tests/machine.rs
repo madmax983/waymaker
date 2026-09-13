@@ -129,12 +129,11 @@ fn bytes_on_media_are_never_taken_back_within_a_run() {
 fn a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank() {
     for (from, transition, to) in edges() {
         let dropped = from.records().len() - matched(&from, &to).len();
-        if matches!(transition, Transition::BeginErase(_) | Transition::Reboot) {
-            // `BeginErase` drops a whole bank's records — `erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else`
-            // is the claim about which ones. `Reboot` can also shrink `records`, but only
-            // down to what `recover()` already said survives the crash —
-            // `a_reboot_keeps_exactly_the_recovered_prefix_and_nothing_it_declared_after` is
-            // that claim.
+        if matches!(transition, Transition::BeginErase(_)) {
+            // The one exception, and `erasing_a_bank_drops_exactly_that_banks_records_and_nothing_else`
+            // is the claim about which records it may drop — exactly the named bank's.
+            // `Reboot` restores power and nothing else, so it is not a second exception:
+            // `a_reboot_changes_nothing_but_the_power` is that claim.
             continue;
         }
         assert_eq!(
@@ -326,20 +325,90 @@ fn no_legal_transition_leaves_the_state_unchanged_except_where_it_is_meant_to() 
 }
 
 #[test]
-fn a_reboot_keeps_exactly_the_recovered_prefix_and_nothing_it_declared_after() {
-    // Issue #67's second gap: a reboot has to carry forward precisely what recovery says
-    // survived the crash, id for id, and drop everything else — nothing more forgiving, and
-    // nothing that quietly kept a record recovery would have refused.
+fn a_reboot_changes_nothing_but_the_power() {
+    // Issue #67's second gap, corrected after review found the first version wrong: a reboot
+    // restores power and nothing else. It must not prune `records` down to `recover()`'s
+    // answer — `recover()` already computes that fresh from whatever bytes are there, and
+    // pruning would erase a torn record's bytes (and, since `recover()` is scoped to one
+    // bank, the *other* bank's own history too) the way only `Transition::BeginErase` may.
+    // A device rebooting behind a torn record has to stay stuck behind it, exactly as
+    // `Guard::AppendOnly` already requires, until a real erase clears that bank.
     for (from, transition, to) in edges() {
         if transition != Transition::Reboot {
             continue;
         }
-        let kept: Vec<_> = from.recover();
-        let after_ids: Vec<_> = to.records().iter().map(|record| record.id).collect();
+        assert_eq!(to.records(), from.records(), "Reboot changed the records");
         assert_eq!(
-            after_ids, kept,
-            "Reboot from {from:?} kept {after_ids:?}, and recovery says {kept:?}"
+            to.dispatched(),
+            from.dispatched(),
+            "Reboot changed the dispatch log"
         );
+        assert_eq!(to.banks(), from.banks(), "Reboot changed a bank's seal");
         assert!(to.powered(), "Reboot left the device unpowered");
     }
+}
+
+#[test]
+fn a_reboot_behind_a_torn_record_still_cannot_write_past_it() {
+    // The positive claim `a_reboot_changes_nothing_but_the_power` exists to protect: a device
+    // that reboots with a torn tail in the bank it is still writing to is exactly as stuck in
+    // that bank afterwards as it was the instant before the crash — ADR 0018's "only erased
+    // media is an append point", now proved to survive a reboot rather than only a first
+    // boot. Before the fix, `Journal::reboot` dropped the torn record along with everything
+    // else, which made this false: `Declare` then `Program` into the same bank succeeded
+    // right after reboot.
+    let mut checked = 0_usize;
+    for (_, transition, to) in edges() {
+        if transition != Transition::Reboot || !to.has_torn_record() {
+            continue;
+        }
+        // Whichever bank `Declare` lands a new record in is the bank still being written to;
+        // if that is not the torn record's bank, the torn one belongs to an already-retired
+        // bank and this edge is not the scenario this test is about. Whichever role protocol
+        // order permits here is fine — either demonstrates the same append-only refusal.
+        let declare_outcome = to.step(
+            Transition::Declare(waymaker_spec::model::Role::Outcome),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let declare_schedule = to.step(
+            Transition::Declare(waymaker_spec::model::Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        );
+        let Ok(declared) = declare_outcome.or(declare_schedule) else {
+            continue;
+        };
+        let new_record = declared
+            .records()
+            .iter()
+            .find(|record| !to.records().iter().any(|old| old.id == record.id))
+            .expect("Declare added exactly one record");
+        let Some(torn) = to
+            .records()
+            .iter()
+            .find(|record| record.bank == new_record.bank && record.media == OnMedia::Partial)
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            declared
+                .step(
+                    Transition::Program(new_record.id),
+                    Guards::ENFORCED,
+                    Bound::PROOF
+                )
+                .is_err(),
+            "programming a new record in {:?} succeeded right after reboot, behind torn \
+             record {} in {to:?}",
+            new_record.bank,
+            torn.id.0
+        );
+    }
+    assert!(
+        checked > 0,
+        "no reboot ever landed behind a torn record in the bank still being written to, so \
+         this claim is about nothing"
+    );
 }

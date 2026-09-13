@@ -33,11 +33,11 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// rest kept passing — and a change that makes it larger is one a reviewer should see too.
 /// Either way the number is the review, and it is expected to move when the model does.
 ///
-/// It grew by nearly a factor of four with issue [#67](https://github.com/madmax983/waymaker/issues/67):
+/// It moved with issue [#67](https://github.com/madmax983/waymaker/issues/67):
 /// `Transition::Reboot` reopens every crashed state into a fresh live one, and a `Record` now
 /// carrying a `bank` lets `Journal::begin_erase` produce states two banks could not
 /// distinguish before.
-const REACHABLE_STATES: usize = 10_104;
+const REACHABLE_STATES: usize = 8_372;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -60,18 +60,18 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
 /// led to is reachable by some other path. Every invariant, every mutant verdict and every
 /// necessity proof stays green through all three. The edge counts do not.
 const TRANSITION_EDGES: [(TransitionKind, usize); 12] = [
-    (TransitionKind::Declare, 1202),
-    (TransitionKind::Program, 1589),
-    (TransitionKind::FailedProgram, 1589),
-    (TransitionKind::Barrier, 5052),
-    (TransitionKind::Dispatch, 720),
-    (TransitionKind::BeginErase, 4362),
-    (TransitionKind::CommitErase, 1466),
-    (TransitionKind::BeginSeal, 1078),
-    (TransitionKind::CommitSeal, 1078),
-    (TransitionKind::Tear, 1055),
-    (TransitionKind::PowerLoss, 5052),
-    (TransitionKind::Reboot, 5052),
+    (TransitionKind::Declare, 1109),
+    (TransitionKind::Program, 1475),
+    (TransitionKind::FailedProgram, 1475),
+    (TransitionKind::Barrier, 4186),
+    (TransitionKind::Dispatch, 578),
+    (TransitionKind::BeginErase, 3609),
+    (TransitionKind::CommitErase, 1153),
+    (TransitionKind::BeginSeal, 865),
+    (TransitionKind::CommitSeal, 865),
+    (TransitionKind::Tear, 962),
+    (TransitionKind::PowerLoss, 4186),
+    (TransitionKind::Reboot, 4186),
 ];
 
 #[test]

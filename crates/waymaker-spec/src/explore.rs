@@ -351,8 +351,9 @@ pub fn explore(bound: Bound, guards: Guards, ceiling: usize) -> Result<Explored,
 /// permitted to drop records outright, and a zip over the raw slices would pair the survivor
 /// of an erased bank against whatever record happens to sit at its old index, filing the
 /// difference as an invented durability step. `tests/machine.rs`'s
-/// `a_declared_record_is_never_renumbered_or_removed` names `BeginErase` as the one
-/// exception, and this is the matching change on the census side of the same fact.
+/// `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank` names
+/// `BeginErase` as the one exception, and this is the matching change on the census side of
+/// the same fact.
 fn record_edge(census: &mut Census, transition: Transition, from: &Journal, to: &Journal) {
     *census.transitions.entry(transition.kind()).or_default() += 1;
     census.edges = census.edges.saturating_add(1);
