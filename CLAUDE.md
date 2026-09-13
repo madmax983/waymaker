@@ -2893,7 +2893,16 @@ stopped a safe caller reaching `high_water_mark` directly with an arbitrary `usi
 `paint` call at all — and a raw read of stack memory nobody painted is undefined behavior
 however tightly the address is clamped. `paint` now returns `Painted`, a type this module is
 the only one able to construct, and `high_water_mark` takes one instead of a bare `usize`, so
-a caller with no `Painted` in hand cannot call it at all. See
+a caller with no `Painted` in hand cannot call it at all. Two more findings came from a
+review of the merge that followed. `current_stack_pointer` read the core's MSP register
+unconditionally, which is correct only because this image never selects the other Thread-mode
+candidate, PSP — a fact about how the crate happens to be used today rather than one its
+`pub` signature states; it now reads `CONTROL.SPSEL` first and follows it to whichever
+register is actually live. And `emulation-boot`'s extern-block exemption was a byte *range*
+rather than the one keyword's own offset the two permitted functions are each held to, so a
+second, unrelated `unsafe` sitting anywhere between the linker-symbol block's braces passed
+unnoticed; it now matches only that one offset, the same way `sole_depth_zero_unsafe` already
+does for `paint` and `high_water_mark`. See
 [ADR 0042](docs/adr/0042-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 The kernel-state registry has three entries — the replay machine, the record view and an

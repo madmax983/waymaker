@@ -194,6 +194,29 @@ itself, so a caller who has not painted cannot name a value of the type this sca
 The fix costs nothing at the one real call site in `main`, which already passed `paint`'s own
 return value straight through.
 
+**"The stack pointer" is two registers in Thread mode, and a seventh finding is that reading
+one of them unconditionally was never argued, only true by accident.** `CONTROL.SPSEL` says
+which of MSP and PSP is live, and `current_stack_pointer` read MSP regardless. Nothing in this
+image ever sets `SPSEL` — there is no RTOS and no second stack here — so MSP has in fact always
+been the active pointer, and every figure this ADR reports is correct for that reason. That
+reason lives in how this crate happens to be used today, not in `current_stack_pointer`'s own
+signature: it is `pub`, reachable from any future caller in any future execution context, and
+nothing pins it to the one file `paint` and `high_water_mark` are pinned to. `current_stack_pointer`
+now reads `CONTROL` first and follows `SPSEL` to whichever register is actually live, so the
+function is sound on its own terms rather than sound because nothing has asked it the hard
+question yet.
+
+**The extern-block exemption was a range, and an eighth finding is the same shape of gap
+`sole_depth_zero_unsafe` had already closed for the two permitted functions.** `covers`
+treated *every* `unsafe` occurrence between the block's opening brace and its closing one as
+part of the one exemption the 2024 edition's linker-symbol block needs — so a second,
+unrelated `unsafe` occurrence sitting anywhere inside those braces, beside the two permitted
+statics rather than replacing either, passed unnoticed. The fix mirrors the one already used
+for `paint` and `high_water_mark`: only the offset of the block's own opening `unsafe` keyword
+is stored and matched exactly, so a sibling `unsafe` elsewhere in the block is refused rather
+than inherited. `a_second_unsafe_hidden_inside_the_extern_block_is_reported` is the test
+watched failing against the old range check before this closed it.
+
 ## Consequences
 
 **A real, measured stack figure exists where before there was none**, on both architectures
@@ -223,7 +246,7 @@ failing before the checks that close them existed. `hand_written_unsafe_is_repor
 `unsafe_in_stack_rs_outside_the_two_named_functions_is_reported` is the sibling test showing
 the same file does not get a blanket pass.
 
-**None of the six hardenings changed what the figure means, only what a wrong caller could do
+**None of the eight hardenings changed what the figure means, only what a wrong caller could do
 to it, how the one real caller is sequenced, and how strictly the gate reads a degenerate or
 an internally inconsistent report.** `clamp_to_stack_region` is a floor-and-ceiling clamp plus
 a live-stack-pointer clamp, not a new measurement path, and what changed is the *worst case*

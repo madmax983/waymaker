@@ -96,14 +96,26 @@ fn clamp_to_stack_region(depth_from: usize) -> usize {
         .min(current_stack_pointer())
 }
 
-/// The stack pointer, read from the core rather than inferred from a local's address.
+/// The active stack pointer, read from the core rather than inferred from a local's address.
 ///
 /// A local's address depends on where a compiler chooses to place it within its frame, which
 /// this workspace's own layering rules do not promise and a future rebuild could change. The
-/// stack pointer is the one number that is always exactly where the hardware says it is.
+/// stack pointer is the one number that is always exactly where the hardware says it is —
+/// but Thread mode has *two* candidates, MSP and PSP, and the `CONTROL` register's `SPSEL` bit
+/// says which one is live. This image never touches `SPSEL` — nothing here runs an RTOS or a
+/// second stack — so MSP is the only stack that has ever been selected, and reading it
+/// unconditionally happened to agree with the active pointer for that reason alone. That
+/// reason is a fact about how this crate is used today, not one `current_stack_pointer`'s own
+/// signature states, so a future caller in a different execution context — this function is
+/// `pub`, and nothing pins it to one file the way `paint` and `high_water_mark` are — could
+/// read `SPSEL == Psp` and still get MSP back. Reading `CONTROL` first closes that: whichever
+/// stack Thread mode is actually using is the one this returns.
 #[must_use]
 pub fn current_stack_pointer() -> usize {
-    cortex_m::register::msp::read() as usize
+    match cortex_m::register::control::read().spsel() {
+        cortex_m::register::control::Spsel::Psp => cortex_m::register::psp::read() as usize,
+        cortex_m::register::control::Spsel::Msp => cortex_m::register::msp::read() as usize,
+    }
 }
 
 /// Proof that [`paint`] has poisoned the region [`high_water_mark`] is about to scan.

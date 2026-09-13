@@ -899,9 +899,17 @@ struct PermittedStackSpans {
     /// that: a function with two depth-zero `unsafe` keywords permits neither, because which
     /// one is real would be a guess.
     function_unsafe_at: Vec<usize>,
-    /// The byte range of the one well-formed `unsafe extern "C" { .. }` block, if the file
-    /// has one — declaring only [`STACK_FLOOR_SYMBOL`] and nothing else.
-    extern_block: Option<(usize, usize)>,
+    /// The absolute byte offset of the `unsafe` keyword opening the one well-formed
+    /// `unsafe extern "C" { .. }` block, if the file has one — declaring only
+    /// [`STACK_FLOOR_SYMBOL`] and [`STACK_CEILING_SYMBOL`] and nothing else.
+    ///
+    /// A single offset, not the block's byte range: `covers` checking containment over the
+    /// whole span would permit a *second*, unrelated `unsafe` occurrence anywhere between the
+    /// braces — an attribute, or any other text this scan does not police the shape of — as
+    /// long as it left the two-static, no-`fn` count alone. Matching only the one keyword that
+    /// opens the block is `function_unsafe_at`'s own fix met here: the block's `unsafe extern`
+    /// is the sole thing the 2024 edition requires, so it is the sole thing permitted.
+    extern_block_unsafe_at: Option<usize>,
 }
 
 impl PermittedStackSpans {
@@ -933,20 +941,14 @@ impl PermittedStackSpans {
             .collect();
         Self {
             function_unsafe_at,
-            extern_block: extern_block_span(code),
+            extern_block_unsafe_at: extern_block_unsafe_keyword(code),
         }
     }
 
-    /// Whether the `unsafe` starting at `start` in `code` is one of the spans this file
+    /// Whether the `unsafe` starting at `start` in `code` is one of the offsets this file
     /// permits.
     fn covers(&self, start: usize) -> bool {
-        if self
-            .extern_block
-            .is_some_and(|(from, to)| start >= from && start < to)
-        {
-            return true;
-        }
-        self.function_unsafe_at.contains(&start)
+        self.extern_block_unsafe_at == Some(start) || self.function_unsafe_at.contains(&start)
     }
 }
 
@@ -1023,16 +1025,20 @@ fn span_of(code: &str, body: &str) -> (usize, usize) {
     (start, start.saturating_add(body.len()))
 }
 
-/// The byte range of the one well-formed `unsafe extern "C" { .. }` block in `code`, if it has
-/// one.
+/// The byte offset of the `unsafe` keyword opening the one well-formed
+/// `unsafe extern "C" { .. }` block in `code`, if it has one.
 ///
-/// Well-formed means: the block declares [`STACK_FLOOR_SYMBOL`] and exactly one `static`, and
-/// no `fn` — which is what stops `unsafe extern "C" fn trap_handler() { .. }`, a foreign
-/// *function* item whose `unsafe` also reads as "extern" immediately following it, from being
-/// read as this block. A second `unsafe extern` block declaring something else is scored on
-/// its own content and refused on its own account, so nothing here needs to also count how
-/// many such blocks the file has.
-fn extern_block_span(code: &str) -> Option<(usize, usize)> {
+/// Well-formed means: the block declares [`STACK_FLOOR_SYMBOL`] and [`STACK_CEILING_SYMBOL`]
+/// and exactly two `static`s, and no `fn` — which is what stops
+/// `unsafe extern "C" fn trap_handler() { .. }`, a foreign *function* item whose `unsafe` also
+/// reads as "extern" immediately following it, from being read as this block. A second
+/// `unsafe extern` block declaring something else is scored on its own content and refused on
+/// its own account, so nothing here needs to also count how many such blocks the file has.
+/// Only the keyword's own offset is returned, not the block's range: `covers` matches it
+/// exactly, so an `unsafe` occurrence anywhere *inside* the braces — an attribute, or any
+/// other text this scan does not police the shape of — is refused rather than waved through
+/// as part of the block's own exemption.
+fn extern_block_unsafe_keyword(code: &str) -> Option<usize> {
     let mut at = 0;
     while let Some(found) = code.get(at..).and_then(|rest| rest.find("unsafe extern")) {
         let keyword_start = at.saturating_add(found);
@@ -1064,9 +1070,7 @@ fn extern_block_span(code: &str) -> Option<(usize, usize)> {
                 let two_statics = crate::source::declaration_count(inner, "static") == 2;
                 let no_fn = crate::source::declaration_count(inner, "fn") == 0;
                 if names_floor && names_ceiling && two_statics && no_fn {
-                    // The span offered to callers starts at the `unsafe` keyword itself, so a
-                    // `covers` check against the keyword's own occurrence succeeds.
-                    return Some((keyword_start, to));
+                    return Some(keyword_start);
                 }
             }
         }
@@ -1821,6 +1825,29 @@ mod tests {
             "{}\nunsafe extern \"C\" {{\n    static mut SOMEBODY_ELSES_STATE: u32;\n}}\n",
             tests_support::clean_stack_module()
         );
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_unsafe_hidden_inside_the_extern_block_is_reported() {
+        // Before this test existed, `covers` treated the *whole* byte range of a well-formed
+        // extern block as exempt, so a second, unrelated `unsafe` occurrence sitting between
+        // the braces — beside the two permitted statics, not replacing either of them — was
+        // waved through as though it were the one keyword the 2024 edition requires. Only
+        // that one keyword's own offset is permitted now: this one is a sibling of it, at a
+        // different offset, and must be reported exactly as a sibling `unsafe` beside a
+        // permitted function's fill already is.
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n    unsafe {}\n}\n\
+             pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n}\n\
+             pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned();
         let sources = tests_support::sources_with_stack_module(decoy);
         let violations = check(&sources);
         assert!(
