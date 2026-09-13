@@ -903,8 +903,9 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
 /// Whether [`markdown_prose`] keeps the text of inline code spans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlineCode {
-    /// Keep: `` `the-question-id` `` renders as `the-question-id`. Marker claims
-    /// backtick their id, so claim scans keep the spans.
+    /// Keep: `` `the-question-id` `` renders as `` `the-question-id` ``, backticks
+    /// and all. Marker claims and table rows match on a backtick-delimited id, so
+    /// the delimiters have to survive along with the text.
     Keep,
     /// Drop: `` `# Title` `` is literal text, not a heading. Structure scans drop
     /// the spans so a fenced example cannot satisfy a rule about the document.
@@ -920,9 +921,11 @@ pub enum InlineCode {
 /// `- ` markers, so the ADR field and heading scans run unchanged on the result.
 /// Inline code spans are kept or dropped per [`InlineCode`].
 ///
-/// HTML comments are NOT stripped here: the call sites that need them gone strip
-/// them first, exactly as before, because comment stripping has its own
-/// fusion-avoiding semantics the Markdown parser must not second-guess.
+/// HTML — a block comment included — is dropped by the parser itself, through the
+/// events this function does not handle, so `contents` may be raw. A caller may
+/// still pre-strip comments for a narrower reason of its own (`check_adr_structure`
+/// does, to avoid two fields fusing across a same-line comment); this function does
+/// not require it.
 #[must_use]
 pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -950,7 +953,12 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             }
             Event::Code(code) => {
                 if !in_fence && matches!(inline_code, InlineCode::Keep) {
+                    // Backticks kept, not just the content: row and claim scans match
+                    // on a backtick-delimited id, and a bare id could be a substring
+                    // of a longer one.
+                    out.push('`');
                     out.push_str(&code);
+                    out.push('`');
                 }
             }
             Event::Text(text) => {

@@ -1377,12 +1377,18 @@ fn without_blockquote_marker(line: &str) -> &str {
 
 /// `contents` with every fenced code block removed.
 ///
-/// A link or a heading inside a fence is displayed as literal text: it is an example of
-/// Markdown, not Markdown. Used where a rule asks whether a reader can follow something.
+/// Used only by [`linked_markdown_files`]'s caller, which needs the raw link syntax a
+/// rendered-prose pass would strip along with the markup — [`crate::parse::markdown_prose`]
+/// is what every other rule in this file uses instead, and does not have this limit.
 ///
 /// A fence is found under one level of blockquote too — `> ` ```` ``` ```` — because an
 /// example quoted in a reply is still an example. Nested quoting beyond one level is not
 /// unwrapped, which only narrows what this function catches, never what it wrongly hides.
+///
+/// Not fully robust against a comment that itself contains a fence-looking line: this is a
+/// textual scanner, not a parser, and the two constructs are not tracked against each
+/// other. `linked_markdown_files`'s own content is index prose rather than an adversarial
+/// input, which is why this is accepted here and nowhere else.
 #[must_use]
 fn without_fenced_code(contents: &str) -> String {
     let mut kept = Vec::new();
@@ -1852,7 +1858,7 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
     // Fences as well as comments, for the reason the ADR half strips them: a fenced example
     // listing the six ids would otherwise satisfy every check below in a file whose table
     // has been deleted.
-    let contents = without_html_comments(&without_fenced_code(contents));
+    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
     for clause in SPEC_CLAUSES {
         // The clause's own table row, found by its backticked id — not three global
@@ -1928,7 +1934,7 @@ fn check_spec_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              is a choice nobody wrote down",
         )];
     };
-    let contents = without_html_comments(&without_fenced_code(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     SPEC_CLAUSES
         .iter()
         .filter(|clause| !contents.contains(&format!("`{}`", clause.id)))
@@ -2116,7 +2122,7 @@ fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violat
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = without_html_comments(&without_fenced_code(contents));
+    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own table row, found by its backticked id. Not three whole-file
@@ -2195,7 +2201,7 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              and what it can observe are choices nobody wrote down",
         )];
     };
-    let contents = without_html_comments(&without_fenced_code(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own row, as in the `CLAUDE.md` half. The ADR states what discharges
@@ -2397,7 +2403,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
 /// `deferred-questions`' reason: a decoy `- Status: accepted` shown as an example, or
 /// hidden in a comment, must not out-rank the real line.
 fn adr_status(contents: &str) -> Option<String> {
-    without_html_comments(&without_fenced_code(contents))
+    crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep)
         .lines()
         .map(str::trim_start)
         .find_map(|line| line.strip_prefix("- Status:"))
@@ -2449,11 +2455,12 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
 
-    // Both directions read the same parsed link list, and it is parsed from what renders.
-    // Asking only whether the file *name* appears would accept
-    // `[0001-one.md](../architecture.md)`, where the ADR is mentioned and not linked; and a
-    // link inside an HTML comment or a fenced example is text about a link rather than one
-    // — which is the whole of what an index is for.
+    // Both directions read the same parsed link list. Asking only whether the file
+    // *name* appears would accept `[0001-one.md](../architecture.md)`, where the ADR is
+    // mentioned and not linked; and a link inside an HTML comment or a fenced example is
+    // text about a link rather than one — which is the whole of what an index is for.
+    // Not `markdown_prose`: the raw `](target)` syntax this needs is exactly what
+    // rendered prose strips.
     let linked = linked_markdown_files(&without_html_comments(&without_fenced_code(index)));
 
     let mut violations: Vec<Violation> = adrs
@@ -2559,7 +2566,7 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
 
     // Fences as well as comments, for the reason its three siblings strip them: a fenced
     // example listing every decision id would otherwise settle this check on its own.
-    let contents = without_html_comments(&without_fenced_code(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     SETTLED_DECISIONS
         .iter()
         .flat_map(|decision| {
@@ -2810,7 +2817,7 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
 
     // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
     // every target id would otherwise satisfy this check in a file whose table is gone.
-    let contents = without_html_comments(&without_fenced_code(contents));
+    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
 
     for target in HARDWARE_TARGETS {
@@ -3247,7 +3254,7 @@ fn check_failure_rows_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = without_html_comments(&without_fenced_code(contents));
+    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
     for row in FAILURE_ROWS {
         let rows: Vec<&str> = contents
@@ -3309,7 +3316,7 @@ fn check_failure_rows_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              choice nobody wrote down",
         )];
     };
-    let contents = without_html_comments(&without_fenced_code(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     FAILURE_ROWS
         .iter()
         .filter(|row| !contents.contains(&format!("`{}`", row.id)))
@@ -3405,7 +3412,7 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
 
     // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
     // every question id would otherwise satisfy this check in a file whose table is gone.
-    let contents = without_html_comments(&without_fenced_code(contents));
+    let contents = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
     let mut violations = Vec::new();
 
     for question in DEFERRED_QUESTIONS {
@@ -3929,7 +3936,7 @@ fn check_wire_format_is_documented(
     }
 
     if let Some(claude_md) = claude_md {
-        let claude_md = without_html_comments(&without_fenced_code(claude_md));
+        let claude_md = crate::parse::markdown_prose(claude_md, crate::parse::InlineCode::Keep);
         if !claude_md.contains(WIRE_FORMAT_SPEC_PATH) {
             violations.push(Violation::new(
                 RULE,
@@ -5163,39 +5170,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_is_closed_only_by_its_own_character() {
-        // The other half of knowing about two fence characters: a backtick block must not
-        // be closed by a tilde line, or everything after it stops being fenced.
-        assert_eq!(
-            without_fenced_code("keep\n```\nhidden\n~~~\nstill hidden\n```\nkeep too"),
-            "keep\nkeep too"
-        );
-    }
-
-    #[test]
-    fn a_closing_fence_cannot_carry_an_info_string() {
-        // Codex, pull request #138. CommonMark allows nothing but whitespace after the
-        // fence characters on a closing line. A line like "```rust" is not a closing
-        // fence — it is content quoted inside the outer ```text block — so it must not
-        // end the block early, and it must not be mistaken for a new opener either.
-        // `mermaid_blocks` already gets this right; `without_fenced_code` did not.
-        assert_eq!(
-            without_fenced_code("keep\n```text\nhidden\n```rust\nstill hidden\n```\nkeep too"),
-            "keep\nkeep too"
-        );
-    }
-
-    #[test]
-    fn a_fence_opened_under_one_level_of_blockquote_is_still_a_fence() {
-        // Codex, pull request #138: the fence scan looked only at the line's own first
-        // byte, so a `>`-quoted example fence was invisible to it.
-        assert_eq!(
-            without_fenced_code("keep\n> ```text\n> hidden\n> ```\nkeep too"),
-            "keep\nkeep too"
-        );
-    }
-
-    #[test]
     fn prose_naming_a_question_before_the_table_does_not_stand_in_for_its_row() {
         // Codex, PR #58 round 3. The scan took the first line containing the backticked id,
         // so a mention in prose above the table shadowed the row — failing the gate on a
@@ -5631,6 +5605,20 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_looking_line_inside_a_comment_does_not_confuse_the_status() {
+        // Codex, pull request #138: the converse of the case above. Reordering to
+        // strip fences before comments breaks the other way round — a comment whose
+        // body happens to contain a fence-looking line would make a purely textual
+        // fence scan (run first) consume the comment's own close along with it.
+        // `adr_status` now reads through `markdown_prose`, a real parser: an HTML
+        // comment block runs to its own `-->` regardless of what looks like a fence
+        // inside it, so this is not a hazard for it.
+        let contents =
+            "# ADR\n\n<!--\n```text\n- Status: accepted\n```\n-->\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -5949,15 +5937,43 @@ mod tests {
     #[test]
     fn ids_hidden_in_a_blockquoted_fenced_example_do_not_record_a_decision() {
         // Codex, pull request #138: a fence opened with a leading `>` was invisible to
-        // `without_fenced_code`, whose fence scan looked only at the very first byte of
-        // the line, so a decision listed only inside a quoted example still satisfied
-        // this check.
+        // a first, textual fix for this, whose fence scan looked only at the very
+        // first byte of the line, so a decision listed only inside a quoted example
+        // still satisfied this check. `check_settled_decisions` now reads this through
+        // `markdown_prose`, a real parser, which tracks the blockquote container
+        // structurally rather than by a leading-byte guess.
         let mut body = String::from("> ```text\n");
         for decision in SETTLED_DECISIONS {
             use std::fmt::Write as _;
             let _ = writeln!(body, "> {} {}", decision.id, decision.headline);
         }
         body.push_str("> ```\n");
+        let adrs = vec![AdrFile {
+            name: SETTLED_DECISIONS_ADR.to_owned(),
+            contents: format!("# ADR 0003: nothing here\n\n{body}"),
+        }];
+        let violations = check_settled_decisions(&adrs);
+        assert_eq!(
+            violations.len(),
+            SETTLED_DECISIONS.len() * 2,
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_looking_line_inside_a_top_level_fence_does_not_close_it() {
+        // Codex, pull request #138: the converse of the case above. A textual fix that
+        // strips one leading `>` to find a fence underneath a quote would also strip
+        // it from a line like `> id headline` that is really just content quoted
+        // *inside* a top-level (unquoted) fence, closing that fence early and exposing
+        // what should still be hidden. A real parser does not have this failure mode,
+        // because it tracks which container a line is actually inside.
+        let mut body = String::from("```text\n");
+        for decision in SETTLED_DECISIONS {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "> {} {}", decision.id, decision.headline);
+        }
+        body.push_str("```\n");
         let adrs = vec![AdrFile {
             name: SETTLED_DECISIONS_ADR.to_owned(),
             contents: format!("# ADR 0003: nothing here\n\n{body}"),
