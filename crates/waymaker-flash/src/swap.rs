@@ -763,8 +763,8 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
 /// the check `C` the swap sealed with. See [`recovery`](Self::recovery) for why.
 ///
 /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to drop `C`.
-/// Its own docs said nothing left to do reads or writes a seal. That is true of `reclaim`. It
-/// is not true of a caller that reads [`region`](Self::region) back with the wrong check.
+/// The old docs said no later step reads or writes a seal. That is true of `reclaim`. It is
+/// not true if a caller uses [`region`](Self::region) with the wrong check.
 ///
 /// # Why it is not `Copy`
 ///
@@ -809,9 +809,7 @@ impl<C: IntegrityCheck> Installed<C> {
     /// is a second way to reach an append offset that no scan vouched for.
     ///
     /// This bank was sealed with `C`. Use [`recovery`](Self::recovery) to read it, not
-    /// [`Recovery::new`]. `Recovery::new` defaults to [`Catalogued`]. A bank sealed with
-    /// another check then stops at the first frame with
-    /// [`IntegrityFailed`](DecodeError::IntegrityFailed).
+    /// [`Recovery::new`] — see there for why.
     #[must_use]
     pub const fn region(&self) -> JournalRegion {
         self.plan.region
@@ -820,10 +818,12 @@ impl<C: IntegrityCheck> Installed<C> {
     /// A [`Recovery`] of the journal this swap installed, keyed to the check `C` it was
     /// sealed with.
     ///
-    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85):
-    /// [`region`](Self::region) alone lets a caller pick [`Recovery::new`] by mistake and
-    /// read this bank with [`Catalogued`]. This method returns the same journal, keyed to
-    /// the right check.
+    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): a caller may pass
+    /// [`region`](Self::region) to [`Recovery::new`] by mistake. `Recovery::new` defaults to
+    /// [`Catalogued`], the wrong check for a bank sealed with another one — recovery then
+    /// stops at the first frame with
+    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the same
+    /// journal, keyed to the right check.
     #[must_use]
     pub const fn recovery(&self) -> Recovery<C> {
         Recovery::with_integrity(self.plan.region)

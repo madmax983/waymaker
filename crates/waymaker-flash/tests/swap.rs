@@ -1326,8 +1326,8 @@ fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
     let mut device = booted();
     let installed = perform_with_other(&mut device);
 
-    // The typed handoff: `installed.recovery()` verifies with `Other`. That is the check
-    // this swap sealed with, not the default `Recovery::new` picks.
+    // The typed handoff: `installed.recovery()` verifies with `Other`. This swap sealed
+    // with `Other`. `Recovery::new` would pick a different, wrong default.
     let mut page = [0_u8; PAGE];
     let mut recovery = installed.recovery();
     while recovery.next(&mut device, &mut page).is_some() {}
@@ -1362,8 +1362,8 @@ fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
     );
 
     // Issue #85's trap: `Recovery::new` defaults to `Catalogued`. It cannot verify a
-    // journal `Other` sealed. The typed handoff stops a caller reaching this by accident.
-    // This shows what happens if they do.
+    // journal `Other` sealed. The typed handoff stops a caller from reaching this by
+    // accident. This shows what happens if they do.
     let mut wrong = Recovery::new(installed.region());
     assert_eq!(
         wrong.next(&mut device, &mut page),
