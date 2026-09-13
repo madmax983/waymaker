@@ -1202,8 +1202,16 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence || blockquote_depth > 0;
         match event {
+            // A fenced block or blockquote opening while an item is being collected
+            // disqualifies it, the same way a line break does (Codex, pull request
+            // #138, round 15): `- Status:` followed by a nested fenced or quoted
+            // `accepted` is hidden content standing in for the field's value, and
+            // simply skipping the hidden text (rather than dropping the item) would
+            // leave `item` holding just `Status:`, which still strips to an empty —
+            // and therefore still matching — value.
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
+                collecting = false;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_sub(1);
@@ -1211,6 +1219,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             Event::Start(Tag::CodeBlock(kind)) => {
                 if matches!(kind, CodeBlockKind::Fenced(_)) {
                     in_fence = true;
+                    collecting = false;
                 }
             }
             Event::End(TagEnd::CodeBlock) => in_fence = false,
@@ -1325,6 +1334,13 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                 cell.push_str(&dest_url);
                 cell.push(' ');
             }
+            // Raw HTML, `<a href="tests/spine.rs">recovery proof</a>`, is not a
+            // `Tag::Link` at all — it is two `InlineHtml` events around the label's own
+            // `Event::Text` (Codex, pull request #138, round 15) — so the destination is
+            // read the way `visible_source` treats real HTML: kept verbatim rather than
+            // parsed apart, since the tag's own text already carries the `href` value as
+            // a literal substring.
+            Event::InlineHtml(html) if in_row => cell.push_str(&html),
             _ => {}
         }
     }

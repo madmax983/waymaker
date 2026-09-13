@@ -5666,6 +5666,17 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_value_nested_in_a_fenced_block_inside_the_item() {
+        // Codex, pull request #138, round 15: a fenced block indented under the item's
+        // own `- Status:` line is hidden the same as a top-level one, but `collecting`
+        // stayed true across it — leaving `item` at `Status:` once the hidden text was
+        // skipped, which still strips to an empty value that still counts as a match.
+        // The nested fence has to disqualify the item outright, not just go unread.
+        let contents = "# ADR\n\n- Status:\n  ```\n  accepted\n  ```\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -6652,6 +6663,31 @@ mod tests {
         let linked = claude_md.replace(
             &format!("| {} |", clause.discharged_by),
             &format!("| [recovery proof]({}) |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 15: raw HTML is not a `Tag::Link` at all — it
+        // is two `InlineHtml` events around the label's own text — so the fix for a
+        // Markdown link left a raw-HTML one, `<a href="tests/spine.rs">recovery
+        // proof</a>`, still losing its destination.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!(
+                "| <a href=\"{}\">recovery proof</a> |",
+                clause.discharged_by
+            ),
         );
         let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
         assert!(
