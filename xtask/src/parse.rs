@@ -431,6 +431,13 @@ fn collect_trait_implementors(
 /// rather than evaluating it is what `codec-is-optional` already does for a compound
 /// `cfg`, for the same reason.
 ///
+/// The alias an unconditional derive resolves through may itself be behind any `cfg`
+/// except `cfg(test)` — a `#[cfg(feature = "x")] use Y as Klon;` still means
+/// `#[derive(Klon)]` is `Y` under that feature, so excluding it would be the false
+/// negative, the opposite mistake from the one two paragraphs up. Only `cfg(test)` is
+/// excluded, because a name defined solely under it could never be reached by a
+/// `#[derive(..)]` on a struct that ships.
+///
 /// Only a struct declared at the top level of `contents` is `name`. A private struct of
 /// the same name nested inside a `mod` is a different declaration, not a second sighting
 /// of the one the crate's public API exports under that name — reading it as one is
@@ -460,7 +467,14 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     let mut aliases = Vec::new();
     for item in &file.items {
         if let syn::Item::Use(use_item) = item {
-            if !has_any_cfg(item_attrs(item)) {
+            // `has_cfg_test`, not `has_any_cfg`: an alias needs the opposite
+            // conservatism a declaration does. A `#[cfg(feature = "x")] use Y as Klon;`
+            // still means `#[derive(Klon)]` is `Y` under that feature, so excluding a
+            // cfg-gated alias here would be the false negative — the derive scan has to
+            // read every alias that could possibly apply, and only a `#[cfg(test)]` one
+            // is excluded, because code reachable only from a shipped struct could never
+            // reach a name defined solely under `cfg(test)` in the first place.
+            if !has_cfg_test(item_attrs(item)) {
                 collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
             }
         }

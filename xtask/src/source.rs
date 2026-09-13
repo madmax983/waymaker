@@ -10443,6 +10443,30 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_derived_under_a_cfg_gated_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): the first version of this check
+        // excluded a `cfg`-gated `use` from the alias table entirely, on the same
+        // reasoning that excludes a `cfg`-gated *struct declaration* — but the two need
+        // opposite conservatism. `#[cfg(all())] use core::clone::Clone as Klon;` still
+        // means `#[derive(Klon)]` is `Clone` whenever that condition holds, so excluding
+        // the alias was the false negative: it left `Klon` unresolved and the derive
+        // unreported.
+        let cfg_gated_alias = recovery_source_with_struct(concat!(
+            "#[cfg(all())]\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&cfg_gated_alias);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
