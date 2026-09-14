@@ -679,23 +679,27 @@ fn collect_future_implementors(
 }
 
 /// Every name in `names` that `contents` writes to as a struct field, outside
-/// `#[cfg(test)]` — in any of the three ways a field's value can be rewritten in place
+/// `#[cfg(test)]` — in any of the five ways a field's value can be rewritten in place
 /// rather than rebuilt.
 ///
-/// A plain assignment, `x.field = value;`, is one route. A `&mut` reference taken to the
-/// field is the second — `std::mem::swap(&mut x.field, &mut y.field)`,
-/// `std::mem::replace(&mut x.field, value)`, and passing the reference to an arbitrary
-/// function that takes `&mut T` are all routes to the same rewrite that spell no `=` at all,
-/// and all three need a `&mut` to the field first, which is the shape this refuses. A
-/// *method* call on the field is the third, and the one that needs neither: `x.field.
+/// A plain assignment, `x.field = value;`, is one route. A compound assignment —
+/// `x.field += value;`, and the other nine arithmetic and bitwise operators with their own
+/// `=` — is a second, and a separate one from `syn`'s own point of view: every
+/// compound-assignment operator parses as a `BinOp` on an `Expr::Binary`, never as
+/// `Expr::Assign`, which is `=` alone. A `&mut` reference taken to the field is the third —
+/// `std::mem::swap(&mut x.field, &mut y.field)`, `std::mem::replace(&mut x.field, value)`,
+/// and passing the reference to an arbitrary function that takes `&mut T` are all routes to
+/// the same rewrite that spell no `=` at all, and every one of them needs a `&mut` to the
+/// field first, which is the shape this refuses. A *method* call on the field is the fourth,
+/// and the one that needs neither: `x.field.
 /// clone_from(&other)` autorefs `&mut x.field` implicitly, with no `&mut` token written
 /// anywhere — so every method call on a guarded field is refused outright, since telling a
 /// mutating method from a read-only one needs type inference `syn` does not have. A method
 /// called on the whole *value* (`x.field()`, an accessor) is unaffected: its receiver is a
-/// plain path, not a field access. A `ref mut` binding in a struct pattern is the fourth:
+/// plain path, not a field access. A `ref mut` binding in a struct pattern is the fifth:
 /// `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the pattern
 /// itself, with no assignment, no `&mut` expression and no method call anywhere for the
-/// first three routes to see. A field bound `mut slot` with no `ref` is not this: it moves
+/// other four routes to see. A field bound `mut slot` with no `ref` is not this: it moves
 /// or copies the value into a fresh local, which is a read, and rebuilding `x` from that
 /// local afterward is a struct literal the construction pins already cover.
 ///
@@ -777,6 +781,30 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
         fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
             self.note(&node.left);
             syn::visit::visit_expr_assign(self, node);
+        }
+
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            // `dispatch.intent.request.kind ^= 1;` rewrites `kind` in place, but `syn`
+            // parses every compound-assignment operator (`+=`, `^=`, and the rest) as a
+            // `BinOp` on an `Expr::Binary`, not as an `Expr::Assign` — `ExprAssign` is
+            // `=` alone. `visit_expr_assign` above never sees one, so a guarded field's
+            // ancestor chain could be rewritten with the gate still green.
+            if matches!(
+                node.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+                    | syn::BinOp::BitXorAssign(_)
+                    | syn::BinOp::BitAndAssign(_)
+                    | syn::BinOp::BitOrAssign(_)
+                    | syn::BinOp::ShlAssign(_)
+                    | syn::BinOp::ShrAssign(_)
+            ) {
+                self.note(&node.left);
+            }
+            syn::visit::visit_expr_binary(self, node);
         }
 
         fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
@@ -2304,6 +2332,33 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_compound_assignment_to_a_field_is_reported() {
+        // `^=` and its nine siblings parse as `Expr::Binary`, never `Expr::Assign` — a
+        // separate route from a plain `=` in `syn`'s own grammar, not only in the source.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo) -> Foo {\n\
+             \x20   dispatch.bytes ^= 1;\n\
+             \x20   dispatch\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn an_ordinary_binary_expression_is_not_reported() {
+        // `x.field + 1` reads `field` and rewrites nothing; only the ten assignment
+        // operators name a mutation.
+        let found = mutated_field_names(
+            "fn read(dispatch: &Foo) -> i32 {\n\
+             \x20   dispatch.bytes + 1\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

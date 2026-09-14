@@ -191,6 +191,16 @@ iterating past two or three rounds and open an issue once a fourth still finds r
 rather than continue an unbounded loop. They are tracked in issue
 [#171](https://github.com/madmax983/waymaker/issues/171) instead.
 
+**An eleventh round, on the merge of this branch with a concurrent one, found a gap in the
+tenth's own fix: a compound assignment.** `dispatch.intent.request.kind ^= 1;` rewrites
+`kind` in place, and `note`'s chain walk covers it once reached — but `visit_expr_assign`
+was the only route that called `note` at all, and `syn` does not parse `+=`, `^=` or the
+other eight compound-assignment operators as an `Expr::Assign`. Each is a `BinOp` on an
+`Expr::Binary`, a different node the visitor never visited. `mutated_field_names` now also
+visits `Expr::Binary` and calls `note` on the left operand for any of the ten assignment
+operators, leaving an ordinary binary expression (`x.field + 1`, which reads and rewrites
+nothing) untouched.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
