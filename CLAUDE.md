@@ -3250,13 +3250,29 @@ one actually sitting inside the anchor. The anchor passed while showing untested
 `crate::parse::NamedFn` now carries `line`, the 1-indexed source line of the exact function
 whose attributes were just checked, read off that function's own `syn` span rather than
 re-found by a second search; `proc-macro2`'s `span-locations` feature is what makes a span
-carry a real line outside an actual proc-macro, and `book`'s position check now comes from
-the one function `fns_matching` already found rather than from a search that could name
-another one entirely.
+carry a real line outside an actual proc-macro.
+
+Codex found a sixth bug, the mirror image of the fifth, on the very next round: fixing "the
+first declaration found can be the wrong one" by taking `fns_matching`'s first match still
+takes *a* first match — of every declaration of `name` in the file, not of the ones that are
+actually candidates for *this* anchor. A plain helper `fn a_first_sample()` declared earlier
+in the file, not a test at all, made `declares_test` stop there and report "declares no
+test" for an anchor whose own content was a real, running `#[test]` — the old line scanner
+had tolerated exactly this by continuing past a same-named non-test, and the structural
+rewrite lost it. `declares_test` now takes the anchor's own line range as a third argument
+and prefers, among every candidate `fns_matching` finds, the one whose line falls inside it;
+only when none do is the first candidate taken, which is what keeps the "declared, but
+outside the anchor" report for a file with exactly one declaration. This one change closes
+both the fifth bug and the sixth by the same construction — preferring the in-anchor
+candidate answers "is the anchor's own declaration a real test" directly, rather than "does
+some declaration of this name run," which is a different question in each direction once a
+name can be declared more than once.
 
 The parametrized test grew eleven cases across the first four rounds, one or more per bug
-found, and every earlier one still passes unmodified against each fix in turn. The fifth bug
-was not a spelling any single attribute check could see — it was a mismatch between two
-different functions of one name — so `a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name`
-stands beside that parametrized test rather than inside it. No new ADR: nothing here moves a
-must-not-own cell, a dependency edge, or a rule id.
+found, and every earlier one still passes unmodified against each fix in turn. The fifth and
+sixth bugs were not spellings any single attribute check could see — they were a mismatch
+between two different functions of one name, in each direction — so
+`a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name` and
+`a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor` each stand beside
+that parametrized test rather than inside it. No new ADR: nothing here moves a must-not-own
+cell, a dependency edge, or a rule id.

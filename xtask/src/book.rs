@@ -742,13 +742,28 @@ fn anchors(sample: &str) -> Vec<Anchor> {
 /// answer about two different ones: `name` declared twice, once inside the anchor and once
 /// outside it, could pair one declaration's attributes with the other's position and wrongly
 /// vouch for either (issue #97, Codex review round 5).
-fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
-    let Some(function) = crate::parse::fns_matching(sample, name, true)
-        .into_iter()
-        .next()
-    else {
-        return Err(format!("declares no `#[test] fn {name}`"));
-    };
+///
+/// `name` can be declared more than once — in different modules, or as a method of the same
+/// name in different `impl` blocks — and which declaration is *this anchor's* is a question
+/// only `anchor` can answer, not "whichever one `syn` found first." Taking the first match
+/// unconditionally fails in both directions: it can vouch for an unrelated real test while
+/// an untested decoy sits in the anchor (round 5), and it can just as wrongly refuse an
+/// anchor whose own declaration is real and runs, because some other same-named declaration
+/// earlier in the file happens not to be a test (Codex, review round 6). A candidate whose
+/// own line falls inside `anchor` is preferred over every other candidate; only when none do
+/// is the first taken, which keeps the existing "declared, but outside the anchor" report for
+/// a file with exactly one declaration of the name.
+fn declares_test(
+    sample: &str,
+    name: &str,
+    anchor: std::ops::RangeInclusive<usize>,
+) -> Result<usize, String> {
+    let candidates = crate::parse::fns_matching(sample, name, true);
+    let function = candidates
+        .iter()
+        .find(|function| anchor.contains(&function.line.saturating_sub(1)))
+        .or_else(|| candidates.first())
+        .ok_or_else(|| format!("declares no `#[test] fn {name}`"))?;
     let at = function.line.saturating_sub(1);
     let mut tested = false;
     for attribute in &function.attrs {
@@ -1112,7 +1127,7 @@ fn check_anchor(
         return violations;
     };
 
-    let at = match declares_test(sample, anchor) {
+    let at = match declares_test(sample, anchor, declared.start..=declared.end) {
         Ok(at) => Some(at),
         Err(why) => {
             violations.push(Violation::new(
@@ -2583,6 +2598,28 @@ mod tests {
         assert!(
             fired(&check(&inputs), BOOK),
             "a real test outside the anchor vouched for an untested decoy inside it"
+        );
+    }
+
+    #[test]
+    fn a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor() {
+        // Codex, review round 6 of issue #97: the mirror image of round 5. An earlier
+        // declaration of the same name that is not a test — a plain helper `fn`, not
+        // `#[test]` — must not stop `declares_test` from finding the real, running test
+        // that is the anchor's own content. The old line scanner tolerated this because it
+        // kept scanning past a same-named non-test; `fns_matching(..).next()` alone does
+        // not, because it stops at the first declaration whatever it is.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "fn a_first_sample() {}\n\n\
+             // ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            !fired(&check(&inputs), BOOK),
+            "a real test in the anchor was refused because of an earlier non-test of the \
+             same name"
         );
     }
 
