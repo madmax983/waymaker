@@ -22,11 +22,11 @@
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
 //!   builds them too.
-//! * `facade`, `ota` and `provisioning` — the bridge to `waymaker-embassy`'s `Ctx` and
-//!   design document §06's two examples. They are the only modules that name the façade, so
-//!   removing it removes these three files and nothing else. The `without-facade` feature
-//!   deletes them, and the `drive-facadeless` pipeline stage builds that configuration for
-//!   the part.
+//!
+//! This crate names no dependency on `waymaker-embassy`, in any table. Issue
+//! [#106](https://github.com/madmax983/waymaker/issues/106):
+//! [`waymaker-facade-demo`](https://docs.rs/waymaker-facade-demo) holds the bridge to
+//! `waymaker-embassy`'s `Ctx` and design document §06's two examples, above this crate.
 //!
 //! # What this crate must not own
 //!
@@ -102,12 +102,6 @@ mod boundary;
 pub mod demo;
 mod drive;
 mod effect;
-#[cfg(not(feature = "without-facade"))]
-pub mod facade;
-#[cfg(not(feature = "without-facade"))]
-pub mod ota;
-#[cfg(not(feature = "without-facade"))]
-pub mod provisioning;
 mod workflow;
 
 pub use activity::{Activities, Clocks, Performed};
@@ -117,6 +111,4 @@ pub use effect::{
     CheckedDispatch, Dispatchable, DurableIntent, Effect, InputMismatch, Resolution, Resolved,
     Scheduled,
 };
-#[cfg(not(feature = "without-facade"))]
-pub use facade::Bridge;
 pub use workflow::{Identity, Workflow};

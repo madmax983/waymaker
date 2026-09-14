@@ -9,7 +9,7 @@
 //!
 //! `ota_update` runs on `ota::URL`, a module constant. No boot reads it back, so `Ota`'s
 //! `Workflow::identity` and the input bytes agree by accident, not by design.
-//! [`Driver::begin`](crate::Driver) checks the recorded `RunStarted` against
+//! [`Driver::begin`](waymaker_drive::Driver) checks the recorded `RunStarted` against
 //! `Workflow::identity` on every boot. [`Provisioning`] stores its run's input as a field,
 //! and [`provision`] reads that field. A caller that changes the input between boots gets
 //! `DriveError::NotThisWorkflow`, not a silent rewind.
@@ -30,14 +30,13 @@ use waymaker_core::EffectId;
 use waymaker_core::timer::TimerSpec;
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome};
+use waymaker_drive::{Boundary, Identity, Suspended, Workflow};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
 use waymaker_flash::capacity::Bounds;
 
-use crate::boundary::{Boundary, Suspended};
 use crate::facade::Bridge;
-use crate::workflow::{Identity, Workflow};
 
 /// Register this device with the fleet.
 pub const REGISTER: ActivityKind = ActivityKind(14);
@@ -230,7 +229,7 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        let ended = {
+        let (ended, suspended) = {
             let mut bridge = Bridge::over(boundary);
             let mut ctx = Ctx::new(&mut bridge, &mut self.dispatcher, &mut self.out);
             let polled = {
@@ -239,7 +238,7 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
             };
             // The recorded ending outranks the poll. See `Ota::run`: `TerminalFuture` never
             // resolves, so nothing later in this poll can have overwritten `self.out`.
-            match (ctx.conclusion(), polled) {
+            let ended = match (ctx.conclusion(), polled) {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => {
                     Some(Ended::Completed(bytes.len()))
                 }
@@ -251,10 +250,16 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
                 (Some(Conclusion::Refused), _) | (None, Poll::Pending) => None,
                 (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),
                 (None, Poll::Ready(Err(_))) => Some(Ended::Failed(0)),
-            }
+            };
+            // Read after `ctx`'s last use: the same `Suspended` the boundary returned, not
+            // a fresh one — see `facade`'s module doc.
+            (ended, bridge.take_suspended())
         };
         let Some(ended) = ended else {
-            return Err(Suspended::NEW);
+            // `suspended` is the real value whenever a boundary call produced one; a
+            // dispatcher still working produces none, so this falls back to the one
+            // `Suspended` named for that — see `Suspended::awaiting_dispatch`.
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
         };
         Ok(match ended {
             Ended::Completed(len) => Outcome::Completed(self.out.get(..len).unwrap_or_default()),

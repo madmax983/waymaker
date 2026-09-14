@@ -200,27 +200,21 @@ pub const STAGES: &[Stage] = &[
         why: "issue #28: \"no `Future`, no Embassy, no allocation\" is a build failure rather than an inspection",
     },
     Stage {
-        name: "drive-facadeless",
+        name: "facade-demo-firmware",
         job: "firmware",
-        // `waymaker-drive`'s `without-facade` feature deletes the modules that name
-        // `waymaker-embassy`, so this stage compiles the driver, design document §06's
-        // boundary, §07's typestate and the reference workflows with the façade edge gone.
+        // `waymaker-facade-demo` is issue #106's crate split: the bridge to
+        // `waymaker-embassy` and design document §06's two examples, above `waymaker-drive`
+        // rather than inside it. `waymaker-drive`'s own firmware build (the stage above) no
+        // longer touches the façade at all, so this is where `Bridge`, `poll_ota` and
+        // `poll_provisioning` are compiled for the part — replacing `drive-facadeless`,
+        // which used to build `waymaker-drive` with those three modules deleted to make the
+        // same claim from the other side.
         //
-        // A build rather than a scan. `ctx-facade` reads the modules that may not name the
-        // façade, and a scanner cannot see an import routed through `crate::facade` or a
-        // dependency renamed in a manifest; a compiler sees both. On the firmware target
-        // rather than the host, because that is where the claim is worth something.
-        //
-        // What it establishes is that no other `waymaker-drive` module *needs* the façade
-        // — not that the crate would build with `waymaker-embassy` deleted. The
-        // manifest entry is not optional, so this configuration still resolves and compiles
-        // it, and a compile error inside the façade fails this stage too. Codex round 3
-        // measured that; issue
-        // [#106](https://github.com/madmax983/waymaker/issues/106) is the crate split that
-        // would make the dependency graph say it instead.
-        command: "cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi",
+        // `--lib`, for the reason `drive-firmware` gives: the tests drive `waymaker-fault`,
+        // which models media in a `Vec`, and it is the library a board would link.
+        command: "cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi",
         in_hook: false,
-        why: "issue #35: no synchronous-driver module outside the fa\u{e7}ade edge needs the fa\u{e7}ade, as a compile rather than a text search",
+        why: "issue #106: the fa\u{e7}ade bridge and design document \u{a7}06's two examples are firmware, so a change to them is measured on the part",
     },
     Stage {
         name: "codec-firmware",
