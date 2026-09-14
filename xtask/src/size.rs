@@ -3097,10 +3097,10 @@ enum Block {
 ///
 /// # A floor, not a proof
 ///
-/// A real dependency not on the fixed list — `serde`, say — can still read as local, so a
-/// private trait of the same name can hide a live external impl. [`public_functions_reachable`]
-/// closes that gap with a real dependency graph. This function stays for a caller with no
-/// graph in hand. Issue [#141](https://github.com/madmax983/waymaker/issues/141).
+/// A real dependency, such as `serde`, may not be on the fixed list. Then a private trait
+/// can hide a live external impl of the same name. [`public_functions_reachable`] closes
+/// this gap using the real dependency graph. Use this function only when no graph is
+/// available. Issue [#141](https://github.com/madmax983/waymaker/issues/141).
 #[must_use]
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
     scan_public_functions(sources, |_crate_name| {
@@ -3400,26 +3400,28 @@ fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Optio
 /// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
 /// can still resolve to a trait this crate declares itself.
 ///
-/// Reads declared dependency names rather than resolved ones: a name in the
-/// manifest is in the extern prelude whether or not this build enabled it, and a
-/// declared name needs no matching package elsewhere in `graph`.
+/// This reads declared dependency names, not resolved ones. A manifest name enters
+/// the extern prelude even when this build does not enable it. So a declared name
+/// needs no matching package in `graph`.
 ///
-/// A dependency's crate-root spelling is its package name with every `-` swapped
-/// for `_`, the same rule cargo uses to name its own extern-prelude entry. Closes
+/// A dependency's crate-root name replaces each `-` with `_`. Cargo names its
+/// extern-prelude entries the same way. A renamed dependency (`package = "..."`)
+/// uses its local name, not its package name — the two can differ. This closes
 /// issue [#141](https://github.com/madmax983/waymaker/issues/141): a private trait
-/// can no longer hide a live impl of a trait the crate really depends on.
+/// can no longer hide a live impl of a real dependency's trait.
 fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String> {
     let mut roots: HashSet<String> = EXTERNAL_PATH_ROOTS
         .iter()
         .map(|root| (*root).to_owned())
         .collect();
     if let Some(package) = graph.find(crate_name) {
-        roots.extend(
-            package
-                .manifest_deps
-                .iter()
-                .map(|dependency| dependency.name.replace('-', "_")),
-        );
+        roots.extend(package.manifest_deps.iter().map(|dependency| {
+            dependency
+                .rename
+                .as_deref()
+                .unwrap_or(&dependency.name)
+                .replace('-', "_")
+        }));
     }
     roots
 }
@@ -7275,6 +7277,65 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(message.contains("serialize"), "{message}");
+    }
+
+    #[test]
+    fn a_hyphenated_dependency_name_is_read_as_its_underscored_root() {
+        // Cargo spells the package `embassy-time`. Rust source spells the root
+        // `embassy_time`. A private trait under the underscored name must not hide
+        // a live impl of the dependency's trait.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("embassy-time", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Timer {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl embassy_time::Timer for Bank {\n    fn now(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["now"]);
+    }
+
+    #[test]
+    fn a_renamed_dependency_is_read_by_its_local_name_not_its_package_name() {
+        // `foo = { package = "bar" }` in the manifest is `impl foo::Trait`, not
+        // `impl bar::Trait`, in source. Checking the package name instead would
+        // leave the real root unrecognized as external.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core").with_renamed_dependency(
+            "bar",
+            "foo",
+            DepKind::Normal,
+        )]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Trait {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl foo::Trait for Bank {\n    fn run(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["run"]);
     }
 
     #[test]
