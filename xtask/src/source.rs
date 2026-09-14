@@ -20466,6 +20466,37 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_matched_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { _x @ 0 => 0, _ => 100 };`
+        // nests an at-binding pattern inside the match that initializes a numbered
+        // constant. `match_arm_matches_constant`'s `Pat::Ident` case required
+        // `subpat.is_none()`, so an at-binding fell straight through its guard to the
+        // wildcard `_ => None` case and stopped the whole search — even though
+        // `pattern_literal`'s own at-binding case already answers the identical question
+        // for a numbered table's own *outer* patterns: the binding name is incidental to
+        // the value the arm matches. A second `Pat::Ident` arm now recurses into the
+        // subpattern the same way, so an at-binding inside a nested match resolves exactly
+        // as one written directly as an outer pattern already did.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_matched_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { _x @ 0 => 0, _ => 100 };\n    \
+             const P1: u8 = match 1u8 { _x @ 1 => 1, _ => 100 };\n    \
+             const P2: u8 = match 2u8 { _x @ 2 => 2, _ => 100 };\n    \
+             const P3: u8 = match 3u8 { _x @ 3 => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

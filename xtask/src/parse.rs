@@ -4124,6 +4124,17 @@ fn match_arm_matches_constant(
             (resolve.value)(&syn::Path::from(named.ident.clone()))
                 .is_none_or(|resolved| resolved == value),
         ),
+        // Codex's next-round finding: `_x @ 0 => 0, _ => 100` — an at-binding over a match
+        // this function itself is asked to evaluate — fell through the guard above (which
+        // requires `subpat.is_none()`) straight to the wildcard `_ => None` case below and
+        // stopped the whole search, even though [`pattern_literal`]'s own at-binding case
+        // already answers the identical question for a numbered table's own outer
+        // patterns: the binding name is incidental to the value the arm matches, and this
+        // recurses into the subpattern the same way.
+        syn::Pat::Ident(named) if named.by_ref.is_none() => {
+            let (_, subpat) = named.subpat.as_ref()?;
+            match_arm_matches_constant(subpat, value, resolve)
+        }
         syn::Pat::Paren(paren) => match_arm_matches_constant(&paren.pat, value, resolve),
         syn::Pat::Or(or_pattern) => {
             let mut matched = false;
