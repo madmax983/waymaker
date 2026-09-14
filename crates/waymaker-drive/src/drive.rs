@@ -506,8 +506,11 @@ struct BankFacts {
 /// whose *own* header does not fit can still be safely ignored, if the *other* bank turns
 /// out to be a fully validated, higher-generation candidate. Whether that is so is not
 /// knowable until both banks have been looked at, so this carries the undecided case as a
-/// value for [`select_bank`] to weigh rather than deciding it here.
-enum BankRead {
+/// value for [`select_bank`] to weigh rather than deciding it here. Codex round 9 found the
+/// same shape of eagerness one step earlier: a bank whose header fails to *read* at all —
+/// a device fault confined to that bank, once its seal already answered with a claimed
+/// generation — was still an immediate `Err`, for the same reason and with the same fix.
+enum BankRead<E> {
     /// A fully validated candidate, at the generation its own seal names.
     Found(BankFacts),
     /// Not a candidate at any generation — unsealed, or a header that fails to validate for
@@ -522,6 +525,14 @@ enum BankRead {
     Oversized {
         claimed_generation: bank::Generation,
         needed: usize,
+    },
+    /// Genuinely sealed, at `claimed_generation`, but the device itself refused this bank's
+    /// header read — damage or a fault confined to this bank, unrelated to how large `page`
+    /// is. `error` is what a caller sees if nothing rescues the boot; a larger page cannot
+    /// fix it, so it carries forward unchanged rather than being reported as a size to grow.
+    Unreadable {
+        claimed_generation: bank::Generation,
+        error: DriveError<E>,
     },
 }
 
@@ -544,15 +555,18 @@ fn round_up_to_unit(len: usize, unit: u32) -> Option<usize> {
 ///
 /// # Errors
 ///
-/// Only a real device error, or [`RecoveryError::PageTooSmall`] when `page` cannot even hold
-/// this bank's seal — nothing about *this* bank's header ever fails to fit large enough a
-/// page to invalidate the other bank's answer, which is what [`BankRead::Oversized`] is for.
+/// Only a real device error reading this bank's *seal* — there is no claimed generation yet
+/// to weigh a seal read's own failure against — or [`RecoveryError::PageTooSmall`] when
+/// `page` cannot even hold this bank's seal. Neither this bank's header failing to fit a
+/// large enough page, nor a device error reading it once its seal has already answered,
+/// ever fails this call outright — both are [`BankRead`] values for [`select_bank`] to weigh
+/// against the other bank instead.
 fn read_bank<S, C>(
     layout: BankLayout,
     id: BankId,
     storage: &mut S,
     page: &mut [u8],
-) -> Result<BankRead, DriveError<S::Error>>
+) -> Result<BankRead<S::Error>, DriveError<S::Error>>
 where
     S: StableStorage,
     C: IntegrityCheck,
@@ -602,9 +616,17 @@ where
         // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
         return Ok(BankRead::Absent);
     };
-    storage
-        .read(region.base(), header_buf)
-        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    // Codex found that a device error here — damage or a fault confined to this bank's
+    // header, with its seal already read and validated above — was still an immediate
+    // `Err`, aborting the whole boot before the other bank could be looked at. This bank's
+    // claimed generation is already in hand, so the same deferral `BankRead::Oversized`
+    // gives a header that fails to *decode* applies here to one that fails to *read* at all.
+    if let Err(error) = storage.read(region.base(), header_buf) {
+        return Ok(BankRead::Unreadable {
+            claimed_generation: seal.generation,
+            error: DriveError::Recovery(RecoveryError::Storage(error)),
+        });
+    }
     // A header whose self-declared length reaches past what fit in `page` — as opposed to
     // one this bank's own layout could never have held either, which `seal_for_with` below
     // still catches on its own — is not refused outright here any more than treated as "not
@@ -682,12 +704,43 @@ where
     }))
 }
 
+/// The error a bank not fully validated would answer with alone: [`BankRead::Oversized`]'s
+/// own [`RecoveryError::PageTooSmall`], or [`BankRead::Unreadable`]'s own device error
+/// unchanged. [`BankRead::Found`] and [`BankRead::Absent`] need no such reduction, since
+/// [`resolve_bank_read`] never reaches for this once either bank is one of those two.
+fn undecided_error<E>(needed_or_error: Result<usize, DriveError<E>>) -> DriveError<E> {
+    match needed_or_error {
+        Ok(needed) => DriveError::Recovery(RecoveryError::PageTooSmall { needed }),
+        Err(error) => error,
+    }
+}
+
+/// Between two banks that are each undecidable — too large for `page`, or a device error
+/// reading their header — the one whose seal claimed the *higher* generation is the one
+/// worth reporting: if it turns out genuine once given whatever it is missing, the guarded
+/// arms of [`resolve_bank_read`] already say the other bank's own answer never matters
+/// again. Codex found that reporting whichever bank needed *more* room, or an error from
+/// whichever bank happened to be checked first, could point a caller at a retired bank's
+/// own stale trouble instead of the real authority's.
+fn higher_claim<E>(
+    generation_a: bank::Generation,
+    error_a: Result<usize, DriveError<E>>,
+    generation_b: bank::Generation,
+    error_b: Result<usize, DriveError<E>>,
+) -> DriveError<E> {
+    if generation_a >= generation_b {
+        undecided_error(error_a)
+    } else {
+        undecided_error(error_b)
+    }
+}
+
 /// Weighs what [`read_bank`] learned about both banks into design document §10's selection
 /// rule.
 ///
-/// Split out of [`select_bank`] so each of the six shapes two [`BankRead`]s can take is a
+/// Split out of [`select_bank`] so each of the shapes two [`BankRead`]s can take is a
 /// `match` arm rather than a nest of conditionals — see this function's own tests.
-fn resolve_bank_read<E>(a: BankRead, b: BankRead) -> Result<BankFacts, DriveError<E>> {
+fn resolve_bank_read<E>(a: BankRead<E>, b: BankRead<E>) -> Result<BankFacts, DriveError<E>> {
     match (a, b) {
         (BankRead::Found(a), BankRead::Found(b)) => {
             match bank::select([Some(a.generation), Some(b.generation)]) {
@@ -703,14 +756,25 @@ fn resolve_bank_read<E>(a: BankRead, b: BankRead) -> Result<BankFacts, DriveErro
             Ok(facts)
         }
         (BankRead::Absent, BankRead::Absent) => Err(DriveError::NoAuthoritativeBank),
+        // A fully validated bank against one this call could not decide, for either reason
+        // `BankRead` has: too large for `page`, or a device error reading its header. Codex
+        // round 9 found the second case was still an eager `Err` — a header that fails to
+        // *read* is exactly as safe to ignore as one that fails to *decode*, once the other
+        // bank fully validates at a strictly higher generation.
         (
             BankRead::Found(facts),
             BankRead::Oversized {
+                claimed_generation, ..
+            }
+            | BankRead::Unreadable {
                 claimed_generation, ..
             },
         )
         | (
             BankRead::Oversized {
+                claimed_generation, ..
+            }
+            | BankRead::Unreadable {
                 claimed_generation, ..
             },
             BankRead::Found(facts),
@@ -724,22 +788,57 @@ fn resolve_bank_read<E>(a: BankRead, b: BankRead) -> Result<BankFacts, DriveErro
                 claimed_generation: generation_b,
                 needed: needed_b,
             },
-        ) => {
-            // The higher claimed generation is the one worth asking a caller for room to
-            // validate: if it turns out genuine, the guarded arm above says the other
-            // bank's own requirement never matters again. Codex found that reporting
-            // whichever bank needed *more* room — the larger of the two, regardless of
-            // which one that was — could ask a caller for room a retired bank's own stale,
-            // oversized header needed and the real authority never did.
-            let needed = if generation_a >= generation_b {
-                needed_a
-            } else {
-                needed_b
-            };
-            Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
-        }
+        ) => Err(higher_claim(
+            generation_a,
+            Ok(needed_a),
+            generation_b,
+            Ok(needed_b),
+        )),
+        (
+            BankRead::Unreadable {
+                claimed_generation: generation_a,
+                error: error_a,
+            },
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error: error_b,
+            },
+        ) => Err(higher_claim(
+            generation_a,
+            Err(error_a),
+            generation_b,
+            Err(error_b),
+        )),
+        (
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed,
+            },
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error,
+            },
+        )
+        | (
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error,
+            },
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed,
+            },
+        ) => Err(higher_claim(
+            generation_a,
+            Ok(needed),
+            generation_b,
+            Err(error),
+        )),
         (BankRead::Oversized { needed, .. }, _) | (_, BankRead::Oversized { needed, .. }) => {
             Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
+        }
+        (BankRead::Unreadable { error, .. }, _) | (_, BankRead::Unreadable { error, .. }) => {
+            Err(error)
         }
     }
 }

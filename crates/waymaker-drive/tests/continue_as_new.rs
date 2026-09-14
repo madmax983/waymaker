@@ -1682,3 +1682,91 @@ fn a_reserve_priced_for_another_layout_is_refused_before_the_swap_touches_anythi
     let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
     assert_eq!(a_run, RUN);
 }
+
+/// Fails every read of one bank's own header base offset; every other read — that same
+/// bank's own seal included — reaches the real device unchanged.
+///
+/// Stands in for a genuine device fault confined to one bank's header — an ECC failure,
+/// say — once that bank's own seal has already answered with a claimed generation. That is
+/// exactly the shape `BankRead::Oversized` already handles for a header that fails to
+/// *decode*; this is the same defect for a header that fails to *read* at all.
+struct HeaderReadFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for HeaderReadFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset == region.base() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_stale_banks_unreadable_header_never_blocks_the_intact_authoritative_bank() {
+    // Codex found this on round 9, in the same shape round 5's oversized-header finding was:
+    // bank A's *seal* reads and validates fine — that is what supplies its claimed
+    // generation — but a device fault confined to its header (an ECC failure, say) makes
+    // that one read fail outright. Bank B is one generation higher and fully readable, so
+    // the boot must succeed on it exactly as if bank A's header damage did not exist,
+    // rather than aborting the whole boot over damage confined to a bank it does not need.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut storage = HeaderReadFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "the intact, higher-generation bank must boot even though the retired bank's header \
+         cannot be read at all: {progress:?}"
+    );
+
+    // Bank A's header was never touched by the driver's own writes — only read, and that
+    // read failed — so it still reads back exactly as installed, once the injected fault is
+    // out of the way.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
