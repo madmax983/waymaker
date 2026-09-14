@@ -196,6 +196,20 @@ impl Package {
         self
     }
 
+    /// Adds a declared dependency with no matching resolved edge — the shape an *optional*
+    /// dependency takes in real `cargo metadata` output when nothing enables its feature:
+    /// `packages[].dependencies` still names it, but `resolve.nodes[].deps` does not, so
+    /// [`PackageGraph::transitive_dependencies`] and
+    /// [`PackageGraph::normal_transitive_dependencies`] cannot walk through it.
+    #[must_use]
+    pub fn with_manifest_only_dependency(mut self, name: &str, kind: DepKind) -> Self {
+        self.manifest_deps.push(ManifestDep {
+            name: name.to_owned(),
+            kind,
+        });
+        self
+    }
+
     /// Adds a resolved edge to package id `id`, in the given table — for a test that needs
     /// to name the specific id an edge resolved to, as when two packages share a name.
     #[must_use]
@@ -833,18 +847,28 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
 /// about what its source happens to import today. The edge belongs in `waymaker-facade-demo`,
 /// one crate above.
 ///
-/// Two checks, because one kind of edge must stop at the root and the other must not.
-/// Direct declarations are checked in every table, including `[dev-dependencies]` and
-/// `[build-dependencies]`: naming the façade there is still naming it. But the *walk* below
-/// that follows only `[dependencies]` edges, at every hop — `waymaker-drive` dev-depends on
-/// `waymaker-rig`, and `waymaker-rig` normal-depends on `waymaker-embassy` for the
-/// `PersistentClock` two board clocks implement (issue #34, ADR 0031), a legitimate edge
-/// that predates and is unrelated to this one. Walking every kind at every hop would flag
-/// that dev-only test dependency as though it were the façade edge; walking no kind past the
-/// root would miss `waymaker-drive` gaining a normal dependency on some *other* crate that
-/// itself normal-depends on the façade, which is exactly the edge the firmware library build
-/// would link. [`PackageGraph::normal_transitive_dependencies`] is the walk that stops at
-/// the first table and not the other two, at every hop rather than only the first.
+/// Two checks, and both run over every direct declaration rather than splitting the tables
+/// between them, because an *optional* normal dependency is invisible to one of them.
+/// `waymaker-drive` dev-depends on `waymaker-rig`, and `waymaker-rig` normal-depends on
+/// `waymaker-embassy` for the `PersistentClock` two board clocks implement (issue #34, ADR
+/// 0031), a legitimate edge that predates and is unrelated to this one — which is why the
+/// walk below follows only `[dependencies]` edges, at every hop, rather than every kind: that
+/// stops it misreading the dev-only test dependency as the façade edge, while still catching
+/// `waymaker-drive` gaining a normal dependency on some *other* crate that itself
+/// normal-depends on the façade.
+///
+/// But a manifest can declare `facade = { package = "waymaker-embassy", optional = true }`
+/// with no feature enabling it, and `cargo metadata` then omits the edge from
+/// `resolve.nodes[].deps` entirely — an unresolved optional dependency is not part of the
+/// resolved graph [`PackageGraph::normal_transitive_dependencies`] walks, so the walk cannot
+/// see it. It is still in `packages[].dependencies`, though, which is why the direct check
+/// below reads every manifest declaration regardless of kind rather than only the non-Normal
+/// ones: a Normal, optional, disabled dependency is exactly the case the walk is structurally
+/// blind to, and skipping it here on the assumption the walk would catch it left the gate
+/// passing for a declaration that named the façade in plain text. Reporting both checks over
+/// the full manifest can now double a finding when the same crate is both declared directly
+/// and reached through the walk (an enabled optional dependency is both), so each crate name
+/// is reported at most once.
 ///
 /// `waymaker-drive` is not in [`LAYERS`], so [`check_embassy_stays_above_flash`] does not
 /// reach it; this is that check's cousin, narrowed to the one test-support crate issue #106
@@ -857,14 +881,12 @@ pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
         return Vec::new();
     };
 
-    let mut violations: Vec<Violation> = package
-        .manifest_deps
-        .iter()
-        // `Normal` edges are the walk's below; checking them again here would double the
-        // same finding under one name.
-        .filter(|dep| dep.kind != DepKind::Normal && policy::is_embassy_package(&dep.name))
-        .map(|dep| {
-            Violation::new(
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for dep in &package.manifest_deps {
+        if policy::is_embassy_package(&dep.name) && reported.insert(dep.name.clone()) {
+            violations.push(Violation::new(
                 "ctx-facade",
                 DRIVER,
                 format!(
@@ -872,12 +894,12 @@ pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
                      waymaker-facade-demo, above this crate",
                     dep.name, dep.kind
                 ),
-            )
-        })
-        .collect();
+            ));
+        }
+    }
 
     for reached in graph.normal_transitive_dependencies(DRIVER) {
-        if policy::is_embassy_package(&reached) {
+        if policy::is_embassy_package(&reached) && reported.insert(reached.clone()) {
             violations.push(Violation::new(
                 "ctx-facade",
                 DRIVER,
@@ -1363,6 +1385,66 @@ mod tests {
                 .with_dependency("waymaker-flash", DepKind::Normal),
         ]);
         assert!(check_driver_reaches_no_embassy(&graph).is_empty());
+    }
+
+    #[test]
+    fn a_disabled_optional_normal_dependency_on_embassy_is_still_caught() {
+        // Codex's third follow-up: `facade = { package = "waymaker-embassy", optional =
+        // true }` with nothing enabling the feature stays in `packages[].dependencies` but
+        // drops out of `resolve.nodes[].deps` entirely, so the walk cannot see it. The old
+        // direct check filtered out every `Normal`-kind declaration on the assumption the
+        // walk would catch it, which left exactly this case unreported by either half.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_manifest_only_dependency("waymaker-embassy", DepKind::Normal),
+        ]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "a disabled optional normal dependency on the fa\u{e7}ade must still be caught: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_optional_dependency_on_embassy_is_reported_once() {
+        // The other half of the same fix: once a `Normal`-kind declaration is checked
+        // directly rather than skipped, an *enabled* optional dependency is both a direct
+        // declaration and a resolved edge the walk reaches — the same crate must not be
+        // reported twice under one rule id.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        let embassy_violation_count = violations
+            .iter()
+            .filter(|violation| violation.detail.contains("waymaker-embassy"))
+            .count();
+        assert_eq!(
+            embassy_violation_count, 1,
+            "one crate reached both directly and through the walk must be reported once: \
+             {violations:?}"
+        );
     }
 
     #[test]

@@ -194,6 +194,16 @@ still working answers `Poll::Pending` with nothing recorded, and `Suspended::awa
 is the value named for that case, `pub` rather than `pub(crate)` because both examples need
 it and neither can be granted the wider privilege `Suspended::NEW` still keeps.
 
+**The direct-declaration check had a gap of its own.** It had skipped every `Normal`-kind
+manifest entry on the assumption that the walk below it would catch any real one, but an
+*optional* normal dependency the workspace never enables — `facade = { package =
+"waymaker-embassy", optional = true }` with no feature turning it on — stays in `cargo
+metadata`'s `packages[].dependencies` and drops out of `resolve.nodes[].deps` entirely, so
+neither half saw it: Codex's review found the fifth gap in this half. The direct check now
+reads every declared dependency regardless of kind, and since an *enabled* optional
+dependency is then caught by both the direct check and the walk, the two findings are
+deduplicated by crate name before they are reported.
+
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
 caller's, so §04's runtime-RAM statics gate does not move, but a device running the façade
