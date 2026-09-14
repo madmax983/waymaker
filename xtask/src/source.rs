@@ -17757,6 +17757,67 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_initialized_by_a_match_with_a_cfg_test_arm_is_reported() {
+        // Codex's forty-eighth-round finding: `evaluate_match` read every arm of a
+        // constant-valued initializer regardless of its own `#[cfg(test)]`, unlike
+        // `visit_expr_match`'s own scan of a top-level match, which has filtered such an
+        // arm out since round forty-six. Each `const P0` here is initialized by
+        // `match true { #[cfg(test)] true => 99, true => 0, false => 200 }`: a test build
+        // never reaches the first arm at all, and the real, shipped value is `0` — but an
+        // unfiltered scan matches the `#[cfg(test)]` arm first (its pattern is `true`,
+        // identical to the production arm's own), resolving `P0` to the sparse, test-only
+        // `99` instead. Filtering the arm the same way `visit_expr_match` already does
+        // makes `P0` through `P3` resolve to `0..3`, the dense sequence the outer match's
+        // patterns actually are in the shipped binary.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst fn cfg_test_arm_initializer_table(nibble: u8) -> u32 {\n");
+        source.push_str("    const P0: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 99,\n        true => 0,\n        false => 200,\n    };\n");
+        source.push_str("    const P1: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 199,\n        true => 1,\n        false => 201,\n    };\n");
+        source.push_str("    const P2: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 299,\n        true => 2,\n        false => 202,\n    };\n");
+        source.push_str("    const P3: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 399,\n        true => 3,\n        false => 203,\n    };\n");
+        source.push_str("    match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_nested_inside_an_if_chain_condition_is_reported() {
+        // Codex's forty-eighth-round finding: a recognised `if`/`else if` chain's manual
+        // traversal visited only each link's *body*, never its *condition* — so a dense
+        // match embedded inside a condition, as in `(match nibble & 3 { .. }) == 0`, was
+        // never handed to `self.visit_expr` and so never reached `visit_expr_match` at
+        // all. The outer chain here is not itself dense (two numbered arms and an else,
+        // one short of `MINIMUM_DENSE_TABLE_ARMS`), so the only violation this source can
+        // produce is the nested match inside its own two conditions — which is identical
+        // text in both, keeping the chain's scrutinee consistent the way
+        // `extract_if_chain` requires, and is exactly what visiting each condition finds.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn condition_nested_table(nibble: u8) -> u32 {\n    \
+             if (match nibble & 3 {\n        0 => 10,\n        1 => 11,\n        2 => \
+             12,\n        _ => 13,\n    }) == 0 {\n        0\n    } else if (match nibble \
+             & 3 {\n        0 => 10,\n        1 => 11,\n        2 => 12,\n        _ => \
+             13,\n    }) == 1 {\n        1\n    } else {\n        2\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

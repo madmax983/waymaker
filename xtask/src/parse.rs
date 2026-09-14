@@ -2681,12 +2681,24 @@ fn literal_or_const_value(
 /// `None` the moment a guard appears, a pattern's own match-or-not cannot be determined,
 /// or no arm matches at all — every one of those means guessing which arm `rustc` would
 /// have chosen, which this scan does not do.
+///
+/// Codex's forty-eighth-round finding: an arm can carry its own `#[cfg(test)]`, the same
+/// way a `match` [`MatchVisitor::visit_expr_match`] scans directly can, and `rustc` strips
+/// such an arm from a production build. This function had read every arm regardless, so a
+/// constant initialized by a match whose *production* arms are dense and whose *test-only*
+/// arms are not — or the reverse — could be resolved to a value only a test build would
+/// produce, feeding a wrong constant into the density check the same
+/// [`has_cfg_test`]-filtered exclusion already protects `visit_expr_match` itself from.
 fn evaluate_match(
     expr_match: &syn::ExprMatch,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
 ) -> Option<i128> {
     let scrutinee = literal_or_const_value(&expr_match.expr, resolve)?;
-    for arm in &expr_match.arms {
+    for arm in expr_match
+        .arms
+        .iter()
+        .filter(|arm| !has_cfg_test(&arm.attrs))
+    {
         if arm.guard.is_some() {
             return None;
         }
@@ -4336,6 +4348,15 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     // == literal`) falls through to the ordinary default walk, which is what lets a
     // genuine chain nested inside an unrelated `if`'s own branches still be reached on its
     // own later visit.
+    //
+    // Codex's forty-eighth-round finding: the manual traversal visited only branch
+    // *bodies*, so a condition itself — `consume(match x { 0 => A, .. }) == 0` is still an
+    // `Expr::Binary` this function reads as `scrutinee == literal`, but the `match` buried
+    // inside `consume(..)`'s argument is a separate, nested dense-match shape of its own —
+    // was never handed to `self.visit_expr` and so never reached this visitor at all. Every
+    // link's condition is now visited by hand too, the same way every link's body already
+    // was, so a construct nested inside a condition is found exactly as one nested inside a
+    // body already is.
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
         let ctx = ResolutionContext {
             scopes: &self.scopes,
@@ -4350,11 +4371,13 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let resolve = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         if let Some((selector, arms)) = extract_if_chain(node, &resolve) {
             self.found.push(FoundMatch { selector, arms });
+            self.visit_expr(&node.cond);
             self.visit_block(&node.then_branch);
             let mut current = node;
             while let Some((_, else_expr)) = &current.else_branch {
                 match else_expr.as_ref() {
                     syn::Expr::If(next_if) => {
+                        self.visit_expr(&next_if.cond);
                         self.visit_block(&next_if.then_branch);
                         current = next_if;
                     }
