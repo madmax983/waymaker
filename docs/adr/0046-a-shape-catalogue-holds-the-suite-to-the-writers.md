@@ -41,7 +41,7 @@ the way `STORAGE_CONTRACT_CLAUSES` transcribes design document §12 rather than 
 
 | Shape | Issued by |
 | --- | --- |
-| `program-single-unit` | the commit seal in `append::Journal::commit` and `swap::Staged::commit` |
+| `program-single-unit` | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
 | `program-multi-unit` | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
 | `erase-single-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
 | `erase-multi-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks |

@@ -37,7 +37,7 @@ pub const SHAPES: &[Shape] = &[
     Shape {
         id: "program-single-unit",
         sentence: "A program of exactly one program unit.",
-        issued_by: "the commit seal in `append::Journal::commit` and `swap::Staged::commit`",
+        issued_by: "the commit seal in `append::Sealable::commit` and `swap::Sealable::commit`",
     },
     Shape {
         id: "program-multi-unit",

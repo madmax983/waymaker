@@ -234,7 +234,7 @@ All 6 storage shapes, with the id to cite when a change touches one:
 
 | Id | Sentence | Issued by |
 | --- | --- | --- |
-| `program-single-unit` | A program of exactly one program unit. | the commit seal in `append::Journal::commit` and `swap::Staged::commit` |
+| `program-single-unit` | A program of exactly one program unit. | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
 | `program-multi-unit` | A program of more than one program unit in one call. | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
 | `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
 | `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks |
@@ -1031,6 +1031,13 @@ Stated so that nobody mistakes silence for coverage:
   pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
   in a sibling module adds a method to every port's type with the rule silent, the same way
   `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **That a shape's `issued_by` names the function that really issues it.** `storage-shapes`
+  compares the sentence and the issuer *text* across the four places the table lives, the
+  same as `storage-conformance` does for a clause's discharge — it does not resolve
+  `append::Sealable::commit` against the crate and check that such a function exists. A row
+  transcribed against the wrong type — a program attributed to `Journal::commit` when the
+  method is `Sealable::commit`'s — reads and checks the same as a correct one; review of this
+  section is what catches it.
 - **Crash points of operations that exist only after an injected failure.** `injections` is
   computed from the *fault-free* write sequence, so a retry a writer performs only because a
   call failed has no crash points of its own — it is never torn, interrupted or power-lost
