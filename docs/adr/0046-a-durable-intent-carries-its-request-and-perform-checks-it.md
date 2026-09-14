@@ -201,6 +201,16 @@ visits `Expr::Binary` and calls `note` on the left operand for any of the ten as
 operators, leaving an ordinary binary expression (`x.field + 1`, which reads and rewrites
 nothing) untouched.
 
+**A twelfth round found a gap in the eleventh's own review, not its fix: destructuring
+assignment.** `(dispatch.bytes,) = (replacement,);` is still an `Expr::Assign` — `note` is
+still called on its left side — but that left side is `Expr::Tuple`, not `Expr::Field`, and
+`note`'s chain walk starts by checking for `Expr::Field` and does nothing at all otherwise.
+A field buried inside a tuple, array or struct-literal destructuring target was invisible
+the same way a compound-assignment target had been. `note` now recurses into each element
+of a tuple or array and each field's value in a struct literal — arbitrarily nested, since a
+tuple can hold another tuple — before falling back to the field-chain walk, so
+`(x, (dispatch.bytes,)) = (x, (replacement,));` is still caught two levels down.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

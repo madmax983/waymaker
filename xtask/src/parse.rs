@@ -678,28 +678,76 @@ fn collect_future_implementors(
     }
 }
 
+/// Whether `op` rewrites its left operand in place: one of the ten compound-assignment
+/// operators (`+=`, `^=`, and the rest), each of which `syn` parses as a `BinOp` on an
+/// `Expr::Binary` rather than as an `Expr::Assign` — `ExprAssign` is `=` alone.
+const fn is_compound_assign(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
+}
+
+/// Whether `pat`, or any sub-pattern it contains, binds by `ref mut`.
+///
+/// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
+/// [`syn::Pat`] variant, so a `ref mut` nested inside a struct, tuple, tuple-struct,
+/// slice or paren pattern is found the same way regardless of how deep it sits — the
+/// traversal is `syn`'s own, only the question asked at each identifier is new.
+fn pattern_binds_ref_mut(pat: &syn::Pat) -> bool {
+    struct RefMutBinding(bool);
+
+    impl<'ast> syn::visit::Visit<'ast> for RefMutBinding {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            if node.by_ref.is_some() && node.mutability.is_some() {
+                self.0 = true;
+            }
+            syn::visit::visit_pat_ident(self, node);
+        }
+    }
+
+    let mut visitor = RefMutBinding(false);
+    visitor.visit_pat(pat);
+    visitor.0
+}
+
 /// Every name in `names` that `contents` writes to as a struct field, outside
-/// `#[cfg(test)]` — in any of the five ways a field's value can be rewritten in place
+/// `#[cfg(test)]` — in any of the six ways a field's value can be rewritten in place
 /// rather than rebuilt.
 ///
 /// A plain assignment, `x.field = value;`, is one route. A compound assignment —
 /// `x.field += value;`, and the other nine arithmetic and bitwise operators with their own
 /// `=` — is a second, and a separate one from `syn`'s own point of view: every
 /// compound-assignment operator parses as a `BinOp` on an `Expr::Binary`, never as
-/// `Expr::Assign`, which is `=` alone. A `&mut` reference taken to the field is the third —
+/// `Expr::Assign`, which is `=` alone. A *destructuring* assignment is a third, and a
+/// different kind of gap: `(x.field,) = (value,);` is still an `Expr::Assign`, but its left
+/// side is a tuple, an array or a struct literal of places rather than a bare field access,
+/// so a field buried inside one is invisible to a walk that only recognises `Expr::Field` at
+/// the top. Recursing into each element of a tuple or array, and each field's value in a
+/// struct literal, is what finds it — arbitrarily nested, since a tuple can hold another
+/// tuple. A `&mut` reference taken to the field is the fourth —
 /// `std::mem::swap(&mut x.field, &mut y.field)`, `std::mem::replace(&mut x.field, value)`,
 /// and passing the reference to an arbitrary function that takes `&mut T` are all routes to
 /// the same rewrite that spell no `=` at all, and every one of them needs a `&mut` to the
-/// field first, which is the shape this refuses. A *method* call on the field is the fourth,
+/// field first, which is the shape this refuses. A *method* call on the field is the fifth,
 /// and the one that needs neither: `x.field.
 /// clone_from(&other)` autorefs `&mut x.field` implicitly, with no `&mut` token written
 /// anywhere — so every method call on a guarded field is refused outright, since telling a
 /// mutating method from a read-only one needs type inference `syn` does not have. A method
 /// called on the whole *value* (`x.field()`, an accessor) is unaffected: its receiver is a
-/// plain path, not a field access. A `ref mut` binding in a struct pattern is the fifth:
+/// plain path, not a field access. A `ref mut` binding in a struct pattern is the sixth:
 /// `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the pattern
 /// itself, with no assignment, no `&mut` expression and no method call anywhere for the
-/// other four routes to see. A field bound `mut slot` with no `ref` is not this: it moves
+/// other five routes to see. A field bound `mut slot` with no `ref` is not this: it moves
 /// or copies the value into a fresh local, which is a read, and rebuilding `x` from that
 /// local afterward is a struct literal the construction pins already cover.
 ///
@@ -714,29 +762,6 @@ fn collect_future_implementors(
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>, syn::Error> {
-    /// Whether `pat`, or any sub-pattern it contains, binds by `ref mut`.
-    ///
-    /// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
-    /// [`syn::Pat`] variant, so a `ref mut` nested inside a struct, tuple, tuple-struct,
-    /// slice or paren pattern is found the same way regardless of how deep it sits — the
-    /// traversal is `syn`'s own, only the question asked at each identifier is new.
-    fn pattern_binds_ref_mut(pat: &syn::Pat) -> bool {
-        struct RefMutBinding(bool);
-
-        impl<'ast> syn::visit::Visit<'ast> for RefMutBinding {
-            fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
-                if node.by_ref.is_some() && node.mutability.is_some() {
-                    self.0 = true;
-                }
-                syn::visit::visit_pat_ident(self, node);
-            }
-        }
-
-        let mut visitor = RefMutBinding(false);
-        visitor.visit_pat(pat);
-        visitor.0
-    }
-
     struct Mutations<'a> {
         names: &'a [&'a str],
         found: Vec<String>,
@@ -744,21 +769,47 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
 
     impl Mutations<'_> {
         fn note(&mut self, expr: &syn::Expr) {
-            // Walks the whole chain of field accesses, not only the outermost one:
-            // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent` and
-            // `request` are guarded *ancestors* in the same chain, and rewriting through
-            // either is the rewrite this whole family of checks exists to catch (issue #92,
-            // Codex's tenth round). Stops at the first non-field expression, which is the
-            // root the chain is built on.
-            let mut current = expr;
-            while let syn::Expr::Field(field) = current {
-                if let syn::Member::Named(ident) = &field.member {
-                    let name = ident_name(ident);
-                    if self.names.contains(&name.as_str()) {
-                        self.found.push(name);
+            match expr {
+                syn::Expr::Field(_) => {
+                    // Walks the whole chain of field accesses, not only the outermost one:
+                    // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent`
+                    // and `request` are guarded *ancestors* in the same chain, and rewriting
+                    // through either is the rewrite this whole family of checks exists to
+                    // catch (issue #92, Codex's tenth round). Stops at the first non-field
+                    // expression, which is the root the chain is built on.
+                    let mut current = expr;
+                    while let syn::Expr::Field(field) = current {
+                        if let syn::Member::Named(ident) = &field.member {
+                            let name = ident_name(ident);
+                            if self.names.contains(&name.as_str()) {
+                                self.found.push(name);
+                            }
+                        }
+                        current = &field.base;
                     }
                 }
-                current = &field.base;
+                // `(dispatch.bytes,) = (replacement,);` is a destructuring assignment: the
+                // left side is a tuple, array or struct literal of *places*, each of which
+                // can itself be, or contain, a guarded field chain (issue #92, Codex's
+                // eleventh round). Recursing into each element/field is what lets the
+                // ordinary `Expr::Field` case above see one nested inside.
+                syn::Expr::Tuple(tuple) => {
+                    for elem in &tuple.elems {
+                        self.note(elem);
+                    }
+                }
+                syn::Expr::Array(array) => {
+                    for elem in &array.elems {
+                        self.note(elem);
+                    }
+                }
+                syn::Expr::Struct(strukt) => {
+                    for field in &strukt.fields {
+                        self.note(&field.expr);
+                    }
+                }
+                syn::Expr::Paren(paren) => self.note(&paren.expr),
+                _ => {}
             }
         }
     }
@@ -784,24 +835,9 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
         }
 
         fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-            // `dispatch.intent.request.kind ^= 1;` rewrites `kind` in place, but `syn`
-            // parses every compound-assignment operator (`+=`, `^=`, and the rest) as a
-            // `BinOp` on an `Expr::Binary`, not as an `Expr::Assign` — `ExprAssign` is
-            // `=` alone. `visit_expr_assign` above never sees one, so a guarded field's
-            // ancestor chain could be rewritten with the gate still green.
-            if matches!(
-                node.op,
-                syn::BinOp::AddAssign(_)
-                    | syn::BinOp::SubAssign(_)
-                    | syn::BinOp::MulAssign(_)
-                    | syn::BinOp::DivAssign(_)
-                    | syn::BinOp::RemAssign(_)
-                    | syn::BinOp::BitXorAssign(_)
-                    | syn::BinOp::BitAndAssign(_)
-                    | syn::BinOp::BitOrAssign(_)
-                    | syn::BinOp::ShlAssign(_)
-                    | syn::BinOp::ShrAssign(_)
-            ) {
+            // `dispatch.intent.request.kind ^= 1;` rewrites `kind` in place, and
+            // `visit_expr_assign` above never sees it — see `is_compound_assign`.
+            if is_compound_assign(&node.op) {
                 self.note(&node.left);
             }
             syn::visit::visit_expr_binary(self, node);
@@ -2359,6 +2395,41 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_tuple_destructuring_assignment_to_a_field_is_reported() {
+        // `(dispatch.bytes,) = (replacement,);` puts the field access inside a tuple on
+        // the left of `=`, which the plain `Expr::Field` walk never enters on its own.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, replacement: Bytes) {\n\
+             \x20   (dispatch.bytes,) = (replacement,);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_struct_destructuring_assignment_to_a_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: Bytes, id: Id) {\n\
+             \x20   Foo { bytes: dispatch.bytes, id } = Foo { bytes: other, id };\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_nested_tuple_destructuring_assignment_to_a_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: Bytes, x: i32) {\n\
+             \x20   (x, (dispatch.bytes,)) = (x, (other,));\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
     }
 
     #[test]
