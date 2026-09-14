@@ -367,13 +367,30 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 }
 
 /// The identifier a further alias lookup has to match against `segments`, and what
-/// follows it — stripping a leading `self` or `crate`, because a module qualifier is not
-/// itself an aliasable name: `self::C` and `crate::C` both mean "this crate's own `C`",
-/// whether that qualifier opens a derive path directly (`#[derive(self::C)]`) or shows up
-/// partway through, in an alias's own target (`use self::C as Klon;`).
+/// follows it — stripping a leading `self`, because a module qualifier is not itself an
+/// aliasable name: `self::C` means "this module's own `C`", whether that qualifier opens
+/// a derive path directly (`#[derive(self::C)]`) or shows up partway through, in an
+/// alias's own target (`use self::C as Klon;`).
+///
+/// `crate` is deliberately *not* stripped here, unlike `self`. Found by Codex review of
+/// this change (PR #143), round 25: `self::C` really does mean "this file's own module
+/// scope", which is exactly the table every caller of this function builds — but a
+/// *bare* `crate::C` means the *crate root's* own scope, a different file this scan
+/// never reads (every function here parses one file's `contents` alone, and none of
+/// the files `recovery-surface` walks is ever the crate root). Treating the two as
+/// interchangeable let `impl crate::C for Recovery` resolve `C` against this file's own
+/// table as if `crate::` were `self::`, silently missing that the real `C` lives in
+/// `lib.rs`. `every_resolution` fails a bare, two-segment `crate::NAME` closed the same
+/// way it already fails a `super`-qualified path — but only that shape: a longer
+/// `crate::a::b::NAME` names another module's own real declaration rather than asking
+/// for an identifier lookup in a table this scan does not have, and review of the
+/// broader version found it rejecting `waymaker-embassy/src/wiring.rs`'s own `use
+/// crate::dispatch::ActivityDispatcher;` — an ordinary, unaliased import this codebase
+/// uses throughout — so that shape falls through to the plain "no matching alias, take
+/// the last segment" branch below instead, unchanged from before this round.
 fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
     match segments {
-        [first, second, tail @ ..] if first == "self" || first == "crate" => Some((second, tail)),
+        [first, second, tail @ ..] if first == "self" => Some((second, tail)),
         [first, tail @ ..] => Some((first, tail)),
         [] => None,
     }
@@ -382,11 +399,14 @@ fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
 /// Sentinel a derive-path resolution emits in place of a name it could not pin down,
 /// rather than guessing one.
 ///
-/// Two things earn it: a path (the derive path itself, or an alias reached partway
+/// Three things earn it: a path (the derive path itself, or an alias reached partway
 /// through resolving it) that opens with `super`, whose meaning depends on the *parent*
-/// module's own bindings — a file this module never reads, since every function here
-/// parses one file's `contents` alone — and a candidate this scan gave up chasing once
-/// its bound on how many it will explore was reached.
+/// module's own bindings; a *bare* two-segment `crate::NAME`, whose meaning depends on
+/// the *crate root's* own bindings (round 25) — a file this module never reads either
+/// way, since every function here parses one file's `contents` alone — and a candidate
+/// this scan gave up chasing once its bound on how many it will explore was reached. A
+/// longer `crate::a::b::NAME` is not this shape: see `lookup_candidate`'s own doc for
+/// why only the bare, two-segment form fails closed.
 ///
 /// A caller checking for one specific trait name must treat this the same as a match:
 /// "this scan could not run it down" is not evidence that it is not `Clone`, and reading
@@ -411,14 +431,14 @@ pub const UNRESOLVED_DERIVE: &str = "<unresolved derive>";
 /// that always holds, and resolving only whichever `Klon` happened to be declared first
 /// would miss it whenever that one loses the race. And a resolved target can itself need
 /// another hop — `use core::clone::Clone as C; use self::C as Klon;` needs two — which
-/// [`lookup_candidate`]'s `self`/`crate` stripping makes visible at every step, not only
-/// the first.
+/// [`lookup_candidate`]'s `self` stripping makes visible at every step, not only the
+/// first.
 ///
 /// Bounded twice over, so neither an adversarial pile of aliases nor a cycle spelled by
 /// hand (`use A as B; use B as A;` — not something real Rust name resolution could
 /// produce, but something a text file can still spell) can make this loop unbounded: at
 /// most `aliases.len()` hops, and at most `MAX_CANDIDATES` names explored in total. Both
-/// bounds, and a `super`-qualified path met at any hop, contribute
+/// bounds, a `super`-qualified path, and a bare `crate::NAME` met at any hop, contribute
 /// [`UNRESOLVED_DERIVE`] rather than the segment sequence a bound or a missing qualifier
 /// happened to stop resolution at — so nothing this scan stopped chasing early, and
 /// nothing it could never chase in the first place, is silently treated as a plain name
@@ -449,6 +469,24 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
             if current.first().is_some_and(|first| first == "super") {
                 finished.push(UNRESOLVED_DERIVE.to_owned());
                 continue;
+            }
+            // A *bare* `crate::NAME` — exactly two segments — asks to look `NAME` up
+            // in the crate root's own scope, which this scan never reads either; see
+            // `UNRESOLVED_DERIVE` and `lookup_candidate`'s own doc for why round 25
+            // added this narrowly rather than for every `crate`-qualified path. A
+            // longer `crate::a::b::NAME` is a path to another module's own
+            // declaration, not an alias lookup by a bare identifier, and review of
+            // this fix found the broad version rejecting `waymaker-embassy/src/
+            // wiring.rs`'s own `use crate::dispatch::ActivityDispatcher;` — a real,
+            // unaliased import this codebase uses throughout — so it falls through to
+            // the ordinary "no matching alias, take the last segment" branch below,
+            // exactly as any other multi-segment path this scan cannot fully resolve
+            // already does.
+            if let [first, _] = current.as_slice() {
+                if first == "crate" {
+                    finished.push(UNRESOLVED_DERIVE.to_owned());
+                    continue;
+                }
             }
             let Some((candidate, tail)) = lookup_candidate(&current) else {
                 continue;
@@ -787,47 +825,28 @@ fn collect_trait_implementors_in_item_body<'a>(
         }
         syn::Item::Impl(implementation) => {
             roots.extend(direct_blocks_in_generics(&implementation.generics));
-            for member in &implementation.items {
-                match member {
-                    syn::ImplItem::Fn(method) if !has_cfg_test(&method.attrs) => {
-                        roots.extend(direct_blocks_in_signature(&method.sig));
-                        roots.push(&method.block);
-                    }
-                    syn::ImplItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
-                        roots.extend(direct_blocks_in_expr(&constant.expr));
-                    }
-                    // Round 23: an associated type's own type can bury a block the
-                    // same way a type alias's or a struct field's can — `impl T for X
-                    // { type A = [(); { impl Clone for Recovery { .. }; 0 }]; }` —
-                    // and this member was dropped on the floor before.
-                    syn::ImplItem::Type(assoc_type) if !has_cfg_test(&assoc_type.attrs) => {
-                        roots.extend(direct_blocks_in_type(&assoc_type.ty));
-                    }
-                    _ => {}
-                }
+            // Round 25: the impl header's own trait path and self type can each bury a
+            // block through a const generic argument, exactly the way the impl's own
+            // generic declarations already could — `impl Marker<{ impl Clone for
+            // super::Recovery { .. }; 0 }> for Holder {}` reached neither before.
+            if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
+                roots.extend(direct_blocks_in_path(trait_path));
             }
+            roots.extend(direct_blocks_in_type(&implementation.self_ty));
+            roots.extend(impl_member_scope_roots(implementation));
         }
         syn::Item::Trait(trait_item) => {
             roots.extend(direct_blocks_in_generics(&trait_item.generics));
-            for member in &trait_item.items {
-                match member {
-                    syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => {
-                        roots.extend(direct_blocks_in_signature(&method.sig));
-                        if let Some(default) = method.default.as_ref() {
-                            roots.push(default);
-                        }
-                    }
-                    syn::TraitItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
-                        if let Some((_, expr)) = constant.default.as_ref() {
-                            roots.extend(direct_blocks_in_expr(expr));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            roots.extend(trait_member_scope_roots(trait_item));
         }
-        syn::Item::Const(constant) => roots.extend(direct_blocks_in_expr(&constant.expr)),
-        syn::Item::Static(statik) => roots.extend(direct_blocks_in_expr(&statik.expr)),
+        syn::Item::Const(constant) => {
+            roots.extend(direct_blocks_in_type(&constant.ty));
+            roots.extend(direct_blocks_in_expr(&constant.expr));
+        }
+        syn::Item::Static(statik) => {
+            roots.extend(direct_blocks_in_type(&statik.ty));
+            roots.extend(direct_blocks_in_expr(&statik.expr));
+        }
         syn::Item::Enum(enum_item) => {
             roots.extend(direct_blocks_in_generics(&enum_item.generics));
             for variant in enum_item
@@ -873,6 +892,62 @@ fn collect_trait_implementors_in_item_body<'a>(
     for root in roots {
         collect_trait_implementors_in_block(root, aliases, trait_name, implementors);
     }
+}
+
+/// [`collect_trait_implementors_in_item_body`]'s `Item::Impl` arm, over one `impl`
+/// block's own members — split out to keep that function under this file's own
+/// line-count lint once round 25's impl-header roots joined it.
+fn impl_member_scope_roots(implementation: &syn::ItemImpl) -> Vec<&syn::Block> {
+    let mut roots = Vec::new();
+    for member in &implementation.items {
+        match member {
+            syn::ImplItem::Fn(method) if !has_cfg_test(&method.attrs) => {
+                roots.extend(direct_blocks_in_signature(&method.sig));
+                roots.push(&method.block);
+            }
+            // Round 25: an associated const's own *declared type* can bury a
+            // block exactly the way its initializer already could — `const N:
+            // [(); { impl Clone for super::Recovery { .. }; 0 }] = [];` — and
+            // this arm read only `constant.expr`, never `constant.ty`.
+            syn::ImplItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
+                roots.extend(direct_blocks_in_type(&constant.ty));
+                roots.extend(direct_blocks_in_expr(&constant.expr));
+            }
+            // Round 23: an associated type's own type can bury a block the
+            // same way a type alias's or a struct field's can — `impl T for X
+            // { type A = [(); { impl Clone for Recovery { .. }; 0 }]; }` —
+            // and this member was dropped on the floor before.
+            syn::ImplItem::Type(assoc_type) if !has_cfg_test(&assoc_type.attrs) => {
+                roots.extend(direct_blocks_in_type(&assoc_type.ty));
+            }
+            _ => {}
+        }
+    }
+    roots
+}
+
+/// [`collect_trait_implementors_in_item_body`]'s `Item::Trait` arm, over one trait's own
+/// members — split out for the same reason [`impl_member_scope_roots`] is.
+fn trait_member_scope_roots(trait_item: &syn::ItemTrait) -> Vec<&syn::Block> {
+    let mut roots = Vec::new();
+    for member in &trait_item.items {
+        match member {
+            syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => {
+                roots.extend(direct_blocks_in_signature(&method.sig));
+                if let Some(default) = method.default.as_ref() {
+                    roots.push(default);
+                }
+            }
+            syn::TraitItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
+                roots.extend(direct_blocks_in_type(&constant.ty));
+                if let Some((_, expr)) = constant.default.as_ref() {
+                    roots.extend(direct_blocks_in_expr(expr));
+                }
+            }
+            _ => {}
+        }
+    }
+    roots
 }
 
 /// Walks one [`syn::Block`] the way real Rust scopes it: an item declared directly in
@@ -938,15 +1013,37 @@ fn collect_trait_implementors_in_block(
 /// `impl` to the block-local `Harmless` in real Rust, but appending kept the ambient
 /// `Clone` binding reachable too, so `every_resolution`'s search still found it and
 /// rejected a `Recovery` that never implements `Clone`. Every ambient alias whose local
-/// name is redeclared here is dropped before the new ones are added, so a shadowed name
-/// resolves only through its innermost declaration, the way every other alias lookup in
-/// this module already treats "the nearest binding wins" for a *single* hop — this is
-/// that same rule applied to which binding is on the table at all.
+/// name is *unconditionally* redeclared here is dropped before the new ones are added,
+/// so a shadowed name resolves only through its innermost declaration, the way every
+/// other alias lookup in this module already treats "the nearest binding wins" for a
+/// *single* hop — this is that same rule applied to which binding is on the table at
+/// all.
+///
+/// "Unconditionally" is round 25's own correction: round 24's fix dropped an ambient
+/// alias whenever *any* local declaration of the same name existed, including one
+/// behind a `#[cfg(any())]` that can never actually compile — module scope importing
+/// `use core::clone::Clone as C;`, beside a function body's `#[cfg(any())] use
+/// self::Harmless as C; impl C for Recovery { .. }`, resolves the `impl` through the
+/// *ambient* `Clone` in the only configuration that ever ships, because the `cfg`-gated
+/// local declaration never exists in it. This module does not evaluate a `cfg`'s
+/// condition (see the module doc's residual limits), so it cannot tell that `any()`
+/// never holds; the correct, fail-closed answer is to treat the shadowing itself as
+/// conditional and keep the ambient alias reachable alongside the local one, the same
+/// way [`struct_derives`] reads past an unevaluated `cfg` rather than trusting either
+/// branch alone. Only a local declaration with no `#[cfg(..)]` at all — checked with
+/// [`has_any_cfg`], not [`has_cfg_test`], since any condition leaves the ambient
+/// binding possibly still live — shadows the ambient alias it redeclares.
 fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> Vec<UseAlias> {
     let local = direct_scope_aliases(local_items.iter().copied());
+    let unconditionally_shadowed: Vec<String> = local_items
+        .iter()
+        .filter(|item| !has_cfg_test(item_attrs(item)) && !has_any_cfg(item_attrs(item)))
+        .flat_map(|item| direct_scope_aliases(std::iter::once(*item)))
+        .map(|alias| alias.local)
+        .collect();
     let mut extended: Vec<UseAlias> = ambient
         .iter()
-        .filter(|alias| !local.iter().any(|shadowing| shadowing.local == alias.local))
+        .filter(|alias| !unconditionally_shadowed.contains(&alias.local))
         .cloned()
         .collect();
     extended.extend(local);
@@ -2197,6 +2294,17 @@ fn type_items(ty: &syn::Type) -> Vec<&syn::Item> {
     visitor.items
 }
 
+/// [`block_items`], starting from a path rather than a block, an expression or a type —
+/// a path segment's own generic arguments can carry a const generic argument the same
+/// way a type's can. Round 25 of Codex review on this change (PR #143) found an impl's
+/// own trait path reaching neither scanner: `impl Marker<{ impl Clone for
+/// super::Recovery { .. }; 0 }> for Holder {}` names a trait path this walk never read.
+fn path_items(path: &syn::Path) -> Vec<&syn::Item> {
+    let mut visitor = BlockItemVisitor { items: Vec::new() };
+    visitor.visit_path(path);
+    visitor.items
+}
+
 /// [`block_items`], starting from a set of generics rather than a block, an expression
 /// or a type — a type parameter's own bounds and default, and a `where` clause
 /// predicate's bounded type and bounds, can each carry a buried block the same way a
@@ -2307,6 +2415,20 @@ fn direct_blocks_in_type(ty: &syn::Type) -> Vec<&syn::Block> {
     visitor.blocks
 }
 
+/// [`direct_blocks_in_expr`], starting from a path rather than an expression — a path
+/// segment's own generic arguments can carry a const generic argument the same way a
+/// type's can, since a type is often spelled as exactly such a path
+/// (`Wrapper<{ .. }>`). Round 25 of Codex review on this change (PR #143) found this
+/// gap in an `impl` header specifically: `impl Marker<{ impl Clone for super::Recovery
+/// { .. }; 0 }> for Holder {}` is legal Rust with `non_local_definitions` allowed, and
+/// [`collect_trait_implementors_in_item_body`]'s `Item::Impl` arm walked the impl's own
+/// generic *declarations* and its members, but never the trait path it implements.
+fn direct_blocks_in_path(path: &syn::Path) -> Vec<&syn::Block> {
+    let mut visitor = DirectChildBlockVisitor { blocks: Vec::new() };
+    visitor.visit_path(path);
+    visitor.blocks
+}
+
 /// [`direct_blocks_in_expr`], starting from a set of generics — a type parameter's own
 /// bounds and default, and a `where` clause predicate's bounded type and bounds, can
 /// each embed a block the same way a parameter or return type can.
@@ -2408,6 +2530,10 @@ fn mod_candidates(
 /// 0 }]; }` buries a non-local `impl` inside an associated type's own type exactly
 /// the way a type alias's or a struct field's type already could, and this match
 /// dropped `ImplItem::Type` on the floor instead of walking it with [`type_items`].
+/// Round 25 found the same gap one shape over: an associated const's own *declared
+/// type* — `const N: [(); { impl Clone for Recovery { .. }; 0 }] = [];` — can bury a
+/// block exactly the way its initializer already could, and this arm read only
+/// `constant.expr`, never `constant.ty`.
 fn impl_member_bodies(
     implementation: &syn::ItemImpl,
     impl_gated: bool,
@@ -2425,7 +2551,10 @@ fn impl_member_bodies(
             )),
             syn::ImplItem::Const(constant) => Some((
                 impl_gated || has_cfg_test(&constant.attrs),
-                expr_items(&constant.expr),
+                type_items(&constant.ty)
+                    .into_iter()
+                    .chain(expr_items(&constant.expr))
+                    .collect(),
             )),
             syn::ImplItem::Type(assoc_type) => Some((
                 impl_gated || has_cfg_test(&assoc_type.attrs),
@@ -2516,7 +2645,11 @@ fn enum_variant_bodies(
 ///
 /// Every declared method contributes its signature's own [`fn_signature_type_items`]
 /// regardless of whether it has a default body — round 21's finding applies just as
-/// much to a trait method with none, since the signature is parsed either way.
+/// much to a trait method with none, since the signature is parsed either way. Round 25
+/// found the same standing applies to a trait const's own *declared type*: it exists
+/// whether or not the const has a default value, exactly as a method's signature exists
+/// whether or not it has a default body, so every declared trait const contributes its
+/// type regardless.
 fn trait_member_bodies(
     trait_item: &syn::ItemTrait,
     trait_gated: bool,
@@ -2535,12 +2668,19 @@ fn trait_member_bodies(
                         .collect(),
                 ))
             }
-            syn::TraitItem::Const(constant) => constant.default.as_ref().map(|(_, expr)| {
-                (
+            syn::TraitItem::Const(constant) => {
+                let default_items = constant
+                    .default
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, expr)| expr_items(expr));
+                Some((
                     trait_gated || has_cfg_test(&constant.attrs),
-                    expr_items(expr),
-                )
-            }),
+                    type_items(&constant.ty)
+                        .into_iter()
+                        .chain(default_items)
+                        .collect(),
+                ))
+            }
             _ => None,
         })
         .collect()
@@ -2613,7 +2753,9 @@ fn collect_child_modules<'a>(
 /// predicate — can bury a `mod` the same way its members' or fields' types can, and
 /// round 24 of Codex review on this change (PR #143) found that neither this walk nor
 /// the per-member helpers below read it; each arm's own gate now covers the generics
-/// pass alongside the member-body pass.
+/// pass alongside the member-body pass. Round 25 found the same gap in an `impl`
+/// header's own trait path and self type, which can each bury a `mod` through a const
+/// generic argument the same way the impl's own generic declarations already could.
 fn nested_item_bodies_for_child_modules(
     item: &syn::Item,
     gated: bool,
@@ -2631,7 +2773,17 @@ fn nested_item_bodies_for_child_modules(
         }
         syn::Item::Impl(implementation) => {
             let impl_gated = gated || has_cfg_test(&implementation.attrs);
-            std::iter::once((impl_gated, generics_items(&implementation.generics)))
+            let header_items: Vec<&syn::Item> = generics_items(&implementation.generics)
+                .into_iter()
+                .chain(
+                    implementation
+                        .trait_
+                        .as_ref()
+                        .map_or_else(Vec::new, |(_, path, _)| path_items(path)),
+                )
+                .chain(type_items(&implementation.self_ty))
+                .collect();
+            std::iter::once((impl_gated, header_items))
                 .chain(impl_member_bodies(implementation, impl_gated))
                 .collect()
         }
@@ -2643,11 +2795,23 @@ fn nested_item_bodies_for_child_modules(
         }
         syn::Item::Const(constant) => {
             let item_gated = gated || has_cfg_test(&constant.attrs);
-            vec![(item_gated, expr_items(&constant.expr))]
+            vec![(
+                item_gated,
+                type_items(&constant.ty)
+                    .into_iter()
+                    .chain(expr_items(&constant.expr))
+                    .collect(),
+            )]
         }
         syn::Item::Static(statik) => {
             let item_gated = gated || has_cfg_test(&statik.attrs);
-            vec![(item_gated, expr_items(&statik.expr))]
+            vec![(
+                item_gated,
+                type_items(&statik.ty)
+                    .into_iter()
+                    .chain(expr_items(&statik.expr))
+                    .collect(),
+            )]
         }
         syn::Item::Enum(enum_item) => {
             let enum_gated = gated || has_cfg_test(&enum_item.attrs);

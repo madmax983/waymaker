@@ -3373,6 +3373,45 @@ rejected a `Recovery` that never implements `Clone`. The fix drops every ambient
 whose local name is redeclared in the new scope before adding the new ones, so a
 shadowed name resolves only through its innermost declaration.
 
+Round 25 found four more, one of them in round 24's own fix. The first: round 24's
+shadowing fix dropped an ambient alias whenever *any* local declaration of the same
+name existed, including one behind `#[cfg(any())]`, which never compiles — module scope
+importing `use core::clone::Clone as C;` beside a function body's `#[cfg(any())] use
+self::Harmless as C;` never actually shadows the ambient binding in the only
+configuration that ships, but the unconditional version dropped it anyway and missed
+that `impl C for Recovery` still resolves to `Clone`. Only a local declaration with no
+`#[cfg(..)]` at all (checked with `has_any_cfg`, not `has_cfg_test`) now shadows the
+ambient alias it redeclares; a conditionally-declared one is added alongside the
+ambient binding instead, keeping both candidates reachable the same way this scan
+already reads past any other unevaluated `cfg`. The second: `impl crate::C for
+Recovery` can name a crate-root `use core::clone::Clone as C;` in `lib.rs`, a file this
+per-file scan never reads, but `lookup_candidate` stripped a leading `crate` the same
+way it correctly strips a leading `self`, silently resolving `C` against *this* file's
+own table instead of failing closed. The first fix for it treated *every*
+`crate`-qualified path as unresolved, and review of that fix found it rejecting
+`waymaker-embassy/src/wiring.rs`'s own `use crate::dispatch::ActivityDispatcher;` — an
+ordinary, unaliased import this codebase uses throughout — because `ctx-facade`'s
+future-detection scan shares this same machinery. The corrected fix is narrower: only a
+*bare*, two-segment `crate::NAME` fails closed to `UNRESOLVED_DERIVE`, since that shape
+alone asks to look `NAME` up in a table this scan does not have; a longer
+`crate::a::b::NAME` is a path to another module's own real declaration and falls
+through to the ordinary "no matching alias, take the last segment" branch every other
+unresolvable multi-segment path already uses. The third: `const N: [(); { impl Clone
+for Recovery { .. }; 0 }] = [];` buries a non-local `impl` inside an associated const's
+own *declared type* exactly the way its initializer already could, and every const-like
+arm — `ImplItem::Const`, `TraitItem::Const`, `Item::Const`, `Item::Static` — walked only
+the initializer expression, never the type ascription; a trait const with no default
+value used to contribute nothing at all; now every one contributes its type regardless,
+matching how a method's signature is already read whether or not it has a default body.
+The fourth: `impl Marker<{ impl Clone for Recovery { .. }; 0 }> for Holder {}` is legal
+Rust with `non_local_definitions` allowed — the impl header's own trait path and self
+type can each bury a block through a const generic argument exactly the way the impl's
+own generic *declarations* already could, and neither was read; a new
+`direct_blocks_in_path`/`path_items` pair mirrors the existing type-walking helpers for
+this shape. `collect_trait_implementors_in_item_body`'s `Item::Impl` arm needed a split
+into `impl_member_scope_roots`/`trait_member_scope_roots` to stay under this file's own
+line-count lint once the header roots joined it.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

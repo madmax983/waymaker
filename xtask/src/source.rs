@@ -12019,6 +12019,164 @@ mod tests {
     }
 
     #[test]
+    fn a_conditionally_shadowed_ambient_alias_is_still_used_when_the_shadow_never_ships() {
+        // Found by Codex review of this change (PR #143), round 25: round 24's own fix
+        // dropped an ambient alias whenever *any* local declaration of the same name
+        // existed, including one behind `#[cfg(any())]`, which never compiles. Module
+        // scope imports `use core::clone::Clone as C;`, and a function body's
+        // `#[cfg(any())] use self::Harmless as C;` never actually shadows it in the
+        // only configuration that ships, so `impl C for Recovery` still resolves
+        // through the ambient `Clone` and must be rejected.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Harmless {}\n",
+                "use core::clone::Clone as C;\n",
+                "#[allow(non_local_definitions, dead_code)]\n",
+                "fn install() {\n",
+                "    #[cfg(any())]\n",
+                "    #[allow(unused_imports)]\n",
+                "    use self::Harmless as C;\n",
+                "    impl C for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_crate_qualified_trait_path_is_not_silently_stripped_to_a_local_name() {
+        // Found by Codex review of this change (PR #143), round 25: `impl crate::C for
+        // Recovery` can name a crate-root `use core::clone::Clone as C;` this per-file
+        // scan never reads — every function here parses one file's own contents alone,
+        // and `crate::` means the *crate root's* scope, not this file's own, unlike
+        // `self::` which correctly does mean this file's own scope. Treating `crate`
+        // as a qualifier to strip the same way `self` is resolved `crate::C` to the
+        // bare name `C` instead of failing closed the way a `super`-qualified path
+        // already does, whether or not a crate-root `C` actually exists.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl crate::CloneAlias for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_associated_consts_own_declared_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 25: `const N: [(); {
+        // impl Clone for Recovery { .. }; 0 }] = [];` buries a non-local `impl` inside
+        // an associated const's own *declared type* exactly the way its initializer
+        // already could, and this arm walked only `constant.expr`, never
+        // `constant.ty`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Marker;\n",
+                "impl Marker {\n",
+                "    const N: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }] = [];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_impl_headers_own_trait_path_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 25: `impl Marker<{
+        // impl Clone for Recovery { .. }; 0 }> for Holder {}` is legal Rust with
+        // `non_local_definitions` allowed; the inner implementation applies globally.
+        // The outer impl's own trait path can bury a block through a const generic
+        // argument exactly the way its own generic declarations already could, and
+        // this arm walked neither the trait path nor the self type.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Holder;\n",
+                "trait Marker<const N: usize> {}\n",
+                "#[allow(non_local_definitions)]\n",
+                "impl Marker<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}> for Holder {}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
