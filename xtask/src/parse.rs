@@ -193,6 +193,11 @@ pub struct UseAlias {
     pub local: String,
     /// The path it stands for, as written, e.g. `["core", "future", "Future"]`.
     pub target: Vec<String>,
+    /// Whether `target` was written `use ::a::b as c;`. A leading `::` reaches
+    /// the extern prelude directly, past every local scope on purpose — so
+    /// `target`'s first segment must never be looked up as a local alias
+    /// (Codex review, PR #160, round 8).
+    pub absolute: bool,
 }
 
 /// Every `use` binding in `contents`, file scope and inline modules alike.
@@ -224,7 +229,12 @@ fn collect_item_aliases(
             continue;
         }
         match item {
-            syn::Item::Use(use_item) => collect_tree_aliases(&use_item.tree, prefix, aliases),
+            syn::Item::Use(use_item) => collect_tree_aliases(
+                &use_item.tree,
+                use_item.leading_colon.is_some(),
+                prefix,
+                aliases,
+            ),
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_item_aliases(nested, prefix, aliases);
@@ -252,7 +262,12 @@ fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
             continue;
         }
         if let syn::Item::Use(use_item) = item {
-            collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
+            collect_tree_aliases(
+                &use_item.tree,
+                use_item.leading_colon.is_some(),
+                &mut Vec::new(),
+                &mut aliases,
+            );
         }
     }
     aliases
@@ -260,13 +275,14 @@ fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
 
 fn collect_tree_aliases(
     tree: &syn::UseTree,
+    absolute: bool,
     prefix: &mut Vec<String>,
     aliases: &mut Vec<UseAlias>,
 ) {
     match tree {
         syn::UseTree::Path(path) => {
             prefix.push(ident_name(&path.ident));
-            collect_tree_aliases(&path.tree, prefix, aliases);
+            collect_tree_aliases(&path.tree, absolute, prefix, aliases);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
@@ -275,6 +291,7 @@ fn collect_tree_aliases(
                 aliases.push(UseAlias {
                     local: ident_name(&name.ident),
                     target: [prefix.clone(), vec![ident_name(&name.ident)]].concat(),
+                    absolute,
                 });
             }
         }
@@ -282,12 +299,13 @@ fn collect_tree_aliases(
             aliases.push(UseAlias {
                 local: ident_name(&rename.rename),
                 target: [prefix.clone(), vec![ident_name(&rename.ident)]].concat(),
+                absolute,
             });
         }
         syn::UseTree::Glob(_) => {}
         syn::UseTree::Group(group) => {
             for tree in &group.items {
-                collect_tree_aliases(tree, prefix, aliases);
+                collect_tree_aliases(tree, absolute, prefix, aliases);
             }
         }
     }
@@ -420,6 +438,13 @@ fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
         let mut resolved = alias.target.clone();
         resolved.extend(segments.drain(1..));
         segments = resolved;
+        // `use ::a::b as c;` reaches the extern prelude directly, past every
+        // local scope on purpose (Codex review, PR #160, round 8): `a` is
+        // never a local alias, whatever else in this file happens to share
+        // its spelling. Stop the chain here rather than looking `a` up.
+        if alias.absolute {
+            return segments;
+        }
     }
     consume_scope_prefix(&mut segments, &mut scope);
     segments
@@ -1858,6 +1883,25 @@ mod alias_scope_tests {
             !implementors.contains(&"Innocent".to_owned()),
             "a top-level `super`-qualified path resolved through this file's own aliases, as \
              though scope 0 were the module above this file: {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_alias_target_does_not_chain_through_a_same_spelled_local_one() {
+        // Codex review, round 8: `use ::A as B;` names the external crate
+        // `A` from the extern prelude — a leading `::` reaches past every
+        // local scope on purpose. `own_aliases` had dropped that marker
+        // when recording `B`'s target, so a *separate*, local
+        // `use core::future::Future as A;` in the same file let the chain
+        // loop treat `B`'s `A` as that local alias and walk straight into
+        // `Future`, even though the two `A`s name unrelated things.
+        let code = "use core::future::Future as A;\nuse ::A as B;\nstruct Sneaky;\nimpl B for \
+             Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Sneaky".to_owned()),
+            "an absolute alias target chained through a same-spelled local alias: \
+             {implementors:?}"
         );
     }
 
