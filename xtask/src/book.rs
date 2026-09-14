@@ -25,6 +25,8 @@
 
 use core::fmt::Write as _;
 
+use syn::ext::IdentExt as _;
+
 use crate::Violation;
 use crate::docs::{Attestation, HARDWARE_TARGETS};
 use crate::wear::{PARTS, PartWear};
@@ -716,6 +718,30 @@ fn anchors(sample: &str) -> Vec<Anchor> {
     found
 }
 
+/// True if `attribute` is one of `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]`, under any
+/// legal spelling.
+///
+/// Parsed with `syn` rather than matched by prefix (issue #97 follow-up): `#[ cfg_attr(..) ]`,
+/// `#[cfg_attr (..)]` and `#[r#cfg_attr(..)]` all name the same attribute rustc does, and a
+/// prefix match on `"#[cfg_attr("` sees none of them. A line `syn` cannot parse as an
+/// attribute names nothing here — it is not one of the three, whatever it is.
+fn skips_execution(attribute: &str) -> bool {
+    use syn::parse::Parser as _;
+    let Ok(parsed) = syn::Attribute::parse_outer.parse_str(attribute) else {
+        return false;
+    };
+    let Some(attribute) = parsed.first() else {
+        return false;
+    };
+    let Some(ident) = attribute.path().get_ident() else {
+        return false;
+    };
+    matches!(
+        ident.unraw().to_string().as_str(),
+        "ignore" | "cfg" | "cfg_attr"
+    )
+}
+
 /// Where `sample` declares `#[test] fn name(`, or why it does not.
 ///
 /// The whole contiguous attribute run before the function is read, in both directions:
@@ -731,11 +757,7 @@ fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
                 run.clear();
                 continue;
             }
-            if let Some(refused) = run.iter().find(|attribute| {
-                attribute.starts_with("#[ignore")
-                    || attribute.starts_with("#[cfg(")
-                    || attribute.starts_with("#[cfg_attr(")
-            }) {
+            if let Some(refused) = run.iter().find(|attribute| skips_execution(attribute)) {
                 return Err(format!(
                     "carries `{refused}`, so the test does not run and the sample the book \
                      shows is compiled or executed by nothing"
@@ -2497,6 +2519,15 @@ mod tests {
             "#[cfg(feature = \"never\")]",
             // Issue #97: `#[cfg_attr(..)]` must skip the test the same way.
             "#[cfg_attr(all(), ignore)]",
+            // Issue #97 follow-up: a prefix match on the raw line missed a spelling with
+            // extra whitespace, or with a raw-identifier marker on the attribute name.
+            "#[ cfg_attr(all(), ignore) ]",
+            "#[cfg_attr (all(), ignore)]",
+            "#[ ignore ]",
+            "#[ cfg(any()) ]",
+            "#[r#ignore]",
+            "#[r#cfg(any())]",
+            "#[r#cfg_attr(all(), ignore)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(

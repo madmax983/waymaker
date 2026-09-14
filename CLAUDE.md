@@ -3214,8 +3214,22 @@ direct `#[ignore]` or `#[cfg(..)]`, so such a test still vouched for its row. Th
 own rewrite for issue #51 had already closed this — `crate::parse::declares_test` reads a
 test function's own attributes through `syn` and refuses `#[cfg_attr(..)]` the same way —
 but no regression test drove that specific attribute through `failure-matrix`'s own check,
-and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested gap.
-Both now do: `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` and
+and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested
+gap. Both now do: `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` and
 `a_test_that_does_not_run_is_not_a_test` each drive a `#[cfg_attr(all(), ignore)]` row test
-through the real check and require the refusal. No new ADR: nothing here moves a
-must-not-own cell, a dependency edge, or a rule id.
+through the real check and require the refusal.
+
+Review of this change found a second, real gap in `book`'s own scanner while proving the
+first one closed: it read a raw line and matched a *prefix* — `"#[cfg_attr("` — so
+`#[ cfg_attr(all(), ignore) ]`, `#[cfg_attr (all(), ignore)]` and a raw-identifier spelling,
+`#[r#cfg_attr(all(), ignore)]`, all compile, all skip, and none matched the prefix; the same
+held for `#[ignore]` and `#[cfg(..)]`. `skips_execution` now parses the collected attribute
+line with `syn::Attribute::parse_outer` and reads its path's identifier — the same `unraw`
+comparison `crate::parse::ident_is` uses — so a legal spelling rustc accepts is a spelling
+this scanner sees, whatever the whitespace or the raw marker. The positive `#[test]` match
+stays a literal string: over-refusing an unusually spelled `#[test]` is the fail-closed
+direction, and the book's own samples are written, not adversarial. Both bugs are one
+invariant — a row test that runs is the only kind allowed to vouch for its row — so the
+fix for the second rides this issue's PR rather than a second one; the parametrized test
+above grew the seven cases that prove it. No new ADR: nothing here moves a must-not-own
+cell, a dependency edge, or a rule id.
