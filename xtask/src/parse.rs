@@ -869,6 +869,69 @@ pub fn trait_impls(contents: &str) -> Result<Vec<TraitImpl>, syn::Error> {
     Ok(visitor.found)
 }
 
+/// Every macro `contents` invokes or defines, named by the path it uses, in source order.
+///
+/// Covers a `macro_rules!` definition, an item-position invocation (`foo! { ... }`), a
+/// statement- or expression-position invocation (`foo!(...)`), or one in any other
+/// position `syn` reaches. Items and `impl` members under exactly `#[cfg(test)]` are
+/// skipped, the same structural exclusion [`trait_impls`] makes.
+///
+/// Codex's finding, against the checksum module's dense-match scan: nothing in this
+/// module expands a macro, and neither does `syn` — this module's own contract says so.
+/// A macro that expands to a dense `match` or to an array is therefore invisible to
+/// [`match_expressions`] and to the textual array ban beside it, whatever it expands to,
+/// because both read the syntax a macro invocation *is* rather than the syntax it
+/// produces. This function does not try to see through one; the caller refuses every
+/// macro the checksum module's own tree names, so a table hidden behind one is a build
+/// failure rather than a gap nobody had reasoned about.
+///
+/// A single override of [`syn::visit::Visit::visit_macro`] reaches every position a
+/// macro can appear in — item, statement, expression, and a `macro_rules!` definition's
+/// own body — because each of `syn`'s per-position wrappers (`ItemMacro`, `StmtMacro`,
+/// `ExprMacro`, and so on) carries one [`syn::Macro`] and the default visit for each
+/// forwards to it.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn macro_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
+    struct Macros {
+        found: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Macros {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let segments: Vec<String> = node
+                .path
+                .segments
+                .iter()
+                .map(|segment| ident_name(&segment.ident))
+                .collect();
+            self.found.push(segments.join("::"));
+            syn::visit::visit_macro(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = Macros { found: Vec::new() };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
 /// Every name a file uses: all identifiers in source order, and all paths with `use`
 /// aliases resolved.
 ///
@@ -1518,6 +1581,7 @@ pub fn match_expressions_with_prefix(
     let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
+        use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
         qualified: external_qualified.clone(),
@@ -1585,6 +1649,7 @@ pub fn qualified_constants_with_prefix(
     }
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
+        use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
         qualified,
@@ -1634,6 +1699,30 @@ impl ConstScopes {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+}
+
+/// A stack of `use`-import scopes, mirroring [`ConstScopes`]: each level maps a name this
+/// scope's own `use` declarations bind — its own spelling, after any `as` rename — to the
+/// full path segments it names.
+///
+/// Codex's finding: `use indices::{P0, P1};` brings `indices::P0` and `indices::P1` into
+/// scope under the bare names `P0` and `P1`, and Rust resolves a pattern spelled that way
+/// exactly as if the full path had been written out — but nothing here had ever read a
+/// `use` item at all, so an imported constant used bare read as an unresolved binding.
+struct UseScopes(Vec<std::collections::HashMap<String, Vec<String>>>);
+
+impl UseScopes {
+    /// `name`'s imported target, at the innermost scope that binds it, searching outward —
+    /// the same shadowing [`ConstScopes::resolve`] gives a bare constant, and the same
+    /// approximation: a `use` is really only visible in the module that declares it, not
+    /// automatically in every module nested inside it, but this searches the whole
+    /// enclosing chain the way a bare constant reference already does here.
+    fn resolve(&self, name: &str) -> Option<&[String]> {
+        self.0
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).map(Vec::as_slice))
     }
 }
 
@@ -1689,6 +1778,79 @@ fn block_const_exprs(block: &syn::Block) -> std::collections::HashMap<String, sy
                 .then(|| (ident_name(&constant.ident), (*constant.expr).clone()))
         })
         .collect()
+}
+
+/// Every `use` declared *directly* in `items`, flattened to `(bound name, full path)`
+/// pairs — not recursing into a nested `mod` or `fn`, each of which is its own scope, the
+/// same split [`item_const_exprs`] makes for a `const`.
+fn item_use_imports(items: &[syn::Item]) -> std::collections::HashMap<String, Vec<String>> {
+    let mut bound = std::collections::HashMap::new();
+    for item in items {
+        let syn::Item::Use(use_item) = item else {
+            continue;
+        };
+        if has_cfg_test(&use_item.attrs) {
+            continue;
+        }
+        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut bound);
+    }
+    bound
+}
+
+/// Every `use` declared *directly* as a local item statement in `block` — a function
+/// body's own `use indices::P0;` — the same split [`block_const_exprs`] makes for a
+/// `const`.
+fn block_use_imports(block: &syn::Block) -> std::collections::HashMap<String, Vec<String>> {
+    let mut bound = std::collections::HashMap::new();
+    for stmt in &block.stmts {
+        let syn::Stmt::Item(syn::Item::Use(use_item)) = stmt else {
+            continue;
+        };
+        if has_cfg_test(&use_item.attrs) {
+            continue;
+        }
+        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut bound);
+    }
+    bound
+}
+
+/// Walks one `use` declaration's tree, appending every leaf it binds to `out` as
+/// `(bound name, full path segments)` — `prefix` is the path segments accumulated so far.
+///
+/// A glob (`use indices::*;`) binds nothing here: expanding it would need every name
+/// `indices` exports, which this scan only ever learns by walking the module that
+/// declares them, and it does not attempt to join the two. A constant reached only
+/// through a glob import and used bare in a pattern stays unresolved — a stated gap, the
+/// same standing a call to a user-defined `const fn` has.
+fn flatten_use_tree(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    out: &mut std::collections::HashMap<String, Vec<String>>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(ident_name(&path.ident));
+            flatten_use_tree(&path.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let bound_name = ident_name(&name.ident);
+            let mut full = prefix.clone();
+            full.push(bound_name.clone());
+            out.insert(bound_name, full);
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut full = prefix.clone();
+            full.push(ident_name(&rename.ident));
+            out.insert(ident_name(&rename.rename), full);
+        }
+        syn::UseTree::Group(group) => {
+            for member in &group.items {
+                flatten_use_tree(member, prefix, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
 }
 
 /// `own`'s constants, each resolved to an integer where its initializer allows — directly,
@@ -2138,6 +2300,78 @@ fn resolve_anchored_single_segment(
     AnchoredLookup::NotApplicable
 }
 
+/// `path`'s own value, the whole of what a [`MatchVisitor`] arm's `resolve` closure asks —
+/// factored out to a plain function, rather than left inline in the closure, so that
+/// resolving a `use`-imported bare name can recurse into this same question over the
+/// import's own target path.
+///
+/// Codex's finding: `use indices::{P0, P1};` brings `indices::P0` into scope under the
+/// bare name `P0`, and Rust resolves a pattern spelled `P0` exactly as if the full path
+/// `indices::P0` had been written out — but a bare identifier here only ever consulted
+/// `scopes` (locally declared constants), never `use_scopes`. A single-segment path now
+/// falls back to the import scope when the constant scope has nothing, and — found there —
+/// is resolved the same way any other qualified pattern is, by building a fresh
+/// [`syn::Path`] from the import's own target and asking this same question of it. The
+/// recursion terminates because a `use` target is never itself the name it was imported
+/// under (Rust rejects `use self::P0 as P0;` as importing nothing new), so it cannot loop.
+fn resolve_pattern_path(
+    path: &syn::Path,
+    scopes: &ConstScopes,
+    use_scopes: &UseScopes,
+    qualified: &std::collections::HashMap<String, u128>,
+    module_path: &[String],
+    module_scope_depths: &[usize],
+) -> Option<u128> {
+    if let Some(ident) = path.get_ident() {
+        let name = ident_name(ident);
+        if let Some(value) = scopes.resolve(&name) {
+            return Some(value);
+        }
+        let target = use_scopes.resolve(&name)?;
+        let synthetic = syn::parse_str::<syn::Path>(&target.join("::")).ok()?;
+        return resolve_pattern_path(
+            &synthetic,
+            scopes,
+            use_scopes,
+            qualified,
+            module_path,
+            module_scope_depths,
+        );
+    }
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    // `crate`/`self`/`super` followed by exactly one more segment names a plain
+    // constant declared directly in a specific ancestor, not a further-qualified
+    // `module::name` chain — `resolve_qualified_path`'s map has no entry for a
+    // constant that was never itself nested in a named module of its own. Tried
+    // before anything else strips these words, because the anchor decides *which*
+    // scope the remaining name is looked up against.
+    if let AnchoredLookup::Resolved(value) =
+        resolve_anchored_single_segment(&refs, scopes, module_path, module_scope_depths, qualified)
+    {
+        return value;
+    }
+    // A leading `crate` or `self` names no module of its own, so a path that is
+    // only that plus one more segment (`crate::P0`) is still a bare, ambiently
+    // resolved name once it is stripped — the qualified map only holds an actual
+    // module's own constants. (The anchored form above already caught this shape;
+    // reaching here means `refs` had more than one segment left after `crate`/
+    // `self`, so this is `crate::module::P0` rather than `crate::P0`.)
+    let relevant: Vec<&str> = refs
+        .iter()
+        .copied()
+        .skip_while(|segment| *segment == "crate" || *segment == "self")
+        .collect();
+    if relevant.len() == 1 {
+        return relevant.first().and_then(|name| scopes.resolve(name));
+    }
+    resolve_qualified_path(path, qualified, module_path)
+}
+
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
@@ -2158,6 +2392,7 @@ fn resolve_anchored_single_segment(
 /// return a *shadowing* constant declared at a level the anchor explicitly steps past).
 struct MatchVisitor {
     scopes: ConstScopes,
+    use_scopes: UseScopes,
     module_path: Vec<String>,
     module_scope_depths: Vec<usize>,
     qualified: std::collections::HashMap<String, u128>,
@@ -2191,9 +2426,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 .insert(format!("{}::{name}", self.module_path.join("::")), *value);
         }
         self.scopes.0.push(scope);
+        self.use_scopes.0.push(item_use_imports(items));
         self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
         self.module_scope_depths.pop();
+        self.use_scopes.0.pop();
         self.scopes.0.pop();
         self.module_path.pop();
     }
@@ -2235,55 +2472,27 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let scope = resolve_scope_consts(&block_const_exprs(node), &self.scopes);
         self.scopes.0.push(scope);
+        self.use_scopes.0.push(block_use_imports(node));
         syn::visit::visit_block(self, node);
+        self.use_scopes.0.pop();
         self.scopes.0.pop();
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
         let scopes = &self.scopes;
+        let use_scopes = &self.use_scopes;
         let qualified = &self.qualified;
         let module_path = &self.module_path;
         let module_scope_depths = &self.module_scope_depths;
         let resolve = move |path: &syn::Path| {
-            if let Some(ident) = path.get_ident() {
-                return scopes.resolve(&ident_name(ident));
-            }
-            let segments: Vec<String> = path
-                .segments
-                .iter()
-                .map(|segment| ident_name(&segment.ident))
-                .collect();
-            let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
-            // `crate`/`self`/`super` followed by exactly one more segment names a plain
-            // constant declared directly in a specific ancestor, not a further-qualified
-            // `module::name` chain — `resolve_qualified_path`'s map has no entry for a
-            // constant that was never itself nested in a named module of its own. Tried
-            // before anything else strips these words, because the anchor decides *which*
-            // scope the remaining name is looked up against.
-            if let AnchoredLookup::Resolved(value) = resolve_anchored_single_segment(
-                &refs,
+            resolve_pattern_path(
+                path,
                 scopes,
+                use_scopes,
+                qualified,
                 module_path,
                 module_scope_depths,
-                qualified,
-            ) {
-                return value;
-            }
-            // A leading `crate` or `self` names no module of its own, so a path that is
-            // only that plus one more segment (`crate::P0`) is still a bare, ambiently
-            // resolved name once it is stripped — the qualified map only holds an actual
-            // module's own constants. (The anchored form above already caught this shape;
-            // reaching here means `refs` had more than one segment left after `crate`/
-            // `self`, so this is `crate::module::P0` rather than `crate::P0`.)
-            let relevant: Vec<&str> = refs
-                .iter()
-                .copied()
-                .skip_while(|segment| *segment == "crate" || *segment == "self")
-                .collect();
-            if relevant.len() == 1 {
-                return relevant.first().and_then(|name| scopes.resolve(name));
-            }
-            resolve_qualified_path(path, qualified, module_path)
+            )
         };
         let selector = node.expr.to_token_stream().to_string();
         let arms = node

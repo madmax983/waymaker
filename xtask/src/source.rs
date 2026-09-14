@@ -8511,6 +8511,8 @@ fn check_integrity_check_module_tree(
             ));
         }
 
+        check_checksum_module_macros(scanned, &mut violations);
+
         let prefix = prefixes
             .iter()
             .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
@@ -8540,6 +8542,53 @@ fn check_integrity_check_module_tree(
     }
 
     violations
+}
+
+/// [`check_integrity_check_module_tree`]'s macro half, factored out to keep that function
+/// under clippy's line count: every macro `scanned` declares or invokes, outside
+/// `#[cfg(test)]`, pushed as a violation.
+///
+/// Codex's twenty-seventh-round finding: neither the array ban above nor
+/// [`check_checksum_module_dense_matches`] below reads what a macro expands to — `syn`
+/// does not expand one, and this module's own contract says so — so a `macro_rules!`
+/// table or a wrapper invocation that expands to a dense match is invisible to both,
+/// whatever it expands to. Rather than reasoning about what a given macro produces, every
+/// macro the tree names outside `#[cfg(test)]` is refused outright.
+fn check_checksum_module_macros(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::macro_uses(&scanned.contents) {
+        Ok(macros) => {
+            for name in macros {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} names the macro `{name}`, and neither this scan nor `syn` \
+                         expands one — a macro can expand to a dense match or to an array, \
+                         either of which would be a lookup table invisible to every check \
+                         above; the checksum module's own tree needs no macro to compute \
+                         its arithmetic, so it may declare or invoke none outside its own \
+                         tests",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for macros; an unreadable \
+                 source fails closed rather than approving what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
 }
 
 /// [`check_integrity_check_module_tree`]'s dense-match half, factored out to keep that
@@ -15718,6 +15767,122 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_reading_an_imported_constant_bare_is_reported() {
+        // Codex's twenty-seventh-round finding: `use indices::{P0, P1, P2, P3};` brings
+        // each constant into scope under its bare name, and Rust resolves a pattern
+        // spelled `P0` exactly as if `indices::P0` had been written out — but the old
+        // `resolve` closure only ever consulted locally declared constants (`ConstScopes`),
+        // never a `use` import, so a match written entirely in terms of imported bare
+        // names read every arm as an unresolved binding and the table was invisible.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices::{P0, P1, P2, P3};\n\nconst fn \
+             imported_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        \
+             _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_declared_in_the_checksum_module_is_reported() {
+        // Codex's twenty-seventh-round finding: the dense-match scan and the array ban
+        // both read the syntax a macro invocation *is*, never what it expands to — `syn`
+        // does not expand a macro, and this module's own contract says so — so a
+        // `macro_rules!` definition shaped like a lookup table is invisible to both. This
+        // fixture never even invokes the macro it defines: the point is that declaring one
+        // in the checksum module's own tree is refused outright, not that a particular
+        // expansion is caught.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmacro_rules! dense_table {\n    () => {\n        match 0_u8 & 0xF {\n            \
+             0 => 0,\n            1 => 1,\n            2 => 2,\n            3 => 3,\n            \
+             _ => 4,\n        }\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro `macro_rules`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_the_checksum_module_is_reported() {
+        // The invocation half of the same finding: a checksum module that calls a macro
+        // declared elsewhere — a helper macro imported from a sibling module, say — never
+        // declares `macro_rules!` itself, so the fixture above alone would leave every
+        // *invocation* uncovered. `env!` is a real, always-available macro so this fixture
+        // needs no companion definition to be valid Rust.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst CARGO_PKG_NAME: &str = env!(\"CARGO_PKG_NAME\");\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro `env`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn codexs_extra_table_macro_reproduction_is_reported() {
+        // Codex's own round-27 reproduction, reproduced exactly: a `macro_rules!
+        // extra_table` carrying the same five-arm mapping the existing regression tests
+        // use, invoked as `extra_table!(nibble)` — which rustc compiles into an indexed
+        // lookup table the same way ADR 0044's own pinned `crc32_nibble_table` is, and
+        // which neither `has_dense_arm_patterns` nor the array ban could ever see, because
+        // both the definition's body and the invocation's arguments are opaque token
+        // streams to `syn`. Both halves are reported (the definition once, as
+        // `macro_rules`, and the invocation once, as `extra_table`), so this only checks
+        // that at least one violation exists — the two single-purpose tests above already
+        // pin each half's own wording.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmacro_rules! extra_table {\n    ($nibble:expr) => {\n        match $nibble & \
+             0xF {\n            0 => 0,\n            1 => 1,\n            2 => 2,\n            \
+             3 => 3,\n            _ => 4,\n        }\n    };\n}\n\nconst fn \
+             uses_extra_table(nibble: u8) -> u32 {\n    extra_table!(nibble)\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_used_only_under_cfg_test_is_not_reported() {
+        // The exclusion half: `assert_eq!` and friends are how the checksum module's own
+        // tests already work (`crates/waymaker-flash/src/crc.rs`'s `#[cfg(test)] mod
+        // tests`), and a scan that refused those would fail the real workspace's own file
+        // outright rather than catching a bypass.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a_check() {\n        \
+             assert_eq!(1, 1);\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_reading_super_does_not_find_a_shadowing_child_value() {
         // Codex's twenty-second-round finding: `super::P0` was resolved with a plain,
         // unrestricted `ConstScopes::resolve`, which searches the *entire* live scope
@@ -16554,9 +16719,16 @@ mod deferred_answer_pins {
     fn a_const_fn_and_a_const_generic_are_not_lookup_tables() {
         // The real module is all `pub(crate) const fn`. A rule that read those as tables
         // would fail the workspace it is supposed to pass.
+        //
+        // This fixture used to also carry `const _: () = assert!(true);`, to prove an
+        // anonymous const's initializer is not a table either — round 27's macro ban
+        // means that line is now refused on its own terms (`assert!` is a macro, and the
+        // ban does not carve out an exception for one from the standard library, the same
+        // way the array ban carves out none for a `const` array), so the anonymous-const
+        // shape is exercised here with no macro in it instead.
         let source = format!(
             "{}pub(crate) const fn f() -> u32 {{ 0 }}\n\
-             const _: () = assert!(true);\n\
+             const _: () = ();\n\
              fn g<const N: usize>() -> usize {{ N }}\n",
             tests_support::clean_checksum_module()
         );
