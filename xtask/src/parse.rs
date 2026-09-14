@@ -911,6 +911,29 @@ fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
     visitor.0
 }
 
+/// Whether `op` is a compound-assignment operator (`+=`, `^=`, ...).
+///
+/// `syn` represents these as `BinOp` variants on an `Expr::Binary` rather than as
+/// `Expr::Assign` with a binary right-hand side — Rust's own grammar treats `a += b` as one
+/// operator token, not `a = a + b` spelled out. [`Mutations::visit_expr_binary`] is why this
+/// matters: a scanner that only watched `Expr::Assign` for `=` would miss every compound
+/// form.
+const fn is_compound_assign(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
+}
+
 /// [`mutated_field_names`]'s own visitor.
 struct Mutations<'a> {
     names: &'a [&'a str],
@@ -1011,6 +1034,41 @@ impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
         self.note_assignment_target(&node.left);
         syn::visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        // `dispatch.intent.request.input_crc ^= other;` rewrites `input_crc` exactly like
+        // a plain `=` would, but `syn` represents every compound-assignment operator as a
+        // `BinOp` on an `Expr::Binary` rather than as `Expr::Assign` — so `visit_expr_assign`
+        // above never sees it, and the default traversal walks the left side as an ordinary
+        // read (Codex review, PR #183). A compound-assignment target is always a single
+        // place, never a tuple or struct destructuring, so this goes straight to `note`
+        // rather than through `note_assignment_target`.
+        if is_compound_assign(&node.op) {
+            self.note(&node.left);
+        }
+        syn::visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        // `let ref mut slot = dispatch.intent.request;` borrows the initializer's own
+        // place directly through the pattern — no `Expr::Assign`, no `Expr::Reference` and
+        // no method call anywhere, so none of the routes above sees it, and there is no
+        // struct pattern here for `visit_field_pat` to read either: the whole pattern is
+        // one identifier (Codex review, PR #183). `ref` and `mut` are explicit keywords
+        // here, not a scrutinee-dependent default binding mode the way a struct pattern's
+        // field is, so the check is exact rather than over-broad: only `ref mut` creates a
+        // mutable alias, and only when the whole pattern is one identifier binding directly
+        // to the initializer expression. A nested correspondence — a tuple pattern's own
+        // `ref mut` element matched against a tuple initializer's own element — is a
+        // residual limit stated rather than closed, the same standing this file already
+        // states for other syntactic scans.
+        if let (syn::Pat::Ident(pat_ident), Some(init)) = (&node.pat, &node.init) {
+            if pat_ident.by_ref.is_some() && pat_ident.mutability.is_some() {
+                self.note(&init.expr);
+            }
+        }
+        syn::visit::visit_local(self, node);
     }
 
     fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
@@ -2694,6 +2752,96 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(found, ["intent"], "{found:?}");
+    }
+
+    #[test]
+    fn a_compound_assignment_to_a_field_is_reported() {
+        // Codex, PR #183's own review: `dispatch.intent.request.input_crc ^= other;` parses
+        // as `Expr::Binary` with `BinOp::BitXorAssign`, not `Expr::Assign` — `visit_expr_assign`
+        // never sees it, and the default traversal walks the field chain as a plain read.
+        let found = mutated_field_names(
+            "fn tamper(dispatch: &mut Foo, other: u32) {\n\
+             \x20   dispatch.intent.request.input_crc ^= other;\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn every_compound_assignment_operator_is_reported() {
+        for op in ["+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<=", ">>="] {
+            let found = mutated_field_names(
+                &format!(
+                    "fn tamper(dispatch: &mut Foo, other: u32) {{\n\
+                     \x20   dispatch.bytes {op} other;\n}}"
+                ),
+                &["bytes"],
+            )
+            .unwrap_or_else(|error| panic!("{op} fixture parses: {error}"));
+            assert_eq!(found, ["bytes"], "operator {op}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_binary_comparison_on_a_field_is_not_reported() {
+        // `dispatch.bytes == other` is a read, and `BinOp::Eq` is not on the compound-
+        // assignment list — this is the control that shows the new check is scoped to
+        // assignment operators rather than to every `Expr::Binary`.
+        let found = mutated_field_names(
+            "fn read(dispatch: &Foo, other: u32) -> bool {\n\
+             \x20   dispatch.bytes == other\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_ref_mut_let_binding_of_a_field_chain_is_reported() {
+        // Codex, PR #183's own review: `let ref mut slot = dispatch.intent.request;` borrows
+        // the initializer's place directly through the pattern, with no struct pattern for
+        // `visit_field_pat` to read and no `=`/`&mut`/method call for the other three routes.
+        let found = mutated_field_names(
+            "fn tamper(dispatch: &mut Foo) {\n\
+             \x20   let ref mut slot = dispatch.intent.request;\n\
+             \x20   consume(slot);\n}",
+            &["intent"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["intent"], "{found:?}");
+    }
+
+    #[test]
+    fn a_plain_ref_let_binding_of_a_field_chain_is_not_reported() {
+        // `ref` with no `mut` borrows immutably — `&T`, not `&mut T` — so it cannot alias a
+        // guarded field for writing and must stay unreported, the control beside the
+        // positive case above.
+        let found = mutated_field_names(
+            "fn read(dispatch: &Foo) {\n\
+             \x20   let ref slot = dispatch.intent;\n\
+             \x20   consume(slot);\n}",
+            &["intent"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_by_value_let_binding_of_a_field_chain_is_not_reported() {
+        // `let mut slot = dispatch.intent;` with no `ref` moves or copies the value into a
+        // fresh local rather than aliasing the original place — a read, and the control that
+        // shows the new check is scoped to `ref mut` rather than to every `let`.
+        let found = mutated_field_names(
+            "fn read(dispatch: Foo) {\n\
+             \x20   let mut slot = dispatch.intent;\n\
+             \x20   consume(slot);\n}",
+            &["intent"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
