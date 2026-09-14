@@ -1403,10 +1403,17 @@ Stated so that nobody mistakes silence for coverage:
   `implements_trait_for` both now strip a self type's path before comparing it to a pinned
   name, so `impl crate::timer::ClockKind` and `impl Forge for crate::timer::ClockKind` are
   found the same way a bare `impl ClockKind` already was — the fix is shared by every other
-  pin built on either function, not only the three this issue added. One route Codex found
-  stays open: a macro invocation inside a pinned `impl` — `impl ClockKind { extra!(); }`,
-  where `extra!` expands to a `pub const` — is a line these bans read and not a constant they
-  see, the same shape `effect-protocol` and `dispatch-wiring` already carry this limit for.
+  pin built on either function, not only the three this issue added. Two routes Codex found
+  stay open, both a name split across lines rather than a name misread on one — the residual
+  every line-scanned pin in this file already carries, not a new one. A macro invocation
+  inside a pinned `impl` — `impl ClockKind { extra!(); }`, where `extra!` expands to a
+  `pub const` — is a line these bans read and not a constant they see, the same shape
+  `effect-protocol` and `dispatch-wiring` already carry this limit for. And a declaration
+  `#[rustfmt::skip]` holds split before its name — `pub const\nBEST_EFFORT: Self = ..;` — is
+  two lines neither of which reads as a whole declaration, the same shape the wrapped-value
+  residual above is. Both need a token parser rather than a line scanner, which is a larger
+  change than this issue's three bans; each is a hand-written, `#[rustfmt::skip]`-guarded
+  spelling rather than one `cargo fmt` produces.
 - **That a pinned timer type is the type the crate ships.** `timer-capability`'s member pin
   reads a header string, so a rename that carries the crate root with it — `TimerSpec` becomes
   `TimerSpecV2`, a decoy `mod compat` keeps the pinned name and the pinned members — leaves it
