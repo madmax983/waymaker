@@ -3440,6 +3440,13 @@ fn attribute_body_end(body: &str) -> Option<usize> {
                 after_ident = false;
                 continue;
             }
+            '/' => {
+                if let Some(next) = block_comment_end(&chars, index) {
+                    index = next;
+                    after_ident = false;
+                    continue;
+                }
+            }
             'b' | 'c' | 'r' if !after_ident => {
                 if let Some((quote, hashes)) = raw_string_open(&chars, index) {
                     index = skip_raw_string(&chars, quote, hashes)?;
@@ -3467,6 +3474,38 @@ fn attribute_body_end(body: &str) -> Option<usize> {
         index = index.saturating_add(1);
     }
     None
+}
+
+/// Index in `chars` just past a block comment's closing `*/`, if `chars[start]` opens one.
+///
+/// A raw string or a character literal read out of Rust source often quotes example
+/// syntax in a comment — `/* r#"x" */` — and that example is not a real literal. Skipping
+/// the whole comment first keeps its contents from being read as one. Nested block
+/// comments close on their own inner `*/` first, matching the language: `/* /* */ */`
+/// closes at the outer pair.
+fn block_comment_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    if chars.get(start)?.1 != '/' || chars.get(start.saturating_add(1))?.1 != '*' {
+        return None;
+    }
+    let mut depth = 1_u32;
+    let mut index = start.saturating_add(2);
+    while depth > 0 {
+        let next = chars
+            .get(index.saturating_add(1))
+            .map(|&(_, character)| character);
+        match (chars.get(index)?.1, next) {
+            ('/', Some('*')) => {
+                depth = depth.saturating_add(1);
+                index = index.saturating_add(2);
+            }
+            ('*', Some('/')) => {
+                depth = depth.saturating_sub(1);
+                index = index.saturating_add(2);
+            }
+            _ => index = index.saturating_add(1),
+        }
+    }
+    Some(index)
 }
 
 /// Index in `chars` just past an ordinary string's closing `"`.

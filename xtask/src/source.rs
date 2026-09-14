@@ -11456,6 +11456,20 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_block_comment_hides_the_syntax_it_quotes() {
+        // Codex's third round on #164. A comment showing example syntax —
+        // `/* r#"x" */` — is not a real raw string, and the old quote-toggle scanner read
+        // it as inert text by accident. Recognizing real raw strings without also
+        // recognizing comments turned that accident into a regression: the fake opener
+        // never closes, so the scan fails and the real item is lost.
+        let fixture = "#[allow(/* r#\"x\" */ dead_code)] pub fn raw() {}\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+        // Nested block comments close on their own inner pair first.
+        let nested = "#[allow(/* outer /* inner */ still-outer */ dead_code)] pub fn raw() {}\n";
+        assert!(counted(nested).contains(&"raw".to_owned()), "{nested}");
+    }
+
+    #[test]
     fn an_unterminated_raw_string_leaves_the_item_unclassified() {
         // Same fail-closed direction as an unterminated ordinary string: no `"` plus the
         // right hash count ever closes it, so the scan never finds the real `]` and leaves
