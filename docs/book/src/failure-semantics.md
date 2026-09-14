@@ -9,6 +9,10 @@ has run either half. See [the hardware compatibility matrix](hardware-matrix.md)
 The **rig** column says whether the rig reaches that row. It reaches all ten. Issue
 [#96](https://github.com/madmax983/waymaker/issues/96) closed the last four: a bank-swap
 workload for rows 7 and 8, a capacity refusal for row 9, and a divergent replay for row 10.
+Eight rows are swept: the crash injector interrupts a real run at every point and the rig
+classifies where each point landed. Rows 9 and 10 are driven instead, one hand-built case
+each, because a capacity refusal and a declared-workflow mismatch are not media crashes the
+injector produces.
 
 | Id | Failure point | What happens | On the rig |
 | --- | --- | --- | --- |
@@ -20,8 +24,8 @@ workload for rows 7 and 8, a capacity refusal for row 9, and a divergent replay 
 | `after-completion-barrier` | After completion barrier | The completion is replayed. The activity never runs again. | Swept |
 | `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | The old bank stays authoritative and the old run continues. | Swept |
 | `after-new-bank-seal-barrier` | After new bank seal barrier | The new bank is authoritative and the old run is never current. | Swept |
-| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Swept |
-| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Swept |
+| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Driven |
+| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Driven |
 
 ## Row 5 does not hold as §14 writes it
 

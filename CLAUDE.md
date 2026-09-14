@@ -426,8 +426,8 @@ All 10 failure rows, with the id to cite when a change touches one:
 | `after-completion-barrier` | After completion barrier | `after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again` | Swept |
 | `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Swept |
 | `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Swept |
-| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Swept |
-| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Swept |
+| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Driven |
+| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Driven |
 
 Row 5 does not hold as §14 writes it. It says "redeliver": a torn completion leaves no append
 point ([ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)),
@@ -3242,7 +3242,7 @@ Rows 7 and 8 needed a workload that rolls over, and `Rig::iterate_until_rollover
 smallest addition that provides one: it writes a run's `RunStarted` and as many
 schedule/completion pairs as it is asked for, and stops — no `RunCompleted`, because the
 run's continuation is whichever bank a swap leaves authoritative rather than this bank's own
-end. `crates/waymaker-rig/tests/matrix.rs`'s `perform_rollover_swap` drives §10's seven
+end. `crates/waymaker-rig/tests/matrix.rs`'s `drive_rollover_swap` drives §10's seven
 steps directly against the bank the partial run left off in, the same way
 `crates/waymaker-fault/tests/swap.rs` drives them for the model; the whole sequence — the
 partial run, the swap, and a small complete run written into the bank it installs — runs
@@ -3277,3 +3277,33 @@ search is over declared bounds rather than over geometries, so it says nothing a
 sized differently than the rig's shared fixture. And issue #96's board half — rows 2, 3 and
 4 need the dispatcher's own record of what it was entered for, which a reset takes with the
 RAM — is exactly as unmet as it was before this issue, and stays a board's to close.
+
+Review of the pull request that closed issue #96 found two more real defects, both the same
+shape as `Rig::authority`'s own fix: an instrument reading a state issue #96 made reachable
+for the first time and answering the question it was never asked to answer. The first is in
+row 9's own no-mutation claim: `iterate_reserved` and `resume_reserved` wrote the witness's
+`Attempted` mark for a record *before* asking `Reserve::admits` whether that record would fit
+— so the very first encounter with a near-capacity refusal genuinely mutated the device's
+instrument region, even though `Reserved::stage` itself never touched the journal. The
+existing test could not see it: a *replay*'s witness continuation skips a mark the first
+attempt already wrote, so `assert_replay_refuses_without_mutation`'s wear comparison compared
+two states that were already equal for the wrong reason. A free `admits` function — the same
+`Reserve::admits` call `Reserved::stage` makes internally, read one call earlier — closes it;
+`the_first_capacity_refusal_writes_no_mark_of_its_own` compares the first refusal's rig-only
+wear against a device that legitimately stops after the same one-effect prefix and never
+meets a refusal at all, verified failing against the prior order (one extra program operation
+and barrier — the mark) before the fix landed.
+
+The second is `Rig::judge` itself, and it is the sharper of the two: gating the audit on
+*current* authority, the way `Rig::resume` correctly must, made a row-8 rollover's own
+retired bank read as though its acknowledged records had gone missing, because `uninstalled`
+assumes a bank with no current authority has nothing to say about this run rather than that
+it said something and was superseded. `installed_journal` stays authority-gated for
+`resume` and `recover_prefix`, which do need to know whether a bank is still the one a boot
+would choose; `judge` moves to a new `own_bank_journal`, which reads `Rig::BANK`'s own header
+by run id alone and audits what it holds regardless of which bank is authoritative now — a
+retired bank's own history does not change when a swap moves authority away from it.
+The row 8 test now asserts `rig.verify(0, ..)` reports `Outcome::Passed` at every one of its
+crash points, beside the assertion that `resume` refuses them; verified failing with
+`Breached(LostAcknowledgedRecord { .. })` against the prior single check before this split
+existed.

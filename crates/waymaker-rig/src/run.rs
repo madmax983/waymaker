@@ -672,8 +672,11 @@ impl Rig {
     /// The journal of the bank *this run* was installed in, or `None` if it was never
     /// installed on this part.
     ///
-    /// Four ways to answer `None`, and each of them is a part that has nothing to say about
-    /// `workload`'s run rather than a part that lost something:
+    /// For a caller that means to *continue* the run — [`resume`](Self::resume) and
+    /// [`recover_prefix`](Self::recover_prefix) — so it is gated on [`Rig::BANK`] being the
+    /// bank a boot would choose right now, not merely on its header naming this run. Three
+    /// ways to answer `None`, and each of them is a part this call has nothing to
+    /// continue rather than a part that lost something:
     ///
     /// * no bank is authoritative, or two are — preparation was cut before its generation
     ///   seal landed, which is the state every part is in before its first one;
@@ -681,16 +684,10 @@ impl Rig {
     ///   the other bank. [`Rig::BANK`]'s header still names the retired run (issue
     ///   [#96](https://github.com/madmax983/waymaker/issues/96): `Rig::judge` and
     ///   `Rig::resume` used to trust [`Rig::BANK`] by run id alone. A swap leaves the losing
-    ///   bank's header untouched, so that check gave a false positive);
-    /// * the authoritative bank's header does not decode — there is no journal region to
-    ///   derive, and §14's `frame ignored; previous history prefix wins` is about frames
-    ///   inside a journal rather than about the header that names one;
-    /// * the header decodes and names a **different run** — the part is still the previous
-    ///   iteration's, which is exactly the window a reset during `prepare` opens.
-    ///
-    /// The run id is compared as well as the bank, because that is what makes a bank
-    /// *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so two
-    /// iterations of one plan never share one.
+    ///   bank's header untouched, so that check gave a false positive) — [`own_bank_journal`]
+    ///   is the twin that does not gate on this, for [`judge`](Self::judge)'s different
+    ///   question;
+    /// * [`own_bank_journal`] answered `None`, for either of its own two reasons.
     fn installed_journal<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
@@ -701,6 +698,41 @@ impl Rig {
         let bank::Authority::Bank { id: Self::BANK, .. } = authority else {
             return Ok(None);
         };
+        self.own_bank_journal(engine, workload, page)
+    }
+
+    /// [`Rig::BANK`]'s own journal, if its header names `workload`'s run — regardless of
+    /// which bank is authoritative right now.
+    ///
+    /// For [`judge`](Self::judge) alone. A bank's own written history does not change when
+    /// a swap moves authority away from it: issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8 leave
+    /// [`Rig::BANK`]'s own history exactly as intact after a swap as before it, so auditing
+    /// what this bank's witness claimed against what its own journal holds is sound whether
+    /// or not this bank is still the one a boot would choose. [`installed_journal`] is the
+    /// authority-gated twin a caller that means to *continue* the run needs instead, because
+    /// continuing does depend on which bank a boot would choose and auditing history does
+    /// not. Reverting to this call alone in [`installed_journal`] reproduces the defect that
+    /// twin exists to refuse — see its own documentation.
+    ///
+    /// Two ways to answer `None`, both a part with nothing to say about `workload`'s run
+    /// rather than a part that lost something:
+    ///
+    /// * the header does not decode — there is no journal region to derive, and §14's
+    ///   `frame ignored; previous history prefix wins` is about frames inside a journal
+    ///   rather than about the header that names one;
+    /// * the header decodes and names a **different run** — the part is still the previous
+    ///   iteration's, which is exactly the window a reset during `prepare` opens.
+    ///
+    /// The run id is compared rather than the bank, because that is what makes a bank
+    /// *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so two
+    /// iterations of one plan never share one.
+    fn own_bank_journal<S: StableStorage>(
+        &self,
+        engine: &mut Window<'_, S>,
+        workload: Workload,
+        page: &mut [u8],
+    ) -> Result<Option<JournalRegion>, RigError<S::Error>> {
         let read = self.read_header(engine, Self::BANK, page)?;
         let Some(bytes) = page.get(..read) else {
             return Err(RigError::ShortPage);
@@ -1634,13 +1666,17 @@ impl Rig {
     ///
     /// # Which bank it walks
     ///
-    /// [`Rig::BANK`], always. The authority count above is computed the way a boot computes
-    /// it — both banks' headers and seals, through [`bank::select`] — and then only bank A's
-    /// journal is read, because bank A is the only one this rig installs. §10's swap has since
-    /// landed as `waymaker_flash::swap` (issue
-    /// [#26](https://github.com/madmax983/waymaker/issues/26)) and this rig still does not
-    /// drive it, so the two agree today; a workload that rolled over would have to make this
-    /// walk the bank [`bank::select`] names, and that is what is owed before it can.
+    /// [`Rig::BANK`], always — this rig only ever writes a run's own history there, whether
+    /// or not a later swap moves authority to the other one. The authority count above is
+    /// still computed the way a boot computes it — both banks' headers and seals, through
+    /// [`bank::select`] — because two sealed banks makes ownership unanswerable regardless
+    /// of what either header names (see the ambiguity check above), and because the count is
+    /// part of the reported [`Verdict`]. What authority does *not* gate any more is whether
+    /// [`Rig::BANK`]'s own history gets audited: issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96)'s bank-swap rows found that
+    /// gating on it made a legitimately retired, still-intact bank read as one that had lost
+    /// its acknowledged records, because `uninstalled` assumes nothing was written rather
+    /// than that something was written somewhere else now current. See `own_bank_journal`.
     ///
     /// # Errors
     ///
@@ -1682,15 +1718,21 @@ impl Rig {
             });
         }
 
-        // §10's authority is what a boot reads, and a bank belongs to the run whose header it
-        // carries. Both halves are load-bearing here, and the second one was found by review
-        // rather than by writing it down: a rig's loop is `prepare(n)` → `iterate(n)` → reset
-        // → `verify(n)`, so from the second iteration onwards `verify(n)` meets a part that
-        // *finished* `n - 1`. A reset during `prepare(n)` leaves that part's engine still
-        // sealed at `n - 1`, and a `judge` that walked whatever bank A held read run `n - 1`'s
-        // journal against run `n`'s declarations and reported a §14 violation on a healthy
-        // board. An uninstalled part is not a verdict about recovery — see [`uninstalled`].
-        let Some(region) = self.installed_journal(&mut engine, workload, authority, page)? else {
+        // A bank belongs to the run whose header it carries, and that is the only thing
+        // gating an audit: whether it is still the bank a boot would choose is
+        // [`resume`](Self::resume)'s question, not this one's, because a swap moving
+        // authority elsewhere does not rewrite what this bank already holds — issue
+        // [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8 found this
+        // by review, having a `judge` gated on authority report `LostAcknowledgedRecord` on
+        // a device whose retired bank was exactly as intact as its witness claimed.
+        // The run-id half stays load-bearing on its own: a rig's loop is
+        // `prepare(n)` → `iterate(n)` → reset → `verify(n)`, so from the second iteration
+        // onwards `verify(n)` meets a part that *finished* `n - 1`. A reset during
+        // `prepare(n)` leaves that part's engine still sealed at `n - 1`, and a `judge` that
+        // walked whatever bank A held with no run-id check would read run `n - 1`'s journal
+        // against run `n`'s declarations and report a §14 violation on a healthy board. An
+        // uninstalled part is not a verdict about recovery — see [`uninstalled`].
+        let Some(region) = self.own_bank_journal(&mut engine, workload, page)? else {
             return Ok(uninstalled(workload, progress, banks));
         };
 

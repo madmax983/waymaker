@@ -101,8 +101,10 @@ mutation and no dispatch each time.
 `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap` — a name that asserted a gap this
 issue closes — is now `every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned`,
 matching the model half's own name for the same idea. `xtask::docs::FAILURE_ROWS` moves all
-four rows from `RigStanding::Owed` to `RigStanding::Swept` with their rig test names, and
-`CLAUDE.md`'s table follows.
+four rows off `RigStanding::Owed`, two — the bank rows — to `RigStanding::Swept` and two —
+history-capacity-reached and replay-divergence, driven once each rather than swept — to a
+`RigStanding::Driven` added by review so a hand-driven row is never rendered as one the
+injector's own census covers, and `CLAUDE.md`'s table follows.
 
 ## Consequences
 
@@ -123,6 +125,23 @@ consumed in this workspace by pattern rather than by an exhaustive `match`.
 depends on. None of the four public additions changes what `iterate` or `resume` do; each is
 a new entry point rather than a new branch in an existing one, which is what keeps the six
 swept rows' pinned counts exact.
+
+**Review found two more defects of the same shape as this ADR's own fix: an instrument
+answering a question issue #96 made reachable for the first time that it had never been
+asked before.** `iterate_reserved` and `resume_reserved` wrote a record's `Attempted`
+witness mark *before* asking `Reserve::admits` whether that record would fit, so row 9's own
+no-mutation claim was false on the first encounter with a refusal — invisible in the
+original test because a replay's witness continuation skips a mark the first attempt already
+wrote. A free `admits` call, made before any mark, closes it. And `Rig::judge` gating its
+audit on *current* authority — the same gate `Rig::resume` correctly needs — made a
+healthy row-8 rollover's own retired bank read as though its acknowledged records had been
+lost, because `uninstalled` assumes a bank with no current authority has nothing to say
+about this run rather than that it said something and was superseded. `installed_journal`
+stays authority-gated for `resume` and `recover_prefix`; `judge` moves to a new
+`own_bank_journal`, which audits `Rig::BANK`'s own header by run id alone, regardless of
+which bank is authoritative now — a retired bank's own history does not change when a swap
+moves authority away from it. Both were verified failing against the prior code before their
+fixes landed.
 
 **What is still owed.** The two bank rows are swept at one `effects_before_swap` value and
 one declared next-run input; unlike `waymaker-fault`'s own swap sweep, this one does not vary

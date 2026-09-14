@@ -906,6 +906,20 @@ fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_
             );
         }
 
+        // Retired is not lost: the old bank's own witness-claimed history is still exactly
+        // what it was before the swap, and `verify` must say so rather than reading "not
+        // current any more" as "records went missing".
+        {
+            let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+                unreachable!("a judgeable part, at {injection:?}")
+            };
+            assert_eq!(
+                verdict.outcome(),
+                Outcome::Passed,
+                "the retired bank's own history was reported lost, at {injection:?}"
+            );
+        }
+
         // The new bank is authoritative. Where its own journal still has an append point
         // — every case but a torn first frame, which ADR 0018 refuses rather than
         // repairs, the same as any other bank — it starts and does work.
