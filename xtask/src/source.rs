@@ -15474,6 +15474,28 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_at_binding_patterns_is_reported() {
+        // Codex's twenty-third-round finding: `_p0 @ 0` is exactly as singleton a pattern
+        // as `0` alone — the binding name is incidental to the value the arm matches, and
+        // the form is legal, unwarned Rust at the project's MSRV. `pattern_literal`'s
+        // `Pat::Ident` arm required `subpat.is_none()`, so every at-bound numbered pattern
+        // read as unresolved; it now recurses into the subpattern instead of refusing one.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             _p0 @ 0 => crc32_nibble(0),\n        _p1 @ 1 => crc32_nibble(1),\n        \
+             _p2 @ 2 => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_reading_super_does_not_find_a_shadowing_child_value() {
         // Codex's twenty-second-round finding: `super::P0` was resolved with a plain,
         // unrestricted `ConstScopes::resolve`, which searches the *entire* live scope

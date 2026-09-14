@@ -1754,6 +1754,11 @@ fn literal_or_const_value(
 /// value, because treating it as one would have to know the element type's own successor
 /// function, which this scan has no reason to.
 ///
+/// An at-binding (`_p0 @ 0`) resolves to whatever its own subpattern does, recursively —
+/// Codex's finding: the binding name is incidental to the value the arm matches, and MSRV
+/// Rust accepts the form with no warning, so a table spelled that way is exactly as dense
+/// as one without the bindings and was read as unresolved on every arm instead.
+///
 /// `None` for a wildcard, a wider range, a tuple, or anything else a dense table's patterns
 /// are not, and for a binding that names no known constant — that is
 /// [`is_catchall_pattern`]'s question, not this one's.
@@ -1763,9 +1768,14 @@ fn pattern_literal(
 ) -> Option<u128> {
     match pattern {
         syn::Pat::Lit(literal) => lit_value(&literal.lit),
-        syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
-            resolve(&syn::Path::from(named.ident.clone()))
-        }
+        syn::Pat::Ident(named) if named.by_ref.is_none() => match &named.subpat {
+            None => resolve(&syn::Path::from(named.ident.clone())),
+            // Codex's finding: an at-binding (`_p0 @ 0`) is exactly as singleton a pattern
+            // as its own subpattern is, and MSRV-legal, unwarned Rust — the binding name
+            // is incidental to the value the arm matches, so the subpattern is resolved
+            // the same way any other pattern here is, recursively.
+            Some((_, subpat)) => pattern_literal(subpat, resolve),
+        },
         syn::Pat::Path(path) => resolve(&path.path),
         syn::Pat::Range(range) if matches!(range.limits, syn::RangeLimits::Closed(_)) => {
             let start = literal_or_const_value(range.start.as_deref()?, resolve)?;
