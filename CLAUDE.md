@@ -1143,11 +1143,19 @@ Stated so that nobody mistakes silence for coverage:
   expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Alias
   resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
   within one module (issue #109), a nested module does not inherit an outer one's aliases,
-  and `self::`, `super::` and `crate::` reach the scope each names explicitly rather than by
-  inheritance — a stack of each module's own aliases from the file root down makes all three
-  well-defined regardless of nesting depth. An alias declared in one module and reached
-  through a `use` in another *file* is invisible outright, the same limit `capacity-reserve`,
-  `recovery-surface` and `storage-contract` each record for the one file they pin. Nor does
+  and `self::` and `super::` reach the scope each names explicitly rather than by
+  inheritance — a stack of each module's own aliases from the file this scan read down makes
+  both well-defined regardless of nesting depth. `crate::` does not: this scan sees one file
+  and never the crate, so it has no way to tell whether that file is really the crate root —
+  treating its own top level as `crate`'s target was tried (Codex review, PR #160, round 5)
+  and reverted (round 6), because it is right only for the one file that happens to be
+  `lib.rs` and a guess everywhere else, catching an unrelated `impl crate::X for Y` as a
+  false fifth future in one file and staying silent on a real one reached through a named
+  submodule (`crate::traits::X`) in another — the same shape of over- vs under-matching
+  namespace ambiguity settles below, decided the same way. An alias declared in one module
+  and reached through a `use` in another *file* is invisible outright, the same limit
+  `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
+  they pin. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
   function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
   a later occurrence meant. Picking the first-declared alias can silently miss a real match;

@@ -379,16 +379,19 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 }
 
 /// `path`'s segments, resolved against `stack` — the alias scopes from the
-/// file root (index 0) to the current module (the last one), each holding
-/// only what that module declares directly. Real Rust does not let a
-/// nested module inherit an outer one's aliases just by being written
-/// inside it (issue #109 review), but `self::`, `super::` and `crate::`
-/// are not inheritance — each names a scope explicitly, the same way
-/// regardless of nesting depth: `self` is the current scope, `super` is
-/// one level up (repeatable: `super::super::X`), and `crate` is the root.
-/// Each is consumed before every lookup, because an alias's own target can
-/// itself start with one, e.g. `pub use super::Pollable as Awaitable;`
-/// (Codex review, PR #160).
+/// file this scan read (index 0) to the current module (the last one),
+/// each holding only what that module declares directly. Real Rust does
+/// not let a nested module inherit an outer one's aliases just by being
+/// written inside it (issue #109 review), but `self::` and `super::` are
+/// not inheritance — each names a scope explicitly, the same way
+/// regardless of nesting depth: `self` is the current scope and `super`
+/// is one level up (repeatable: `super::super::X`), bounded at the file
+/// this scan read. `crate::` is a residual limit rather than index 0 of
+/// this stack: this function sees one file, never the crate, so it has no
+/// way to tell whether that file is really the crate root (Codex review,
+/// PR #160, round 6). Each is consumed before every lookup, because an
+/// alias's own target can itself start with one, e.g.
+/// `pub use super::Pollable as Awaitable;` (Codex review, PR #160).
 fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
     let mut segments: Vec<String> = path
         .segments
@@ -422,10 +425,13 @@ fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
     segments
 }
 
-/// Consumes leading `self`/`super`/`crate` segments, moving `scope` — an
-/// index into the alias stack — to match: `self` leaves it where it is,
-/// `super` moves it one level toward the root per repetition (never past
-/// it), and `crate` jumps straight to the root.
+/// Consumes leading `self`/`super` segments, moving `scope` — an index
+/// into the alias stack — to match: `self` leaves it where it is, and
+/// `super` moves it one level toward the file this scan read (never past
+/// it). A leading `crate` is left in place rather than consumed: this
+/// scan never has the crate root's aliases to jump to (see
+/// [`resolve_segments`]), so a `crate`-qualified path is left unresolved
+/// rather than guessed against the wrong scope.
 fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
     loop {
         match segments.first().map(String::as_str) {
@@ -435,10 +441,6 @@ fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
             Some("super") => {
                 segments.remove(0);
                 *scope = scope.saturating_sub(1);
-            }
-            Some("crate") => {
-                segments.remove(0);
-                *scope = 0;
             }
             _ => break,
         }
@@ -1816,14 +1818,25 @@ mod alias_scope_tests {
     }
 
     #[test]
-    fn a_crate_qualified_alias_still_reaches_future() {
-        // `crate::` names the file root from any depth, unlike `super::`,
-        // which only steps up one level per repetition.
-        let code = "use core::future::Future as Pollable;\nmod a {\n    mod b {\n        use \
-             crate::Pollable as Awaitable;\n        struct Sneaky;\n        impl Awaitable for \
-             Sneaky {}\n    }\n}\n";
+    fn a_crate_qualified_path_does_not_falsely_resolve_through_this_files_own_top() {
+        // Codex review, round 6: this scanner reads one file at a time and
+        // never learns whether that file is the crate root. Treating the
+        // parsed file's own top-level aliases as `crate`'s target is a
+        // guess that is right only when the scanned file happens to be
+        // `lib.rs` — for any other file, `crate::Pollable` names a
+        // *different* file's top level, one this scan never sees. A file
+        // that locally aliases `Future` to `Pollable` and separately
+        // implements an unrelated `crate::Pollable` (some other, real trait
+        // at the true crate root) must not have that unrelated impl
+        // reported as a fifth future.
+        let code = "use core::future::Future as Pollable;\nstruct Innocent;\nimpl crate::Pollable \
+             for Innocent {}\n";
         let implementors = future_trait_implementors(code).expect("the fixture parses");
-        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "a `crate`-qualified path resolved through this file's own aliases, as though this \
+             file were necessarily the crate root: {implementors:?}"
+        );
     }
 
     #[test]
