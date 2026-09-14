@@ -568,6 +568,11 @@ fn collect_type_aliases<'a>(
                             .collect(),
                     });
                 }
+                // The alias extraction above reads the type as a plain path; a type
+                // can also carry a block buried inside it (an array length, or a
+                // const generic argument) — round 18's finding, closed the same way
+                // as the arm below.
+                collect_type_aliases(nested_body_items(item), aliases);
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
@@ -578,7 +583,8 @@ fn collect_type_aliases<'a>(
             | syn::Item::Impl(_)
             | syn::Item::Trait(_)
             | syn::Item::Const(_)
-            | syn::Item::Static(_) => {
+            | syn::Item::Static(_)
+            | syn::Item::Enum(_) => {
                 collect_type_aliases(nested_body_items(item), aliases);
             }
             _ => {}
@@ -676,9 +682,17 @@ fn collect_trait_implementors<'a>(
             // lint documents as never actually scoped to the function, however it
             // looks written down; round 17 found the same non-local shape reachable
             // through a `const`/`static` initializer's own block too, and through a
-            // trait's own default method bodies and default associated consts.
-            // `item.attrs` is not re-checked, for the reason given above.
-            syn::Item::Fn(_) | syn::Item::Const(_) | syn::Item::Static(_) | syn::Item::Trait(_) => {
+            // trait's own default method bodies and default associated consts; round
+            // 18 found it reachable through an enum variant's discriminant and
+            // through a block buried inside a type alias's own type (an array length
+            // or a const generic argument). `item.attrs` is not re-checked, for the
+            // reason given above.
+            syn::Item::Fn(_)
+            | syn::Item::Const(_)
+            | syn::Item::Static(_)
+            | syn::Item::Trait(_)
+            | syn::Item::Enum(_)
+            | syn::Item::Type(_) => {
                 collect_trait_implementors(
                     nested_body_items(item),
                     aliases,
@@ -1922,11 +1936,25 @@ fn expr_items(expr: &syn::Expr) -> Vec<&syn::Item> {
     visitor.items
 }
 
-/// The shared walk [`block_items`] and [`expr_items`] each drive: every `Stmt::Item` at
-/// any nesting depth of control flow, stopping at the item itself rather than
-/// descending into it — every caller of either function already recurses into a found
-/// `Item::Fn`/`Item::Impl`/`Item::Trait`/`Item::Const`/`Item::Static` itself, so walking
-/// through the item here too would walk its own body twice.
+/// [`block_items`], starting from a type rather than a block or an expression — an
+/// array type's length (`[T; N]`, where `N` is a const expression) or a const generic
+/// argument (`Foo<{ N }>`) can each be a block, and round 18 of Codex review on this
+/// change (PR #143) found `type R = [(); { impl Clone for super::Recovery { .. }; 1
+/// }];` reaching neither scanner: the visitor here walks the whole type looking for an
+/// embedded expression the same way [`expr_items`] walks one expression looking for a
+/// nested block.
+fn type_items(ty: &syn::Type) -> Vec<&syn::Item> {
+    let mut visitor = BlockItemVisitor { items: Vec::new() };
+    visitor.visit_type(ty);
+    visitor.items
+}
+
+/// The shared walk [`block_items`], [`expr_items`] and [`type_items`] each drive: every
+/// `Stmt::Item` at any nesting depth of control flow, stopping at the item itself
+/// rather than descending into it — every caller of any of the three already recurses
+/// into a found `Item::Fn`/`Item::Impl`/`Item::Trait`/`Item::Const`/`Item::Static`/
+/// `Item::Enum`/`Item::Type` itself, so walking through the item here too would walk
+/// its own body twice.
 struct BlockItemVisitor<'ast> {
     items: Vec<&'ast syn::Item>,
 }
@@ -1965,6 +1993,12 @@ impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
 /// `impl` itself. And `const _: () = { impl Clone for super::Recovery { .. } }; };` —
 /// a non-local `impl` inside a `const` initializer's own block — reached neither
 /// scanner at all, because neither read `Item::Const` or `Item::Static`.
+///
+/// Round 18 found two more block-bearing shapes the same way: an enum variant's
+/// discriminant (`enum E { A = { impl Clone for super::Recovery { .. }; 1 } }`) is an
+/// expression exactly like a `const`'s initializer, and a type alias's own type can
+/// carry one buried inside it — an array length or a const generic argument, which
+/// [`type_items`] finds by walking the type rather than reading it as a plain path.
 fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
     match item {
         syn::Item::Fn(function) => block_items(&function.block),
@@ -1997,14 +2031,132 @@ fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
             .collect(),
         syn::Item::Const(constant) => expr_items(&constant.expr),
         syn::Item::Static(statik) => expr_items(&statik.expr),
+        syn::Item::Enum(enum_item) => enum_item
+            .variants
+            .iter()
+            .filter(|variant| !has_cfg_test(&variant.attrs))
+            .flat_map(|variant| {
+                variant
+                    .discriminant
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, expr)| expr_items(expr))
+            })
+            .collect(),
+        syn::Item::Type(type_item) => type_items(&type_item.ty),
         _ => Vec::new(),
     }
+}
+
+/// The candidate groups a plain `mod name;` or a `#[path]`-attributed one resolves to,
+/// from the declaring module's attributes and its would-be name.
+///
+/// Split out of [`collect_child_modules`] to keep that function under the line count
+/// this file's own `too_many_lines` lint holds every function to; the logic is
+/// unchanged from when it lived inline.
+///
+/// No unconditional `#[path]`: a `#[cfg_attr(.., path = "...")]` may still choose one
+/// under some build — round 16 found `#[cfg_attr(all(), path =
+/// "recovery/clone_impl.rs")] mod child;` beside a harmless natural
+/// `recovery/child.rs`, where `rustc` loads the `cfg_attr` target and the old scan,
+/// reading only a direct `#[path]`, found neither: it fell back to the natural pair
+/// and saw only the harmless decoy. This module does not evaluate a `cfg`'s condition,
+/// so every build's candidate — the natural pair *and* every path a `cfg_attr` could
+/// select, at any nesting depth — is scanned. Each is its own group (see
+/// [`ChildModule`]'s own doc): round 17 found that merging them into one flat list
+/// made a real, legal layout — the natural file *and* the `cfg_attr` target both
+/// present, for two different builds — misreport as `Ambiguous`.
+///
+/// An unconditional `#[path = "..."]`: `rustc` consults exactly this one path, so no
+/// fallback.
+fn mod_candidates(
+    module: &syn::ItemMod,
+    parent_dir: &str,
+    child_dir: &str,
+    name: &str,
+) -> Vec<Vec<String>> {
+    module.attrs.iter().find_map(path_attr_value).map_or_else(
+        || {
+            let mut groups = vec![vec![
+                format!("{child_dir}{name}.rs"),
+                format!("{child_dir}{name}/mod.rs"),
+            ]];
+            for attr in &module.attrs {
+                for path in cfg_attr_path_values(attr) {
+                    groups.push(vec![normalize_path(&format!("{parent_dir}{path}"))]);
+                }
+            }
+            groups
+        },
+        |path| vec![vec![normalize_path(&format!("{parent_dir}{path}"))]],
+    )
+}
+
+/// Every `(gated, items)` pair `collect_child_modules` should recurse into for one
+/// `impl` block's members — its methods' bodies and its associated consts'
+/// initializers — split out for the reason [`mod_candidates`] is.
+fn impl_member_bodies(
+    implementation: &syn::ItemImpl,
+    impl_gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    implementation
+        .items
+        .iter()
+        .filter_map(|member| match member {
+            syn::ImplItem::Fn(method) => Some((
+                impl_gated || has_cfg_test(&method.attrs),
+                block_items(&method.block),
+            )),
+            syn::ImplItem::Const(constant) => Some((
+                impl_gated || has_cfg_test(&constant.attrs),
+                expr_items(&constant.expr),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`impl_member_bodies`], for a trait's own default method bodies and default
+/// associated consts.
+fn trait_member_bodies(
+    trait_item: &syn::ItemTrait,
+    trait_gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    trait_item
+        .items
+        .iter()
+        .filter_map(|member| match member {
+            syn::TraitItem::Fn(method) => method.default.as_ref().map(|block| {
+                (
+                    trait_gated || has_cfg_test(&method.attrs),
+                    block_items(block),
+                )
+            }),
+            syn::TraitItem::Const(constant) => constant.default.as_ref().map(|(_, expr)| {
+                (
+                    trait_gated || has_cfg_test(&constant.attrs),
+                    expr_items(expr),
+                )
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The out-of-line `mod`s in `items`, appending to `found` in source order.
 ///
 /// `parent_dir` is the declaring file's directory and `child_dir` the directory its
 /// children live in; `gated` is whether an enclosing inline module is `#[cfg(test)]`.
+///
+/// Every shape a block-bearing body or an initializer comes in is gated the same way
+/// an inline module is — an enclosing `#[cfg(test)]`, on the item itself or inherited
+/// from `gated`, marks whatever `mod` it declares as test-only rather than hiding it
+/// from the walk entirely, for the reason the module doc gives. Round 18 of Codex
+/// review on this change (PR #143): `nested_body_items` already reaches a `mod` —
+/// through its `Clone`-detecting callers' eyes, an `impl`, whether handwritten or
+/// macro-generated — inside a `const`/`static` initializer, an enum variant's
+/// discriminant, or a block buried inside a type alias's own type; this walk needs
+/// the same shapes, so a `mod` declared inside one of them is not merely unresolved
+/// as a self-type but never even reached as a file at all.
 fn collect_child_modules<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     parent_dir: &str,
@@ -2028,54 +2180,13 @@ fn collect_child_modules<'a>(
                         found,
                     );
                 } else {
-                    let direct_path = module.attrs.iter().find_map(path_attr_value);
-                    let candidates = direct_path.map_or_else(
-                        || {
-                            // No unconditional `#[path]`, but a `#[cfg_attr(.., path =
-                            // "...")]` may still choose one under some build — round
-                            // 16 found `#[cfg_attr(all(), path =
-                            // "recovery/clone_impl.rs")] mod child;` beside a
-                            // harmless natural `recovery/child.rs`, where `rustc`
-                            // loads the `cfg_attr` target and the old scan, reading
-                            // only a direct `#[path]`, found neither: it fell back to
-                            // the natural pair and saw only the harmless decoy. This
-                            // module does not evaluate a `cfg`'s condition, so every
-                            // build's candidate — the natural pair *and* every path a
-                            // `cfg_attr` could select, at any nesting depth — is
-                            // scanned. Each is its own group (see `ChildModule`'s own
-                            // doc): round 17 found that merging them into one flat
-                            // list made a real, legal layout — the natural file *and*
-                            // the `cfg_attr` target both present, for two different
-                            // builds — misreport as `Ambiguous`.
-                            let mut groups = vec![vec![
-                                format!("{child_dir}{name}.rs"),
-                                format!("{child_dir}{name}/mod.rs"),
-                            ]];
-                            for attr in &module.attrs {
-                                for path in cfg_attr_path_values(attr) {
-                                    groups
-                                        .push(vec![normalize_path(&format!("{parent_dir}{path}"))]);
-                                }
-                            }
-                            groups
-                        },
-                        // An unconditional `#[path = "..."]`: `rustc` consults
-                        // exactly this one path (see above), so no fallback.
-                        |path| vec![vec![normalize_path(&format!("{parent_dir}{path}"))]],
-                    );
                     found.push(ChildModule {
+                        candidates: mod_candidates(module, parent_dir, child_dir, &name),
                         name,
-                        candidates,
                         test_gated: item_gated,
                     });
                 }
             }
-            // The three shapes a function-like body comes in: a free function, a method
-            // in an `impl` block, and a trait's own default method. Each is gated the
-            // same way an inline module is — an enclosing `#[cfg(test)]`, on the
-            // function itself or inherited from `gated`, marks whatever `mod` it
-            // declares as test-only rather than hiding it from the walk entirely, for
-            // the reason the module doc gives.
             syn::Item::Fn(function) => {
                 let item_gated = gated || has_cfg_test(&function.attrs);
                 collect_child_modules(
@@ -2088,35 +2199,60 @@ fn collect_child_modules<'a>(
             }
             syn::Item::Impl(implementation) => {
                 let impl_gated = gated || has_cfg_test(&implementation.attrs);
-                for member in &implementation.items {
-                    if let syn::ImplItem::Fn(method) = member {
-                        let method_gated = impl_gated || has_cfg_test(&method.attrs);
+                for (member_gated, items) in impl_member_bodies(implementation, impl_gated) {
+                    collect_child_modules(items, parent_dir, child_dir, member_gated, found);
+                }
+            }
+            syn::Item::Trait(trait_item) => {
+                let trait_gated = gated || has_cfg_test(&trait_item.attrs);
+                for (member_gated, items) in trait_member_bodies(trait_item, trait_gated) {
+                    collect_child_modules(items, parent_dir, child_dir, member_gated, found);
+                }
+            }
+            syn::Item::Const(constant) => {
+                let item_gated = gated || has_cfg_test(&constant.attrs);
+                collect_child_modules(
+                    expr_items(&constant.expr),
+                    parent_dir,
+                    child_dir,
+                    item_gated,
+                    found,
+                );
+            }
+            syn::Item::Static(statik) => {
+                let item_gated = gated || has_cfg_test(&statik.attrs);
+                collect_child_modules(
+                    expr_items(&statik.expr),
+                    parent_dir,
+                    child_dir,
+                    item_gated,
+                    found,
+                );
+            }
+            syn::Item::Enum(enum_item) => {
+                let enum_gated = gated || has_cfg_test(&enum_item.attrs);
+                for variant in &enum_item.variants {
+                    if let Some((_, expr)) = &variant.discriminant {
+                        let variant_gated = enum_gated || has_cfg_test(&variant.attrs);
                         collect_child_modules(
-                            block_items(&method.block),
+                            expr_items(expr),
                             parent_dir,
                             child_dir,
-                            method_gated,
+                            variant_gated,
                             found,
                         );
                     }
                 }
             }
-            syn::Item::Trait(trait_item) => {
-                let trait_gated = gated || has_cfg_test(&trait_item.attrs);
-                for member in &trait_item.items {
-                    if let syn::TraitItem::Fn(method) = member {
-                        if let Some(block) = &method.default {
-                            let method_gated = trait_gated || has_cfg_test(&method.attrs);
-                            collect_child_modules(
-                                block_items(block),
-                                parent_dir,
-                                child_dir,
-                                method_gated,
-                                found,
-                            );
-                        }
-                    }
-                }
+            syn::Item::Type(type_item) => {
+                let item_gated = gated || has_cfg_test(&type_item.attrs);
+                collect_child_modules(
+                    type_items(&type_item.ty),
+                    parent_dir,
+                    child_dir,
+                    item_gated,
+                    found,
+                );
             }
             _ => {}
         }

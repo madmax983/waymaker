@@ -11410,6 +11410,116 @@ mod tests {
     }
 
     #[test]
+    fn a_path_module_declared_inside_a_const_initializer_block_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 18: a `mod` can sit
+        // inside a `const`/`static` initializer's own block — `const _: () = {
+        // #[path = "..."] mod clone_impl; };` — which `collect_child_modules` could
+        // not see at all: it read only `Item::Mod`, `Item::Fn`, `Item::Impl` and
+        // `Item::Trait`, so the child file was never even reached, and neither a
+        // handwritten impl nor a macro inside it could be checked.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "const _: () = {\n",
+            "    #[path = \"recovery/clone_impl.rs\"]\n",
+            "    mod clone_impl;\n",
+            "};\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_enum_discriminant_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 18: a non-local
+        // `impl` can sit inside an enum variant's discriminant expression — legal
+        // Rust exactly the way one inside a `const` initializer's own block already
+        // was (round 17) — and the shared `nested_body_items` helper read only
+        // `Item::Const`/`Item::Static` at the time, not `Item::Enum`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    A = {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        1\n",
+                "    },\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_type_alias_array_length_block_is_rejected() {
+        // The other block-bearing shape round 18 found: an array type's length can
+        // be a block, and a type alias's own type is exactly where one can be
+        // buried.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type T = [(); {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    1\n",
+                "}];\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

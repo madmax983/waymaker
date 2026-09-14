@@ -3222,7 +3222,23 @@ misreport the workspace as `Ambiguous`. `ChildModule::candidates` is now grouped
 flat: each group (the natural pair, or one `cfg_attr` target) resolves independently to at
 most one file, and every group's resolution is scanned rather than requiring exactly one
 across the whole thing — ambiguous only when rustc itself would reject one group, never
-because two different builds legally pick two different files.
+because two different builds legally pick two different files. Round 18 found two more, both
+the same shape as round 17's `const`/`static` finding one level over. `collect_child_modules`
+— the module-tree walk that discovers an out-of-line child file at all, which round 17 left
+with its own Fn/Impl/Trait descent rather than the shared `nested_body_items` because it has
+to carry a `test_gated` flag `nested_body_items` throws away — still read only those three
+item shapes, so a `mod` declared inside a `const`/`static` initializer's own block, an enum
+variant's discriminant, or a type alias's array-length expression was never even reached: the
+child file existed on disk and nothing scanned it, which is a more severe gap than an
+unresolved self-type inside a file that was reached. And `nested_body_items` itself — the
+Clone-detection scanners' shared descent — covered `Item::Const`/`Item::Static` since round 17
+but not `Item::Enum`'s discriminants or `Item::Type`'s own type, so an `impl Clone for
+super::Recovery` buried in either shape reached neither `collect_type_aliases` nor
+`collect_trait_implementors`. Both are fixed the same way: `collect_child_modules` gained its
+own `Const`/`Static`/`Enum`/`Type` arms (each verified against a real, compiling bypass — a
+`mod` behind `#[path]` inside a `const _: () = { .. };`, reached and flagged, where round 17's
+own fix left it unreached), and `nested_body_items` gained `Enum` and `Type` arms via a new
+shared `type_items` helper, mirroring `block_items`/`expr_items`.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
