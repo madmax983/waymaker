@@ -15463,6 +15463,36 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_with_super_to_a_single_ancestor_constant_is_reported() {
+        // Codex's twentieth-round finding: `resolve_qualified_path` refused any chain whose
+        // segments, after removing leading `super`s, numbered fewer than two — right for a
+        // module-qualified reference (`super::indices::P0`), and wrong for `super::P0`
+        // itself, which names a plain constant declared directly in the ancestor module
+        // rather than inside a further-named module of its own. `resolve_qualified_path`'s
+        // map has no entry for such a constant at all, since only a module's *own* consts
+        // get a qualified key when `visit_item_mod` records them — a bare `const P0` at the
+        // file root is never inserted into `qualified` under any name. The fix resolves a
+        // single trailing segment after `super` the same way a bare identifier is: against
+        // the live scope stack, which already holds it regardless of how many `super`s it
+        // took to name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nmod child {\n    const fn qualified_constant_pattern_table(nibble: u8) \
+             -> u32 {\n        match nibble & 0xF {\n            super::P0 => 0,\n            \
+             super::P1 => 1,\n            super::P2 => 2,\n            super::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_singleton_range_patterns_is_reported() {
         // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
         // `Pat::Range`, including an inclusive range whose two ends are the same integer —

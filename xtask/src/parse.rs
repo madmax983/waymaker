@@ -1955,6 +1955,23 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             if relevant.len() == 1 {
                 return relevant.first().and_then(|name| scopes.resolve(name));
             }
+            // Codex's finding: one or more leading `super`s followed by exactly one more
+            // segment (`super::P0`) names a plain constant declared directly in an
+            // ancestor module, not a further-qualified `module::name` chain —
+            // `resolve_qualified_path`'s map has no entry for a constant that was never
+            // itself nested in a named module of its own, and `qualified_constants_with_prefix`
+            // has nothing else to have recorded it under. The live scope stack already
+            // holds every ancestor's own constants regardless of how many `super`s it took
+            // to name one, so the remaining single name is resolved the same way a bare
+            // identifier is.
+            let after_super: Vec<&str> = relevant
+                .iter()
+                .copied()
+                .skip_while(|segment| *segment == "super")
+                .collect();
+            if after_super.len() == 1 {
+                return after_super.first().and_then(|name| scopes.resolve(name));
+            }
             resolve_qualified_path(path, qualified, module_path)
         };
         let selector = node.expr.to_token_stream().to_string();
