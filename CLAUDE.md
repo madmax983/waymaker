@@ -3215,38 +3215,30 @@ own rewrite for issue #51 had already closed this — `crate::parse::declares_te
 test function's own attributes through `syn` and refuses `#[cfg_attr(..)]` the same way —
 but no regression test drove that specific attribute through `failure-matrix`'s own check,
 and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested
-gap. Both now do: `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` and
-`a_test_that_does_not_run_is_not_a_test` each drive a `#[cfg_attr(all(), ignore)]` row test
-through the real check and require the refusal.
+gap. `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` now does.
 
-Review of this change found a second, real gap in `book`'s own scanner while proving the
-first one closed: it read a raw line and matched a *prefix* — `"#[cfg_attr("` — so
-`#[ cfg_attr(all(), ignore) ]`, `#[cfg_attr (all(), ignore)]` and a raw-identifier spelling,
-`#[r#cfg_attr(all(), ignore)]`, all compile, all skip, and none matched the prefix; the same
-held for `#[ignore]` and `#[cfg(..)]`. `skips_execution` now parses the collected attribute
-line with `syn::Attribute::parse_outer` and reads its path's identifier — the same `unraw`
-comparison `crate::parse::ident_is` uses — so a legal spelling rustc accepts is a spelling
-this scanner sees, whatever the whitespace or the raw marker. The positive `#[test]` match
-stays a literal string: over-refusing an unusually spelled `#[test]` is the fail-closed
-direction, and the book's own samples are written, not adversarial. Both bugs are one
-invariant — a row test that runs is the only kind allowed to vouch for its row — so the
-fix for the second rides this issue's PR rather than a second one; the parametrized test
-above grew the seven cases that prove it.
+`book`'s own scanner turned out to need more than a test. It was a hand-written line scan —
+collect the lines above a `fn name(` that look like attributes, reset on anything that does
+not, refuse if `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]` is one of them by *prefix* —
+and across four Codex review rounds on this PR it lost every one of those four ways: a
+spelling with extra whitespace or a raw-identifier marker never matched the prefix; two
+attributes sharing one line hid the second behind the first a patched version checked; an
+attribute spanning several lines lost its own continuation to the "reset on anything that
+does not look like an attribute" rule; and once that was patched with a bracket count, a
+delimiter character inside a string literal — `doc = ")]"` — closed the count early and let
+the same multi-line trick back in. Four patches to one heuristic is four attempts to
+reimplement enough of Rust's grammar to answer "is this really `#[cfg_attr(..)]`" by hand,
+which is the mistake: `crate::parse::declares_test` never had any of these four bugs, because
+a real parser has no such thing as a line or a bracket count.
 
-Codex found a third on the same PR: `parse_outer` returns every outer attribute on a line,
-and the first version of `skips_execution` read only `parsed.first()` — so
-`#[allow(dead_code)] #[cfg_attr(all(), ignore)]`, two attributes on one line, hid the second
-behind the first. `skips_execution` now checks every parsed attribute rather than the first
-one.
-
-Codex found a fourth: `declares_test` reset its whole run on any line that did not open with
-`#[`, so `#[cfg_attr(\n  all(), ignore\n)]` — legal, and still skipping — lost its own
-continuation lines to that reset and left only the `#[test]` after it standing. A
-line-by-line scan cannot see that an attribute is still open without counting the brackets
-that opened it, so it now does: `bracket_balance` sums `(`/`[`/`{` against `)`/`]`/`}` across
-each line, and a run whose balance has not returned to zero appends the next line to the
-attribute in progress instead of judging it alone or discarding it. `crate::parse::declares_test`
-never had this bug — a real parser has no such thing as a line — which is the argument for
-moving `book`'s scanner onto `syn` structurally rather than patching the heuristic a fourth
-time, and is worth doing the day this scanner needs another patch. No new ADR: nothing here
-moves a must-not-own cell, a dependency edge, or a rule id.
+`book`'s `declares_test` now asks `syn` the same way: [`crate::parse::fns_matching`] — the
+same structural lookup the `failure-matrix` scanner already uses, made `pub(crate)` for this
+— finds the function by name and hands back its real attributes, and every attribute is
+checked regardless of order, line breaks, whitespace, a raw-identifier marker, or what a
+string literal inside it happens to contain. The line index the caller still needs, to check
+the test sits inside its anchor, is found by an unrelated plain-text search — a *shape*
+question about the page, answered the same simple way as before, kept apart from the *does
+this run* question a parser now answers. The parametrized test grew eleven cases across the
+four rounds, one or more per bug found, and every earlier one still passes unmodified against
+the `syn`-based scanner. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
+or a rule id.

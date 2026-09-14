@@ -1123,7 +1123,7 @@ pub fn fns_named(contents: &str, name: &str) -> Vec<NamedFn> {
 /// [`fns_named`] is the production view. [`declares_test`] passes `true`: a `#[cfg(test)]`
 /// on the enclosing module must not disqualify a test declaration, exactly as the old
 /// scan read only the attribute block above the `fn`.
-fn fns_matching(contents: &str, name: &str, include_test_gated: bool) -> Vec<NamedFn> {
+pub(crate) fn fns_matching(contents: &str, name: &str, include_test_gated: bool) -> Vec<NamedFn> {
     let Ok(file) = parse_rust(contents) else {
         return Vec::new();
     };

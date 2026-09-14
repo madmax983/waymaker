@@ -718,92 +718,62 @@ fn anchors(sample: &str) -> Vec<Anchor> {
     found
 }
 
-/// True if `attribute` carries `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]`, under any
-/// legal spelling, anywhere in it.
-///
-/// Parsed with `syn` rather than matched by prefix (issue #97 follow-up): `#[ cfg_attr(..) ]`,
-/// `#[cfg_attr (..)]` and `#[r#cfg_attr(..)]` all name the same attribute rustc does, and a
-/// prefix match on `"#[cfg_attr("` sees none of them. A line `syn` cannot parse as an
-/// attribute names nothing here — it is not one of the three, whatever it is.
-///
-/// `syn::Attribute::parse_outer` returns every outer attribute on the line, not only the
-/// first: `#[allow(dead_code)] #[cfg_attr(all(), ignore)]` is two attributes on one line, and
-/// checking only the first one missed the second (Codex, review round 2 of issue #97).
-fn skips_execution(attribute: &str) -> bool {
-    use syn::parse::Parser as _;
-    let Ok(parsed) = syn::Attribute::parse_outer.parse_str(attribute) else {
-        return false;
-    };
-    parsed.iter().any(|attribute| {
-        attribute.path().get_ident().is_some_and(|ident| {
-            matches!(
-                ident.unraw().to_string().as_str(),
-                "ignore" | "cfg" | "cfg_attr"
-            )
-        })
-    })
-}
-
-/// The running total of `(`, `[` and `{` in `text` minus `)`, `]` and `}`.
-///
-/// An attribute is still open while this is above zero: `#[cfg_attr(` alone is `+2` (one for
-/// each of `[` and `(`), and only the line carrying the matching `)]` brings a line-by-line
-/// running total back to the zero an attribute starts and ends at.
-fn bracket_balance(text: &str) -> i32 {
-    text.chars()
-        .map(|character| match character {
-            '(' | '[' | '{' => 1,
-            ')' | ']' | '}' => -1,
-            _ => 0,
-        })
-        .sum()
-}
-
 /// Where `sample` declares `#[test] fn name(`, or why it does not.
 ///
-/// The whole contiguous attribute run before the function is read, in both directions:
-/// attribute order is free, and review of this change put `#[ignore]` *above* the anchor
-/// marker, where a reader of the book never sees it and the test never runs.
+/// Parsed structurally with `syn` rather than scanned line by line (issue #97, Codex review
+/// rounds 1 through 4): a line-based scan has to reinvent enough of Rust's grammar to answer
+/// "is this attribute really `#[cfg_attr(..)]`" that it kept losing — whitespace inside the
+/// attribute, a raw-identifier marker, two attributes sharing a line, an attribute spanning
+/// several lines, and a delimiter character sitting inside a string literal a naive bracket
+/// count cannot tell from a real one. `syn` has already solved all of that; asking it again
+/// each round was the mistake. [`crate::parse::fns_matching`] is the same structural lookup
+/// `crate::parse::declares_test` already uses for the `failure-matrix` rule, with
+/// `include_test_gated: true` for the same reason: a `#[cfg(test)]` on the enclosing module
+/// must not disqualify a test declaration.
 ///
-/// An attribute spanning several lines is read as one (Codex, review round 3 of issue #97):
-/// `#[cfg_attr(\n  all(), ignore\n)]` is legal and still skips the test it decorates, and a
-/// scan that reset its run on every line without a leading `#[` read the continuation lines
-/// as unrelated code, dropped the attribute, and let the `#[test]` below it vouch alone.
-/// [`bracket_balance`] tracks whether an attribute opened on an earlier line is still open,
-/// and a still-open line is appended to the attribute in progress rather than judged alone.
+/// Attribute order is free, and review of this change put `#[ignore]` *above* the anchor
+/// marker, where a reader of the book never sees it and the test never runs — `syn` reads
+/// every attribute on the function regardless of where it sits, so order was never actually
+/// load-bearing here.
+///
+/// The line index returned on success is found by a plain text search, kept deliberately
+/// separate from the parse above: it exists only to check the test sits inside its anchor's
+/// line range, which is a *shape* question about the page, not a *does this run* one.
 fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
     let opening = format!("fn {name}(");
-    let mut run: Vec<String> = Vec::new();
-    let mut open = 0;
-    for (at, line) in sample.lines().enumerate() {
-        let trimmed = line.trim();
-        if open == 0 && trimmed.starts_with(&opening) {
-            if !run.iter().any(|attribute| attribute == "#[test]") {
-                run.clear();
-                continue;
-            }
-            if let Some(refused) = run.iter().find(|attribute| skips_execution(attribute)) {
+    let Some(at) = sample
+        .lines()
+        .position(|line| line.trim().starts_with(&opening))
+    else {
+        return Err(format!("declares no `#[test] fn {name}`"));
+    };
+    let Some(function) = crate::parse::fns_matching(sample, name, true)
+        .into_iter()
+        .next()
+    else {
+        return Err(format!("declares no `#[test] fn {name}`"));
+    };
+    let mut tested = false;
+    for attribute in &function.attrs {
+        let Some(ident) = attribute.path().get_ident() else {
+            continue;
+        };
+        match ident.unraw().to_string().as_str() {
+            "test" => tested = true,
+            "ignore" | "cfg" | "cfg_attr" => {
                 return Err(format!(
-                    "carries `{refused}`, so the test does not run and the sample the book \
-                     shows is compiled or executed by nothing"
+                    "carries `#[{}]`, so the test does not run and the sample the book shows \
+                     is compiled or executed by nothing",
+                    ident.unraw()
                 ));
             }
-            return Ok(at);
-        }
-        if open > 0 {
-            if let Some(last) = run.last_mut() {
-                last.push(' ');
-                last.push_str(trimmed);
-            }
-            open += bracket_balance(trimmed);
-        } else if trimmed.starts_with("#[") {
-            run.push(trimmed.to_owned());
-            open += bracket_balance(trimmed);
-        } else if !(trimmed.is_empty() || trimmed.starts_with("//")) {
-            run.clear();
+            _ => {}
         }
     }
-    Err(format!("declares no `#[test] fn {name}`"))
+    if !tested {
+        return Err(format!("declares no `#[test] fn {name}`"));
+    }
+    Ok(at)
 }
 
 /// Every link target a summary names that is not an absolute URL.
@@ -2566,6 +2536,10 @@ mod tests {
             // Codex, review round 3 of issue #97: an attribute broken over several lines
             // must not lose the run that came before it.
             "#[cfg_attr(\n    all(),\n    ignore\n)]",
+            // Codex, review round 4 of issue #97: a delimiter character inside a string
+            // literal is not a real delimiter, and a line-based bracket count could not
+            // tell the two apart.
+            "#[cfg_attr(\n    all(),\n    doc = \")]\",\n    ignore\n)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(
