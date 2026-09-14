@@ -4159,7 +4159,7 @@ pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
 }];
 
 /// The one call each top-level checksum's body must make into the helper its polynomial
-/// now lives in, and how many times.
+/// now lives in, with which nibble-extraction argument and how many times.
 ///
 /// ADR 0044 moved each polynomial out of `crc16`/`crc32` and into a per-nibble helper, so
 /// [`INTEGRITY_CHECK_PARAMETERS`] pinning the helper's own body only proves the helper
@@ -4174,17 +4174,26 @@ pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
 pub struct ChecksumRoute {
     /// The top-level checksum function, by name.
     pub function: &'static str,
-    /// The exact update statement the routed call must appear as — not merely present
-    /// somewhere in the body. Codex found that a bare call count is satisfied by
-    /// `let _ = helper(0);` twice, discarded, beside a return value computed some other
-    /// way, so this pins the whole assignment: which variable is updated, with which
-    /// shift, and that the routed call is the other side of the xor.
-    pub statement: &'static str,
-    /// How many times — two, for both rows: a byte is two nibbles.
-    pub occurrences: usize,
+    /// The call every nibble update must route through, up to and including its opening
+    /// parenthesis — used only to count *how many times* the helper is called in total, so
+    /// a third, unaccounted-for call cannot hide behind [`updates`](Self::updates) being
+    /// satisfied.
+    pub call: &'static str,
+    /// The exact update statement each nibble's fold must appear as, in order — not merely
+    /// a call to the helper somewhere in the body. Codex found this gap twice over. First,
+    /// that a bare call count is satisfied by `let _ = helper(0);` twice, discarded, beside
+    /// a return value computed some other way — closed by pinning the whole assignment:
+    /// which variable is updated and with which shift. Second, sharper, that pinning the
+    /// assignment only up to the call's opening parenthesis still lets both nibble updates
+    /// pass the *same* literal argument — `helper(0)` for both the high and low halves —
+    /// which routes into the helper the pinned number of times and updates the pinned
+    /// variable, while computing a different table lookup than the real fold. Each entry
+    /// here is therefore the complete statement pair for one nibble — its extraction and
+    /// the call it feeds, argument included — checked in this order against the body.
+    pub updates: &'static [&'static str],
     /// The function's own last statement, exactly as source spells it — tying the
-    /// variable `statement` updates to what the function actually returns, so a body that
-    /// updates it correctly and then returns something else is still caught.
+    /// variable [`updates`](Self::updates) updates to what the function actually returns,
+    /// so a body that updates it correctly and then returns something else is still caught.
     pub returns: &'static str,
 }
 
@@ -4194,14 +4203,20 @@ pub struct ChecksumRoute {
 pub const INTEGRITY_CHECK_ROUTING: &[ChecksumRoute] = &[
     ChecksumRoute {
         function: "crc16",
-        statement: "crc = (crc << 4) ^ crc16_nibble(",
-        occurrences: 2,
+        call: "crc16_nibble(",
+        updates: &[
+            "let hi = (((crc >> 12) as u8) ^ (*byte >> 4)) & 0xF; crc = (crc << 4) ^ crc16_nibble(hi);",
+            "let lo = (((crc >> 12) as u8) ^ (*byte & 0xF)) & 0xF; crc = (crc << 4) ^ crc16_nibble(lo);",
+        ],
         returns: "crc",
     },
     ChecksumRoute {
         function: "crc32",
-        statement: "crc = (crc >> 4) ^ crc32_nibble_table(",
-        occurrences: 2,
+        call: "crc32_nibble_table(",
+        updates: &[
+            "let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ crc32_nibble_table(lo as u8);",
+            "let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; crc = (crc >> 4) ^ crc32_nibble_table(hi as u8);",
+        ],
         returns: "crc ^ 0xFFFF_FFFF",
     },
 ];
@@ -8347,6 +8362,21 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     // under `#[cfg(test)]` is not what this is pinned against.
     violations.extend(check_integrity_check_tables(&code));
 
+    violations.extend(check_integrity_check_module_tree(sources, source));
+    violations
+}
+
+/// The array ban and the dense-match-table scan, both walked across the checksum module's
+/// whole tree rather than the single named function [`check_integrity_check_tables`] pins —
+/// factored out to keep `check_integrity_check` under clippy's line count.
+fn check_integrity_check_module_tree(
+    sources: &[crate::size::LayerSource],
+    source: &crate::size::LayerSource,
+) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+    let mut violations = Vec::new();
+
     // The checksum module and anything it is split into. Codex asked for this on PR #58:
     // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
     // rule that read one file would have called it absent.
@@ -8366,6 +8396,15 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
             vec![source]
         }
     };
+    // Codex found a second gap in the same review: the check above only ever looks inside
+    // the one function name `INTEGRITY_CHECK_TABLES` pins, so a second dense match — calling
+    // the same helper from a function of its own, or an unrelated one calling something
+    // else entirely — passes every rule here. This scan is shape-derived rather than
+    // name-derived, the way `SEALING_FUNCTIONS`'s own routing scan is: every `match` in the
+    // tree is a candidate, and one is only excused when it is, exactly, the one table
+    // `INTEGRITY_CHECK_TABLES` names — counted, so a byte-identical copy under a second
+    // function name is still a second table rather than a coincidence.
+    let mut allowed_table_hits = vec![0_usize; INTEGRITY_CHECK_TABLES.len()];
     for scanned in scanned_sources {
         let scanned_code = without_test_modules(&code_only(&scanned.contents));
         for name in array_items(&scanned_code) {
@@ -8381,6 +8420,51 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
                      second one, spelled as an array, is still a superseding ADR, not an \
                      optimisation",
                     scanned.path.replace('\\', "/")
+                ),
+            ));
+        }
+
+        for (selector, arms) in match_expressions(&scanned_code) {
+            let Some((callee, arm_count)) = dense_table_shape(arms) else {
+                continue;
+            };
+            let pinned = INTEGRITY_CHECK_TABLES.iter().position(|table| {
+                table.selector == selector
+                    && table.helper == callee
+                    && usize::from(table.arms) == arm_count
+            });
+            match pinned {
+                Some(index) => {
+                    if let Some(count) = allowed_table_hits.get_mut(index) {
+                        *count += 1;
+                    }
+                }
+                None => violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} declares a {arm_count}-arm dense match over `{selector}` calling \
+                         `{callee}`, which LLVM compiles into a lookup table the same way \
+                         `INTEGRITY_CHECK_TABLES` pins `crc32_nibble_table` — and this one is \
+                         not in that table, so ADR 0044's superseding decision does not cover \
+                         it; a second table is still a decision, not an optimisation",
+                        scanned.path.replace('\\', "/")
+                    ),
+                )),
+            }
+        }
+    }
+    for (table, count) in INTEGRITY_CHECK_TABLES.iter().zip(&allowed_table_hits) {
+        if *count != 1 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "the checksum module's own tree declares {count} dense match(es) shaped \
+                     like `{}`'s pinned table rather than exactly one — a second copy \
+                     anywhere in the tree is still a second 64 B table, whatever function \
+                     holds it",
+                    table.function
                 ),
             ));
         }
@@ -8431,6 +8515,19 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
         }
     }
 
+    violations.extend(check_integrity_check_routing(code));
+    violations
+}
+
+/// [`INTEGRITY_CHECK_ROUTING`]'s half of `check_integrity_check_tables`, factored out to
+/// keep that function under clippy's line count: for each routed checksum, verifies its
+/// `function` body calls the helper the pinned number of times, contains every pinned
+/// nibble update exactly once and in order, and ends with the pinned return expression.
+fn check_integrity_check_routing(code: &str) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
     for route in INTEGRITY_CHECK_ROUTING {
         let header = format!("fn {}", route.function);
         let Some(body) = braced_body(code, &header) else {
@@ -8444,20 +8541,69 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
             ));
             continue;
         };
-        let found = count_prefixes(body, route.statement);
-        if found != route.occurrences {
+        let found = count_prefixes(body, route.call);
+        if found != route.updates.len() {
             violations.push(Violation::new(
                 RULE,
                 ADAPTER,
                 format!(
-                    "`{}` in {INTEGRITY_CHECK_PATH} does not contain `{}` exactly {} \
-                     time(s) — found {found}. A checksum that stopped routing into the \
-                     helper its polynomial lives in could compute anything and still pass \
+                    "`{}` in {INTEGRITY_CHECK_PATH} calls `{}` {found} time(s) where the \
+                     pinned nibble updates call it exactly {} — a checksum that stopped \
+                     routing into the helper its polynomial lives in, or added a call \
+                     nothing here accounts for, could compute anything and still pass \
                      every other check here",
-                    route.function, route.statement, route.occurrences
+                    route.function,
+                    route.call,
+                    route.updates.len()
                 ),
             ));
         }
+
+        let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized_body = normalize(body);
+        let mut previous_index = None;
+        for update in route.updates {
+            let normalized_update = normalize(update);
+            match (
+                normalized_body.matches(normalized_update.as_str()).count(),
+                normalized_body.find(normalized_update.as_str()),
+            ) {
+                (1, Some(index)) => {
+                    if previous_index.is_some_and(|previous| index < previous) {
+                        violations.push(Violation::new(
+                            RULE,
+                            ADAPTER,
+                            format!(
+                                "`{}` in {INTEGRITY_CHECK_PATH} performs its pinned nibble \
+                                 updates out of order — the high and low halves fold in a \
+                                 specific order and a body that performs them in the other \
+                                 one computes a different checksum",
+                                route.function
+                            ),
+                        ));
+                    }
+                    previous_index = Some(index);
+                }
+                (found, _) => {
+                    violations.push(Violation::new(
+                        RULE,
+                        ADAPTER,
+                        format!(
+                            "`{}` in {INTEGRITY_CHECK_PATH} does not contain the pinned \
+                             nibble update `{update}` exactly once — found {found}. Codex \
+                             found that a routing pin ending at the call's opening \
+                             parenthesis lets both nibble updates pass the same literal \
+                             argument, which routes into the helper the pinned number of \
+                             times and updates the pinned variable while computing a \
+                             different table lookup; pinning the whole extraction and its \
+                             argument is what stops that",
+                            route.function
+                        ),
+                    ));
+                }
+            }
+        }
+
         if !body_ends_with(body, route.returns) {
             violations.push(Violation::new(
                 RULE,
@@ -8530,6 +8676,188 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
     // this match and nothing else, so nothing is lost by requiring the whole of it.
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     normalize(body) == normalize(&expected)
+}
+
+/// The minimum number of arms a `match` needs before [`dense_table_shape`] will call it
+/// table-shaped.
+///
+/// [`INTEGRITY_CHECK_TABLES`]'s one entry has sixteen. This module's own doc comment says
+/// it owns "two functions... and the per-nibble helpers each is built from" and nothing
+/// else, so any dense integer match here is suspect; three explicit arms plus a wildcard is
+/// low enough to catch a small proof-of-concept table without also flagging a two-arm match
+/// that happens to have integer patterns for an unrelated reason.
+const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
+
+/// Every `match <selector> { <arms> }` in `code`, both parts verbatim and in the order they
+/// appear.
+///
+/// Text-scanned rather than parsed with `syn`, the same way [`braced_body`] finds a named
+/// item's body: `match` is matched at a token boundary and the arm block is the first
+/// brace-balanced `{ ... }` that follows, which is exact for the simple scrutinees this
+/// module's functions use (`nibble & 0xF`, no braces of their own) and is what
+/// [`dense_table_shape`] is checked against rather than assumed sound on anything wilder.
+#[must_use]
+fn match_expressions(code: &str) -> Vec<(&str, &str)> {
+    const KEYWORD: &str = "match";
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+
+    let mut found = Vec::new();
+    let mut cursor = 0_usize;
+    while let Some(relative) = code.get(cursor..).and_then(|rest| rest.find(KEYWORD)) {
+        let index = cursor + relative;
+        let Some(after_keyword) = code.get(index + KEYWORD.len()..) else {
+            break;
+        };
+        let before_boundary = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        let after_boundary = after_keyword
+            .chars()
+            .next()
+            .is_none_or(|character| !continues(character));
+        cursor = index + KEYWORD.len();
+        if !(before_boundary && after_boundary) {
+            continue;
+        }
+        let Some(open_relative) = after_keyword.find('{') else {
+            continue;
+        };
+        let (Some(selector), Some(after_open)) = (
+            after_keyword.get(..open_relative),
+            after_keyword.get(open_relative + 1..),
+        ) else {
+            continue;
+        };
+
+        let mut depth = 1_u32;
+        let mut end = None;
+        for (offset, character) in after_open.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(arms) = end.and_then(|end| after_open.get(..end)) else {
+            continue;
+        };
+        found.push((selector.trim(), arms));
+    }
+    found
+}
+
+/// `text`, split on its own top-level occurrences of `separator` — one that sits outside
+/// any `(...)`, `[...]` or `{...}` nesting the text opens.
+///
+/// A `match` arm's own expression can itself hold a call with a comma-separated argument
+/// list, so a plain [`str::split`] would cut an arm in the wrong place; this is what
+/// [`parse_dense_arms`] uses instead to find the commas that actually separate arms.
+#[must_use]
+fn split_top_level(text: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_i32;
+    let mut start = 0_usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            candidate if candidate == separator && depth == 0 => {
+                if let Some(part) = text.get(start..index) {
+                    parts.push(part);
+                }
+                start = index + candidate.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(part) = text.get(start..) {
+        parts.push(part);
+    }
+    parts
+}
+
+/// One parsed `match` arm of the shape [`dense_table_shape`] permits: `pattern =>
+/// callee(argument)`.
+struct DenseArm<'a> {
+    pattern: &'a str,
+    callee: &'a str,
+    argument: &'a str,
+}
+
+/// Parses `arms` as a sequence of [`DenseArm`]s, or `None` the moment one segment is not
+/// that one shape — a body with any other kind of arm, or any statement that is not an arm
+/// at all, is not a `match` [`dense_table_shape`] has any business calling a table.
+#[must_use]
+fn parse_dense_arms(arms: &str) -> Option<Vec<DenseArm<'_>>> {
+    let mut parsed = Vec::new();
+    for segment in split_top_level(arms, ',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let (pattern, expression) = segment.split_once("=>")?;
+        let pattern = pattern.trim();
+        let expression = expression.trim();
+        let open = expression.find('(')?;
+        if !expression.ends_with(')') {
+            return None;
+        }
+        let callee = expression.get(..open)?.trim();
+        if callee.is_empty() || !callee.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let argument = expression.get(open + 1..expression.len() - 1)?.trim();
+        parsed.push(DenseArm {
+            pattern,
+            callee,
+            argument,
+        });
+    }
+    Some(parsed)
+}
+
+/// Whether `arms` has the shape ADR 0044 permits a `match` to compile into a lookup table:
+/// literal patterns `0` through `n - 2` in order, a final wildcard arm, one callee named
+/// throughout, and every argument the same number as its own arm's pattern. Returns the
+/// callee and the arm count when it is, so a caller can compare that pair against
+/// [`INTEGRITY_CHECK_TABLES`] without caring which function, or which selector, the match
+/// happens to sit under — the shape is what ADR 0044 gated, not a name.
+///
+/// Codex found, on review of the pull request that added [`INTEGRITY_CHECK_TABLES`], that
+/// the table check only ever looked inside the one function name it is pinned to: a second
+/// dense match calling the same helper from a function of its own — or an unrelated one
+/// calling something else entirely — passed every rule here. This is the shape half of the
+/// fix; [`check_integrity_check`] is what refuses anything this returns `Some` for unless it
+/// is the one table [`INTEGRITY_CHECK_TABLES`] names, and refuses that one more than once.
+#[must_use]
+fn dense_table_shape(arms: &str) -> Option<(&str, usize)> {
+    let parsed = parse_dense_arms(arms)?;
+    if parsed.len() < MINIMUM_DENSE_TABLE_ARMS {
+        return None;
+    }
+    let callee = parsed.first()?.callee;
+    let last = parsed.len().checked_sub(1)?;
+    for (index, arm) in parsed.iter().enumerate() {
+        if arm.callee != callee {
+            return None;
+        }
+        let expected_pattern = if index == last {
+            "_".to_string()
+        } else {
+            index.to_string()
+        };
+        if arm.pattern != expected_pattern || arm.argument != index.to_string() {
+            return None;
+        }
+    }
+    Some((callee, parsed.len()))
 }
 
 /// The checksum module, every file its module tree reaches, and every source under a
@@ -14400,18 +14728,51 @@ mod deferred_answer_pins {
         // Codex, on review of the pull request that introduced `crc16_nibble`/
         // `crc32_nibble`: pinning the helper's own body proves the helper still computes
         // with the right polynomial, but nothing tied the top-level function to it. A
-        // `crc32` rewritten to call something else, leaving `crc32_nibble_table` sitting
-        // unused beside it, has to be reported even though `crc32_nibble_table` itself is
-        // untouched and still matches its own pin. `some_other_function` rather than a
-        // literal, so this is only ever the routing pin's finding and not also a changed
-        // literal count.
-        let source = tests_support::clean_checksum_module()
-            .replace("crc32_nibble_table(0)", "some_other_function(0)");
+        // `crc32` rewritten to call something else for one of its two nibbles, leaving
+        // `crc32_nibble_table` sitting unused for that half, has to be reported even
+        // though `crc32_nibble_table` itself is untouched and still matches its own pin.
+        // `some_other_function` rather than a literal, so this is only ever the routing
+        // pin's finding and not also a changed literal count.
+        let source = tests_support::clean_checksum_module().replacen(
+            "crc32_nibble_table(",
+            "some_other_function(",
+            1,
+        );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations.iter().any(|violation| violation
                 .detail
-                .contains("does not contain `crc = (crc >> 4) ^ crc32_nibble_table(`")),
+                .contains("calls `crc32_nibble_table(` 1 time(s)")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_argument_across_both_nibble_updates_is_reported() {
+        // Codex's third-round finding: the routing pin used to end each pinned statement
+        // at the call's opening parenthesis, so `crc32_nibble_table(0)` for both the high
+        // and the low nibble called the helper the pinned number of times, updated `crc`
+        // with it, and left the function's tail untouched — while reading the wrong
+        // nibble for one half of every byte, since the real fold extracts a distinct `lo`
+        // or `hi` argument from the byte and the running checksum rather than a constant.
+        // Pinning the complete extraction and its argument is what catches a body that
+        // routes into the helper correctly but folds the wrong nibble into it.
+        let source = tests_support::clean_checksum_module()
+            .replace(
+                "let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ \
+                 crc32_nibble_table(lo as u8);",
+                "crc = (crc >> 4) ^ crc32_nibble_table(0);",
+            )
+            .replace(
+                "let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; crc = (crc >> 4) ^ \
+                 crc32_nibble_table(hi as u8);",
+                "crc = (crc >> 4) ^ crc32_nibble_table(0);",
+            );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("does not contain the pinned nibble update")),
             "{violations:?}"
         );
     }
@@ -14438,22 +14799,67 @@ mod deferred_answer_pins {
     #[test]
     fn a_discarded_routing_call_is_reported_even_though_the_tail_is_unchanged() {
         // Codex's sharper version of the routing finding, on the revision that first
-        // added `INTEGRITY_CHECK_ROUTING` as a bare call count: `let _ =
-        // crc32_nibble_table(0);`, discarded, twice, satisfies "calls
-        // crc32_nibble_table(" twice while never actually updating `crc` with it — the
-        // function can still end with the pinned `crc ^ 0xFFFF_FFFF` tail syntactically.
-        // Pinning the whole assignment statement rather than a bare call is what catches
-        // it: a discarded call does not contain `crc = (crc >> 4) ^
-        // crc32_nibble_table(` at all.
+        // added `INTEGRITY_CHECK_ROUTING` as a bare call count: discarding the
+        // low-nibble update into `let _ = crc32_nibble_table(lo as u8);` still calls the
+        // helper the pinned number of times and leaves the function's tail expression
+        // untouched, so a check that only counted calls and checked the tail would miss
+        // it. Pinning the whole assignment statement is what catches it: the discarded
+        // update no longer contains the pinned nibble update at all.
         let source = tests_support::clean_checksum_module().replace(
-            "crc = (crc >> 4) ^ crc32_nibble_table(0)",
-            "let _ = crc32_nibble_table(0)",
+            "crc = (crc >> 4) ^ crc32_nibble_table(lo as u8);",
+            "let _ = crc32_nibble_table(lo as u8);",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations.iter().any(|violation| violation
                 .detail
-                .contains("does not contain `crc = (crc >> 4) ^ crc32_nibble_table(`")),
+                .contains("does not contain the pinned nibble update")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_dense_match_table_outside_the_allowlist_is_reported() {
+        // Codex's fourth-round finding: the table check only ever looks inside the one
+        // function name `INTEGRITY_CHECK_TABLES` pins, so a second dense match calling
+        // the same helper from a function of its own — a different shape from the pinned
+        // sixteen-arm one, so it cannot be mistaken for a duplicate of it — passed every
+        // rule here.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn extra_nibble_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_byte_identical_second_copy_of_the_pinned_table_is_reported() {
+        // The sharper case beside the one above: a second table that reuses the pinned
+        // table's own selector, helper and arm count under a different function name is
+        // still a second 64 B table, and the tuple-based check alone would wave it
+        // through as "the one table `INTEGRITY_CHECK_TABLES` names" a second time.
+        // Counting occurrences of the pinned shape, rather than merely permitting it, is
+        // what catches a duplicate.
+        let mut source = tests_support::clean_checksum_module();
+        let copy = source
+            .find("const fn crc32_nibble_table")
+            .map(|start| source[start..].to_string())
+            .unwrap_or_default();
+        source.push('\n');
+        source.push_str(&copy.replace("crc32_nibble_table", "second_nibble_table"));
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares 2 dense match(es)")),
             "{violations:?}"
         );
     }
@@ -15837,19 +16243,22 @@ mod tests {
                 let _ = write!(body, " {} ", parameter.literal);
             }
         }
-        // Each routed function's body also contains its pinned update statement the
-        // pinned number of times, ending with its pinned return expression, so this
-        // fixture satisfies `INTEGRITY_CHECK_ROUTING` as well as the literal pins above —
-        // added to the same bodies map so a routed function that also carries a literal
-        // (`crc16`, `crc32`) gets both. The return expression goes last and with no
-        // trailing content after it, which is what `body_ends_with` checks for.
+        // Each routed function's body also contains every one of its pinned nibble
+        // updates, in order, ending with its pinned return expression, so this fixture
+        // satisfies `INTEGRITY_CHECK_ROUTING` as well as the literal pins above — added to
+        // the same bodies map so a routed function that also carries a literal (`crc16`,
+        // `crc32`) gets both. Each update is copied verbatim rather than synthesised from
+        // a call count, because the pin now checks the whole extraction and its argument,
+        // not merely how many times the helper's name appears. The return expression goes
+        // last and with no trailing content after it, which is what `body_ends_with`
+        // checks for.
         for route in INTEGRITY_CHECK_ROUTING {
             let body = bodies.entry(route.function).or_default();
-            for _ in 0..route.occurrences {
+            for update in route.updates {
                 if !body.is_empty() {
                     body.push(';');
                 }
-                let _ = write!(body, " {}0) ", route.statement);
+                let _ = write!(body, " {update} ");
             }
             if !body.is_empty() {
                 body.push(';');
