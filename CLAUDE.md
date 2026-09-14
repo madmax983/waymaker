@@ -3617,7 +3617,7 @@ a caller still cannot tell "the world is slow" from "no firmware will ever servi
 the return value alone. Both cases return `Poll::Pending` — a halted journal and an unpassed
 deadline already work the same way. Design document §13's boundary gives no reason for any
 stop, and this change adds none. See
-[ADR 0047](docs/adr/0047-an-unserviceable-kind-is-an-answer-not-a-record.md).
+[ADR 0048](docs/adr/0048-an-unserviceable-kind-is-an-answer-not-a-record.md).
 
 Issue #115 closes a gap Codex found on the fourth review round of issue #39's own pull
 request: `SizeReport::runtime_ram_total` composed the statics term from the largest `Δram`

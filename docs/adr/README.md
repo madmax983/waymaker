@@ -55,7 +55,7 @@ be superseded.
 | [0044](0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
 | [0045](0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
 | [0046](0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md) | CRC-16 folds its nibble round to a multiply, and CRC-32 stays bitwise | accepted |
-| [0047](0047-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
+| [0048](0048-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
 
 ## Reading the numbers
 
