@@ -3759,3 +3759,21 @@ against a freshly prepared device: `iterate_reserved` dispatched effect 0 and on
 answered `Refusal::OverDeclaredBound` at its completion's index, and `resume_reserved`
 did the same from a device recovered no further than `RunStarted`, where the main loop
 rather than the redelivery branch reaches the fresh schedule.
+
+A ninth returned to round 7's write-path check, and it is one identity narrower than the
+round it followed: `journal_region` compared `header.run` against the workload's own run
+id and stopped there, so a bank whose header names the right run but a different
+`workflow_kind` or `input` still passed. A run id agreeing is not the whole of a
+workflow's identity — a real boot (`crates/waymaker-drive/src/drive.rs`) refuses a
+recorded kind or input that disagrees with the one it expected — and nothing stops the
+public swap surface installing a header that reuses a run id under a different declared
+identity, since `SwapError::RunReused` only compares the *next* run against the
+*retiring* one. `journal_region` now also compares the header's `workflow_kind`,
+`workflow_version` and `input` against `workload`'s own opening record before handing
+back a region to write into. Reproduced first with two real swaps rather than a
+hand-fabricated header — a single swap moves authority to the *other* bank and would
+refuse earlier, at `require_own_authority`, for an unrelated reason: the first retires a
+freshly prepared run onto the other bank under a throwaway identity, and the second
+retires that throwaway run back onto `Rig::BANK` naming one iteration's own run id but
+another iteration's workflow input. The unfixed code answered `Ok(Completed)`, having
+written and dispatched into the mismatched bank, before this check existed.

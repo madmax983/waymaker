@@ -51,7 +51,7 @@ use waymaker_flash::capacity::{Bounds, Refusal, Reserve};
 use waymaker_flash::frame::input_digest;
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
-use waymaker_flash::swap::{Retired, Swap};
+use waymaker_flash::swap::{Installed, Retired, Swap};
 use waymaker_rig::audit::Breach;
 use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
 use waymaker_rig::log::Outcome;
@@ -2505,6 +2505,138 @@ fn iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration() {
         device.image(),
         before.as_slice(),
         "a mismatched iteration mutated the device"
+    );
+}
+
+/// Drives `swap` through its remaining steps — erase, program, barrier, seal — and returns
+/// what it installed. The four-step chain is identical for every swap this file drives; only
+/// the plan differs between them.
+fn drive_swap<'storage, S: StableStorage>(
+    swap: Swap<'_>,
+    engine: &'storage mut S,
+) -> Installed<'storage, S> {
+    let Ok(prepared) = swap.prepare(engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    installed
+}
+
+/// `journal_region` refuses a bank whose header names the right run but the wrong workflow
+/// identity, before writing or dispatching anything.
+///
+/// The check above this one compares only `header.run` against the workload's own run id.
+/// A run id agreeing is not the whole of a workflow's identity: a real boot
+/// (`crates/waymaker-drive/src/drive.rs`) also refuses a recorded `workflow_kind` or `input`
+/// that disagrees with what it expected. Built through two real swaps rather than a
+/// hand-fabricated header — a single swap moves authority to the *other* bank and would
+/// refuse at `require_own_authority` instead, for an unrelated reason, never reaching
+/// `journal_region` at all. Swap 1 retires iteration 0's run onto the other bank under a
+/// throwaway identity nothing ever reads through `Rig`; swap 2 retires that throwaway run
+/// back onto `Rig::BANK`, naming iteration 1's own run id but iteration 0's workflow input.
+#[test]
+fn iterate_refuses_a_bank_whose_header_names_the_right_run_but_the_wrong_identity() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+    }
+
+    let layout = rig.layout();
+    let mut wrong_input_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    let Some(RecordRef::RunStarted {
+        input: wrong_input, ..
+    }) = rig.workload(0).record(0, &mut wrong_input_page)
+    else {
+        unreachable!("a workload's own opening record")
+    };
+    let mismatched = bank::BankHeader {
+        run: rig.workload(1).run(),
+        align: layout.align(),
+        workflow_kind: Workload::WORKFLOW_KIND,
+        workflow_version: Workload::WORKFLOW_VERSION,
+        input_schema: 0,
+        input: wrong_input,
+    };
+
+    {
+        let booted = bank::Authority::Bank {
+            id: Rig::BANK,
+            generation: Rig::GENERATION,
+        };
+        let throwaway = bank::BankHeader {
+            run: rig.workload(2).run(),
+            align: layout.align(),
+            workflow_kind: Workload::WORKFLOW_KIND,
+            workflow_version: Workload::WORKFLOW_VERSION,
+            input_schema: 0,
+            input: NEXT_RUN_INPUT,
+        };
+        let region = bank_a_region(&rig, &mut device, &mut page);
+        let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+            unreachable!("the engine window")
+        };
+        let mut recovery = Recovery::new(region, &mut engine);
+        while let Some(step) = recovery.next(&mut page) {
+            if step.is_err() {
+                unreachable!("a freshly prepared bank's empty journal is whole")
+            }
+        }
+        let Ok(swap) = Swap::beginning(
+            layout,
+            booted,
+            rig.workload(0).run(),
+            Retired::Recovery(recovery),
+            throwaway,
+        ) else {
+            unreachable!("a swap can be planned from a freshly prepared bank")
+        };
+        let installed = drive_swap(swap, &mut engine);
+        let after_first_swap = installed.authority();
+        let mut recovery = installed.recovery();
+        while let Some(step) = recovery.next(&mut page) {
+            if step.is_err() {
+                unreachable!("a freshly installed bank scans clean")
+            }
+        }
+        let Ok(swap) = Swap::beginning(
+            layout,
+            after_first_swap,
+            rig.workload(2).run(),
+            Retired::Recovery(recovery),
+            mismatched,
+        ) else {
+            unreachable!("a swap can be planned back onto Rig::BANK")
+        };
+        let _installed = drive_swap(swap, &mut engine);
+    }
+
+    let before = device.image().to_vec();
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate(1, &mut metered, &mut dispatcher, &mut NeverCut, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the mismatched bank's effect was dispatched before its identity was checked"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "the mismatched bank's journal or witness was mutated before its identity was checked"
     );
 }
 

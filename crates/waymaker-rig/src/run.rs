@@ -654,7 +654,7 @@ impl Rig {
     }
 
     /// The journal region of the bank this rig writes into, refusing unless that bank's
-    /// header names `workload`'s own run.
+    /// header names `workload`'s own run and its own declared workflow identity.
     ///
     /// `require_own_authority` names the *bank*; this names the *run*. Review found the gap
     /// between them: a bank that is this rig's own and currently authoritative can still
@@ -663,6 +663,13 @@ impl Rig {
     /// iteration's journal rather than refuse — the write-path twin of the check
     /// [`installed_journal`](Self::installed_journal) already makes `resume` and
     /// `recover_prefix` pass.
+    ///
+    /// A run id agreeing is not the whole of a workflow's identity: nothing stops the public
+    /// swap surface installing a header that reuses a run id while declaring a different
+    /// `workflow_kind` or input — a real boot compares both against the journal's own
+    /// `RunStarted` (`crates/waymaker-drive/src/drive.rs`), so a bank a boot would refuse as
+    /// `NotThisWorkflow` used to be one this write path accepted on the strength of the run
+    /// id alone.
     fn journal_region<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
@@ -677,6 +684,21 @@ impl Rig {
             return Err(RigError::Bank);
         };
         if header.run != workload.run() {
+            return Err(RigError::Bank);
+        }
+        let mut start_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let Some(RecordRef::RunStarted {
+            workflow_kind,
+            workflow_version,
+            input,
+        }) = workload.record(0, &mut start_page)
+        else {
+            return Err(RigError::Workload);
+        };
+        if header.workflow_kind != workflow_kind
+            || header.workflow_version != workflow_version
+            || header.input != input
+        {
             return Err(RigError::Bank);
         }
         JournalRegion::of(self.layout, Self::BANK, &header).map_err(RigError::Region)
