@@ -3307,6 +3307,44 @@ signature's own generics — a type parameter's bounds and default, and a `where
 predicate's bounded type and bounds — can carry one too, closed by a new `generics_items`
 chained into `fn_signature_type_items` alongside its parameter and return types.
 
+Round 23 found three more, and the deepest of the three closed a gap round 22's own
+redesign left standing at a finer grain than the module or item boundary it was drawn
+at. `collect_trait_implementors` still computed each item's own alias extension from
+its *whole* body flattened by `nested_body_items` — every item reachable through
+control flow, however deeply nested — so `use self::Harmless as C;` at module scope,
+followed by `fn install() { if false { use core::clone::Clone as C; } impl C for
+Recovery {} }`, resolved the harmless `impl` through the inner `use`, even though that
+`use` is scoped only to the `if false { .. }` block it is declared in. The fix replaces
+the whole flatten-then-extend design with one that walks exactly one `syn::Block` at a
+time: `nested_body_items` is retired, along with the `BlockItemVisitor` it and
+`block_items`/`expr_items`/`type_items`/`generics_items` shared; a new
+`DirectChildBlockVisitor` captures blocks instead of items, stopping at each one rather
+than flattening through it (and at a nested item's own boundary, which is handled
+separately), giving `direct_blocks_in_expr`/`direct_blocks_in_type`/
+`direct_blocks_in_generics`/`direct_blocks_in_signature` and
+`direct_child_blocks_of_block`. `collect_trait_implementors_in_item_body` finds every
+scope-root block an item's signature, body, initializer or member types can carry, and
+`collect_trait_implementors_in_block` walks one block's own direct items to build that
+block's own scope, then recurses into every block nested directly in one of its own
+statements — one level at a time, in real Rust's own order — so a sibling block's
+aliases are never on a table it did not declare them in, while a body still correctly
+inherits its enclosing scope (a body is not a Rust scope boundary the way `mod { .. }`
+is). The second: `impl T for X { type A = [(); { impl Clone for Recovery { .. }; 0 }];
+}` buries a non-local `impl` inside an associated type's own type exactly the way a
+type alias's, a struct field's, an enum variant field's, or a union field's type
+already could, and the fallback for an `impl` block's own members — in both the
+handwritten-implementation scan and `impl_member_bodies`, the module-tree scan's
+identical case — dropped `ImplItem::Type` on the floor instead of walking it with
+`type_items`. The third: `impl Clone for <() as Alias>::Target`, where a reached file
+defines `trait Alias { type Target; }` and binds `Target` to `Recovery`, is legal Rust
+whose self-type is a projected associated type — `syn`'s `Type::Path` stores the
+qualified self and the trait separately from `path`, which here is only `Target`, so
+resolving `path` alone through the alias table missed that rustc normalizes the
+projection to `Recovery`. This scan does not resolve trait bindings, so a self-type
+carrying a `qself` now fails closed to `UNRESOLVED_DERIVE` the same way a
+`super`-qualified path already does, rather than silently comparing the unqualified
+associated-type name.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

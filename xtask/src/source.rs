@@ -11800,6 +11800,121 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_for_a_projected_associated_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 23: `impl Clone for
+        // <() as Alias>::Target` is legal Rust whose self-type is a projected
+        // associated type — `syn` stores the qualified self and the trait separately
+        // from `path`, which here is only `Target`, and rustc normalizes the
+        // projection to `Recovery` once `Alias for ()` binds it. Resolving `path`
+        // alone through the alias table would miss it, and this scan cannot evaluate
+        // a trait binding to learn what the projection resolves to — it must fail
+        // closed rather than silently comparing the unqualified associated type name.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Alias {\n",
+                "    type Target;\n",
+                "}\n",
+                "impl Alias for () {\n",
+                "    type Target = super::Recovery;\n",
+                "}\n",
+                "impl Clone for <() as Alias>::Target {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_alias_inside_a_nested_control_flow_block_does_not_leak_to_its_enclosing_function_body() {
+        // Found by Codex review of this change (PR #143), round 23: round 22's own
+        // fix stopped a body's own local aliases from being shared across *sibling
+        // items*, but it still computed those local aliases by flattening every item
+        // reachable through control flow, however deeply nested, into one list before
+        // building the extension — so `use self::Harmless as C;` at module scope,
+        // followed by `fn install() { if false { use core::clone::Clone as C; } impl C
+        // for Recovery {} }`, resolved the harmless `impl C for Recovery` through the
+        // inner `use`, even though that `use` is scoped only to the `if false { .. }`
+        // block it is declared in — not to the function body around it, and not to
+        // the `impl`'s own statement beside it. `Recovery` here implements only a
+        // local, harmless marker trait, never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as C;\n",
+            "#[allow(non_local_definitions, dead_code)]\n",
+            "fn install() {\n",
+            "    if false {\n",
+            "        #[allow(unused_imports)]\n",
+            "        use core::clone::Clone as C;\n",
+            "    }\n",
+            "    impl C for Recovery {}\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_associated_types_own_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 23: an associated
+        // type's own type can bury a block exactly the way a type alias's, a struct
+        // field's, an enum variant field's, or a union field's type already could —
+        // `impl T for X { type A = [(); { impl Clone for Recovery { .. }; 0 }]; }` —
+        // and the fallback for an `impl` block's own members dropped `ImplItem::Type`
+        // on the floor instead of walking it, in both the handwritten-implementation
+        // scan and the module-tree scan that discovers a reached file at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Trait {\n",
+                "    type A;\n",
+                "}\n",
+                "impl Trait for () {\n",
+                "    type A = [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
