@@ -18385,6 +18385,71 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_if_chain_with_a_parenthesised_scrutinee_link_is_reported() {
+        // Codex's next-round finding: `if_chain_condition_value` read a link's scrutinee
+        // as raw token text with no normalisation of its *own* shape, so `if nibble == 0
+        // { .. } else if (nibble) == 1 { .. }` compared "nibble" against "(nibble)" —
+        // different token strings for the identical scrutinee `rustc` sees straight
+        // through parentheses — and `extract_if_chain` refused the whole chain as
+        // inconsistent, even though every link names the same value. `strip_parens` is
+        // now applied to the unresolved side before its token text is taken, the same
+        // normalisation this scan already applies before looking at most other
+        // expressions' own shape.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn mixed_paren_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn mixed_paren_if_chain_table(nibble: u8) -> u32 {\n    \
+             if nibble == 0 {\n        mixed_paren_if_chain_helper(0)\n    } else if \
+             (nibble) == 1 {\n        mixed_paren_if_chain_helper(1)\n    } else if \
+             nibble == 2 {\n        mixed_paren_if_chain_helper(2)\n    } else {\n        \
+             mixed_paren_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_guard_ordering_an_upper_half_u128_value_does_not_wrongly_prune_a_live_arm() {
+        // Codex's next-round finding: an upper-half `u128` value (above `i128::MAX`) is
+        // stored here as its own two's-complement bit pattern reinterpreted as a
+        // *negative* `i128` — the identical storage a genuinely negative signed value
+        // already uses — so `evaluate_binary_op`'s old plain signed `Lt`/`Gt`/... folded
+        // `2^127u128 > 0` as `false`, where `rustc` evaluates it `true`. A guard spelled
+        // that way is not provably dead in real Rust, but the old signed fold made this
+        // scan's own dead-guard filter treat it as exactly that and drop the arm outright
+        // — losing the `1` arm from the numbered sequence below and leaving only a
+        // *3*-arm dense window (`0`, `2` present, `1` a tolerated single-value gap).
+        // `evaluate_binary_op` now declines to fold an ordering comparison whenever
+        // either operand is negative, since this domain cannot tell "really negative"
+        // apart from "a large unsigned value wrapped around" — so the guard stays
+        // unresolved, the arm is kept with its own literal pattern intact (unaffected by
+        // an unresolved guard), and the real, full *4*-arm dense window is what this scan
+        // reports.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn upper_half_u128_ordering_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn upper_half_u128_ordering_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => upper_half_u128_ordering_helper(0),\n        \
+             1 if 170141183460469231731687303715884105728u128 > 0 => \
+             upper_half_u128_ordering_helper(1),\n        \
+             2 => upper_half_u128_ordering_helper(2),\n        \
+             _ => upper_half_u128_ordering_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

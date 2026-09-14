@@ -2720,6 +2720,21 @@ fn evaluate_block(
 /// comparison between two values this scan already resolved is exactly as sound to fold as
 /// an arithmetic one — `bool`'s own `0`/`1` representation, the identical one
 /// `lit_value`'s `Lit::Bool` case and `Expr::If`'s own condition already use.
+///
+/// Codex's next-round finding: `Eq`/`Ne` are sound at any value this domain holds, because
+/// bit-pattern equality does not care which of `i128`/`u128` a value is really meant as —
+/// but `Lt`/`Le`/`Gt`/`Ge` are not. `lit_value` and `apply_integer_cast` both store a
+/// `u128` value above `i128::MAX` as its own two's-complement bit pattern reinterpreted as
+/// a *negative* `i128` — the identical storage a genuinely negative `i8`..`i128` value
+/// already uses — so a negative value in this domain is ambiguous between "really
+/// negative" and "a large unsigned value wrapped around", and ordering the two ways
+/// disagrees whenever either operand is negative. Folding `left < right` as a plain signed
+/// comparison would answer `0x80000000000000000000000000000000u128 > 0` as `false`, where
+/// `rustc` answers `true`. Ordering is therefore folded only when *both* operands are
+/// non-negative, where every domain this scan stores agrees on the order regardless of
+/// which one a value is really meant as; either operand negative stays unresolved rather
+/// than guessed at, the same standing every other shape this scan declines to interpret
+/// already has.
 fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     match op {
         syn::BinOp::Add(_) => left.checked_add(right),
@@ -2738,10 +2753,10 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
             .and_then(|shift| left.checked_shr(shift)),
         syn::BinOp::Eq(_) => Some(i128::from(left == right)),
         syn::BinOp::Ne(_) => Some(i128::from(left != right)),
-        syn::BinOp::Lt(_) => Some(i128::from(left < right)),
-        syn::BinOp::Le(_) => Some(i128::from(left <= right)),
-        syn::BinOp::Gt(_) => Some(i128::from(left > right)),
-        syn::BinOp::Ge(_) => Some(i128::from(left >= right)),
+        syn::BinOp::Lt(_) => (left >= 0 && right >= 0).then(|| i128::from(left < right)),
+        syn::BinOp::Le(_) => (left >= 0 && right >= 0).then(|| i128::from(left <= right)),
+        syn::BinOp::Gt(_) => (left >= 0 && right >= 0).then(|| i128::from(left > right)),
+        syn::BinOp::Ge(_) => (left >= 0 && right >= 0).then(|| i128::from(left >= right)),
         // `&&`/`||` are not folded here at all — [`literal_or_const_value`]'s own
         // `Expr::Binary` case handles them in a match arm of its own, before this
         // function's caller would otherwise require both operands to resolve, so a
@@ -3653,15 +3668,19 @@ fn block_as_expr(block: &syn::Block) -> syn::Expr {
 /// resolve as a constant is taken to be it; if both sides resolve, or neither does, this
 /// chain is not a shape this scan can tell apart from an ordinary comparison, and it stays
 /// unrecognised rather than guessed at.
+///
+/// Codex's next-round finding: the scrutinee's own token text was read straight from
+/// whichever side did not resolve, with no normalisation of *that* side — so `x == 0`
+/// alongside a later link's `(x) == 1` compared "x" against "(x)" and never matched, even
+/// though `(x)` names the identical scrutinee `rustc` sees straight through. [`strip_parens`]
+/// is applied to the unresolved side before its token text is taken, the same normalisation
+/// every other literal- or constant-reading function here already applies before it looks
+/// at an expression's own shape.
 fn if_chain_condition_value(
     cond: &syn::Expr,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
 ) -> Option<(String, i128)> {
-    let cond = match cond {
-        syn::Expr::Paren(paren) => paren.expr.as_ref(),
-        syn::Expr::Group(group) => group.expr.as_ref(),
-        other => other,
-    };
+    let cond = strip_parens(cond);
     let syn::Expr::Binary(binary) = cond else {
         return None;
     };
@@ -3671,9 +3690,30 @@ fn if_chain_condition_value(
     let left_value = literal_or_const_value(&binary.left, resolve);
     let right_value = literal_or_const_value(&binary.right, resolve);
     match (left_value, right_value) {
-        (None, Some(value)) => Some((binary.left.to_token_stream().to_string(), value)),
-        (Some(value), None) => Some((binary.right.to_token_stream().to_string(), value)),
+        (None, Some(value)) => Some((
+            strip_parens(&binary.left).to_token_stream().to_string(),
+            value,
+        )),
+        (Some(value), None) => Some((
+            strip_parens(&binary.right).to_token_stream().to_string(),
+            value,
+        )),
         _ => None,
+    }
+}
+
+/// `expr`, seen through any nesting of parentheses or brace groups — the same
+/// normalisation most literal- and constant-reading functions in this file already apply
+/// before they look at an expression's own shape, factored out here so
+/// [`if_chain_condition_value`] can apply it to a *sub*-expression rather than only to
+/// the top-level one it is handed.
+fn strip_parens(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        expr = match expr {
+            syn::Expr::Paren(paren) => &paren.expr,
+            syn::Expr::Group(group) => &group.expr,
+            other => return other,
+        };
     }
 }
 
