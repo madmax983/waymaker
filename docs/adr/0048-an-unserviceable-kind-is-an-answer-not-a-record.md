@@ -3,8 +3,14 @@
 - Status: Accepted
 - Date: 2026-09-14
 - Issue: [#111](https://github.com/madmax983/waymaker/issues/111)
-- Supersedes: nothing
-- Related: [ADR 0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md), [ADR 0028](0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md)
+- Supersedes: one decision of
+  [ADR 0033](0033-the-dispatcher-answers-in-a-bound-the-journal-states.md) — "`Unhandled::NoSuchActivity`
+  is what a kind no row declares answers with. It is recorded as a failure with no payload,
+  which is a **permanent** decision for that run." A kind no row declares now answers
+  `Produced::Unserviceable` and records nothing. Nothing else in 0033 changes: the bound on
+  `out`, `Produced::Failed`'s recorded payload, and the dispatch table's numeric selection all
+  stand.
+- Related: [ADR 0028](0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md)
 
 ## Context
 
