@@ -1405,7 +1405,9 @@ pub struct FoundArm {
     /// initializer (`literal_or_const_value`'s reach) — or `None` for anything else,
     /// `_` included.
     pub pattern: Option<u128>,
-    /// Whether the pattern is exactly `_`.
+    /// Whether the pattern is irrefutable the way a dense table's final arm needs to be —
+    /// `_`, or an unguarded binding naming no known constant — since a plain binding
+    /// matches everything a wildcard does and compiles to the identical lookup table.
     pub is_wild: bool,
     /// The callee name and the resolved argument value, when the arm's whole value is a
     /// call with exactly one argument. `None` for anything else, including a call whose
@@ -1434,7 +1436,7 @@ pub struct FoundArm {
 pub fn match_expressions(contents: &str) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
     let mut constants = std::collections::HashMap::new();
-    collect_literal_constants(&file.items, &mut constants);
+    collect_literal_constants(&file, &mut constants);
     let mut visitor = MatchVisitor {
         constants: &constants,
         found: Vec::new(),
@@ -1450,11 +1452,14 @@ pub fn match_expressions(contents: &str) -> Result<Vec<FoundMatch>, syn::Error> 
 /// chain among a handful of constants is shallow) is what a single top-to-bottom scan would
 /// get wrong for a constant that names a later one.
 fn collect_literal_constants(
-    items: &[syn::Item],
+    file: &syn::File,
     resolved: &mut std::collections::HashMap<String, u128>,
 ) {
-    let mut pending = std::collections::HashMap::new();
-    collect_const_exprs(items, &mut pending);
+    let mut collector = ConstExprCollector {
+        exprs: std::collections::HashMap::new(),
+    };
+    collector.visit_file(file);
+    let pending = collector.exprs;
     for _ in 0..pending.len().max(1) {
         let mut progressed = false;
         for (name, expr) in &pending {
@@ -1472,27 +1477,41 @@ fn collect_literal_constants(
     }
 }
 
-/// The unevaluated initializer of every `const` `items` declares, at any nesting depth
-/// through inline modules, outside `#[cfg(test)]`.
-fn collect_const_exprs(
-    items: &[syn::Item],
-    out: &mut std::collections::HashMap<String, syn::Expr>,
-) {
-    for item in items {
+/// The unevaluated initializer of every `const` a file declares, outside `#[cfg(test)]` —
+/// at module scope, in an inline module, inside an `impl` (an associated constant), or
+/// declared *locally inside a function body*, which Codex found the first version of this
+/// visitor missed: a manual walk over `syn::Item::Mod`'s own nested items never looks inside
+/// `syn::Item::Fn`'s block, and a second dense table can declare its singleton patterns as
+/// `const P0: u8 = 0;` statements at the top of its own function rather than at module
+/// scope. A `syn::visit::Visit` default traversal already descends into a function's block,
+/// a block's statements, and a local item statement among them, so overriding only
+/// `visit_item` and `visit_impl_item` — to record a `Const` and to skip `#[cfg(test)]` — is
+/// enough; the recursion the manual version had to write by hand is now the visitor's own.
+struct ConstExprCollector {
+    exprs: std::collections::HashMap<String, syn::Expr>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ConstExprCollector {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
         if has_cfg_test(item_attrs(item)) {
-            continue;
+            return;
         }
-        match item {
-            syn::Item::Const(constant) => {
-                out.insert(ident_name(&constant.ident), (*constant.expr).clone());
-            }
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = &module.content {
-                    collect_const_exprs(nested, out);
-                }
-            }
-            _ => {}
+        if let syn::Item::Const(constant) = item {
+            self.exprs
+                .insert(ident_name(&constant.ident), (*constant.expr).clone());
         }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(item)) {
+            return;
+        }
+        if let syn::ImplItem::Const(constant) = item {
+            self.exprs
+                .insert(ident_name(&constant.ident), constant.expr.clone());
+        }
+        syn::visit::visit_impl_item(self, item);
     }
 }
 
@@ -1525,7 +1544,8 @@ fn literal_or_const_value(
 /// literal, or a plain identifier — a pattern this simple parses as a binding rather than a
 /// path, since `syn` cannot tell one from a constant of the same name without resolving it —
 /// that `known` already resolves. `None` for a wildcard, a range, a tuple, or anything else
-/// a dense table's patterns are not.
+/// a dense table's patterns are not, and for a binding that names no known constant — that
+/// is [`is_catchall_pattern`]'s question, not this one's.
 fn pattern_literal(
     pattern: &syn::Pat,
     known: &std::collections::HashMap<String, u128>,
@@ -1544,6 +1564,34 @@ fn pattern_literal(
             .and_then(|ident| known.get(&ident_name(ident)))
             .copied(),
         _ => None,
+    }
+}
+
+/// Whether `pattern` is irrefutable the way a dense table's final arm needs to be — `_`, or
+/// a plain, unguarded binding that names no constant [`pattern_literal`] could have resolved
+/// it to instead.
+///
+/// Codex's finding: `_ => VALUE15` and `other => VALUE15` are equally irrefutable and
+/// compile to the identical lookup table, since an ordinary binding matches everything a
+/// wildcard does — `has_dense_arm_patterns` asking specifically for `_` on the last arm was
+/// a spelling requirement `rustc`'s own exhaustiveness check does not share. `guarded` is the
+/// caller's to pass, since a guard (`other if cond => ..`) makes even a binding pattern
+/// refutable and this function sees only the pattern, not the arm it belongs to.
+#[must_use]
+fn is_catchall_pattern(
+    pattern: &syn::Pat,
+    guarded: bool,
+    known: &std::collections::HashMap<String, u128>,
+) -> bool {
+    if guarded {
+        return false;
+    }
+    match pattern {
+        syn::Pat::Wild(_) => true,
+        syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
+            !known.contains_key(&ident_name(&named.ident))
+        }
+        _ => false,
     }
 }
 
@@ -1609,7 +1657,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor<'_> {
             .iter()
             .map(|arm| FoundArm {
                 pattern: pattern_literal(&arm.pat, self.constants),
-                is_wild: matches!(arm.pat, syn::Pat::Wild(_)),
+                is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), self.constants),
                 call: call_shape_of(&arm.body, self.constants),
             })
             .collect();

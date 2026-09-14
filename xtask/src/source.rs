@@ -15043,6 +15043,57 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_function_local_constant_patterns_is_reported() {
+        // Codex's twelfth-round finding: the constant-collecting visitor overrode
+        // `visit_item` and `visit_impl_item` but never descended into a function's own
+        // block, so `const P0: u8 = 0;` declared *inside* the very function that matches
+        // on it was invisible to the resolver — every pattern resolves fine for `rustc`,
+        // but this scan recorded each as unresolved and read the match as not dense.
+        // `syn::visit::Visit`'s own default traversal already walks into a function's
+        // block and every local item statement in it, so nothing but not fighting that
+        // default was needed to close it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn local_constant_pattern_table(nibble: u8) -> u32 {\n    const P0: u8 \
+             = 0;\n    const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n    \
+             match nibble & 0xF {\n        P0 => crc32_nibble(0),\n        \
+             P1 => crc32_nibble(1),\n        P2 => crc32_nibble(2),\n        \
+             P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_binding_catchall_is_reported() {
+        // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
+        // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
+        // the identical lookup table, since it matches every value a wildcard would.
+        // `is_catchall_pattern` now treats any unguarded binding that names no known
+        // constant as the catch-all, alongside `_` itself, rather than requiring the one
+        // spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn binding_catchall_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             other => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_postfixed_block_values_is_reported() {
         // Codex's seventh-round finding, the sharper half: the synthetic-separator fix for
         // comma-less block arms used to insert a separator after *every* top-level `}`,
