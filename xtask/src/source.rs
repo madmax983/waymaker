@@ -18450,6 +18450,63 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_guard_ordering_two_explicitly_typed_u128_operands_is_still_pruned_as_dead() {
+        // Codex's next-round finding: the round-before-this fix declined to fold an
+        // ordering comparison whenever *either* operand was negative in this scan's own
+        // domain, with no exception — sound, but overbroad: `2^127u128 < 0u128` is written
+        // with an explicit `u128` suffix on *both* sides, so nothing about which domain it
+        // means is actually ambiguous, and `rustc` folds it to `false` outright. The same
+        // signed-only rule left this guard unresolved too, so the arm it sits on was kept
+        // rather than pruned as the dead code it really is, leaving an empty-pattern arm
+        // in the numbered prefix and no violation reported at all.
+        // `evaluate_ordering_op` now reinterprets a negative operand's bit pattern as
+        // `u128` once `is_definitely_unsigned` confirms that is what it means, so this
+        // guard folds to `0` and the arm is dropped, restoring the real 4-arm dense window.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_upper_half_u128_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn typed_upper_half_u128_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => typed_upper_half_u128_dead_guard_helper(0),\n        \
+             1 => typed_upper_half_u128_dead_guard_helper(1),\n        2 => typed_upper_half_u128_dead_guard_helper(2),\n        \
+             _ if 170141183460469231731687303715884105728u128 < 0u128 => 999,\n        \
+             _ => typed_upper_half_u128_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_well_known_integer_bound_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = u8::MIN;` names a real, well-known
+        // associated constant of a language primitive — not anything the scanned source
+        // tree ever declares — so no amount of collecting local, qualified or
+        // trait-default constants would ever find it, and every such initializer read as
+        // unresolved. `well_known_integer_bound` answers `TypeName::MIN`/`MAX` directly
+        // for the ten fixed-width integer types this scan already knows, checked in
+        // `resolve_pattern_path` before any of the scope-dependent lookups.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn well_known_bound_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = u8::MIN;\n    const P1: u8 = u8::MIN + 1;\n    \
+             const P2: u8 = u8::MIN + 2;\n    const P3: u8 = u8::MIN + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

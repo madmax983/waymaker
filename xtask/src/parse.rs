@@ -2583,6 +2583,44 @@ fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
     }
 }
 
+/// `TypeName::MIN` or `TypeName::MAX`'s own well-known value, for the ten fixed-width
+/// integer types this scan already tracks a width and a signedness for in
+/// [`apply_integer_cast`] — a fact about the language rather than about anything the
+/// scanned source tree declares, so no amount of collecting local, qualified or
+/// trait-default constants would ever find it. Read straight off Rust's own associated
+/// constants rather than re-derived from `width`/`signed` by hand, so this can never
+/// disagree with the values `apply_integer_cast`'s own casts already produce.
+///
+/// `u128::MAX` is the one case with no positive `i128` to hold it — `2^128 - 1`, every bit
+/// set — so it answers `-1`, the identical all-ones bit pattern [`apply_integer_cast`]'s
+/// own upper-half `u128` reinterpretation already uses; `u128::MIN` is `0`, which needs no
+/// such reinterpretation at all.
+fn well_known_integer_bound(type_name: &str, member: &str) -> Option<i128> {
+    match (type_name, member) {
+        ("u8", "MIN") => Some(i128::from(u8::MIN)),
+        ("u8", "MAX") => Some(i128::from(u8::MAX)),
+        ("u16", "MIN") => Some(i128::from(u16::MIN)),
+        ("u16", "MAX") => Some(i128::from(u16::MAX)),
+        ("u32", "MIN") => Some(i128::from(u32::MIN)),
+        ("u32", "MAX") => Some(i128::from(u32::MAX)),
+        ("u64", "MIN") => Some(i128::from(u64::MIN)),
+        ("u64", "MAX") => Some(i128::from(u64::MAX)),
+        ("u128", "MIN") => Some(0),
+        ("u128", "MAX") => Some(-1),
+        ("i8", "MIN") => Some(i128::from(i8::MIN)),
+        ("i8", "MAX") => Some(i128::from(i8::MAX)),
+        ("i16", "MIN") => Some(i128::from(i16::MIN)),
+        ("i16", "MAX") => Some(i128::from(i16::MAX)),
+        ("i32", "MIN") => Some(i128::from(i32::MIN)),
+        ("i32", "MAX") => Some(i128::from(i32::MAX)),
+        ("i64", "MIN") => Some(i128::from(i64::MIN)),
+        ("i64", "MAX") => Some(i128::from(i64::MAX)),
+        ("i128", "MIN") => Some(i128::MIN),
+        ("i128", "MAX") => Some(i128::MAX),
+        _ => None,
+    }
+}
+
 /// `expr`'s own integer literal, if it is one carrying an explicit suffix (`255u8`, never
 /// a bare `255`) — seen through any nesting of parentheses or brace groups, the same two
 /// wrappers every other literal-reading function here sees through.
@@ -2721,20 +2759,10 @@ fn evaluate_block(
 /// an arithmetic one — `bool`'s own `0`/`1` representation, the identical one
 /// `lit_value`'s `Lit::Bool` case and `Expr::If`'s own condition already use.
 ///
-/// Codex's next-round finding: `Eq`/`Ne` are sound at any value this domain holds, because
-/// bit-pattern equality does not care which of `i128`/`u128` a value is really meant as —
-/// but `Lt`/`Le`/`Gt`/`Ge` are not. `lit_value` and `apply_integer_cast` both store a
-/// `u128` value above `i128::MAX` as its own two's-complement bit pattern reinterpreted as
-/// a *negative* `i128` — the identical storage a genuinely negative `i8`..`i128` value
-/// already uses — so a negative value in this domain is ambiguous between "really
-/// negative" and "a large unsigned value wrapped around", and ordering the two ways
-/// disagrees whenever either operand is negative. Folding `left < right` as a plain signed
-/// comparison would answer `0x80000000000000000000000000000000u128 > 0` as `false`, where
-/// `rustc` answers `true`. Ordering is therefore folded only when *both* operands are
-/// non-negative, where every domain this scan stores agrees on the order regardless of
-/// which one a value is really meant as; either operand negative stays unresolved rather
-/// than guessed at, the same standing every other shape this scan declines to interpret
-/// already has.
+/// `Eq`/`Ne` are folded here because bit-pattern equality does not care which of
+/// `i128`/`u128` a value is really meant as; `Lt`/`Le`/`Gt`/`Ge` are not, for the reason
+/// [`evaluate_ordering_op`] states, and are folded there instead — the same split `&&`/`||`
+/// already have with [`evaluate_short_circuit_op`].
 fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     match op {
         syn::BinOp::Add(_) => left.checked_add(right),
@@ -2753,16 +2781,89 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
             .and_then(|shift| left.checked_shr(shift)),
         syn::BinOp::Eq(_) => Some(i128::from(left == right)),
         syn::BinOp::Ne(_) => Some(i128::from(left != right)),
-        syn::BinOp::Lt(_) => (left >= 0 && right >= 0).then(|| i128::from(left < right)),
-        syn::BinOp::Le(_) => (left >= 0 && right >= 0).then(|| i128::from(left <= right)),
-        syn::BinOp::Gt(_) => (left >= 0 && right >= 0).then(|| i128::from(left > right)),
-        syn::BinOp::Ge(_) => (left >= 0 && right >= 0).then(|| i128::from(left >= right)),
-        // `&&`/`||` are not folded here at all — [`literal_or_const_value`]'s own
-        // `Expr::Binary` case handles them in a match arm of its own, before this
-        // function's caller would otherwise require both operands to resolve, so a
-        // genuinely short-circuited operand never needs to.
+        // `&&`/`||` and the four ordering comparisons are not folded here at all —
+        // [`literal_or_const_value`]'s own `Expr::Binary` case handles each in a match arm
+        // of its own, before this function's caller would otherwise require both operands
+        // to resolve (for `&&`/`||`) or lose the operand expressions this function never
+        // sees (for ordering).
         _ => None,
     }
+}
+
+/// Whether `expr` is written with an explicit unsigned integer type — a suffixed literal
+/// (`0u128`) or a cast to one (`x as u128`) — seen through any nesting of parentheses or
+/// brace groups. The only way [`evaluate_ordering_op`] can know an operand's own *type*
+/// rather than only its resolved bit pattern, which is what lets it tell a genuinely
+/// negative value apart from an upper-half `u128` one wrapped around.
+fn is_definitely_unsigned(expr: &syn::Expr) -> bool {
+    match strip_parens(expr) {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(int),
+            ..
+        }) => matches!(int.suffix(), "u8" | "u16" | "u32" | "u64" | "u128"),
+        syn::Expr::Cast(cast) => single_segment_type_name(&cast.ty)
+            .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")),
+        _ => false,
+    }
+}
+
+/// `left_expr op right_expr`'s own value, for the four ordering comparisons
+/// (`Lt`/`Le`/`Gt`/`Ge`) — factored out of [`evaluate_binary_op`] because these, unlike
+/// every other operator that function folds, need the operand *expressions* themselves,
+/// not only their resolved values, to answer every case this scan can soundly decide.
+///
+/// Codex's next-round finding: `Eq`/`Ne` are sound at any value this domain holds, because
+/// bit-pattern equality does not care which of `i128`/`u128` a value is really meant as —
+/// but ordering is not. `lit_value` and `apply_integer_cast` both store a `u128` value
+/// above `i128::MAX` as its own two's-complement bit pattern reinterpreted as a *negative*
+/// `i128` — the identical storage a genuinely negative `i8`..`i128` value already uses —
+/// so a negative value in this domain is ambiguous between "really negative" and "a large
+/// unsigned value wrapped around", and ordering the two ways disagrees whenever either
+/// operand is negative. A first version of this fix folded ordering only when both
+/// operands were non-negative, refusing every ambiguous case rather than guessing — sound,
+/// but overbroad: `0x80000000000000000000000000000000u128 < 0u128` is written with an
+/// explicit `u128` suffix on *both* sides, so nothing is actually ambiguous about which
+/// domain it means, and the same signed-only rule left this comparison — and the guard
+/// spelled with it — unresolved too, when `rustc` folds it to `false` outright.
+///
+/// Codex's next-round finding after that: only an operand that is itself negative in this
+/// domain needs its type *confirmed* by [`is_definitely_unsigned`] before its bit pattern
+/// is reinterpreted as `u128` for ordering — a non-negative operand's value is identical
+/// whichever domain it is really meant as, so requiring proof of *its* type as well would
+/// refuse cases (`huge_u128 < 0`, the right side an ordinary, unsuffixed `0`) that are not
+/// actually ambiguous either.
+fn evaluate_ordering_op(
+    op: syn::BinOp,
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let left = literal_or_const_value(left_expr, resolve)?;
+    let right = literal_or_const_value(right_expr, resolve)?;
+    if (left < 0 && !is_definitely_unsigned(left_expr))
+        || (right < 0 && !is_definitely_unsigned(right_expr))
+    {
+        return None;
+    }
+    let ordering = if left >= 0 && right >= 0 {
+        left.cmp(&right)
+    } else {
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "reinterpreting the shared 128-bit storage as unsigned, once an \
+                      explicit suffix or cast has confirmed that is what a negative \
+                      operand means, not converting a value"
+        )]
+        let unsigned_ordering = (left as u128).cmp(&(right as u128));
+        unsigned_ordering
+    };
+    Some(i128::from(match op {
+        syn::BinOp::Lt(_) => ordering.is_lt(),
+        syn::BinOp::Le(_) => ordering.is_le(),
+        syn::BinOp::Gt(_) => ordering.is_gt(),
+        syn::BinOp::Ge(_) => ordering.is_ge(),
+        _ => return None,
+    }))
 }
 
 /// `left && right` or `left || right`'s own value (`is_and` selects which), evaluated
@@ -2882,6 +2983,16 @@ fn literal_or_const_value(
                 &binary.right,
                 resolve,
             )
+        }
+        // [`evaluate_ordering_op`] holds the rationale for why the four ordering
+        // comparisons are not folded through `evaluate_binary_op` like `Eq`/`Ne` are.
+        syn::Expr::Binary(binary)
+            if matches!(
+                binary.op,
+                syn::BinOp::Lt(_) | syn::BinOp::Le(_) | syn::BinOp::Gt(_) | syn::BinOp::Ge(_)
+            ) =>
+        {
+            evaluate_ordering_op(binary.op, &binary.left, &binary.right, resolve)
         }
         // [`evaluate_binary_op`] holds the rationale for every operator this folds,
         // arithmetic and comparison alike, since both are one decision rather than two.
@@ -3824,6 +3935,17 @@ fn resolve_qualified_path(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
+    // Codex's next-round finding: `const P0: u8 = u8::MIN;`, a local block-scoped
+    // constant, resolves through `resolve_scope_consts`'s own closure — which reaches
+    // this function directly through `resolve_qualified_path_at_any_depth`, never through
+    // `resolve_pattern_path`'s own well-known-bound check above it — so a second check is
+    // needed here too, for the identical reason `[`well_known_integer_bound`]`'s own doc
+    // comment already states.
+    if let [type_name, member] = segments.as_slice() {
+        if let Some(value) = well_known_integer_bound(type_name, member) {
+            return Some(value);
+        }
+    }
     // Codex's finding: stripping `crate` the same way `self` is stripped, below, loses
     // the one fact that made it worth reading — `crate::indices::P0` names the crate
     // root exclusively, in real Rust, and never the current module, however deep a nested
@@ -4118,6 +4240,17 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
+    // Codex's next-round finding: `u8::MIN` is a real, well-known associated constant of
+    // a language primitive — not anything the scanned source tree ever declares — so no
+    // amount of collecting local, qualified or trait-default constants would ever find
+    // it, and a table whose numbered arms are spelled `u8::MIN` through `u8::MIN + 14`
+    // read as unresolved on every arm. Checked before any of the scope-dependent lookups
+    // below, since this is a fact about the language rather than about where `path` sits.
+    if let [type_name, member] = segments.as_slice() {
+        if let Some(value) = well_known_integer_bound(type_name, member) {
+            return Some(value);
+        }
+    }
     // Codex's finding: `Self::P0`, written inside the very impl that declares `P0`,
     // names no module `resolve_qualified_path`'s map could ever hold under the literal
     // spelling `Self` — `MatchVisitor::visit_item_impl` indexes the constant under the
