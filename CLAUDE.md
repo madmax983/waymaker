@@ -3231,5 +3231,10 @@ stays a literal string: over-refusing an unusually spelled `#[test]` is the fail
 direction, and the book's own samples are written, not adversarial. Both bugs are one
 invariant — a row test that runs is the only kind allowed to vouch for its row — so the
 fix for the second rides this issue's PR rather than a second one; the parametrized test
-above grew the seven cases that prove it. No new ADR: nothing here moves a must-not-own
-cell, a dependency edge, or a rule id.
+above grew the seven cases that prove it.
+
+Codex found a third on the same PR: `parse_outer` returns every outer attribute on a line,
+and the first version of `skips_execution` read only `parsed.first()` — so
+`#[allow(dead_code)] #[cfg_attr(all(), ignore)]`, two attributes on one line, hid the second
+behind the first. `skips_execution` now checks every parsed attribute rather than the first
+one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

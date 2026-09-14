@@ -718,28 +718,30 @@ fn anchors(sample: &str) -> Vec<Anchor> {
     found
 }
 
-/// True if `attribute` is one of `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]`, under any
-/// legal spelling.
+/// True if `attribute` carries `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]`, under any
+/// legal spelling, anywhere in it.
 ///
 /// Parsed with `syn` rather than matched by prefix (issue #97 follow-up): `#[ cfg_attr(..) ]`,
 /// `#[cfg_attr (..)]` and `#[r#cfg_attr(..)]` all name the same attribute rustc does, and a
 /// prefix match on `"#[cfg_attr("` sees none of them. A line `syn` cannot parse as an
 /// attribute names nothing here — it is not one of the three, whatever it is.
+///
+/// `syn::Attribute::parse_outer` returns every outer attribute on the line, not only the
+/// first: `#[allow(dead_code)] #[cfg_attr(all(), ignore)]` is two attributes on one line, and
+/// checking only the first one missed the second (Codex, review round 2 of issue #97).
 fn skips_execution(attribute: &str) -> bool {
     use syn::parse::Parser as _;
     let Ok(parsed) = syn::Attribute::parse_outer.parse_str(attribute) else {
         return false;
     };
-    let Some(attribute) = parsed.first() else {
-        return false;
-    };
-    let Some(ident) = attribute.path().get_ident() else {
-        return false;
-    };
-    matches!(
-        ident.unraw().to_string().as_str(),
-        "ignore" | "cfg" | "cfg_attr"
-    )
+    parsed.iter().any(|attribute| {
+        attribute.path().get_ident().is_some_and(|ident| {
+            matches!(
+                ident.unraw().to_string().as_str(),
+                "ignore" | "cfg" | "cfg_attr"
+            )
+        })
+    })
 }
 
 /// Where `sample` declares `#[test] fn name(`, or why it does not.
@@ -2528,6 +2530,9 @@ mod tests {
             "#[r#ignore]",
             "#[r#cfg(any())]",
             "#[r#cfg_attr(all(), ignore)]",
+            // Codex, review round 2 of issue #97: a second outer attribute on the same
+            // line must not hide behind the first one checked.
+            "#[allow(dead_code)] #[cfg_attr(all(), ignore)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(
