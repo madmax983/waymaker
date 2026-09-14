@@ -1280,6 +1280,22 @@ fn is_void_element(name: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
+/// Whether `span` — a complete, well-formed tag's own markup, ending at its own
+/// unquoted `>` — is self-closing: a `/` immediately before that `>`, outside any
+/// quoted attribute value (Codex, pull request #138, round 44, finding 2). Foreign
+/// content — SVG and `MathML` elements, which `HTML_BLOCK_TAG_NAMES` and
+/// [`VOID_ELEMENTS`] both leave unnamed — is the one place ordinary HTML still
+/// honors the self-closing flag XML uses: `<svg hidden />` has no body and no
+/// `</svg>` a document ever writes, so [`find_any_hidden_opening_tag`] must not wait
+/// forever for one, the same way it already never does for a [`VOID_ELEMENTS`]
+/// member.
+fn is_self_closing_tag(span: &str) -> bool {
+    span.len()
+        .checked_sub(2)
+        .and_then(|index| span.as_bytes().get(index))
+        .is_some_and(|&byte| byte == b'/')
+}
+
 /// Whether `span` — a complete, well-formed opening tag's own markup — carries the
 /// HTML boolean `hidden` attribute as an attribute *name* (Codex, pull request #138,
 /// round 42, finding 3): bare `hidden`, or `hidden=...` with any value, at a position
@@ -1323,8 +1339,11 @@ fn has_hidden_attribute(span: &str) -> bool {
 }
 
 /// The byte range and lowercase name of the earliest opening tag, at or after `from`
-/// in `line`, that carries [`has_hidden_attribute`] and is not a [`VOID_ELEMENTS`]
-/// member (Codex, pull request #138, round 42, finding 3).
+/// in `line`, that carries [`has_hidden_attribute`] and is neither a [`VOID_ELEMENTS`]
+/// member nor [`is_self_closing_tag`] (Codex, pull request #138, round 42, finding 3;
+/// round 44, finding 2 — a self-closing foreign element such as `<svg hidden />` has
+/// no body and writes no `</svg>` either, so it must not be tracked as an opener any
+/// more than a genuine void element already is not).
 ///
 /// A browser never renders such an element or anything inside it, the same as the
 /// three explicitly tracked non-rendering elements — but `hidden` can appear on *any*
@@ -1342,7 +1361,7 @@ fn find_any_hidden_opening_tag(line: &str, from: usize) -> Option<(usize, usize,
         let span = &line[start..end];
         if !span.starts_with("</") {
             let name = markup_tag_name(span);
-            if !is_void_element(name) && has_hidden_attribute(span) {
+            if !is_void_element(name) && !is_self_closing_tag(span) && has_hidden_attribute(span) {
                 return Some((start, end, name.to_ascii_lowercase()));
             }
         }
@@ -2094,6 +2113,11 @@ fn is_line_break_tag(html: &str) -> bool {
 /// open, the same way `find_any_tag` and `find_opening_tag` do, and only tests for
 /// `href=` while no attribute value is open — text inside one is never a fresh
 /// attribute name, whatever byte precedes it.
+///
+/// The returned slice is the raw source text, not yet resolved the way a browser
+/// resolves an attribute value before following it — [`decode_character_references`]
+/// is the caller's job, kept separate so this function stays about finding the right
+/// bytes rather than about decoding them.
 fn anchor_href(html: &str) -> Option<&str> {
     find_opening_tag(html, 0, "a")?;
     let bytes = html.as_bytes();
@@ -2167,6 +2191,64 @@ fn anchor_href(html: &str) -> Option<&str> {
         index += 1;
     }
     None
+}
+
+/// `value` with every HTML character reference it carries resolved to the character
+/// it names, the way a browser resolves an attribute value before using it (Codex,
+/// pull request #138, round 44, finding 3): a raw anchor's destination can itself
+/// encode part of its path as a reference — `tests&#47;spine.rs` and `tests/spine.rs`
+/// are the same destination to a reader's click — and comparing the undecoded source
+/// text against a real repository path finds neither. Decodes the five XML entities
+/// (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`) and a numeric reference, decimal
+/// (`&#47;`) or hexadecimal (`&#x2F;`/`&#X2F;`); any other named entity, or a `&` with
+/// no terminating `;` at all, is left exactly as written — a narrower scope than a
+/// full HTML5 decoder, stated rather than solved.
+fn decode_character_references(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(offset) = rest.find('&') {
+        out.push_str(&rest[..offset]);
+        let after_amp = &rest[offset + 1..];
+        let Some(semicolon) = after_amp.find(';') else {
+            out.push('&');
+            rest = after_amp;
+            continue;
+        };
+        let entity = &after_amp[..semicolon];
+        if let Some(character) = decode_one_character_reference(entity) {
+            out.push(character);
+            rest = &after_amp[semicolon + 1..];
+        } else {
+            out.push('&');
+            rest = after_amp;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One HTML character reference's own name or digits (the text between `&` and `;`,
+/// exclusive of both), resolved to the character it names — see
+/// [`decode_character_references`] for which references this recognizes.
+fn decode_one_character_reference(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let digits = entity.strip_prefix('#')?;
+            let value = match digits
+                .strip_prefix('x')
+                .or_else(|| digits.strip_prefix('X'))
+            {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse::<u32>().ok()?,
+            };
+            char::from_u32(value)
+        }
+    }
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
@@ -2700,8 +2782,18 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                 row.clear();
                 row.push('|');
             }
-            Event::End(TagEnd::TableHead | TagEnd::TableRow) if !hidden => {
-                if in_row {
+            // Never guarded by `!hidden` (Codex, pull request #138, round 44, finding
+            // 1): an inline non-rendering element opened partway through this row and
+            // left open past its own end — `open_non_rendering_tag` still non-empty
+            // right at `End(TableRow)` — used to skip this whole arm, so neither
+            // `rows.push` nor `in_row = false` ever ran; `in_row` and this row's
+            // partial text then carried straight into the *next* row, whose own
+            // content (after the element's real close, later in that row) was
+            // appended onto it, synthesizing one visible-looking row out of two a
+            // reader never sees combined. The row still ends here regardless — only
+            // whether it is *kept* depends on `hidden`, and `in_row` always resets.
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                if in_row && !hidden {
                     rows.push(row.clone());
                 }
                 in_row = false;
@@ -2773,7 +2865,12 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     && !html.starts_with("<!--") =>
             {
                 if let Some(href) = anchor_href(&html) {
-                    cell.push_str(href);
+                    // Decoded, not kept as raw source text (Codex, pull request #138,
+                    // round 44, finding 3): a destination can itself encode part of
+                    // its path as an HTML character reference, and only the resolved
+                    // value is what a reader's click — or a comparison against a
+                    // real repository path — ever sees.
+                    cell.push_str(&decode_character_references(href));
                     cell.push(' ');
                 } else if is_line_break_tag(&html) {
                     cell.push('\n');

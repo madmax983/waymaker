@@ -8246,6 +8246,105 @@ mod tests {
     }
 
     #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_encoded_slashes_still_counts() {
+        // Codex, pull request #138, round 44, finding 3: `anchor_href` hands back the
+        // raw source text of an `href`, and a destination can spell part of its own
+        // path as an HTML character reference — `tests&#47;spine.rs` resolves to
+        // `tests/spine.rs` exactly the way a browser resolves it before following the
+        // link, but as raw bytes the two never matched a real repository path. The
+        // extracted destination is now decoded before it is compared.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&#47;");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_left_hidden_past_its_own_end_is_discarded_rather_than_merged_into_the_next() {
+        // Codex, pull request #138, round 44, finding 1: ending a table row used to be
+        // guarded by `!hidden`, so a row that was still inside an inline non-rendering
+        // element when it ended — one opened in this row and not yet closed — skipped
+        // both the push and the `in_row = false` reset. Its own content then survived,
+        // concatenated onto the front of the *next* row's, and because the
+        // concatenation still contained every substring a naive check looks for, the
+        // corruption was invisible unless the check requires the first row to be
+        // properly discarded on its own rather than smuggled through merged with its
+        // neighbour. Here a `<script>` opens at the end of the first clause's row and
+        // closes at the very start of the second clause's, so under the old code the
+        // two rows became one and both clauses' text survived; under the fix the first
+        // row is discarded for having ended hidden and the second is captured cleanly.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let next = SPEC_CLAUSES.get(1).expect("the table has a second row");
+        let opened = claude_md.replacen(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| {}<script> |", clause.discharged_by),
+            1,
+        );
+        let hidden = opened.replacen(
+            &format!("| `{}`", next.id),
+            &format!("| </script>`{}`", next.id),
+            1,
+        );
+        let violations = check_recovery_spec(Some(&hidden), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation
+                        .detail
+                        .contains("no table row naming this recovery invariant")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_closing_hidden_element_before_a_clause_does_not_swallow_it_forever() {
+        // Codex, pull request #138, round 44, finding 2: `find_any_hidden_opening_tag`
+        // used to track every tag carrying a bare `hidden` attribute as needing a
+        // matching close, self-closing foreign elements included — and a self-closing
+        // tag like `<svg hidden />` never has one. Nothing after it, for the rest of
+        // the document, would ever be visible again. It is now recognised as
+        // self-closing from its own trailing `/>` and opens no hidden state at all.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let edited: Vec<AdrFile> = adrs
+            .into_iter()
+            .map(|adr| {
+                if adr.name == RECOVERY_SPEC_ADR {
+                    AdrFile {
+                        contents: adr.contents.replace(
+                            &format!("- `{}`", clause.id),
+                            &format!("- <svg hidden />\n- `{}`", clause.id),
+                        ),
+                        ..adr
+                    }
+                } else {
+                    adr
+                }
+            })
+            .collect();
+        let violations = check_recovery_spec(Some(&claude_md), &edited, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_discharge_split_by_a_line_break_tag_is_reported_as_missing() {
         // Codex, pull request #138, round 38, finding 3: the round-37 fix for `<br>`
         // landed in `markdown_prose`; this independent collector, `table_rows`, still
