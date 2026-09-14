@@ -28,6 +28,18 @@ pub struct Suspended(());
 impl Suspended {
     /// The one value, made by the driver only.
     pub(crate) const NEW: Self = Self(());
+
+    /// The run cannot continue because a caller's own dispatch has not answered yet.
+    ///
+    /// A synchronous workflow gets [`Suspended`] by propagating one a boundary call
+    /// returned. A caller driving an opaque `Future` cannot: design document §07 step 4 is
+    /// the world's, so a dispatcher that answers `Poll::Pending` stops the future with
+    /// nothing recorded and nothing to propagate — no boundary call is pending, only the
+    /// world's own answer. This is that stop, named for the one caller it is for.
+    #[must_use]
+    pub const fn awaiting_dispatch() -> Self {
+        Self(())
+    }
 }
 
 /// What the driver says about one activity boundary, after design document §07 step 3.
@@ -39,11 +51,12 @@ impl Suspended {
 ///
 /// # Why this vocabulary is the driver's own
 ///
-/// So that removing the façade removes nothing here. Nothing below `facade`, `ota` and
-/// `provisioning` names a `waymaker-embassy` type, and the `without-facade` feature deletes
-/// those modules — which is what makes "the protocol is fully usable through the
-/// synchronous driver" a build rather than a claim. The `drive-facadeless` pipeline stage is
-/// that build.
+/// So that removing the façade removes nothing here. This crate names no dependency on
+/// `waymaker-embassy` at all — issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106) moved `facade`, `ota` and
+/// `provisioning` into `waymaker-facade-demo`, above this crate — which is what makes "the
+/// protocol is fully usable through the synchronous driver" a fact `cargo metadata` states
+/// rather than a claim a feature flag argued for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handoff<'a> {
     /// History holds the outcome. Nothing may be dispatched.

@@ -118,7 +118,7 @@ pub const BOOK_CHAPTERS: &[Chapter] = &[
 /// code samples are tested, not merely quoted": the bytes the book shows are the bytes of a
 /// file the `test` stage compiles and runs, so a sample that stopped compiling is a red
 /// pipeline rather than a wrong page.
-pub const BOOK_SAMPLE_FILES: &[&str] = &["crates/waymaker-drive/tests/book.rs"];
+pub const BOOK_SAMPLE_FILES: &[&str] = &["crates/waymaker-facade-demo/tests/book.rs"];
 
 /// The documents a chapter may include whole, by workspace-relative path.
 ///
@@ -2069,7 +2069,7 @@ mod tests {
             .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
             .expect("the fixture has the first chapter");
         chapter.1 = chapter.1.replace(
-            "crates/waymaker-drive/tests/book.rs",
+            "crates/waymaker-facade-demo/tests/book.rs",
             "crates/waymaker-drive/src/ota.rs",
         );
         assert!(

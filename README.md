@@ -79,19 +79,23 @@ Dependency direction is strict: `waymaker-embassy` → `waymaker-flash` → `way
 The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI gate, not a
 convention — see [Development](#development).
 
-Seven workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
+Eight workspace members are not layers: `xtask` is the gate itself, `waymaker-size-probe` is
 firmware linked only so that its section sizes can be measured, `waymaker-fault` is the crash
 harness, `waymaker-spec` is the formal specification of the recovery invariants,
 `waymaker-conformance` is the storage-contract suite and the `embedded-storage` port,
 `waymaker-rig` is the power-cut and watchdog-reset rig and the two board clocks of design
-document §11 — an RTC in a backed-up domain and an epoch a network restores — and
+document §11 — an RTC in a backed-up domain and an epoch a network restores —
 `waymaker-drive` is the
 synchronous driver that runs a workflow to completion through the kernel boundary, together
 with design document §07's seven-step effect protocol — which is here rather than in
-`waymaker-flash` because step 4 is an activity, and that layer must not own activities. No layer
-may depend on any of them. The last three are `#![no_std]` and allocation-free, because each
-exists to be run on the part rather than only about it; CI builds `waymaker-rig` and
-`waymaker-drive` for `thumbv6m-none-eabi`, and `waymaker-conformance` is meant to be built by
+`waymaker-flash` because step 4 is an activity, and that layer must not own activities — and
+`waymaker-facade-demo` is the bridge from `waymaker-drive` to `waymaker-embassy` and design
+document §06's two examples, above `waymaker-drive` rather than inside it so that
+`waymaker-drive` names no dependency on the façade at all (issue #106). No layer
+may depend on any of them. The last four are `#![no_std]` and allocation-free, because each
+exists to be run on the part rather than only about it; CI builds `waymaker-rig`,
+`waymaker-drive` and `waymaker-facade-demo` for `thumbv6m-none-eabi`, and
+`waymaker-conformance` is meant to be built by
 an adapter author for the target their driver is for. None is in the image the code-flash
 budget is measured against.
 
@@ -163,7 +167,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
-cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings

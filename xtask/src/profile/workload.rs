@@ -10,7 +10,7 @@
 //! Because a new workspace member is a row in [`crate::policy`], a bullet in `CLAUDE.md` and
 //! a category to argue about, and this is not code anything links — it is a subcommand of
 //! the gate, run under a tool, for the length of one measurement. `xtask` already depends on
-//! all five crates driven below, for the reason [`crate::wear`] gives: a number that lives in
+//! all six crates driven below, for the reason [`crate::wear`] gives: a number that lives in
 //! two places is a number that ends up disagreeing with itself.
 //!
 //! # What a workload owes
@@ -23,9 +23,9 @@
 
 use waymaker_core::{Outcome as DriveOutcome, RunId};
 use waymaker_drive::demo::{BOUNDS, DOWNLOAD, HASH, Pipeline, World};
-use waymaker_drive::ota::{self, Downloader, Ota, poll_ota};
 use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
 use waymaker_drive::{Identity, Suspended, Workflow};
+use waymaker_facade_demo::ota::{self, Downloader, Ota, poll_ota};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -180,11 +180,10 @@ impl Workflow for Concrete {
 /// `waymaker-embassy`'s `Ctx` and its four futures, over the same driver and the same media.
 ///
 /// Design document §06's OTA example is an `async fn` whose boundaries are the façade's.
-/// Driving it is what makes `waymaker-embassy` a crate this gate has *measured* rather than
-/// one it names: the façade is reached through `waymaker-drive`'s dependency either way, and
-/// until this workload existed nothing executed a line of it, so an allocation in `Ctx` would
-/// have produced no frame and left every row clean. Codex found that on the first review of
-/// this gate.
+/// Driving it is what makes `waymaker-embassy` and `waymaker-facade-demo` two crates this
+/// gate has *measured* rather than only named: until this workload existed nothing executed
+/// a line of either, so an allocation in `Ctx` would have produced no frame and left every
+/// row clean. Codex found that on the first review of this gate.
 fn facade() -> Result<u32, WorkloadError> {
     let geometry = Geometry::new(4096, 1024, 4, 1)
         .map_err(|error| WorkloadError::new(format!("not a geometry ({})", error.message())))?;

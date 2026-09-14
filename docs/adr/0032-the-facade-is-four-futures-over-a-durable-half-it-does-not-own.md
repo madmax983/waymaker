@@ -163,6 +163,21 @@ the dependency graph is to move the two modules into a crate of their own, above
 [#106](https://github.com/madmax983/waymaker/issues/106) rather than this change, because a
 restructure taken at the end of a review round is one no round has reviewed.
 
+**Superseded by issue #106.** `without-facade` and the `drive-facadeless` stage are gone.
+`waymaker-facade-demo` now holds `facade`, `ota` and `provisioning` above `waymaker-drive`,
+which names no dependency on `waymaker-embassy` at all — a fact `cargo metadata` states
+rather than a claim a feature flag argued for. `ctx-facade`'s driver half keeps its shape,
+holding every `waymaker-drive` module to naming no façade, but its exemption list is now
+empty because there is no in-crate module left to exempt. Moving `ota` and `provisioning`
+also moved the one place either built a `Suspended`: a private field an in-crate module
+could reach directly, that a crate above `waymaker-drive` cannot. `Bridge` now keeps the
+real value the boundary returned and hands it back after a poll, rather than a value the
+workflow mints itself — the same fact, carried across the `.await` instead of asserted anew
+on the other side of it. One stall has no boundary call behind it to keep: a dispatcher
+still working answers `Poll::Pending` with nothing recorded, and `Suspended::awaiting_dispatch`
+is the value named for that case, `pub` rather than `pub(crate)` because both examples need
+it and neither can be granted the wider privilege `Suspended::NEW` still keeps.
+
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
 caller's, so §04's runtime-RAM statics gate does not move, but a device running the façade

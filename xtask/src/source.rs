@@ -6660,26 +6660,21 @@ pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 
 /// The driver files that may name the façade.
 ///
-/// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
-/// fully usable through the synchronous driver. Every *other* module of `waymaker-drive` is
-/// held to naming no façade, and the list is the exemptions rather than the modules held —
-/// so a module added tomorrow is covered without anyone remembering to add a row.
-///
-/// `lib.rs` is here because a crate root declares its modules and re-exports a name from
-/// them. Its own honesty is the `drive-facadeless` build's rather than this scan's.
-pub const FACADE_DRIVER_MODULES: &[&str] = &[
-    "waymaker-drive/src/facade.rs",
-    "waymaker-drive/src/lib.rs",
-    "waymaker-drive/src/ota.rs",
-    "waymaker-drive/src/provisioning.rs",
-];
+/// Empty. Issue [#106](https://github.com/madmax983/waymaker/issues/106) moved the façade
+/// edge — `facade`, `ota` and `provisioning` — into `waymaker-facade-demo`, a crate above
+/// `waymaker-drive` rather than inside it, so no `waymaker-drive` module needs an exemption
+/// any more. The list stays rather than being deleted: it is what
+/// `check_facade_free_driver` iterates, and an empty list read by a live rule is a
+/// stronger statement than a rule with nothing to hold.
+pub const FACADE_DRIVER_MODULES: &[&str] = &[];
 
 /// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
 ///
-/// The crate itself, and the three source-level routes to it that name no crate: the two
-/// modules that hold the edge, and the type they re-export. Review of this change reached
-/// the façade with `use crate::facade::Bridge;` while a ban on the crate name alone stayed
-/// green.
+/// The façade crate, and four source-level routes to it that name no crate directly: the
+/// bridge that once held the edge, design document §06's two examples, and the type the
+/// bridge exports. `waymaker-drive` has no dependency on any of these — issue #106 — so
+/// this is a floor under a regression rather than a description of what the crate does
+/// today.
 pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
     (
         "waymaker_embassy",
@@ -6728,11 +6723,12 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 /// And **no hidden global state**: a `static` in either module is the other half of the
 /// must-not-own cell, and a façade with one is a façade two runs on a device would share.
 ///
-/// The fourth half is the driver's. Every `waymaker-drive` module but the three in
-/// [`FACADE_DRIVER_MODULES`] is held to naming none of [`FACADE_FREE_VOCABULARY`], so a
-/// module added tomorrow is covered without anyone remembering a row. That is the fast half
-/// of "removing the Embassy crate leaves the protocol fully usable"; the `drive-facadeless`
-/// pipeline stage is the half a compiler decides.
+/// The fourth half is the driver's. Every `waymaker-drive` module — [`FACADE_DRIVER_MODULES`]
+/// is empty, since issue #106 moved the edge above the crate rather than exempting a file
+/// inside it — is held to naming none of [`FACADE_FREE_VOCABULARY`], so a module added
+/// tomorrow is covered without anyone remembering a row. That is the fast half of "removing
+/// the Embassy crate leaves the protocol fully usable"; `cargo metadata` saying
+/// `waymaker-drive` has no dependency on `waymaker-embassy` is the half nothing can fake.
 ///
 /// # What it cannot see
 ///
@@ -7280,12 +7276,14 @@ fn count_declarations(code: &str, header: &str) -> usize {
         .count()
 }
 
-/// Every `waymaker-drive` module but the three that hold the façade edge names no façade.
+/// Every `waymaker-drive` module names no façade.
 ///
 /// Discovered from the sources rather than listed, so a module added tomorrow is covered.
-/// A scanner is not the whole of this claim and does not have to be: the `drive-facadeless`
-/// pipeline stage builds the crate with `without-facade`, which a `use crate::facade::Bridge`
-/// and a dependency renamed in a manifest both fail. This is the fast, local half.
+/// A scanner is not the whole of this claim and does not have to be: `cargo metadata` says
+/// `waymaker-drive` has no dependency on `waymaker-embassy` at all, in any table, which a
+/// `use waymaker_embassy::...` or a dependency renamed in a manifest both fail to resolve.
+/// This is the fast, local half. See issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106).
 fn check_facade_free_driver(
     rule: &'static str,
     subject: &str,
@@ -7310,8 +7308,7 @@ fn check_facade_free_driver(
                     subject.to_owned(),
                     format!(
                         "{path} names `{forbidden}`, which {why}; the edge belongs in \
-                         waymaker-drive/src/facade.rs, waymaker-drive/src/ota.rs or \
-                         waymaker-drive/src/provisioning.rs"
+                         waymaker-facade-demo"
                     ),
                 ));
             }
@@ -7321,8 +7318,8 @@ fn check_facade_free_driver(
         violations.push(Violation::new(
             rule,
             subject.to_owned(),
-            "no waymaker-drive module outside the façade edge is in the workspace, so \
-             nothing says the synchronous driver still compiles with the façade removed"
+            "no waymaker-drive module is in the workspace, so nothing says the synchronous \
+             driver still compiles with the façade removed"
                 .to_owned(),
         ));
     }
@@ -11610,7 +11607,7 @@ mod deferred_answer_pins {
     #[test]
     fn a_driver_module_that_names_the_facade_is_reported() {
         // Issue #35's second "done when": removing the façade must leave the protocol
-        // usable, so the edge belongs in the two files that exist to hold it.
+        // usable, so the edge belongs in `waymaker-facade-demo` and not here.
         let module = "//! A driver module.\nuse waymaker_embassy::Journal;\n";
         let details = facade_driver_details("waymaker-drive/src/drive.rs", module);
         assert!(
