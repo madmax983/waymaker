@@ -1979,11 +1979,13 @@ pub fn match_expressions(
     contents: &str,
     external_qualified: &std::collections::HashMap<String, i128>,
     external_qualified_unsigned: &std::collections::HashMap<String, bool>,
+    external_qualified_types: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     match_expressions_with_prefix(
         contents,
         external_qualified,
         external_qualified_unsigned,
+        external_qualified_types,
         &[],
     )
 }
@@ -2017,6 +2019,7 @@ pub fn match_expressions_with_prefix(
     contents: &str,
     external_qualified: &std::collections::HashMap<String, i128>,
     external_qualified_unsigned: &std::collections::HashMap<String, bool>,
+    external_qualified_types: &std::collections::HashMap<String, String>,
     prefix: &[String],
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
@@ -2061,11 +2064,15 @@ pub fn match_expressions_with_prefix(
         qualified_unsigned: external_qualified_unsigned.clone(),
         // Codex's next-round finding: `path_declared_type` answered `None` for every
         // qualified reference, because nothing here tracked a qualified constant's own
-        // declared type at all — only `qualified_unsigned`'s own bool did. Seeded empty
-        // here the same first-round way `qualified_unsigned` itself once was, before that
-        // map's own cross-file threading was added: this file's own inline modules are what
-        // `visit_item_mod` populates it from below.
-        qualified_types: std::collections::HashMap::new(),
+        // declared type at all — only `qualified_unsigned`'s own bool did. Seeded empty at
+        // first, the same first-round way `qualified_unsigned` itself once was — but
+        // `check_integrity_check_module_tree` already collects one, alongside `qualified`
+        // and `qualified_unsigned`, from every file of the tree before any file is checked
+        // for a dense match; `bounds::OFF` declared in one file and referenced as
+        // `!bounds::OFF` in a guard written in another needed `OFF`'s own `bool` declaration
+        // to reach that guard, and this parameter is what carries it there — the identical
+        // map `qualified_constants_with_prefix` now returns instead of discarding.
+        qualified_types: external_qualified_types.clone(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -2102,9 +2109,9 @@ pub fn match_expressions_with_prefix(
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 #[allow(
     clippy::type_complexity,
-    reason = "the value map and its unsignedness mirror, returned together the same way \
-              they are threaded together through every caller — a type alias would name \
-              the pair once more than the signature already does"
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way they are threaded together through every caller — a \
+              type alias would name the trio once more than the signature already does"
 )]
 pub fn qualified_constants(
     contents: &str,
@@ -2112,12 +2119,14 @@ pub fn qualified_constants(
     (
         std::collections::HashMap<String, i128>,
         std::collections::HashMap<String, bool>,
+        std::collections::HashMap<String, String>,
     ),
     syn::Error,
 > {
     qualified_constants_with_prefix(
         contents,
         &[],
+        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
     )
@@ -2164,29 +2173,32 @@ pub fn qualified_constants(
 )]
 #[allow(
     clippy::type_complexity,
-    reason = "the value map and its unsignedness mirror, returned together the same way \
-              they are threaded together through every caller — a type alias would name \
-              the pair once more than the signature already does"
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way they are threaded together through every caller — a \
+              type alias would name the trio once more than the signature already does"
 )]
 pub fn qualified_constants_with_prefix(
     contents: &str,
     prefix: &[String],
     external_qualified: &std::collections::HashMap<String, i128>,
     external_qualified_unsigned: &std::collections::HashMap<String, bool>,
+    external_qualified_types: &std::collections::HashMap<String, String>,
 ) -> Result<
     (
         std::collections::HashMap<String, i128>,
         std::collections::HashMap<String, bool>,
+        std::collections::HashMap<String, String>,
     ),
     syn::Error,
 > {
     let file = parse_rust(contents)?;
     let item_unsigned = item_const_unsigned(&file.items);
+    let item_types = item_const_types(&file.items);
     let base = resolve_scope_consts(
         &OwnConsts {
             exprs: &item_const_exprs(&file.items),
             unsigned: &item_unsigned,
-            types: &item_const_types(&file.items),
+            types: &item_types,
         },
         &OuterScopes {
             values: &ConstScopes(Vec::new()),
@@ -2208,6 +2220,14 @@ pub fn qualified_constants_with_prefix(
     // key `qualified` itself gains, from the identical `item_unsigned` map `base`'s own
     // values were resolved against.
     let mut qualified_unsigned = external_qualified_unsigned.clone();
+    // Codex's next-round finding: this still seeded `qualified_types` empty even once
+    // `qualified_unsigned` was threaded through, because a declared type is not an
+    // unsignedness — `bounds.rs` declaring `OFF: bool = false;` and a guard in `crc.rs`
+    // spelled `!bounds::OFF` needs `OFF`'s own `bool` ascription to reach that guard's own
+    // file, and only this function ever sees `bounds.rs`'s own `item_types`. Inserted at the
+    // identical key `qualified` and `qualified_unsigned` themselves gain, from the identical
+    // `item_types` map `base`'s own values were resolved against.
+    let mut qualified_types = external_qualified_types.clone();
     if !prefix.is_empty() {
         for (name, value) in &base {
             qualified.insert(format!("{}::{name}", prefix.join("::")), *value);
@@ -2215,12 +2235,15 @@ pub fn qualified_constants_with_prefix(
                 format!("{}::{name}", prefix.join("::")),
                 item_unsigned.get(name).copied().unwrap_or(false),
             );
+            if let Some(type_name) = item_types.get(name) {
+                qualified_types.insert(format!("{}::{name}", prefix.join("::")), type_name.clone());
+            }
         }
     }
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         scopes_unsigned: UnsignedConstScopes(vec![item_unsigned]),
-        scopes_types: ConstTypeScopes(vec![item_const_types(&file.items)]),
+        scopes_types: ConstTypeScopes(vec![item_types]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
@@ -2231,14 +2254,15 @@ pub fn qualified_constants_with_prefix(
         trait_defaults: std::collections::HashMap::new(),
         qualified,
         qualified_unsigned,
-        // Codex's next-round finding: seeded empty here for the identical first-round
-        // reason `match_expressions_with_prefix`'s own seed is — this file's own inline
-        // modules are what `visit_item_mod` populates it from during the walk below.
-        qualified_types: std::collections::HashMap::new(),
+        qualified_types,
         found: Vec::new(),
     };
     visitor.visit_file(&file);
-    Ok((visitor.qualified, visitor.qualified_unsigned))
+    Ok((
+        visitor.qualified,
+        visitor.qualified_unsigned,
+        visitor.qualified_types,
+    ))
 }
 
 /// A stack of constant scopes, outermost first, each mapping a `const` name declared

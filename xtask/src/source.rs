@@ -8431,6 +8431,100 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     violations
 }
 
+/// Every module-qualified constant `scanned_sources` declares, across the whole tree, run to
+/// a fixed point — alongside its own unsignedness mirror and its own declared-type mirror —
+/// factored out of [`check_integrity_check_module_tree`] to keep that function under
+/// clippy's line count.
+///
+/// Codex's finding: `qualified` used to start empty and grow only as `match_expressions`
+/// reached each inline module, so a match textually *before* the `mod` it references — or
+/// one in another file of the same tree entirely — never resolved. Rust's own item lookup is
+/// neither order- nor file-dependent inside one module tree, so this collects every
+/// module-qualified constant the whole tree declares, from every scanned source, before any
+/// of them is checked for a dense match. `prefixes` is what makes an out-of-line
+/// `mod indices;` resolve at all: without a declaration's own name seeded as that file's
+/// prefix, `indices.rs`'s own top-level constants have no module to be qualified under,
+/// because the declaration naming them lives in a different file.
+///
+/// Codex's forty-fourth-round finding: a single pass over the tree, each file scanned in
+/// isolation, cannot resolve a constant whose own initializer names a *different* file's
+/// module — `pub const P0: u8 = super::base::BASE + 0;` in an out-of-line `indices.rs`
+/// sibling to a `base` module declared in another file entirely — because
+/// `qualified_constants_with_prefix` used to see nothing beyond the one file it was handed,
+/// regardless of which order the tree's files were visited in. Run to a fixed point instead,
+/// feeding each pass's accumulated map back in as the next pass's own seed: a dependency
+/// chain across files needs at most as many passes as there are files to fully resolve, so
+/// bounding the loop at `scanned_sources.len()` (mirroring `resolve_scope_consts`'s own
+/// bounded fixed point) is exact rather than a heuristic cutoff, and a pass that adds
+/// nothing new stops the loop early.
+///
+/// Codex's next-round finding: `qualified_unsigned` was never collected here at all, so
+/// every caller downstream had nothing to thread through but an empty map — a qualified
+/// constant's own unsignedness stayed invisible to any match outside the one file that
+/// declared it, however far `qualified` itself had already reached across the tree.
+/// Collected in lockstep with `qualified`, at the identical key, from the identical
+/// fixed-point pass: `qualified_constants_with_prefix` now returns both maps together.
+///
+/// Codex's next-round finding: `qualified_types` was never collected here either, for the
+/// identical reason `qualified_unsigned` once was not — a declared type is not an
+/// unsignedness, and `bounds.rs` declaring `const OFF: bool = false;` needed its own `bool`
+/// ascription to reach a guard spelled `!bounds::OFF` in a different file of the same tree.
+/// Collected in lockstep with `qualified` and `qualified_unsigned`, at the identical key,
+/// from the identical fixed-point pass: `qualified_constants_with_prefix` now returns all
+/// three maps together.
+#[allow(
+    clippy::type_complexity,
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way they are threaded together through every caller — a \
+              type alias would name the trio once more than the signature already does"
+)]
+fn collect_tree_qualified_constants(
+    scanned_sources: &[&crate::size::LayerSource],
+    prefixes: &[(String, Vec<String>)],
+) -> (
+    std::collections::HashMap<String, i128>,
+    std::collections::HashMap<String, bool>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut qualified = std::collections::HashMap::new();
+    let mut qualified_unsigned = std::collections::HashMap::new();
+    let mut qualified_types = std::collections::HashMap::new();
+    for _ in 0..scanned_sources.len().max(1) {
+        let mut progressed = false;
+        for scanned in scanned_sources {
+            let prefix = prefixes
+                .iter()
+                .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
+                .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+            if let Ok((found, found_unsigned, found_types)) =
+                crate::parse::qualified_constants_with_prefix(
+                    &scanned.contents,
+                    &prefix,
+                    &qualified,
+                    &qualified_unsigned,
+                    &qualified_types,
+                )
+            {
+                for (name, value) in found {
+                    if qualified.insert(name.clone(), value).is_none() {
+                        progressed = true;
+                    }
+                    if let Some(unsigned) = found_unsigned.get(&name) {
+                        qualified_unsigned.insert(name.clone(), *unsigned);
+                    }
+                    if let Some(type_name) = found_types.get(&name) {
+                        qualified_types.insert(name, type_name.clone());
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    (qualified, qualified_unsigned, qualified_types)
+}
+
 /// The array ban and the dense-match-table scan, both walked across the checksum module's
 /// whole tree rather than the single named function [`check_integrity_check_tables`] pins —
 /// factored out to keep `check_integrity_check` under clippy's line count.
@@ -8469,62 +8563,9 @@ fn check_integrity_check_module_tree(
     // tree is a candidate, and one is only excused when it is, exactly, the one table
     // `INTEGRITY_CHECK_TABLES` names — counted, so a byte-identical copy under a second
     // function name is still a second table rather than a coincidence.
-    // Codex's finding: `qualified` used to start empty and grow only as `match_expressions`
-    // reached each inline module, so a match textually *before* the `mod` it references
-    // — or one in another file of the same tree entirely — never resolved. Rust's own item
-    // lookup is neither order- nor file-dependent inside one module tree, so this collects
-    // every module-qualified constant the whole tree declares, from every scanned source,
-    // before any of them is checked for a dense match. `module_path_prefixes` is what makes
-    // an out-of-line `mod indices;` resolve at all: without a declaration's own name seeded
-    // as that file's prefix, `indices.rs`'s own top-level constants have no module to be
-    // qualified under, because the declaration naming them lives in a different file.
-    // Codex's forty-fourth-round finding: a single pass over the tree, each file scanned
-    // in isolation, cannot resolve a constant whose own initializer names a *different*
-    // file's module — `pub const P0: u8 = super::base::BASE + 0;` in an out-of-line
-    // `indices.rs` sibling to a `base` module declared in another file entirely — because
-    // `qualified_constants_with_prefix` used to see nothing beyond the one file it was
-    // handed, regardless of which order the tree's files were visited in. Run to a fixed
-    // point instead, feeding each pass's accumulated map back in as the next pass's own
-    // seed: a dependency chain across files needs at most as many passes as there are
-    // files to fully resolve, so bounding the loop at `scanned_sources.len()` (mirroring
-    // `resolve_scope_consts`'s own bounded fixed point) is exact rather than a heuristic
-    // cutoff, and a pass that adds nothing new stops the loop early.
-    let mut qualified = std::collections::HashMap::new();
-    // Codex's next-round finding: `qualified_unsigned` was never collected here at all, so
-    // every caller downstream had nothing to thread through but an empty map — a qualified
-    // constant's own unsignedness stayed invisible to any match outside the one file that
-    // declared it, however far `qualified` itself had already reached across the tree.
-    // Collected in lockstep with `qualified`, at the identical key, from the identical
-    // fixed-point pass: `qualified_constants_with_prefix` now returns both maps together.
-    let mut qualified_unsigned = std::collections::HashMap::new();
     let prefixes = module_path_prefixes(sources, source).unwrap_or_default();
-    for _ in 0..scanned_sources.len().max(1) {
-        let mut progressed = false;
-        for scanned in &scanned_sources {
-            let prefix = prefixes
-                .iter()
-                .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
-                .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
-            if let Ok((found, found_unsigned)) = crate::parse::qualified_constants_with_prefix(
-                &scanned.contents,
-                &prefix,
-                &qualified,
-                &qualified_unsigned,
-            ) {
-                for (name, value) in found {
-                    if qualified.insert(name.clone(), value).is_none() {
-                        progressed = true;
-                    }
-                    if let Some(unsigned) = found_unsigned.get(&name) {
-                        qualified_unsigned.insert(name, *unsigned);
-                    }
-                }
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
+    let (qualified, qualified_unsigned, qualified_types) =
+        collect_tree_qualified_constants(&scanned_sources, &prefixes);
 
     let mut allowed_table_hits = vec![0_usize; INTEGRITY_CHECK_TABLES.len()];
     for scanned in scanned_sources {
@@ -8558,6 +8599,7 @@ fn check_integrity_check_module_tree(
             scanned,
             &qualified,
             &qualified_unsigned,
+            &qualified_types,
             &prefix,
             &mut allowed_table_hits,
             &mut violations,
@@ -8740,6 +8782,7 @@ fn check_checksum_module_dense_matches(
     scanned: &crate::size::LayerSource,
     qualified: &std::collections::HashMap<String, i128>,
     qualified_unsigned: &std::collections::HashMap<String, bool>,
+    qualified_types: &std::collections::HashMap<String, String>,
     prefix: &[String],
     allowed_table_hits: &mut [usize],
     violations: &mut Vec<Violation>,
@@ -8751,6 +8794,7 @@ fn check_checksum_module_dense_matches(
         &scanned.contents,
         qualified,
         qualified_unsigned,
+        qualified_types,
         prefix,
     ) {
         Ok(matches) => matches,
@@ -20958,6 +21002,45 @@ mod deferred_answer_pins {
              _ => qualified_bool_catchall_guard_helper(4),\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_cross_file_qualified_declared_bool_constant_is_the_effective_catchall()
+     {
+        // Codex's next-round finding: the inline-module fix above still left
+        // `check_integrity_check_module_tree`'s own tree-wide `qualified_types` seeded
+        // empty at every `match_expressions_with_prefix` call, the identical gap
+        // `a_dense_match_guarded_by_a_cross_file_qualified_typed_constant_is_pruned_as_dead`
+        // already closed for `qualified_unsigned` — `bounds::OFF` declared in a sibling
+        // *out-of-line* `bounds.rs`, referenced as `!bounds::OFF` in a guard written in a
+        // different file, answered `None` for its own declared type no matter how it was
+        // declared, because the file that would answer honestly (`bounds.rs`) was never the
+        // file whose guard needed it. `qualified_constants_with_prefix` now returns its own
+        // `qualified_types` alongside `qualified` and `qualified_unsigned`, collected across
+        // the tree the same fixed-point pass already collects both with, and threaded
+        // through to `match_expressions_with_prefix` instead of an empty map.
+        let parent = format!(
+            "{}\nmod bounds;\n\nconst fn cross_file_qualified_bool_catchall_helper(nibble: \
+             u32) -> u32 {{\n    nibble\n}}\n\nconst fn \
+             cross_file_qualified_bool_catchall_table(nibble: u8) -> u32 {{\n    match \
+             nibble {{\n        0 => cross_file_qualified_bool_catchall_helper(0),\n        \
+             1 => cross_file_qualified_bool_catchall_helper(1),\n        \
+             2 => cross_file_qualified_bool_catchall_helper(2),\n        \
+             _ if !bounds::OFF => cross_file_qualified_bool_catchall_helper(3),\n        \
+             _ => cross_file_qualified_bool_catchall_helper(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let bounds = "//! Bounds.\npub(crate) const OFF: bool = false;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/bounds.rs", bounds),
+        ]);
         assert!(
             violations
                 .iter()
