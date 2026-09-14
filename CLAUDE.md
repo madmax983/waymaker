@@ -3717,6 +3717,18 @@ exactly like a bare `X`, reaching a block-local shadow `self::` exists to bypass
 every block in between, since a `mod` can itself be declared inside a block — before either
 token is consumed, so `self` lands there and `super` steps one module further from it. No new
 ADR here either: this is `struct_literal_counts`'s own correctness, not a new decision.
+A fourth gap in the same reconciliation surfaced on this pull request's own review:
+`LiteralScope::Block` had carried a block's own `use`/`type` aliases since issue #92 but
+never a `mod` declared directly in that same block, so a lookup from *inside* the block that
+declares the module — not only from outside it, which was already covered — found no modules
+at that frame and fell through to the enclosing scope instead of stepping in.
+`fn f() { mod aliases { pub type Ready = super::Sealable; } aliases::Ready { .. } }` resolved
+as `Ready` instead of `Sealable`, which would let a `commit-discipline` or `swap-discipline`
+construction pin miss a barrier-capable state built this way. `block_own_modules` is
+`own_modules`'s own block-scoped twin, mirroring `block_own_aliases` beside `own_aliases`;
+`LiteralScope::Block` now carries a block's own inline modules alongside its aliases, and
+every module lookup — at a `Module` frame or a `Block` one — reads them the same way. No new
+ADR here either.
 `Effect::redelivering` threads the same binding through with no kernel-boundary change:
 `decide` already checks the workflow's current request against history with
 `ReplayMachine::intent` before the redelivery row is reached, so the request `redelivering`

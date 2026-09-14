@@ -480,8 +480,11 @@ fn block_own_aliases(block: &syn::Block) -> Vec<UseAlias> {
     }))
 }
 
-/// The inline sibling modules `items` declares directly, at its own level only:
-/// `mod name { .. }` and the items inside it.
+/// The inline sibling modules any item list declares directly, at its own level only:
+/// `mod name { .. }` and the items inside it. Shared by [`own_modules`], over a module's own
+/// item list, and [`block_own_modules`], over a block's own statements — the same split
+/// [`own_aliases`] and [`block_own_aliases`] already make, for the same reason: a block has
+/// no `&[syn::Item]` slice of its own to reuse the module scan on directly.
 ///
 /// Issue #169: a plain relative path can name a sibling module instead of a
 /// `use` alias, e.g. `traits::Pollable` beside `mod traits { .. }`.
@@ -489,9 +492,11 @@ fn block_own_aliases(block: &syn::Block) -> Vec<UseAlias> {
 /// resolving there. An out-of-line declaration (`mod name;`) has no body
 /// here to step into, and a `#[cfg(test)]` module is skipped — the same
 /// reason `own_aliases` skips one (issue #51).
-fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
+fn own_modules_from<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> Vec<(String, &'a [syn::Item])> {
     items
-        .iter()
+        .into_iter()
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter_map(|item| match item {
             syn::Item::Mod(module) => module
@@ -501,6 +506,25 @@ fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
             _ => None,
         })
         .collect()
+}
+
+/// [`own_modules_from`] over a module's own item list.
+fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
+    own_modules_from(items)
+}
+
+/// [`own_modules_from`] over a block's own statements, not a nested block's (issue #171,
+/// Codex review: `LiteralScope::Block` had carried a block's own `use`/`type` aliases since
+/// issue #92 but never a `mod` declared directly in that same block, so
+/// `fn f() { mod aliases { pub type Ready = super::Sealable; } aliases::Ready { .. } }`
+/// fell through the block frame — which carries no modules to check — straight to the
+/// enclosing module, and resolved to the wrong `Ready` if one existed there instead of
+/// refusing to resolve at all). Mirrors [`block_own_aliases`]'s own filter.
+fn block_own_modules(block: &syn::Block) -> Vec<(String, &[syn::Item])> {
+    own_modules_from(block.stmts.iter().filter_map(|stmt| match stmt {
+        syn::Stmt::Item(item) => Some(item),
+        _ => None,
+    }))
 }
 
 /// Every item anywhere in `items`, at any nesting depth, `mod` blocks
@@ -826,36 +850,51 @@ fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
 }
 
 /// One scope of [`struct_literal_counts`]'s own stack: a module's item list (opaque,
-/// steppable into by name — issue #169) or a block's own precomputed aliases (transparent —
-/// issue #92's local `type` alias).
+/// steppable into by name — issue #169) or a block's own precomputed aliases and modules
+/// (transparent — issue #92's local `type` alias, and issue #171's local `mod`).
 ///
 /// A block has no `&[syn::Item]` slice of its own — its statements interleave items with
-/// everything else — so a block's aliases are collected once, by [`block_own_aliases`], and
-/// carried here rather than recomputed from an item list the way a module's are. Module
-/// descent (issue #169) is scoped to module frames only: nothing here asks for a `mod`
-/// declared inside a block to be steppable into from outside that block, which is a case
-/// nobody has built or needed.
+/// everything else — so a block's aliases and modules are collected once, by
+/// [`block_own_aliases`] and [`block_own_modules`], and carried here rather than recomputed
+/// from an item list the way a module's are. A `mod` declared inside a block is steppable
+/// into only from inside that same block (or a block nested in it) — it goes on the stack
+/// alongside the block's aliases, at the same frame, rather than being reachable from outside
+/// the block that declares it.
 enum LiteralScope<'ast> {
     /// A module's own item list.
     Module(&'ast [syn::Item]),
-    /// A block's own precomputed aliases.
-    Block(Vec<UseAlias>),
+    /// A block's own precomputed aliases and inline sibling modules.
+    Block {
+        /// This block's own `use` and `type` aliases.
+        aliases: Vec<UseAlias>,
+        /// The inline `mod` blocks this block declares directly in its own statements.
+        modules: Vec<(String, &'ast [syn::Item])>,
+    },
 }
 
-impl LiteralScope<'_> {
+impl<'ast> LiteralScope<'ast> {
     /// This scope's own `use` and `type` aliases, computed on demand for a module the same
     /// way [`resolve_segments`] does.
     fn aliases(&self) -> Vec<UseAlias> {
         match self {
             Self::Module(items) => own_aliases(*items),
-            Self::Block(aliases) => aliases.clone(),
+            Self::Block { aliases, .. } => aliases.clone(),
+        }
+    }
+
+    /// This scope's own inline sibling modules, computed on demand for a module the same way
+    /// [`resolve_segments`] does.
+    fn modules(&self) -> Vec<(String, &'ast [syn::Item])> {
+        match self {
+            Self::Module(items) => own_modules(items),
+            Self::Block { modules, .. } => modules.clone(),
         }
     }
 
     /// Whether a lookup that misses here falls through to the scope below without an
     /// explicit `super::` — true for a block, false for a module (issue #109).
     const fn transparent(&self) -> bool {
-        matches!(self, Self::Block(_))
+        matches!(self, Self::Block { .. })
     }
 }
 
@@ -958,12 +997,22 @@ fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>])
     // walk never sees inside a `syn::Block` — so its own alias count is added separately.
     let module_bound = match stack.first() {
         Some(LiteralScope::Module(items)) => item_count(items) + total_alias_count(items),
-        Some(LiteralScope::Block(_)) | None => 0,
+        Some(LiteralScope::Block { .. }) | None => 0,
     };
+    // A block frame is invisible to `module_bound` too — its own inline modules are never
+    // part of the file's top-level item list `item_count`/`total_alias_count` walk — so each
+    // one's own reachable item and alias count is added here, the same reasoning applied to
+    // the block's own aliases.
     let block_bound: usize = stack
         .iter()
         .map(|frame| match frame {
-            LiteralScope::Block(aliases) => aliases.len(),
+            LiteralScope::Block { aliases, modules } => {
+                aliases.len()
+                    + modules
+                        .iter()
+                        .map(|(_, items)| item_count(items) + total_alias_count(items))
+                        .sum::<usize>()
+            }
             LiteralScope::Module(_) => 0,
         })
         .sum();
@@ -994,13 +1043,10 @@ fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>])
                 break Some((LiteralFound::Alias(alias), probe));
             }
             if segments.len() > 1 {
-                if let LiteralScope::Module(items) = frame {
-                    if let Some((_, module_items)) = own_modules(items)
-                        .into_iter()
-                        .find(|(name, _)| *name == first)
-                    {
-                        break Some((LiteralFound::Module(module_items), probe));
-                    }
+                if let Some((_, module_items)) =
+                    frame.modules().into_iter().find(|(name, _)| *name == first)
+                {
+                    break Some((LiteralFound::Module(module_items), probe));
                 }
             }
             if frame.transparent() && probe > 0 {
@@ -1631,8 +1677,10 @@ pub fn struct_literal_counts(
             // enforces for a module, on the same stack. A block is transparent (`true`):
             // real Rust resolves a bare name against every enclosing block, with no
             // `super::` needed, unlike a module.
-            self.stack
-                .push(LiteralScope::Block(block_own_aliases(node)));
+            self.stack.push(LiteralScope::Block {
+                aliases: block_own_aliases(node),
+                modules: block_own_modules(node),
+            });
             syn::visit::visit_block(self, node);
             self.stack.pop();
         }
@@ -3005,6 +3053,32 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_mod_declared_in_the_same_block_is_stepped_into() {
+        // Codex review, PR #183 (P1): `LiteralScope::Block` carried a block's own `use`/
+        // `type` aliases since issue #92 but never a `mod` declared directly in that same
+        // block, so the block frame's own module search found nothing and fell through to
+        // the enclosing module — even for a lookup from *inside* the block that declares the
+        // module, not only from outside it (`a_mod_declared_inside_a_block_is_not_reached_from_outside_it`
+        // above is the outside case). `fn f() { mod aliases { pub type Ready =
+        // super::Sealable; } aliases::Ready { .. } }` used to resolve as `Ready` instead of
+        // `Sealable`, which would let a `commit-discipline` or `swap-discipline` construction
+        // pin miss a barrier-capable state built exactly this way.
+        let counts = struct_literal_counts(
+            "struct Sealable;\n\
+             fn f() {\n\
+             \x20   mod aliases {\n\
+             \x20       pub type Ready = super::Sealable;\n\
+             \x20   }\n\
+             \x20   let _ = aliases::Ready {};\n\
+             }",
+            "Sealable",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 
     #[test]
