@@ -35,10 +35,15 @@
 
 use std::cell::RefCell;
 
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
 use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
+use waymaker_flash::append::Journal;
 use waymaker_flash::bank;
+use waymaker_flash::capacity::{Bounds, Refusal, Reserve};
+use waymaker_flash::frame::input_digest;
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
+use waymaker_flash::swap::{Retired, Swap};
 use waymaker_rig::audit::Breach;
 use waymaker_rig::cutter::{Dispatcher, NeverCut};
 use waymaker_rig::log::Outcome;
@@ -48,7 +53,7 @@ use waymaker_rig::run::{Resumed, Rig, RigError, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Progress as Marks, Witness, WitnessError};
-use waymaker_rig::workload::Role;
+use waymaker_rig::workload::{Role, Workload};
 
 const SEED: u64 = 0x0031_0031_0031_0031;
 const EFFECTS: u16 = 2;
@@ -547,6 +552,350 @@ fn after_completion_barrier_the_completion_is_replayed_and_the_activity_never_ru
     for point in points_of(Row::AfterCompletionBarrier) {
         require(&point);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Row 9: history capacity reached
+// ---------------------------------------------------------------------------------------
+
+/// §10's exits, priced for a run whose records are all at most
+/// [`Workload::MAX_PAYLOAD_BYTES`] wide, plus `tail` for the outcome and terminal record —
+/// a bound wider than any record this workload ever writes, so the room it reserves is
+/// never spent on a real payload and always on the reserve's own floor.
+// Guards the literal `bounds` uses below: a `usize as u16` cast cannot prove at compile
+// time that it fits, so the width is asserted here instead of cast there.
+const _: () = assert!(Workload::MAX_PAYLOAD_BYTES == 16);
+
+const fn bounds(tail: u16) -> Bounds {
+    Bounds {
+        run_input_bytes: 16,
+        effect_result_bytes: tail,
+        terminal_bytes: tail,
+    }
+}
+
+/// A declared tail wide enough that the reserve refuses the second effect's schedule once
+/// the first effect has completed, on the rig's own standard fixture.
+///
+/// Searched for rather than written down, so the number comes from the reserve's own
+/// arithmetic over real records instead of a figure copied out of a passing run.
+fn near_capacity() -> (Rig, Reserve, Device) {
+    for tail in [32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500] {
+        let rig = rig();
+        let Ok(reserve) = Reserve::for_layout(bounds(tail), rig.layout()) else {
+            continue;
+        };
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let entered = {
+            let mut metered = Metered::new(&mut device);
+            if rig.prepare(&mut metered, 0, &mut page).is_err() {
+                continue;
+            }
+            let mut dispatcher = Log::default();
+            let outcome =
+                rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+            if !matches!(outcome, Err(RigError::Capacity(Refusal::NearCapacity))) {
+                continue;
+            }
+            dispatcher.entered
+        };
+        if entered == [0] {
+            return (rig, reserve, device);
+        }
+    }
+    unreachable!("no declared tail in the search fills after exactly one effect")
+}
+
+/// Bank A's journal region, read the way a boot reads it.
+fn bank_a_region(rig: &Rig, device: &mut Device, page: &mut [u8]) -> JournalRegion {
+    let layout = rig.layout();
+    let region = layout.bank(Rig::BANK);
+    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let Some(want) = usize::try_from(region.payload_bytes())
+        .ok()
+        .map(|want| want.min(page.len()))
+    else {
+        unreachable!("a header fits a page")
+    };
+    let Some(slot) = page.get_mut(..want) else {
+        unreachable!("a header fits a page")
+    };
+    let Ok(()) = engine.read(region.base(), slot) else {
+        unreachable!("a readable bank")
+    };
+    let Some(bytes) = page.get(..want) else {
+        unreachable!("a header fits a page")
+    };
+    let Ok(header) = bank::decode_header(bytes) else {
+        unreachable!("an installed bank")
+    };
+    let Ok(region) = JournalRegion::of(layout, Rig::BANK, &header) else {
+        unreachable!("a journal region")
+    };
+    region
+}
+
+/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does.
+fn write_record(engine: &mut Window<'_, Device>, journal: &mut Journal, record: &RecordRef<'_>) {
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = journal.stage(engine, record, &mut page) else {
+        unreachable!("room was reserved for this record")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(_amplification) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+}
+
+/// Replays the near-capacity run and requires the same refusal, having read, programmed
+/// and barriered nothing for it.
+fn assert_replay_refuses_without_mutation(
+    rig: &Rig,
+    reserve: Reserve,
+    device: &mut Device,
+    page: &mut [u8],
+) {
+    let mut metered = Metered::new(device);
+    let before = (metered.wear(), metered.rig_wear());
+    let mut dispatcher = Log::default();
+    let resumed = rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, page);
+    assert_eq!(
+        before,
+        (metered.wear(), metered.rig_wear()),
+        "the refusal touched the device"
+    );
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::NearCapacity))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the refused effect was dispatched again"
+    );
+}
+
+/// Writes one complete, one-effect run into `journal`: `RunStarted`, a schedule and
+/// completion for effect 0, and `RunCompleted`. Returns the effects it dispatched.
+fn write_tiny_run(engine: &mut Window<'_, Device>, journal: &mut Journal) -> Vec<u16> {
+    let input = b"i";
+    write_record(
+        engine,
+        journal,
+        &RecordRef::RunStarted {
+            workflow_kind: Workload::WORKFLOW_KIND,
+            workflow_version: Workload::WORKFLOW_VERSION,
+            input,
+        },
+    );
+    write_record(
+        engine,
+        journal,
+        &RecordRef::EffectScheduled {
+            seq: EffectSeq(0),
+            kind: ActivityKind(1),
+            input_len: 1,
+            input_crc: input_digest(input),
+        },
+    );
+    let mut dispatcher = Log::default();
+    let Ok(()) = dispatcher.dispatch(0, input) else {
+        unreachable!("the new run's own dispatcher accepts effect 0")
+    };
+    write_record(
+        engine,
+        journal,
+        &RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"ok",
+        },
+    );
+    write_record(engine, journal, &RecordRef::RunCompleted { result: b"done" });
+    dispatcher.entered
+}
+
+/// §10's explicit exit from the near-capacity state: a swap into the other bank, and a
+/// small complete run written into it. Returns the effects the new run dispatched.
+fn explicit_rollover(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Vec<u16> {
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next_input = b"n";
+    let next = bank::BankHeader {
+        run: waymaker_core::RunId(rig.workload(0).run().0 ^ 1),
+        align: layout.align(),
+        workflow_kind: Workload::WORKFLOW_KIND,
+        workflow_version: Workload::WORKFLOW_VERSION,
+        input_schema: 0,
+        input: next_input,
+    };
+    let region = bank_a_region(rig, device, page);
+    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the near-capacity state")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    assert_eq!(
+        installed.authority(),
+        bank::Authority::Bank {
+            id: Rig::BANK.other(),
+            generation: bank::Generation(2),
+        },
+        "the new bank is authoritative, at the next generation, and the old run is retired"
+    );
+
+    let mut new_recovery = installed.recovery();
+    while let Some(step) = new_recovery.next(page) {
+        if step.is_err() {
+            unreachable!("a freshly installed bank scans clean")
+        }
+    }
+    let Some(mut new_journal) = Journal::after(new_recovery) else {
+        unreachable!("a freshly installed bank is a clean, extendable journal")
+    };
+    write_tiny_run(&mut engine, &mut new_journal)
+}
+
+/// Row 9, driven: no mutation on a replayed refusal, and an explicit swap past it that
+/// starts a new run and dispatches its first effect. Returns the row it credits.
+fn row_nine() -> Row {
+    let (rig, reserve, mut device) = near_capacity();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    assert_replay_refuses_without_mutation(&rig, reserve, &mut device, &mut page);
+    let dispatched = explicit_rollover(&rig, &mut device, &mut page);
+    assert_eq!(dispatched, [0], "the new run starts and does work");
+    Row::HistoryCapacityReached
+}
+
+#[test]
+fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new()
+ {
+    assert_eq!(row_nine(), Row::HistoryCapacityReached);
+}
+
+// ---------------------------------------------------------------------------------------
+// Row 10: replay divergence
+// ---------------------------------------------------------------------------------------
+
+/// Row 10, driven: at every crash point that leaves the second effect's schedule
+/// recoverable and its completion outstanding, a declared workload naming a different
+/// activity for that schedule is refused, twice in a row, with nothing dispatched and
+/// nothing rewritten. Returns the row it credits.
+///
+/// Not swept through [`classified`]: that function resumes each point as it classifies
+/// it, and a resumed device is no longer the crash image this test needs. This runs its
+/// own pass over the harness instead, stopping at [`evidence`] — which only reads the
+/// device — so every device checked here is untouched.
+fn row_ten() -> Row {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(diverging_at);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // The sharpest case row 10's model half names: the second effect's schedule is
+        // recovered, its completion is not, so the effect is outstanding when the
+        // declared workflow stops agreeing with history.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Schedule(1), Activity::NotEntered, true)
+        ) {
+            continue;
+        }
+        let at = format!("{injection:?}");
+        for attempt in 0_u8..2 {
+            let before = device.image().to_vec();
+            let mut page = [0_u8; Rig::PAGE_BYTES];
+            let mut dispatcher = Log::default();
+            let outcome = {
+                let mut metered = Metered::new(&mut device);
+                rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+            };
+            assert!(
+                matches!(
+                    outcome,
+                    Err(RigError::Breach(Breach::RecordDiffers { index }))
+                        if index == diverging_at
+                ),
+                "attempt {attempt} at {at}: {outcome:?}"
+            );
+            assert!(
+                dispatcher.entered.is_empty(),
+                "executed past a divergence, attempt {attempt} at {at}"
+            );
+            assert_eq!(
+                device.image(),
+                before.as_slice(),
+                "history was reinterpreted, attempt {attempt} at {at}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left the second effect's schedule outstanding"
+    );
+    Row::ReplayDivergence
+}
+
+#[test]
+fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched()
+ {
+    assert_eq!(row_ten(), Row::ReplayDivergence);
 }
 
 #[test]

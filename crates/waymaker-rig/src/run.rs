@@ -38,6 +38,7 @@
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation, LayoutError};
+use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
@@ -116,6 +117,10 @@ pub enum RigError<E, D = core::convert::Infallible> {
     },
     /// The four units are not a geometry.
     Geometry(GeometryError),
+    /// §10's reserve refused the record, before the device was asked for anything.
+    Capacity(Refusal),
+    /// `reserve` does not describe this journal.
+    Reserve(CapacityError),
 }
 
 /// What a verification found, and the evidence it found it from.
@@ -836,6 +841,101 @@ impl Rig {
         Ok(Stop::Completed)
     }
 
+    /// Runs the workload with `reserve` gating every append, to completion or to the first
+    /// refusal.
+    ///
+    /// As [`iterate`](Self::iterate), through [`Reserved`] instead of the ungated writer.
+    /// No cutter: issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// history-capacity-reached row is a refusal §10's reserve produces on its own, not one
+    /// a crash injector finds.
+    ///
+    /// # Errors
+    ///
+    /// As [`iterate`](Self::iterate), and [`RigError::Capacity`] when the reserve refuses a
+    /// record: the run stops there, having read, programmed and barriered nothing for it.
+    pub fn iterate_reserved<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        reserve: Reserve,
+        page: &mut [u8],
+    ) -> Result<Stop, RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        let workload = self.workload(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+
+        let region = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
+                return Err(RigError::Bank);
+            }
+            self.journal_region(&mut engine, page).map_err(widen)?
+        };
+        let mut reserved = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            let mut recovery = Recovery::new(region, &mut engine);
+            while let Some(step) = recovery.next(page) {
+                if let Err(error) = step {
+                    return Err(RigError::Recovery(unwindow_recovery(error)));
+                }
+            }
+            let Some(journal) = Journal::after(recovery) else {
+                return Err(RigError::Region(RegionError::EmptyRegion));
+            };
+            Reserved::over(journal, reserve).map_err(RigError::Reserve)?
+        };
+
+        let mut witness = Witness::new(self.witness);
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+
+        for index in 0..records {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Attempted),
+                page,
+            )
+            .map_err(widen)?;
+
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append_reserved(part, &mut reserved, &record, page)
+                .map_err(widen)?;
+
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Acknowledged),
+                page,
+            )
+            .map_err(widen)?;
+
+            if let Role::Schedule(effect) = role {
+                self.mark(
+                    part,
+                    &mut witness,
+                    Mark::new(iteration, index, Stage::Dispatched),
+                    page,
+                )
+                .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(Stop::Completed)
+    }
+
     /// §07 step 4, for the schedule record at `index`: mark the dispatch, take the cut point
     /// if this iteration armed one here, and perform the effect.
     ///
@@ -902,6 +1002,39 @@ impl Rig {
                 .map_err(|error| RigError::Append(unwindow_append(error)))?;
         }
         part.set_amplification(journal.amplification());
+        Ok(())
+    }
+
+    /// [`append`](Self::append), gated by §10's reserve.
+    ///
+    /// # Errors
+    ///
+    /// [`RigError::Capacity`] when the reserve refuses the record — nothing is read,
+    /// programmed or barriered for it — and [`RigError::Append`] for everything
+    /// [`append`](Self::append) can fail with.
+    fn append_reserved<S: StableStorage>(
+        &self,
+        part: &mut Metered<'_, S>,
+        reserved: &mut Reserved,
+        record: &RecordRef<'_>,
+        page: &mut [u8],
+    ) -> Result<(), RigError<S::Error>> {
+        {
+            let mut engine = self.engine(part)?;
+            let staged = reserved
+                .stage(&mut engine, record, page)
+                .map_err(|error| match error {
+                    ReservedError::Capacity(refusal) => RigError::Capacity(refusal),
+                    ReservedError::Append(inner) => RigError::Append(unwindow_append(inner)),
+                })?;
+            let sealable = staged
+                .payload_barrier()
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+            sealable
+                .commit()
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+        }
+        part.set_amplification(reserved.journal().amplification());
         Ok(())
     }
 
@@ -998,10 +1131,46 @@ impl Rig {
         dispatcher: &mut D,
         page: &mut [u8],
     ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        self.resume_as(iteration, self.workload(iteration), part, dispatcher, page)
+    }
+
+    /// Resumes as [`resume`](Self::resume), but treats `declared` as this run's true shape
+    /// instead of the workload `iteration` derives.
+    ///
+    /// Models replay divergence: a firmware whose declared workflow no longer agrees with a
+    /// run already on media. Pass `self.workload(iteration).diverging(at)` for `declared` to
+    /// change one schedule record's activity kind and leave the rest of the run untouched —
+    /// issue [#96](https://github.com/madmax983/waymaker/issues/96)'s row 10.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume`](Self::resume). A `declared` that disagrees with history answers
+    /// [`RigError::Breach`] with [`Breach::RecordDiffers`], before any effect runs again and
+    /// before any byte is written.
+    pub fn resume_declaring<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        declared: Workload,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        self.resume_as(iteration, declared, part, dispatcher, page)
+    }
+
+    /// [`resume`](Self::resume) and [`resume_declaring`](Self::resume_declaring), over the
+    /// workload each one means to audit history against.
+    fn resume_as<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        workload: Workload,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
         }
-        let workload = self.workload(iteration);
         let Some(records) = workload.records() else {
             return Err(RigError::Workload);
         };
@@ -1048,6 +1217,97 @@ impl Rig {
                 return Err(RigError::Workload);
             };
             self.append(part, &mut journal, &record, page)
+                .map_err(widen)?;
+            let mark = Mark::new(iteration, index, Stage::Acknowledged);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(Resumed::Completed {
+            recovered,
+            redelivered,
+        })
+    }
+
+    /// Resumes as [`resume`](Self::resume), but gates every record this run still owes with
+    /// `reserve`.
+    ///
+    /// Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s history-capacity-reached
+    /// row, on replay: a run whose next record the reserve already refused meets the same
+    /// refusal again here, having read, programmed and barriered nothing for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume`](Self::resume), [`RigError::Capacity`] when the reserve refuses the next
+    /// record this run owes, and [`RigError::Reserve`] when `reserve` does not describe this
+    /// journal.
+    pub fn resume_reserved<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        reserve: Reserve,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        let workload = self.workload(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
+        let (recovered, journal) = self
+            .recover_prefix(part, workload, known, page)
+            .map_err(widen)?;
+        let Some(journal) = journal else {
+            return Ok(Resumed::Unextendable { recovered });
+        };
+        if recovered >= records {
+            return Ok(Resumed::Completed {
+                recovered,
+                redelivered: None,
+            });
+        }
+        let mut reserved = Reserved::over(journal, reserve).map_err(RigError::Reserve)?;
+
+        let outstanding = recovered
+            .checked_sub(1)
+            .and_then(|index| match workload.role(index) {
+                Some(Role::Schedule(effect)) => Some((index, effect)),
+                Some(Role::Start | Role::Completion(_) | Role::Finish) | None => None,
+            });
+        let redelivered = match outstanding {
+            Some((index, effect)) => {
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+                Some(effect)
+            }
+            None => None,
+        };
+
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        for index in recovered..records {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append_reserved(part, &mut reserved, &record, page)
                 .map_err(widen)?;
             let mark = Mark::new(iteration, index, Stage::Acknowledged);
             self.mark_above(part, &mut witness, &mut known, mark, page)
@@ -1481,6 +1741,8 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::Geometry(inner) => RigError::Geometry(inner),
         RigError::Breach(inner) => RigError::Breach(inner),
         RigError::Authority { banks } => RigError::Authority { banks },
+        RigError::Capacity(refusal) => RigError::Capacity(refusal),
+        RigError::Reserve(inner) => RigError::Reserve(inner),
         RigError::Dispatch(never) => match never {},
     }
 }
