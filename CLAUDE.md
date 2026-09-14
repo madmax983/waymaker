@@ -237,7 +237,7 @@ All 6 storage shapes, with the id to cite when a change touches one:
 | `program-single-unit` | A program of exactly one program unit. | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
 | `program-multi-unit` | A program of more than one program unit in one call. | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
 | `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
-| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks |
+| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
 | `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |
 | `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read and its erased-tail walk |
 

@@ -17,7 +17,9 @@ Item 2 is this ADR's: "every legal operation shape the firmware issues must appe
 suite". `waymaker-flash`'s writers issue a program or an erase of one unit and of more than
 one — the journal's frame body and the bank swap's header are wider than a single program
 unit for any non-trivial record, and the bank swap's erase spans more than one erase block on
-any device with more than the minimum two. Before this, the suite's two multi-unit cases
+any device with at least four erase blocks — `BankLayout::new` sizes a bank at
+`erase_blocks >> 1`, so a three-block device still has a one-block bank. Before this, the
+suite's two multi-unit cases
 proved the *category* legal at a width of exactly two, and nothing stopped a *third* shape
 from going unexercised the way earlier review rounds found a *fourth* one had. A hand-written
 table would say so and rot the moment a case changed; what was missing was a check that fails
@@ -44,7 +46,7 @@ the way `STORAGE_CONTRACT_CLAUSES` transcribes design document §12 rather than 
 | `program-single-unit` | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
 | `program-multi-unit` | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
 | `erase-single-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
-| `erase-multi-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks |
+| `erase-multi-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
 | `read-single-unit` | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |
 | `read-multi-unit` | `recovery::Recovery::stage`'s whole-record read and its erased-tail walk |
 

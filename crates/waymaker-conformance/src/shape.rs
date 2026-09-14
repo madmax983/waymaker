@@ -52,7 +52,7 @@ pub const SHAPES: &[Shape] = &[
     Shape {
         id: "erase-multi-block",
         sentence: "An erase of more than one erase block in one call.",
-        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks",
     },
     Shape {
         id: "read-single-unit",
@@ -152,9 +152,11 @@ impl<S: StableStorage> StableStorage for ShapeWitness<'_, S> {
 
     fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
         let unit = self.storage.geometry().read_size();
-        let len = u32::try_from(dst.len()).unwrap_or(u32::MAX);
+        // `Ok` and skipped rather than clamped on overflow: a length this witness cannot
+        // name is a length it declines to guess a shape for, not one it credits regardless.
+        let len = u32::try_from(dst.len()).ok();
         self.storage.read(offset, dst)?;
-        if let Some(id) = classify(Operation::Read, len, unit) {
+        if let Some(id) = len.and_then(|len| classify(Operation::Read, len, unit)) {
             self.record(id);
         }
         Ok(())
@@ -162,9 +164,9 @@ impl<S: StableStorage> StableStorage for ShapeWitness<'_, S> {
 
     fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
         let unit = self.storage.geometry().program_size();
-        let len = u32::try_from(src.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(src.len()).ok();
         self.storage.program(offset, src)?;
-        if let Some(id) = classify(Operation::Program, len, unit) {
+        if let Some(id) = len.and_then(|len| classify(Operation::Program, len, unit)) {
             self.record(id);
         }
         Ok(())
@@ -220,8 +222,10 @@ mod tests {
         assert_eq!(classify(Operation::Read, 4, 0), None);
     }
 
+    // Whether a shape is *reachable* — really issued somewhere by a real run — is
+    // `tests/shapes.rs::a_full_run_issues_every_declared_shape`'s claim, not this one's.
     #[test]
-    fn every_shape_has_a_reachable_row() {
+    fn every_shape_has_a_sentence_and_an_issuer() {
         for spec in SHAPES {
             assert!(!spec.sentence.is_empty(), "{} has no sentence", spec.id);
             assert!(!spec.issued_by.is_empty(), "{} names no issuer", spec.id);

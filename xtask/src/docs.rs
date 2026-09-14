@@ -681,7 +681,7 @@ pub const STORAGE_SHAPES: &[StorageShape] = &[
     StorageShape {
         id: "erase-multi-block",
         sentence: "An erase of more than one erase block in one call.",
-        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks",
     },
     StorageShape {
         id: "read-single-unit",
