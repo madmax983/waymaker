@@ -20150,6 +20150,85 @@ mod deferred_answer_pins {
             "a table in a checksum submodule went unseen: {violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_an_unsigned_right_shift_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` folded `Shr` the same way it
+        // folded every other binary operator — as a plain signed `i128::checked_shr` over
+        // the shared 128-bit storage — which is not sound for a `u128` shift the way an
+        // ordinary bitwise operator's storage-agnostic bit pattern is. `u128::MAX >> 127`
+        // is a real, unsigned, zero-filling shift `rustc` performs, landing on `1`; the
+        // same bits reinterpreted as the stored `i128` (`-1`) shift arithmetically and
+        // sign-extend, landing on `-1` again. A constant built from that shift therefore
+        // resolved to the wrong value rather than merely staying unresolved, and a match
+        // over constants derived from it went undetected. `evaluate_shift_op` now
+        // reinterprets the left operand as `u128` before shifting, once
+        // `is_definitely_unsigned` — recursing into the shifted expression itself, not
+        // only into a literal, a cast or a bare path — confirms that is what its bits
+        // mean.
+        //
+        // Writing this test surfaced a second, narrower gap in the same family:
+        // `resolve_scope_consts`'s own local `resolve_unsigned` closure — used while
+        // resolving `Q`'s own initializer, before any pattern is ever reached — answered
+        // only for a bare name, never for a qualified reference or a well-known primitive
+        // bound, on the reasoning (now stale) that this was the identical scope
+        // `path_is_definitely_unsigned` itself declines beyond. `u128::MAX` is exactly a
+        // qualified, well-known-bound reference, so `is_definitely_unsigned(u128::MAX)`
+        // answered `false` inside `evaluate_shift_op` regardless of that function's own
+        // fix, and `Q` stayed unresolved rather than merely wrong. Threaded to match
+        // `path_is_definitely_unsigned`'s own two-step fallback instead. `40 / Q` through
+        // `43 / Q`, rather than `Q * 0` through `Q * 3`, is deliberate: a wrongly-signed
+        // `Q` still multiplies or adds into *some* contiguous window, just one shifted by
+        // a constant amount, which this scan's own density check cannot tell apart from a
+        // correct one — dividing a distinct dividend by the reinterpreted-as-`u128::MAX`
+        // wrong answer collapses all four to `0` instead, which is not a window at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn unsigned_shift_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = u128::MAX >> 127;\n    const P0: u128 = 40 / Q;\n    \
+             const P1: u128 = 41 / Q;\n    const P2: u128 = 42 / Q;\n    const P3: u128 = 43 / Q;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_u128_sum_crossing_the_i128_boundary_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` added two `u128` operands as
+        // plain `i128::checked_add`, which refuses a sum that is a valid `u128` value but
+        // exceeds `i128::MAX` — `(1u128 << 126) + (1u128 << 126)` is `2u128.pow(127)`, well
+        // inside `u128`'s range and exactly what `rustc` computes, but one past what a
+        // *signed* 128-bit addition can hold. The constant therefore stayed unresolved
+        // rather than resolving to the wrong thing, and a match over constants derived
+        // from it went undetected — the same shape of gap `evaluate_ordering_op` and
+        // `evaluate_division_op` already closed for comparison and division, met here for
+        // addition, subtraction and multiplication. `evaluate_additive_op` now retries as
+        // `u128` once the signed attempt overflows and at least one operand is confirmed
+        // unsigned, reinterpreting the result back into the shared storage.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn additive_overflow_pattern_table(nibble: u32) -> u32 {\n    \
+             const BASE: u128 = (1u128 << 126) + (1u128 << 126);\n    \
+             const P0: u128 = (BASE / BASE) * 0;\n    const P1: u128 = (BASE / BASE) * 1;\n    \
+             const P2: u128 = (BASE / BASE) * 2;\n    const P3: u128 = (BASE / BASE) * 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

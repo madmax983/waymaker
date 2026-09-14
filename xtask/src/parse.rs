@@ -1929,6 +1929,10 @@ pub fn match_expressions_with_prefix(
             unsigned: &UnsignedConstScopes::default(),
         },
         external_qualified,
+        // `external_qualified` carries no unsignedness of its own — cross-file qualified
+        // constants are not this round's scope, the same narrowing `qualified_unsigned`
+        // itself is seeded empty with below.
+        &std::collections::HashMap::new(),
         prefix,
         &[],
         &[],
@@ -2046,6 +2050,9 @@ pub fn qualified_constants_with_prefix(
             unsigned: &UnsignedConstScopes::default(),
         },
         external_qualified,
+        // Same narrowing as [`match_expressions_with_prefix`]'s identical call: cross-file
+        // qualified constants carry no unsignedness of their own here.
+        &std::collections::HashMap::new(),
         prefix,
         &[],
         &[],
@@ -2521,6 +2528,7 @@ fn resolve_scope_consts(
     own: &OwnConsts<'_>,
     outer: &OuterScopes<'_>,
     qualified: &std::collections::HashMap<String, i128>,
+    qualified_unsigned: &std::collections::HashMap<String, bool>,
     module_path: &[String],
     function_path: &[String],
     block_path: &[String],
@@ -2553,17 +2561,62 @@ fn resolve_scope_consts(
             // fold (arithmetic does not care), but a *sibling's* own ordering comparison —
             // `const P1: bool = P0 < OTHER;` — would, and a bare reference to `own`'s own
             // declared-unsigned map answers that the same way the value lookup above
-            // answers a bare value reference. A qualified reference is not attempted here,
-            // the same scope [`path_is_definitely_unsigned`] itself declines beyond a bare
-            // name and a well-known bound — declining is always sound.
+            // answers a bare value reference.
+            //
+            // Codex's next-round finding: `const Q: u128 = u128::MAX >> 127;` — a qualified,
+            // well-known-bound reference — declined unconditionally here, on the reasoning
+            // that this was the same scope [`path_is_definitely_unsigned`] itself declines
+            // beyond a bare name; that reasoning was wrong about what that function actually
+            // covers, once [`qualified_path_is_declared_at_any_depth`]'s own finding is
+            // accounted for — it resolves a qualified local constant and a well-known
+            // primitive bound alike, not only a bare name. Widened to match: a qualified
+            // reference already recorded in `qualified_unsigned` (a sibling module's own
+            // constant, at the identical most-specific-first depth the value resolver above
+            // already searches), then, failing that, a well-known bound not shadowed by any
+            // real declaration at any of those depths — the identical two-step fallback
+            // [`path_is_definitely_unsigned`] uses, so a local constant's own initializer and
+            // a match arm's own guard or pattern answer the identical question the identical
+            // way.
             let resolve_unsigned = |path: &syn::Path| {
-                path.get_ident().is_some_and(|ident| {
+                if let Some(ident) = path.get_ident() {
                     let candidate = ident_name(ident);
-                    own.unsigned
+                    return own
+                        .unsigned
                         .get(&candidate)
                         .copied()
-                        .unwrap_or_else(|| outer.unsigned.resolve(&candidate))
-                })
+                        .unwrap_or_else(|| outer.unsigned.resolve(&candidate));
+                }
+                if resolve_qualified_unsigned_at_any_depth(
+                    path,
+                    qualified,
+                    qualified_unsigned,
+                    module_path,
+                    function_path,
+                    block_path,
+                ) {
+                    return true;
+                }
+                let segments: Vec<String> = path
+                    .segments
+                    .iter()
+                    .map(|segment| ident_name(&segment.ident))
+                    .collect();
+                let Some((type_name, member)) = well_known_bound_segments(&segments) else {
+                    return false;
+                };
+                if !matches!(type_name, "u8" | "u16" | "u32" | "u64" | "u128") {
+                    return false;
+                }
+                if qualified_path_is_declared_at_any_depth(
+                    path,
+                    qualified,
+                    module_path,
+                    function_path,
+                    block_path,
+                ) {
+                    return false;
+                }
+                well_known_integer_bound(type_name, member).is_some()
             };
             let bundled = Resolve {
                 value: &resolve,
@@ -3025,27 +3078,40 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
 /// [`evaluate_division_op`] is where the two operators live now, needing the operand
 /// *expressions* [`is_definitely_unsigned`] reads, exactly as [`evaluate_ordering_op`]
 /// already does.
+///
+/// Codex's next-round finding: `Add`/`Sub`/`Mul` are not sound *checked* here either, for a
+/// third reason beside ordering's and division's — not because either operand's own bit
+/// pattern is ambiguous (`(1u128 << 126) + (1u128 << 126)`'s two operands are each `2^126`,
+/// an ordinary non-negative `i128` value either domain agrees on), but because the *result*
+/// — `2^127` — overflows `i128::MAX` while fitting `u128` with room to spare. `checked_add`
+/// answers `None` for a sum `rustc` computes without complaint, and every constant built
+/// from it stays unresolved. [`evaluate_additive_op`] is where the three operators live now,
+/// retrying in the `u128` domain — once [`is_definitely_unsigned`] confirms that is what the
+/// operation means — exactly when the `i128` domain's own checked arithmetic already failed.
+///
+/// Codex's next-round finding: `Shr` shares division's and ordering's ambiguity and not
+/// addition's — `i128::checked_shr` performs an *arithmetic* shift, sign-extending a
+/// negative value's own top bits, where the unsigned `u128` shift `rustc` performs for an
+/// upper-half value zero-fills instead, so `u128::MAX >> 127` folds to `-1` here rather than
+/// the `1` a real unsigned shift gives. `Shl` has no such split: a left shift's own bit
+/// pattern is identical whichever domain it is read in, since it only ever moves bits toward
+/// the top and drops what falls off, so it stays exactly where it is. [`evaluate_shift_op`]
+/// is where `Shr` lives now, folded the same way [`evaluate_ordering_op`] folds ordering.
 fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     match op {
-        syn::BinOp::Add(_) => left.checked_add(right),
-        syn::BinOp::Sub(_) => left.checked_sub(right),
-        syn::BinOp::Mul(_) => left.checked_mul(right),
         syn::BinOp::BitAnd(_) => Some(left & right),
         syn::BinOp::BitOr(_) => Some(left | right),
         syn::BinOp::BitXor(_) => Some(left ^ right),
         syn::BinOp::Shl(_) => u32::try_from(right)
             .ok()
             .and_then(|shift| left.checked_shl(shift)),
-        syn::BinOp::Shr(_) => u32::try_from(right)
-            .ok()
-            .and_then(|shift| left.checked_shr(shift)),
         syn::BinOp::Eq(_) => Some(i128::from(left == right)),
         syn::BinOp::Ne(_) => Some(i128::from(left != right)),
-        // `&&`/`||`, the four ordering comparisons and `Div`/`Rem` are not folded here at
-        // all — [`literal_or_const_value`]'s own `Expr::Binary` case handles each in a
-        // match arm of its own, before this function's caller would otherwise require both
-        // operands to resolve (for `&&`/`||`) or lose the operand expressions this function
-        // never sees (for ordering and division).
+        // `&&`/`||`, the four ordering comparisons, `Div`/`Rem`, `Add`/`Sub`/`Mul` and `Shr`
+        // are not folded here at all — [`literal_or_const_value`]'s own `Expr::Binary` case
+        // handles each in a match arm of its own, before this function's caller would
+        // otherwise require both operands to resolve (for `&&`/`||`) or lose the operand
+        // expressions this function never sees (for every other one of them).
         _ => None,
     }
 }
@@ -3077,11 +3143,25 @@ struct Resolve<'a> {
 }
 
 /// Whether `expr` is written with an explicit unsigned integer type — a suffixed literal
-/// (`0u128`), a cast to one (`x as u128`), or a bare path whose own declaration names one
-/// (`HI`, where `const HI: u128 = ..;` is in scope) — seen through any nesting of
-/// parentheses or brace groups. The only way [`evaluate_ordering_op`] can know an operand's
-/// own *type* rather than only its resolved bit pattern, which is what lets it tell a
-/// genuinely negative value apart from an upper-half `u128` one wrapped around.
+/// (`0u128`), a cast to one (`x as u128`), a bare path whose own declaration names one
+/// (`HI`, where `const HI: u128 = ..;` is in scope), or an arithmetic or bitwise expression
+/// either of whose own operands already is — seen through any nesting of parentheses or
+/// brace groups. The only way [`evaluate_ordering_op`] can know an operand's own *type*
+/// rather than only its resolved bit pattern, which is what lets it tell a genuinely
+/// negative value apart from an upper-half `u128` one wrapped around.
+///
+/// Codex's next-round finding: `(1u128 << 126) + (1u128 << 126)` names two operands neither
+/// of which this function recognised — each is `Expr::Binary(Shl)`, not a literal, a cast or
+/// a bare path — even though Rust requires `+`'s two operands to share one type, so a
+/// suffixed `u128` on either side of the shift settles what the *whole* addition is typed
+/// as. `Add`/`Sub`/`Mul`/`BitAnd`/`BitOr`/`BitXor` all share that same-type requirement on
+/// both sides, so confirming *either* side is unsigned confirms the operator's own result
+/// is too. `Shl`/`Shr` do not: Rust lets the shift amount be a different, narrower integer
+/// type than the value being shifted (`huge_u128 << 5u32` is ordinary, legal Rust), so only
+/// the left — the value actually being shifted, and the one whose type the result shares —
+/// is asked; confirming the shift *amount*'s own type would say nothing about the operand
+/// that matters. `Eq`/`Ne`/the four ordering comparisons/`&&`/`||` are excluded on purpose:
+/// each answers `bool`, a type of its own that shares nothing with its operands'.
 fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
     match strip_parens(expr) {
         syn::Expr::Lit(syn::ExprLit {
@@ -3091,6 +3171,25 @@ fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
         syn::Expr::Cast(cast) => single_segment_type_name(&cast.ty)
             .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")),
         syn::Expr::Path(path) if path.qself.is_none() => (resolve.unsigned)(&path.path),
+        syn::Expr::Binary(binary)
+            if matches!(
+                binary.op,
+                syn::BinOp::Add(_)
+                    | syn::BinOp::Sub(_)
+                    | syn::BinOp::Mul(_)
+                    | syn::BinOp::BitAnd(_)
+                    | syn::BinOp::BitOr(_)
+                    | syn::BinOp::BitXor(_)
+            ) =>
+        {
+            is_definitely_unsigned(&binary.left, resolve)
+                || is_definitely_unsigned(&binary.right, resolve)
+        }
+        syn::Expr::Binary(binary)
+            if matches!(binary.op, syn::BinOp::Shl(_) | syn::BinOp::Shr(_)) =>
+        {
+            is_definitely_unsigned(&binary.left, resolve)
+        }
         _ => false,
     }
 }
@@ -3207,6 +3306,139 @@ fn evaluate_division_op(
         syn::BinOp::Rem(_) => left_unsigned % right_unsigned,
         _ => return None,
     };
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "deliberate two's-complement bit reinterpretation of a `u128` result at or \
+                  above 2^127, the same convention every other u128-domain value in this \
+                  scan uses, not a value conversion"
+    )]
+    let reinterpreted = result as i128;
+    Some(reinterpreted)
+}
+
+/// Whether `op` is one of the six operators [`evaluate_additive_or_shift_op`] routes —
+/// `Div`/`Rem`/`Add`/`Sub`/`Mul`/`Shr` — factored into its own small function so the guard
+/// naming them in [`literal_or_const_value`]'s own `match` stays one line, the same reason
+/// every other arm in that function is kept under clippy's per-function line count.
+const fn is_additive_or_shift_or_division_op(op: syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::Div(_)
+            | syn::BinOp::Rem(_)
+            | syn::BinOp::Add(_)
+            | syn::BinOp::Sub(_)
+            | syn::BinOp::Mul(_)
+            | syn::BinOp::Shr(_)
+    )
+}
+
+/// Routes `Div`/`Rem` to [`evaluate_division_op`], `Shr` to [`evaluate_shift_op`], and
+/// `Add`/`Sub`/`Mul` to [`evaluate_additive_op`] — factored out of
+/// [`literal_or_const_value`]'s own `Expr::Binary` case to keep that function under
+/// clippy's line count, the same reason the ordering case is factored the way it is.
+fn evaluate_additive_or_shift_op(
+    op: syn::BinOp,
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    match op {
+        syn::BinOp::Div(_) | syn::BinOp::Rem(_) => {
+            evaluate_division_op(op, left_expr, right_expr, resolve)
+        }
+        syn::BinOp::Shr(_) => evaluate_shift_op(left_expr, right_expr, resolve),
+        _ => evaluate_additive_op(op, left_expr, right_expr, resolve),
+    }
+}
+
+/// `left_expr op right_expr`'s own value, for `Add`/`Sub`/`Mul` — needing the operand
+/// *expressions* for a different reason than [`evaluate_ordering_op`] and
+/// [`evaluate_division_op`] do: not because either operand's own bit pattern is ambiguous,
+/// but because `rustc`'s own `u128` arithmetic can cross `i128::MAX` without overflowing at
+/// all, and this scan's plain `i128`-checked arithmetic has no way to tell that crossing
+/// apart from a genuine overflow.
+///
+/// Codex's next-round finding: `(1u128 << 126) + (1u128 << 126)` is `2^127` — a real `u128`
+/// sum, well inside that type's own range — but `i128::checked_add` answers `None`, since
+/// `2^127` is one past `i128::MAX`. Retried in the `u128` domain once
+/// [`is_definitely_unsigned`] confirms *either* operand's own type — `Add`, `Sub` and `Mul`
+/// all require both sides to share one type in real Rust, so confirming either one confirms
+/// the whole operation — but only when the plain `i128`-checked arithmetic has already
+/// failed: an ordinary result both domains agree on is returned directly, without needing
+/// either operand's type confirmed at all, the same shape [`evaluate_ordering_op`]'s own
+/// non-negative case already has.
+fn evaluate_additive_op(
+    op: syn::BinOp,
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let left = literal_or_const_value(left_expr, resolve)?;
+    let right = literal_or_const_value(right_expr, resolve)?;
+    let signed_result = match op {
+        syn::BinOp::Add(_) => left.checked_add(right),
+        syn::BinOp::Sub(_) => left.checked_sub(right),
+        syn::BinOp::Mul(_) => left.checked_mul(right),
+        _ => None,
+    };
+    if signed_result.is_some() {
+        return signed_result;
+    }
+    if !is_definitely_unsigned(left_expr, resolve) && !is_definitely_unsigned(right_expr, resolve) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "reinterpreting the shared 128-bit storage as unsigned, once an explicit \
+                  suffix or cast has confirmed that is what one of the two operands means, \
+                  not converting a value"
+    )]
+    let (left_unsigned, right_unsigned) = (left as u128, right as u128);
+    let result = match op {
+        syn::BinOp::Add(_) => left_unsigned.checked_add(right_unsigned),
+        syn::BinOp::Sub(_) => left_unsigned.checked_sub(right_unsigned),
+        syn::BinOp::Mul(_) => left_unsigned.checked_mul(right_unsigned),
+        _ => None,
+    }?;
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "deliberate two's-complement bit reinterpretation of a `u128` result at or \
+                  above 2^127, the same convention every other u128-domain value in this \
+                  scan uses, not a value conversion"
+    )]
+    let reinterpreted = result as i128;
+    Some(reinterpreted)
+}
+
+/// `left_expr >> right_expr`'s own value — needing the shifted operand's own *expression*
+/// for the identical reason [`evaluate_ordering_op`] and [`evaluate_division_op`] need
+/// theirs: `i128::checked_shr` performs an arithmetic shift, sign-extending a negative
+/// value's own top bits, where the unsigned `u128` shift `rustc` performs for an upper-half
+/// value zero-fills instead. Only the left operand — the value being shifted, whose type the
+/// result shares — is asked; the shift amount on the right may legally be a different,
+/// narrower type in real Rust (`huge_u128 >> 5u32`), so confirming *its* type would say
+/// nothing about the one that matters. `Shl` has no such split and stays in
+/// [`evaluate_binary_op`]: a left shift's own bit pattern is identical whichever domain it is
+/// read in, since it only ever moves bits toward the top and drops what falls off.
+fn evaluate_shift_op(
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let left = literal_or_const_value(left_expr, resolve)?;
+    let right = literal_or_const_value(right_expr, resolve)?;
+    if left < 0 && !is_definitely_unsigned(left_expr, resolve) {
+        return None;
+    }
+    let shift = u32::try_from(right).ok()?;
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "reinterpreting the shared 128-bit storage as unsigned, once an explicit \
+                  suffix or cast has confirmed that is what a negative operand means, or \
+                  because the value was already non-negative, not converting a value"
+    )]
+    let left_unsigned = left as u128;
+    let result = left_unsigned.checked_shr(shift)?;
     #[allow(
         clippy::cast_possible_wrap,
         reason = "deliberate two's-complement bit reinterpretation of a `u128` result at or \
@@ -3339,12 +3571,9 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         {
             evaluate_ordering_op(binary.op, &binary.left, &binary.right, resolve)
         }
-        // [`evaluate_division_op`] holds the rationale for why `Div`/`Rem` are not folded
-        // through `evaluate_binary_op` like every other arithmetic operator is.
-        syn::Expr::Binary(binary)
-            if matches!(binary.op, syn::BinOp::Div(_) | syn::BinOp::Rem(_)) =>
-        {
-            evaluate_division_op(binary.op, &binary.left, &binary.right, resolve)
+        // [`evaluate_additive_or_shift_op`] holds the rationale for this arm.
+        syn::Expr::Binary(binary) if is_additive_or_shift_or_division_op(binary.op) => {
+            evaluate_additive_or_shift_op(binary.op, &binary.left, &binary.right, resolve)
         }
         // [`evaluate_binary_op`] holds the rationale for every operator this folds,
         // arithmetic and comparison alike, since both are one decision rather than two.
@@ -4712,6 +4941,46 @@ fn resolve_qualified_path_at_any_depth(
     well_known_integer_bound(type_name, member)
 }
 
+/// Whether some real, already-scanned entry in `qualified` answers `path` — the identical
+/// depth-loop-then-plain-module-path search [`resolve_qualified_path_at_any_depth`] itself
+/// runs before its own well-known-primitive-bound fallback, with that fallback excluded.
+///
+/// Codex's next-round finding: [`path_is_definitely_unsigned`]'s own "a real declaration
+/// wins over the primitive's own bound" guard called [`resolve_qualified_path_at_any_depth`]
+/// directly and treated any `Some` answer as proof one existed — but that function's own
+/// last line answers `Some` for a path like `u128::MAX` from its *own* well-known-bound
+/// fallback whenever nothing shadows it, which is exactly the case this guard exists to tell
+/// apart from a real one, not a confirmation of one. The guard therefore fired on every
+/// path `well_known_bound_segments` itself would also recognise — since the fallback that
+/// answers `well_known_integer_bound(type_name, member)` for the guard's own local check is
+/// the identical call the value resolver just made two lines above it — so
+/// `well_known_integer_bound(type_name, member).is_some()` on the line after the guard was
+/// unreachable: every well-known bound this scan resolves at all read as signed, `u128::MAX`
+/// included, however it was confirmed unsigned via `Expr::Lit`'s own suffix elsewhere. This
+/// is the value resolver's identical two-step search with the tail cut off, so a real
+/// declaration is told apart from the fallback that stands in for one only when nothing real
+/// answered first.
+fn qualified_path_is_declared_at_any_depth(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+) -> bool {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined_module = module_path.to_vec();
+        combined_module.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined_module.extend(prefix.iter().cloned());
+        }
+        if resolve_qualified_path(path, qualified, &combined_module).is_some() {
+            return true;
+        }
+    }
+    !(function_path.is_empty() && block_path.is_empty())
+        && resolve_qualified_path(path, qualified, module_path).is_some()
+}
+
 fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option<i128> {
     if let Some(ident) = path.get_ident() {
         let name = ident_name(ident);
@@ -4920,17 +5189,19 @@ fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) ->
     }
     // A real declaration anywhere in the depth search above — even one that turned out to
     // be signed, or unsigned but already answered `true` and returned before here — must
-    // still win over the primitive's own bound, exactly as [`resolve_qualified_path_at_any_depth`]'s
-    // own fallback only answers once its whole search has failed to find *any* declaration.
-    if resolve_qualified_path_at_any_depth(
+    // still win over the primitive's own bound. [`qualified_path_is_declared_at_any_depth`]
+    // is that search alone, deliberately not [`resolve_qualified_path_at_any_depth`]'s own
+    // fallback-carrying answer: that function's own last line resolves `path` from the
+    // identical well-known bound this check is about to fall back to, so treating *its*
+    // `Some` as evidence of a real declaration made this guard fire on every well-known
+    // bound this scan can resolve at all, and the line below unreachable.
+    if qualified_path_is_declared_at_any_depth(
         path,
         ctx.qualified,
         ctx.module_path,
         ctx.function_path,
         ctx.block_path,
-    )
-    .is_some()
-    {
+    ) {
         return false;
     }
     well_known_integer_bound(type_name, member).is_some()
@@ -5235,6 +5506,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 unsigned: &self.scopes_unsigned,
             },
             &self.qualified,
+            &self.qualified_unsigned,
             &self.module_path,
             &self.function_path,
             &self.block_path,
@@ -5297,6 +5569,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     unsigned: &self.scopes_unsigned,
                 },
                 &self.qualified,
+                &self.qualified_unsigned,
                 &self.module_path,
                 &self.function_path,
                 &self.block_path,
@@ -5428,6 +5701,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                             unsigned: &self.scopes_unsigned,
                         },
                         &self.qualified,
+                        &self.qualified_unsigned,
                         &self.module_path,
                         &self.function_path,
                         &self.block_path,
@@ -5595,6 +5869,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 unsigned: &self.scopes_unsigned,
             },
             &self.qualified,
+            &self.qualified_unsigned,
             &self.module_path,
             &self.function_path,
             &self.block_path,
