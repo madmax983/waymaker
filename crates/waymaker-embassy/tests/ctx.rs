@@ -782,6 +782,62 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
 }
 
 #[test]
+fn a_dropped_terminal_future_cannot_let_a_second_one_overwrite_the_conclusion() {
+    // Issue #107. `TerminalFuture` guarded on its own `ended` field. Poll `complete`, then
+    // drop it. Poll `fail`. The second future is new, so its flag reports nothing recorded
+    // yet. It overwrites the first decision. The flag must live in the `Ctx`.
+    let mut ledger = Ledger::new();
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _first: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"first"));
+    let _second: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"second"));
+
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Completed(b"first"))),
+        "the first terminal decision is the run's"
+    );
+}
+
+#[test]
+fn a_run_that_continued_reaches_neither_the_journal_nor_the_world_again() {
+    // Issue #107. `continue_as_new` marked its own future asked, not the `Ctx`. Poll it,
+    // then drop it. The old workflow could then reach the journal again through another
+    // boundary — even after it asked to replace the run.
+    let spec = TimerSpec::AfterBoot { ticks: 1 };
+    let mut ledger = Ledger::new();
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _restarted = poll_once(ctx.continue_as_new(b"next"));
+    let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let waited = poll_once(ctx.timer(spec));
+    let restarted_again = poll_once(ctx.continue_as_new(b"again"));
+    let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"late"));
+
+    assert_eq!(after, Poll::Pending);
+    assert_eq!(waited, Poll::Pending);
+    assert!(restarted_again.is_pending());
+    assert_eq!(ended, Poll::Pending, "a continued run cannot also end");
+    assert_eq!(
+        ctx.conclusion(),
+        None,
+        "a continued run is suspended, not ended: it has no terminal record"
+    );
+    // The `Ctx` borrow ends here, so the two counters below can be read.
+    let _ = ctx;
+    assert_eq!(world.polls, 0, "the world was never asked");
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::ContinueAsNew(b"next".to_vec())],
+        "only the first continue reaches the journal"
+    );
+}
+
+#[test]
 fn a_dispatcher_is_handed_exactly_the_runs_declared_result_bound() {
     // The caller's buffer is the wider of the run's two bounds, so it is wider than an
     // activity answer may be. Issue #36 asks that the length be validated against the
