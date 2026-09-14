@@ -6722,6 +6722,9 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 ///
 /// And **no hidden global state**: a `static` in either module is the other half of the
 /// must-not-own cell, and a façade with one is a façade two runs on a device would share.
+/// The vocabulary and static bans, and the future-set and macro bans beside them, read every
+/// file of `waymaker-facade-demo` too — `Bridge` is the one other caller of this boundary,
+/// and the must-not-own cell binds it exactly as it binds `waymaker-embassy`.
 ///
 /// The fourth half is the driver's. Every `waymaker-drive` module — [`FACADE_DRIVER_MODULES`]
 /// is empty, since issue #106 moved the edge above the crate rather than exempting a file
@@ -6739,6 +6742,7 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 #[must_use]
 pub fn check_ctx_facade(
     sources: &[crate::size::LayerSource],
+    facade_demo: &[crate::size::LayerSource],
     driver: &[crate::size::LayerSource],
 ) -> Vec<Violation> {
     const RULE: &str = "ctx-facade";
@@ -6767,19 +6771,29 @@ pub fn check_ctx_facade(
     // `pub static ATTEMPTS: AtomicUsize` and a `macro_rules!` expanding a tenth public
     // method into `impl Ctx` in `dispatch.rs` — one file over from the two the surface pins
     // read — and watched the gate stay green on all three.
-    for source in sources.iter().filter(|source| source.crate_name == FACADE) {
+    //
+    // `waymaker-facade-demo` reads the same way, for the same must-not-own cell: it holds
+    // `Bridge`, the one other place a caller reaches this boundary, and Codex's review of
+    // issue #106 found that the crate split moved the edge without moving this ban — a
+    // `facade.rs` naming `StableStorage` directly would have passed every check here.
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == FACADE)
+        .chain(facade_demo)
+    {
+        let subject = source.crate_name.as_str();
         let path = source.path.replace('\\', "/");
         let code = without_test_modules(&code_only(&source.contents));
         for (forbidden, why) in CTX_FORBIDDEN_VOCABULARY {
             if names_identifier(&code, forbidden) {
                 violations.push(Violation::new(
                     RULE,
-                    FACADE,
+                    subject,
                     format!("{path} names `{forbidden}`, which {why}"),
                 ));
             }
         }
-        violations.extend(check_no_hidden_state(RULE, FACADE, &path, &code));
+        violations.extend(check_no_hidden_state(RULE, subject, &path, &code));
         // And the future set, for the same reason: a fifth future whose `impl Future` lives
         // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
         // cannot see. Review of this change declared one in `dispatch.rs`.
@@ -6796,7 +6810,7 @@ pub fn check_ctx_facade(
                     if !CTX_FUTURES.contains(&future.as_str()) {
                         violations.push(Violation::new(
                             RULE,
-                            FACADE,
+                            subject,
                             format!(
                                 "{path} implements `Future` for `{future}`, which `CTX_FUTURES` \
                                  does not name: a fifth thing a workflow can `.await` is a \
@@ -6808,7 +6822,7 @@ pub fn check_ctx_facade(
             }
             Err(error) => violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} does not parse, so its `Future` implementors cannot be checked: {error}"
                 ),
@@ -6819,7 +6833,7 @@ pub fn check_ctx_facade(
         if names_identifier(&code, "macro_rules") {
             violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} declares a `macro_rules!`, which can expand a public method into \
                      a pinned `impl`, or a future's `poll`, where no pin can read it"
@@ -10870,11 +10884,21 @@ mod deferred_answer_pins {
     fn facade_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources(path, contents),
+            &[],
             &facade_free_driver_sources("", ""),
         )
         .into_iter()
         .map(|violation| violation.detail)
         .collect()
+    }
+
+    /// A clean `waymaker-facade-demo/src/facade.rs`, with `contents` in place of it.
+    fn facade_demo_sources(contents: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-facade-demo".to_owned(),
+            path: "waymaker-facade-demo/src/facade.rs".to_owned(),
+            contents: contents.to_owned(),
+        }]
     }
 
     /// The two wiring files `dispatch-wiring` reads, with one of them replaced.
@@ -11133,6 +11157,7 @@ mod deferred_answer_pins {
     fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources("", ""),
+            &[],
             &facade_free_driver_sources(path, contents),
         )
         .into_iter()
@@ -11154,6 +11179,28 @@ mod deferred_answer_pins {
             tests_support::clean_ctx_facade()
         );
         let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("StableStorage")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_moved_bridge_is_held_to_the_same_authority_ban() {
+        // Issue #106 moved `Bridge` into `waymaker-facade-demo`; Codex's review found that
+        // the authority ban still read only `waymaker-embassy`'s files, so a `facade.rs`
+        // reaching a `StableStorage` directly would have passed every check here.
+        let module = "pub fn record(storage: &mut impl StableStorage) { let _ = storage; }\n";
+        let details: Vec<String> = check_ctx_facade(
+            &facade_sources("", ""),
+            &facade_demo_sources(module),
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect();
         assert!(
             details
                 .iter()
@@ -11590,7 +11637,7 @@ mod deferred_answer_pins {
     fn a_facade_module_that_is_gone_is_reported() {
         // Fails closed, for `timer-capability`'s reason: a pin that cannot find its file is
         // a pin that has stopped checking.
-        let details: Vec<String> = check_ctx_facade(&[], &[])
+        let details: Vec<String> = check_ctx_facade(&[], &[], &[])
             .into_iter()
             .map(|violation| violation.detail)
             .collect();

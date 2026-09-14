@@ -309,8 +309,18 @@ fn check_source_rules(inputs: &WorkspaceInputs) -> Vec<Violation> {
         &inputs.driver_sources,
     ));
     violations.extend(source::check_effect_protocol(&inputs.driver_sources));
+    // `waymaker-facade-demo` is `no_std_support_sources`' too, alongside `waymaker-rig`,
+    // `waymaker-conformance` and `waymaker-drive` itself; `ctx-facade`'s authority ban is
+    // about the one crate that holds `Bridge`, so it reads only that slice of it.
+    let facade_demo_sources: Vec<size::LayerSource> = inputs
+        .no_std_support_sources
+        .iter()
+        .filter(|source| source.crate_name == "waymaker-facade-demo")
+        .cloned()
+        .collect();
     violations.extend(source::check_ctx_facade(
         &inputs.layer_sources,
+        &facade_demo_sources,
         &inputs.driver_sources,
     ));
     violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));

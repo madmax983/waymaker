@@ -90,6 +90,16 @@ pub struct Package {
     pub features: Vec<String>,
     /// Resolved graph edges, by package id.
     pub resolved_deps: Vec<PackageId>,
+    /// The subset of `resolved_deps` reached through at least one `[dependencies]` table
+    /// entry for that edge.
+    ///
+    /// By resolved id, not by declared name: two differently-versioned packages can share a
+    /// name, and a lookup by name alone could walk the wrong one's subtree.
+    /// [`PackageGraph::normal_transitive_dependencies`] is why this exists — it needs to
+    /// walk only the edges the shipped library actually links, and `resolved_deps` alone
+    /// does not say which those are, because `cargo metadata`'s resolved graph carries no
+    /// kind at all: only the *manifest* half does.
+    pub normal_resolved_deps: Vec<PackageId>,
     /// Absolute path to the package's `Cargo.toml`, when known.
     pub manifest_path: Option<PathBuf>,
     /// Absolute path to the package's library root, when the package has a library.
@@ -124,6 +134,7 @@ impl Package {
             features: Vec::new(),
             is_proc_macro: false,
             resolved_deps: Vec::new(),
+            normal_resolved_deps: Vec::new(),
             manifest_path: None,
             lib_source_path: None,
             source: None,
@@ -153,6 +164,14 @@ impl Package {
         self
     }
 
+    /// Overrides the package id, so two packages can share a name with distinct ids — the
+    /// shape two differently-versioned copies of one crate take in a real resolved graph.
+    #[must_use]
+    pub fn with_id(mut self, id: &str) -> Self {
+        id.clone_into(&mut self.id);
+        self
+    }
+
     /// Marks the package as having a `build.rs`.
     #[must_use]
     pub const fn with_build_script(mut self) -> Self {
@@ -161,6 +180,9 @@ impl Package {
     }
 
     /// Adds a declared and resolved dependency on `name`, in the given table.
+    ///
+    /// Test packages use the name as its own id, so `normal_resolved_deps` can be built the
+    /// same way the real parser builds it — from a resolved id, not a declared name.
     #[must_use]
     pub fn with_dependency(mut self, name: &str, kind: DepKind) -> Self {
         self.manifest_deps.push(ManifestDep {
@@ -168,6 +190,20 @@ impl Package {
             kind,
         });
         self.resolved_deps.push(name.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(name.to_owned());
+        }
+        self
+    }
+
+    /// Adds a resolved edge to package id `id`, in the given table — for a test that needs
+    /// to name the specific id an edge resolved to, as when two packages share a name.
+    #[must_use]
+    pub fn with_resolved_dependency(mut self, id: &str, kind: DepKind) -> Self {
+        self.resolved_deps.push(id.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(id.to_owned());
+        }
         self
     }
 
@@ -305,9 +341,11 @@ impl PackageGraph {
     /// ever linked into it — where `transitive_dependencies` answers the broader one: what
     /// building and testing this package needs at all.
     ///
-    /// Declared names rather than resolved ids, because kind lives on [`ManifestDep`] and
-    /// not on a resolved edge: each hop looks the next package up by the name its declaring
-    /// package named it under.
+    /// By resolved id at every hop, via [`Package::normal_resolved_deps`], the same as
+    /// `transitive_dependencies` and for the same reason: a lookup by declared *name* alone
+    /// can resolve to the wrong package when two differently-versioned copies of one name
+    /// are both in the graph, walking whichever one happened to sort first rather than the
+    /// one this specific edge actually selected.
     #[must_use]
     pub fn normal_transitive_dependencies(&self, name: &str) -> BTreeSet<String> {
         let mut reached = BTreeSet::new();
@@ -317,22 +355,22 @@ impl PackageGraph {
 
         let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
         seen_ids.insert(root.id.as_str());
-        let mut queue: VecDeque<&Package> = VecDeque::new();
-        queue.push_back(root);
+        let mut queue: VecDeque<&str> = root
+            .normal_resolved_deps
+            .iter()
+            .map(String::as_str)
+            .collect();
 
-        while let Some(package) = queue.pop_front() {
-            for dep in &package.manifest_deps {
-                if dep.kind != DepKind::Normal {
-                    continue;
-                }
-                let Some(next) = self.find(&dep.name) else {
-                    continue;
-                };
-                if !seen_ids.insert(next.id.as_str()) {
-                    continue;
-                }
-                reached.insert(next.name.clone());
-                queue.push_back(next);
+        while let Some(id) = queue.pop_front() {
+            if !seen_ids.insert(id) {
+                continue;
+            }
+            let Some(package) = self.by_id(id) else {
+                continue;
+            };
+            reached.insert(package.name.clone());
+            for next in &package.normal_resolved_deps {
+                queue.push_back(next.as_str());
             }
         }
 
@@ -436,6 +474,7 @@ impl PackageGraph {
             .collect();
 
         let resolved = resolved_edges(&root);
+        let normal_resolved = normal_resolved_edges(&root);
 
         let mut packages = Vec::with_capacity(package_values.len());
         for value in package_values {
@@ -489,6 +528,7 @@ impl PackageGraph {
 
             packages.push(Package {
                 resolved_deps: resolved.get(&id).cloned().unwrap_or_default(),
+                normal_resolved_deps: normal_resolved.get(&id).cloned().unwrap_or_default(),
                 id,
                 name,
                 manifest_deps,
@@ -541,6 +581,60 @@ fn resolved_edges(root: &Value) -> BTreeMap<PackageId, Vec<PackageId>> {
     }
 
     edges
+}
+
+/// The subset of [`resolved_edges`] reached through at least one `[dependencies]` table
+/// entry for that edge, by resolved package id.
+///
+/// `resolve.nodes[].deps[].dep_kinds[]` is where `cargo metadata` puts this — a `null` kind
+/// is `[dependencies]`, matching [`DepKind::from_metadata`]. An edge can carry more than one
+/// entry, normal and dev both, if a workspace declares the same package in both tables; it
+/// counts as normal if *any* entry does, because that is what decides whether the shipped
+/// library links it. An edge with no `dep_kinds` at all — a metadata shape this parser does
+/// not otherwise expect — is kept rather than dropped: a walk that missed a real edge here
+/// would under-report the façade this exists to catch, which is the wrong direction to fail
+/// closed in.
+fn normal_resolved_edges(root: &Value) -> BTreeMap<PackageId, Vec<PackageId>> {
+    let mut edges = BTreeMap::new();
+    let Some(nodes) = root
+        .get("resolve")
+        .and_then(|resolve| resolve.get("nodes"))
+        .and_then(Value::as_array)
+    else {
+        return edges;
+    };
+
+    for node in nodes {
+        let Some(id) = string_field(node, "id") else {
+            continue;
+        };
+        let deps = node
+            .get("deps")
+            .and_then(Value::as_array)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|dep| is_normal_edge(dep))
+                    .filter_map(|dep| string_field(dep, "pkg"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        edges.insert(id, deps);
+    }
+
+    edges
+}
+
+/// Whether a `resolve.nodes[].deps[]` entry carries a `[dependencies]` kind.
+fn is_normal_edge(dep: &Value) -> bool {
+    let Some(kinds) = dep.get("dep_kinds").and_then(Value::as_array) else {
+        // No `dep_kinds` at all: fail closed by keeping the edge, per this function's own
+        // doc.
+        return true;
+    };
+    kinds.is_empty()
+        || kinds.iter().any(|entry| {
+            DepKind::from_metadata(entry.get("kind").and_then(Value::as_str)) == DepKind::Normal
+        })
 }
 
 /// Every crate type that produces a library, and therefore has a crate root the
@@ -1209,6 +1303,50 @@ mod tests {
                 .any(|violation| violation.subject == "waymaker-drive"
                     && violation.detail.contains("waymaker-embassy")),
             "a two-hop normal chain to the fa\u{e7}ade must be caught: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn normal_transitive_dependencies_follows_the_resolved_id_not_the_name() {
+        // Codex's second follow-up: two packages can share a *name* while resolving to
+        // distinct *ids* — semver allows two incompatible versions of one crate in a real
+        // graph. A walk that looked the next hop up by declared name alone, rather than by
+        // the id the edge actually named, could follow the wrong version's subtree — here,
+        // the one that never reaches Embassy, silently clearing the one that does.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("drive")
+                .with_resolved_dependency("helper@1", DepKind::Normal),
+            Package::new("helper").with_id("helper@1"),
+            Package::new("helper")
+                .with_id("helper@2")
+                .with_resolved_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-embassy").with_id("waymaker-embassy"),
+        ]);
+
+        let reached = graph.normal_transitive_dependencies("waymaker-drive");
+        assert!(
+            !reached.contains("waymaker-embassy"),
+            "waymaker-drive's own edge names helper@1, which does not reach Embassy: {reached:?}"
+        );
+
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("drive")
+                .with_resolved_dependency("helper@2", DepKind::Normal),
+            Package::new("helper").with_id("helper@1"),
+            Package::new("helper")
+                .with_id("helper@2")
+                .with_resolved_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-embassy").with_id("waymaker-embassy"),
+        ]);
+
+        let reached = graph.normal_transitive_dependencies("waymaker-drive");
+        assert!(
+            reached.contains("waymaker-embassy"),
+            "waymaker-drive's edge names helper@2, which does reach Embassy, and a lookup \
+             by name alone (matching whichever `helper` sorts first) must not miss it: \
+             {reached:?}"
         );
     }
 
