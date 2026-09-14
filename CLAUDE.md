@@ -3595,11 +3595,16 @@ workspace and holding the document's row set to what `matrix` derives from it �
 `matrix` would produce and the document lacks, by name or by feature selection, is refused.
 Resolving metadata costs nothing a firmware build would: no image is linked, which is what
 keeps `--report` usable without one. `main.rs`'s `run_size` runs it alongside
-`SizeReport::shortfalls` and renders both lists as one report. Three tests drive it: a
-per-feature row's large `Δram` raising the total again, `missing_rows` catching a document
-missing a row `matrix` derives, and catching a row whose name is reused with a narrowed
-feature selection. Review also found an out-of-scope, genuinely separate gap — a gated row's
-own `ram`/`bss` fields carry no non-zero floor, unlike `flash`'s — filed as issue
+`SizeReport::shortfalls` and renders both lists as one report. `missing_rows` is refused
+outright on an empty `expected` rather than read as nothing to check — a workspace with no
+`waymaker-size-probe` has `matrix` derive no row at all, and a document from before the
+probe was removed would otherwise pass against it vacuously, the same empty matrix
+`measure_into` already refuses to link. Four tests drive it: a per-feature row's large
+`Δram` raising the total again, `missing_rows` catching a document missing a row `matrix`
+derives, catching a row whose name is reused with a narrowed feature selection, and catching
+a document read against a probe-less workspace. Review also found an out-of-scope,
+genuinely separate gap — a gated row's own `ram`/`bss` fields carry no non-zero floor,
+unlike `flash`'s — filed as issue
 [#172](https://github.com/madmax983/waymaker/issues/172) rather than folded in, since `0 B`
 is this engine's real, current statics figure and a floor there would fail every honest
 report. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule

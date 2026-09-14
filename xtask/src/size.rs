@@ -351,8 +351,20 @@ pub fn completeness_shortfalls(
 /// A row of `rows` is missing when no row shares `expected`'s name *and* its exact feature
 /// set — a name reused with a narrowed selection is a row that was not really built with
 /// the feature the name claims, so its `Δram` would not be that feature's.
+///
+/// An empty `expected` is refused rather than read as "nothing to check": [`matrix`]
+/// derives no row at all for a workspace with no [`PROBE_PACKAGE`], and a document read
+/// against that workspace would otherwise pass vacuously — the same empty matrix
+/// [`measure_into`] already refuses to link.
 #[must_use]
 fn missing_rows(expected: &[Variant], rows: &[Row]) -> Vec<BudgetShortfall> {
+    if expected.is_empty() {
+        return vec![BudgetShortfall::Unmeasurable {
+            detail: format!(
+                "this workspace has no `{PROBE_PACKAGE}`, so `matrix` derives no row to hold the document's row set to"
+            ),
+        }];
+    }
     expected
         .iter()
         .filter(|variant| {
@@ -5169,6 +5181,23 @@ mod tests {
         narrowed.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
         let shortfalls = missing_rows(&expected, std::slice::from_ref(&narrowed));
         assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    }
+
+    #[test]
+    fn a_workspace_with_no_probe_does_not_let_an_old_report_pass() {
+        // `matrix` derives no row at all for a workspace with no probe, and an empty
+        // `expected` read as "nothing to check" would let a document from before the probe
+        // was removed pass vacuously — even one that looks complete for the workspace it
+        // was really measured against.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core")]);
+        assert!(matrix(&graph).is_empty());
+        let rows = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let shortfalls = missing_rows(&matrix(&graph), &rows);
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+        assert!(
+            rendered(&shortfalls).contains(PROBE_PACKAGE),
+            "{shortfalls:?}"
+        );
     }
 
     #[test]
