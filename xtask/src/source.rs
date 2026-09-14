@@ -18165,6 +18165,61 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_indexed_into_a_repeat_array_literal_is_reported() {
+        // Codex's next-round finding: `[0u8; 1][0]` is `syn`'s `Expr::Repeat` — the
+        // `[value; count]` grammar, a different node kind from the bracketed-list
+        // `Expr::Array` the previous round's `Expr::Index` case first handled — and fell
+        // straight through that case's own refusal, for the same reason the tuple/struct
+        // split needed a second match arm two rounds earlier. Every element of a repeat
+        // literal is definitionally the same expression, so the new arm bounds-checks the
+        // index against the (separately resolved) repeat count and evaluates that one
+        // shared element expression rather than looking anything up positionally.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn repeat_array_indexed_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = [0u8; 1][0];\n    const P1: u8 = [1u8; 1][0];\n    \
+             const P2: u8 = [2u8; 1][0];\n    const P3: u8 = [3u8; 1][0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_comparison_valued_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if 1 == 0 => ..`, sitting between the numbered
+        // arms and the real wildcard, is exactly the dead code the forty-sixth round's
+        // `false`-guard fix and the forty-eighth round's `!true`-guard fix already prune —
+        // but `Expr::Binary`'s own `match` on `binary.op` had no arm at all for a
+        // comparison operator, so `1 == 0` fell to the wildcard `_ => None` and the guard
+        // stayed unresolved rather than provably `0`. `evaluate_binary_op` now folds every
+        // comparison operator the same way it already folds arithmetic, so the guard
+        // resolves to `0` and the arm is dropped the way `rustc`'s own dead-code
+        // elimination would drop it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn comparison_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn comparison_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => comparison_dead_guard_helper(0),\n        \
+             1 => comparison_dead_guard_helper(1),\n        2 => comparison_dead_guard_helper(2),\n        \
+             _ if 1 == 0 => 999,\n        _ => comparison_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

@@ -2649,6 +2649,53 @@ fn evaluate_block(
     literal_or_const_value(tail_expr, &block_resolve)
 }
 
+/// `left op right`'s own value, for every [`syn::BinOp`] this scan folds — factored out of
+/// [`literal_or_const_value`]'s own `Expr::Binary` case to keep that function under
+/// clippy's line count, not because the two arithmetic and comparison halves are otherwise
+/// unrelated: a `const` initializer that is real, MSRV-legal arithmetic over literals or
+/// other constants (`BASE + 1`) is evaluated by `rustc` before the match it feeds ever
+/// lowers, and compiles to the identical table a literal would. Checked throughout, so
+/// overflow, a shift wider than the value's own bits, or division and remainder by zero
+/// each fail closed to `None` rather than wrapping to a value `rustc` itself would have
+/// rejected at a different one. A call to a user-defined `const fn` (`index(1)`) is not
+/// evaluated — doing that in general means interpreting an arbitrary function body, which
+/// this scan does not attempt — so a table whose numbered arms are spelled that way stays
+/// unresolved.
+///
+/// Codex's next-round finding: a guard this scan can prove is always `false` is dropped
+/// before `visit_expr_match` ever records the arm — but that check resolves the guard
+/// through this same function, and a comparison (`_ if 1 == 0 => ..`) is `Expr::Binary`
+/// with a comparison operator this `match` had no arm for at all, so it fell to the
+/// wildcard `_ => None` below and the guard stayed unresolved rather than provably `0`. A
+/// comparison between two values this scan already resolved is exactly as sound to fold as
+/// an arithmetic one — `bool`'s own `0`/`1` representation, the identical one
+/// `lit_value`'s `Lit::Bool` case and `Expr::If`'s own condition already use.
+fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
+    match op {
+        syn::BinOp::Add(_) => left.checked_add(right),
+        syn::BinOp::Sub(_) => left.checked_sub(right),
+        syn::BinOp::Mul(_) => left.checked_mul(right),
+        syn::BinOp::Div(_) => left.checked_div(right),
+        syn::BinOp::Rem(_) => left.checked_rem(right),
+        syn::BinOp::BitAnd(_) => Some(left & right),
+        syn::BinOp::BitOr(_) => Some(left | right),
+        syn::BinOp::BitXor(_) => Some(left ^ right),
+        syn::BinOp::Shl(_) => u32::try_from(right)
+            .ok()
+            .and_then(|shift| left.checked_shl(shift)),
+        syn::BinOp::Shr(_) => u32::try_from(right)
+            .ok()
+            .and_then(|shift| left.checked_shr(shift)),
+        syn::BinOp::Eq(_) => Some(i128::from(left == right)),
+        syn::BinOp::Ne(_) => Some(i128::from(left != right)),
+        syn::BinOp::Lt(_) => Some(i128::from(left < right)),
+        syn::BinOp::Le(_) => Some(i128::from(left <= right)),
+        syn::BinOp::Gt(_) => Some(i128::from(left > right)),
+        syn::BinOp::Ge(_) => Some(i128::from(left >= right)),
+        _ => None,
+    }
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -2669,37 +2716,13 @@ fn literal_or_const_value(
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
         syn::Expr::Path(path) => resolve(&path.path),
-        // Codex's finding: a `const` initializer that is real, MSRV-legal arithmetic over
-        // literals or other constants (`BASE + 1`) is evaluated by `rustc` before the match
-        // it feeds ever lowers, and compiles to the identical table a literal would — this
-        // was refusing every such initializer as unresolved rather than doing the same
-        // constant folding. Checked throughout, so overflow, a shift wider than the value's
-        // own bits, or division and remainder by zero each fail closed to `None` rather
-        // than wrapping to a value `rustc` itself would have rejected at a different one.
-        // A call to a user-defined `const fn` (`index(1)`) is not evaluated — doing that in
-        // general means interpreting an arbitrary function body, which this scan does not
-        // attempt — so a table whose numbered arms are spelled that way stays unresolved.
-        syn::Expr::Binary(binary) => {
-            let left = literal_or_const_value(&binary.left, resolve)?;
-            let right = literal_or_const_value(&binary.right, resolve)?;
-            match binary.op {
-                syn::BinOp::Add(_) => left.checked_add(right),
-                syn::BinOp::Sub(_) => left.checked_sub(right),
-                syn::BinOp::Mul(_) => left.checked_mul(right),
-                syn::BinOp::Div(_) => left.checked_div(right),
-                syn::BinOp::Rem(_) => left.checked_rem(right),
-                syn::BinOp::BitAnd(_) => Some(left & right),
-                syn::BinOp::BitOr(_) => Some(left | right),
-                syn::BinOp::BitXor(_) => Some(left ^ right),
-                syn::BinOp::Shl(_) => u32::try_from(right)
-                    .ok()
-                    .and_then(|shift| left.checked_shl(shift)),
-                syn::BinOp::Shr(_) => u32::try_from(right)
-                    .ok()
-                    .and_then(|shift| left.checked_shr(shift)),
-                _ => None,
-            }
-        }
+        // [`evaluate_binary_op`] holds the rationale for every operator this folds,
+        // arithmetic and comparison alike, since both are one decision rather than two.
+        syn::Expr::Binary(binary) => evaluate_binary_op(
+            binary.op,
+            literal_or_const_value(&binary.left, resolve)?,
+            literal_or_const_value(&binary.right, resolve)?,
+        ),
         // Codex's finding: a negative *range endpoint* (`-8..=6`) is a full expression,
         // not the special negative-literal-pattern grammar a bare `-8` pattern parses
         // through — `syn::Pat::Range`'s own `start`/`end` are `Expr`s, so `-8` there is
@@ -2862,12 +2885,26 @@ fn literal_or_const_value(
         // itself resolved through this same pipeline; an index outside the array's own
         // bounds, or one this scan cannot resolve to a value, stays unresolved rather than
         // guessed at.
+        //
+        // Codex's next-round finding: `[0u8; 1][0]` — a *repeat* array literal (`syn`'s
+        // `Expr::Repeat`, the `[value; count]` grammar), rather than the bracketed-list
+        // `Expr::Array` this case first handled — fell straight through that case's own
+        // refusal, for the same reason the tuple/struct split above needed a second match
+        // arm. Every element of a repeat literal is definitionally the same expression, so
+        // this resolves the index only far enough to bounds-check it against the
+        // (separately resolved) repeat count, then evaluates that one shared element
+        // expression rather than looking anything up positionally.
         syn::Expr::Index(indexed) => {
-            let syn::Expr::Array(array) = indexed.expr.as_ref() else {
-                return None;
-            };
             let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
-            literal_or_const_value(array.elems.get(index)?, resolve)
+            match indexed.expr.as_ref() {
+                syn::Expr::Array(array) => literal_or_const_value(array.elems.get(index)?, resolve),
+                syn::Expr::Repeat(repeat) => {
+                    let len =
+                        usize::try_from(literal_or_const_value(&repeat.len, resolve)?).ok()?;
+                    (index < len).then(|| literal_or_const_value(&repeat.expr, resolve))?
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
