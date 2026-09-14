@@ -15480,6 +15480,75 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_enum_variants_is_reported() {
+        // Codex's thirtieth-round finding: `Indices::P0` names a fieldless enum variant
+        // exactly the way `Pat::Path` spells a module-qualified constant, and `rustc`
+        // compiles a dense match over sequential variant discriminants into the identical
+        // indexed table — but nothing here had ever read an `enum`'s own variants, so
+        // every numbered arm of such a table resolved to `None` and the match read as not
+        // dense.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0,\n    P1,\n    P2,\n    P3,\n}\n\nconst \
+             fn enum_variant_pattern_table(index: Indices) -> u32 {\n    match index {\n        \
+             Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 => 2,\n        \
+             Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_explicit_enum_discriminants_is_reported() {
+        // The explicit-discriminant half of the same finding: a variant's own value can be
+        // written out (`P2 = 2`) rather than left implicit, and `literal_or_const_value`
+        // is what resolves it — the same constant folding a `const`'s own initializer
+        // already gets, reused here rather than duplicated.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0 = 0,\n    P1 = 1,\n    P2 = 2,\n    P3 = \
+             3,\n}\n\nconst fn explicit_enum_variant_pattern_table(index: Indices) -> u32 {\n    \
+             match index {\n        Indices::P0 => 0,\n        Indices::P1 => 1,\n        \
+             Indices::P2 => 2,\n        Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_local_match_in_an_ordinary_function_is_not_reported() {
+        // Codex's thirtieth-round finding: `syn::visit::visit_block`'s default walk
+        // descends into every statement unconditionally, so a `#[cfg(test)] let expected =
+        // match ...;` local inside an otherwise ordinary (non-test) function — a statement
+        // `rustc` strips from shipped code entirely — was still walked and its match
+        // reported as a second production table. Only items and `impl` members were ever
+        // checked for `#[cfg(test)]`; a local statement's own attributes were never read.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    let _expected = \
+             match nibble & 0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             3 => 3,\n        _ => 4,\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_qualified_against_the_current_module_wins_over_a_same_named_root_one() {
         // Codex's seventeenth-round finding: the fix for the sixteenth round's relative-path
         // gap tried the plain, file-root chain *first* and only fell back to the
@@ -16533,6 +16602,30 @@ mod deferred_answer_pins {
         assert!(
             violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
             "a production table outside crc/ was not scanned: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_an_inline_module_resolves_against_its_own_directory() {
+        // Codex's thirtieth-round finding: a `#[path]` attribute on a `mod` declared
+        // inside an inline `mod outer { ... }` resolves against `outer`'s own directory
+        // (`crc/outer/`) — the same one an unattributed `mod table;` there would use —
+        // not against the declaring file's directory (`src/`) the way a top-level
+        // `#[path]` does. The two only coincide when there is no inline nesting, which is
+        // why `parent_dir` was ever the right answer for the top-level case above.
+        let parent = format!(
+            "{}\nmod outer {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside an inline mod was not resolved against its own \
+             directory: {violations:?}"
         );
     }
 

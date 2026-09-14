@@ -1328,12 +1328,19 @@ fn normalize_path(path: &str) -> String {
 /// lives in the child directory — beside the parent when the parent is `mod.rs`,
 /// otherwise in the directory named after the parent's file stem — as `name.rs` or
 /// `name/mod.rs`, in `rustc`'s probe order. A `#[path = "..."]` attribute replaces the
-/// file name, and `rustc` resolves it against the declaring file's directory: verified
-/// by compiling a nested probe (`lib.rs` → `mod crc;` → `crc.rs` → `#[path = "tbl.rs"]
-/// mod table;` reads the sibling `src/tbl.rs`; `src/crc/tbl.rs` is never consulted —
-/// the build fails without the sibling). A `#[path]` with directory components is
-/// relative the same way, so `#[path = "crc/tbl.rs"]` in `src/crc.rs` reads
+/// file name, and at the top level `rustc` resolves it against the declaring file's own
+/// directory: verified by compiling a nested probe (`lib.rs` → `mod crc;` → `crc.rs` →
+/// `#[path = "tbl.rs"] mod table;` reads the sibling `src/tbl.rs`; `src/crc/tbl.rs` is
+/// never consulted — the build fails without the sibling). A `#[path]` with directory
+/// components is relative the same way, so `#[path = "crc/tbl.rs"]` in `src/crc.rs` reads
 /// `src/crc/tbl.rs`.
+///
+/// That directory is not the declaring *file's* directory once the declaration sits
+/// inside an inline `mod outer { ... }` — Codex's finding: `rustc` then resolves the
+/// attribute against `outer`'s own directory (`src/crc/outer/`, the same one an
+/// unattributed `mod table;` there would use) rather than against `crc.rs`'s. The two
+/// only coincide at the top level, which is why `parent_dir` was ever the right answer to
+/// begin with.
 ///
 /// A `#[path]` attribute names exactly the file `rustc` reads (issue #59): no natural
 /// directory fallback is offered, because a fallback would scan a file the compiler
@@ -1415,6 +1422,19 @@ fn collect_child_modules(
             );
             inline_path.pop();
         } else {
+            // A `#[path]` attribute resolves against the *declaring file's* own directory
+            // at the top level (`parent_dir`), but Codex's finding is that this stops
+            // being true the moment the declaration sits inside an inline `mod { ... }`:
+            // `rustc` then resolves it against that inline module's own directory
+            // instead, which is `child_dir` by the time this call is reached — it was
+            // extended with each inline module's own name on the way in, one level per
+            // `inline_path.push` above. `inline_path` being non-empty is exactly "this
+            // declaration is nested inside at least one inline module".
+            let path_base = if inline_path.is_empty() {
+                parent_dir
+            } else {
+                child_dir
+            };
             let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
                 || {
                     vec![
@@ -1423,7 +1443,7 @@ fn collect_child_modules(
                     ]
                 },
                 // `rustc` consults exactly this one path (see above): no fallback.
-                |path| vec![normalize_path(&format!("{parent_dir}{path}"))],
+                |path| vec![normalize_path(&format!("{path_base}{path}"))],
             );
             found.push(ChildModule {
                 name,
@@ -2512,11 +2532,94 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         syn::visit::visit_item_impl(self, node);
     }
 
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        // Codex's finding: `Indices::P0` names a fieldless enum variant exactly the way
+        // `Pat::Path` spells a module-qualified constant, and `rustc` compiles a dense
+        // match over sequential variant discriminants into the identical indexed table —
+        // but nothing here had ever read an `enum`'s own variants, so every arm of such a
+        // table read as unresolved. Each unit variant's discriminant is recorded as
+        // `EnumName::VariantName`, the same key shape an associated constant gets above,
+        // so [`resolve_pattern_path`] finds it by the same route.
+        //
+        // A variant's own discriminant is either explicit (`Variant = EXPR`) — evaluated
+        // through the same constant folding a `const`'s initializer gets, so a discriminant
+        // spelled as arithmetic over an earlier constant still resolves — or implicit: one
+        // more than the previous variant's own value, `0` for the first. A variant carrying
+        // fields is skipped, since `Pat::Path` cannot name one; the running counter still
+        // advances past it, matching how `rustc` numbers a mixed enum's fieldless variants.
+        // An unresolvable explicit discriminant stops the count rather than guessing a
+        // wrong running value for every variant after it.
+        if !has_cfg_test(&node.attrs) {
+            let scopes = &self.scopes;
+            let use_scopes = &self.use_scopes;
+            let module_path = &self.module_path;
+            let module_scope_depths = &self.module_scope_depths;
+            let qualified_snapshot = self.qualified.clone();
+            let resolve = |path: &syn::Path| {
+                resolve_pattern_path(
+                    path,
+                    scopes,
+                    use_scopes,
+                    &qualified_snapshot,
+                    module_path,
+                    module_scope_depths,
+                )
+            };
+            let mut enum_path = self.module_path.clone();
+            enum_path.push(ident_name(&node.ident));
+            let mut next: u128 = 0;
+            let mut found = Vec::new();
+            for variant in &node.variants {
+                if has_cfg_test(&variant.attrs) {
+                    continue;
+                }
+                let Some(value) = (match &variant.discriminant {
+                    Some((_, expr)) => literal_or_const_value(expr, &resolve),
+                    None => Some(next),
+                }) else {
+                    break;
+                };
+                if matches!(variant.fields, syn::Fields::Unit) {
+                    found.push((
+                        format!("{}::{}", enum_path.join("::"), ident_name(&variant.ident)),
+                        value,
+                    ));
+                }
+                let Some(successor) = value.checked_add(1) else {
+                    break;
+                };
+                next = successor;
+            }
+            for (key, value) in found {
+                self.qualified.insert(key, value);
+            }
+        }
+        syn::visit::visit_item_enum(self, node);
+    }
+
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let scope = resolve_scope_consts(&block_const_exprs(node), &self.scopes);
         self.scopes.0.push(scope);
         self.use_scopes.0.push(block_use_imports(node));
-        syn::visit::visit_block(self, node);
+        // Codex's finding: `syn::visit::visit_block`'s default walk descends into every
+        // statement unconditionally, so a `#[cfg(test)] let expected = match ... ;` local
+        // — attributes `rustc` reads and strips the whole statement over in shipped code —
+        // was still walked into and its match reported as a second production table. Only
+        // items and `impl` members were ever checked for `#[cfg(test)]` (`visit_item` and
+        // `visit_impl_item`, above); a local statement's own attributes were never read at
+        // all. Scoped to the shape the finding names: a `Stmt::Local`'s own attribute list,
+        // which is where a `let`'s `#[cfg(test)]` lives. A bare `#[cfg(test)]` expression
+        // statement is a residual gap this does not close — `syn::Expr` has no one place
+        // every variant keeps its own attributes, so reading it uniformly needs a match
+        // over each of `syn`'s expression kinds rather than one field access.
+        for stmt in &node.stmts {
+            if let syn::Stmt::Local(local) = stmt {
+                if has_cfg_test(&local.attrs) {
+                    continue;
+                }
+            }
+            self.visit_stmt(stmt);
+        }
         self.use_scopes.0.pop();
         self.scopes.0.pop();
     }
