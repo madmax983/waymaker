@@ -1372,12 +1372,13 @@ impl Rig {
     /// [`resume`](Self::resume) and [`resume_declaring`](Self::resume_declaring), over the
     /// workload each one means to audit history against.
     ///
-    /// Refuses a `workload` other than [`effects`](Self::effects) wide before touching the
-    /// device. `resume_declaring`'s `declared` only ever means to audit history against a
-    /// workload that agrees with this rig's own run everywhere but the one record
-    /// [`Workload::diverging`] names, and a workload of another length is not that shape —
-    /// nor one this bank or this witness was provisioned for, since `Rig::new` sizes both
-    /// against `effects` alone.
+    /// Refuses a `workload` other than [`effects`](Self::effects) wide, or one whose run
+    /// disagrees with `iteration`'s own, before touching the device. `resume_declaring`'s
+    /// `declared` only ever means to audit history against a workload that agrees with this
+    /// rig's own run everywhere but the one record [`Workload::diverging`] names, and a
+    /// workload of another length or another run is not that shape — nor one this bank or
+    /// this witness was provisioned for, since `Rig::new` sizes both against `effects` alone
+    /// and [`Workload::run`] is what a bank belongs to.
     ///
     /// A *wider* declaration was the first review found: it can share this rig's seed and
     /// iteration and so match its recovered prefix exactly while naming more effects than
@@ -1387,7 +1388,13 @@ impl Rig {
     /// a shorter run's opening effects are a byte-for-byte prefix of a longer one's — so
     /// nothing catches it until the declaration's own early `RunCompleted` collides with an
     /// index the real run still has open, after everything in between was already written
-    /// and dispatched. Both are refused the same way, before either happens.
+    /// and dispatched. Both are refused the same way, before either happens. A third is a
+    /// `declared` for a *different iteration* sharing this rig's seed: its effect count can
+    /// equal `self.effects` by construction, so it passes the first check, and
+    /// `recover_prefix`'s audit checks it against the bank's own header — which agrees,
+    /// because `declared` genuinely is that other iteration's own workload — so a run
+    /// already complete for that iteration was reported as `iteration`'s own `Completed`
+    /// before the per-record comparison against `self.workload(iteration)` was ever reached.
     fn resume_as<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -1399,7 +1406,7 @@ impl Rig {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
         }
-        if workload.effects() != self.effects {
+        if workload.effects() != self.effects || workload.run() != self.workload(iteration).run() {
             return Err(RigError::Workload);
         }
         let Some(records) = workload.records() else {

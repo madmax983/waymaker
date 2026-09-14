@@ -3958,3 +3958,19 @@ freshly prepared run onto the other bank under a throwaway identity, and the sec
 retires that throwaway run back onto `Rig::BANK` naming one iteration's own run id but
 another iteration's workflow input. The unfixed code answered `Ok(Completed)`, having
 written and dispatched into the mismatched bank, before this check existed.
+
+An eleventh found the read path's own twin of the ninth's gap: `resume_as`'s preflight
+compared `workload.effects()` against `self.effects`, but never `workload`'s own run
+against the run `iteration` names. Two iterations of one plan share an effect count by
+construction, so a `declared` sharing this rig's seed and *another* iteration's number
+passes that check while still naming a bank installed for a different run.
+`recover_prefix`'s audit then checks `declared` against the bank's own header, which
+agrees — `declared` genuinely is that other iteration's own workload — and once the
+recovered prefix already covers the whole run, the `recovered >= records` branch answers
+`Completed` before the per-record comparison against `self.workload(iteration)` is ever
+reached: a run belonging to iteration 0 is reported as iteration 1's. `resume_as` now
+also refuses unless `workload.run()` agrees with `self.workload(iteration).run()`, before
+recovery is read at all. Reproduced first by completing iteration 0 with no cut anywhere,
+then calling `resume_declaring(1, rig.workload(0), ..)` on the same device: the unfixed
+code answered `Ok(Completed { recovered: 6, .. })`, reporting iteration 0's own history as
+iteration 1's, rather than refusing with `RigError::Workload`.

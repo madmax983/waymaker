@@ -2954,3 +2954,60 @@ fn resume_declaring_refuses_before_running_any_record_that_agrees_ahead_of_the_d
     }
     assert!(checked > 0, "no crash point left only RunStarted durable");
 }
+
+/// Round 11: the preflight above compares `declared.effects()` against `self.effects`, but
+/// never `declared`'s own run against the run `iteration` names. Two iterations of one plan
+/// share an effect count, so a `declared` sharing this rig's seed and *another* iteration's
+/// number can pass that check while still naming a bank installed for a different run.
+/// `recover_prefix`'s audit then checks `declared` against the bank's own header, which
+/// agrees — it is genuinely that other iteration's own workload — and, once the recovered
+/// prefix already covers the whole run, `resume_as`'s `recovered >= records` branch answers
+/// `Completed` before the per-record comparison against `self.workload(iteration)` is ever
+/// reached: a run that belongs to iteration 0 is reported as iteration 1's.
+///
+/// The fix widens the preflight once more: `declared`'s run must agree with
+/// `self.workload(iteration)`'s before recovery is read at all, so a declaration that
+/// belongs to one iteration cannot be presented as another's.
+#[test]
+fn resume_declaring_refuses_a_workload_for_another_iterations_run() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        let outcome = rig.iterate(
+            0,
+            &mut metered,
+            &mut Log::default(),
+            &mut NeverCut,
+            &mut page,
+        );
+        assert!(
+            matches!(outcome, Ok(Stop::Completed)),
+            "the fault-free iteration completes: {outcome:?}"
+        );
+    }
+
+    let declared = rig.workload(0);
+    let mut dispatcher = Log::default();
+    let before = device.image().to_vec();
+    let outcome = {
+        let mut metered = Metered::new(&mut device);
+        rig.resume_declaring(1, declared, &mut metered, &mut dispatcher, &mut page)
+    };
+    assert!(
+        matches!(outcome, Err(RigError::Workload)),
+        "a declaration for iteration 0's run was accepted as iteration 1's: {outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched before being refused"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device before being refused"
+    );
+}
