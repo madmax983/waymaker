@@ -584,7 +584,8 @@ fn collect_type_aliases<'a>(
             | syn::Item::Trait(_)
             | syn::Item::Const(_)
             | syn::Item::Static(_)
-            | syn::Item::Enum(_) => {
+            | syn::Item::Enum(_)
+            | syn::Item::Struct(_) => {
                 collect_type_aliases(nested_body_items(item), aliases);
             }
             _ => {}
@@ -685,14 +686,16 @@ fn collect_trait_implementors<'a>(
             // trait's own default method bodies and default associated consts; round
             // 18 found it reachable through an enum variant's discriminant and
             // through a block buried inside a type alias's own type (an array length
-            // or a const generic argument). `item.attrs` is not re-checked, for the
-            // reason given above.
+            // or a const generic argument); round 19 found the same type-bearing shape
+            // reachable through a struct's own field types. `item.attrs` is not
+            // re-checked, for the reason given above.
             syn::Item::Fn(_)
             | syn::Item::Const(_)
             | syn::Item::Static(_)
             | syn::Item::Trait(_)
             | syn::Item::Enum(_)
-            | syn::Item::Type(_) => {
+            | syn::Item::Type(_)
+            | syn::Item::Struct(_) => {
                 collect_trait_implementors(
                     nested_body_items(item),
                     aliases,
@@ -1999,6 +2002,12 @@ impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
 /// expression exactly like a `const`'s initializer, and a type alias's own type can
 /// carry one buried inside it — an array length or a const generic argument, which
 /// [`type_items`] finds by walking the type rather than reading it as a plain path.
+///
+/// Round 19 found the same type-bearing shape one level over: a struct's own field
+/// types can each carry a buried block the same way a type alias's can (`struct Holder
+/// { field: [(); { impl Clone for super::Recovery { .. }; 0 }] }`), so every field's
+/// type is walked with [`type_items`] too, skipping a `#[cfg(test)]` field the same way
+/// the enum arm skips a `#[cfg(test)]` variant.
 fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
     match item {
         syn::Item::Fn(function) => block_items(&function.block),
@@ -2043,6 +2052,12 @@ fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
             })
             .collect(),
         syn::Item::Type(type_item) => type_items(&type_item.ty),
+        syn::Item::Struct(struct_item) => struct_item
+            .fields
+            .iter()
+            .filter(|field| !has_cfg_test(&field.attrs))
+            .flat_map(|field| type_items(&field.ty))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -2115,6 +2130,25 @@ fn impl_member_bodies(
         .collect()
 }
 
+/// [`impl_member_bodies`], for a struct's own field types — split out for the same
+/// reason and to keep [`collect_child_modules`] under this file's own line-count lint
+/// once round 19's `Item::Struct` arm joined it.
+fn struct_field_bodies(
+    struct_item: &syn::ItemStruct,
+    struct_gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    struct_item
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                struct_gated || has_cfg_test(&field.attrs),
+                type_items(&field.ty),
+            )
+        })
+        .collect()
+}
+
 /// [`impl_member_bodies`], for a trait's own default method bodies and default
 /// associated consts.
 fn trait_member_bodies(
@@ -2156,7 +2190,8 @@ fn trait_member_bodies(
 /// macro-generated — inside a `const`/`static` initializer, an enum variant's
 /// discriminant, or a block buried inside a type alias's own type; this walk needs
 /// the same shapes, so a `mod` declared inside one of them is not merely unresolved
-/// as a self-type but never even reached as a file at all.
+/// as a self-type but never even reached as a file at all. Round 19 found the same
+/// type-bearing shape one level over, in a struct's own field types.
 fn collect_child_modules<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     parent_dir: &str,
@@ -2253,6 +2288,12 @@ fn collect_child_modules<'a>(
                     item_gated,
                     found,
                 );
+            }
+            syn::Item::Struct(struct_item) => {
+                let struct_gated = gated || has_cfg_test(&struct_item.attrs);
+                for (field_gated, items) in struct_field_bodies(struct_item, struct_gated) {
+                    collect_child_modules(items, parent_dir, child_dir, field_gated, found);
+                }
             }
             _ => {}
         }

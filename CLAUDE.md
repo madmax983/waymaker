@@ -3238,7 +3238,14 @@ super::Recovery` buried in either shape reached neither `collect_type_aliases` n
 own `Const`/`Static`/`Enum`/`Type` arms (each verified against a real, compiling bypass — a
 `mod` behind `#[path]` inside a `const _: () = { .. };`, reached and flagged, where round 17's
 own fix left it unreached), and `nested_body_items` gained `Enum` and `Type` arms via a new
-shared `type_items` helper, mirroring `block_items`/`expr_items`.
+shared `type_items` helper, mirroring `block_items`/`expr_items`. Round 19 found the same
+type-bearing shape one level over: a struct's own field types can each carry a buried block —
+`struct Holder { field: [(); { impl Clone for super::Recovery { .. }; 0 }] }` — exactly the
+way a type alias's own type can, and neither `nested_body_items` nor `collect_child_modules`
+read `Item::Struct` at all. Both gained a `Struct` arm, the latter through a new
+`struct_field_bodies` helper (mirroring `impl_member_bodies`/`trait_member_bodies`) split out
+to keep `collect_child_modules` under this file's own line-count lint, each field's `#[cfg(test)]`
+gate carried onward the same way an enum variant's already was.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
