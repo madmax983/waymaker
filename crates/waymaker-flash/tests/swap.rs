@@ -52,6 +52,7 @@ enum Op {
 ///
 /// Erased is `0xFF` and a program only ever clears bits, so a swap that programmed a seal
 /// over an unerased bank would show up as bytes rather than as a passing test.
+#[derive(Debug)]
 struct Nor {
     geometry: Geometry,
     media: Vec<u8>,
@@ -350,8 +351,8 @@ fn current_region() -> JournalRegion {
 /// A writer over the bank in use, positioned where a recovery of it says it may write.
 fn current_journal(device: &mut Nor) -> Journal {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(current_region());
-    while recovery.next(device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(current_region(), device);
+    while recovery.next(&mut page).is_some() {}
     let Some(journal) = Journal::after(recovery) else {
         unreachable!("an erased journal has an append point")
     };
@@ -360,7 +361,7 @@ fn current_journal(device: &mut Nor) -> Journal {
 
 /// The swap this file is about, planned but not yet begun.
 fn planned(device: &mut Nor) -> Swap<'static> {
-    let retired = Retired::Journal(current_journal(device));
+    let retired: Retired<'_, Nor> = Retired::Journal(current_journal(device));
     let Ok(swap) = Swap::beginning(
         layout(),
         Authority::Bank {
@@ -377,14 +378,14 @@ fn planned(device: &mut Nor) -> Swap<'static> {
 }
 
 /// The whole protocol, steps 2 to 6, against `device`.
-fn perform(device: &mut Nor) -> Installed {
+fn perform(device: &mut Nor) -> Installed<'_, Nor> {
     let swap = planned(device);
     let mut page = [0_u8; PAGE];
     let Ok(installed) = swap
         .prepare(device)
-        .and_then(|prepared| prepared.stage(device, &mut page))
-        .and_then(|staged| staged.payload_barrier(device))
-        .and_then(|sealable| sealable.commit(device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
@@ -399,6 +400,10 @@ fn perform(device: &mut Nor) -> Installed {
 fn a_swap_installs_the_next_run_in_the_other_bank_and_makes_it_authoritative() {
     let mut device = booted();
     let installed = perform(&mut device);
+    // Captured before `device` is read directly: issue #84 has `installed` hold its device
+    // for as long as it lives, so the two borrows cannot overlap.
+    let installed_authority = installed.authority();
+    drop(installed);
 
     assert_eq!(
         authority(&mut device),
@@ -409,7 +414,7 @@ fn a_swap_installs_the_next_run_in_the_other_bank_and_makes_it_authoritative() {
         "\u{a7}10: the bank with the highest valid generation seal is authoritative"
     );
     assert_eq!(
-        installed.authority(),
+        installed_authority,
         Authority::Bank {
             id: BankId::B,
             generation: NEXT
@@ -434,10 +439,13 @@ fn the_seven_steps_reach_the_device_in_the_order_the_protocol_states() {
     let retiring = layout().bank(BankId::A);
 
     let installed = perform(&mut device);
-    let through_six = device.ops.clone();
-    let Ok(()) = installed.reclaim(&mut device) else {
+    let Ok(()) = installed.reclaim() else {
         unreachable!("a device that accepts every mutation accepts an erase")
     };
+    // `installed` borrowed `device` until `reclaim` consumed it (issue #84), so the ops
+    // through step 6 are read back as a prefix of the whole log rather than captured
+    // mid-protocol — step 7 is known to be exactly the last two entries by construction.
+    let through_six = device.ops[..device.ops.len() - 2].to_vec();
 
     assert_eq!(
         through_six,
@@ -494,15 +502,24 @@ fn header_bytes() -> u32 {
 fn the_old_run_survives_until_the_lazy_erase_and_is_never_authoritative_after_it() {
     // §10 step 7 is *lazy*: the old bank is still on media, still sealed, and still lower
     // than the new one, right up to the erase — and after it the device has one bank.
-    let mut device = booted();
-    let installed = perform(&mut device);
-
+    //
+    // Two devices rather than one, since issue #84: `Installed` borrows its device for as
+    // long as it is alive, so a caller cannot hold it *and* read the media directly to see
+    // what it has not yet erased. `booted()` is deterministic, so a second one run to the
+    // same point and then dropped without reclaiming is the "right up to the erase" half —
+    // `the_seven_steps_reach_the_device_in_the_order_the_protocol_states` is what proves no
+    // erase of the retiring bank happens before step 7 on the very same sequence.
+    let mut not_yet_reclaimed = booted();
+    drop(perform(&mut not_yet_reclaimed));
     assert_eq!(
-        sealed_generation(&mut device, BankId::A),
+        sealed_generation(&mut not_yet_reclaimed, BankId::A),
         Some(CURRENT),
         "the retired bank is intact until it is reclaimed"
     );
-    let Ok(()) = installed.reclaim(&mut device) else {
+
+    let mut device = booted();
+    let installed = perform(&mut device);
+    let Ok(()) = installed.reclaim() else {
         unreachable!("a device that accepts every mutation accepts an erase")
     };
 
@@ -539,7 +556,7 @@ fn the_installed_journal_is_erased_and_takes_the_new_runs_opening_record() {
 
     let mut page = [0_u8; PAGE];
     let mut recovery = installed.recovery();
-    while recovery.next(&mut device, &mut page).is_some() {}
+    while recovery.next(&mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: 0 }));
 
     let Some(mut journal) = Journal::after(recovery) else {
@@ -553,8 +570,8 @@ fn the_installed_journal_is_erased_and_takes_the_new_runs_opening_record() {
     let mut staging = [0_u8; PAGE];
     let Ok(_written) = journal
         .stage(&mut device, &opening, &mut staging)
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(waymaker_flash::Staged::payload_barrier)
+        .and_then(waymaker_flash::Sealable::commit)
     else {
         unreachable!("an erased journal takes its run's opening record")
     };
@@ -577,8 +594,8 @@ fn recovery_never_combines_the_footprints_of_the_two_runs() {
     };
     let Ok(_written) = old
         .stage(&mut device, &record, &mut page)
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(waymaker_flash::Staged::payload_barrier)
+        .and_then(waymaker_flash::Sealable::commit)
     else {
         unreachable!("an erased journal takes a record")
     };
@@ -592,19 +609,22 @@ fn recovery_never_combines_the_footprints_of_the_two_runs() {
             generation: CURRENT,
         },
         RUN,
-        Retired::Journal(old),
+        Retired::<'_, Nor>::Journal(old),
         next_header(),
     ) else {
         unreachable!("this device is on a run that can roll over")
     };
     let Ok(installed) = swap
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
+    // Captured before `device` is read directly: issue #84 has `installed` hold its device
+    // for as long as it lives, and `recovery()` consumes it to hand that borrow onward.
+    let installed_region = installed.recovery().region();
 
     let Authority::Bank { id, generation } = authority(&mut device) else {
         unreachable!("a swapped device has exactly one authoritative bank")
@@ -618,8 +638,8 @@ fn recovery_never_combines_the_footprints_of_the_two_runs() {
 
     // And the journal behind that header is the new run's, which is empty: the old run's
     // record is in the bank the reader did not boot.
-    let mut recovery = installed.recovery();
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(installed_region, &mut device);
+    while recovery.next(&mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: 0 }));
 }
 
@@ -661,10 +681,10 @@ fn a_run_refused_for_capacity_rolls_over_with_the_writer_it_was_refused_on() {
         };
         match writer
             .stage(&mut device, &record, &mut page)
-            .map(|staged| staged.payload_barrier(&mut device))
+            .map(waymaker_flash::Staged::payload_barrier)
         {
             Ok(Ok(sealable)) => {
-                let Ok(_written) = sealable.commit(&mut device) else {
+                let Ok(_written) = sealable.commit() else {
                     unreachable!("this device accepts every mutation")
                 };
                 committed += 1;
@@ -695,19 +715,23 @@ fn a_run_refused_for_capacity_rolls_over_with_the_writer_it_was_refused_on() {
             generation: CURRENT,
         },
         RUN,
-        Retired::Reserved(writer),
+        Retired::<'_, Nor>::Reserved(writer),
         next_header(),
     ) else {
         unreachable!("a run at its reserve boundary is a run that can roll over")
     };
     let Ok(installed) = swap
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
+    // Captured before `device` is read directly: issue #84 has `installed` hold its device
+    // for as long as it lives.
+    let installed_run = installed.allocator().run();
+    drop(installed);
 
     assert_eq!(
         authority(&mut device),
@@ -717,7 +741,7 @@ fn a_run_refused_for_capacity_rolls_over_with_the_writer_it_was_refused_on() {
         },
         "the run that ran out of room is the one that was replaced"
     );
-    assert_eq!(installed.allocator().run(), NEXT_RUN);
+    assert_eq!(installed_run, NEXT_RUN);
 }
 
 #[test]
@@ -765,7 +789,7 @@ fn a_swap_refuses_to_install_the_run_it_is_replacing() {
     // id on both sides, the old run's committed effect ids and the new run's are the same
     // values, and nothing on the device can tell a redelivery from a fresh effect.
     let mut device = booted();
-    let retired = Retired::Journal(current_journal(&mut device));
+    let retired: Retired<'_, Nor> = Retired::Journal(current_journal(&mut device));
     let same_run = BankHeader {
         run: RUN,
         ..next_header()
@@ -795,7 +819,7 @@ fn a_swap_refuses_to_install_the_run_it_is_replacing() {
 fn refuses(
     at: Authority,
     run: RunId,
-    retired: impl FnOnce(&mut Nor) -> Retired,
+    retired: impl for<'a> FnOnce(&'a mut Nor) -> Retired<'a, Nor>,
     next: BankHeader<'_>,
     expected: SwapError,
 ) {
@@ -867,7 +891,7 @@ fn a_swap_refuses_a_reader_that_is_not_the_bank_it_is_retiring() {
             generation: CURRENT,
         },
         RUN,
-        |_device| Retired::Recovery(Recovery::new(spare)),
+        |device| Retired::Recovery(Recovery::new(spare, device)),
         next_header(),
         SwapError::NotTheActiveBank,
     );
@@ -890,7 +914,7 @@ fn a_swap_refuses_a_reader_validated_against_another_device() {
             generation: CURRENT,
         },
         RUN,
-        |_device| Retired::Recovery(Recovery::new(foreign)),
+        |device| Retired::Recovery(Recovery::new(foreign, device)),
         next_header(),
         SwapError::WrongDevice,
     );
@@ -905,6 +929,7 @@ fn accepted_ceiling() -> usize {
     let mut input = layout().bank(BankId::B).max_run_input_bytes(align());
     loop {
         let bytes = std::vec![0x3C_u8; input];
+        let mut device = Nor::new(geometry());
         let planned = Swap::beginning(
             layout(),
             Authority::Bank {
@@ -912,7 +937,7 @@ fn accepted_ceiling() -> usize {
                 generation: CURRENT,
             },
             RUN,
-            Retired::Recovery(Recovery::new(current_region())),
+            Retired::Recovery(Recovery::new(current_region(), &mut device)),
             BankHeader {
                 input: &bytes,
                 ..next_header()
@@ -1010,7 +1035,7 @@ fn an_installed_run_can_write_the_opening_record_it_must_write() {
     let mut device = booted();
     let at_ceiling = std::vec![0x3C_u8; accepted_ceiling()];
 
-    let retired = Retired::Journal(current_journal(&mut device));
+    let retired = Retired::<'_, Nor>::Journal(current_journal(&mut device));
     let planned = Swap::beginning(
         layout(),
         Authority::Bank {
@@ -1032,15 +1057,15 @@ fn an_installed_run_can_write_the_opening_record_it_must_write() {
     let mut page = std::vec![0_u8; 8192];
     let Ok(installed) = swap
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
 
     let mut recovery = installed.recovery();
-    while recovery.next(&mut device, &mut page).is_some() {}
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased journal has an append point")
     };
@@ -1051,8 +1076,8 @@ fn an_installed_run_can_write_the_opening_record_it_must_write() {
     };
     let outcome = journal
         .stage(&mut device, &opening, &mut page)
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device));
+        .and_then(waymaker_flash::Staged::payload_barrier)
+        .and_then(waymaker_flash::Sealable::commit);
     assert!(
         outcome.is_ok(),
         "the swap installed a run that can never write its opening record: {outcome:?}"
@@ -1086,64 +1111,30 @@ fn a_swap_refuses_a_header_written_at_another_granularity() {
 // What a swap refuses once it has started
 // ---------------------------------------------------------------------------------------
 
+// Issue #24's review found that a barrier taken on some *other* device orders nothing on
+// this one, and issue #84 is what closed it for four of the five steps: `stage`,
+// `payload_barrier`, `commit` and `reclaim` no longer take a `storage` argument at all, so a
+// caller cannot even write the call this test used to make those four refusals fail. The
+// module documentation's `a_second_device_has_no_call_to_make` compile-time doctest is what
+// proves that now.
+
 #[test]
-fn every_step_refuses_a_device_the_swap_was_not_planned_for() {
-    // The lesson issue #24's review left: a barrier taken on some *other* device orders
-    // nothing on this one, and an erase or a program aimed at an offset proved legal on
-    // another device is a write outside any bank that device has. So every step compares,
-    // not only the first.
+fn a_swap_refuses_a_device_it_was_not_prepared_with() {
+    // `prepare` is the one step left that takes `storage` at all — every later step carries
+    // the same borrow onward — so it is the one place this refusal can still happen.
     let Ok(other_geometry) = Geometry::new(16384, 4096, 8, 1) else {
         unreachable!("16384 is four whole 4096-byte blocks")
     };
 
     let mut device = booted();
     let mut elsewhere = Nor::new(other_geometry);
-    let mut page = [0_u8; PAGE];
 
     let swap = planned(&mut device);
     assert_eq!(
         swap.prepare(&mut elsewhere).err(),
         Some(SwapStepError::WrongDevice)
     );
-
-    let Ok(prepared) = planned(&mut device).prepare(&mut device) else {
-        unreachable!("this device accepts an erase")
-    };
-    let Err(refusal) = prepared.stage(&mut elsewhere, &mut page) else {
-        unreachable!("a swap must not program a header on another device")
-    };
-    assert_eq!(refusal, SwapStepError::WrongDevice);
-
-    let Ok(staged) = planned(&mut device)
-        .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-    else {
-        unreachable!("this device accepts a header")
-    };
-    assert_eq!(
-        staged.payload_barrier(&mut elsewhere).err(),
-        Some(SwapStepError::WrongDevice)
-    );
-
-    let mut second = [0_u8; PAGE];
-    let Ok(sealable) = planned(&mut device)
-        .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut second))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-    else {
-        unreachable!("this device accepts a payload barrier")
-    };
-    assert_eq!(
-        sealable.commit(&mut elsewhere).err(),
-        Some(SwapStepError::WrongDevice)
-    );
-
-    let installed = perform(&mut device);
-    assert_eq!(
-        installed.reclaim(&mut elsewhere).err(),
-        Some(SwapStepError::WrongDevice),
-        "an erase aimed at a bank another device does not have is the worst of the five"
-    );
+    assert!(elsewhere.ops.is_empty(), "a refusal must not touch media");
 }
 
 #[test]
@@ -1154,7 +1145,7 @@ fn a_swap_refuses_a_page_too_small_for_the_next_runs_header() {
         unreachable!("this device accepts an erase")
     };
 
-    let Err(refusal) = prepared.stage(&mut device, &mut crumb) else {
+    let Err(refusal) = prepared.stage(&mut crumb) else {
         unreachable!("a header does not fit eight bytes")
     };
     assert!(
@@ -1179,9 +1170,9 @@ fn fails_at(accepts: usize) {
     let mut page = [0_u8; PAGE];
     let outcome = planned(&mut device)
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device));
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit);
     assert!(
         matches!(outcome, Err(SwapStepError::Storage(_))),
         "the device refused mutation {accepts} and the swap carried on"
@@ -1224,9 +1215,9 @@ fn a_swap_that_fails_at_its_commit_barrier_says_so() {
 
     let outcome = planned(&mut device)
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device));
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit);
 
     assert!(
         matches!(outcome, Err(SwapStepError::Storage(_))),
@@ -1294,8 +1285,11 @@ impl IntegrityCheck for Other {
 }
 
 /// The whole protocol, steps 2 to 6, sealed with [`Other`] rather than the shipped check.
-fn perform_with_other(device: &mut Nor) -> Installed<Other> {
-    let retired = Retired::Recovery(Recovery::<Other>::with_integrity(current_region()));
+fn perform_with_other(device: &mut Nor) -> Installed<'_, Nor, Other> {
+    let retired = Retired::Recovery(Recovery::<Nor, Other>::with_integrity(
+        current_region(),
+        device,
+    ));
     let Ok(swap) = Swap::<Other>::beginning(
         layout(),
         Authority::Bank {
@@ -1311,9 +1305,9 @@ fn perform_with_other(device: &mut Nor) -> Installed<Other> {
     let mut page = [0_u8; PAGE];
     let Ok(installed) = swap
         .prepare(device)
-        .and_then(|prepared| prepared.stage(device, &mut page))
-        .and_then(|staged| staged.payload_barrier(device))
-        .and_then(|sealable| sealable.commit(device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation succeeds")
     };
@@ -1329,7 +1323,8 @@ fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
     // with `Other`. `Recovery::new` would pick a different, wrong default.
     let mut page = [0_u8; PAGE];
     let mut recovery = installed.recovery();
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let region = recovery.region();
+    while recovery.next(&mut page).is_some() {}
     assert_eq!(
         recovery.ending(),
         Some(Ending::Clean { append_at: 0 }),
@@ -1345,29 +1340,27 @@ fn a_completed_swaps_recovery_reads_back_the_check_it_was_sealed_with() {
     };
     let Ok(_written) = journal
         .stage(&mut device, &record, &mut page)
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(waymaker_flash::Staged::payload_barrier)
+        .and_then(waymaker_flash::Sealable::commit)
     else {
         unreachable!("a swap on a device that accepts every mutation accepts an append")
     };
 
-    // Read back with the same handoff. The record round-trips under the check that sealed
-    // it.
-    let mut readback = installed.recovery();
+    // Read back with the same check, over the region `installed.recovery()` already
+    // validated: `installed` is gone, so this is `Recovery::with_integrity` given the
+    // region back rather than `installed.recovery()` called a second time.
+    let mut readback = Recovery::<Nor, Other>::with_integrity(region, &mut device);
     assert_eq!(
-        readback.next(&mut device, &mut page),
+        readback.next(&mut page),
         Some(Ok(record)),
         "a record sealed with `Other` reads back under `Other`"
     );
 
     // Issue #85's trap: `Recovery::new` defaults to `Catalogued`. It cannot verify a
-    // journal `Other` sealed. `Installed` has no bare `JournalRegion` accessor any more, so
-    // reaching `Recovery::new` at all now takes a deliberate second step: pulling the region
-    // back out of a `Recovery` already keyed correctly. This shows what happens if a caller
-    // does that anyway.
-    let mut wrong = Recovery::new(installed.recovery().region());
+    // journal `Other` sealed.
+    let mut wrong = Recovery::new(region, &mut device);
     assert_eq!(
-        wrong.next(&mut device, &mut page),
+        wrong.next(&mut page),
         Some(Err(RecoveryError::Decode(DecodeError::IntegrityFailed))),
         "the shipped check cannot read a journal sealed with another one"
     );

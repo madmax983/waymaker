@@ -80,10 +80,10 @@ fn boot(
 
 /// The kind byte of every record the journal holds.
 fn kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -239,12 +239,12 @@ fn flip_the_clock_kind(device: &mut Device) {
     let Some(align) = ProgramAlign::new(4) else {
         unreachable!("4 is a power of two")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut *device);
     let mut page = [0_u8; 256];
     let at;
     let flipped = loop {
         let offset = recovery.offset();
-        let Some(step) = recovery.next(device, &mut page) else {
+        let Some(step) = recovery.next(&mut page) else {
             unreachable!("the journal holds a scheduled timer")
         };
         let Ok(record) = step else {
@@ -322,10 +322,10 @@ fn a_timer_and_an_activity_share_one_sequence_space() {
     let mut world = world_at(DEADLINE + 1);
     assert!(boot(&mut device, &mut world).is_ok());
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut sequences = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journal this test wrote is legal")
         };

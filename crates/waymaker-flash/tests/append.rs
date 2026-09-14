@@ -164,9 +164,9 @@ const fn record(seq: u32) -> RecordRef<'static> {
 /// A recovery of `region` on `device`, run to its end.
 fn recover(device: &mut Nor, region: JournalRegion) -> (Vec<u32>, Option<Ending>) {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
+    let mut recovery = Recovery::new(region, device);
     let mut seen = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         match step {
             Ok(RecordRef::EffectCompleted { seq, .. }) => seen.push(seq.0),
             Ok(_) => seen.push(u32::MAX),
@@ -179,8 +179,8 @@ fn recover(device: &mut Nor, region: JournalRegion) -> (Vec<u32>, Option<Ending>
 /// A writer positioned at the start of an erased region.
 fn opened(device: &mut Nor, region: JournalRegion) -> Journal {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
-    while recovery.next(device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region, device);
+    while recovery.next(&mut page).is_some() {}
     let Some(journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly at its first byte")
     };
@@ -196,8 +196,8 @@ fn commit(
     let mut page = [0_u8; PAGE];
     journal
         .stage(device, record, &mut page)?
-        .payload_barrier(device)?
-        .commit(device)
+        .payload_barrier()?
+        .commit()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -260,8 +260,8 @@ fn the_seal_is_one_program_unit_wide_at_every_granularity() {
         };
         let mut device = Nor::new(geometry);
         let mut page = [0_u8; PAGE];
-        let mut recovery = Recovery::new(region);
-        while recovery.next(&mut device, &mut page).is_some() {}
+        let mut recovery = Recovery::new(region, &mut device);
+        while recovery.next(&mut page).is_some() {}
         let Some(mut journal) = Journal::after(recovery) else {
             unreachable!("an erased region ends cleanly")
         };
@@ -270,8 +270,8 @@ fn the_seal_is_one_program_unit_wide_at_every_granularity() {
         let mut staging = [0_u8; PAGE];
         journal
             .stage(&mut device, &record(0), &mut staging)
-            .and_then(|staged| staged.payload_barrier(&mut device))
-            .and_then(|sealable| sealable.commit(&mut device))
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
             .expect("a legal append");
 
         let programs = device.programs();
@@ -315,8 +315,8 @@ fn a_writer_resumes_where_the_last_boot_left_off() {
     let ended_at = first.offset();
 
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut resumed) = Journal::after(recovery) else {
         unreachable!("a journal of committed records ends cleanly")
     };
@@ -382,7 +382,7 @@ fn amplification_counts_what_the_device_was_asked_for_and_not_what_it_agreed_to(
         second
             .stage(&mut fresh, &record(0), &mut staging)
             .expect("a legal stage")
-            .payload_barrier(&mut fresh)
+            .payload_barrier()
             .is_err()
     );
     assert_eq!(second.amplification().barriers(), 1);
@@ -406,8 +406,8 @@ fn a_seal_wider_than_the_devices_program_unit_is_written_and_read_back() {
     };
     let mut device = Nor::new(geometry);
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly")
     };
@@ -417,8 +417,8 @@ fn a_seal_wider_than_the_devices_program_unit_is_written_and_read_back() {
         let mut staging = [0_u8; PAGE];
         journal
             .stage(&mut device, &record(seq), &mut staging)
-            .and_then(|staged| staged.payload_barrier(&mut device))
-            .and_then(|sealable| sealable.commit(&mut device))
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
             .expect("a legal append");
     }
 
@@ -429,9 +429,9 @@ fn a_seal_wider_than_the_devices_program_unit_is_written_and_read_back() {
         "the seal is one journal unit — four device program units — and not one of those"
     );
 
-    let mut reader = Recovery::new(region);
+    let mut reader = Recovery::new(region, &mut device);
     let mut seen = Vec::new();
-    while let Some(step) = reader.next(&mut device, &mut page) {
+    while let Some(step) = reader.next(&mut page) {
         match step {
             Ok(RecordRef::EffectCompleted { seq, .. }) => seen.push(seq.0),
             other => unreachable!("{other:?}"),
@@ -454,7 +454,7 @@ fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
     let region = region(256);
 
     // A scan that has not finished has no append point either.
-    let unfinished = Recovery::new(region);
+    let unfinished = Recovery::new(region, &mut device);
     assert!(Journal::after(unfinished).is_none());
 
     // A journal whose tail is a frame nobody sealed.
@@ -465,8 +465,8 @@ fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
         .expect("a legal stage");
     drop(staged);
     // ... and the power went. The body is on media and the seal is not.
-    let mut recovery = Recovery::new(region);
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Unsealed { at: 0 }));
     assert!(
         Journal::after(recovery).is_none(),
@@ -474,44 +474,13 @@ fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
     );
 }
 
-#[test]
-fn every_step_refuses_a_device_the_region_was_not_validated_against() {
-    // `stage` is not the only step that touches media. A payload barrier taken on some other
-    // device orders nothing on this one, so the frame would be sealed without ever having
-    // been made durable; and a commit taken elsewhere programs a seal at an offset that
-    // device never validated. Review of this change found both.
-    let Ok(elsewhere) = Geometry::new(8192, 4096, 16, 1) else {
-        unreachable!("a legal geometry")
-    };
-
-    for step in 0..2_usize {
-        let mut device = Nor::new(geometry());
-        let region = region(256);
-        let mut journal = opened(&mut device, region);
-        let mut other = Nor::new(elsewhere);
-        let mut page = [0_u8; PAGE];
-
-        let staged = journal
-            .stage(&mut device, &record(0), &mut page)
-            .expect("a legal stage");
-        if step == 0 {
-            assert_eq!(
-                staged.payload_barrier(&mut other).err(),
-                Some(AppendError::WrongDevice)
-            );
-        } else {
-            let sealable = staged
-                .payload_barrier(&mut device)
-                .expect("the payload barrier holds");
-            assert_eq!(
-                sealable.commit(&mut other).err(),
-                Some(AppendError::WrongDevice)
-            );
-        }
-        assert!(other.ops.is_empty(), "a refusal must not touch media");
-        assert_eq!(journal.offset(), 0);
-    }
-}
+// Issue #24's review found that a payload barrier or a commit taken on some other device
+// orders or programs nothing on this one, and issue #84 is what closed it: `payload_barrier`
+// and `commit` no longer take a `storage` argument at all, so a caller cannot even write the
+// call this test used to make a runtime refusal fail. The module documentation's
+// `a_second_device_has_no_call_to_make` compile-time doctest is what proves that now, and
+// `a_writer_handed_another_device_is_refused_before_a_byte_moves` below is what still holds
+// `Journal::stage` — the one step left that takes `storage` at all — to the refusal.
 
 #[test]
 fn a_record_that_does_not_fit_is_refused_before_a_byte_moves() {
@@ -590,7 +559,7 @@ fn a_payload_barrier_that_fails_leaves_nothing_that_can_be_sealed() {
         .stage(&mut device, &record(0), &mut page)
         .expect("a legal stage");
     assert_eq!(
-        staged.payload_barrier(&mut device).err(),
+        staged.payload_barrier().err(),
         Some(AppendError::Storage(GeometryError::OutOfBounds))
     );
 
@@ -613,10 +582,10 @@ fn a_commit_barrier_that_fails_does_not_advance_the_writer() {
     let sealable = journal
         .stage(&mut device, &record(0), &mut page)
         .expect("a legal stage")
-        .payload_barrier(&mut device)
+        .payload_barrier()
         .expect("the payload barrier holds");
     assert_eq!(
-        sealable.commit(&mut device).err(),
+        sealable.commit().err(),
         Some(AppendError::Storage(GeometryError::OutOfBounds))
     );
     assert_eq!(
@@ -686,7 +655,7 @@ fn a_failed_step_ends_the_journal_whichever_step_it_was() {
                 let outcome = journal
                     .stage(&mut device, &record(0), &mut page)
                     .expect("a legal stage")
-                    .payload_barrier(&mut device);
+                    .payload_barrier();
                 assert!(outcome.is_err(), "the payload barrier was refused");
                 device.fail_barrier_at = None;
             }
@@ -695,9 +664,9 @@ fn a_failed_step_ends_the_journal_whichever_step_it_was() {
                 let outcome = journal
                     .stage(&mut device, &record(0), &mut page)
                     .expect("a legal stage")
-                    .payload_barrier(&mut device)
+                    .payload_barrier()
                     .expect("the payload barrier holds")
-                    .commit(&mut device);
+                    .commit();
                 assert!(outcome.is_err(), "the commit barrier was refused");
                 device.fail_barrier_at = None;
             }
