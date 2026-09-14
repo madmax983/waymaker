@@ -2887,11 +2887,14 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
     }
 }
 
-/// `local`'s own name and declared type, when it is a plain `let NAME: TYPE = EXPR;` with no
-/// tuple and no `@` sub-pattern — `None` when a binding carries no type ascription at all,
-/// or ascribes anything but a single, bare name, which [`block_let_exprs`]'s own
-/// `destructured_binding` accepts (`Pat::Type` is optional there, and a tuple or `@` pattern
-/// is not) but this cannot answer a width for.
+/// `local`'s own name and declared type, when it binds a single, bare name with no tuple and
+/// no `@` sub-pattern — `None` for anything else, which [`block_let_exprs`]'s own
+/// `destructured_binding` accepts (a tuple or `@` pattern among them) but this cannot answer
+/// a width for. The type itself comes from an explicit `let NAME: TYPE = EXPR;` ascription
+/// when `local` carries one, and otherwise from `init`'s own initializer expression — a
+/// suffixed literal's suffix or a cast's destination type, the identical fallback
+/// [`expr_declared_width`] already gives an arm-bound name matched against such an
+/// expression, read here for a `let`-bound one instead.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let q: u8 = 255; !q };` names an operand
 /// [`evaluate_block`]'s own `local_resolve_width`/`block_resolve_width` closures declined
@@ -2913,17 +2916,40 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
 /// statement executes, so a read before the shadow sees the old width and a read after it
 /// sees the new one — the identical ordering fix already applied to *values*, extended to
 /// the type metadata a value's own arithmetic is read against.
-fn stmt_let_type(local: &syn::Local) -> Option<(String, String)> {
-    let syn::Pat::Type(pat_type) = &local.pat else {
-        return None;
+///
+/// Codex's next finding after that: `let mut x = 128u8; x <<= 1; ..` names no ascription at
+/// all, only a suffixed initializer — this function answered `None` for it, so
+/// `apply_compound_assignment` folded the shift with no declared type, which
+/// [`plain_assign_operator_text`]'s own caller passes straight through as an *unsuffixed*
+/// synthetic literal. Rust performs that shift at `x`'s real, inferred width and truncates
+/// accordingly; an unsuffixed synthetic literal has no width for
+/// [`evaluate_shl_op`]/[`evaluate_shr_op`] to truncate against, so the fold produces the
+/// *untruncated* value where a suffix or an ascription would have produced the real one —
+/// wrong rather than merely unresolved, and past the finding this doc comment already
+/// records for a fully unascribed shadow, which stays `None` because nothing here can name a
+/// width for it either. `expr_declared_width` is what closes it: called on `init`'s own
+/// expression whenever `local`'s own pattern carries no ascription, so a suffixed literal or
+/// a cast still states the width `stmt_let_type` could not otherwise see.
+fn stmt_let_type(
+    local: &syn::Local,
+    init: &syn::LocalInit,
+    resolve: &Resolve<'_>,
+) -> Option<(String, String)> {
+    let (pat, ascribed) = match &local.pat {
+        syn::Pat::Type(pat_type) => (
+            pat_type.pat.as_ref(),
+            single_segment_type_name(&pat_type.ty),
+        ),
+        other => (other, None),
     };
-    let syn::Pat::Ident(ident) = pat_type.pat.as_ref() else {
+    let syn::Pat::Ident(ident) = pat else {
         return None;
     };
     if ident.subpat.is_some() {
         return None;
     }
-    single_segment_type_name(&pat_type.ty).map(|name| (ident_name(&ident.ident), name))
+    let ty = ascribed.or_else(|| expr_declared_width(&init.expr, resolve))?;
+    Some((ident_name(&ident.ident), ty))
 }
 
 /// The count of every plain `let _ = EXPR;` declared *directly* as a statement in `block` —
@@ -3845,7 +3871,7 @@ fn resolve_sequential_let(
     local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
 ) {
-    let ascribed_type = stmt_let_type(local);
+    let ascribed_type = stmt_let_type(local, init, resolve);
     let mut bound_names = Vec::new();
     for (name, expr) in destructured_binding(&local.pat, &init.expr) {
         let scoped_resolve_value = |path: &syn::Path| {
@@ -4906,8 +4932,22 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         // function, which is what lets an `else if` chain resolve without a case of its
         // own.
         syn::Expr::If(if_expr) => {
-            let condition = literal_or_const_value(&if_expr.cond, resolve)?;
             let (_, else_branch) = if_expr.else_branch.as_ref()?;
+            // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
+            // branch, whose own body reads `x` — a name only `if_expr.cond`'s own
+            // `Expr::Let` pattern binds. The generic path below folds `if_expr.cond` down
+            // to a bare `0`/`1` through the same pipeline every other condition shape
+            // uses, discarding whatever the condition bound along the way — sound for a
+            // plain boolean, which introduces no binding, and unsound the moment the
+            // condition is `Expr::Let`, which can introduce several. [`evaluate_if_let`]
+            // answers the match and the binding together, the identical two things
+            // `evaluate_match`'s own arm resolver computes for a `match` arm, and hands
+            // the chosen branch a resolver that answers for them before the generic path
+            // ever sees the condition.
+            if let syn::Expr::Let(let_expr) = strip_parens(&if_expr.cond) {
+                return evaluate_if_let(let_expr, if_expr, else_branch, resolve);
+            }
+            let condition = literal_or_const_value(&if_expr.cond, resolve)?;
             if condition == 0 {
                 literal_or_const_value(else_branch, resolve)
             } else {
@@ -5132,6 +5172,55 @@ fn expr_declared_width(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<String
         .then(|| type_name.to_string())
 }
 
+/// [`literal_or_const_value`]'s own `Expr::If`-over-`Expr::Let` half, factored out to keep
+/// that function under clippy's line count: resolves `let_expr`'s own scrutinee, selects
+/// `if_expr`'s `then` branch or `else_branch` by whether `let_expr`'s pattern matches it, and
+/// — when it does — evaluates the `then` branch with every name that pattern binds mapped to
+/// the scrutinee, the identical two-part answer [`evaluate_match`]'s own arm resolver
+/// computes for a `match` arm's pattern and body.
+fn evaluate_if_let(
+    let_expr: &syn::ExprLet,
+    if_expr: &syn::ExprIf,
+    else_branch: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let scrutinee = literal_or_const_value(&let_expr.expr, resolve)?;
+    if !match_arm_matches_constant(&let_expr.pat, scrutinee, resolve)? {
+        return literal_or_const_value(else_branch, resolve);
+    }
+    let bound = pattern_bindings(&let_expr.pat, resolve);
+    let is_bound =
+        |path: &syn::Path| -> bool { path.get_ident().is_some_and(|ident| bound.contains(&ident)) };
+    let bound_unsigned_value = !bound.is_empty() && is_definitely_unsigned(&let_expr.expr, resolve);
+    let bound_width_value = (!bound.is_empty())
+        .then(|| expr_declared_width(&let_expr.expr, resolve))
+        .flatten();
+    let bound_value = |path: &syn::Path| -> Option<i128> {
+        if is_bound(path) {
+            return Some(scrutinee);
+        }
+        (resolve.value)(path)
+    };
+    let bound_unsigned = |path: &syn::Path| -> bool {
+        if is_bound(path) {
+            return bound_unsigned_value;
+        }
+        (resolve.unsigned)(path)
+    };
+    let bound_width = |path: &syn::Path| -> Option<&str> {
+        if is_bound(path) {
+            return bound_width_value.as_deref();
+        }
+        (resolve.width)(path)
+    };
+    let let_resolve = Resolve {
+        value: &bound_value,
+        unsigned: &bound_unsigned,
+        width: &bound_width,
+    };
+    evaluate_block(&if_expr.then_branch, &let_resolve)
+}
+
 fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<i128> {
     // Codex's next-round finding: `match (0u8, 1u8) { (0, 1) => 0, _ => 100 }` names a
     // scrutinee this scan's own `i128` domain has no room for — [`literal_or_const_value`]'s
@@ -5173,25 +5262,29 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
             // unsignedness and width are computed from *that* expression once, through
             // `is_definitely_unsigned` and `expr_declared_width` exactly as any other operand
             // of that shape already would be, and handed back for the bound name alone.
-            let bound = pattern_binding(&arm.pat, resolve);
+            let bound = pattern_bindings(&arm.pat, resolve);
+            let is_bound = |path: &syn::Path| -> bool {
+                path.get_ident().is_some_and(|ident| bound.contains(&ident))
+            };
             let bound_unsigned_value =
-                bound.is_some() && is_definitely_unsigned(&expr_match.expr, resolve);
-            let bound_width_value =
-                bound.and_then(|_| expr_declared_width(&expr_match.expr, resolve));
+                !bound.is_empty() && is_definitely_unsigned(&expr_match.expr, resolve);
+            let bound_width_value = (!bound.is_empty())
+                .then(|| expr_declared_width(&expr_match.expr, resolve))
+                .flatten();
             let bound_value = |path: &syn::Path| -> Option<i128> {
-                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                if is_bound(path) {
                     return Some(scrutinee);
                 }
                 (resolve.value)(path)
             };
             let bound_unsigned = |path: &syn::Path| -> bool {
-                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                if is_bound(path) {
                     return bound_unsigned_value;
                 }
                 (resolve.unsigned)(path)
             };
             let bound_width = |path: &syn::Path| -> Option<&str> {
-                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                if is_bound(path) {
                     return bound_width_value.as_deref();
                 }
                 (resolve.width)(path)
@@ -5327,15 +5420,18 @@ fn tuple_pattern_bindings<'a>(
                 .iter()
                 .zip(values)
                 .zip(scrutinee_elems)
-                .filter_map(|((sub_pattern, value), elem_expr)| {
-                    pattern_binding(sub_pattern, resolve).map(|name| {
-                        (
-                            name,
-                            *value,
-                            is_definitely_unsigned(elem_expr, resolve),
-                            expr_declared_width(elem_expr, resolve),
-                        )
-                    })
+                .flat_map(|((sub_pattern, value), elem_expr)| {
+                    pattern_bindings(sub_pattern, resolve)
+                        .into_iter()
+                        .map(|name| {
+                            (
+                                name,
+                                *value,
+                                is_definitely_unsigned(elem_expr, resolve),
+                                expr_declared_width(elem_expr, resolve),
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect()
         }
@@ -5370,10 +5466,12 @@ fn tuple_pattern_matches_constant(
     }
 }
 
-/// The identifier `pattern` binds when it matches a value, for the same narrow set of
-/// shapes [`match_arm_matches_constant`] recognises — `None` when the pattern introduces
-/// no binding at all (a wildcard, a literal, a range) or when the shape is not one this
-/// scan supports.
+/// Every identifier `pattern` binds when it matches a value, for the same narrow set of
+/// shapes [`match_arm_matches_constant`] recognises — empty when the pattern introduces no
+/// binding at all (a wildcard, a literal, a range) or when the shape is not one this scan
+/// supports. Every name returned binds to the identical value `pattern` as a whole matched,
+/// unlike [`destructured_binding`]'s own per-name expressions for a `let`'s tuple pattern,
+/// because none of the shapes here destructures a value into parts.
 ///
 /// Codex's finding: `match 0u8 { x @ 0 => x, _ => 100 }` — a constant initializer that
 /// returns the value its own selected arm bound — confirmed the arm matched through
@@ -5387,26 +5485,43 @@ fn tuple_pattern_matches_constant(
 /// [`match_arm_matches_constant`]'s own bare-`Pat::Ident` arm draws between a value match
 /// and an irrefutable catch-all — since a constant's own name is not a fresh binding. An
 /// or-pattern's alternatives are required by `rustc` to bind the same names, so the first
-/// alternative that names one speaks for all of them.
-fn pattern_binding<'a>(pattern: &'a syn::Pat, resolve: &Resolve<'_>) -> Option<&'a syn::Ident> {
+/// alternative that names any speaks for all of them.
+///
+/// Codex's next-round finding: `match 0u8 { _outer @ inner => inner }` binds *two* names —
+/// `_outer`, from the at-pattern itself, and `inner`, from the sub-pattern an at-pattern's
+/// own bare-identifier arm returned unconditionally without ever looking inside — and this
+/// function used to answer only the first of them, `Option`-shaped rather than list-shaped,
+/// the same gap [`destructured_binding`] closed for a `let`'s own pattern before this did
+/// for a match arm's. `_outer @ inner` now recurses into the sub-pattern exactly as
+/// `destructured_binding`'s own `Pat::Ident` case already does, and every caller reads a
+/// list rather than a single name.
+fn pattern_bindings<'a>(pattern: &'a syn::Pat, resolve: &Resolve<'_>) -> Vec<&'a syn::Ident> {
     match pattern {
         syn::Pat::Ident(named) if named.by_ref.is_none() => {
-            if named.subpat.is_some() {
-                return Some(&named.ident);
+            if let Some((_, subpat)) = &named.subpat {
+                let mut bound = vec![&named.ident];
+                bound.extend(pattern_bindings(subpat, resolve));
+                bound
+            } else if (resolve.value)(&syn::Path::from(named.ident.clone())).is_none() {
+                vec![&named.ident]
+            } else {
+                Vec::new()
             }
-            (resolve.value)(&syn::Path::from(named.ident.clone()))
-                .is_none()
-                .then_some(&named.ident)
         }
-        syn::Pat::Paren(paren) => pattern_binding(&paren.pat, resolve),
-        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => {
-            pattern_binding(tuple.elems.first()?, resolve)
-        }
+        syn::Pat::Paren(paren) => pattern_bindings(&paren.pat, resolve),
+        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => tuple
+            .elems
+            .first()
+            .map_or_else(Vec::new, |inner| pattern_bindings(inner, resolve)),
         syn::Pat::Or(or_pattern) => or_pattern
             .cases
             .iter()
-            .find_map(|case| pattern_binding(case, resolve)),
-        _ => None,
+            .find_map(|case| {
+                let names = pattern_bindings(case, resolve);
+                (!names.is_empty()).then_some(names)
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

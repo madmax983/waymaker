@@ -21684,6 +21684,118 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_an_if_let_bound_then_branch_is_reported() {
+        // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
+        // branch, whose own body reads `x` — a name only the condition's own `Expr::Let`
+        // pattern binds — but the `Expr::If` case evaluated the chosen branch with only the
+        // outer resolver, where that binding does not exist, so `x` stayed unresolved.
+        // Verified against real rustc: `if let x @ 0 = 0u8 { x } else { 100 }` is `0`, `if
+        // let x @ 1 = 1u8 { x } else { 100 }` is `1`, and so on.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if let x @ {n} = {n}u8 {{ x }} else {{ 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_if_let_bound_then_branch(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_binding_a_nested_at_pattern_name_is_reported() {
+        // Codex's finding: `match 0u8 { _outer @ inner => inner }` binds *two* names —
+        // `_outer` from the at-pattern itself, and `inner` from its sub-pattern, a bare
+        // identifier that is itself an irrefutable binding — and `pattern_binding` answered
+        // only the first, `Option`-shaped rather than list-shaped, so a body naming the
+        // *inner* binding (as this one does) stayed unresolved. Verified against real rustc:
+        // `match 0u8 { _outer @ inner => inner }` is `0`, `match 1u8 { .. }` is `1`, and so
+        // on, so every constant built this way should resolve to its own scrutinee.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match {n}u8 {{ _outer @ inner => inner }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_nested_at_pattern_binding(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_shift_over_a_suffixed_but_unascribed_local_is_reported()
+    {
+        // Codex's finding: `let mut x = 128u8; x <<= 1; if x == 0 { n } else { n * 10 } }`
+        // names no type *ascription* at all — only a suffixed initializer — which
+        // `stmt_let_type` answered `None` for before this fix, so
+        // `apply_compound_assignment` folded the shift with no declared type at all. An
+        // unsuffixed synthetic literal has no width to truncate against, so `128 << 1`
+        // folded to the untruncated `256` rather than the real, 8-bit-truncated `0`, and
+        // `if x == 0` took the wrong branch for every constant built this way. `128u8`
+        // truncates to exactly `0` after one left shift regardless of `n`, so every
+        // constant should resolve to `n` — the dense `0..14` sequence the outer match's
+        // patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u32 = {{ let mut x = 128u8; x <<= 1; if x == 0 {{ {n} }} \
+                 else {{ {n} * 10 }} }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_shift_over_a_suffixed_local(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_a_shift_before_a_shadowing_typed_let_is_reported() {
         // Codex's finding: `let mut x: u8 = 128 + n; x <<= 1; let x: u16 = if x < 100 { n }
         // else { 10 * n + 1 }; x` declares `x` twice with two different widths, and the
