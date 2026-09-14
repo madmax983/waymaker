@@ -143,12 +143,12 @@ jobs:
       - name: Build the synchronous driver for the firmware target
         run: cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 
-      # Issue #35's second "done when". `without-facade` deletes the two modules that name
-      # `waymaker-embassy`, so this builds the driver, §06's boundary, §07's typestate and
-      # the reference workflow with the façade edge gone. A compiler sees an import routed
-      # through `crate::facade` or a dependency renamed in a manifest; a scanner does not.
-      - name: Build the synchronous driver with the façade removed
-        run: cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+      # Issue #106's crate split: the façade bridge and design document §06's two examples
+      # live above `waymaker-drive` rather than inside it, so the step above already builds
+      # the driver with no façade edge at all. This is where `Bridge`, `poll_ota` and
+      # `poll_provisioning` are compiled for the part.
+      - name: Build the façade demo for the firmware target
+        run: cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 
       # Issue #37's codec helpers are optional, not host-only: a firmware that enables
       # `postcard` still has to link for the part.

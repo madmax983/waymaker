@@ -31,7 +31,7 @@ Ask the boundary. The driver records the answer. Every later replay gets the rec
 answer and the world is not asked again.
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_reading_of_the_world_is_recorded_rather_than_taken_again}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_reading_of_the_world_is_recorded_rather_than_taken_again}}
 ```
 
 The clock moved between the two boots. The workflow saw one reading, because the reading is

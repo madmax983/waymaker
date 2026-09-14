@@ -6833,26 +6833,21 @@ pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 
 /// The driver files that may name the façade.
 ///
-/// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
-/// fully usable through the synchronous driver. Every *other* module of `waymaker-drive` is
-/// held to naming no façade, and the list is the exemptions rather than the modules held —
-/// so a module added tomorrow is covered without anyone remembering to add a row.
-///
-/// `lib.rs` is here because a crate root declares its modules and re-exports a name from
-/// them. Its own honesty is the `drive-facadeless` build's rather than this scan's.
-pub const FACADE_DRIVER_MODULES: &[&str] = &[
-    "waymaker-drive/src/facade.rs",
-    "waymaker-drive/src/lib.rs",
-    "waymaker-drive/src/ota.rs",
-    "waymaker-drive/src/provisioning.rs",
-];
+/// Empty. Issue [#106](https://github.com/madmax983/waymaker/issues/106) moved the façade
+/// edge — `facade`, `ota` and `provisioning` — into `waymaker-facade-demo`, a crate above
+/// `waymaker-drive` rather than inside it, so no `waymaker-drive` module needs an exemption
+/// any more. The list stays rather than being deleted: it is what
+/// `check_facade_free_driver` iterates, and an empty list read by a live rule is a
+/// stronger statement than a rule with nothing to hold.
+pub const FACADE_DRIVER_MODULES: &[&str] = &[];
 
 /// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
 ///
-/// The crate itself, and the three source-level routes to it that name no crate: the two
-/// modules that hold the edge, and the type they re-export. Review of this change reached
-/// the façade with `use crate::facade::Bridge;` while a ban on the crate name alone stayed
-/// green.
+/// The façade crate, and four source-level routes to it that name no crate directly: the
+/// bridge that once held the edge, design document §06's two examples, and the type the
+/// bridge exports. `waymaker-drive` has no dependency on any of these — issue #106 — so
+/// this is a floor under a regression rather than a description of what the crate does
+/// today.
 pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
     (
         "waymaker_embassy",
@@ -6900,12 +6895,16 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 ///
 /// And **no hidden global state**: a `static` in either module is the other half of the
 /// must-not-own cell, and a façade with one is a façade two runs on a device would share.
+/// The vocabulary and static bans, and the future-set and macro bans beside them, read every
+/// file of `waymaker-facade-demo` too — `Bridge` is the one other caller of this boundary,
+/// and the must-not-own cell binds it exactly as it binds `waymaker-embassy`.
 ///
-/// The fourth half is the driver's. Every `waymaker-drive` module but the three in
-/// [`FACADE_DRIVER_MODULES`] is held to naming none of [`FACADE_FREE_VOCABULARY`], so a
-/// module added tomorrow is covered without anyone remembering a row. That is the fast half
-/// of "removing the Embassy crate leaves the protocol fully usable"; the `drive-facadeless`
-/// pipeline stage is the half a compiler decides.
+/// The fourth half is the driver's. Every `waymaker-drive` module — [`FACADE_DRIVER_MODULES`]
+/// is empty, since issue #106 moved the edge above the crate rather than exempting a file
+/// inside it — is held to naming none of [`FACADE_FREE_VOCABULARY`], so a module added
+/// tomorrow is covered without anyone remembering a row. That is the fast half of "removing
+/// the Embassy crate leaves the protocol fully usable"; `cargo metadata` saying
+/// `waymaker-drive` has no dependency on `waymaker-embassy` is the half nothing can fake.
 ///
 /// # What it cannot see
 ///
@@ -6916,6 +6915,7 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 #[must_use]
 pub fn check_ctx_facade(
     sources: &[crate::size::LayerSource],
+    facade_demo: &[crate::size::LayerSource],
     driver: &[crate::size::LayerSource],
 ) -> Vec<Violation> {
     const RULE: &str = "ctx-facade";
@@ -6944,19 +6944,29 @@ pub fn check_ctx_facade(
     // `pub static ATTEMPTS: AtomicUsize` and a `macro_rules!` expanding a tenth public
     // method into `impl Ctx` in `dispatch.rs` — one file over from the two the surface pins
     // read — and watched the gate stay green on all three.
-    for source in sources.iter().filter(|source| source.crate_name == FACADE) {
+    //
+    // `waymaker-facade-demo` reads the same way, for the same must-not-own cell: it holds
+    // `Bridge`, the one other place a caller reaches this boundary, and Codex's review of
+    // issue #106 found that the crate split moved the edge without moving this ban — a
+    // `facade.rs` naming `StableStorage` directly would have passed every check here.
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == FACADE)
+        .chain(facade_demo)
+    {
+        let subject = source.crate_name.as_str();
         let path = source.path.replace('\\', "/");
         let code = without_test_modules(&code_only(&source.contents));
         for (forbidden, why) in CTX_FORBIDDEN_VOCABULARY {
             if names_identifier(&code, forbidden) {
                 violations.push(Violation::new(
                     RULE,
-                    FACADE,
+                    subject,
                     format!("{path} names `{forbidden}`, which {why}"),
                 ));
             }
         }
-        violations.extend(check_no_hidden_state(RULE, FACADE, &path, &code));
+        violations.extend(check_no_hidden_state(RULE, subject, &path, &code));
         // And the future set, for the same reason: a fifth future whose `impl Future` lives
         // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
         // cannot see. Review of this change declared one in `dispatch.rs`.
@@ -6973,7 +6983,7 @@ pub fn check_ctx_facade(
                     if !CTX_FUTURES.contains(&future.as_str()) {
                         violations.push(Violation::new(
                             RULE,
-                            FACADE,
+                            subject,
                             format!(
                                 "{path} implements `Future` for `{future}`, which `CTX_FUTURES` \
                                  does not name: a fifth thing a workflow can `.await` is a \
@@ -6985,7 +6995,7 @@ pub fn check_ctx_facade(
             }
             Err(error) => violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} does not parse, so its `Future` implementors cannot be checked: {error}"
                 ),
@@ -6996,7 +7006,7 @@ pub fn check_ctx_facade(
         if names_identifier(&code, "macro_rules") {
             violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} declares a `macro_rules!`, which can expand a public method into \
                      a pinned `impl`, or a future's `poll`, where no pin can read it"
@@ -7456,12 +7466,14 @@ fn count_declarations(code: &str, header: &str) -> usize {
         .count()
 }
 
-/// Every `waymaker-drive` module but the three that hold the façade edge names no façade.
+/// Every `waymaker-drive` module names no façade.
 ///
 /// Discovered from the sources rather than listed, so a module added tomorrow is covered.
-/// A scanner is not the whole of this claim and does not have to be: the `drive-facadeless`
-/// pipeline stage builds the crate with `without-facade`, which a `use crate::facade::Bridge`
-/// and a dependency renamed in a manifest both fail. This is the fast, local half.
+/// A scanner is not the whole of this claim and does not have to be: `cargo metadata` says
+/// `waymaker-drive` has no dependency on `waymaker-embassy` at all, in any table, which a
+/// `use waymaker_embassy::...` or a dependency renamed in a manifest both fail to resolve.
+/// This is the fast, local half. See issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106).
 fn check_facade_free_driver(
     rule: &'static str,
     subject: &str,
@@ -7486,8 +7498,7 @@ fn check_facade_free_driver(
                     subject.to_owned(),
                     format!(
                         "{path} names `{forbidden}`, which {why}; the edge belongs in \
-                         waymaker-drive/src/facade.rs, waymaker-drive/src/ota.rs or \
-                         waymaker-drive/src/provisioning.rs"
+                         waymaker-facade-demo"
                     ),
                 ));
             }
@@ -7497,8 +7508,8 @@ fn check_facade_free_driver(
         violations.push(Violation::new(
             rule,
             subject.to_owned(),
-            "no waymaker-drive module outside the façade edge is in the workspace, so \
-             nothing says the synchronous driver still compiles with the façade removed"
+            "no waymaker-drive module is in the workspace, so nothing says the synchronous \
+             driver still compiles with the façade removed"
                 .to_owned(),
         ));
     }
@@ -11167,11 +11178,21 @@ mod deferred_answer_pins {
     fn facade_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources(path, contents),
+            &[],
             &facade_free_driver_sources("", ""),
         )
         .into_iter()
         .map(|violation| violation.detail)
         .collect()
+    }
+
+    /// A clean `waymaker-facade-demo/src/facade.rs`, with `contents` in place of it.
+    fn facade_demo_sources(contents: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-facade-demo".to_owned(),
+            path: "waymaker-facade-demo/src/facade.rs".to_owned(),
+            contents: contents.to_owned(),
+        }]
     }
 
     /// The two wiring files `dispatch-wiring` reads, with one of them replaced.
@@ -11430,6 +11451,7 @@ mod deferred_answer_pins {
     fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources("", ""),
+            &[],
             &facade_free_driver_sources(path, contents),
         )
         .into_iter()
@@ -11451,6 +11473,28 @@ mod deferred_answer_pins {
             tests_support::clean_ctx_facade()
         );
         let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("StableStorage")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_moved_bridge_is_held_to_the_same_authority_ban() {
+        // Issue #106 moved `Bridge` into `waymaker-facade-demo`; Codex's review found that
+        // the authority ban still read only `waymaker-embassy`'s files, so a `facade.rs`
+        // reaching a `StableStorage` directly would have passed every check here.
+        let module = "pub fn record(storage: &mut impl StableStorage) { let _ = storage; }\n";
+        let details: Vec<String> = check_ctx_facade(
+            &facade_sources("", ""),
+            &facade_demo_sources(module),
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect();
         assert!(
             details
                 .iter()
@@ -12062,7 +12106,7 @@ mod deferred_answer_pins {
     fn a_facade_module_that_is_gone_is_reported() {
         // Fails closed, for `timer-capability`'s reason: a pin that cannot find its file is
         // a pin that has stopped checking.
-        let details: Vec<String> = check_ctx_facade(&[], &[])
+        let details: Vec<String> = check_ctx_facade(&[], &[], &[])
             .into_iter()
             .map(|violation| violation.detail)
             .collect();
@@ -12079,7 +12123,7 @@ mod deferred_answer_pins {
     #[test]
     fn a_driver_module_that_names_the_facade_is_reported() {
         // Issue #35's second "done when": removing the façade must leave the protocol
-        // usable, so the edge belongs in the two files that exist to hold it.
+        // usable, so the edge belongs in `waymaker-facade-demo` and not here.
         let module = "//! A driver module.\nuse waymaker_embassy::Journal;\n";
         let details = facade_driver_details("waymaker-drive/src/drive.rs", module);
         assert!(
