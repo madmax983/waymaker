@@ -7195,6 +7195,43 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_id_hidden_behind_a_quoted_close_tag_inside_an_intervening_tag_does_not_count() {
+        // Codex, pull request #138, round 39, finding 1: `find_closing_tag`'s
+        // block-level search for a non-rendering element's own close did a raw
+        // substring search for `</tag`, blind to whether that text sat inside a
+        // *different*, intervening tag's own quoted attribute value.
+        // `<span title="</template>">...</span>` written inside an open `<template>`
+        // has a `title` attribute whose value happens to be the literal text
+        // `</template>` — legal HTML, and no more a real close than any other quoted
+        // string — but the raw search matched it anyway, popping the tracked state
+        // early and exposing everything the `<span>` itself hides as though the
+        // template had already ended. Verified via a throwaway `pulldown-cmark` probe
+        // that this source is one `HtmlBlock` of three `Event::Html` lines.
+        // `find_closing_tag` now tokenizes the line tag by tag (the same fix
+        // `find_any_tag` already got in round 36), so a spelling trapped inside an
+        // unrelated tag's own quotes can never stand in for the real close.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<span title=\"</template>\">{} {}</span>\n</template>\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == sixth.id),
+            "a decision id hidden behind a quoted close tag inside an intervening tag \
+             still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_tag_spelling_inside_another_tags_quoted_attribute_still_counts() {
         // Codex, pull request #138, round 38, finding 1: `opens_non_rendering_element`
         // searched a whole self-contained `Event::InlineHtml` construct for a tag
@@ -7227,6 +7264,38 @@ mod tests {
             !violations.iter().any(|v| v.subject == fifth.id),
             "a decision after a tag spelling inside another tag's quoted attribute was \
              still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_adjacent_block_level_tags_does_not_count() {
+        // Codex, pull request #138, round 39, finding 3: a block tag's own markup was
+        // excluded from `visible_html_ranges`'s output with nothing between it and
+        // neighboring text, so the reader-visible line break two adjacent block
+        // elements force — `<div>head</div><div>line</div>` renders as two separate
+        // lines, `head` and `line`, never one running word — was not preserved at all,
+        // fusing back into the literal contiguous run `headline` a `.contains` scan
+        // could match. A block tag (any of `HTML_BLOCK_TAG_NAMES`) now leaves a real
+        // line break behind when its markup is stripped; an inline tag still leaves
+        // none.
+        let mut inputs = clean_inputs(RULES);
+        let seventh = SETTLED_DECISIONS[6];
+        let (first_half, second_half) = seventh.id.split_at(seventh.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", seventh.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{first_half}</div><div>{second_half} {}</div>\n",
+                    seventh.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == seventh.id),
+            "a decision id split by adjacent block-level tags still counted: {violations:?}"
         );
     }
 
@@ -7760,6 +7829,34 @@ mod tests {
         let linked = claude_md.replace(
             &format!("| {} |", clause.discharged_by),
             &format!("| <a href={}>recovery proof</a> |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_spaced_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 39, finding 2: a bare, contiguous `href=`
+        // search rejected anything else, so a legal raw anchor written with the
+        // whitespace HTML permits on either side of `=` — `<a href = "tests/spine.rs">
+        // recovery proof</a>` — was read as carrying no destination at all, even
+        // though a browser follows it exactly as it would `href="..."`. The scan now
+        // skips whitespace after the attribute name and after the `=` before looking
+        // for the value.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!(
+                "| <a href = \"{}\">recovery proof</a> |",
+                clause.discharged_by
+            ),
         );
         let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
         assert!(

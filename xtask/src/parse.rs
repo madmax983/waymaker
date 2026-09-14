@@ -1097,12 +1097,10 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             // string, say — without ending HTML parsing of the script, so closing on
             // any of the three would resume visibility too early.
             Event::Html(html) => {
-                for range in
-                    visible_html_ranges(&html, &mut in_html_comment, &mut open_non_rendering_tag)
-                {
-                    if !container_hidden {
-                        out.push_str(&html[range]);
-                    }
+                let spans =
+                    visible_html_ranges(&html, &mut in_html_comment, &mut open_non_rendering_tag);
+                if !container_hidden {
+                    append_visible_html(&mut out, &html, spans);
                 }
             }
             // Never pushes the construct's own raw text (Codex, round 33, finding 1): a
@@ -1162,44 +1160,26 @@ fn non_rendering_element_nests(tag: &str) -> bool {
 /// name ends right there rather than continuing into a longer one (`<scriptx>` does not
 /// match).
 ///
-/// A `>` inside a quoted attribute value does not end the tag (Codex, pull request
-/// #138, round 37, finding 3, closing the gap round 36's own fix for `find_any_tag`
-/// left in this sibling): `<script title="></script>">hidden</script>` has a `title`
-/// attribute whose value happens to contain the literal text `></script>`, and ending
-/// the *opening* tag there made the block scanner accept that quoted text as the
-/// element's real close — exposing the genuinely hidden body after it. Byte-scanned
-/// rather than searched, the same way `find_any_tag` now is, tracking whichever quote
-/// character is currently open so a `>` inside one is skipped.
+/// Tokenized through [`find_any_tag`] rather than searched for `<tag` as a raw substring
+/// (Codex, pull request #138, round 39, finding 1, generalizing round 37's fix for a
+/// `>` inside this *same* tag's own quoted value to a quoted value inside an
+/// *intervening* one): `<span title="</template>">hidden marker</span>` sits between a
+/// search's `from` and a real `<template>`'s close, and a raw substring search for
+/// `</template` finds that name inside the `<span>`'s own quoted attribute value — text
+/// a browser never treats as a tag at all. Walking tag by tag, checking each whole
+/// span's own name, skips straight over an unrelated tag's quoted content exactly the
+/// way `find_any_tag` already skips over one *quote's* contents, so a spelling trapped
+/// inside either can never stand in for a real tag.
 fn find_opening_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
-    let lower = line.to_ascii_lowercase();
-    let marker = format!("<{tag}");
-    lower
-        .get(from..)?
-        .match_indices(&marker)
-        .find_map(|(rel, _)| {
-            let start = from + rel;
-            let after = start + marker.len();
-            let boundary = lower
-                .as_bytes()
-                .get(after)
-                .is_none_or(|&byte| matches!(byte, b'>' | b' ' | b'\t' | b'\n' | b'/'));
-            if !boundary {
-                return None;
-            }
-            let bytes = line.as_bytes();
-            let mut quote: Option<u8> = None;
-            let mut index = after;
-            while let Some(&byte) = bytes.get(index) {
-                match quote {
-                    Some(open) if byte == open => quote = None,
-                    None if byte == b'"' || byte == b'\'' => quote = Some(byte),
-                    None if byte == b'>' => return Some((start, index + 1)),
-                    Some(_) | None => {}
-                }
-                index += 1;
-            }
-            Some((start, line.len()))
-        })
+    let mut cursor = from;
+    loop {
+        let (start, end) = find_any_tag(line, cursor)?;
+        let span = &line[start..end];
+        if !span.starts_with("</") && markup_tag_name(span).eq_ignore_ascii_case(tag) {
+            return Some((start, end));
+        }
+        cursor = end;
+    }
 }
 
 /// The byte range of the first closing tag for `tag` at or after `from` in `line`,
@@ -1207,22 +1187,17 @@ fn find_opening_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
 /// between the tag name and `>` (Codex, pull request #138, round 32, finding 2): an
 /// exact `</tag>` match left `open_non_rendering_tag` set forever against a real,
 /// legally spelled `</script >` or `</template\t>`, hiding every line after it.
+/// Tokenized the same way [`find_opening_tag`] now is, for the same round-39 reason.
 fn find_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
-    let lower = line.to_ascii_lowercase();
-    let marker = format!("</{tag}");
-    lower
-        .get(from..)?
-        .match_indices(&marker)
-        .find_map(|(rel, _)| {
-            let start = from + rel;
-            let after = start + marker.len();
-            let rest = lower.get(after..)?;
-            let gt = rest.find('>')?;
-            rest.get(..gt)?
-                .bytes()
-                .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-                .then_some((start, after + gt + 1))
-        })
+    let mut cursor = from;
+    loop {
+        let (start, end) = find_any_tag(line, cursor)?;
+        let span = &line[start..end];
+        if span.starts_with("</") && markup_tag_name(span).eq_ignore_ascii_case(tag) {
+            return Some((start, end));
+        }
+        cursor = end;
+    }
 }
 
 /// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
@@ -1318,6 +1293,94 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<&'static str>) -> bool {
             true
         }),
     }
+}
+
+/// Every `CommonMark` §4.6 "type 6" HTML block tag name, lowercase — the fixed list whose
+/// mere presence at a line's start begins a raw HTML block, because a browser always
+/// renders each one as its own block rather than running inline with neighboring text.
+const HTML_BLOCK_TAG_NAMES: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+/// The tag name an opening or closing tag span (`<div ...>` or `</div>`) names, without
+/// the angle brackets, slash or any attributes.
+fn markup_tag_name(span: &str) -> &str {
+    let rest = span.strip_prefix('<').unwrap_or(span);
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let end = rest
+        .find(|character: char| character.is_whitespace() || character == '/' || character == '>')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Whether `span` — an opening or closing tag's own markup — names one of
+/// [`HTML_BLOCK_TAG_NAMES`], case-insensitively.
+fn is_html_block_tag(span: &str) -> bool {
+    let name = markup_tag_name(span);
+    HTML_BLOCK_TAG_NAMES
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 /// One place in a line that stops content from being visible: a comment opener, a
@@ -1500,12 +1563,23 @@ fn advance_past_non_rendering(
 /// be tracked as its own level — closed only by its own matching close — rather than
 /// scanned for a `</template>`-looking substring that is really just JavaScript or CSS
 /// text.
+///
+/// A block tag's own markup (`Markup`, stripped in either direction) is followed by a
+/// [`VisibleHtmlSpan::Break`] (Codex, pull request #138, round 39, finding 3): a
+/// browser always starts a block element — `<div>`, `<p>`, and the rest of
+/// [`HTML_BLOCK_TAG_NAMES`] — on a line of its own, so `<div>head</div><div>line</div>`
+/// renders as two separate lines, `head` and `line`, not one running word. Excluding
+/// the tags' own markup with nothing between them — as every fix through round 38 did —
+/// fused the two into the literal contiguous run `headline`, matching a `.contains`
+/// scan no reader would. An inline tag (`<span>`, `<em>`, and anything else not on that
+/// list) forces no such break, so it gets none: `<div>Some <em>emphasized</em>
+/// text</div>` must still read as one running line.
 fn visible_html_ranges(
     line: &str,
     in_html_comment: &mut bool,
     open_non_rendering: &mut Vec<&'static str>,
-) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
+) -> Vec<VisibleHtmlSpan> {
+    let mut spans = Vec::new();
     let mut cursor = 0usize;
     loop {
         // Checked before the open element (Codex, round 32, finding 1): a comment
@@ -1534,11 +1608,11 @@ fn visible_html_ranges(
         }
         match next_hiding_marker(line, cursor) {
             None => {
-                ranges.push(cursor..line.len());
+                spans.push(VisibleHtmlSpan::Text(cursor..line.len()));
                 break;
             }
             Some(HidingMarker::Comment(start)) => {
-                ranges.push(cursor..start);
+                spans.push(VisibleHtmlSpan::Text(cursor..start));
                 let Some(offset) = line[start..].find("-->") else {
                     *in_html_comment = true;
                     break;
@@ -1546,17 +1620,46 @@ fn visible_html_ranges(
                 cursor = start + offset + "-->".len();
             }
             Some(HidingMarker::Tag(start, end, tag)) => {
-                ranges.push(cursor..start);
+                spans.push(VisibleHtmlSpan::Text(cursor..start));
                 open_non_rendering.push(tag);
                 cursor = end;
             }
             Some(HidingMarker::Markup(start, end)) => {
-                ranges.push(cursor..start);
+                spans.push(VisibleHtmlSpan::Text(cursor..start));
+                if is_html_block_tag(&line[start..end]) {
+                    spans.push(VisibleHtmlSpan::Break);
+                }
                 cursor = end;
             }
         }
     }
-    ranges
+    spans
+}
+
+/// One visible byte range of an `Event::Html` line, or a forced line break a stripped
+/// block tag's own markup leaves behind — see [`visible_html_ranges`].
+enum VisibleHtmlSpan {
+    /// A visible byte range into the original line.
+    Text(std::ops::Range<usize>),
+    /// A line break a browser renders here that no byte range can carry, because no
+    /// byte of the source is one.
+    Break,
+}
+
+/// Appends `spans` (from `visible_html_ranges` over `html`) to `out`, extracted from
+/// `markdown_prose` itself only to stay under clippy's line limit (Codex, pull request
+/// #138, round 30, the same reason `track_non_rendering_html` was pulled out).
+fn append_visible_html(out: &mut String, html: &str, spans: Vec<VisibleHtmlSpan>) {
+    for span in spans {
+        match span {
+            VisibleHtmlSpan::Text(range) => out.push_str(&html[range]),
+            VisibleHtmlSpan::Break => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
+    }
 }
 
 /// Whether an `Event::InlineHtml`'s text is some spelling of the `<br>` tag — the one
@@ -1616,7 +1719,7 @@ fn anchor_href(html: &str) -> Option<&str> {
     find_opening_tag(html, 0, "a")?;
     let bytes = html.as_bytes();
     let lower = html.to_ascii_lowercase();
-    let marker = "href=";
+    let marker = "href";
     let mut quote: Option<u8> = None;
     let mut index = 0;
     while let Some(&byte) = bytes.get(index) {
@@ -1629,7 +1732,38 @@ fn anchor_href(html: &str) -> Option<&str> {
                     bytes.get(before).is_some_and(u8::is_ascii_whitespace)
                 }) =>
             {
-                let value_start = index + marker.len();
+                let after_name = index + marker.len();
+                // The name must end right there, not continue into a longer attribute
+                // (Codex, pull request #138, round 39, finding 2, guarded against while
+                // fixing that same round's own ask): `hreflang="en"` starts with
+                // `href`, and without this boundary check its own `l` would be read as
+                // the start of the `=` HTML permits whitespace around — matching
+                // `hreflang`'s value as though it were `href`'s.
+                if !bytes
+                    .get(after_name)
+                    .is_none_or(|&b| b.is_ascii_whitespace() || b == b'=')
+                {
+                    index = after_name;
+                    continue;
+                }
+                // HTML permits whitespace on both sides of the `=` — `href = "..."`
+                // and `href= "..."` are as legal as `href="..."` — but a bare,
+                // contiguous `href=` search rejected anything else (Codex, round 39,
+                // finding 2): `table_rows` then lost the destination of a raw anchor
+                // written with any of that legal spacing.
+                let after_name_whitespace = html
+                    .get(after_name..)?
+                    .find(|character: char| !character.is_whitespace())
+                    .map_or(html.len(), |offset| after_name + offset);
+                if bytes.get(after_name_whitespace) != Some(&b'=') {
+                    index = after_name;
+                    continue;
+                }
+                let after_equals = after_name_whitespace + 1;
+                let value_start = html
+                    .get(after_equals..)?
+                    .find(|character: char| !character.is_whitespace())
+                    .map_or(html.len(), |offset| after_equals + offset);
                 let value_quote = *bytes.get(value_start)?;
                 if value_quote != b'"' && value_quote != b'\'' {
                     // An unquoted HTML attribute value (Codex, pull request #138, round
