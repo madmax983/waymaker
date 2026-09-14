@@ -1648,12 +1648,25 @@ fn literal_or_const_value(
 }
 
 /// `pattern`'s own integer value, the pattern half of [`literal_or_const_value`]: a bare
-/// literal, or a path — a single plain identifier parses as a binding rather than a path,
+/// literal, a path — a single plain identifier parses as a binding rather than a path,
 /// since `syn` cannot tell one from a constant of the same name without resolving it, so it
 /// is turned into a one-segment [`syn::Path`] before asking `resolve` the same question a
-/// multi-segment, qualified pattern (`module::P0`) would be asked. `None` for a wildcard, a
-/// range, a tuple, or anything else a dense table's patterns are not, and for a binding that
-/// names no known constant — that is [`is_catchall_pattern`]'s question, not this one's.
+/// multi-segment, qualified pattern (`module::P0`) would be asked — or an inclusive range
+/// whose two ends resolve to the same value.
+///
+/// Codex's finding on the last: `0..=0` names exactly the value `0` and nothing else, so a
+/// table that spelled its patterns that way — indistinguishable from `0` at the value level,
+/// and identical to it in every value `rustc`'s exhaustiveness check accepts — folds into
+/// the same lookup table a bare-literal version would, and was read as a range (which is
+/// genuinely not one of the shapes a dense table's *patterns* take, hence not accepted for
+/// any width wider than one value) rather than as the single integer it singles out. A
+/// half-open range (`0..1`) is not a singleton by this test even though it also names one
+/// value, because treating it as one would have to know the element type's own successor
+/// function, which this scan has no reason to.
+///
+/// `None` for a wildcard, a wider range, a tuple, or anything else a dense table's patterns
+/// are not, and for a binding that names no known constant — that is
+/// [`is_catchall_pattern`]'s question, not this one's.
 fn pattern_literal(
     pattern: &syn::Pat,
     resolve: &dyn Fn(&syn::Path) -> Option<u128>,
@@ -1667,6 +1680,11 @@ fn pattern_literal(
             resolve(&syn::Path::from(named.ident.clone()))
         }
         syn::Pat::Path(path) => resolve(&path.path),
+        syn::Pat::Range(range) if matches!(range.limits, syn::RangeLimits::Closed(_)) => {
+            let start = literal_or_const_value(range.start.as_deref()?, resolve)?;
+            let end = literal_or_const_value(range.end.as_deref()?, resolve)?;
+            (start == end).then_some(start)
+        }
         _ => None,
     }
 }
@@ -1749,10 +1767,17 @@ fn call_shape_of(
 /// Rust against `outer`'s own scope — `outer::indices::P0` — not against a top-level
 /// `mod indices` of the same name, because plain module-relative resolution consults the
 /// current module's own items rather than the file root. So the stripped chain is tried
-/// first as itself, then with `current_module` — [`MatchVisitor::module_path`] at the
-/// match's own position — prepended, which is what a bare or `self`-relative path actually
-/// resolves against. A `super` is not resolved positionally, so a chain that does not match
-/// either way falls back to its last two segments (`module::name`), which is what lets
+/// first with `current_module` — [`MatchVisitor::module_path`] at the match's own position
+/// — prepended, which is what a bare or `self`-relative path actually resolves against.
+///
+/// Codex's finding after that: trying the plain, unprefixed chain *first* still answers
+/// wrong when a same-named path exists at both the file root and the current module — a
+/// root `mod indices` and an `outer::indices` both declaring `P0` means the root lookup
+/// would find something and return before the relative one is ever tried, even though
+/// Rust resolves `indices::P0` written inside `outer` to `outer`'s own `indices`
+/// exclusively. So the relative lookup goes first and the plain chain is the fallback, not
+/// the other way around. A `super` is not resolved positionally, so a chain that matches
+/// neither falls back to its last two segments (`module::name`), which is what lets
 /// `crate::indices::P0` and `super::indices::P0` both still find a `mod indices` recorded
 /// relative to the file root.
 fn resolve_qualified_path(
@@ -1774,14 +1799,14 @@ fn resolve_qualified_path(
         return None;
     }
     let joined = relevant.join("::");
-    if let Some(value) = qualified.get(&joined) {
-        return Some(*value);
-    }
     if !current_module.is_empty() {
         let relative = format!("{}::{joined}", current_module.join("::"));
         if let Some(value) = qualified.get(&relative) {
             return Some(*value);
         }
+    }
+    if let Some(value) = qualified.get(&joined) {
+        return Some(*value);
     }
     let tail_start = relevant.len().saturating_sub(2);
     let tail = relevant.get(tail_start..)?;

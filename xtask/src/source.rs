@@ -15350,6 +15350,63 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_against_the_current_module_wins_over_a_same_named_root_one() {
+        // Codex's seventeenth-round finding: the fix for the sixteenth round's relative-path
+        // gap tried the plain, file-root chain *first* and only fell back to the
+        // current-module-prefixed one when that missed — so a root `mod indices` with the
+        // same names, declaring non-dense values, would answer first and hide a real dense
+        // table nested one module deeper that Rust itself resolves the reference to. Here
+        // the root `mod indices` deliberately holds scattered, non-dense values (100..103)
+        // that `has_dense_arm_patterns` cannot cover, while `outer::indices` holds the real
+        // 0..3 range the match actually resolves to; the fix has to try the current-module
+        // form first for this to be caught.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 100;\n    pub(crate) const P1: \
+             u8 = 101;\n    pub(crate) const P2: u8 = 102;\n    pub(crate) const P3: u8 = \
+             103;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             0;\n        pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = \
+             2;\n        pub(crate) const P3: u8 = 3;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            indices::P0 => super::crc32_nibble(0),\n            \
+             indices::P1 => super::crc32_nibble(1),\n            indices::P2 => \
+             super::crc32_nibble(2),\n            indices::P3 => super::crc32_nibble(3),\n            \
+             _ => super::crc32_nibble(4),\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_singleton_range_patterns_is_reported() {
+        // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
+        // `Pat::Range`, including an inclusive range whose two ends are the same integer —
+        // `0..=0` names exactly the value `0` and nothing else, so a table spelled that way
+        // folds into the identical lookup table a bare `0` would, and was read as "not one
+        // of a dense table's shapes" rather than as the single value it singles out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn singleton_range_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn singleton_range_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0..=0 => singleton_range_helper(0),\n        \
+             1..=1 => singleton_range_helper(1),\n        2..=2 => \
+             singleton_range_helper(2),\n        _ => singleton_range_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
