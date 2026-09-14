@@ -2816,6 +2816,15 @@ fn literal_or_const_value(
             }
             _ => None,
         },
+        // Codex's next-round finding: `const P0: u8 = const { 0u8 };` is `Expr::Const` — an
+        // inline const block, MSRV-legal and evaluated by `rustc` before the match it feeds
+        // ever lowers — which fell to the wildcard `_ => None` case below, the const-call
+        // and array backstops included, since an inline const block is neither a call nor
+        // an array index. Its own body is a plain `syn::Block`, the identical shape
+        // `Expr::Block`'s own case already evaluates through `evaluate_block`, so this case
+        // is nothing more than routing that body to the same function — no local `const` or
+        // `let` fixed point of its own to invent.
+        syn::Expr::Const(expr_const) => evaluate_block(&expr_const.block, resolve),
         _ => None,
     }
 }
@@ -2963,6 +2972,20 @@ fn match_arm_matches_constant(
 /// trait's bare name whether the pattern referenced it bare or through a longer qualified
 /// path — before falling back to the type-only suffix, which stays for an impl this second
 /// key cannot reach (an inherent impl, where there is no trait to disambiguate with).
+///
+/// Codex's next-round finding after *that*: a bare last segment is *still* ambiguous the
+/// moment two different traits sharing that one bare name — `traits_a::Indices` and
+/// `traits_b::Indices`, each implemented for `u8` in its own sibling module — exist
+/// anywhere in the scanned tree, because `visit_item_impl`'s second key now carries the
+/// trait's full *resolved* scope path (`traits_a::Indices`, `traits_b::Indices`), but this
+/// search still built its own query suffix from the single segment right before the
+/// member, discarding the rest of what the pattern itself wrote. The suffix is now built
+/// from every segment of the pattern's own trait path (`path.segments[..segment_count -
+/// 1]`, everything before the member) rather than the one immediately preceding it, so
+/// `<u8 as traits_a::Indices>::P0` searches for `::traits_a::Indices::u8::P0` and no longer
+/// shares a candidate with `traits_b::Indices`'s own key. A trait referenced bare
+/// (`<u8 as Indices>::P0`) still searches the identical single-segment suffix it always
+/// has, since there is nothing more written to widen it with.
 fn resolve_qself_associated_const(
     qself: &syn::QSelf,
     path: &syn::Path,
@@ -2992,16 +3015,23 @@ fn resolve_qself_associated_const(
     if let Some(value) = resolve(&synthetic) {
         return Some(value);
     }
-    if let Some(trait_segment) = segment_count
-        .checked_sub(2)
-        .and_then(|index| path.segments.get(index))
-    {
-        let trait_bare_name = ident_name(&trait_segment.ident);
-        let trait_suffix = format!("::{trait_bare_name}::{type_name}::{member}");
-        let mut trait_candidates = qualified.keys().filter(|key| key.ends_with(&trait_suffix));
-        if let Some(unique) = trait_candidates.next() {
-            if trait_candidates.next().is_none() {
-                return qualified.get(unique).copied();
+    if let Some(trait_path_len) = segment_count.checked_sub(1) {
+        if trait_path_len > 0 {
+            let trait_path_segments: Vec<String> = path
+                .segments
+                .iter()
+                .take(trait_path_len)
+                .map(|segment| ident_name(&segment.ident))
+                .collect();
+            let trait_suffix = format!(
+                "::{}::{type_name}::{member}",
+                trait_path_segments.join("::")
+            );
+            let mut trait_candidates = qualified.keys().filter(|key| key.ends_with(&trait_suffix));
+            if let Some(unique) = trait_candidates.next() {
+                if trait_candidates.next().is_none() {
+                    return qualified.get(unique).copied();
+                }
             }
         }
     }
@@ -3950,13 +3980,17 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
 /// side of that: try the trait impl's own full scope first, peeling `block_path` down to
 /// nothing, then drop `function_path` and try the bare `module_path` — never falling all
 /// the way to a bare, unscoped trait name, which is exactly the collision this closes.
+/// Returns the canonical scope path that answered, `path` and all, alongside the defaults
+/// map itself — Codex's next-round finding is exactly why: a *caller* keying its own index
+/// by the trait's bare name alone (rather than the full scope path that actually resolved)
+/// reproduces the identical ambiguity this function exists to close, one call site later.
 fn lookup_trait_defaults<'a>(
     trait_defaults: &'a std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
     module_path: &[String],
     function_path: &[String],
     block_path: &[String],
     trait_name: &str,
-) -> Option<&'a std::collections::HashMap<String, i128>> {
+) -> Option<(Vec<String>, &'a std::collections::HashMap<String, i128>)> {
     for depth in (0..=block_path.len()).rev() {
         let mut combined = module_path.to_vec();
         combined.extend(function_path.iter().cloned());
@@ -3965,7 +3999,7 @@ fn lookup_trait_defaults<'a>(
         }
         combined.push(trait_name.to_string());
         if let Some(defaults) = trait_defaults.get(&combined.join("::")) {
-            return Some(defaults);
+            return Some((combined, defaults));
         }
     }
     if function_path.is_empty() {
@@ -3973,7 +4007,9 @@ fn lookup_trait_defaults<'a>(
     }
     let mut bare = module_path.to_vec();
     bare.push(trait_name.to_string());
-    trait_defaults.get(&bare.join("::"))
+    trait_defaults
+        .get(&bare.join("::"))
+        .map(|defaults| (bare, defaults))
 }
 
 /// `trait_path`'s own default associated constants, when `trait_path` is *qualified* — two
@@ -3999,11 +4035,16 @@ fn lookup_trait_defaults<'a>(
 /// constant path already does. `visit_item_impl` now tries this resolution first, against
 /// the impl's full written trait path, before falling back to [`lookup_trait_defaults`]'s
 /// bare-name search for a trait referenced without qualification.
+/// Returns the canonical scope path that answered alongside the defaults map, the same
+/// reason [`lookup_trait_defaults`] does: a caller indexing its own lookup under the
+/// trait's bare last segment alone reproduces the ambiguity this whole search exists to
+/// close, one call site later — see [`lookup_trait_defaults`]'s own next-round finding,
+/// which this function shares in full.
 fn resolve_qualified_trait_defaults<'a>(
     trait_defaults: &'a std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
     trait_path: &syn::Path,
     current_module: &[String],
-) -> Option<&'a std::collections::HashMap<String, i128>> {
+) -> Option<(Vec<String>, &'a std::collections::HashMap<String, i128>)> {
     let segments: Vec<String> = trait_path
         .segments
         .iter()
@@ -4033,16 +4074,20 @@ fn resolve_qualified_trait_defaults<'a>(
         if !effective_module.is_empty() {
             let relative = format!("{}::{joined}", effective_module.join("::"));
             if let Some(defaults) = trait_defaults.get(&relative) {
-                return Some(defaults);
+                let mut resolved = effective_module.to_vec();
+                resolved.extend(rest.iter().map(ToString::to_string));
+                return Some((resolved, defaults));
             }
         }
     }
     if let Some(defaults) = trait_defaults.get(&joined) {
-        return Some(defaults);
+        return Some((rest.iter().map(ToString::to_string).collect(), defaults));
     }
     let tail_start = rest.len().saturating_sub(2);
     let tail = rest.get(tail_start..)?;
-    trait_defaults.get(&tail.join("::"))
+    trait_defaults
+        .get(&tail.join("::"))
+        .map(|defaults| (tail.iter().map(ToString::to_string).collect(), defaults))
 }
 
 /// [`resolve_qualified_trait_defaults`], peeled down over `module_path`, `function_path`
@@ -4056,17 +4101,17 @@ fn resolve_qualified_trait_defaults_at_any_depth<'a>(
     module_path: &[String],
     function_path: &[String],
     block_path: &[String],
-) -> Option<&'a std::collections::HashMap<String, i128>> {
+) -> Option<(Vec<String>, &'a std::collections::HashMap<String, i128>)> {
     for depth in (0..=block_path.len()).rev() {
         let mut combined_module = module_path.to_vec();
         combined_module.extend(function_path.iter().cloned());
         if let Some(prefix) = block_path.get(..depth) {
             combined_module.extend(prefix.iter().cloned());
         }
-        if let Some(defaults) =
+        if let Some(found) =
             resolve_qualified_trait_defaults(trait_defaults, trait_path, &combined_module)
         {
-            return Some(defaults);
+            return Some(found);
         }
     }
     if function_path.is_empty() && block_path.is_empty() {
@@ -4329,8 +4374,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     // real declaration exactly the way a qualified constant path already
                     // does. Only when that fails — a bare, unqualified trait name, or a
                     // qualified one this scan cannot resolve — does the bare-name,
-                    // lexically-scoped search run, exactly as before.
-                    let mut scope = trait_path
+                    // lexically-scoped search run, exactly as before. Both searches now
+                    // return the *canonical scope path* that actually answered, alongside
+                    // the defaults themselves, which is what the disambiguating key below
+                    // needs.
+                    let resolved_trait = trait_path
                         .and_then(|trait_path| {
                             resolve_qualified_trait_defaults_at_any_depth(
                                 &self.trait_defaults,
@@ -4350,9 +4398,20 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                                     trait_name,
                                 )
                             })
-                        })
-                        .cloned()
+                        });
+                    let mut scope = resolved_trait
+                        .as_ref()
+                        .map(|(_, defaults)| (*defaults).clone())
                         .unwrap_or_default();
+                    // Codex's next-round finding after that: a trait this scan *could not
+                    // resolve* (an external trait, or one outside the scanned tree) whose
+                    // impl still redeclares every constant itself has no canonical scope
+                    // path to fall back to — the bare trait name, ambiguous as it is, is
+                    // still what the forty-third round's fix relied on for that case, and
+                    // dropping it outright would regress the impls that fix already covers.
+                    let trait_scope_path: Option<Vec<String>> = resolved_trait
+                        .map(|(scope_path, _)| scope_path)
+                        .or_else(|| trait_name.as_ref().map(|name| vec![name.clone()]));
                     let mut path = self.module_path.clone();
                     path.extend(self.function_path.iter().cloned());
                     path.extend(self.block_path.iter().cloned());
@@ -4373,14 +4432,28 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     // precisely because the impl's own module can differ from the trait's —
                     // found two candidates for `<u8 as traits::Dense>::P0` and answered
                     // neither, even though the pattern's own trait path names the impl
-                    // unambiguously. A second key, carrying the trait's own bare name ahead
+                    // unambiguously. A second key, carrying the trait's own scope path ahead
                     // of the type, is inserted alongside the existing one whenever this is a
                     // trait impl, so a suffix search keyed on *both* the trait and the type
                     // finds exactly one candidate again.
+                    //
+                    // Codex's next-round finding: that scope path was the trait's bare
+                    // *last segment* alone, which is exactly the collision this key exists
+                    // to close, met one level up — `traits_a::Indices` and
+                    // `traits_b::Indices`, each implemented for `u8` in a sibling module,
+                    // both inserted a key ending in `Indices::u8::P0`, and the suffix search
+                    // found two candidates again. `trait_scope_path` carries the trait's
+                    // *full* resolved scope — the same canonical path
+                    // `resolve_qualified_trait_defaults`/`lookup_trait_defaults` themselves
+                    // found it under — so `traits_a::Indices::u8::P0` and
+                    // `traits_b::Indices::u8::P0` no longer share a suffix at all.
                     let mut trait_qualified_path = path.clone();
-                    if let Some(trait_name) = &trait_name {
+                    if let Some(trait_scope_path) = &trait_scope_path {
                         let insertion_point = trait_qualified_path.len() - 1;
-                        trait_qualified_path.insert(insertion_point, trait_name.clone());
+                        trait_qualified_path.splice(
+                            insertion_point..insertion_point,
+                            trait_scope_path.iter().cloned(),
+                        );
                     }
                     // Codex's forty-sixth-round finding: `impl defs::Key { .. }`, written
                     // outside `defs`, indexes its constants under the *impl's* own lexical
@@ -4405,7 +4478,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     for (const_name, value) in &scope {
                         self.qualified
                             .insert(format!("{}::{const_name}", path.join("::")), *value);
-                        if trait_name.is_some() {
+                        if trait_scope_path.is_some() {
                             self.qualified.insert(
                                 format!("{}::{const_name}", trait_qualified_path.join("::")),
                                 *value,

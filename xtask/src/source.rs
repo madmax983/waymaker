@@ -18014,6 +18014,74 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_inline_const_block_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = const { 0u8 };` is `Expr::Const` — an
+        // inline const block, MSRV-legal and evaluated by `rustc` before the match it feeds
+        // ever lowers — which fell to the wildcard `_ => None` case in
+        // `literal_or_const_value` and left every such constant unresolved, the const-call
+        // and array backstops included, since an inline const block is neither a call nor
+        // an array index. The new `Expr::Const` case routes the block's own body to
+        // `evaluate_block`, the identical function `Expr::Block`'s own case already uses.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn const_block_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = const { 0u8 };\n    const P1: u8 = const { 1u8 };\n    \
+             const P2: u8 = const { 2u8 };\n    const P3: u8 = const { 3u8 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_two_same_named_traits_implemented_for_one_type_is_reported() {
+        // Codex's next-round finding: explicit impl constants were still keyed, and looked
+        // up, by the trait's bare *last segment* alone — the exact collision the
+        // forty-third round's fix closed for two *differently*-named traits reappears the
+        // moment two traits sharing one bare name (`Indices`, declared once in
+        // `traits_a` and once in `traits_b`) are each implemented for the same type in
+        // their own sibling module: both impls' constants ended in the identical
+        // `Indices::u8::P0` suffix, so the trait-aware suffix search found two candidates
+        // and answered neither, even though `<u8 as traits_a::Indices>::P0` names the
+        // intended impl exactly. `visit_item_impl` now keys a trait impl's constants under
+        // the trait's *full resolved* scope path (`traits_a::Indices`, not bare
+        // `Indices`), and `resolve_qself_associated_const`'s own suffix search is widened
+        // to match — built from every segment of the pattern's own trait path rather than
+        // only the one immediately before the member — so `traits_a::Indices::u8::P0` and
+        // `traits_b::Indices::u8::P0` no longer share a candidate.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits_a {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod traits_b {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod impl_a {\n    impl super::traits_a::Indices for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             mod impl_b {\n    impl super::traits_b::Indices for u8 {\n        \
+             const P0: u8 = 99;\n        const P1: u8 = 100;\n        const P2: u8 = \
+             101;\n        const P3: u8 = 102;\n    }\n}\n\n\
+             const fn same_named_trait_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        <u8 as traits_a::Indices>::P0 => 0,\n        \
+             <u8 as traits_a::Indices>::P1 => 1,\n        <u8 as traits_a::Indices>::P2 => \
+             2,\n        <u8 as traits_a::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
