@@ -594,9 +594,12 @@ fn payload_of(record: &RecordRef<'_>) -> u32 {
 /// thing that produces a [`Sealable`] is that call.
 ///
 /// Dropping one is legal and leaves an unsealed frame on media. That is not a leak and not a
-/// silent failure: the record is not history either way. If nothing else was ever written
-/// past its reserved slot, recovery ignores it and the bank stays appendable — issue
-/// [#95](https://github.com/madmax983/waymaker/issues/95); otherwise recovery reports
+/// silent failure: the record is not history either way. Recovery checks only this frame's
+/// own reserved slot — `[frame_len, stride)`, the padding and the seal — and if every byte of
+/// it is erased, ignores the frame and keeps scanning past it, whatever lies further out
+/// (including a later boot's own committed history) — issue
+/// [#95](https://github.com/madmax983/waymaker/issues/95). Otherwise a byte in that slot is
+/// neither erased nor a real seal, and recovery reports
 /// [`Ending::Unsealed`](crate::recovery::Ending::Unsealed) and the bank is recycled instead.
 /// It is `#[must_use]` all the same, because dropping one is almost never what a caller
 /// meant.

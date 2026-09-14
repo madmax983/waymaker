@@ -109,7 +109,10 @@ seal[i] = frame_crc.to_le_bytes()[i % 4] & 0x7F
 No byte of a seal is ever `0xFF`. Three properties follow, and they are the whole reason for
 this shape:
 
-- an erased program unit is never a seal, so an unsealed frame is refused rather than read;
+- an erased program unit is never a seal, so an unsealed frame is refused rather than read as
+  a record — though refusing the *frame* does not always mean refusing the *bank*: since
+  issue #95, a reader that finds the rest of the frame's reserved slot erased ignores it and
+  keeps scanning, rather than stopping there;
 - a seal that did not land whole is never a whole one, because a missing byte still reads
   erased;
 - a seal is bound to the frame it seals, so a writer that sealed what it meant to write
