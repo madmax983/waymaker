@@ -226,6 +226,24 @@ project's own review-depth guidance is to stop past two or three rounds and open
 once a fourth still finds real bugs — so a fourteenth finding of this shape goes to issue
 [#171](https://github.com/madmax983/waymaker/issues/171) rather than a fourteenth round here.
 
+**Review of the merge itself found a separate bug in code the merge introduced, not in
+`mutated_field_names`'s own chain above: a nested module's alias leaking into a block's
+lookup.** `resolve_local_alias_chain` was written to keep issue #92's function-local
+type-alias resolution working after issue #169's rewrite of `struct_literal_counts` onto a
+stack of raw `&[syn::Item]` slices rather than precomputed alias lists. It resolved a
+block's own aliases by calling `collect_item_aliases`, which recurses into any `mod` the
+block declares — the right behaviour for a whole-file alias index, wrong for a block-local
+one. A block declaring both `type S = Foo;` directly and `mod hidden { type S = Bar; }`
+alongside it had `hidden`'s own `S` collected into the same flat list as the block's own, so
+a bare `S {}` outside `hidden` could resolve through the nested module's private alias
+rather than the block's real one — exactly the leak `own_aliases`'s own doc comment already
+states a module-level lookup must not have. `own_aliases` is generalized to take any
+`&syn::Item` iterator instead of only a `&[syn::Item]` slice, and `resolve_local_alias_chain`
+now calls it in place of `collect_item_aliases` — the same non-recursive, own-level-only
+collection a module lookup already gets, reused rather than reimplemented.
+`a_nested_modules_alias_does_not_leak_into_the_enclosing_blocks_lookup` is the regression,
+confirmed RED against the unpatched lookup.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

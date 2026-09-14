@@ -405,8 +405,12 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// sibling modules (issue #169) — not tested, and not needed for the shapes a function-local
 /// alias is actually written in.
 fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<String>> {
-    let mut aliases = Vec::new();
-    collect_item_aliases(items.iter().copied(), &mut Vec::new(), &mut aliases);
+    // `own_aliases`, not `collect_item_aliases`: a block's own declarations are exactly
+    // one scope, the same as a module's, and reading through a `mod` nested in this block
+    // would let that inner module's private alias shadow the outer, real one (Codex
+    // review) — a bare `S {}` outside `mod hidden { type S = Other; }` still means
+    // whatever `S` resolves to in the enclosing block, never `hidden`'s own.
+    let aliases = own_aliases(items.iter().copied());
     let mut segments = vec![name.to_owned()];
     let mut resolved_any = false;
     let bound = aliases.len().saturating_add(1);
@@ -446,7 +450,13 @@ fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<Str
 /// on that module's own items, so every scope stays its own. A `type` alias
 /// is scoped the same way and resolves the same way a `use` alias does (issue
 /// #92, Codex's third round), so it is collected here too.
-fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
+///
+/// Generic over the item source rather than pinned to `&[syn::Item]`, so
+/// [`resolve_local_alias_chain`] can hand it a block's own `&syn::Item` references
+/// directly — the block-local case has exactly the same non-recursive-into-`mod`
+/// requirement a module-level lookup does, and reusing this rather than
+/// [`collect_item_aliases`] is what makes that true rather than assumed (Codex review).
+fn own_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
     let mut aliases = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -2878,6 +2888,29 @@ mod raw_identifier_tests {
         let mut sorted = found;
         sorted.sort_unstable();
         assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_nested_modules_alias_does_not_leak_into_the_enclosing_blocks_lookup() {
+        // Codex: block-local alias lookup must not descend into a nested `mod`'s own
+        // aliases. `type S = Foo;` declared directly in the block is what a bare `S {}`
+        // resolves to there; `mod hidden { type S = Bar; }` declared alongside it is a
+        // separate scope, invisible outside `hidden` — the same rule `own_aliases`
+        // already enforces for module-level lookups, not consulted here before this fix.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type S = Foo;\n\
+             \x20   mod hidden {\n\
+             \x20       type S = Bar;\n\
+             \x20   }\n\
+             \x20   let _ = S {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 
     #[test]
