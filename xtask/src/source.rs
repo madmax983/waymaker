@@ -17844,6 +17844,55 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_method_call_initializer_is_reported() {
+        // Codex's next-round finding: `syn` gives a dot-call its own node kind rather than
+        // lowering it to `Expr::Call`, so `const P0: u8 = 0u8.wrapping_add(0);` walked
+        // straight past `const_call_initializer_uses`'s original `visit_expr_call`-only
+        // override — a real, `const`-evaluable method call this scan does not interpret,
+        // exactly like the free-function call the const-call backstop already refuses, but
+        // silently unrecognised as either a call or a resolved value. `contains_call` now
+        // also overrides `visit_expr_method_call`, so a method-call initializer is refused
+        // outright the same way a free-function-call one already is.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst P0: u8 = 0u8.wrapping_add(0);\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_boolean_negated_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if !true => ..` is still retained after the
+        // provably-dead-guard fix, because that fix's `Unary(Not)` case requires a
+        // *suffixed integer literal* (`as_suffixed_int_literal`) — the width it needs for a
+        // bitwise flip — and `true` is a `Lit::Bool`, which carries no width and no suffix
+        // at all, so `!true` resolved to `None` rather than the `0` the dead-guard filter
+        // in `visit_expr_match` needs to prove the arm unreachable. `as_bool_literal` is
+        // now tried first, so a boolean operand is read as logical negation (`!true` is
+        // `false`, `0`) and only a non-boolean operand falls through to the width-aware
+        // bitwise path.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn bool_negated_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn bool_negated_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => bool_negated_dead_guard_helper(0),\n        \
+             1 => bool_negated_dead_guard_helper(1),\n        2 => bool_negated_dead_guard_helper(2),\n        \
+             _ if !true => 999,\n        _ => bool_negated_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

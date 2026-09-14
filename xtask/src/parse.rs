@@ -1165,7 +1165,16 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
         found: Vec<String>,
     }
 
-    /// Whether `expr`'s own tree contains a call anywhere within it.
+    /// Whether `expr`'s own tree contains a call anywhere within it — a plain
+    /// `f(..)`/`Type::method(..)` `Expr::Call`, or a `receiver.method(..)` `Expr::MethodCall`.
+    ///
+    /// Codex's next-round finding: `syn` gives a dot-call its own node kind rather than
+    /// lowering it to `Expr::Call`, so `0u8.wrapping_add(0)` — a real, `const`-evaluable
+    /// method call `rustc` folds before the match it feeds ever lowers, exactly like the
+    /// free-function call this function already refuses to interpret — walked straight
+    /// past the original `visit_expr_call`-only override. The same conservative answer this
+    /// function already gives a free call is given to a method call too: refuse the
+    /// initializer outright rather than deciding which method calls are safe to interpret.
     fn contains_call(expr: &syn::Expr) -> bool {
         struct FindCall {
             found: bool,
@@ -1174,6 +1183,11 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
             fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
                 self.found = true;
                 syn::visit::visit_expr_call(self, node);
+            }
+
+            fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+                self.found = true;
+                syn::visit::visit_expr_method_call(self, node);
             }
         }
         let mut finder = FindCall { found: false };
@@ -2484,6 +2498,29 @@ fn as_suffixed_int_literal(expr: &syn::Expr) -> Option<&syn::LitInt> {
     }
 }
 
+/// `expr`'s own boolean literal — seen through any nesting of parentheses or brace groups,
+/// the same two wrappers [`as_suffixed_int_literal`] sees through for an integer literal.
+///
+/// Codex's next-round finding: `!true` and `!false` are [`syn::UnOp::Not`] over a
+/// [`syn::Lit::Bool`], exactly the same node kind an integer bitwise-NOT wears — but
+/// `!true` is logical negation to `false`, not a width-dependent bitwise flip, and has no
+/// suffix for [`as_suffixed_int_literal`] to find (`true`/`false` carry no width at all).
+/// A guard spelled `_ if !true => ..` therefore resolved to `None` rather than the `0` a
+/// dead-guard check elsewhere needs to prove the arm unreachable. This is tried first, so a
+/// boolean operand is read as logical negation and only a non-boolean operand falls through
+/// to the width-aware bitwise path.
+fn as_bool_literal(expr: &syn::Expr) -> Option<bool> {
+    match expr {
+        syn::Expr::Paren(paren) => as_bool_literal(&paren.expr),
+        syn::Expr::Group(group) => as_bool_literal(&group.expr),
+        syn::Expr::Lit(literal) => match &literal.lit {
+            syn::Lit::Bool(boolean) => Some(boolean.value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `block`'s own value as a constant-initializer expression: its own tail expression,
 /// once any local `const` declarations feeding that tail are resolved first — a
 /// block-scoped mirror of `resolve_scope_consts`'s own fixed point, self-contained here
@@ -2615,10 +2652,14 @@ fn literal_or_const_value(
         // same answer a width-aware NOT would give directly: masking to the low `N` bits
         // after a full-width NOT is bit-for-bit identical to NOT-ing those `N` bits alone.
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
-            let int = as_suffixed_int_literal(&unary.expr)?;
-            let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
-            let raw = lit_value(&syn::Lit::Int(int.clone()))?;
-            apply_integer_cast(!raw, &ty)
+            if let Some(boolean) = as_bool_literal(&unary.expr) {
+                Some(i128::from(!boolean))
+            } else {
+                let int = as_suffixed_int_literal(&unary.expr)?;
+                let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
+                let raw = lit_value(&syn::Lit::Int(int.clone()))?;
+                apply_integer_cast(!raw, &ty)
+            }
         }
         // Codex's finding: `const P0: u8 = { const N: u8 = 0; N };` is `Expr::Block` — a
         // block used as an expression, most often to give an initializer a scope of its
