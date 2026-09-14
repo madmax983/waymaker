@@ -3140,6 +3140,12 @@ fn scan_public_functions(
         // crate's private trait names first, before any `impl` in the crate is read.
         let private_traits = private_trait_names(sources, &source.crate_name);
         let external_roots = external_roots_for(&source.crate_name);
+        // A file that imports a name from an external root settles that name for
+        // itself, whatever a private trait of the same name elsewhere in the crate
+        // says. `use` is scoped per file, so this reads only this file's own
+        // imports. See `imported_external_names`.
+        let private_traits =
+            &private_traits - &imported_external_names(&source.contents, &external_roots);
 
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
@@ -3479,6 +3485,35 @@ fn module_declaration(line: &str) -> Option<&str> {
     rest.strip_prefix("mod ")?
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .find(|token| !token.is_empty())
+}
+
+/// The names `source`'s own `use` declarations bring in from a root in
+/// `external_roots` — the alias a rename gives it, or the item's own name.
+///
+/// `use` is scoped to the file that wrote it. So this reads one file, unlike
+/// [`private_trait_names`] and [`local_module_names`], which read the whole crate.
+/// An unqualified `impl <Name> for <Type>` cannot be told from a local trait by
+/// name alone. A name this file imports from an external root settles it for this
+/// file, whatever a same-named private trait elsewhere in the crate says. Codex
+/// found this on this pull request's own review.
+///
+/// Parsed with [`crate::parse::use_aliases`], not scanned: a `use` item can group,
+/// nest and rename in ways a line scanner reads wrong (issue #51). A file that
+/// fails to parse contributes no name, the safe direction — its unqualified impls
+/// still fall back to the crate-wide private-trait check, exactly as before this
+/// function existed.
+fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> HashSet<String> {
+    crate::parse::use_aliases(source)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|alias| {
+            alias
+                .target
+                .first()
+                .is_some_and(|first| external_roots.contains(first))
+        })
+        .map(|alias| alias.local)
+        .collect()
 }
 
 /// Path roots no crate in this workspace can declare a module or a trait under,
@@ -7424,6 +7459,39 @@ mod tests {
         ];
         let functions = public_functions_reachable(&sources, &graph);
         assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_imported_external_trait_is_not_hidden_by_a_same_named_private_trait_elsewhere() {
+        // One file declares its own private `trait Serialize`. A different file
+        // imports the real `serde::Serialize` and implements it unqualified.
+        // Aggregating trait names crate-wide, as `private_trait_names` does,
+        // cannot tell the two apart by name alone — this file's own import must
+        // win for its own `impl`. Codex found this on this pull request's own
+        // review.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "use serde::Serialize;\n\n\
+                           impl Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
     }
 
     #[test]
