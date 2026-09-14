@@ -1160,17 +1160,30 @@ Stated so that nobody mistakes silence for coverage:
   in for the crate root; it is left unresolved the same way `crate::` is, rather than guessed
   against the file's own aliases. A *plain relative* path naming a sibling module declared in
   this same file — `traits::Pollable`, where `mod traits { pub use .. as Pollable; }` sits in
-  the same scope, with no `crate`/`super`/`self` prefix at all — is a distinguishable gap
-  rather than the same one: nothing outside this file is needed to resolve it, but the scope
-  stack only tracks the lexical ancestors the visitor happens to be walking through, not an
-  index of named modules reachable by segment from an arbitrary point in the tree (Codex
-  review, PR #160, round 9). Filed as issue
-  [#169](https://github.com/madmax983/waymaker/issues/169) rather than fixed in that PR: it
-  is a miss, not the false positives rounds 5 through 8 kept finding, and closing it needs a
-  materially larger mechanism than a leading-marker check. An alias declared in one module
+  the same scope, with no `crate`/`super`/`self` prefix at all — is resolved (issue
+  [#169](https://github.com/madmax983/waymaker/issues/169)): `resolve_segments` steps into a
+  sibling `mod` block by name when no alias matches, and keeps resolving there, chained
+  through as many levels of nested sibling module as the path names. Three narrower limits are
+  left where descent cannot go. An out-of-line declaration (`mod traits;`, no body in this
+  file) and a module gated on exactly `#[cfg(test)]` are both left unresolved rather than
+  guessed at. The first is because the module's real content lives in a file this per-file
+  scan never reads. The second is for `own_aliases`'s own reason (issue #51: test code is not
+  shipped code). Once resolution has stepped into a module by name it is off the lexical
+  ancestor stack, so `self::` still resolves inside it but `super::` does not. That is the
+  same residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
+  a module reached by name has no ancestor this per-file scan can identify past the point it
+  was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
-  they pin. Nor does
+  they pin. Module descent (issue #169) inherits this scanner's oldest limit rather than
+  adding a new one: `resolve_segments` has never tracked a function body's own scope, so a
+  generic parameter or a block-local item named the same as a `use` alias was already able to
+  shadow it unsoundly before #169 existed, and a sibling `mod` block reached the same way now
+  can be shadowed the same way (issue
+  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). Closing it
+  needs generic parameter lists and block-local scopes to become scopes of their own, ahead of
+  every module-level lookup — a materially larger mechanism than anything here today, the same
+  standing #169 itself had on PR #160 before it was filed rather than chased. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
   function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
   a later occurrence meant. Picking the first-declared alias can silently miss a real match;
