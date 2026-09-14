@@ -233,7 +233,7 @@ pub enum CapacityError {
     /// would write does not — so the gate would promise an exit that is not there. The name is
     /// shared with [`AppendError::WrongDevice`], one layer up, but the shape of the check is
     /// not: see
-    /// [ADR 0043](https://github.com/madmax983/waymaker/blob/main/docs/adr/0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md).
+    /// [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md).
     ///
     /// From [`Reserved::over`] only.
     WrongDevice,
