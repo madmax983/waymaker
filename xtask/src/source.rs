@@ -10946,6 +10946,36 @@ mod deferred_answer_pins {
         vec![layer(EFFECT_PROTOCOL_PATH, contents)]
     }
 
+    /// The real `effect.rs`, so a check is proved against what ships and not only against a
+    /// fixture built from the same table it is pinned by.
+    fn real_effect_module() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(EFFECT_PROTOCOL_PATH);
+        std::fs::read_to_string(&path).expect("the effect module should exist")
+    }
+
+    /// The real `timer.rs`, `clock.rs` and kernel root, so a check is proved against what
+    /// ships and not only against a fixture built from the same table it is pinned by.
+    fn real_timer_capability_sources() -> Vec<crate::size::LayerSource> {
+        fn read(path: &str) -> String {
+            let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("crates")
+                .join(path);
+            std::fs::read_to_string(&full).unwrap_or_else(|_| panic!("{path} should exist"))
+        }
+        vec![
+            layer(TIMER_SEMANTICS_PATH, &read(TIMER_SEMANTICS_PATH)),
+            layer(CLOCK_CAPABILITY_PATH, &read(CLOCK_CAPABILITY_PATH)),
+            layer(
+                "waymaker-core/src/lib.rs",
+                &read("waymaker-core/src/lib.rs"),
+            ),
+        ]
+    }
+
     /// The three layer files `timer-capability` reads, with one of them replaced.
     fn timer_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
         let clean: [(&str, String); 3] = [
@@ -11794,6 +11824,38 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn the_real_timer_capability_files_satisfy_the_rule_they_are_pinned_by() {
+        // Issue #99: the clean fixture is generated from `CLOCK_KIND_CONSTANTS` itself, so it
+        // cannot show that the check reads the real `impl ClockKind` the same way.
+        let violations = check_timer_capability(
+            &real_timer_capability_sources(),
+            &board_clock_sources("", ""),
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_timer_type_is_reported() {
+        // Issue #99's own example: `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0
+        // };` on `impl TimerSpec` is neither a function nor a member, so the surface pin and
+        // the member pin are both blind to it. Checked for every type `TIMER_TYPE_METHODS`
+        // pins, not only `TimerSpec`.
+        for (name, _) in TIMER_TYPE_METHODS {
+            let anchor = format!("impl {name} {{\n");
+            let module = tests_support::clean_timer_module().replacen(
+                &anchor,
+                &format!("{anchor}    pub const FORGE: usize = 0;\n"),
+                1,
+            );
+            let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
+                "{name}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_renumbered_clock_kind_constant_is_reported() {
         // Issue #99: `ClockKind` is a `u8` newtype, not an enum, so no member pin and no
         // method pin sees its two constants. A renumbering passes every round-trip test and
@@ -12135,6 +12197,15 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn the_real_effect_protocol_satisfies_the_rule_it_is_pinned_by() {
+        // Issue #99: the clean fixture is generated from `EFFECT_TYPE_METHODS` itself, so it
+        // cannot show that the new constant ban reads the real `impl` blocks the same way —
+        // every real method here is a `const fn`, which the ban must not mistake for a
+        // constant.
+        assert!(effect_details(&real_effect_module()).is_empty());
+    }
+
+    #[test]
     fn an_aliased_proof_type_does_not_evade_the_construction_pin() {
         // Issue #99, the effect-protocol end: `use crate::DurableIntent as Proof;`
         // followed by `Proof { .. }` inside `schedule` and `redelivering` — the textual
@@ -12292,6 +12363,25 @@ mod deferred_answer_pins {
             assert!(
                 details.iter().any(|detail| detail.contains("FORGE")),
                 "{opaque}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_associated_constant_at_any_visibility_on_a_proof_type_is_reported() {
+        // The hole review found for methods applies to a constant too: a `pub(crate)` one is
+        // reach enough for a downgrade, because `waymaker-drive` is the crate that forges.
+        for visibility in ["pub", "pub(crate)", ""] {
+            let anchor = "    /// The identity step 4 dispatches under.";
+            let source = tests_support::clean_effect_module().replacen(
+                anchor,
+                &format!("    {visibility} const FORGE: usize = 0;\n\n{anchor}"),
+                1,
+            );
+            let details = effect_details(&source);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
+                "{visibility}: {details:?}"
             );
         }
     }
@@ -13800,6 +13890,23 @@ mod deferred_answer_pins {
             violations.iter().any(|one| one.detail.contains("FORGE")),
             "{violations:?}"
         );
+    }
+
+    #[test]
+    fn an_associated_constant_at_any_visibility_on_a_boundary_type_is_reported() {
+        // The hole review found for methods applies to a constant too: a `pub(crate)` one is
+        // reach enough for a downgrade, because `waymaker-drive` lands in the same workspace.
+        for visibility in ["pub", "pub(crate)", ""] {
+            let mutant = format!(
+                "{}\nimpl Resolve<'_> {{\n    {visibility} const FORGE: usize = 0;\n}}\n",
+                real_transition_module()
+            );
+            let violations = boundary_violations(&mutant, &real_driver_module());
+            assert!(
+                violations.iter().any(|one| one.detail.contains("FORGE")),
+                "{visibility}: {violations:?}"
+            );
+        }
     }
 
     #[test]
