@@ -3136,12 +3136,18 @@ fn next_impl_line(code: &str) -> Option<usize> {
     None
 }
 
-/// The type an inherent `impl` header names, with its generics stripped.
+/// The type an inherent `impl` header names, with its generics and its path stripped.
 ///
 /// `impl<'a, C: IntegrityCheck> Sealable<'a, C>` is a block for `Sealable`, and the two
 /// angle-bracket groups mean different things: the first declares parameters and the second
 /// applies them. So the leading one is skipped by matching brackets rather than by taking
 /// the last whitespace-separated word, which reads `C>` out of exactly that header.
+///
+/// `impl crate::timer::ClockKind` names the same type as a bare `impl ClockKind` — nothing
+/// about a path-qualified self type changes which constants `ClockKind::` reaches. Codex
+/// found this on issue #99's own PR: the character scan below stopped at the first `:` and
+/// read `crate`, which matches no pinned type, so a second `impl` reached this way was
+/// invisible to every pin built on `inherent_impl_bodies`.
 fn implemented_type(header: &str) -> Option<String> {
     let after_keyword = header.strip_prefix("impl")?.trim_start();
     let rest = if after_keyword.starts_with('<') {
@@ -3164,11 +3170,24 @@ fn implemented_type(header: &str) -> Option<String> {
     } else {
         after_keyword
     };
-    let name: String = rest
+    let path: String = rest
         .chars()
-        .take_while(|character| character.is_alphanumeric() || *character == '_')
+        .take_while(|character| {
+            character.is_alphanumeric() || *character == '_' || *character == ':'
+        })
         .collect();
-    (!name.is_empty()).then_some(name)
+    let name = last_path_segment(&path)?;
+    Some(name.to_owned())
+}
+
+/// The last `::`-separated segment of a type path, empty segments skipped.
+///
+/// `crate::timer::ClockKind` and `ClockKind` name the same type; a bare name has exactly one
+/// segment and is returned unchanged. Shared by [`implemented_type`] and
+/// [`implements_trait_for`], which both used to compare a path against a bare pinned name and
+/// never match.
+fn last_path_segment(path: &str) -> Option<&str> {
+    path.rsplit("::").find(|segment| !segment.is_empty())
 }
 
 /// Whether `code` declares `header` as a struct with a braced body.
@@ -3219,13 +3238,15 @@ fn implements_trait_for(code: &str, type_name: &str) -> bool {
             continue;
         };
         // The bare name, with any generic arguments cut off: `DurableIntent` and
-        // `Dispatchable<C>` are the same type here.
+        // `Dispatchable<C>` are the same type here. And with any path stripped: `impl Forge
+        // for crate::timer::ClockKind` names `ClockKind` too, which Codex found on issue
+        // #99's own PR — the comparison below used to read the whole path and never match.
         let named = implemented
             .trim()
             .split(['<', ' ', '\n'])
             .next()
             .unwrap_or_default();
-        if named == type_name {
+        if last_path_segment(named) == Some(type_name) {
             return true;
         }
     }
@@ -12040,6 +12061,36 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("AT_PERSISTENT_TIME") && detail.contains("Self(9)")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_inherent_impl_is_not_a_second_clock_kind() {
+        // Codex, on this change's own PR: `impl crate::timer::ClockKind { .. }` names the
+        // same type as a bare `impl ClockKind { .. }`, and the character scan used to stop
+        // at the first `:` and read `crate` — a name that matches no pinned type, so this
+        // second block was invisible to `inherent_impl_bodies` and everything built on it.
+        let module = tests_support::clean_timer_module()
+            + "impl crate::timer::ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("RTC2")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_trait_impl_on_clock_kind_is_reported() {
+        // Codex, on this change's own PR: `impl Forge for crate::timer::ClockKind` names
+        // `ClockKind` too, and the old comparison read the whole path and never matched.
+        let module = tests_support::clean_timer_module()
+            + "impl Forge for crate::timer::ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
             "{details:?}"
         );
     }
