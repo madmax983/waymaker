@@ -54,7 +54,8 @@ be superseded.
 | [0043](0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md) | The model gains banked records, a reboot, and a live compaction | accepted |
 | [0044](0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
 | [0045](0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
-| [0046](0046-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md) | A torn record redelivers when its reserved slot is clean | accepted |
+| [0046](0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md) | CRC-16 folds its nibble round to a multiply, and CRC-32 stays bitwise | accepted |
+| [0047](0047-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md) | A torn record redelivers when its reserved slot is clean | accepted |
 
 ## Reading the numbers
 
@@ -73,7 +74,7 @@ of these are older than their numbers suggest:
 In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 → 0006 → 0007 → 0008
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
-0035 → 0036 → 0037 → 0038 → 0039 → 0040 → 0041 → 0042 → 0043 → 0044 → 0045 → 0046.
+0035 → 0036 → 0037 → 0038 → 0039 → 0040 → 0041 → 0042 → 0043 → 0044 → 0045 → 0046 → 0047.
 
 ## Writing one
 
