@@ -12146,6 +12146,26 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_through_a_function_local_type_alias_is_reported() {
+        // Codex, issue #92's fifth round: a `type` alias declared *inside* a helper's own
+        // body is legal Rust, and the earlier fix only walked file items and inline modules
+        // — a function-local one was invisible to it. `struct_literal_counts` now gives
+        // every block its own alias scope, so this forge is caught the same way a
+        // file-scoped one already is.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {\n\
+               \x20   type Unchecked<'a> = CheckedDispatch<'a>;\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_never_built_inside_perform_is_reported() {
         let source = tests_support::clean_effect_module().replace(
             "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",

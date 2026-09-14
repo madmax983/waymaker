@@ -212,19 +212,49 @@ pub fn use_aliases(contents: &str) -> Result<Vec<UseAlias>, syn::Error> {
     Ok(aliases)
 }
 
-fn collect_item_aliases(
-    items: &[syn::Item],
+/// Every `use` binding and `type` alias declared by `items`, recursing into inline modules.
+///
+/// A `use` alias and a `type` alias resolve the same way: both map a local name to the path
+/// it stands for, so `use Sealable as S;` followed by `S { .. }` and
+/// `type Unchecked<'a> = CheckedDispatch<'a>;` followed by `Unchecked { .. }` are one shape
+/// to every caller that resolves through this list — `struct_literal_counts`,
+/// `resolved_path_uses` and `future_trait_implementors` all do. Codex found the type-alias
+/// gap on a third round of review of issue #92's construction-site pin: a `type` alias
+/// forwarded to `CheckedDispatch`, and a literal spelled through the alias's name was
+/// invisible to a scan that resolved only `use` bindings.
+///
+/// A `type` alias's right-hand side counts only when it is a plain type path — generics on
+/// either side are not part of a struct literal's path and are dropped. A right-hand side
+/// that is not a type path (a tuple, a reference, a trait object, a qualified
+/// `<T as Trait>::Type`) introduces no alias: there is no single final segment for a struct
+/// literal to be counted against.
+///
+/// `items` need not be a whole file's items: [`struct_literal_counts`] calls this once more
+/// per block, over the items declared directly in that block's own statements, to resolve a
+/// function-local alias in the scope it is actually visible in (issue #92, Codex's fifth
+/// round: a `type` alias declared inside a function body is invisible to a scan that walks
+/// only file items and inline modules).
+fn collect_item_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
     prefix: &mut Vec<String>,
     aliases: &mut Vec<UseAlias>,
 ) {
     for item in items {
-        // A `#[cfg(test)]` import is not in the shipped code, so it resolves nothing —
+        // A `#[cfg(test)]` declaration is not in the shipped code, so it resolves nothing —
         // the structural half of what `without_test_modules` did textually (issue #51).
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
         match item {
             syn::Item::Use(use_item) => collect_tree_aliases(&use_item.tree, prefix, aliases),
+            syn::Item::Type(type_item) => {
+                if let Some(target) = type_alias_target(&type_item.ty) {
+                    aliases.push(UseAlias {
+                        local: ident_name(&type_item.ident),
+                        target,
+                    });
+                }
+            }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_item_aliases(nested, prefix, aliases);
@@ -235,61 +265,41 @@ fn collect_item_aliases(
     }
 }
 
-/// Every `use` binding and `type` alias in `items`, file scope and inline modules alike.
-///
-/// A `use` alias and a `type` alias resolve the same way: both map a local name to the path
-/// it stands for, so `use Sealable as S;` followed by `S { .. }` and
-/// `type Unchecked<'a> = CheckedDispatch<'a>;` followed by `Unchecked { .. }` are one shape
-/// to every caller that resolves through this list — `struct_literal_counts`,
-/// `resolved_path_uses` and `future_trait_implementors` all do. Codex found the type-alias
-/// gap on a third round of review of issue #92's construction-site pin: a `type` alias
-/// forwarded to `CheckedDispatch`, and a literal spelled through the alias's name was
-/// invisible to a scan that resolved only `use` bindings.
+/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
+fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => Some(
+            type_path
+                .path
+                .segments
+                .iter()
+                .map(|segment| ident_name(&segment.ident))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// [`collect_item_aliases`] over a whole file's top-level items.
 fn collect_all_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
     let mut aliases = Vec::new();
     collect_item_aliases(items, &mut Vec::new(), &mut aliases);
-    collect_type_aliases(items, &mut aliases);
     aliases
 }
 
-/// Every `type` alias in `items`, file scope and inline modules alike, whose right-hand side
-/// is a plain type path.
-///
-/// `type Unchecked<'a> = CheckedDispatch<'a>;` resolves `Unchecked` to `CheckedDispatch` the
-/// same way a `use` alias resolves an imported name — generics on either side are not part of
-/// a struct literal's path and are dropped. A right-hand side that is not a type path (a
-/// tuple, a reference, a trait object, a qualified `<T as Trait>::Type`) introduces no alias:
-/// there is no single final segment for a struct literal to be counted against.
-fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
-    for item in items {
-        // A `#[cfg(test)]` alias is not in the shipped code, matching `collect_item_aliases`.
-        if has_cfg_test(item_attrs(item)) {
-            continue;
-        }
-        match item {
-            syn::Item::Type(type_item) => {
-                if let syn::Type::Path(type_path) = type_item.ty.as_ref() {
-                    if type_path.qself.is_none() {
-                        aliases.push(UseAlias {
-                            local: ident_name(&type_item.ident),
-                            target: type_path
-                                .path
-                                .segments
-                                .iter()
-                                .map(|segment| ident_name(&segment.ident))
-                                .collect(),
-                        });
-                    }
-                }
-            }
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = module.content.as_ref() {
-                    collect_type_aliases(nested, aliases);
-                }
-            }
-            _ => {}
-        }
-    }
+/// The `use` and `type` aliases `block` declares directly in its own statements — not in a
+/// nested block, which gets its own scope when [`struct_literal_counts`]'s visitor reaches it.
+fn block_own_aliases(block: &syn::Block) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    collect_item_aliases(
+        block.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        }),
+        &mut Vec::new(),
+        &mut aliases,
+    );
+    aliases
 }
 
 fn collect_tree_aliases(
@@ -412,6 +422,43 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
             break;
         };
         let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) else {
+            break;
+        };
+        let mut resolved = alias.target.clone();
+        resolved.extend(segments.drain(1..));
+        segments = resolved;
+    }
+    segments
+}
+
+/// [`resolve_segments`], over a stack of lexical scopes rather than one flat list.
+///
+/// `scopes[0]` is the file's own top-level aliases; each later entry is one block nested
+/// inside the last, pushed on entry and popped on exit by
+/// [`struct_literal_counts`]'s visitor. A name is looked up innermost first, so a
+/// function-local `type Unchecked = Foo;` shadows a same-named alias declared outside it —
+/// the same rule a real compiler resolves a name under, and the reason this walks the stack
+/// rather than flattening it into one list: a flat list has no way to prefer the alias that
+/// is actually in scope over one of the same name declared somewhere else in the file.
+fn resolve_in_scopes(path: &syn::Path, scopes: &[Vec<UseAlias>]) -> Vec<String> {
+    let mut segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    if path.leading_colon.is_some() {
+        return segments;
+    }
+    let alias_count: usize = scopes.iter().map(Vec::len).sum();
+    for _ in 0..=alias_count {
+        let Some(first) = segments.first() else {
+            break;
+        };
+        let Some(alias) = scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.iter().find(|candidate| candidate.local == *first))
+        else {
             break;
         };
         let mut resolved = alias.target.clone();
@@ -625,13 +672,16 @@ pub fn struct_literal_counts(
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals<'aliases> {
-        aliases: &'aliases [UseAlias],
+    struct Literals {
+        // `scopes[0]` is the file's top-level aliases; a later entry is one block nested
+        // inside the last, pushed by `visit_block` and popped when it returns — see
+        // `resolve_in_scopes`.
+        scopes: Vec<Vec<UseAlias>>,
         name: String,
         count: usize,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for Literals<'_> {
+    impl<'ast> syn::visit::Visit<'ast> for Literals {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
@@ -646,8 +696,17 @@ pub fn struct_literal_counts(
             syn::visit::visit_impl_item(self, node);
         }
 
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            // A function-local `use` or `type` alias is visible only inside the block that
+            // declares it (issue #92, Codex's fifth round), so every block gets its own
+            // scope rather than one flat, file-wide list.
+            self.scopes.push(block_own_aliases(node));
+            syn::visit::visit_block(self, node);
+            self.scopes.pop();
+        }
+
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            let resolved = resolve_segments(&node.path, self.aliases);
+            let resolved = resolve_in_scopes(&node.path, &self.scopes);
             if resolved
                 .last()
                 .is_some_and(|last| last.as_str() == self.name)
@@ -659,10 +718,10 @@ pub fn struct_literal_counts(
     }
 
     let file = parse_rust(contents)?;
-    let aliases = collect_all_aliases(&file.items);
+    let file_scope = collect_all_aliases(&file.items);
 
     let mut total = Literals {
-        aliases: &aliases,
+        scopes: vec![file_scope.clone()],
         name: name.to_owned(),
         count: 0,
     };
@@ -671,7 +730,7 @@ pub fn struct_literal_counts(
     let mut inside_count = 0_usize;
     for target in inside_targets(&file, &inside) {
         let mut visitor = Literals {
-            aliases: &aliases,
+            scopes: vec![file_scope.clone()],
             name: name.to_owned(),
             count: 0,
         };
@@ -1591,6 +1650,65 @@ mod raw_identifier_tests {
         let counts = struct_literal_counts(
             "use Sealable as S; type Unchecked = S; fn forge() -> Unchecked { Unchecked {} }",
             "Sealable",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_function_local_type_alias_still_resolves() {
+        // Codex, issue #92's fifth round: a `type` alias declared *inside* a function body
+        // is legal Rust and was invisible to a scan that only walked file items and inline
+        // modules. `Unchecked` here exists only within `forge`'s block.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = Foo;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_in_a_nested_block_still_resolves() {
+        // The alias need not be at the top of the function body: an `if` arm's own block is
+        // a block too, and gets its own scope when the visitor reaches it.
+        let counts = struct_literal_counts(
+            "fn forge(flag: bool) -> u8 {\n\
+             \x20   if flag {\n\
+             \x20       type Unchecked = Foo;\n\
+             \x20       let _ = Unchecked {};\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_local_alias_does_not_leak_into_a_sibling_scope() {
+        // A block-local alias shadows only its own scope. `Unchecked` in `other` means
+        // something else, so its literal must not be counted as `Foo`.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = Foo;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }\n\
+             fn other() -> u8 {\n\
+             \x20   type Unchecked = Bar;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
             FnScope::None,
         )
         .expect("the fixture parses");

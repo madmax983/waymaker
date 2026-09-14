@@ -93,6 +93,18 @@ CheckedDispatch;` is two aliases, and a literal spelled `A { .. }` has to reach
 alone, so `EFFECT_CONSTRUCTIONS` and every other construction pin built on
 `struct_literal_counts` closed the same gap at once.
 
+A fifth round found the alias collector's own blind spot: it walked file items and inline
+modules only, so a `type` alias declared *inside* a function body — legal Rust, and
+invisible to a scan built for module-level declarations — evaded it just as the file-scoped
+one had. `struct_literal_counts` now gives every block its own alias scope: entering a block
+collects the `use` and `type` aliases declared directly in its own statements, resolves a
+name against the innermost scope that declares it — the same rule a real compiler resolves
+under, so a local alias correctly shadows a same-named one declared elsewhere in the file
+rather than the scan picking whichever declaration happens to sort first — and pops that
+scope on the way back out. The fix is still in the shared mechanism rather than bolted onto
+this one pin: the same block-scoped resolution closes the gap for every construction pin
+built on `struct_literal_counts`.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
