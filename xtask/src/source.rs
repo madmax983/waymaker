@@ -15793,6 +15793,32 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_reading_a_glob_imported_constant_bare_is_reported() {
+        // Codex's twenty-eighth-round finding: `use indices::*;` was recorded nowhere at
+        // all — the prior fix only ever read a named `use` (`use indices::{P0, ...};`),
+        // and a glob import was explicitly documented as unresolved. A match built
+        // entirely of bare names reached only through a glob is exactly as invisible to
+        // the dense-match scan as one reached through no `use` at all, and Rust resolves
+        // both the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices::*;\n\nconst fn \
+             glob_imported_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        \
+             _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_macro_declared_in_the_checksum_module_is_reported() {
         // Codex's twenty-seventh-round finding: the dense-match scan and the array ban
         // both read the syntax a macro invocation *is*, never what it expands to — `syn`

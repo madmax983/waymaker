@@ -1702,27 +1702,48 @@ impl ConstScopes {
     }
 }
 
-/// A stack of `use`-import scopes, mirroring [`ConstScopes`]: each level maps a name this
-/// scope's own `use` declarations bind — its own spelling, after any `as` rename — to the
-/// full path segments it names.
+/// One scope level's own `use` declarations: the names they bind directly — after any `as`
+/// rename — to the full path segments each names, and the prefixes any glob import in this
+/// scope names.
+#[derive(Default)]
+struct UseScope {
+    named: std::collections::HashMap<String, Vec<String>>,
+    globs: Vec<Vec<String>>,
+}
+
+/// A stack of [`UseScope`]s, mirroring [`ConstScopes`].
 ///
 /// Codex's finding: `use indices::{P0, P1};` brings `indices::P0` and `indices::P1` into
 /// scope under the bare names `P0` and `P1`, and Rust resolves a pattern spelled that way
 /// exactly as if the full path had been written out — but nothing here had ever read a
 /// `use` item at all, so an imported constant used bare read as an unresolved binding.
-struct UseScopes(Vec<std::collections::HashMap<String, Vec<String>>>);
+struct UseScopes(Vec<UseScope>);
 
 impl UseScopes {
-    /// `name`'s imported target, at the innermost scope that binds it, searching outward —
-    /// the same shadowing [`ConstScopes::resolve`] gives a bare constant, and the same
-    /// approximation: a `use` is really only visible in the module that declares it, not
-    /// automatically in every module nested inside it, but this searches the whole
+    /// `name`'s imported target, at the innermost scope that binds it directly, searching
+    /// outward — the same shadowing [`ConstScopes::resolve`] gives a bare constant, and the
+    /// same approximation: a `use` is really only visible in the module that declares it,
+    /// not automatically in every module nested inside it, but this searches the whole
     /// enclosing chain the way a bare constant reference already does here.
     fn resolve(&self, name: &str) -> Option<&[String]> {
         self.0
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).map(Vec::as_slice))
+            .find_map(|scope| scope.named.get(name).map(Vec::as_slice))
+    }
+
+    /// Every glob import's own prefix visible from here, innermost scope first — the same
+    /// shadowing order [`resolve`] searches a named import in.
+    ///
+    /// Codex's finding: `use indices::*;` was recorded nowhere at all, so a numbered
+    /// pattern reached only through a glob read as an unresolved binding exactly as an
+    /// unimported one would, and a match built entirely of glob-imported constants was
+    /// invisible to the dense-match scan.
+    fn glob_prefixes(&self) -> impl Iterator<Item = &[String]> {
+        self.0
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.globs.iter().map(Vec::as_slice))
     }
 }
 
@@ -1780,11 +1801,11 @@ fn block_const_exprs(block: &syn::Block) -> std::collections::HashMap<String, sy
         .collect()
 }
 
-/// Every `use` declared *directly* in `items`, flattened to `(bound name, full path)`
-/// pairs — not recursing into a nested `mod` or `fn`, each of which is its own scope, the
-/// same split [`item_const_exprs`] makes for a `const`.
-fn item_use_imports(items: &[syn::Item]) -> std::collections::HashMap<String, Vec<String>> {
-    let mut bound = std::collections::HashMap::new();
+/// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
+/// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
+/// [`item_const_exprs`] makes for a `const`.
+fn item_use_imports(items: &[syn::Item]) -> UseScope {
+    let mut scope = UseScope::default();
     for item in items {
         let syn::Item::Use(use_item) = item else {
             continue;
@@ -1792,16 +1813,16 @@ fn item_use_imports(items: &[syn::Item]) -> std::collections::HashMap<String, Ve
         if has_cfg_test(&use_item.attrs) {
             continue;
         }
-        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut bound);
+        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut scope);
     }
-    bound
+    scope
 }
 
 /// Every `use` declared *directly* as a local item statement in `block` — a function
 /// body's own `use indices::P0;` — the same split [`block_const_exprs`] makes for a
 /// `const`.
-fn block_use_imports(block: &syn::Block) -> std::collections::HashMap<String, Vec<String>> {
-    let mut bound = std::collections::HashMap::new();
+fn block_use_imports(block: &syn::Block) -> UseScope {
+    let mut scope = UseScope::default();
     for stmt in &block.stmts {
         let syn::Stmt::Item(syn::Item::Use(use_item)) = stmt else {
             continue;
@@ -1809,47 +1830,43 @@ fn block_use_imports(block: &syn::Block) -> std::collections::HashMap<String, Ve
         if has_cfg_test(&use_item.attrs) {
             continue;
         }
-        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut bound);
+        flatten_use_tree(&use_item.tree, &mut Vec::new(), &mut scope);
     }
-    bound
+    scope
 }
 
-/// Walks one `use` declaration's tree, appending every leaf it binds to `out` as
-/// `(bound name, full path segments)` — `prefix` is the path segments accumulated so far.
+/// Walks one `use` declaration's tree, recording every leaf it binds into `scope` —
+/// `prefix` is the path segments accumulated so far.
 ///
-/// A glob (`use indices::*;`) binds nothing here: expanding it would need every name
-/// `indices` exports, which this scan only ever learns by walking the module that
-/// declares them, and it does not attempt to join the two. A constant reached only
-/// through a glob import and used bare in a pattern stays unresolved — a stated gap, the
-/// same standing a call to a user-defined `const fn` has.
-fn flatten_use_tree(
-    tree: &syn::UseTree,
-    prefix: &mut Vec<String>,
-    out: &mut std::collections::HashMap<String, Vec<String>>,
-) {
+/// A glob (`use indices::*;`) binds no *name* here: expanding one to the names it actually
+/// exports needs the whole tree's own collected constants, which is [`resolve_pattern_path`]'s
+/// job once it has both a bare name to look up and this glob's own prefix — recording only
+/// the prefix here keeps this function a plain syntactic walk, the same as every other case
+/// in it.
+fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut UseScope) {
     match tree {
         syn::UseTree::Path(path) => {
             prefix.push(ident_name(&path.ident));
-            flatten_use_tree(&path.tree, prefix, out);
+            flatten_use_tree(&path.tree, prefix, scope);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
             let bound_name = ident_name(&name.ident);
             let mut full = prefix.clone();
             full.push(bound_name.clone());
-            out.insert(bound_name, full);
+            scope.named.insert(bound_name, full);
         }
         syn::UseTree::Rename(rename) => {
             let mut full = prefix.clone();
             full.push(ident_name(&rename.ident));
-            out.insert(ident_name(&rename.rename), full);
+            scope.named.insert(ident_name(&rename.rename), full);
         }
         syn::UseTree::Group(group) => {
             for member in &group.items {
-                flatten_use_tree(member, prefix, out);
+                flatten_use_tree(member, prefix, scope);
             }
         }
-        syn::UseTree::Glob(_) => {}
+        syn::UseTree::Glob(_) => scope.globs.push(prefix.clone()),
     }
 }
 
@@ -2327,16 +2344,42 @@ fn resolve_pattern_path(
         if let Some(value) = scopes.resolve(&name) {
             return Some(value);
         }
-        let target = use_scopes.resolve(&name)?;
-        let synthetic = syn::parse_str::<syn::Path>(&target.join("::")).ok()?;
-        return resolve_pattern_path(
-            &synthetic,
-            scopes,
-            use_scopes,
-            qualified,
-            module_path,
-            module_scope_depths,
-        );
+        if let Some(target) = use_scopes.resolve(&name) {
+            let synthetic = syn::parse_str::<syn::Path>(&target.join("::")).ok()?;
+            return resolve_pattern_path(
+                &synthetic,
+                scopes,
+                use_scopes,
+                qualified,
+                module_path,
+                module_scope_depths,
+            );
+        }
+        // Codex's finding: a name reached only through `use indices::*;` was recorded
+        // nowhere, so it fell through to here and returned `None` exactly as an
+        // unimported name would. Each glob's own prefix is tried in turn, innermost
+        // scope first — the same shadowing order a named import already gets, above —
+        // by building `prefix::name` and asking this same question of it, which lets the
+        // multi-segment branch below resolve it exactly as a fully spelled-out
+        // `indices::P0` already would.
+        for prefix in use_scopes.glob_prefixes() {
+            let mut full = prefix.to_vec();
+            full.push(name.clone());
+            let Ok(synthetic) = syn::parse_str::<syn::Path>(&full.join("::")) else {
+                continue;
+            };
+            if let Some(value) = resolve_pattern_path(
+                &synthetic,
+                scopes,
+                use_scopes,
+                qualified,
+                module_path,
+                module_scope_depths,
+            ) {
+                return Some(value);
+            }
+        }
+        return None;
     }
     let segments: Vec<String> = path
         .segments
