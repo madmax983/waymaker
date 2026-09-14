@@ -3293,5 +3293,14 @@ between which declaration answered and which one the anchor actually meant — s
 `a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor`,
 `a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor` and
 `an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test` each stand
-beside that parametrized test rather than inside it. No new ADR: nothing here moves a
-must-not-own cell, a dependency edge, or a rule id.
+beside that parametrized test rather than inside it.
+
+Round eight found an eighth: `NamedFn::line` is still only where the item *starts*, and
+nothing checks where it *ends*, so an anchor whose own end marker sits between the `fn`
+keyword and the identifier "contains" a function that is, on the rendered page, the single
+word `fn`. Left open rather than fixed here — by round eight the construction needed to
+show it is an anchor's own end marker planted inside a function signature, which is the
+kind of input this design has never claimed to survive: this function's whole positional
+check exists for authors, not adversaries. Tracked as issue
+[#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
+one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
