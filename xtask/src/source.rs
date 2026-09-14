@@ -18711,6 +18711,35 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_canonical_primitive_bound_initializers_is_reported() {
+        // Codex's next-round finding: `core::primitive::u8::MIN` names the identical
+        // constant `u8::MIN` does — `core::primitive` (and `std::primitive`) are real
+        // modules that re-export every primitive type under its own name — but
+        // `resolve_qualified_path_at_any_depth`'s own well-known fallback matched only the
+        // bare two-segment shape, so `P0` through `P3`'s initializers spelled this way
+        // stayed unresolved on every arm. `well_known_bound_segments` now reads the
+        // `(type_name, member)` pair out of either shape: `TypeName::MIN` directly, or
+        // `core::primitive::TypeName::MIN` spelled out in full.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn canonical_primitive_bound_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = core::primitive::u8::MIN;\n    \
+             const P1: u8 = core::primitive::u8::MIN + 1;\n    \
+             const P2: u8 = core::primitive::u8::MIN + 2;\n    \
+             const P3: u8 = core::primitive::u8::MIN + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_blocks_holding_a_cfg_test_statement_is_reported() {
         // Codex's next-round finding: `block_const_exprs`, `block_let_exprs` and
         // `block_ignored_let_count` each already skip a `#[cfg(test)]`-gated statement, the

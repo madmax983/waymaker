@@ -2806,6 +2806,33 @@ fn well_known_integer_bound(type_name: &str, member: &str) -> Option<i128> {
     }
 }
 
+/// The `(type_name, member)` [`well_known_integer_bound`] answers for, read out of a path's
+/// own segments in either of the two shapes Rust resolves a primitive's associated bound
+/// through: the bare `TypeName::MIN` two segments name directly, or the canonical
+/// `core::primitive::TypeName::MIN` (or `std::primitive::TypeName::MIN`) four segments spell
+/// out in full — `core::primitive` and `std::primitive` both being real modules that
+/// re-export every primitive type under its own name, not a shape this scan invents.
+///
+/// Codex's next-round finding: `resolve_qualified_path_at_any_depth`'s own well-known
+/// fallback matched only the bare two-segment shape, so `const P0: u8 =
+/// core::primitive::u8::MIN;` — legal, unambiguous Rust naming the identical constant a bare
+/// `u8::MIN` would — read as unresolved on every arm. Scoped to exactly these two shapes: a
+/// path headed by anything else four segments long (a real module a source tree happens to
+/// call `primitive`, say) is not this, and stays unresolved rather than guessed at — the
+/// qualified-map search this fallback follows is what would recognise a local shadowing
+/// module by that name instead.
+fn well_known_bound_segments(segments: &[String]) -> Option<(&str, &str)> {
+    match segments {
+        [type_name, member] => Some((type_name.as_str(), member.as_str())),
+        [root, primitive, type_name, member]
+            if (root == "core" || root == "std") && primitive == "primitive" =>
+        {
+            Some((type_name.as_str(), member.as_str()))
+        }
+        _ => None,
+    }
+}
+
 /// `expr`'s own integer literal, if it is one carrying an explicit suffix (`255u8`, never
 /// a bare `255`) — seen through any nesting of parentheses or brace groups, the same two
 /// wrappers every other literal-reading function here sees through.
@@ -4681,10 +4708,8 @@ fn resolve_qualified_path_at_any_depth(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    if let [type_name, member] = segments.as_slice() {
-        return well_known_integer_bound(type_name, member);
-    }
-    None
+    let (type_name, member) = well_known_bound_segments(&segments)?;
+    well_known_integer_bound(type_name, member)
 }
 
 fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option<i128> {
@@ -4887,10 +4912,10 @@ fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) ->
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    let [type_name, member] = segments.as_slice() else {
+    let Some((type_name, member)) = well_known_bound_segments(&segments) else {
         return false;
     };
-    if !matches!(type_name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128") {
+    if !matches!(type_name, "u8" | "u16" | "u32" | "u64" | "u128") {
         return false;
     }
     // A real declaration anywhere in the depth search above — even one that turned out to
