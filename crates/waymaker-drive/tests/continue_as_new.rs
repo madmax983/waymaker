@@ -207,6 +207,46 @@ impl Workflow for ContinueWithOversizedInput {
     }
 }
 
+/// A workflow admitting both [`WORKFLOW_VERSION`] and its successor — an image that still
+/// replays the version the retiring bank recorded, standing in for a firmware upgrade
+/// arriving mid-run.
+struct UpgradingContinueOnce;
+
+impl Workflow for UpgradingContinueOnce {
+    fn identity(&self) -> Identity<'_> {
+        let Some(versions) = VersionRange::new(WORKFLOW_VERSION, WORKFLOW_VERSION + 1) else {
+            unreachable!("a lower bound below the current version is a legal range")
+        };
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions,
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Err(boundary.continue_as_new(NEXT_INPUT))
+    }
+}
+
+/// [`JustStarted`] over [`NEXT_INPUT`], admitting only the version after
+/// [`WORKFLOW_VERSION`] — an image that has since dropped the retired version entirely.
+struct JustStartedAfterUpgrade;
+
+impl Workflow for JustStartedAfterUpgrade {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION + 1),
+            input: NEXT_INPUT,
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
 const fn scratch<'a>(page: &'a mut [u8; 512], result: &'a mut [u8; 16]) -> Scratch<'a> {
     Scratch { page, result }
 }
@@ -252,6 +292,52 @@ fn a_driver_at_a_bank_performs_a_real_swap_and_installs_the_next_run_in_the_othe
     assert_eq!(
         generation_on(&mut device, BankId::B),
         Generation::FIRST.successor()
+    );
+}
+
+#[test]
+fn continue_as_new_stamps_the_new_bank_with_the_images_current_version_not_the_retired_ones() {
+    // Codex found this. `bank.workflow_version` is the *retiring* bank's own recorded
+    // version, read back from its header rather than from this image — stamping the next
+    // bank with it silently downgrades a run this same call is meant to carry forward. A v2
+    // image continuing a v1 run has to record v2, the version `begin` would also choose for
+    // a freshly erased journal, not the v1 the old header happened to carry.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut UpgradingContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::Migrated { .. })),
+        "{progress:?}"
+    );
+
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+
+    // The sharper proof: an image that has since dropped v1 entirely still replays what the
+    // swap installed, which it could not if the header had been stamped with the retired
+    // v1 rather than the v2 this call was actually made under.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStartedAfterUpgrade,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
     );
 }
 
@@ -513,4 +599,96 @@ fn a_driver_pointed_at_a_region_still_refuses_to_swap() {
     );
 
     assert_eq!(progress, Err(DriveError::ContinueUnsupported));
+}
+
+/// Fails every erase aimed at one bank; every other call reaches the real device unchanged.
+///
+/// Stands in for §10 step 7's own erase failing — `Installed::reclaim`'s documented
+/// postcondition is that the new run stays authoritative either way, and this is what lets
+/// a test hold `swap_in` to that promise rather than to the media this device happens to
+/// model.
+struct EraseFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for EraseFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset >= region.base() && offset < region.base() + region.bytes() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_failed_reclaim_does_not_turn_a_successful_migration_into_a_failure() {
+    // Codex found this. `commit()` is the swap's own point of no return: once it returns,
+    // bank B is durably sealed and authoritative, and reclaiming bank A is cleanup rather
+    // than part of the migration — `Installed::reclaim`'s own documentation says the device
+    // has one authoritative bank, the new one, whether or not the erase lands. Reporting a
+    // failed reclaim as a failed `continue_as_new` would tell a caller the migration it just
+    // performed had not happened, when a fresh boot of this same layout would show that it
+    // had.
+    let mut device = booted();
+    let mut storage = EraseFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    let Ok(Progress::Migrated { run }) = progress else {
+        unreachable!(
+            "a failed reclaim of the retiring bank must not read back as a failed swap: \
+             {progress:?}"
+        )
+    };
+    assert_eq!(run, RunId(RUN.0 + 1));
+
+    // Bank A never actually erased — the injected failure is real, not merely reported —
+    // and bank B is authoritative anyway: the next boot of this layout replays it.
+    assert!(header_on(&mut device, BankId::A).is_some());
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: NEXT_INPUT },
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
 }

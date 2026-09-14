@@ -717,3 +717,84 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
         Err(DriveError::Kernel(KernelError::ClockWentBackwards))
     );
 }
+
+/// A workflow that asks the same deadline twice in one boot.
+///
+/// Codex's review of issue [#110](https://github.com/madmax983/waymaker/issues/110)'s pull
+/// request asked whether a real alarm firing could re-enter `Context::decide_timer` on the
+/// very `Context` its own `Stop::WaitingUntil` already halted, and hang there forever. It
+/// cannot, but not because a second ask is re-measured — it is because a second ask is not
+/// how this driver is resumed at all. `a_deadline_is_re_armed_across_a_reset_from_the_reading_history_recorded`,
+/// above, is the real mechanism: a wake means calling `Driver::boot` again, fresh, and the
+/// durable `TimerScheduled` intent is what carries the deadline to that new `Context`'s own
+/// `Recorded`/`Rearm` path. This workflow is the other half of that answer: a *second* ask
+/// inside the *same* boot must refuse exactly as the first one did, because falling through
+/// to `ReplayMachine::timer_intent` again — the call reserved for a boundary not yet open —
+/// is the one thing that must never happen here, and does not.
+struct WokenTwice {
+    input: [u8; 4],
+    spec: TimerSpec,
+}
+
+impl WokenTwice {
+    const fn waiting(spec: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            spec,
+        }
+    }
+}
+
+impl Workflow for WokenTwice {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 10,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // The first ask halts, exactly as `Napping`'s does, and is not the thing under
+        // test. The second is: the very same boundary, asked again in the same boot,
+        // standing in for `TimerFuture::poll`'s own habit of asking `wait` on every poll —
+        // which this driver never actually re-enters live, per the doc comment above.
+        let _ = boundary.wait(self.spec);
+        boundary.wait(self.spec)?;
+        Ok(Outcome::Completed(b"woke"))
+    }
+}
+
+#[test]
+fn a_boundary_asked_again_within_the_same_boot_repeats_its_own_halt_rather_than_diverging() {
+    let mut device = Device::new(geometry());
+    let mut world = Ticking::new(600);
+    let mut workflow = WokenTwice::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    // Exactly the first ask's own answer — not a kernel divergence, and not a false
+    // `Ready` reached by silently re-arming what history already recorded.
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 400),
+        "{progress:?}"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1,
+        "the second ask commits nothing new"
+    );
+}

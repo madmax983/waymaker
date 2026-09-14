@@ -1956,11 +1956,16 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         // take a fresh argument instead of keeping this one.
         let retired =
             Retired::Recovery(Recovery::<_, C>::with_integrity(bank.region, &mut *storage));
+        // The version this image writes into a new run, not the retiring bank's recorded
+        // one — `begin` makes the same choice for an erased journal. A next-run header
+        // stamped with the *retired* version would still validate today, against this same
+        // image's `verify_header_identity`; it only strands the run once a later image
+        // narrows `oldest` past a version that header never actually held any history under.
         let next_header = BankHeader {
             run: next_run,
             align: bank.align,
             workflow_kind: bank.workflow_kind,
-            workflow_version: bank.workflow_version,
+            workflow_version: self.versions.current(),
             input_schema: bank.input_schema,
             input,
         };
@@ -1970,7 +1975,16 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         let staged = prepared.stage(self.page).map_err(DriveError::SwapStep)?;
         let sealable = staged.payload_barrier().map_err(DriveError::SwapStep)?;
         let installed = sealable.commit().map_err(DriveError::SwapStep)?;
-        installed.reclaim().map_err(DriveError::SwapStep)?;
+        // `commit` is the swap's own point of no return: `next_run` is durably sealed and
+        // authoritative from here whatever happens next, per `Installed::reclaim`'s own
+        // documented postcondition — on failure "the device has one authoritative bank as
+        // well: the new one". Reclaim only ever erases the *retiring* bank, so a failure
+        // here cannot put this migration in doubt; it is not this call's to report, and
+        // folding it into `DriveError::SwapStep` would tell the caller a migration failed
+        // that a fresh boot of this same layout would show had already happened. The stale
+        // bank left behind is not stranded either — the next swap's own `prepare` erases the
+        // bank it installs into unconditionally, before writing anything.
+        let _ = installed.reclaim();
         Ok(next_run)
     }
 }
