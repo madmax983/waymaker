@@ -244,6 +244,21 @@ collection a module lookup already gets, reused rather than reimplemented.
 `a_nested_modules_alias_does_not_leak_into_the_enclosing_blocks_lookup` is the regression,
 confirmed RED against the unpatched lookup.
 
+**Review of that fix found the inverse leak in the same round: a block's own alias leaking
+into a nested module's lookup.** `visit_item_mod`, the `Literals` visitor's own traversal of
+a nested `mod`, pushed the module's items onto `self.stack` and popped them on the way out
+for module-level scoping, but never touched `self.block_items` — so a block's own local
+`type`/`use` aliases stayed visible while the visitor descended into a `mod` declared
+directly inside that block, even though real Rust never lets a nested module inherit an
+enclosing function body's local items, the mirror image of the leak above. A block declaring
+`type S = Foo;` directly and, alongside it, `mod hidden { pub struct S; fn make() -> S { S
+{} } }` had `hidden::make`'s own `S {}` resolve through the outer block's alias to `Foo`,
+when `hidden` should never see that alias at all. `visit_item_mod` now sets `block_items`
+aside with `core::mem::take` before descending into the module and restores it once the
+descent returns, the same discipline `self.stack`'s own push/pop already has.
+`a_blocks_local_alias_does_not_leak_into_a_nested_module` is the regression, confirmed RED
+against the unpatched visitor.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

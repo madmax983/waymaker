@@ -1308,7 +1308,14 @@ pub fn struct_literal_counts(
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
+            // The enclosing block's own local aliases are not visible inside a module
+            // nested within it either — a module inherits nothing from its lexical
+            // surroundings, whether that surrounding is another module or a function body
+            // (Codex review) — so `block_items` is set aside for the module's own
+            // traversal and restored once it is done, the same way `self.stack` is.
+            let enclosing_block_items = core::mem::take(&mut self.block_items);
             syn::visit::visit_item_mod(self, node);
+            self.block_items = enclosing_block_items;
             if pushed {
                 self.stack.pop();
             }
@@ -2888,6 +2895,28 @@ mod raw_identifier_tests {
         let mut sorted = found;
         sorted.sort_unstable();
         assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_blocks_local_alias_does_not_leak_into_a_nested_module() {
+        // Codex: the inverse leak from the next test below. A block-local `type S = Foo;`
+        // is not visible inside a `mod` nested in that same block — real Rust never lets a
+        // module inherit an enclosing function's local items — so `S {}` inside
+        // `hidden::make` names `hidden`'s own `S`, not `Foo`.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type S = Foo;\n\
+             \x20   mod hidden {\n\
+             \x20       pub struct S;\n\
+             \x20       fn make() -> S { S {} }\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 
     #[test]
