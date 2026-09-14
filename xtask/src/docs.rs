@@ -5383,6 +5383,102 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_whose_id_is_wrapped_in_inline_formatting_still_settles() {
+        // Codex, pull request #138, round 33, finding 1: `markdown_prose` kept every
+        // non-comment `InlineHtml` construct's own raw tag text, so a legitimate marker
+        // whose id happened to be wrapped in harmless formatting — `Settles deferred
+        // question: <span>\`id\`</span>` — was returned by `claims_in` as the literal
+        // string `<span>\`id\`</span>` rather than `id`, matching no real question and
+        // reporting the open question as still unsettled.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-id-wrapped-in-span.md".to_owned(),
+            contents: format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} <span>`{}`</span>\n",
+                clean_adr("id wrapped in span"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == question.id),
+            "a marker whose id is wrapped in inline formatting did not settle: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_raw_text_element_nested_in_a_template_does_not_settle_anything() {
+        // Codex, pull request #138, round 33, finding 2: a `<script>` or `<style>`
+        // nested inside a `<template>` is real, raw-text content — a browser stays in
+        // script-data state until that nested element's own close, so a literal
+        // `</template>`-looking string inside it (a JavaScript string, say) is not a
+        // real close of the *outer* template. The tracker previously searched only for
+        // the same tag's own reopen/close while a `<template>` was open, so it read the
+        // literal `</template>` inside the nested `<script>`'s body as the real close
+        // and exposed the marker after it — genuinely still inside the outer, still
+        // open template — as ordinary visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-script-nested-in-template.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n<script>\nlet x='</template>';\n</script>\n\
+                 {DEFERRED_QUESTION_MARKER} {}\n</template>\n",
+                clean_adr("script nested in template"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a raw-text element nested in a template settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_inline_comment_containing_tag_text_still_counts() {
+        // Codex, pull request #138, round 33, finding 3: `track_non_rendering_html`
+        // (the `Event::InlineHtml` tracker `markdown_prose` and `table_rows` share)
+        // checked whether a construct opened or closed a non-rendering element before
+        // checking whether it was a comment at all, so a self-contained inline comment
+        // whose text merely *contains* an opening tag's spelling — `<!-- <script> -->`
+        // — was read as a real `<script>` opening, hiding everything after it,
+        // including this decision, for good.
+        //
+        // `check_settled_decisions` is the vehicle, for `a_decision_after_a_commented_
+        // out_script_still_counts`'s reason: `check_deferred_questions` pre-strips
+        // comments — this one included, regardless of what is inside it — before ever
+        // reaching `markdown_prose`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\nignore this <!-- <script> --> {}\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after an inline comment containing tag text did not count: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_before_a_same_line_script_still_counts() {
         // Codex, pull request #138, round 31, finding 1: when one `Event::Html` line
         // opens and closes a non-rendering element without the whole line being

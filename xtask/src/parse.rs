@@ -952,15 +952,18 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
-    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open,
-    // if any, and how deeply — named rather than a bare flag (Codex, pull request #138,
-    // round 30) so a matching close is required: a `<script>` body containing the
-    // literal text `</style>` (a JavaScript string, say) does not end HTML parsing of
-    // the script, and closing on any of the three would resume visibility while a
-    // browser is still in script-data state. Carries a depth as well (round 31): unlike
-    // `<script>`/`<style>`, `<template>` content is parsed as ordinary HTML, so a nested
-    // `<template>` genuinely opens a second context that needs its own close first.
-    let mut open_non_rendering_tag: Option<(&'static str, u32)> = None;
+    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently
+    // open, innermost last — a stack rather than one tag, named rather than a bare flag
+    // (Codex, pull request #138, round 30) so a matching close is required: a
+    // `<script>` body containing the literal text `</style>` (a JavaScript string, say)
+    // does not end HTML parsing of the script, and closing on any of the three would
+    // resume visibility while a browser is still in script-data state. A real stack
+    // since round 33: unlike `<script>`/`<style>`, `<template>` content is parsed as
+    // ordinary HTML, so a nested `<template>` genuinely opens a second context that
+    // needs its own close first, and a `<script>` or `<style>` can itself nest inside a
+    // `<template>` and needs its own level tracked rather than scanned as more
+    // `<template>` content.
+    let mut open_non_rendering_tag: Vec<&'static str> = Vec::new();
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -980,7 +983,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         // half is passed to the helper; the full `hidden` still gates every event that has
         // no text of its own to scan for a close, such as a heading or item marker.
         let container_hidden = in_fence || blockquote_depth > 0;
-        let hidden = container_hidden || in_html_comment || open_non_rendering_tag.is_some();
+        let hidden = container_hidden || in_html_comment || !open_non_rendering_tag.is_empty();
         match event {
             Event::Start(Tag::List(kind)) => ordered_lists.push(kind.is_some()),
             Event::End(TagEnd::List(_)) => {
@@ -1102,20 +1105,19 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     }
                 }
             }
-            // Routed through the non-rendering tracker the way `table_rows` already does
-            // (Codex, round 31, finding 2): an inline `<script>`/`<style>`/`<template>`
-            // opens and closes as two separate `InlineHtml` events around its own body's
-            // ordinary `Event::Text`, so pushing every non-comment tag verbatim — with
-            // nothing updating `open_non_rendering_tag` — left the body's `Event::Text`
-            // reaching `out` unhidden in between. The tracker call runs unconditionally,
-            // first, so a state change is recorded even where `hidden` already suppresses
-            // this event's own output for an unrelated reason.
-            Event::InlineHtml(html)
-                if !track_non_rendering_html(&html, &mut open_non_rendering_tag)
-                    && !hidden
-                    && !html.starts_with("<!--") =>
-            {
-                out.push_str(&html);
+            // Never pushes the construct's own raw text (Codex, round 33, finding 1): a
+            // reader does not see `<span>`/`</span>` as characters, only the text they
+            // wrap — which already reaches `out` on its own, separately, as this
+            // element's `Event::Text`. Keeping the tag markup verbatim (as every
+            // round-18-through-31 fix here did) was only ever a stand-in for stripping
+            // it properly, and it corrupts a line-based reader like `claims_in`: a
+            // legitimate `Settles deferred question: <span>\`id\`</span>` was returned
+            // with the `<span>` tags still attached, matching no real question id. The
+            // tracker call still runs unconditionally, for every construct including a
+            // comment, so a non-rendering element's open/close (and, since round 33,
+            // finding 3, a comment never being mistaken for either) is still recorded.
+            Event::InlineHtml(html) => {
+                track_non_rendering_html(&html, &mut open_non_rendering_tag);
             }
             _ => {}
         }
@@ -1216,34 +1218,52 @@ fn opens_non_rendering_element(line: &str) -> Option<&'static str> {
     find_any_opening_tag(line, 0).map(|(_, _, tag)| tag)
 }
 
-/// Opens or closes `state` from one self-contained `Event::InlineHtml` construct —
+/// Opens or closes `stack` from one self-contained `Event::InlineHtml` construct —
 /// exactly one tag, since `CommonMark`'s inline HTML grammar matches one open tag, one
 /// close tag, or one comment per event, never a run of surrounding text — returning
 /// whether the construct was consumed as such. A caller has nothing further to do with a
 /// consumed construct: a non-rendering element's own open and close tags are not visible
-/// text either, and neither is anything else `pulldown-cmark` matched while `state` was
+/// text either, and neither is anything else `pulldown-cmark` matched while the stack was
 /// already open, since a real, uncommented `<script>` or `<style>` puts a browser in
 /// raw-text parsing mode until its own close (round 30) — no other inline construct is
 /// real HTML there, whatever `pulldown-cmark` (blind to that state) parsed it as.
 ///
-/// `<template>` nests (round 31, finding 3): `state` carries a depth, incremented on a
-/// further open of the *same*, nesting tag and decremented on each close, clearing only
-/// at zero.
-fn track_non_rendering_html(html: &str, state: &mut Option<(&'static str, u32)>) -> bool {
-    if let Some((tag, depth)) = *state {
-        if non_rendering_element_nests(tag) && opens_non_rendering_element(html) == Some(tag) {
-            *state = Some((tag, depth + 1));
-            return true;
-        }
-        if closes_non_rendering_element(html, tag) {
-            *state = (depth > 1).then_some((tag, depth - 1));
-        }
-        true
-    } else {
-        opens_non_rendering_element(html).is_some_and(|tag| {
-            *state = Some((tag, 1));
+/// A comment never opens, closes, or reopens anything, checked before any other case
+/// (Codex, round 33, finding 3): a self-contained inline comment — `<!-- <script> -->`
+/// — can contain the literal text of an opening *or* closing tag, and reaching for
+/// `opens_non_rendering_element`/`closes_non_rendering_element` without first asking
+/// whether the construct is itself a comment would read either as real.
+///
+/// `<template>` nests, and can nest a *different* non-rendering element inside it
+/// (round 31, finding 3; round 33, finding 2): unlike the raw-text `<script>`/`<style>`,
+/// its content is parsed as ordinary HTML, so `stack` is a real stack rather than one
+/// tag and a depth — a further open pushes whatever tag it names (the same tag, for
+/// plain nesting, or a different one, for a `<script>` or `<style>` nested inside a
+/// `<template>`), and only a close matching the *top* of the stack pops it, the same
+/// "close only what actually opened" discipline round 30 already applies one level up.
+fn track_non_rendering_html(html: &str, stack: &mut Vec<&'static str>) -> bool {
+    if html.starts_with("<!--") {
+        return true;
+    }
+    match stack.last().copied() {
+        Some(top) if non_rendering_element_nests(top) => {
+            if let Some(tag) = opens_non_rendering_element(html) {
+                stack.push(tag);
+            } else if closes_non_rendering_element(html, top) {
+                stack.pop();
+            }
             true
-        })
+        }
+        Some(top) => {
+            if closes_non_rendering_element(html, top) {
+                stack.pop();
+            }
+            true
+        }
+        None => opens_non_rendering_element(html).is_some_and(|tag| {
+            stack.push(tag);
+            true
+        }),
     }
 }
 
@@ -1278,59 +1298,64 @@ fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
 /// What [`next_non_rendering_marker`] found next while a non-rendering element was open.
 enum NonRenderingAdvance {
     /// A nested comment opened — only possible for a nesting element like `<template>`,
-    /// whose content is real, parsed HTML (Codex, round 32, finding 1). Not a real
-    /// reopen or close of the tracked element, and content-agnostic: everything here is
-    /// already hidden regardless of what the comment contains.
+    /// whose content is real, parsed HTML (Codex, round 32, finding 1). Not a real open
+    /// or close of anything, and content-agnostic: everything here is already hidden
+    /// regardless of what the comment contains.
     Comment(usize),
-    /// The tracked, nesting element reopened.
-    Reopen(usize),
-    /// The tracked element closed.
+    /// A non-rendering element opened — the same tag, for plain nesting, or a
+    /// *different* one, for a `<script>` or `<style>` nested inside a `<template>`
+    /// (Codex, round 33, finding 2).
+    Open(usize, &'static str),
+    /// The innermost open element closed.
     Close(usize),
 }
 
-/// The next thing relevant to a currently-open non-rendering element `tag`, at or after
-/// `cursor` in `line`.
+/// The next thing relevant to the innermost currently-open non-rendering element `top`,
+/// at or after `cursor` in `line`.
 ///
 /// For a nesting element (`<template>`, round 31, finding 3), the earliest of a comment
-/// opener, a further open of the same tag, or its close — a close tag written *inside* a
-/// comment inside the template is not a real close (round 32, finding 1):
-/// `<template><!-- </template> -->hidden</template>` keeps `hidden` inert until the
-/// real, final close. For a raw-text element (`<script>`, `<style>`), only its own
-/// close: a browser never parses anything else inside one, comment included.
-fn next_non_rendering_marker(line: &str, cursor: usize, tag: &str) -> Option<NonRenderingAdvance> {
-    let close = find_closing_tag(line, cursor, tag)
+/// opener, a further open of *any* non-rendering element (round 33, finding 2 — a
+/// `<script>` or `<style>` can nest inside a `<template>`, and its raw-text body must be
+/// tracked as its own level rather than scanned for `</template>`-looking text), or
+/// `top`'s own close — a close tag written *inside* a comment inside the template is not
+/// a real close (round 32, finding 1): `<template><!-- </template> -->hidden</template>`
+/// keeps `hidden` inert until the real, final close. For a raw-text element (`<script>`,
+/// `<style>`), only its own close: a browser never parses anything else inside one,
+/// comment or nested element included.
+fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
+    let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    if !non_rendering_element_nests(tag) {
+    if !non_rendering_element_nests(top) {
         return close.map(|(_, marker)| marker);
     }
-    let reopen = find_opening_tag(line, cursor, tag)
-        .map(|(start, end)| (start, NonRenderingAdvance::Reopen(end)));
+    let open = find_any_opening_tag(line, cursor)
+        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag)));
     let comment = line[cursor..].find("<!--").map(|offset| {
         (
             cursor + offset,
             NonRenderingAdvance::Comment(cursor + offset),
         )
     });
-    [close, reopen, comment]
+    [close, open, comment]
         .into_iter()
         .flatten()
         .min_by_key(|&(start, _)| start)
         .map(|(_, marker)| marker)
 }
 
-/// Advances past one close, one nested reopen, or one nested comment, of the
-/// non-rendering element `state` already carries — returning the new cursor, or `None`
-/// when nothing more is found before the end of `line`, meaning the rest of the line
-/// stays hidden and `state` (and `in_html_comment`, if a comment was left open) carry
-/// into the next line unchanged.
+/// Advances past one close, one nested open, or one nested comment, relative to the
+/// innermost element `stack` already carries — returning the new cursor, or `None` when
+/// nothing more is found before the end of `line`, meaning the rest of the line stays
+/// hidden and `stack` (and `in_html_comment`, if a comment was left open) carry into the
+/// next line unchanged.
 fn advance_past_non_rendering(
     line: &str,
     cursor: usize,
-    state: &mut Option<(&'static str, u32)>,
+    stack: &mut Vec<&'static str>,
     in_html_comment: &mut bool,
 ) -> Option<usize> {
-    let (tag, depth) = (*state)?;
-    match next_non_rendering_marker(line, cursor, tag)? {
+    let top = *stack.last()?;
+    match next_non_rendering_marker(line, cursor, top)? {
         NonRenderingAdvance::Comment(start) => {
             let Some(offset) = line[start..].find("-->") else {
                 *in_html_comment = true;
@@ -1338,12 +1363,12 @@ fn advance_past_non_rendering(
             };
             Some(start + offset + "-->".len())
         }
-        NonRenderingAdvance::Reopen(end) => {
-            *state = Some((tag, depth + 1));
+        NonRenderingAdvance::Open(end, tag) => {
+            stack.push(tag);
             Some(end)
         }
         NonRenderingAdvance::Close(end) => {
-            *state = (depth > 1).then_some((tag, depth - 1));
+            stack.pop();
             Some(end)
         }
     }
@@ -1370,10 +1395,16 @@ fn advance_past_non_rendering(
 /// Only the non-rendering element's own subrange is excluded from a line, not the whole
 /// event (Codex, round 31, finding 1): `<div>decision-id headline<script>hidden</script>
 /// visible suffix</div>` keeps its real prefix and suffix.
+///
+/// `open_non_rendering` is a stack rather than one tag (Codex, round 33, finding 2): a
+/// `<script>` or `<style>` can nest inside a `<template>`, and its raw-text body has to
+/// be tracked as its own level — closed only by its own matching close — rather than
+/// scanned for a `</template>`-looking substring that is really just JavaScript or CSS
+/// text.
 fn visible_html_ranges(
     line: &str,
     in_html_comment: &mut bool,
-    open_non_rendering: &mut Option<(&'static str, u32)>,
+    open_non_rendering: &mut Vec<&'static str>,
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
@@ -1393,7 +1424,7 @@ fn visible_html_ranges(
                 None => break,
             }
         }
-        if open_non_rendering.is_some() {
+        if !open_non_rendering.is_empty() {
             match advance_past_non_rendering(line, cursor, open_non_rendering, in_html_comment) {
                 Some(end) => {
                     cursor = end;
@@ -1417,7 +1448,7 @@ fn visible_html_ranges(
             }
             Some(HidingMarker::Tag(start, end, tag)) => {
                 ranges.push(cursor..start);
-                *open_non_rendering = Some((tag, 1));
+                open_non_rendering.push(tag);
                 cursor = end;
             }
         }
@@ -1626,22 +1657,25 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // is reused for the state transition alone: called with `hidden: true`, it never
     // writes anywhere; called for the state transition alone.
     let mut in_html_comment = false;
-    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open at
-    // block level, if any, and how deeply (Codex, pull request #138, round 30):
+    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently open
+    // at block level, innermost last, if any (Codex, pull request #138, round 30):
     // `<div>\n<script>\n\n- Status: accepted\n\n</script>\n</div>` outlives its own
     // `HtmlBlock` across the blank line the same way an unterminated comment does —
     // `pulldown-cmark` ends the block there and resumes the decoy item as an ordinary,
     // structurally separate one, even though a browser is still in script-data state
     // until the real `</script>` two lines later. Folded into `hidden` below so
     // `Start(Tag::Item)` never begins collecting such an item at all, the same
-    // disqualification a fence or blockquote already gets. Carries a depth as well
-    // (round 31): a nested `<template>` genuinely opens a second context, unlike
-    // `<script>`/`<style>`'s raw-text parsing.
-    let mut open_non_rendering_tag: Option<(&'static str, u32)> = None;
+    // disqualification a fence or blockquote already gets. A real stack since round 33:
+    // a nested `<template>` genuinely opens a second context, unlike
+    // `<script>`/`<style>`'s raw-text parsing, and either of those can itself nest
+    // inside a `<template>` and needs its own level tracked.
+    let mut open_non_rendering_tag: Vec<&'static str> = Vec::new();
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
-        let hidden =
-            in_fence || blockquote_depth > 0 || in_html_comment || open_non_rendering_tag.is_some();
+        let hidden = in_fence
+            || blockquote_depth > 0
+            || in_html_comment
+            || !open_non_rendering_tag.is_empty();
         if collecting && paragraph_closed && matches!(event, Event::Start(_)) {
             collecting = false;
         }
@@ -1795,18 +1829,21 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // it by real HTML rules until an actual `-->` appears. `visible_html_ranges` is
     // called for the state transition alone; nothing between cells is ever read.
     let mut in_html_comment = false;
-    // The non-rendering element (`<script>`, `<style>` or `<template>`) currently open
-    // inside a cell, if any, and how deeply (Codex, pull request #138, round 30): this
+    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently open
+    // inside a cell, innermost last, if any (Codex, pull request #138, round 30): this
     // parser is independent of `markdown_prose`'s own non-rendering handling (rounds
     // 27-29), and a required value placed inside one of these three elements is
     // invisible to a reader the same way a comment is, but was still copied into the
-    // cell verbatim. Carries a depth as well (round 31): a nested `<template>` genuinely
-    // opens a second context, unlike `<script>`/`<style>`'s raw-text parsing.
-    let mut open_non_rendering_tag: Option<(&'static str, u32)> = None;
+    // cell verbatim. A real stack since round 33: a nested `<template>` genuinely opens
+    // a second context, unlike `<script>`/`<style>`'s raw-text parsing, and either of
+    // those can itself nest inside a `<template>` and needs its own level tracked.
+    let mut open_non_rendering_tag: Vec<&'static str> = Vec::new();
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
-        let hidden =
-            in_fence || blockquote_depth > 0 || in_html_comment || open_non_rendering_tag.is_some();
+        let hidden = in_fence
+            || blockquote_depth > 0
+            || in_html_comment
+            || !open_non_rendering_tag.is_empty();
         match event {
             Event::Html(html) => {
                 visible_html_ranges(&html, &mut in_html_comment, &mut open_non_rendering_tag);
@@ -1851,10 +1888,10 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // is why `open_non_rendering_tag` (round 30) is checked explicitly here
             // rather than folded into `in_row`: it can open *partway through* a row
             // already started, from an inline `<script>` in this very cell.
-            Event::Text(text) if in_row && open_non_rendering_tag.is_none() => {
+            Event::Text(text) if in_row && open_non_rendering_tag.is_empty() => {
                 cell.push_str(&text);
             }
-            Event::Code(code) if in_row && open_non_rendering_tag.is_none() => {
+            Event::Code(code) if in_row && open_non_rendering_tag.is_empty() => {
                 cell.push('`');
                 cell.push_str(&code);
                 cell.push('`');
@@ -1866,7 +1903,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // whose required value is the link target rather than its label must still
             // carry that value for `.contains` to find.
             Event::Start(Tag::Link { dest_url, .. })
-                if in_row && open_non_rendering_tag.is_none() =>
+                if in_row && open_non_rendering_tag.is_empty() =>
             {
                 cell.push_str(&dest_url);
                 cell.push(' ');
