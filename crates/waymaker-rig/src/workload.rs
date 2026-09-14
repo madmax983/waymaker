@@ -88,17 +88,25 @@ impl Workload {
         }
     }
 
-    /// This workload, but the schedule record at `index` declares a different activity
-    /// kind.
+    /// This workload, but `effect`'s schedule record declares a different activity kind.
     ///
     /// Everything else stays the same: the run identity, the record count, and every other
     /// record's bytes. This is what a firmware upgrade that changed one boundary looks like
     /// on the wire — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
     /// replay-divergence row.
+    ///
+    /// Takes the effect this run schedules rather than a raw record index, and derives the
+    /// index itself through [`schedule_index`](Self::schedule_index): [`record`](Self::record)
+    /// consults `divergent` only from the `Role::Schedule` arm, so a raw index naming a
+    /// `Start`, `Completion` or `Finish` record — or one past the end of the run — used to
+    /// produce a workload that agreed with the base one everywhere, silently, rather than
+    /// diverging at all. An `effect` this run does not schedule — `effect >= effects` —
+    /// still diverges nothing, and honestly: there is no schedule record for it to disagree
+    /// at, which [`schedule_index`](Self::schedule_index) already answers `None` for.
     #[must_use]
-    pub const fn diverging(self, index: u16) -> Self {
+    pub const fn diverging(self, effect: u16) -> Self {
         Self {
-            divergent: Some(index),
+            divergent: self.schedule_index(effect),
             ..self
         }
     }

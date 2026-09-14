@@ -1355,7 +1355,7 @@ fn row_ten() -> Row {
     let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
         unreachable!("a run of two effects schedules a second one")
     };
-    let declared = rig.workload(0).diverging(diverging_at);
+    let declared = rig.workload(0).diverging(1);
 
     let mut checked = 0_usize;
     for (run, entered) in runs.iter().zip(&logs) {
@@ -2753,7 +2753,7 @@ fn resume_declaring_refuses_a_divergent_record_it_would_write_fresh() {
     let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
         unreachable!("a run of two effects schedules a second one")
     };
-    let declared = rig.workload(0).diverging(diverging_at);
+    let declared = rig.workload(0).diverging(1);
 
     let mut checked = 0_usize;
     for (run, entered) in runs.iter().zip(&logs) {
@@ -2903,7 +2903,7 @@ fn resume_declaring_refuses_before_running_any_record_that_agrees_ahead_of_the_d
     let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
         unreachable!("a run of two effects schedules a second one")
     };
-    let declared = rig.workload(0).diverging(diverging_at);
+    let declared = rig.workload(0).diverging(1);
 
     let mut checked = 0_usize;
     for (run, entered) in runs.iter().zip(&logs) {

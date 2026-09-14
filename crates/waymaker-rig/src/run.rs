@@ -1349,9 +1349,9 @@ impl Rig {
     /// instead of the workload `iteration` derives.
     ///
     /// Models replay divergence: a firmware whose declared workflow no longer agrees with a
-    /// run already on media. Pass `self.workload(iteration).diverging(at)` for `declared` to
-    /// change one schedule record's activity kind and leave the rest of the run untouched —
-    /// issue [#96](https://github.com/madmax983/waymaker/issues/96)'s row 10.
+    /// run already on media. Pass `self.workload(iteration).diverging(effect)` for `declared`
+    /// to change one schedule record's activity kind and leave the rest of the run untouched
+    /// — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s row 10.
     ///
     /// # Errors
     ///

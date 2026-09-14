@@ -3829,7 +3829,25 @@ answered `Refusal::OverDeclaredBound` at its completion's index, and `resume_res
 did the same from a device recovered no further than `RunStarted`, where the main loop
 rather than the redelivery branch reaches the fresh schedule.
 
-A ninth returned to round 7's write-path check, and it is one identity narrower than the
+A ninth, and a different shape from every one before it: `Workload::diverging` took a raw
+record index rather than an effect number, and `record`'s only consultation of it is in
+the `Role::Schedule` arm — so a caller who passed the index of a `Start`, `Completion` or
+`Finish` record, or one past the end of the run, got back a workload that agreed with the
+base one everywhere, byte for byte, rather than diverging at all. That is the same
+silent-masking shape every earlier finding in this issue closed against a media state;
+here the wrong input is a caller's own argument, and the fix is the same kind wrong-role
+arguments elsewhere in this codebase are refused by construction: `diverging` now takes
+the effect whose schedule diverges and derives the record index itself through
+`schedule_index`, so a `Start`, `Completion` or `Finish` index cannot be named through
+this API at all. An effect this run does not schedule still diverges nothing — honestly,
+since there is no schedule record for it to disagree at, which `schedule_index` already
+answers `None` for. Reproduced first against the old signature: `.diverging(0)` — record
+index 0, `Role::Start` — produced a workload indistinguishable from the base one across
+every record, and every existing caller turned out to have already been deriving the
+right index through `schedule_index` before calling it, so none needed anything but the
+one call site simplified to the effect number it was computing a schedule index from.
+
+A tenth returned to round 7's write-path check, and it is one identity narrower than the
 round it followed: `journal_region` compared `header.run` against the workload's own run
 id and stopped there, so a bank whose header names the right run but a different
 `workflow_kind` or `input` still passed. A run id agreeing is not the whole of a
