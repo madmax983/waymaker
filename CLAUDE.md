@@ -437,7 +437,7 @@ the bytes there are neither erased nor a real seal, so recovery still cannot tel
 interrupted append from damage — and that half of the row still refuses, exactly as
 [ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
 says of a bank recovery cannot vouch for. The test sweeps both outcomes. See
-[ADR 0045](docs/adr/0045-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
+[ADR 0046](docs/adr/0046-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 The four `Owed` rows are the rig's, not the model's: a swap workload, a capacity refusal and a
 divergent replay are things this rig does not do — issue
@@ -2397,7 +2397,7 @@ could — recovery had no way to tell an interrupted append from damage, so both
 bank, and the table's own continuation was `continue_as_new`, a new run that forfeits the
 effect's identity. [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
 recorded the deviation; issue #95 and
-[ADR 0045](docs/adr/0045-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
+[ADR 0046](docs/adr/0046-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
 close most of it, below.
 
 Issue #32 opens rung 0.5, and what it asks for is one sentence from §11 made structural: a
