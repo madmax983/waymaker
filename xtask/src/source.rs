@@ -8334,6 +8334,25 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
 
     for parameter in INTEGRITY_CHECK_PARAMETERS {
         let header = format!("fn {}", parameter.function);
+        // Before the body: `braced_body` reads the *first* declaration, so a decoy
+        // declared earlier in the file — or in a private nested module, importing the
+        // real helper from `super` — leaves this pin checking a function nobody ships
+        // while the shipped one computes something else entirely. `check_boundary_type`
+        // guards the same shape; this is the same guard for the checksum module's own
+        // parameters.
+        let declarations = declaration_count(&code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
+                     once; the parameter pin reads the first declaration, so a decoy — in \
+                     a nested module, say — leaves it checking a function nobody ships",
+                ),
+            ));
+            continue;
+        }
         let Some(body) = braced_body(&code, &header) else {
             violations.push(Violation::new(
                 RULE,
@@ -8496,6 +8515,23 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
     for table in INTEGRITY_CHECK_TABLES {
         let header = format!("fn {}", table.function);
+        // Same guard as the parameter loop above, and for the same reason: a decoy
+        // declared anywhere else in the file — a private nested module reusing the real
+        // helper is Codex's example — would otherwise leave `braced_body`'s first match
+        // pinning a table that is not the one the shipped `Catalogued` binding calls.
+        let declarations = declaration_count(code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
+                     once; the table pin reads the first declaration, so a decoy — in a \
+                     nested module, say — leaves it checking a function nobody ships",
+                ),
+            ));
+            continue;
+        }
         let Some(body) = braced_body(code, &header) else {
             violations.push(Violation::new(
                 RULE,
@@ -8535,6 +8571,23 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
         // slower on the workloads ADR 0044 profiled.
         for header_name in [table.function, table.helper] {
             let header = format!("fn {header_name}");
+            // `declares_inline_always` also reads the first declaration it finds; a
+            // decoy `{header_name}` elsewhere in the tree — nested-module or otherwise —
+            // would let it vouch for an attribute on a function nobody ships.
+            let declarations = declaration_count(code, &header);
+            if declarations != 1 {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, \
+                         not once; the inline-attribute pin reads the first declaration, \
+                         so a decoy — in a nested module, say — leaves it checking a \
+                         function nobody ships",
+                    ),
+                ));
+                continue;
+            }
             if !declares_inline_always(code, &header) {
                 violations.push(Violation::new(
                     RULE,
@@ -8600,6 +8653,26 @@ fn check_integrity_check_routing(code: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
     for route in INTEGRITY_CHECK_ROUTING {
         let header = format!("fn {}", route.function);
+        // Codex's finding: a private nested module placed before the real checksum,
+        // giving it an exact copy of `crc32` with the helper imported from `super`, lets
+        // `braced_body`'s first-match search pin that decoy while the shipped
+        // `Catalogued` binding still resolves the module-scope `crc32` — every other
+        // check here stays green while the shipped function computes something else
+        // entirely. Counting declarations closes it the same way `check_boundary_type`
+        // already does for a pinned type.
+        let declarations = declaration_count(code, &header);
+        if declarations != 1 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
+                     once; the routing pin reads the first declaration, so a decoy — in a \
+                     nested module, say — leaves it checking a function nobody ships",
+                ),
+            ));
+            continue;
+        }
         let Some(body) = braced_body(code, &header) else {
             violations.push(Violation::new(
                 RULE,
@@ -8979,9 +9052,9 @@ fn parse_integer_literal(text: &str) -> Option<u128> {
 }
 
 /// Whether `parsed`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: `0` through `n - 2` in order, whatever base or suffix each is
-/// spelled with, then a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms
-/// in total.
+/// into a lookup table: `0` through `n - 2`, whatever base or suffix each is spelled with
+/// and in whatever order they are *written*, covering every value exactly once, then a
+/// final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
 /// Independent of what each arm's own *value* is — a call, a bare literal, anything else —
 /// because a lookup table is exactly as much of one whichever shape backs it: `0 =>
@@ -8991,6 +9064,17 @@ fn parse_integer_literal(text: &str) -> Option<u128> {
 /// a call missed exactly that: a match whose arms are dense but whose values are literals
 /// compiles into the same rodata and is invisible to the array ban, which never sees a
 /// `match` at all.
+///
+/// Also independent of the *order* the numbered arms are written in. Codex found, on review
+/// of the pull request that added the nibble-table pin, that comparing each arm's pattern
+/// against its own position in the source — `patterns[0]` must read `0`, `patterns[1]` must
+/// read `1`, and so on — let a match that listed the same complete, singleton set of
+/// patterns out of order, such as `1 => .., 0 => .., 2 => ..`, walk past this check entirely
+/// and so past the module-wide scan it backs: LLVM's switch-to-lookup-table pass does not
+/// care what order a `match`'s arms are written in, only that the patterns it sees are
+/// dense. This now normalises each numbered pattern to its own literal value and checks
+/// that the *set* of them is exactly `0..n - 1`, with no gap and no value repeated, rather
+/// than reading position as identity.
 #[must_use]
 fn has_dense_arm_patterns(parsed: &[DenseArm]) -> bool {
     let Some(last) = parsed.len().checked_sub(1) else {
@@ -8999,21 +9083,32 @@ fn has_dense_arm_patterns(parsed: &[DenseArm]) -> bool {
     if parsed.len() < MINIMUM_DENSE_TABLE_ARMS {
         return false;
     }
-    for (index, arm) in parsed.iter().enumerate() {
-        if index == last {
-            if arm.pattern != "_" {
-                return false;
-            }
-            continue;
-        }
-        let Ok(expected) = u128::try_from(index) else {
+    let Some(wildcard) = parsed.get(last) else {
+        return false;
+    };
+    if wildcard.pattern != "_" {
+        return false;
+    }
+    let Some(numbered) = parsed.get(..last) else {
+        return false;
+    };
+    let mut covered = vec![false; last];
+    for arm in numbered {
+        let Some(value) = parse_integer_literal(&arm.pattern) else {
             return false;
         };
-        if parse_integer_literal(&arm.pattern) != Some(expected) {
+        let Ok(value) = usize::try_from(value) else {
+            return false;
+        };
+        let Some(slot) = covered.get_mut(value) else {
+            return false;
+        };
+        if *slot {
             return false;
         }
+        *slot = true;
     }
-    true
+    covered.into_iter().all(|seen| seen)
 }
 
 /// Whether `expression` is a call `callee(argument)`, both trimmed — the one value shape
@@ -9033,22 +9128,37 @@ fn call_shape(expression: &str) -> Option<(&str, &str)> {
     Some((callee, argument))
 }
 
-/// Whether every one of `parsed`'s arms calls one consistent callee with its own index as
-/// the sole argument — the exact value shape [`INTEGRITY_CHECK_TABLES`] pins, checked only
-/// once [`has_dense_arm_patterns`] has already said the patterns are dense. Returns the
-/// callee when it is, so a caller can compare it and the arm count against
+/// Whether every one of `parsed`'s arms calls one consistent callee with its own pattern's
+/// value as the sole argument — the exact value shape [`INTEGRITY_CHECK_TABLES`] pins,
+/// checked only once [`has_dense_arm_patterns`] has already said the patterns are dense.
+/// Returns the callee when it is, so a caller can compare it and the arm count against
 /// [`INTEGRITY_CHECK_TABLES`] without caring which function, or which selector, the match
 /// happens to sit under. The argument is compared by [`parse_integer_literal`]'s value
 /// rather than by spelling, for [`has_dense_arm_patterns`]'s reason.
+///
+/// Each arm's expected argument is read from *that arm's own pattern* — the wildcard arm's
+/// from the arm count, since [`has_dense_arm_patterns`] already requires it to be the one
+/// value the numbered patterns leave uncovered — rather than from the arm's position in
+/// `parsed`. Codex's finding against [`has_dense_arm_patterns`] applies here unchanged: a
+/// match whose arms are written `1 => helper(1), 0 => helper(0), 2 => helper(2), ..` is the
+/// same table with its arms reordered, and comparing an argument against the position it
+/// happens to sit at would call it a mismatch — or, worse, a *differently* reordered value
+/// half (`1 => helper(0), 0 => helper(1), ..`) would satisfy a positional check by
+/// coincidence while calling the wrong function for each pattern.
 #[must_use]
 fn call_shaped_uniformly(parsed: &[DenseArm]) -> Option<&str> {
+    let last = parsed.len().checked_sub(1)?;
     let callee = call_shape(&parsed.first()?.value)?.0;
     for (index, arm) in parsed.iter().enumerate() {
         let (this_callee, argument) = call_shape(&arm.value)?;
-        let expected = u128::try_from(index).ok()?;
         if this_callee != callee {
             return None;
         }
+        let expected = if index == last {
+            u128::try_from(last).ok()?
+        } else {
+            parse_integer_literal(&arm.pattern)?
+        };
         if parse_integer_literal(argument) != Some(expected) {
             return None;
         }
@@ -15155,6 +15265,87 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_arms_out_of_source_order_is_reported() {
+        // Codex's eighth-round finding: `has_dense_arm_patterns` compared each arm's
+        // pattern against its own *position* in the source — arm 0 had to read `0`, arm
+        // 1 had to read `1`, and so on — so a match listing the same complete, singleton
+        // set of patterns in a different order, such as `1 => .., 0 => .., 2 => ..`,
+        // failed that comparison at the very first arm and was silently treated as not
+        // dense at all: no violation, and no count toward the pinned table's own tally
+        // either. LLVM's switch-to-lookup-table pass does not care what order a
+        // `match`'s arms are written in, only that the patterns are dense, so a second
+        // real lookup table could have hidden here by nothing more than reordering its
+        // arms. The patterns are now normalised to a set and checked for complete,
+        // gap-free, duplicate-free coverage independent of where each is written.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn reordered_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             1 => crc32_nibble(1),\n        0 => crc32_nibble(0),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_swapped_out_of_order_call_arguments_is_reported() {
+        // The sharper half of the same finding: an arm's expected call argument used to
+        // be read from its *position* too, so two arms that swapped both their pattern
+        // and their call argument together — `1 => crc32_nibble(1), 0 =>
+        // crc32_nibble(0), ..` written as `0 => crc32_nibble(1), 1 => crc32_nibble(0),
+        // ..` — would have satisfied a positional comparison by coincidence while
+        // calling the wrong helper index for each pattern. Reading each arm's expected
+        // argument from that arm's own pattern, rather than from its position, is what
+        // this reports on now: this match is dense but not uniform, and it is not the
+        // pinned table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn swapped_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => crc32_nibble(1),\n        1 => crc32_nibble(0),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_checksum_declared_in_a_nested_module_is_reported() {
+        // Codex's eighth-round finding: a private nested module placed before the real
+        // checksum, declaring an exact copy of it under the same name — with the helper
+        // imported from `super` — lets `braced_body`'s first-match search pin the decoy
+        // while the shipped `Catalogued` binding still resolves the module-scope
+        // function of the same name. Every check in this module stays green while the
+        // function that actually ships computes something else entirely. Counting
+        // declarations before `braced_body` is asked which one to read closes it, the
+        // same way `check_boundary_type` already guards a pinned type against a decoy.
+        let mut source = String::from(
+            "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const fn crc32(bytes: \
+             &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        let _ = \
+             crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n",
+        );
+        source.push_str(&tests_support::clean_checksum_module());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `fn crc32` 2 times, not once")),
             "{violations:?}"
         );
     }
