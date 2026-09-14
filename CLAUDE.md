@@ -1175,7 +1175,15 @@ Stated so that nobody mistakes silence for coverage:
   was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
-  they pin. Nor does
+  they pin. Module descent (issue #169) inherits this scanner's oldest limit rather than
+  adding a new one: `resolve_segments` has never tracked a function body's own scope, so a
+  generic parameter or a block-local item named the same as a `use` alias was already able to
+  shadow it unsoundly before #169 existed, and a sibling `mod` block reached the same way now
+  can be shadowed the same way (issue
+  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). Closing it
+  needs generic parameter lists and block-local scopes to become scopes of their own, ahead of
+  every module-level lookup — a materially larger mechanism than anything here today, the same
+  standing #169 itself had on PR #160 before it was filed rather than chased. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
   function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
   a later occurrence meant. Picking the first-declared alias can silently miss a real match;
