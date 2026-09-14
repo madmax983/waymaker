@@ -1,4 +1,4 @@
-# ADR 0046: A durable intent carries its request, and `perform` checks it
+# ADR 0047: A durable intent carries its request, and `perform` checks it
 
 - Status: accepted
 - Date: 2026-09-14

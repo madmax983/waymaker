@@ -359,6 +359,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     ));
     violations.extend(size::check_probe_reach(
         &inputs.layer_sources,
+        &graph,
         inputs.probe_source.as_deref(),
     ));
     violations.extend(emulate::check_emulation_boot(

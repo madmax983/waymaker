@@ -7284,6 +7284,9 @@ fn check_module_functions(
 }
 
 /// One module declares exactly the public functions its pin lists.
+///
+/// Reads through `public_functions`, not `public_functions_reachable` — see
+/// [`check_pinned_surface`]'s doc for what that leaves open.
 fn check_dispatch_surface(
     rule: &'static str,
     subject: &str,
@@ -9350,6 +9353,12 @@ pub(crate) fn without_test_modules(code: &str) -> String {
 ///
 /// Scanned with the same reader `size-probe-reach` uses, so `#[cfg(test)]` helpers are
 /// skipped and a trait method counts even without `pub` on it.
+///
+/// It reads through `crate::size::public_functions`, not
+/// `crate::size::public_functions_reachable`: this call has no `PackageGraph` in hand. So
+/// a private trait here can still hide a live impl of a real dependency's trait, the same
+/// gap issue [#141](https://github.com/madmax983/waymaker/issues/141) closed for
+/// `size-probe-reach`. No pin in this workspace declares a private trait today.
 #[must_use]
 fn check_pinned_surface(
     rule: &'static str,
