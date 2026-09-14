@@ -1422,25 +1422,54 @@ fn blank_string_literal_tree(tree: proc_macro2::TokenTree) -> proc_macro2::Token
     }
 }
 
-/// Drops every macro invocation's argument tokens from `stream`.
+/// True if `tree` is the identifier `macro_rules`.
+fn is_macro_rules_keyword(tree: &proc_macro2::TokenTree) -> bool {
+    matches!(tree, proc_macro2::TokenTree::Ident(ident) if ident == "macro_rules")
+}
+
+/// Drops every macro invocation's argument tokens, and every local macro definition's
+/// body, from `stream`.
 ///
-/// `syn` does not expand macros (this module's own header states the limit). A macro
-/// argument might never run as code: `stringify!(crc32(input))` does not call `crc32`.
-/// It turns the argument's tokens into a string at compile time. A call-boundary scan
-/// cannot tell this case from a real call, so this function drops the argument instead
-/// of rendering it. The macro's name and its `!` stay, so a real call right after a
-/// macro invocation in the same statement still renders at its own token boundary.
+/// `syn` does not expand macros (this module's own header states the limit). Neither a
+/// macro argument nor a macro definition's body runs as code on its own:
+/// `stringify!(crc32(input))` does not call `crc32`, and a local
+/// `macro_rules! spoof { () => { crc32(input) } }` does not either unless something
+/// invokes `spoof!()`. A call-boundary scan cannot tell either case from a real call, so
+/// this function drops both instead of rendering them. A macro's own name, and its `!`,
+/// stay — so a real call right after a macro in the same statement still renders at its
+/// own token boundary.
 ///
-/// A macro invocation is matched by shape: an identifier, then `!`, then a delimited
-/// group. Rust grammar has no other reading of that shape — a bare `!` never follows an
-/// identifier with nothing between them except as a macro call. The logical-not `!` is
-/// a prefix operator and always needs an operator, a delimiter, or the start of an
-/// expression before it, never an identifier.
+/// Both shapes are matched by their tokens alone, and each is the only construct Rust
+/// grammar has with that shape:
+///
+/// - **A macro invocation**: an identifier, then `!`, then a delimited group. A bare `!`
+///   never follows an identifier with nothing between them except as a macro call — the
+///   logical-not `!` is a prefix operator and always needs an operator, a delimiter, or
+///   the start of an expression before it, never an identifier.
+/// - **A macro definition**: the identifier `macro_rules`, then `!`, then the macro's
+///   own name, then a delimited group holding its rules.
 fn blank_macro_arguments(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
     let mut kept: Vec<proc_macro2::TokenTree> = Vec::with_capacity(tokens.len());
     let mut rest: &[proc_macro2::TokenTree] = &tokens;
     loop {
+        if let [
+            keyword,
+            proc_macro2::TokenTree::Punct(bang),
+            name @ proc_macro2::TokenTree::Ident(_),
+            proc_macro2::TokenTree::Group(group),
+            after @ ..,
+        ] = rest
+            && bang.as_char() == '!'
+            && is_macro_rules_keyword(keyword)
+        {
+            kept.push(keyword.clone());
+            kept.push(proc_macro2::TokenTree::Punct(bang.clone()));
+            kept.push(name.clone());
+            kept.push(blanked_group(group));
+            rest = after;
+            continue;
+        }
         if let [
             name @ proc_macro2::TokenTree::Ident(_),
             proc_macro2::TokenTree::Punct(bang),
@@ -1451,10 +1480,7 @@ fn blank_macro_arguments(stream: proc_macro2::TokenStream) -> proc_macro2::Token
         {
             kept.push(name.clone());
             kept.push(proc_macro2::TokenTree::Punct(bang.clone()));
-            let mut emptied =
-                proc_macro2::Group::new(group.delimiter(), proc_macro2::TokenStream::new());
-            emptied.set_span(group.span());
-            kept.push(proc_macro2::TokenTree::Group(emptied));
+            kept.push(blanked_group(group));
             rest = after;
             continue;
         }
@@ -1465,6 +1491,13 @@ fn blank_macro_arguments(stream: proc_macro2::TokenStream) -> proc_macro2::Token
         rest = after;
     }
     kept.into_iter().collect()
+}
+
+/// An empty group with `group`'s own delimiter and span.
+fn blanked_group(group: &proc_macro2::Group) -> proc_macro2::TokenTree {
+    let mut emptied = proc_macro2::Group::new(group.delimiter(), proc_macro2::TokenStream::new());
+    emptied.set_span(group.span());
+    proc_macro2::TokenTree::Group(emptied)
 }
 
 /// [`blank_macro_arguments`], one token at a time, for a token that does not start a
