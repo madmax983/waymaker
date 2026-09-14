@@ -430,6 +430,7 @@ dependencies = [
 name = "waymaker-emu"
 version = "0.0.0"
 dependencies = [
+ "cortex-m",
  "cortex-m-rt",
  "cortex-m-semihosting",
  "embedded-storage",

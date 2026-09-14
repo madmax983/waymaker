@@ -59,8 +59,13 @@ pulldown-cmark = { version = "0.13.3", default-features = false }
 quote = "1"
 # Reading a `macro_rules!` body for a nested `include!` walks `syn::Macro`'s opaque
 # token stream, which is `proc-macro2`'s type. Comes along with `syn`; named here so
-# the `use` is a direct dependency rather than a transitive accident.
-proc-macro2 = "1"
+# the `use` is a direct dependency rather than a transitive accident. `span-locations`
+# is what lets `book`'s scanner read a real source line off a parsed item's span
+# instead of re-finding it with a second, independent text search (issue #97, Codex
+# review round 5): outside an actual proc-macro, this crate is the fallback
+# implementation, and the fallback only tracks a span's line and column when this
+# feature is on.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 # The compile-fail test for the kernel-state assertion reads the budget from the crate
 # that declares it rather than restating the number it expects to be rejected.
