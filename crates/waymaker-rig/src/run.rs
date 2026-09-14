@@ -1009,6 +1009,11 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            admits(&reserved, &record).map_err(RigError::Capacity)?;
+
             self.mark(
                 part,
                 &mut witness,
@@ -1017,9 +1022,6 @@ impl Rig {
             )
             .map_err(widen)?;
 
-            let Some(record) = workload.record(index, &mut record_page) else {
-                return Err(RigError::Workload);
-            };
             self.append_reserved(part, &mut reserved, &record, page)
                 .map_err(widen)?;
 
@@ -1420,12 +1422,14 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
-            let mark = Mark::new(iteration, index, Stage::Attempted);
-            self.mark_above(part, &mut witness, &mut known, mark, page)
-                .map_err(widen)?;
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
+            admits(&reserved, &record).map_err(RigError::Capacity)?;
+
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
             self.append_reserved(part, &mut reserved, &record, page)
                 .map_err(widen)?;
             let mark = Mark::new(iteration, index, Stage::Acknowledged);
@@ -1799,6 +1803,15 @@ const fn finish(audit: Audit, banks: usize) -> Verdict {
         recovered,
         banks,
     }
+}
+
+/// Whether `reserved`'s gate would admit `record`, reading nothing from the device.
+///
+/// Called before any witness mark for `record` is written. Without this, a capacity
+/// refusal that [`Reserved::stage`] would have caught still lets the caller's witness mark
+/// land first — a real mutation, on the one row §10 promises none for.
+fn admits(reserved: &Reserved, record: &RecordRef<'_>) -> Result<(), Refusal> {
+    reserved.reserve().admits(record, reserved.journal().room())
 }
 
 /// How many banks `authority` names.

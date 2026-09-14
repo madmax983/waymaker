@@ -571,6 +571,11 @@ fn after_completion_barrier_the_completion_is_replayed_and_the_activity_never_ru
 /// than one that had already reached its own end.
 const ROLLOVER_EFFECTS_BEFORE: u16 = EFFECTS - 1;
 
+/// The input for the run a swap installs. The bank header names it, and the installed
+/// bank's own `RunStarted` record names it too — the same bytes in both places, as a real
+/// writer would write them.
+const NEXT_RUN_INPUT: &[u8; 1] = b"n";
+
 /// The header the swap installs: a fresh run id, distinct from the retiring one.
 const fn rollover_next_header(rig: &Rig) -> bank::BankHeader<'static> {
     bank::BankHeader {
@@ -579,7 +584,7 @@ const fn rollover_next_header(rig: &Rig) -> bank::BankHeader<'static> {
         workflow_kind: Workload::WORKFLOW_KIND,
         workflow_version: Workload::WORKFLOW_VERSION,
         input_schema: 0,
-        input: b"n",
+        input: NEXT_RUN_INPUT,
     }
 }
 
@@ -697,7 +702,7 @@ fn continue_tiny_run<S: StableStorage>(
 where
     S::Error: core::fmt::Debug,
 {
-    let input = b"i";
+    let input = NEXT_RUN_INPUT;
     let records = tiny_run_records(input);
     let mut dispatcher = Log::default();
 
@@ -987,6 +992,71 @@ fn near_capacity() -> (Rig, Reserve, Device) {
     unreachable!("no declared tail in the search fills after exactly one effect")
 }
 
+/// The refusal [`near_capacity`] finds writes no witness mark of its own for the record
+/// it refuses.
+///
+/// [`assert_replay_refuses_without_mutation`] cannot see this: it checks a *replay*, and a
+/// replay's witness continuation skips any mark the first attempt already wrote, which is
+/// exactly what would hide one written just before that attempt's own refusal. This
+/// compares the first attempt's rig-only wear against a device that legitimately stopped
+/// after the same one-effect prefix and never met a refusal at all — equal wear is the
+/// only way the refused record's mark was never programmed.
+#[test]
+fn the_first_capacity_refusal_writes_no_mark_of_its_own() {
+    let mut found = None;
+    for tail in [
+        32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500,
+    ] {
+        let rig = rig();
+        let Ok(reserve) = Reserve::for_layout(bounds(tail), rig.layout()) else {
+            continue;
+        };
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let refused_rig_wear = {
+            let mut metered = Metered::new(&mut device);
+            if rig.prepare(&mut metered, 0, &mut page).is_err() {
+                continue;
+            }
+            let mut dispatcher = Log::default();
+            let outcome =
+                rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+            if !matches!(outcome, Err(RigError::Capacity(Refusal::NearCapacity))) {
+                continue;
+            }
+            if dispatcher.entered != [0] {
+                continue;
+            }
+            metered.rig_wear()
+        };
+        found = Some((rig, refused_rig_wear));
+        break;
+    }
+    let Some((rig, refused_rig_wear)) = found else {
+        unreachable!("no declared tail in the search fills after exactly one effect")
+    };
+
+    let mut clean = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let clean_rig_wear = {
+        let mut metered = Metered::new(&mut clean);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("the same fixture prepares")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(0, &mut metered, &mut dispatcher, &mut page, 1)
+        else {
+            unreachable!("one full effect, driven without a reserve, does not refuse")
+        };
+        metered.rig_wear()
+    };
+
+    assert_eq!(
+        refused_rig_wear, clean_rig_wear,
+        "the refused record's own witness mark was written before the refusal"
+    );
+}
+
 /// `bank`'s journal region, read the way a boot reads it. Fails rather than panicking, for
 /// a caller driven by the crash injector — a read this close to a fault point can fail
 /// like any other storage call.
@@ -1119,7 +1189,7 @@ fn try_write_tiny_run<S: StableStorage>(
 where
     S::Error: core::fmt::Debug,
 {
-    let input = b"i";
+    let input = NEXT_RUN_INPUT;
     let records = tiny_run_records(input);
     let mut dispatcher = Log::default();
     for (index, record) in records.iter().enumerate() {
@@ -1155,15 +1225,7 @@ fn explicit_rollover(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Vec<u16
         id: Rig::BANK,
         generation: Rig::GENERATION,
     };
-    let next_input = b"n";
-    let next = bank::BankHeader {
-        run: waymaker_core::RunId(rig.workload(0).run().0 ^ 1),
-        align: layout.align(),
-        workflow_kind: Workload::WORKFLOW_KIND,
-        workflow_version: Workload::WORKFLOW_VERSION,
-        input_schema: 0,
-        input: next_input,
-    };
+    let next = rollover_next_header(rig);
     let region = bank_a_region(rig, device, page);
     let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
         unreachable!("the engine window")
