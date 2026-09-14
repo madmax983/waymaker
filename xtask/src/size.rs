@@ -3566,21 +3566,16 @@ fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
 /// Index in `chars` just past a `\u{...}` escape's braced code point, given the index
 /// right after the `u`.
 ///
-/// `None` if no `{` follows, or if no `}` closes it within a few characters — a code point
-/// is at most six hex digits, so a longer run is not one.
+/// `None` if no `{` follows, or the `}` never comes. A code point is six hex digits at
+/// most, but `_` may separate any of them, so the width is not fixed — only the closing
+/// `}` marks the end.
 fn skip_unicode_escape_body(chars: &[(usize, char)], start: usize) -> Option<usize> {
     if chars.get(start)?.1 != '{' {
         return Some(start);
     }
     let mut index = start.saturating_add(1);
-    while chars
-        .get(index)
-        .is_some_and(|&(_, character)| character != '}')
-    {
+    while chars.get(index)?.1 != '}' {
         index = index.saturating_add(1);
-        if index > start.saturating_add(8) {
-            return None;
-        }
     }
     Some(index.saturating_add(1))
 }

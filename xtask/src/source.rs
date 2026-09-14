@@ -11443,6 +11443,19 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_unicode_escape_with_digit_separators_is_still_one_literal() {
+        // Codex's second round on #164. Rust allows `_` between a `\u{...}` escape's hex
+        // digits, so its width has no fixed cap — only the closing `}` marks the end. A
+        // reader that stops looking after a few characters meets the same fate as one that
+        // never widened its `\x`/`\u` support at all.
+        let separated = "#[foo(seps=['\\u{1_0_F_F_F_F}',']'])] pub fn raw(){}\n";
+        assert!(
+            counted(separated).contains(&"raw".to_owned()),
+            "{separated}"
+        );
+    }
+
+    #[test]
     fn an_unterminated_raw_string_leaves_the_item_unclassified() {
         // Same fail-closed direction as an unterminated ordinary string: no `"` plus the
         // right hash count ever closes it, so the scan never finds the real `]` and leaves
