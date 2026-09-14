@@ -2780,22 +2780,42 @@ fn literal_or_const_value(
         // constant — which fell to the wildcard `_ => None` case below and left every such
         // arm unresolved, the const-call and array backstops included, since a field
         // projection is neither a call nor an array index. Scoped to exactly that shape:
-        // the base must itself be an `Expr::Tuple` — nothing reaches outside this
-        // expression for a value, so a named-field struct projection or a projection off a
-        // path is not attempted — and the member an unnamed numeric index within that
-        // tuple's own arity; the picked element is then evaluated through this same
-        // pipeline. A named-field member, an index the tuple has no element at, or a base
-        // that is not a tuple literal each stay unresolved rather than guessed at.
-        syn::Expr::Field(field) => {
-            let syn::Expr::Tuple(tuple) = field.base.as_ref() else {
-                return None;
-            };
-            let syn::Member::Unnamed(index) = &field.member else {
-                return None;
-            };
-            let element = tuple.elems.get(usize::try_from(index.index).ok()?)?;
-            literal_or_const_value(element, resolve)
-        }
+        // the base must itself be an `Expr::Tuple` or `Expr::Struct` literal — nothing
+        // reaches outside this expression for a value, so a projection off a path is not
+        // attempted — and the member the corresponding unnamed index or named field of
+        // that literal; the picked element is then evaluated through this same pipeline.
+        //
+        // Codex's next-round finding: a *named*-field struct literal
+        // (`Cell { value: 0 }.value`) is `Expr::Struct`, a different node kind from the
+        // tuple literal this case first handled, and fell straight through to the tuple
+        // arm's own refusal — the const-call and array backstops do not catch it either,
+        // for the same reason a tuple projection escaped them. A struct literal carrying a
+        // `..rest` base is refused outright: a field this scan does not see named among
+        // the literal's own fields might still come from `rest`, and guessing its value
+        // from nothing written here would be exactly the kind of guess every other case in
+        // this function already declines to make.
+        syn::Expr::Field(field) => match field.base.as_ref() {
+            syn::Expr::Tuple(tuple) => {
+                let syn::Member::Unnamed(index) = &field.member else {
+                    return None;
+                };
+                let element = tuple.elems.get(usize::try_from(index.index).ok()?)?;
+                literal_or_const_value(element, resolve)
+            }
+            syn::Expr::Struct(struct_literal) => {
+                let syn::Member::Named(name) = &field.member else {
+                    return None;
+                };
+                if struct_literal.rest.is_some() {
+                    return None;
+                }
+                let field_value = struct_literal.fields.iter().find(|candidate| {
+                    matches!(&candidate.member, syn::Member::Named(candidate_name) if candidate_name == name)
+                })?;
+                literal_or_const_value(&field_value.expr, resolve)
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3956,6 +3976,105 @@ fn lookup_trait_defaults<'a>(
     trait_defaults.get(&bare.join("::"))
 }
 
+/// `trait_path`'s own default associated constants, when `trait_path` is *qualified* — two
+/// or more segments, `super::traits::Indices` or `crate::traits::Indices` or
+/// `traits::Indices` rather than a bare `Indices` — resolved the identical way
+/// [`resolve_qualified_path`] resolves a qualified *constant* reference against `qualified`:
+/// `crate`, `self` and `super` read the same way, the current-module-relative form tried
+/// before the plain chain, and a same-named trait declared at both the file root and the
+/// current module told apart the same way a same-named constant already is. `current_module`
+/// is the impl's own position, exactly as [`resolve_qualified_path`]'s own caller supplies —
+/// so the search agrees with `resolve_pattern_path`'s peel-down over `module_path`,
+/// `function_path` and `block_path` rather than fixing one combination.
+///
+/// Codex's next-round finding: [`lookup_trait_defaults`] resolves only a *bare* trait name,
+/// searched against the trait *impl's own* lexical scope — right for `impl Indices for u8`
+/// written beside `trait Indices`, and wrong the moment the impl names its trait through a
+/// path of its own. `mod traits { trait Indices { .. } }` beside `mod implementations {
+/// impl super::traits::Indices for u8 {} }` indexes the trait's defaults under
+/// `"traits::Indices"` (`visit_item_trait`'s own full declaration scope), but the impl's
+/// bare-name search only ever tried scopes built from `implementations` — the impl's *own*
+/// module — and never consulted the qualified path (`super::traits::Indices`) the impl
+/// itself wrote, which names the trait's real declaration exactly the way a qualified
+/// constant path already does. `visit_item_impl` now tries this resolution first, against
+/// the impl's full written trait path, before falling back to [`lookup_trait_defaults`]'s
+/// bare-name search for a trait referenced without qualification.
+fn resolve_qualified_trait_defaults<'a>(
+    trait_defaults: &'a std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
+    trait_path: &syn::Path,
+    current_module: &[String],
+) -> Option<&'a std::collections::HashMap<String, i128>> {
+    let segments: Vec<String> = trait_path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let is_crate_absolute = segments.first().map(String::as_str) == Some("crate");
+    let relevant: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .skip_while(|segment| *segment == "crate" || *segment == "self")
+        .collect();
+    if relevant.len() < 2 {
+        return None;
+    }
+    let super_count = relevant
+        .iter()
+        .take_while(|segment| **segment == "super")
+        .count();
+    let rest = relevant.get(super_count..)?;
+    if rest.len() < 2 {
+        return None;
+    }
+    let joined = rest.join("::");
+    if !is_crate_absolute {
+        let pop = super_count.min(current_module.len());
+        let effective_module = current_module.get(..current_module.len() - pop)?;
+        if !effective_module.is_empty() {
+            let relative = format!("{}::{joined}", effective_module.join("::"));
+            if let Some(defaults) = trait_defaults.get(&relative) {
+                return Some(defaults);
+            }
+        }
+    }
+    if let Some(defaults) = trait_defaults.get(&joined) {
+        return Some(defaults);
+    }
+    let tail_start = rest.len().saturating_sub(2);
+    let tail = rest.get(tail_start..)?;
+    trait_defaults.get(&tail.join("::"))
+}
+
+/// [`resolve_qualified_trait_defaults`], peeled down over `module_path`, `function_path`
+/// and `block_path` the identical way [`resolve_qualified_path_at_any_depth`] peels a
+/// qualified constant reference — a trait impl can sit inside a function or a block, not
+/// only directly inside a module, and a single fixed combination would miss a trait path
+/// resolvable only at a shallower one.
+fn resolve_qualified_trait_defaults_at_any_depth<'a>(
+    trait_defaults: &'a std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
+    trait_path: &syn::Path,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+) -> Option<&'a std::collections::HashMap<String, i128>> {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined_module = module_path.to_vec();
+        combined_module.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined_module.extend(prefix.iter().cloned());
+        }
+        if let Some(defaults) =
+            resolve_qualified_trait_defaults(trait_defaults, trait_path, &combined_module)
+        {
+            return Some(defaults);
+        }
+    }
+    if function_path.is_empty() && block_path.is_empty() {
+        return None;
+    }
+    resolve_qualified_trait_defaults(trait_defaults, trait_path, module_path)
+}
+
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
@@ -4200,21 +4319,37 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
             if type_path.qself.is_none() {
                 if let Some(segment) = type_path.path.segments.last() {
-                    let trait_name = node
-                        .trait_
-                        .as_ref()
-                        .and_then(|(_, trait_path, _)| trait_path.segments.last())
+                    let trait_path = node.trait_.as_ref().map(|(_, trait_path, _)| trait_path);
+                    let trait_name = trait_path
+                        .and_then(|trait_path| trait_path.segments.last())
                         .map(|segment| ident_name(&segment.ident));
-                    let mut scope = trait_name
-                        .as_ref()
-                        .and_then(|trait_name| {
-                            lookup_trait_defaults(
+                    // Codex's next-round finding: a *qualified* trait reference
+                    // (`impl super::traits::Indices for u8 {}`) is tried first, against
+                    // the impl's own full written trait path, since it names the trait's
+                    // real declaration exactly the way a qualified constant path already
+                    // does. Only when that fails — a bare, unqualified trait name, or a
+                    // qualified one this scan cannot resolve — does the bare-name,
+                    // lexically-scoped search run, exactly as before.
+                    let mut scope = trait_path
+                        .and_then(|trait_path| {
+                            resolve_qualified_trait_defaults_at_any_depth(
                                 &self.trait_defaults,
+                                trait_path,
                                 &self.module_path,
                                 &self.function_path,
                                 &self.block_path,
-                                trait_name,
                             )
+                        })
+                        .or_else(|| {
+                            trait_name.as_ref().and_then(|trait_name| {
+                                lookup_trait_defaults(
+                                    &self.trait_defaults,
+                                    &self.module_path,
+                                    &self.function_path,
+                                    &self.block_path,
+                                    trait_name,
+                                )
+                            })
                         })
                         .cloned()
                         .unwrap_or_default();

@@ -17953,6 +17953,67 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_named_struct_field_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = Cell { value: 0 }.value;` is
+        // `Expr::Field` over `Expr::Struct` — a *named*-field projection, a different node
+        // kind from the tuple literal the forty-ninth round's `Expr::Field` case first
+        // handled — and fell straight through to that case's own tuple-only refusal, the
+        // const-call and array backstops included, since a field projection is neither a
+        // call nor an array index. `Expr::Field`'s struct-literal arm evaluates the named
+        // field's own initializer expression, refusing outright when the literal carries a
+        // `..rest` base a named field might otherwise come from.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Cell {\n    value: u8,\n}\n\nconst fn struct_field_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = Cell { value: 0 }.value;\n    \
+             const P1: u8 = Cell { value: 1 }.value;\n    \
+             const P2: u8 = Cell { value: 2 }.value;\n    \
+             const P3: u8 = Cell { value: 3 }.value;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_default_implemented_in_a_sibling_module_is_reported() {
+        // Codex's next-round finding: an empty impl of a *qualified* trait reference in a
+        // sibling module — `mod traits { pub trait Indices { const P0: u8 = 0; .. } }`
+        // beside `mod implementations { impl super::traits::Indices for u8 {} }` — indexes
+        // the trait's defaults under `"traits::Indices"` (`visit_item_trait`'s own full
+        // declaration scope), but `visit_item_impl` looked them up only by the trait's
+        // *bare* name, searched against the impl's own lexical scope
+        // (`"implementations::Indices"`) — never against the qualified path
+        // (`super::traits::Indices`) the impl itself wrote, which names the trait's real
+        // declaration. `resolve_qualified_trait_defaults_at_any_depth` now tries that
+        // qualified path first, the same way a qualified constant reference already
+        // resolves.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Indices {\n        const P0: u8 = 0;\n        \
+             const P1: u8 = 1;\n        const P2: u8 = 2;\n        const P3: u8 = \
+             3;\n    }\n}\n\nmod implementations {\n    impl super::traits::Indices for u8 \
+             {}\n}\n\nconst fn sibling_module_trait_default_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as traits::Indices>::P0 => 0,\n        \
+             <u8 as traits::Indices>::P1 => 1,\n        <u8 as traits::Indices>::P2 => \
+             2,\n        <u8 as traits::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
