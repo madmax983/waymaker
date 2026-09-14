@@ -7095,6 +7095,36 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_id_hidden_in_a_quoted_attribute_containing_a_greater_than_sign_does_not_count() {
+        // Codex, pull request #138, round 36, finding 1: `find_any_tag` closed a tag's
+        // markup on the first `>` it found, blind to whether that `>` sat inside a
+        // quoted attribute value. `<div title="ends here>id headline">other</div>` is
+        // one tag whose `title` attribute happens to contain a literal `>` — legal
+        // HTML — and closing early on it exposed the rest of the still-quoted
+        // attribute text as visible prose, even though no browser renders any part of
+        // an attribute value as page content.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div title=\"ends here>{} {}\">other</div>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision id hidden in a quoted attribute containing `>` still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn the_settled_decision_ids_are_unique() {
         let mut ids: Vec<&str> = SETTLED_DECISIONS.iter().map(|d| d.id).collect();
         let count = ids.len();
@@ -8102,6 +8132,40 @@ mod tests {
         assert!(
             violations.iter().any(|v| v.subject == clause.id),
             "a discharge message hidden in a span attribute still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_href_lookalike_attribute_does_not_supply_a_table_cells_evidence() {
+        // Codex, pull request #138, round 36, finding 2: `anchor_href`'s bare
+        // substring search for `href=` also matched inside `data-href=`, so `<a
+        // data-href="...">elsewhere</a>` — an anchor with no link destination at all
+        // — returned that unrelated attribute's value as if it were the real `href`.
+        // The match now requires a fresh attribute name (nothing, or HTML
+        // whitespace, immediately before it), so a look-alike attribute name is
+        // skipped rather than mistaken for the real one.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <a data-href=\"{}\">elsewhere</a> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "a data-href lookalike attribute still supplied the table cell's evidence: \
+             {violations:?}"
         );
     }
 

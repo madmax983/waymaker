@@ -1280,9 +1280,17 @@ enum HidingMarker {
 }
 
 /// The byte range of the next HTML tag — opening or closing, any name — at or after
-/// `from` in `line`, from `<` through the next `>`. A comment opener (`<!--`) is not a
-/// tag and is skipped, since comments are tracked separately with their own semantics
-/// and can span lines a naive "next `>`" search would close early against.
+/// `from` in `line`, from `<` through the next unquoted `>`. A comment opener (`<!--`)
+/// is not a tag and is skipped, since comments are tracked separately with their own
+/// semantics and can span lines a naive "next `>`" search would close early against.
+///
+/// A `>` inside a quoted attribute value does not end the tag (Codex, pull request
+/// #138, round 36, finding 1): `<div title="ends here>decision-id headline">other</div>`
+/// is one tag whose attribute value happens to contain the character, and closing on it
+/// exposed the rest of the (still-quoted) attribute text as visible prose — a value no
+/// browser ever renders. Byte-scanned rather than searched, tracking whichever quote
+/// character (`"` or `'`) is currently open so a `>` inside one is skipped and the
+/// matching close quote is what re-arms the search.
 fn find_any_tag(line: &str, from: usize) -> Option<(usize, usize)> {
     let mut cursor = from;
     loop {
@@ -1291,8 +1299,19 @@ fn find_any_tag(line: &str, from: usize) -> Option<(usize, usize)> {
             cursor = start + "<!--".len();
             continue;
         }
-        let end = line[start..].find('>').map(|offset| start + offset + 1)?;
-        return Some((start, end));
+        let bytes = line.as_bytes();
+        let mut quote: Option<u8> = None;
+        let mut index = start + 1;
+        while let Some(&byte) = bytes.get(index) {
+            match quote {
+                Some(open) if byte == open => quote = None,
+                None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                None if byte == b'>' => return Some((start, index + 1)),
+                Some(_) | None => {}
+            }
+            index += 1;
+        }
+        return None;
     }
 }
 
@@ -1525,18 +1544,40 @@ fn is_line_break_tag(html: &str) -> bool {
 /// extracts only the one attribute a reader's own click already exposes, and only from a
 /// genuine `<a` open tag — every other tag, and an anchor's own `</a>` close, carries
 /// nothing this function returns.
+///
+/// The match is required to start a fresh attribute name — the byte right before it must
+/// be absent or HTML whitespace (Codex, pull request #138, round 36, finding 2): a bare
+/// substring search for `href=` also matches inside `data-href=`, so `<a
+/// data-href="tests/spine.rs">elsewhere</a>` — an anchor with no link destination at all
+/// — returned that unrelated attribute's value as if it were the real one. A rejected
+/// candidate resumes the search past it rather than giving up, since a real `href` can
+/// still follow a decoy one in the same tag.
 fn anchor_href(html: &str) -> Option<&str> {
     find_opening_tag(html, 0, "a")?;
     let lower = html.to_ascii_lowercase();
     let marker = "href=";
-    let start = lower.find(marker)? + marker.len();
-    let quote = *html.as_bytes().get(start)?;
-    if quote != b'"' && quote != b'\'' {
-        return None;
+    let mut search_from = 0;
+    loop {
+        let start = search_from + lower.get(search_from..)?.find(marker)?;
+        let fresh_attribute = start == 0
+            || lower
+                .as_bytes()
+                .get(start - 1)
+                .is_some_and(u8::is_ascii_whitespace);
+        if !fresh_attribute {
+            search_from = start + marker.len();
+            continue;
+        }
+        let value_start = start + marker.len();
+        let quote = *html.as_bytes().get(value_start)?;
+        if quote != b'"' && quote != b'\'' {
+            search_from = value_start;
+            continue;
+        }
+        let value_start = value_start + 1;
+        let end = value_start + html.get(value_start..)?.find(quote as char)?;
+        return Some(&html[value_start..end]);
     }
-    let value_start = start + 1;
-    let end = value_start + html.get(value_start..)?.find(quote as char)?;
-    Some(&html[value_start..end])
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
