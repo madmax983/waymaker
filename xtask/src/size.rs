@@ -3401,16 +3401,17 @@ fn skip_leading_generic_params(text: &str) -> &str {
 /// round 3 found it, in the same one-line form round 1's finding was about.
 ///
 /// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
-/// attribute. A bracket or a quote inside a literal is not syntax, so the scan reads each
-/// literal by its own rule: an ordinary string ends at the next unescaped `"`; a raw string
-/// — `r`, zero or more `#`, then `"` — ends only at a `"` followed by that same number of
-/// `#`; and a character literal — one character or one escape between two `'` — is told
-/// apart from a lifetime by that closing `'`, so `impl<'a>` still reads as a lifetime.
-/// Rounds 4 and 6 found the ordinary-string and the raw-string gaps; #108 is the second.
+/// attribute. A bracket or a quote inside a literal is not syntax. The scan uses one rule
+/// per literal type. An ordinary string ends at the next unescaped `"`. A raw string opens
+/// with an optional `b` or `c`, then `r`, zero or more `#`, then `"`; it ends at a `"`
+/// followed by that same number of `#`. A character literal holds one character, or one
+/// escape, between two `'` marks. This tells a character literal from a lifetime, so
+/// `impl<'a>` still reads as a lifetime. Round 4 found the ordinary-string gap. Round 6
+/// found the raw-string gap: issue #108.
 ///
-/// An attribute the scan cannot finish — an unclosed bracket, string, raw string or
-/// character literal — leaves `line` untouched, so its item stays unclassified rather than
-/// being reported as public. Under-reporting is the safe direction.
+/// The scan may meet an unclosed bracket, string, raw string, or character literal. Then it
+/// leaves `line` unchanged. The item below stays unclassified, never reported as public.
+/// Under-reporting is the safe direction.
 pub(crate) fn without_leading_attributes(line: &str) -> &str {
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix("#[") {
@@ -3439,7 +3440,7 @@ fn attribute_body_end(body: &str) -> Option<usize> {
                 after_ident = false;
                 continue;
             }
-            'r' if !after_ident => {
+            'b' | 'c' | 'r' if !after_ident => {
                 if let Some((quote, hashes)) = raw_string_open(&chars, index) {
                     index = skip_raw_string(&chars, quote, hashes)?;
                     after_ident = false;
@@ -3483,12 +3484,21 @@ fn skip_ordinary_string(chars: &[(usize, char)], open: usize) -> Option<usize> {
     }
 }
 
-/// Whether `chars[start]` is the `r` of a raw string — `r`, zero or more `#`, then `"`.
+/// Whether a raw string opens at `chars[start]`: an optional `b` or `c`, then `r`, then
+/// zero or more `#`, then `"`.
 ///
 /// Returns the opening `"`'s index and the hash count. `start` must not follow an
-/// identifier character, which the caller checks: an `r` inside a word is not a prefix.
+/// identifier character, which the caller checks: `r`, `b` or `c` inside a word is not a
+/// prefix.
 fn raw_string_open(chars: &[(usize, char)], start: usize) -> Option<(usize, usize)> {
-    let mut index = start.saturating_add(1);
+    let mut index = start;
+    if matches!(chars.get(index)?.1, 'b' | 'c') {
+        index = index.saturating_add(1);
+    }
+    if chars.get(index)?.1 != 'r' {
+        return None;
+    }
+    index = index.saturating_add(1);
     let mut hashes = 0_usize;
     while chars
         .get(index)
@@ -3502,9 +3512,11 @@ fn raw_string_open(chars: &[(usize, char)], start: usize) -> Option<(usize, usiz
 
 /// Index in `chars` just past a raw string's closing `"` and its matching `#` run.
 ///
-/// `quote` is the opening `"`'s index and `hashes` is the count after it. The close is the
-/// first `"` followed by that many `#` — the rule the compiler itself uses, so a raw
-/// string opened with two hashes may still hold a bare `"#`, one hash, as plain content.
+/// `quote` is the opening `"`'s index and `hashes` is the count after it.
+///
+/// The string closes at the first `"` followed by the same number of `#`. The Rust
+/// compiler uses this same rule. A raw string opened with two `#` may still hold a bare
+/// `"#`, one `#`, as plain content.
 fn skip_raw_string(chars: &[(usize, char)], quote: usize, hashes: usize) -> Option<usize> {
     let mut index = quote.saturating_add(1);
     loop {
@@ -3526,9 +3538,11 @@ fn skip_raw_string(chars: &[(usize, char)], quote: usize, hashes: usize) -> Opti
 /// Index in `chars` just past a character literal's closing `'`, if `chars[quote]` opens
 /// one.
 ///
-/// `None` for a lifetime: `'a` is a literal only when a `'` closes it within the next few
-/// characters, which is the one look-ahead that tells `'a'` from `impl<'a>` with no token
-/// boundary to read. Bounded so a stray `'` cannot run the scan to the end of the line.
+/// Returns `None` for a lifetime. `'a` is a character literal only if a plain `'` closes
+/// it. A `\` takes exactly one more character as its escaped value, whatever that
+/// character is. So `'\''`, an escaped quote, reads as one four-character literal — its
+/// close is the fourth character, not the third. This tells a character literal (`'a'`)
+/// from a lifetime (`impl<'a>`), with no token boundary to read either one by.
 fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
     let mut index = quote.saturating_add(1);
     let first = chars.get(index)?.1;
@@ -3537,15 +3551,7 @@ fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
     }
     index = index.saturating_add(1);
     if first == '\\' {
-        while chars
-            .get(index)
-            .is_some_and(|&(_, character)| character != '\'')
-        {
-            index = index.saturating_add(1);
-            if index > quote.saturating_add(12) {
-                return None;
-            }
-        }
+        index = index.saturating_add(1);
     }
     (chars.get(index)?.1 == '\'').then_some(index.saturating_add(1))
 }

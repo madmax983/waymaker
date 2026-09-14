@@ -11410,6 +11410,44 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_escaped_quote_inside_a_character_literal_is_still_one_literal() {
+        // `'\''` holds an escaped quote, so its closing `'` is the *fourth* character, not
+        // the third. A scan that stops at the first `'` after the backslash reads the
+        // escaped quote itself as the close, leaves the real close unread, and then misreads
+        // a bracket right after the literal as loose text instead of real syntax.
+        let literal = "#[foo(a = '\\'')] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(literal).contains(&"raw".to_owned()), "{literal}");
+        // The same literal beside a real array, so an unread quote left over from the bug
+        // above has a real bracket next to it to mis-scan.
+        let beside_array = "#[foo(seps = ['\\'', 'x'])] impl Bank { pub fn raw() {} }\n";
+        assert!(
+            counted(beside_array).contains(&"raw".to_owned()),
+            "{beside_array}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_raw_string_leaves_the_item_unclassified() {
+        // Same fail-closed direction as an unterminated ordinary string: no `"` plus the
+        // right hash count ever closes it, so the scan never finds the real `]` and leaves
+        // the line untouched.
+        let unterminated = "#[doc = r#\"unterminated] impl Bank { pub fn raw() {} }\n";
+        assert!(!counted(unterminated).contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_byte_or_c_string_raw_prefix_still_opens_a_raw_string() {
+        // `br"..."` and `cr"..."` are raw strings too, and the `b`/`c` in front is an
+        // identifier character — the same guard that keeps `for` and `bar` from being read
+        // as a raw-string prefix would also block a real one here unless it looks one
+        // character past the `b`/`c`.
+        let byte_raw = "#[doc = br#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(byte_raw).contains(&"raw".to_owned()), "{byte_raw}");
+        let c_raw = "#[doc = cr#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(c_raw).contains(&"raw".to_owned()), "{c_raw}");
+    }
+
+    #[test]
     fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
         // The reader beside `public_functions` had the same blindness, and it is what
         // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
