@@ -3241,6 +3241,12 @@ fn is_unsigned_type_name(name: &str) -> bool {
     matches!(name, "u8" | "u16" | "u32" | "u64" | "u128")
 }
 
+/// [`is_unsigned_type_name`]'s own signed twin — `i8`, `i16`, `i32`, `i64`, `i128` — for
+/// [`is_definitely_signed`]'s three cases in the identical shape.
+fn is_signed_type_name(name: &str) -> bool {
+    matches!(name, "i8" | "i16" | "i32" | "i64" | "i128")
+}
+
 /// Whether `ty` is a plain, unqualified path naming one of the five unsigned fixed-width
 /// integer types — the same shape [`single_segment_type_name`] already recognises.
 /// [`item_const_unsigned`] and [`block_const_unsigned`] are what read it off a `const`
@@ -3818,6 +3824,39 @@ fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
     }
 }
 
+/// [`is_definitely_unsigned`]'s own signed twin, needed only by [`evaluate_shift_op`]'s
+/// `Shr` fold: a suffixed literal, a negation of one (`-128i8`, which reaches `Shr` as
+/// `Expr::Unary(Neg, ..)` over the *positive* literal `128i8`, so the suffix lives one
+/// level deeper than the operand `Shr` itself sees), a cast, or a bare path whose
+/// declaration `resolve.width` names one of the five signed fixed-width types.
+///
+/// Codex's finding: `(-128i8 >> 7) + 1` evaluates to `0` in real Rust because `>>` on a
+/// signed operand is an arithmetic shift — floor division by a power of two, which
+/// [`i128::checked_shr`] already performs natively on the true, sign-extended value this
+/// scan stores (negating a literal here computes the real mathematical value rather than a
+/// narrower bit pattern, so no width reinterpretation is needed the way a *left* shift's
+/// own truncation is) — but [`evaluate_shift_op`] refused every negative operand it could
+/// not confirm as unsigned, leaving `BASE` through `BASE + 14` unresolved and the dense
+/// match built from them unrecognised.
+fn is_definitely_signed(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
+    match strip_parens(expr) {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(int),
+            ..
+        }) => is_signed_type_name(int.suffix()),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            is_definitely_signed(&unary.expr, resolve)
+        }
+        syn::Expr::Cast(cast) => {
+            single_segment_type_name(&cast.ty).is_some_and(|name| is_signed_type_name(&name))
+        }
+        syn::Expr::Path(path) if path.qself.is_none() => {
+            (resolve.width)(&path.path).is_some_and(is_signed_type_name)
+        }
+        _ => false,
+    }
+}
+
 /// `pattern`'s own [`is_definitely_unsigned`], for the two arm-pattern shapes
 /// [`FoundArm::unsigned`] needs it for: a suffixed literal, and a bare path
 /// `resolve.unsigned` answers for. Unwraps a reference pattern (`&0u8`) and a
@@ -4084,10 +4123,20 @@ fn evaluate_shift_op(
 ) -> Option<i128> {
     let left = literal_or_const_value(left_expr, resolve)?;
     let right = literal_or_const_value(right_expr, resolve)?;
-    if left < 0 && !is_definitely_unsigned(left_expr, resolve) {
-        return None;
-    }
     let shift = u32::try_from(right).ok()?;
+    if left < 0 {
+        // [`is_definitely_signed`]'s own doc comment holds the rationale: an arithmetic
+        // shift of a confirmed-signed operand is floor division by a power of two, which
+        // `checked_shr` already performs natively on the true value this scan stores —
+        // width-independent, so no further reinterpretation is needed the way the unsigned
+        // path below needs one.
+        if is_definitely_signed(left_expr, resolve) {
+            return left.checked_shr(shift);
+        }
+        if !is_definitely_unsigned(left_expr, resolve) {
+            return None;
+        }
+    }
     #[allow(
         clippy::cast_sign_loss,
         reason = "reinterpreting the shared 128-bit storage as unsigned, once an explicit \
@@ -4614,6 +4663,47 @@ fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -
 /// resolves to exactly `0` (`false`), and this whole function still bails out — rather than
 /// guessing which of two matching arms `rustc` would pick — the moment a matching arm's own
 /// guard cannot be resolved to a compile-time value at all.
+/// `expr`'s own declared width name (`"u8"`, `"i32"`, ..), when this scan can confirm one —
+/// the identical three-case search [`evaluate_shl_op`]'s own left operand already runs
+/// (a suffixed literal's own suffix, a cast's own destination type, a bare path's declared
+/// type through `resolve.width`), widened with a fourth: a well-known bound (`u128::MAX`)
+/// names its own type as the path's first segment, with no scope to search at all — the
+/// identical fallback [`path_is_definitely_unsigned`] itself falls back to. Answers with an
+/// owned name rather than a borrowed one, since a cast's own type name
+/// ([`single_segment_type_name`]) is never borrowed from anywhere this scan's own AST holds
+/// long enough to return as a reference on its own.
+///
+/// [`evaluate_match`] and [`evaluate_tuple_match`] are this function's only callers, needing
+/// an arm-bound name's own width derived from the scrutinee expression it was matched
+/// against — see [`pattern_binding`]'s own doc comment for the shape of the gap this closes.
+fn expr_declared_width(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<String> {
+    if let Some(int) = as_suffixed_int_literal(expr) {
+        let suffix = int.suffix();
+        return (!suffix.is_empty()).then(|| suffix.to_string());
+    }
+    if let syn::Expr::Cast(cast) = strip_parens(expr) {
+        return single_segment_type_name(&cast.ty);
+    }
+    let syn::Expr::Path(path) = strip_parens(expr) else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    if let Some(width) = (resolve.width)(&path.path) {
+        return Some(width.to_string());
+    }
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let (type_name, _member) = well_known_bound_segments(&segments)?;
+    (is_unsigned_type_name(type_name) || is_signed_type_name(type_name))
+        .then(|| type_name.to_string())
+}
+
 fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<i128> {
     // Codex's next-round finding: `match (0u8, 1u8) { (0, 1) => 0, _ => 100 }` names a
     // scrutinee this scan's own `i128` domain has no room for — [`literal_or_const_value`]'s
@@ -4637,22 +4727,47 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
             // Codex's finding: an arm that binds its own scrutinee (`x @ 0 => x`) has to be
             // evaluated — guard and body alike — through a resolver that answers for that
             // binding, not only through the outer one `resolve` already is. `unsigned` and
-            // `width` are wrapped in fresh pass-through closures rather than copied straight
-            // from `resolve` — the identical shape every other local `Resolve` built in this
+            // `width` are wrapped in fresh closures rather than copied straight from
+            // `resolve` — the identical shape every other local `Resolve` built in this
             // module already uses (`block_resolve_width` and its neighbours, above) — because
             // a field copied unchanged carries its own already-fixed lifetime into the new
             // struct literal and forces every other field to match it exactly, where a fresh
             // closure lets inference pick the one lifetime this whole local value actually
             // needs: this block's own.
+            //
+            // Codex's next-round finding: `x @ u128::MAX => (x >> 127) as u8` resolves `x`'s
+            // own *value* through the fix above, but the two closures directly below still
+            // discarded its *type* — a bare pass-through of `resolve.unsigned`/`resolve.width`
+            // has never heard of an arm-local name, so `is_definitely_unsigned(x, ..)` asked
+            // the outer scope and answered `false` regardless of what `x` was actually bound
+            // to, and a shift or a cast built from it stayed unresolved. The scrutinee
+            // expression `x` was matched against is what its type really is, so `bound`'s own
+            // unsignedness and width are computed from *that* expression once, through
+            // `is_definitely_unsigned` and `expr_declared_width` exactly as any other operand
+            // of that shape already would be, and handed back for the bound name alone.
             let bound = pattern_binding(&arm.pat, resolve);
+            let bound_unsigned_value =
+                bound.is_some() && is_definitely_unsigned(&expr_match.expr, resolve);
+            let bound_width_value =
+                bound.and_then(|_| expr_declared_width(&expr_match.expr, resolve));
             let bound_value = |path: &syn::Path| -> Option<i128> {
                 if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
                     return Some(scrutinee);
                 }
                 (resolve.value)(path)
             };
-            let bound_unsigned = |path: &syn::Path| (resolve.unsigned)(path);
-            let bound_width = |path: &syn::Path| (resolve.width)(path);
+            let bound_unsigned = |path: &syn::Path| -> bool {
+                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                    return bound_unsigned_value;
+                }
+                (resolve.unsigned)(path)
+            };
+            let bound_width = |path: &syn::Path| -> Option<&str> {
+                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                    return bound_width_value.as_deref();
+                }
+                (resolve.width)(path)
+            };
             let arm_resolve = Resolve {
                 value: &bound_value,
                 unsigned: &bound_unsigned,
@@ -4706,21 +4821,35 @@ fn evaluate_tuple_match(
         }
         // [`evaluate_match`]'s own fix, carried here: an arm that binds one of the
         // scrutinee's own elements (`(x, _) => x`) has to be evaluated through a resolver
-        // that answers for it too.
-        let bindings = tuple_pattern_bindings(&arm.pat, &values, resolve);
+        // that answers for it too — value, unsignedness and width alike, each derived from
+        // the scrutinee *element* a binding was matched against, the identical way
+        // `evaluate_match`'s own scalar fix derives them from the whole scrutinee.
+        let bindings = tuple_pattern_bindings(&arm.pat, &values, &scrutinee.elems, resolve);
         let bound_value = |path: &syn::Path| -> Option<i128> {
             if let Some(ident) = path.get_ident() {
-                if let Some((_, value)) = bindings.iter().find(|(name, _)| ident == *name) {
+                if let Some((_, value, ..)) = bindings.iter().find(|(name, ..)| ident == *name) {
                     return Some(*value);
                 }
             }
             (resolve.value)(path)
         };
-        // `unsigned`/`width` wrapped fresh, for the identical reason `evaluate_match`'s own
-        // arm resolver wraps them rather than copying `resolve.unsigned`/`resolve.width`
-        // unchanged.
-        let bound_unsigned = |path: &syn::Path| (resolve.unsigned)(path);
-        let bound_width = |path: &syn::Path| (resolve.width)(path);
+        let bound_unsigned = |path: &syn::Path| -> bool {
+            if let Some(ident) = path.get_ident() {
+                if let Some((_, _, unsigned, _)) = bindings.iter().find(|(name, ..)| ident == *name)
+                {
+                    return *unsigned;
+                }
+            }
+            (resolve.unsigned)(path)
+        };
+        let bound_width = |path: &syn::Path| -> Option<&str> {
+            if let Some(ident) = path.get_ident() {
+                if let Some((_, _, _, width)) = bindings.iter().find(|(name, ..)| ident == *name) {
+                    return width.as_deref();
+                }
+            }
+            (resolve.width)(path)
+        };
         let arm_resolve = Resolve {
             value: &bound_value,
             unsigned: &bound_unsigned,
@@ -4746,21 +4875,42 @@ fn evaluate_tuple_match(
 /// correctly. Element positions that bind nothing are simply absent from the result, rather
 /// than the whole call answering `None` — unlike the match functions beside it, a tuple that
 /// binds nothing at all is not a failure to resolve, it is a pattern with no bindings in it.
+///
+/// Each binding carries its own unsignedness and width alongside its value, both derived
+/// from `scrutinee_elems`' own matching element — [`evaluate_match`]'s scalar-binding fix
+/// carried one level deeper, for the identical reason: a bound name's *type* is the
+/// expression it was matched against, not a fact the outer scope has ever heard of it.
 fn tuple_pattern_bindings<'a>(
     pattern: &'a syn::Pat,
     values: &[i128],
+    scrutinee_elems: &'a syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
     resolve: &Resolve<'_>,
-) -> Vec<(&'a syn::Ident, i128)> {
+) -> Vec<(&'a syn::Ident, i128, bool, Option<String>)> {
     match pattern {
-        syn::Pat::Paren(paren) => tuple_pattern_bindings(&paren.pat, values, resolve),
-        syn::Pat::Tuple(tuple_pat) if tuple_pat.elems.len() == values.len() => tuple_pat
-            .elems
-            .iter()
-            .zip(values)
-            .filter_map(|(sub_pattern, value)| {
-                pattern_binding(sub_pattern, resolve).map(|name| (name, *value))
-            })
-            .collect(),
+        syn::Pat::Paren(paren) => {
+            tuple_pattern_bindings(&paren.pat, values, scrutinee_elems, resolve)
+        }
+        syn::Pat::Tuple(tuple_pat)
+            if tuple_pat.elems.len() == values.len()
+                && tuple_pat.elems.len() == scrutinee_elems.len() =>
+        {
+            tuple_pat
+                .elems
+                .iter()
+                .zip(values)
+                .zip(scrutinee_elems)
+                .filter_map(|((sub_pattern, value), elem_expr)| {
+                    pattern_binding(sub_pattern, resolve).map(|name| {
+                        (
+                            name,
+                            *value,
+                            is_definitely_unsigned(elem_expr, resolve),
+                            expr_declared_width(elem_expr, resolve),
+                        )
+                    })
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -4865,6 +5015,18 @@ fn match_arm_matches_constant(
             match_arm_matches_constant(subpat, value, resolve)
         }
         syn::Pat::Paren(paren) => match_arm_matches_constant(&paren.pat, value, resolve),
+        // Codex's next-round finding: `x @ u128::MAX => ..` — a *qualified* constant path
+        // as the subpattern of an at-binding, over a match this function itself is asked to
+        // evaluate — parses as `Pat::Path` rather than the bare-identifier `Pat::Ident` the
+        // arm above already handles, and fell to the wildcard `_ => None` case below,
+        // stopping the whole search: `evaluate_match`'s own `?` on this function's answer
+        // means a single unresolved arm bails the entire match rather than only that arm,
+        // so `x`'s own value binding never had a chance to matter. `resolve.value` is what
+        // already answers the identical question for a bare path in `Expr::Path` position —
+        // `u128::MAX` included, through the well-known-bound fallback every qualified value
+        // lookup already falls back to — so this asks it the same way rather than
+        // reimplementing that resolution.
+        syn::Pat::Path(path) if path.qself.is_none() => Some((resolve.value)(&path.path)? == value),
         // [`literal_or_const_value`]'s own `Expr::Tuple` case holds the rationale: a
         // one-element tuple pattern names exactly its own element's value, the pattern-side
         // twin of that scrutinee-side fold — `(0,) => 0` over a `(0u8,)` scrutinee is

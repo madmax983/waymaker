@@ -21454,6 +21454,81 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_folding_a_negative_signed_right_shift_is_reported() {
+        // Codex's finding: `(-128i8 >> 7) + 1` evaluates to `0` in real Rust, since `>>` on
+        // a signed operand is an arithmetic shift — floor division by a power of two, which
+        // `i128::checked_shr` already performs natively on the true, sign-extended value
+        // this scan stores for a negated literal. `evaluate_shift_op` used to refuse *every*
+        // negative left operand it could not confirm unsigned, so `BASE` through `BASE + 14`
+        // stayed unresolved and the dense table built from them went unrecognised.
+        // `is_definitely_signed` now confirms a suffixed, cast or declared-type-`i*` operand
+        // as signed, and a confirmed-signed negative operand folds through `checked_shr`
+        // directly instead of being refused.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14i8 {
+            let _ = writeln!(constants, "    const P{n}: i8 = (-128i8 >> 7) + 1 + {n};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_negative_signed_right_shift_constants(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_shifting_an_arm_bound_scrutinee_is_reported() {
+        // Codex's finding: `match u128::MAX { x @ u128::MAX => ((x >> 127) as u8) - 1 + n,
+        // _ => 100 }` resolves `x`'s own *value* through the earlier arm-binding fix, but
+        // the arm resolver's `unsigned`/`width` closures still asked only the *outer* scope
+        // for `x` — which has never heard of an arm-local name — so
+        // `is_definitely_unsigned(x, ..)` answered `false` and the shift `x >> 127` stayed
+        // unresolved regardless of what `x` was actually bound to. `evaluate_match` now
+        // derives an arm-bound name's own unsignedness and width from the *scrutinee
+        // expression* it was matched against — `u128::MAX`, confirmed unsigned by the
+        // identical well-known-bound recognition `path_is_definitely_unsigned` already
+        // gives it — so `x >> 127` folds as an unsigned (logical) shift, `1`, and
+        // `((x >> 127) as u8) - 1 + n` folds to `n`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match u128::MAX {{ x @ u128::MAX => ((x >> 127) as u8) - 1 + {n}, _ => 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_arm_bound_scrutinee_shift(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
