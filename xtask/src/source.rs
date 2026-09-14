@@ -21251,6 +21251,38 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_multi_element_tuple_scrutinee_matches_is_reported() {
+        // Codex's next-round finding: `match (0u8, 1u8) { (0, 1) => 0, _ => 100 }` names a
+        // scrutinee this scan's own `i128` domain has no room for — `literal_or_const_value`'s
+        // own `Expr::Tuple` case only ever reduced a *one*-element tuple to its single inner
+        // value, so a genuinely multi-element tuple scrutinee fell through to the wildcard
+        // `_ => None` case and stayed unresolved, taking every constant built from it with
+        // it. `evaluate_match` now tries `evaluate_tuple_match` when the ordinary
+        // single-value path fails and the scrutinee is itself a multi-element tuple: each
+        // element is resolved on its own, then matched component-wise against the first arm
+        // whose own pattern is a tuple of the identical arity, reusing
+        // `match_arm_matches_constant` per element rather than needing the whole scrutinee
+        // named as one value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_element_tuple_match_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = match (0u8, 1u8) { (0, 1) => 0, _ => 100 };\n    \
+             const P1: u8 = match (0u8, 2u8) { (0, 2) => 1, _ => 101 };\n    \
+             const P2: u8 = match (0u8, 3u8) { (0, 3) => 2, _ => 102 };\n    \
+             const P3: u8 = match (0u8, 4u8) { (0, 4) => 3, _ => 103 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

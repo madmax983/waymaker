@@ -4579,13 +4579,69 @@ fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -
 /// guessing which of two matching arms `rustc` would pick — the moment a matching arm's own
 /// guard cannot be resolved to a compile-time value at all.
 fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<i128> {
-    let scrutinee = literal_or_const_value(&expr_match.expr, resolve)?;
+    // Codex's next-round finding: `match (0u8, 1u8) { (0, 1) => 0, _ => 100 }` names a
+    // scrutinee this scan's own `i128` domain has no room for — [`literal_or_const_value`]'s
+    // own `Expr::Tuple` case only ever reduces a *one*-element tuple to its single inner
+    // value, so a genuinely multi-element tuple scrutinee fell to the wildcard `_ => None`
+    // case there and stayed unresolved, taking every constant built from it with it. Tried
+    // first, and unconditionally, is the ordinary single-value path every other scrutinee
+    // shape already uses; [`evaluate_tuple_match`] is what is tried next, and only when the
+    // scrutinee is itself `Expr::Tuple` with more than one element — a tuple this scan can
+    // still answer for component-wise, matched against a tuple pattern of the identical
+    // arity, without ever needing to name the whole scrutinee as one `i128`.
+    if let Some(scrutinee) = literal_or_const_value(&expr_match.expr, resolve) {
+        for arm in expr_match
+            .arms
+            .iter()
+            .filter(|arm| !has_cfg_test(&arm.attrs))
+        {
+            if !match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
+                continue;
+            }
+            if let Some((_, guard_expr)) = arm.guard.as_ref() {
+                match literal_or_const_value(guard_expr, resolve) {
+                    Some(0) => continue,
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+            return literal_or_const_value(&arm.body, resolve);
+        }
+        return None;
+    }
+    let syn::Expr::Tuple(tuple) = strip_parens(&expr_match.expr) else {
+        return None;
+    };
+    if tuple.elems.len() < 2 {
+        return None;
+    }
+    evaluate_tuple_match(expr_match, tuple, resolve)
+}
+
+/// [`evaluate_match`]'s own tuple-scrutinee half: `scrutinee`'s own elements, each resolved
+/// through the identical single-value pipeline, matched component-wise against the first
+/// arm whose own pattern is a tuple of the identical arity (or an irrefutable catch-all —
+/// `_` or a bare, unguarded binding, the same two shapes [`match_arm_matches_constant`]
+/// already treats as matching anything). Every other half of `evaluate_match`'s own
+/// contract holds unchanged: a `#[cfg(test)]` arm is skipped, a guard is resolved and
+/// applied the identical way, and an arm whose own shape this function does not recognise
+/// stops the whole search rather than being treated as "does not match".
+fn evaluate_tuple_match(
+    expr_match: &syn::ExprMatch,
+    scrutinee: &syn::ExprTuple,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let values: Vec<i128> = scrutinee
+        .elems
+        .iter()
+        .map(|elem| literal_or_const_value(elem, resolve))
+        .collect::<Option<_>>()?;
     for arm in expr_match
         .arms
         .iter()
         .filter(|arm| !has_cfg_test(&arm.attrs))
     {
-        if !match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
+        if !tuple_pattern_matches_constant(&arm.pat, &values, resolve)? {
             continue;
         }
         if let Some((_, guard_expr)) = arm.guard.as_ref() {
@@ -4598,6 +4654,33 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
         return literal_or_const_value(&arm.body, resolve);
     }
     None
+}
+
+/// Whether `pattern` matches the constant tuple `values`, component-wise — the tuple-arity
+/// twin of [`match_arm_matches_constant`], reusing that function for each element rather
+/// than reimplementing what a single element's own pattern can match. `None` for anything
+/// this cannot answer, for the identical reason [`match_arm_matches_constant`]'s own doc
+/// comment states: a caller that treated an unrecognised shape as "does not match" could
+/// silently try the wrong later arm.
+fn tuple_pattern_matches_constant(
+    pattern: &syn::Pat,
+    values: &[i128],
+    resolve: &Resolve<'_>,
+) -> Option<bool> {
+    match pattern {
+        syn::Pat::Wild(_) => Some(true),
+        syn::Pat::Ident(named) if named.subpat.is_none() && named.by_ref.is_none() => Some(true),
+        syn::Pat::Paren(paren) => tuple_pattern_matches_constant(&paren.pat, values, resolve),
+        syn::Pat::Tuple(tuple_pat) if tuple_pat.elems.len() == values.len() => {
+            for (sub_pattern, value) in tuple_pat.elems.iter().zip(values) {
+                if !match_arm_matches_constant(sub_pattern, *value, resolve)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Whether `pattern` matches the constant `value`, for the narrow set of shapes
