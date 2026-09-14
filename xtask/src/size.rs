@@ -29,9 +29,16 @@
 //! is held to `INCREMENTAL_CODE_FLASH_BYTES`; `facade` is the configuration rung 0.4 ships
 //! and is held to `FACADE_CODE_FLASH_BYTES`, a ceiling of its own so that paying for the
 //! façade never widens the kernel's number. A per-feature row is reported with its
-//! incremental cost but not gated, because the design document sets no per-feature budget —
-//! it requires the cost to be *shown*. The base-branch diff is what makes an unbudgeted
-//! row's growth visible in review.
+//! incremental cost but not gated for *flash*, because the design document sets no
+//! per-feature flash budget — it requires the cost to be *shown*. The base-branch diff is
+//! what makes an unbudgeted row's growth visible in review.
+//!
+//! Runtime RAM does not split the same way. §04 states one hard ceiling for the device, not
+//! one per configuration, so [`SizeReport::runtime_ram_total`] composes the largest `Δram`
+//! of *every* row — a per-feature row's RAM counts against it too. [`completeness_shortfalls`]
+//! is what makes composing over "every row" sound against a document this process did not
+//! produce: it holds the document's row *set* to what [`matrix`] derives for the workspace,
+//! so a row cannot be silently dropped to compose a smaller total — issue #115.
 //!
 //! # §04's budgets, and what carries each
 //!
@@ -309,6 +316,74 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
     }
 
     variants
+}
+
+/// Rows the document is missing, compared against what [`matrix`] derives for the
+/// workspace at `root`.
+///
+/// [`SizeReport::runtime_ram_total`] composes the largest `Δram` of *every* row the
+/// document carries, because a per-feature row's statics count against §04's one runtime
+/// ceiling the same as the engine's do. `--report` reads a document this process did not
+/// produce, so the row *set* is not taken at its word either: a row `matrix` would derive
+/// and the document lacks — by name, or by name with a different feature selection — is a
+/// wrong claim, not a smaller one. Issue #115.
+///
+/// Resolves `cargo metadata` for `root` and nothing else. No firmware is linked, which
+/// keeps `--report` usable without a build.
+///
+/// # Errors
+///
+/// If `root`'s workspace cannot be resolved or parsed.
+pub fn completeness_shortfalls(
+    root: &Path,
+    report: &SizeReport,
+) -> Result<Vec<BudgetShortfall>, SizeError> {
+    let metadata = crate::run_cargo_metadata(root)
+        .map_err(|err| SizeError::new(format!("could not resolve the workspace: {err}")))?;
+    let graph = PackageGraph::from_cargo_metadata(&metadata)
+        .map_err(|err| SizeError::new(format!("could not parse cargo metadata: {err}")))?;
+    Ok(missing_rows(&matrix(&graph), report.rows()))
+}
+
+/// [`completeness_shortfalls`]'s comparison, pulled out so a test can drive it against a
+/// fixed `expected` list rather than a live workspace.
+///
+/// A row of `rows` is missing when no row shares `expected`'s name *and* its exact feature
+/// set — a name reused with a narrowed selection is a row that was not really built with
+/// the feature the name claims, so its `Δram` would not be that feature's.
+///
+/// An empty `expected` is refused rather than read as "nothing to check": [`matrix`]
+/// derives no row at all for a workspace with no [`PROBE_PACKAGE`], and a document read
+/// against that workspace would otherwise pass vacuously — the same empty matrix
+/// [`measure_into`] already refuses to link.
+#[must_use]
+fn missing_rows(expected: &[Variant], rows: &[Row]) -> Vec<BudgetShortfall> {
+    if expected.is_empty() {
+        return vec![BudgetShortfall::Unmeasurable {
+            detail: format!(
+                "this workspace has no `{PROBE_PACKAGE}`, so `matrix` derives no row to hold the document's row set to"
+            ),
+        }];
+    }
+    expected
+        .iter()
+        .filter(|variant| {
+            !rows.iter().any(|row| {
+                row.name == variant.name
+                    && row.features.len() == variant.features.len()
+                    && variant
+                        .features
+                        .iter()
+                        .all(|feature| row.features.iter().any(|have| have == feature))
+            })
+        })
+        .map(|variant| BudgetShortfall::Unmeasurable {
+            detail: format!(
+                "the report has no row named `{}` with features {:?}, which `matrix` derives for this workspace",
+                variant.name, variant.features
+            ),
+        })
+        .collect()
 }
 
 /// The section sizes of one linked image.
@@ -1020,6 +1095,30 @@ impl fmt::Display for BudgetShortfall {
     }
 }
 
+/// Why the gate failed, or `None` if `shortfalls` is empty.
+///
+/// [`SizeReport::shortfall_report`] calls this with the document's own shortfalls. A
+/// caller with more than the document's own — [`completeness_shortfalls`]'s, for one —
+/// calls it with both lists combined, so the two read as one report rather than two.
+#[must_use]
+pub fn render_shortfall_report(shortfalls: &[BudgetShortfall]) -> Option<String> {
+    if shortfalls.is_empty() {
+        return None;
+    }
+    let mut message = vec![format!(
+        "{} budget(s) exceeded, measured on {FIRMWARE_TARGET} with the release-size profile:",
+        shortfalls.len()
+    )];
+    for shortfall in shortfalls {
+        message.push(format!("\n  {shortfall}"));
+    }
+    message.push(
+        "\n\nThe budgets are design document \u{a7}04. They are gates rather than claims: a change that needs more space needs the table changed in waymaker_core::budget, in the same pull request, with a reason."
+            .to_owned(),
+    );
+    Some(message.concat())
+}
+
 /// The measured size of every image in the matrix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeReport {
@@ -1094,14 +1193,24 @@ impl SizeReport {
 
     /// Design document §04's runtime RAM sentence, composed.
     ///
-    /// The caller's scratch page, the kernel state registry, the context, and whatever
-    /// statics the gated rows own. `None` when a term could not be read, because a total
-    /// with a term missing is a smaller number than the truth and would pass.
+    /// Adds the caller's scratch page, the kernel state registry, the context, and the
+    /// statics term. `None` when a term could not be read, because a total with a term
+    /// missing is smaller than the truth and would pass.
     ///
-    /// The statics term is the *largest* of the rows rather than their sum: the rows are
-    /// separate images of the same firmware, and a device runs one of them. Every row, not
-    /// only the gated ones — a per-feature row is a configuration somebody ships, and taking
-    /// the largest is the direction that fails closed.
+    /// The statics term is the *largest* `Δram` of *every* row, gated or not — a
+    /// per-feature row is a configuration somebody ships, and a device runs one of them,
+    /// so its own statics count against the one hard runtime-RAM ceiling the same as the
+    /// engine's do. Taking the largest is the direction that fails closed.
+    ///
+    /// This trusts the row *set* the document carries — that every row [`matrix`] derives
+    /// for this workspace is in it. `--report` reads a document this process did not write,
+    /// and before issue #115 nothing checked that: a document that omitted the row with the
+    /// largest `Δram` composed a smaller, wrong total, and could pass a budget a complete
+    /// document would fail. [`completeness_shortfalls`] is the check that closes it, by
+    /// comparing the document against a freshly resolved [`matrix`] rather than by dropping
+    /// rows from this sum — dropping rows here would also stop gating a real per-feature
+    /// configuration's RAM, which is the ceiling this term exists to hold every shippable
+    /// configuration to.
     #[must_use]
     pub fn runtime_ram_total(&self) -> Option<u64> {
         let kernel_state = self.kernel_state.as_ref()?;
@@ -1486,7 +1595,9 @@ impl SizeReport {
     /// The rows a gated report must carry, and that they are the images their ceilings name.
     ///
     /// `--report` gates a document this process did not produce, so neither the presence of
-    /// a row nor its `gated` flag nor its name is taken at its word.
+    /// a row nor its `gated` flag nor its name is taken at its word. The two gated rows are
+    /// pinned here; every row, gated or not, is pinned against the workspace itself by
+    /// [`completeness_shortfalls`].
     fn gated_row_shortfalls(&self) -> Vec<BudgetShortfall> {
         let mut shortfalls = Vec::new();
         for (row, why) in [
@@ -1628,22 +1739,7 @@ impl SizeReport {
     /// Why the gate failed, or `None` if it did not.
     #[must_use]
     pub fn shortfall_report(&self) -> Option<String> {
-        let shortfalls = self.shortfalls();
-        if shortfalls.is_empty() {
-            return None;
-        }
-        let mut message = vec![format!(
-            "{} budget(s) exceeded, measured on {FIRMWARE_TARGET} with the release-size profile:",
-            shortfalls.len()
-        )];
-        for shortfall in &shortfalls {
-            message.push(format!("\n  {shortfall}"));
-        }
-        message.push(
-            "\n\nThe budgets are design document \u{a7}04. They are gates rather than claims: a change that needs more space needs the table changed in waymaker_core::budget, in the same pull request, with a reason."
-                .to_owned(),
-        );
-        Some(message.concat())
+        render_shortfall_report(&self.shortfalls())
     }
 
     /// A table with one row per image, its section deltas, and what it cost over its base.
@@ -1738,7 +1834,7 @@ impl SizeReport {
             |total| format!("{total} B of {RUNTIME_RAM_BUDGET_BYTES} B"),
         );
         format!(
-            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
+            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row, gated or not — a per-feature row's own statics count against this one ceiling too. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
             self.kernel_state.as_ref().map_or(0, |state| state.total),
             runtime.context,
         )
@@ -4994,6 +5090,117 @@ mod tests {
     }
 
     #[test]
+    fn a_per_feature_rows_large_ram_raises_the_runtime_ram_total() {
+        // A per-feature row is a configuration somebody ships, and \u{a7}04 states one hard
+        // runtime-RAM ceiling for the device, not one per configuration — so an ungated
+        // row's `\u{394}ram` has to count against it the same as a gated row's does.
+        let default = default_row(1_024, 0);
+        let huge = feature_row_with_ram(
+            "waymaker-core/serde",
+            &default,
+            0,
+            RUNTIME_RAM_BUDGET_BYTES + 1_000,
+        );
+        let report = SizeReport::new(
+            vec![baseline_row(), default, facade_row(1_024, 0), huge],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(
+            report.runtime_ram_total(),
+            Some(SCRATCH_PAGE_BYTES + 104 + 56 + RUNTIME_RAM_BUDGET_BYTES + 1_000),
+        );
+    }
+
+    #[test]
+    fn a_document_missing_a_row_the_matrix_derives_is_caught() {
+        // Issue #115. `runtime_ram_total` composes every row, so a document that omitted
+        // the row with the largest `\u{394}ram` used to compose a smaller, wrong total and
+        // could pass a budget a complete document would fail. `missing_rows` is the check
+        // that closes it: the row set itself is held to what `matrix` derives.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy").with_features(&["postcard"]),
+            Package::new(PROBE_PACKAGE).with_features(&[
+                PROBE_FEATURE,
+                ENGINE_FEATURE,
+                FACADE_FEATURE,
+                "embassy-postcard",
+            ]),
+        ]);
+        let expected = matrix(&graph);
+        assert!(
+            expected
+                .iter()
+                .any(|variant| variant.name == "waymaker-embassy/postcard"),
+            "{expected:?}"
+        );
+
+        let complete = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let rows: Vec<Row> = expected
+            .iter()
+            .filter(|variant| !complete.iter().any(|row| row.name == variant.name))
+            .map(|variant| {
+                let mut row = feature_row(&variant.name, &default_row(1_024, 0), 8);
+                row.features = variant.features.clone();
+                row
+            })
+            .chain(complete.clone())
+            .collect();
+        assert!(missing_rows(&expected, &rows).is_empty(), "{rows:?}");
+
+        let incomplete: Vec<Row> = rows
+            .into_iter()
+            .filter(|row| row.name != "waymaker-embassy/postcard")
+            .collect();
+        let shortfalls = missing_rows(&expected, &incomplete);
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+        assert!(
+            rendered(&shortfalls).contains("waymaker-embassy/postcard"),
+            "{shortfalls:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_with_the_right_name_and_the_wrong_features_is_also_caught() {
+        // Reusing a row's name with a narrowed feature selection is a row that was not
+        // really built with the feature the name claims, so `missing_rows` compares the
+        // feature set too, not only the name.
+        let expected = [Variant {
+            name: "waymaker-core/serde".to_owned(),
+            features: vec![
+                PROBE_FEATURE.to_owned(),
+                ENGINE_FEATURE.to_owned(),
+                "waymaker-core/serde".to_owned(),
+            ],
+            measured_against: DEFAULT_ROW.to_owned(),
+            gated: false,
+        }];
+        let mut narrowed = feature_row("waymaker-core/serde", &default_row(1_024, 0), 8);
+        narrowed.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
+        let shortfalls = missing_rows(&expected, std::slice::from_ref(&narrowed));
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    }
+
+    #[test]
+    fn a_workspace_with_no_probe_does_not_let_an_old_report_pass() {
+        // `matrix` derives no row at all for a workspace with no probe, and an empty
+        // `expected` read as "nothing to check" would let a document from before the probe
+        // was removed pass vacuously — even one that looks complete for the workspace it
+        // was really measured against.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core")]);
+        assert!(matrix(&graph).is_empty());
+        let rows = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let shortfalls = missing_rows(&matrix(&graph), &rows);
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+        assert!(
+            rendered(&shortfalls).contains(PROBE_PACKAGE),
+            "{shortfalls:?}"
+        );
+    }
+
+    #[test]
     fn exceeding_the_runtime_ram_budget_names_the_total() {
         // Through the statics term, over the statics sub-cap as well, so both budgets are
         // named rather than only the first. The case where the composition alone fails is
@@ -6003,6 +6210,18 @@ mod tests {
 
     /// A feature row costing `flash_over_default` more than the `default` row it sits on.
     fn feature_row(name: &str, default: &Row, flash_over_default: u64) -> Row {
+        feature_row_with_ram(name, default, flash_over_default, 0)
+    }
+
+    /// A feature row costing `flash_over_default` more flash and `ram_over_default` more RAM
+    /// than the `default` row it sits on. Ungated, like every per-feature row [`matrix`]
+    /// derives.
+    fn feature_row_with_ram(
+        name: &str,
+        default: &Row,
+        flash_over_default: u64,
+        ram_over_default: u64,
+    ) -> Row {
         Row::new(
             name,
             &[PROBE_FEATURE, ENGINE_FEATURE, name],
@@ -6010,6 +6229,8 @@ mod tests {
             SectionSizes {
                 flash: default.sizes.flash + flash_over_default,
                 text: default.sizes.text + flash_over_default,
+                bss: default.sizes.bss + ram_over_default,
+                ram: default.sizes.ram + ram_over_default,
                 ..default.sizes
             },
             default.probe_flash,
