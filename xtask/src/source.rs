@@ -16678,6 +16678,160 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_ref_at_bindings_is_reported() {
+        // Codex's thirty-sixth-round finding: an at-binding's recursion into its own
+        // subpattern was gated on `named.by_ref.is_none()` for the *whole* arm, so an
+        // at-binding with an explicit binding mode (`ref _p0 @ 0`) fell to
+        // `_ => Vec::new()` instead of resolving through its subpattern the way an
+        // unmoded at-binding already did — but `ref`, `mut` and `ref mut` change only
+        // how the match binds the value, never which value the pattern matches, and
+        // MSRV Rust accepts the form with no warning.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ref_at_binding_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn ref_at_binding_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        ref _p0 @ 0 => ref_at_binding_helper(0),\n        \
+             ref _p1 @ 1 => ref_at_binding_helper(1),\n        ref _p2 @ 2 => \
+             ref_at_binding_helper(2),\n        _ => ref_at_binding_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_self_inside_its_own_impl_is_reported() {
+        // Codex's thirty-sixth-round finding: `Self::P0`, written inside the very impl
+        // that declares `const P0 = 0;`, is indexed under the concrete implementing
+        // type's own name (`Indices::P0`) exactly like any other associated constant —
+        // but nothing recorded that `Self` currently *means* `Indices` while that
+        // impl's own body was being walked, so `resolve_pattern_path` searched for a
+        // literal path segment spelled `Self`, which `qualified` never indexes anything
+        // under, and every arm read as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices;\n\nimpl Indices {\n    const P0: u8 = 0;\n    \
+             const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n\n    \
+             const fn self_qualified_pattern_table(nibble: u8) -> u32 {\n        \
+             match nibble & 0xF {\n            Self::P0 => 0,\n            \
+             Self::P1 => 1,\n            Self::P2 => 2,\n            Self::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_single_field_tuple_struct_patterns_is_reported() {
+        // Codex's thirty-sixth-round finding: `Some(0)` through `Some(14)` over an
+        // `Option<u8>` scrutinee lowers to the identical indexed table a bare-integer
+        // version gets, but every numbered arm is a `Pat::TupleStruct`, which fell to
+        // the wildcard `_ => Vec::new()` case regardless of which single-field
+        // constructor it named.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_struct_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn tuple_struct_table(nibble: Option<u8>) -> u32 {\n    match nibble \
+             {\n        Some(0) => tuple_struct_helper(0),\n        \
+             Some(1) => tuple_struct_helper(1),\n        Some(2) => \
+             tuple_struct_helper(2),\n        _ => tuple_struct_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_in_one_block_is_not_hidden_by_a_same_named_local_module_in_a_sibling_block() {
+        // Codex's thirty-sixth-round finding: the fix for two *functions* colliding
+        // under one same-named local module left the identical shape open one level
+        // finer — two *sibling blocks of one function*, two bare `{ .. }` expressions
+        // among them, each declaring their own local `mod indices`, still collided
+        // under `function_path` alone, since nothing recorded which *block* a
+        // function-local module sat in.
+        //
+        // The first block's own match is written *before* its own `mod indices`
+        // declaration — legal Rust, since items in a block are visible throughout the
+        // whole block regardless of where they sit — which is what makes the
+        // collision observable rather than merely present: `match_expressions_with_prefix`
+        // makes two full passes over the file, and by the end of the first pass
+        // (which exists only to populate `qualified` completely) the *second*, later
+        // block's own colliding `mod indices` — giving all four constants the
+        // identical value `0` — was the last thing to write that shared key. On the
+        // second pass, the first block's match is reached and resolved *before* that
+        // pass has re-inserted its own block's correct values, so — pre-fix — it read
+        // the first pass's leftover, poisoned state instead: four duplicate patterns
+        // rather than four distinct ones, hiding a real 5-arm dense table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn block_identity_helper(value: u32) -> u32 {\n    value\n}\n\n\
+             const fn block_identity_table(nibble: u8) -> u32 {\n    let first = {\n        \
+             let value = match nibble & 0xF {\n            \
+             indices::P0 => block_identity_helper(0),\n            indices::P1 => \
+             block_identity_helper(1),\n            indices::P2 => \
+             block_identity_helper(2),\n            indices::P3 => \
+             block_identity_helper(3),\n            _ => block_identity_helper(4),\n        \
+             };\n        mod indices {\n            pub(crate) const P0: u8 = 0;\n            \
+             pub(crate) const P1: u8 = 1;\n            pub(crate) const P2: u8 = 2;\n            \
+             pub(crate) const P3: u8 = 3;\n        }\n        value\n    \
+             };\n    let second = {\n        mod indices {\n            \
+             pub(crate) const P0: u8 = 0;\n            pub(crate) const P1: u8 = 0;\n            \
+             pub(crate) const P2: u8 = 0;\n            pub(crate) const P3: u8 = 0;\n        \
+             }\n        0u32\n    };\n    first + second\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_pattern_wider_than_the_cap_is_refused_rather_than_expanded() {
+        // Codex's thirty-sixth-round finding: the `usize`-fit check bounded only
+        // representability, not size — `0..=1_000_000_000u64` fits a `usize` on a
+        // 64-bit host and was then eagerly collected into roughly a billion `i128`
+        // values before the match around it was even checked for its arm count or its
+        // density, an out-of-memory failure one added line could trigger.
+        // `MAX_RANGE_PATTERN_VALUES` refuses to expand a span this wide at all, so the
+        // arm reads as unresolved and the match is never reported as dense — the
+        // opposite of the pre-fix behaviour, which resolved this exact fixture (a
+        // smaller, safely-allocatable 8192-value span rather than the billion-value one
+        // that motivated the fix, since a regression test earns nothing by risking the
+        // failure mode it exists to catch) and reported it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn huge_range_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn huge_range_table(nibble: u32) -> u32 {\n    match nibble \
+             {\n        0..=8191 => huge_range_helper(0),\n        \
+             8192 => huge_range_helper(1),\n        8193 => huge_range_helper(2),\n        \
+             8194 => huge_range_helper(3),\n        _ => huge_range_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
