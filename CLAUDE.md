@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 56 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 57 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -212,6 +212,39 @@ where no such operation exists the case says so rather than reaching somewhere u
 `xtask::policy::LAYERS` are empty — only `waymaker-embassy` has entries, and only for issue
 #37's optional codecs — so the kernel growing that dependency fails
 `kernel-zero-dependencies` and `waymaker-flash` growing it fails `dependency-direction`.
+
+## The storage-shape catalogue
+
+Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that "every legal
+operation shape the firmware issues must appear in the suite". `xtask::docs::STORAGE_SHAPES`
+holds the six shapes, the conformance crate's own `shape.rs` holds them again, and the
+`storage-shapes` rule fails a build in which this section, that table, the crate and
+[ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) stop naming the
+same set.
+
+A shape is a claim about a legal call, transcribed by a reviewer from `waymaker-flash`'s
+writers the same way `STORAGE_CONTRACT_CLAUSES` transcribes §12 rather than deriving it from
+source. What holds the claim to the suite is `shape::ShapeWitness`, which wraps a
+`StableStorage` and records which shapes a run really issues, crediting nothing an adapter
+refused —
+`crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape` fails a
+build in which a declared shape goes unexercised.
+
+All 6 storage shapes, with the id to cite when a change touches one:
+
+| Id | Sentence | Issued by |
+| --- | --- | --- |
+| `program-single-unit` | A program of exactly one program unit. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value — at the journal's own alignment, which may be coarser than the device program unit — comes to exactly one device program unit |
+| `program-multi-unit` | A program of more than one program unit in one call. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever that padded value spans more than one device program unit |
+| `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
+| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
+| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s header read and its erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — come to exactly one read unit |
+| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; and its header read and erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — span more than one read unit |
+
+Issue #130 item 3 — a generator that mutation-tests the suite against its own model, with a
+conformant arm so a false positive is reachable and not only a broken adapter — is still
+open. It is `waymaker-spec`-shaped work, not a small addition to `tests/teeth.rs`, and this
+catalogue does not attempt it.
 
 ## The frozen wire format
 
@@ -830,7 +863,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 56 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 57 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -897,6 +930,7 @@ this table is how you find out what a red build is telling you.
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
+| `storage-shapes` | Issue #130 item 2's shape catalogue and the four places it lives stop agreeing: a shape in `docs::STORAGE_SHAPES` is missing from this file, from [ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md), or from `crates/waymaker-conformance/src/shape.rs`; its row here does not carry the sentence or the issuer; the count is wrong; the crate names a shape's issuer differently than the table does; the crate declares a shape the table never did; or the shape table is not where the gate looks for it. What it cannot see is inside the crate: that a declared shape is really issued by a run is `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
 | `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test — a conditional attribute is refused outright, because a row test is either a test or it is not (issue #97). What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
@@ -997,6 +1031,13 @@ Stated so that nobody mistakes silence for coverage:
   pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
   in a sibling module adds a method to every port's type with the rule silent, the same way
   `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **That a shape's `issued_by` names the function that really issues it.** `storage-shapes`
+  compares the sentence and the issuer *text* across the four places the table lives, the
+  same as `storage-conformance` does for a clause's discharge — it does not resolve
+  `append::Sealable::commit` against the crate and check that such a function exists. A row
+  transcribed against the wrong type — a program attributed to `Journal::commit` when the
+  method is `Sealable::commit`'s — reads and checks the same as a correct one; review of this
+  section is what catches it.
 - **Crash points of operations that exist only after an injected failure.** `injections` is
   computed from the *fault-free* write sequence, so a retry a writer performs only because a
   call failed has no crash points of its own — it is never torn, interrupted or power-lost
