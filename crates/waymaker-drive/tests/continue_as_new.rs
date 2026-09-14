@@ -8,7 +8,7 @@
 
 use waymaker_core::timer::TimerSpec;
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, KernelError, Outcome, RecordRef, RunId};
+use waymaker_core::{ActivityKind, DecodeError, KernelError, Outcome, RecordRef, RunId};
 use waymaker_drive::{
     Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
@@ -16,6 +16,7 @@ use waymaker_fault::Device;
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Bounds, CapacityError, Reserve};
 use waymaker_flash::frame::{self, ProgramAlign};
+use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::recovery::{JournalRegion, RecoveryError};
 use waymaker_flash::storage::{Geometry, StableStorage};
 
@@ -1769,4 +1770,134 @@ fn a_stale_banks_unreadable_header_never_blocks_the_intact_authoritative_bank() 
     // out of the way.
     let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
     assert_eq!(a_run, RUN);
+}
+
+/// Installs bank `id` with a header whose declared *wire* format version this firmware's
+/// `reads_format_version` does not admit — otherwise a completely ordinary, correctly
+/// checksummed header, exactly the shape a firmware elsewhere in the same fleet's rollout
+/// both wrote and would read back.
+///
+/// `bank::seal_for` cannot build this bank's seal — it decodes the header first, and this
+/// header is built specifically to fail that decode — so the seal's digest is computed
+/// directly here, the same arithmetic `seal_for_with` itself would reach for once past a
+/// decode this header cannot pass.
+fn install_with_unsupported_version(
+    device: &mut Device,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    let region = layout().bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get_mut(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    // Byte 2 of the prefix is the format version — `verify_header_prefix_with`'s own field
+    // layout. At v1 `reads_format_version` admits one value, so the byte right after it is
+    // always outside the range; this still searches rather than assuming that stays true.
+    let Some(version_byte) = header_frame.get_mut(2) else {
+        unreachable!("the header prefix has at least 3 bytes")
+    };
+    let mut version = version_byte.wrapping_add(1);
+    while frame::reads_format_version(version) {
+        version = version.wrapping_add(1);
+    }
+    *version_byte = version;
+    // Re-seal the prefix and the header frame over the changed byte, the same way a real
+    // writer would have — `waymaker-flash`'s own
+    // `a_header_from_another_format_version_is_refused_before_its_body_is_read` does this
+    // identical reseal for the same reason.
+    let prefix_len = bank::HEADER_PREFIX_BYTES - 2;
+    let Some(prefix) = header_frame.get(..prefix_len) else {
+        unreachable!("the header is at least as long as its own prefix")
+    };
+    let prefix_resealed = Catalogued::header_check(prefix).to_le_bytes();
+    let Some(prefix_crc) = header_frame.get_mut(prefix_len..prefix_len + 2) else {
+        unreachable!("the header holds its own prefix checksum right after the prefix")
+    };
+    prefix_crc.copy_from_slice(&prefix_resealed);
+    let covered = header_len - bank::HEADER_TRAILER_BYTES;
+    let Some(sealed) = header_frame.get(..covered) else {
+        unreachable!("the header is at least as long as what its trailer covers")
+    };
+    let frame_resealed = Catalogued::frame_check(sealed).to_le_bytes();
+    let Some(trailer) = header_frame.get_mut(covered..covered + bank::HEADER_TRAILER_BYTES) else {
+        unreachable!("the header holds its own trailer right after what it covers")
+    };
+    trailer.copy_from_slice(&frame_resealed);
+
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+    let Some(sealed) = header_frame.get(..covered) else {
+        unreachable!("the header is at least as long as what its trailer covers")
+    };
+    let seal = bank::Seal {
+        generation,
+        header_check: Catalogued::frame_check(sealed),
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.seal_offset(), sealed),
+        device.barrier(),
+    ) else {
+        unreachable!("a generation seal is a legal program")
+    };
+}
+
+#[test]
+fn a_higher_generation_banks_unsupported_format_version_is_never_ignored_for_a_stale_bank() {
+    // Codex found this on round 10. The scenario is a migration that committed a newer
+    // bank in a wire format version this firmware does not read, whose reclaim of the old
+    // bank then failed — so the retired bank is still perfectly readable, one generation
+    // lower, and firmware from before the new format existed meets both. `seal_for_with`
+    // decodes the header before it can seal it, so the higher-generation bank's own
+    // decode fails with `DecodeError::UnsupportedFormatVersion` — and that was folded into
+    // the same `BankRead::Absent` as a genuinely corrupt header, even though its seal had
+    // already validated and named a real, higher claimed generation. `resolve_bank_read`'s
+    // `(Found, Absent)` arm then picked the lower-generation, fully-readable bank with
+    // nothing to say it was ever second — silently resuming a run that was already
+    // replaced, exactly as the finding describes.
+    let mut device = Device::new(geometry());
+    // Bank A: the retired run, still perfectly readable, at the lower generation.
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    // Bank B: the real authority, one generation higher, in a format this firmware does
+    // not read.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install_with_unsupported_version(&mut device, BankId::B, later, &first_header());
+
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Decode(
+                DecodeError::UnsupportedFormatVersion
+            )))
+        ),
+        "a stale, fully-readable bank must never be silently resumed just because the real, \
+         higher-generation authority is in a format this firmware cannot read: {progress:?}"
+    );
 }

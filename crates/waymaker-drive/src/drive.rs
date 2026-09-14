@@ -527,9 +527,11 @@ enum BankRead<E> {
         needed: usize,
     },
     /// Genuinely sealed, at `claimed_generation`, but the device itself refused this bank's
-    /// header read — damage or a fault confined to this bank, unrelated to how large `page`
-    /// is. `error` is what a caller sees if nothing rescues the boot; a larger page cannot
-    /// fix it, so it carries forward unchanged rather than being reported as a size to grow.
+    /// header read — damage or a fault confined to this bank — or this firmware does not
+    /// read the wire format version this bank's header declares. Neither is fixable by a
+    /// larger `page`, unlike [`BankRead::Oversized`], so `error` carries forward unchanged
+    /// as what a caller sees if nothing rescues the boot, rather than being reported as a
+    /// size to grow.
     Unreadable {
         claimed_generation: bank::Generation,
         error: DriveError<E>,
@@ -675,8 +677,25 @@ where
             Err(_) => BankRead::Absent,
         });
     }
-    let Ok(expected) = bank::seal_for_with::<C>(header_buf, seal.generation) else {
-        return Ok(BankRead::Absent);
+    // Codex round 10 found that `seal_for_with` decoding this header failed the same way
+    // for two different reasons this call folded into one: a header a bigger page or a
+    // healthy device could never rescue, and a header declaring a *wire* format version
+    // this firmware does not read (`reads_format_version`) — which a firmware elsewhere in
+    // the same fleet, at a different point in a rollout, both wrote and would read back.
+    // The second is exactly as deferrable as `BankRead::Oversized` and `Unreadable`: the
+    // seal above already named a claimed generation, and a bigger page cannot fix it, but
+    // the other bank fully validating at a higher generation still can.
+    let expected = match bank::seal_for_with::<C>(header_buf, seal.generation) {
+        Ok(expected) => expected,
+        Err(DecodeError::UnsupportedFormatVersion) => {
+            return Ok(BankRead::Unreadable {
+                claimed_generation: seal.generation,
+                error: DriveError::Recovery(RecoveryError::Decode(
+                    DecodeError::UnsupportedFormatVersion,
+                )),
+            });
+        }
+        Err(_) => return Ok(BankRead::Absent),
     };
     if expected != seal {
         return Ok(BankRead::Absent);
