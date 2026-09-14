@@ -2509,14 +2509,31 @@ fn type_path_name(ty: &syn::Type) -> Option<String> {
 /// cast's own destination type used to be discarded entirely, passing the unsigned
 /// operand straight through.
 ///
-/// Scoped to the ten fixed-width integer types (`u8`..`u128`, `i8`..`i128`): `usize` and
-/// `isize` are platform-width, which this scan has no target to measure against, so a
-/// cast to either stays unresolved rather than guessed — the same standing a call to a
-/// user-defined `const fn` already has here. A destination this scan does not resolve
-/// returns `None`, never the operand unchanged, because passing an unevaluated cast
-/// through is exactly the bug being fixed.
+/// Scoped to the ten fixed-width integer types (`u8`..`u128`, `i8`..`i128`) plus one
+/// narrow exception for `usize`/`isize`, which are otherwise platform-width and have no
+/// target here to measure against — so a cast to either stays unresolved rather than
+/// guessed, the same standing a call to a user-defined `const fn` already has here. A
+/// destination this scan does not resolve returns `None`, never the operand unchanged,
+/// because passing an unevaluated cast through is exactly the bug being fixed.
+///
+/// Codex's next-round finding: `0u8 as usize` was refused by that same platform-width
+/// rule, even though nothing about *this* cast's answer depends on which target it runs
+/// on — Rust's own reference guarantees `usize`/`isize` are at least 16 bits wide on
+/// every target, so a value already inside that guaranteed range casts to the identical
+/// `usize`/`isize` value everywhere. Scoped to exactly that width and no wider: a value
+/// needing more than 16 bits genuinely would depend on the target, which this scan still
+/// has no way to know.
 fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
     let name = single_segment_type_name(ty)?;
+    match name.as_str() {
+        "usize" => return (0..=i128::from(u16::MAX)).contains(&value).then_some(value),
+        "isize" => {
+            return (i128::from(i16::MIN)..=i128::from(i16::MAX))
+                .contains(&value)
+                .then_some(value);
+        }
+        _ => {}
+    }
     let (width, signed): (u32, bool) = match name.as_str() {
         "u8" => (8, false),
         "u16" => (16, false),
@@ -2725,18 +2742,96 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
         syn::BinOp::Le(_) => Some(i128::from(left <= right)),
         syn::BinOp::Gt(_) => Some(i128::from(left > right)),
         syn::BinOp::Ge(_) => Some(i128::from(left >= right)),
-        // Codex's next-round finding: `OFF && ON` — the logical operators, over two
-        // already-resolved `bool` constants — reached the same wildcard `_ => None` the
-        // comparison operators did before this same round's fix. This function's own
-        // caller already requires *both* operands to resolve before it is ever called
-        // (`literal_or_const_value`'s `Expr::Binary` case uses `?` on each), so the real
-        // short-circuit behaviour `&&`/`||` have in Rust — never evaluating a right side a
-        // left side already decided — is not reproduced here; that only makes this scan
-        // resolve fewer guards than `rustc` could, never the wrong value for one it does
-        // resolve, which is the same standing every other case here already has for what
-        // it declines to evaluate.
-        syn::BinOp::And(_) => Some(i128::from(left != 0 && right != 0)),
-        syn::BinOp::Or(_) => Some(i128::from(left != 0 || right != 0)),
+        // `&&`/`||` are not folded here at all — [`literal_or_const_value`]'s own
+        // `Expr::Binary` case handles them in a match arm of its own, before this
+        // function's caller would otherwise require both operands to resolve, so a
+        // genuinely short-circuited operand never needs to.
+        _ => None,
+    }
+}
+
+/// `left && right` or `left || right`'s own value (`is_and` selects which), evaluated
+/// with real short-circuit semantics: `right` is resolved only when `left` alone does
+/// not already decide the whole expression's answer. Factored out of
+/// [`literal_or_const_value`]'s own `Expr::Binary` case to keep that function under
+/// clippy's line count.
+///
+/// Codex's next-round finding: `false && opaque()` — a decisive left operand beside a
+/// right one this scan cannot resolve (a call, here) — stayed unresolved under an eager
+/// version of this case that required *both* sides to resolve before
+/// [`evaluate_binary_op`] was even called, exactly the difference from `rustc`'s real
+/// short-circuit behaviour that function's own doc comment had already flagged. `rustc`
+/// never evaluates `opaque()` at all once `false` has already decided `&&`'s answer, and
+/// this scan can match that without interpreting arbitrary control flow: only `left` is
+/// required to resolve; if it alone decides the result (`false` for `&&`, `true` for
+/// `||`), that answer is returned directly and `right` is never asked to resolve at all —
+/// the identical shape of "never reached" this scan already extends to every unresolved
+/// right-hand call. Otherwise `left` was the non-deciding value (`true` for `&&`, `false`
+/// for `||`), so `right` is what the whole expression's value actually is, and it alone
+/// is resolved.
+fn evaluate_short_circuit_op(
+    is_and: bool,
+    left: &syn::Expr,
+    right: &syn::Expr,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let left_value = literal_or_const_value(left, resolve)?;
+    if is_and && left_value == 0 {
+        return Some(0);
+    }
+    if !is_and && left_value != 0 {
+        return Some(1);
+    }
+    let right_value = literal_or_const_value(right, resolve)?;
+    Some(i128::from(right_value != 0))
+}
+
+/// `indexed`'s own value — `expr[index]` — for every indexable literal shape this scan
+/// folds. Factored out of [`literal_or_const_value`]'s own `Expr::Index` case to keep that
+/// function under clippy's line count.
+///
+/// Codex's next-round finding: `const P0: u8 = [0u8][0];` is `Expr::Index` over an array
+/// *literal*, built solely so the indexing yields a constant — which fell to the wildcard
+/// `_ => None` case in `literal_or_const_value` and left every such arm unresolved, the
+/// const-call and array-vocabulary backstops both included, since each declared
+/// constant's own type is a plain `u8` and neither backstop reads an initializer's
+/// *shape*. Scoped to exactly that shape, the same way the tuple- and struct-literal
+/// `Expr::Field` case is: the indexed expression must itself be one of the shapes below —
+/// nothing reaches outside this expression for a value, so indexing a path or a slice
+/// reference is not attempted — and the index itself resolved through this same pipeline;
+/// an index outside the literal's own bounds, or one this scan cannot resolve to a value,
+/// stays unresolved rather than guessed at.
+///
+/// Codex's next-round finding: `[0u8; 1][0]` — a *repeat* array literal (`syn`'s
+/// `Expr::Repeat`, the `[value; count]` grammar), rather than the bracketed-list
+/// `Expr::Array` this function first handled — fell straight through that arm's own
+/// refusal, for the same reason the tuple/struct split needed a second match arm two
+/// rounds earlier. Every element of a repeat literal is definitionally the same
+/// expression, so this resolves the index only far enough to bounds-check it against the
+/// (separately resolved) repeat count, then evaluates that one shared element expression
+/// rather than looking anything up positionally.
+///
+/// Codex's next-round finding: `b"\x00"[0]` indexes a byte-string *literal* (`Expr::Lit`
+/// wrapping `syn::Lit::ByteStr`), a third indexable shape beside the two array literals
+/// above and one this case's own bounds check does not apply to the same way — a byte
+/// string carries its own length in its bytes rather than in a separate `count`
+/// expression, so there is nothing to resolve before indexing, only a bounds check
+/// against that length.
+fn evaluate_index(
+    indexed: &syn::ExprIndex,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
+    match indexed.expr.as_ref() {
+        syn::Expr::Array(array) => literal_or_const_value(array.elems.get(index)?, resolve),
+        syn::Expr::Repeat(repeat) => {
+            let len = usize::try_from(literal_or_const_value(&repeat.len, resolve)?).ok()?;
+            (index < len).then(|| literal_or_const_value(&repeat.expr, resolve))?
+        }
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::ByteStr(byte_str),
+            ..
+        }) => byte_str.value().get(index).map(|&byte| i128::from(byte)),
         _ => None,
     }
 }
@@ -2761,6 +2856,18 @@ fn literal_or_const_value(
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
         syn::Expr::Path(path) => resolve(&path.path),
+        // [`evaluate_short_circuit_op`] holds the rationale for why `&&`/`||` are not
+        // folded through `evaluate_binary_op` like every other operator.
+        syn::Expr::Binary(binary)
+            if matches!(binary.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) =>
+        {
+            evaluate_short_circuit_op(
+                matches!(binary.op, syn::BinOp::And(_)),
+                &binary.left,
+                &binary.right,
+                resolve,
+            )
+        }
         // [`evaluate_binary_op`] holds the rationale for every operator this folds,
         // arithmetic and comparison alike, since both are one decision rather than two.
         syn::Expr::Binary(binary) => evaluate_binary_op(
@@ -2918,50 +3025,8 @@ fn literal_or_const_value(
         // is nothing more than routing that body to the same function — no local `const` or
         // `let` fixed point of its own to invent.
         syn::Expr::Const(expr_const) => evaluate_block(&expr_const.block, resolve),
-        // Codex's next-round finding: `const P0: u8 = [0u8][0];` is `Expr::Index` over an
-        // array *literal*, built solely so the indexing yields a constant — which fell to
-        // the wildcard `_ => None` case below and left every such arm unresolved, the
-        // const-call and array-vocabulary backstops both included, since each declared
-        // constant's own type is a plain `u8` and neither backstop reads an initializer's
-        // *shape*. Scoped to exactly that shape, the same way the tuple- and
-        // struct-literal `Expr::Field` cases above are: the indexed expression must itself
-        // be an `Expr::Array` literal — nothing reaches outside this expression for a
-        // value, so indexing a path or a slice reference is not attempted — and the index
-        // itself resolved through this same pipeline; an index outside the array's own
-        // bounds, or one this scan cannot resolve to a value, stays unresolved rather than
-        // guessed at.
-        //
-        // Codex's next-round finding: `[0u8; 1][0]` — a *repeat* array literal (`syn`'s
-        // `Expr::Repeat`, the `[value; count]` grammar), rather than the bracketed-list
-        // `Expr::Array` this case first handled — fell straight through that case's own
-        // refusal, for the same reason the tuple/struct split above needed a second match
-        // arm. Every element of a repeat literal is definitionally the same expression, so
-        // this resolves the index only far enough to bounds-check it against the
-        // (separately resolved) repeat count, then evaluates that one shared element
-        // expression rather than looking anything up positionally.
-        //
-        // Codex's next-round finding: `b"\x00"[0]` indexes a byte-string *literal*
-        // (`Expr::Lit` wrapping `syn::Lit::ByteStr`), a third indexable shape beside the
-        // two array literals above and the one this case's own bounds check does not
-        // apply to the same way — a byte string carries its own length in its bytes
-        // rather than in a separate `count` expression, so there is nothing to resolve
-        // before indexing, only a bounds check against that length.
-        syn::Expr::Index(indexed) => {
-            let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
-            match indexed.expr.as_ref() {
-                syn::Expr::Array(array) => literal_or_const_value(array.elems.get(index)?, resolve),
-                syn::Expr::Repeat(repeat) => {
-                    let len =
-                        usize::try_from(literal_or_const_value(&repeat.len, resolve)?).ok()?;
-                    (index < len).then(|| literal_or_const_value(&repeat.expr, resolve))?
-                }
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::ByteStr(byte_str),
-                    ..
-                }) => byte_str.value().get(index).map(|&byte| i128::from(byte)),
-                _ => None,
-            }
-        }
+        // [`evaluate_index`] holds the rationale for every indexable shape this folds.
+        syn::Expr::Index(indexed) => evaluate_index(indexed, resolve),
         // Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop` —
         // an unusual but MSRV-legal way to spell a plain value inside a position that must
         // itself be an expression — which fell to the wildcard `_ => None` case below, the

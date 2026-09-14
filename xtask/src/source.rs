@@ -18330,6 +18330,61 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_short_circuited_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if false && opaque() => ..` stayed unresolved
+        // under the round-before-this fix for logical operators, because that fix
+        // resolved *both* operands eagerly before folding `&&` — and `opaque()` is a
+        // call, which this scan never evaluates, so the whole guard answered `None`
+        // instead of the `0` a decisive `false` left operand should have given on its
+        // own, exactly the way `rustc` itself never evaluates `opaque()` once `false` has
+        // already decided `&&`'s answer. `evaluate_short_circuit_op` now resolves only
+        // the left operand first, and returns a decisive answer directly without ever
+        // asking the right operand — the call included — to resolve at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn short_circuit_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn opaque() -> bool {\n    true\n}\n\n\
+             const fn short_circuit_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => short_circuit_dead_guard_helper(0),\n        \
+             1 => short_circuit_dead_guard_helper(1),\n        2 => short_circuit_dead_guard_helper(2),\n        \
+             _ if false && opaque() => 999,\n        _ => short_circuit_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_platform_sized_cast_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: usize = 0u8 as usize;` was refused by
+        // `apply_integer_cast`'s blanket "platform-width, no target to measure against"
+        // rule, even though nothing about *this* cast's answer depends on which target it
+        // runs on — Rust's own reference guarantees `usize`/`isize` are at least 16 bits
+        // wide everywhere, so a value already inside that guaranteed range (`0` here)
+        // casts to the identical value on every target. `apply_integer_cast` now answers
+        // such a cast directly, scoped to exactly that 16-bit-guaranteed width.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn platform_sized_cast_table(nibble: usize) -> u32 {\n    \
+             const P0: usize = 0u8 as usize;\n    const P1: usize = 1u8 as usize;\n    \
+             const P2: usize = 2u8 as usize;\n    const P3: usize = 3u8 as usize;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
