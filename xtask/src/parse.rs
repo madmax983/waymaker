@@ -4345,6 +4345,22 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
                 evaluate_block(&if_expr.then_branch, resolve)
             }
         }
+        // Codex's next-round finding: `if_expr.cond` is evaluated through this same
+        // function above, but `if let 0 = 0u8 { 0 } else { 100 }`'s own condition is
+        // `Expr::Let` — Rust's grammar permits a `let` only in an `if`'s or a `while`'s own
+        // condition position, never as a general value expression, but this function had no
+        // case for the node kind regardless, so it fell to the wildcard `_ => None` case
+        // below and every such `if`'s own condition stayed unresolved. Evaluated the same
+        // way a `match` arm's own pattern already is: the scrutinee resolved through this
+        // same pipeline, then [`match_arm_matches_constant`] answers whether the pattern
+        // matches it — `1` for a match and `0` for none, the identical `i128` encoding
+        // [`lit_value`]'s own `Lit::Bool` case already uses for a plain boolean, so the
+        // `Expr::If` case above needs no case of its own to read it.
+        syn::Expr::Let(let_expr) => {
+            let scrutinee = literal_or_const_value(&let_expr.expr, resolve)?;
+            let matches = match_arm_matches_constant(&let_expr.pat, scrutinee, resolve)?;
+            Some(i128::from(matches))
+        }
         // Codex's forty-seventh-round finding: `const P0: u8 = match true { true => 0,
         // false => 100 };` is `Expr::Match`, which fell to the wildcard `_ => None` case
         // below — and the const-call backstop does not catch it either, since a `match`

@@ -9396,11 +9396,36 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
         if let Some(wildcard) = found.arms.get(last) {
             if wildcard.is_wild {
                 if let Some(numbered) = found.arms.get(..last) {
-                    if missing_value(numbered).is_some() {
-                        return true;
-                    }
-                    if compact_window_with_gaps(numbered) {
-                        return true;
+                    // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2
+                    // => .., 3 => .., _ => ..` names a first arm whose *pattern* (`_x`)
+                    // matches every input outright, guarded by a condition this scan
+                    // cannot resolve — so `pattern_literal` answers it with no values at
+                    // all, and `missing_value`/`compact_window_with_gaps` each bail the
+                    // moment they meet that empty pattern, whatever position it sits at.
+                    // But `rustc` does not stop compiling a switch table there: reaching
+                    // arm 0's own guard and finding it false is exactly how execution
+                    // *reaches* arm 1, so the numbered arms after it still lower to the
+                    // identical indexed table they would if arm 0 were not written at
+                    // all, and a real device runs it every time `flag` is false. Tried at
+                    // every possible start rather than only at position 0 — a numbered
+                    // arm can itself carry an unresolvable guard, so a real table can
+                    // begin after more than one such barrier — and `suffix.len()` only
+                    // shrinks as `start` grows, so the moment a suffix (plus the
+                    // wildcard) is too small to be worth flagging, every later start is
+                    // too small as well.
+                    for start in 0..numbered.len() {
+                        let Some(suffix) = numbered.get(start..) else {
+                            break;
+                        };
+                        if suffix.len().saturating_add(1) < MINIMUM_DENSE_TABLE_ARMS {
+                            break;
+                        }
+                        if missing_value(suffix).is_some() {
+                            return true;
+                        }
+                        if compact_window_with_gaps(suffix) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -9421,7 +9446,32 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
 /// consecutive integers with no gap at all — the wildcard-free twin of the single-gap
 /// window [`missing_value`] looks for, for a match that names every value explicitly
 /// (an exhaustive enum match, most often) rather than leaving one for a catch-all.
+///
+/// Codex's next-round finding: the identical gap `has_dense_arm_patterns`'s own
+/// `numbered` scan had — an unresolvable guard on an early arm answers `pattern_literal`
+/// with no values, and the single top-to-bottom pass below used to bail at the first one
+/// regardless of where it sat, even though every arm after it can still be the dense,
+/// gap-free run `rustc` compiles into a table once that arm's own guard is false. Tried
+/// at every possible start the identical way, for the identical reason.
 fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
+    for start in 0..arms.len() {
+        let Some(suffix) = arms.get(start..) else {
+            break;
+        };
+        if suffix.len() < MINIMUM_DENSE_TABLE_ARMS {
+            break;
+        }
+        if fully_dense_arm_patterns_from(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`fully_dense_arm_patterns`]'s own single-pass check over exactly the slice it is
+/// handed — factored out so the suffix search above can retry it at every start without
+/// duplicating the window arithmetic.
+fn fully_dense_arm_patterns_from(arms: &[crate::parse::FoundArm]) -> bool {
     let mut values = Vec::new();
     let mut unsigned_domain = true;
     for arm in arms {
@@ -17159,13 +17209,20 @@ mod deferred_answer_pins {
         // smaller, safely-allocatable 8192-value span rather than the billion-value one
         // that motivated the fix, since a regression test earns nothing by risking the
         // failure mode it exists to catch) and reported it.
+        //
+        // Codex's next-round finding gave `has_dense_arm_patterns` its own suffix scan,
+        // so a consecutive run of numbered arms *after* the unresolved range would now
+        // be found and correctly reported — this fixture's three residual arms are kept
+        // far apart on purpose, so this test still exercises only the refused-expansion
+        // half and does not accidentally assert against a real dense sub-table the
+        // suffix scan is right to find.
         let mut source = tests_support::clean_checksum_module();
         source.push_str(
             "\nconst fn huge_range_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
              const fn huge_range_table(nibble: u32) -> u32 {\n    match nibble \
              {\n        0..=8191 => huge_range_helper(0),\n        \
-             8192 => huge_range_helper(1),\n        8193 => huge_range_helper(2),\n        \
-             8194 => huge_range_helper(3),\n        _ => huge_range_helper(4),\n    }\n}\n",
+             20000 => huge_range_helper(1),\n        40000 => huge_range_helper(2),\n        \
+             60000 => huge_range_helper(3),\n        _ => huge_range_helper(4),\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
@@ -21099,6 +21156,65 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_if_let_conditioned_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = if let 0 = 0u8 { 0 } else { 100 };`
+        // names an `if` whose own condition is `Expr::Let` — Rust's grammar permits a
+        // `let` only in an `if`'s or a `while`'s own condition position, never as a plain
+        // value expression, but `literal_or_const_value` had no case for the node kind
+        // regardless, so `if_expr.cond` stayed unresolved and every such constant did
+        // too. `literal_or_const_value` now evaluates an `Expr::Let` the same way a
+        // `match` arm's own pattern already is: the scrutinee resolved through this same
+        // pipeline, then `match_arm_matches_constant` answers whether the pattern
+        // matches it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_let_condition_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = if let 0 = 0u8 { 0 } else { 100 };\n    \
+             const P1: u8 = if let 0 = 1u8 { 0 } else { 1 };\n    \
+             const P2: u8 = if let 0 = 2u8 { 0 } else { 2 };\n    \
+             const P3: u8 = if let 0 = 3u8 { 0 } else { 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_suffix_following_an_unresolved_guarded_arm_is_reported() {
+        // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2 => .., 3
+        // => .., _ => ..` names a first arm whose own *pattern* (`_x`) is a bare,
+        // unconstrained binding — `pattern_literal` answers it with no values at all,
+        // regardless of the guard — guarded by a condition (`flag`) this scan cannot
+        // resolve, so it is neither dropped as dead code nor treated as the real
+        // wildcard. `missing_value` and `compact_window_with_gaps` each used to bail
+        // the moment they met that empty pattern anywhere in the numbered prefix, so
+        // the whole match read as not dense even though `rustc` still lowers arms `0`
+        // through `3` to an indexed table whenever `flag` is false — reaching arm `1` is
+        // exactly what a false guard on arm `0` means. `has_dense_arm_patterns` now
+        // retries the numbered scan at every possible start, not only at position `0`,
+        // so a dense run beginning after one or more such barrier arms is still found.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn guarded_barrier_dense_suffix_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        _x if flag => 999,\n        0 => 0,\n        \
+             1 => 1,\n        2 => 2,\n        3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
             "{violations:?}"
         );
     }
