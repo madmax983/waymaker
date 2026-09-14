@@ -17705,6 +17705,58 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_if_else_chain_is_reported() {
+        // Codex's forty-seventh-round finding: this scan only ever looked at `match`
+        // expressions, but a hand-written `if x == 0 { .. } else if x == 1 { .. } else {
+        // .. }` chain over one consistent scrutinee compiles to the identical indexed
+        // table a `match` over the same arms would. `extract_if_chain` now recognises the
+        // shape and answers in the same `FoundMatch` form a real match already produces,
+        // so the existing density check runs over it unchanged.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn if_chain_table(nibble: u8) -> u32 {\n    \
+             if nibble == 0 {\n        if_chain_helper(0)\n    } else if nibble == 1 \
+             {\n        if_chain_helper(1)\n    } else if nibble == 2 {\n        \
+             if_chain_helper(2)\n    } else {\n        if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_match_valued_initializers_is_reported() {
+        // Codex's forty-seventh-round finding: `const P0: u8 = match true { true => 0,
+        // false => 100 };` is `Expr::Match`, which fell to the wildcard `_ => None` case
+        // in `literal_or_const_value` and left every such constant unresolved — and the
+        // const-call backstop does not catch it either, since a `match` is not a call.
+        // `evaluate_match` resolves the scrutinee and evaluates whichever arm's pattern
+        // names that value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn match_valued_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match true {\n        true => 0,\n        false => 100,\n    \
+             };\n    const P1: u8 = match true {\n        true => 1,\n        false => \
+             101,\n    };\n    const P2: u8 = match true {\n        true => 2,\n        \
+             false => 102,\n    };\n    const P3: u8 = match true {\n        true => \
+             3,\n        false => 103,\n    };\n    match nibble {\n        P0 => 0,\n        \
+             P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

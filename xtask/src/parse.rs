@@ -2660,6 +2660,73 @@ fn literal_or_const_value(
                 evaluate_block(&if_expr.then_branch, resolve)
             }
         }
+        // Codex's forty-seventh-round finding: `const P0: u8 = match true { true => 0,
+        // false => 100 };` is `Expr::Match`, which fell to the wildcard `_ => None` case
+        // below — and the const-call backstop does not catch it either, since a `match`
+        // is not a call. Scoped to what a constant match plausibly needs: the scrutinee
+        // resolved through this same pipeline, then the *first* arm whose pattern names
+        // that value evaluated in turn. [`match_arm_matches_constant`] is deliberately not
+        // [`pattern_literal`] reused: a guard, or a pattern shape it does not recognise,
+        // has to stop the search rather than being treated as "does not match" and
+        // silently falling through to a later arm that might answer differently from what
+        // `rustc` itself would choose.
+        syn::Expr::Match(expr_match) => evaluate_match(expr_match, resolve),
+        _ => None,
+    }
+}
+
+/// [`literal_or_const_value`]'s own value for `expr_match`, once its scrutinee resolves
+/// to a constant: the body of the first arm whose pattern [`match_arm_matches_constant`]
+/// confirms matches that value, evaluated the same way any other expression here is.
+/// `None` the moment a guard appears, a pattern's own match-or-not cannot be determined,
+/// or no arm matches at all — every one of those means guessing which arm `rustc` would
+/// have chosen, which this scan does not do.
+fn evaluate_match(
+    expr_match: &syn::ExprMatch,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let scrutinee = literal_or_const_value(&expr_match.expr, resolve)?;
+    for arm in &expr_match.arms {
+        if arm.guard.is_some() {
+            return None;
+        }
+        if match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
+            return literal_or_const_value(&arm.body, resolve);
+        }
+    }
+    None
+}
+
+/// Whether `pattern` matches the constant `value`, for the narrow set of shapes
+/// [`evaluate_match`] needs: a literal (through [`lit_value`], `true`/`false` included), an
+/// unguarded bare binding (a known constant's own name if `resolve` answers for it,
+/// otherwise an irrefutable catch-all exactly as [`is_catchall_pattern`] already treats
+/// one), an or-pattern combining either, or a set of parentheses around any of them.
+/// `None` for anything else — a range, a tuple, a struct pattern — because this function's
+/// only caller stops the whole search on `None` rather than treating an unrecognised
+/// pattern as "does not match" and silently trying the next arm, which could answer from
+/// the wrong one.
+fn match_arm_matches_constant(
+    pattern: &syn::Pat,
+    value: i128,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<bool> {
+    match pattern {
+        syn::Pat::Wild(_) => Some(true),
+        syn::Pat::Lit(literal) => Some(lit_value(&literal.lit)? == value),
+        syn::Pat::Ident(named) if named.subpat.is_none() && named.by_ref.is_none() => Some(
+            resolve(&syn::Path::from(named.ident.clone())).is_none_or(|resolved| resolved == value),
+        ),
+        syn::Pat::Paren(paren) => match_arm_matches_constant(&paren.pat, value, resolve),
+        syn::Pat::Or(or_pattern) => {
+            let mut matched = false;
+            for case in &or_pattern.cases {
+                if match_arm_matches_constant(case, value, resolve)? {
+                    matched = true;
+                }
+            }
+            Some(matched)
+        }
         _ => None,
     }
 }
@@ -3142,6 +3209,112 @@ fn call_shape_of(
         }
         _ => None,
     }
+}
+
+/// `block`, wrapped as the plain, unlabelled `Expr::Block` [`call_shape_of`] already knows
+/// how to see through — the shape an `if`/`else if` chain's own arm bodies are, which
+/// [`extract_if_chain`] needs to ask [`call_shape_of`] the same question a real match arm's
+/// body already gets asked.
+fn block_as_expr(block: &syn::Block) -> syn::Expr {
+    syn::Expr::Block(syn::ExprBlock {
+        attrs: Vec::new(),
+        label: None,
+        block: block.clone(),
+    })
+}
+
+/// `cond`'s own scrutinee and the value it is compared against, when `cond` is (seen
+/// through any nesting of parentheses or brace groups) `left == right` and exactly one
+/// side resolves to a constant — the shape ADR 0044's `crc32_nibble`/`crc16_nibble` never
+/// need but a hand-written `if`/`else if` chain over a checksum table plausibly does.
+///
+/// The scrutinee is returned as its own token text rather than a `syn::Expr`, because
+/// [`extract_if_chain`]'s whole job is confirming every link of a chain compares the
+/// *identical* scrutinee, and comparing token text is the same structural-identity check
+/// [`FoundMatch::selector`] already uses for a real match's own scrutinee — `syn::Expr` has
+/// no `PartialEq` this workspace's own `syn` build enables.
+///
+/// Codex's forty-seventh-round finding: a hand-written `if x == 0 { .. } else if x == 1 {
+/// .. } else { .. }` chain compiles to the identical indexed table a `match` over the same
+/// arms would, but nothing here had ever looked at an `Expr::If` as anything but a
+/// constant-initializer's own conditional. Which side is "the scrutinee" is not fixed by
+/// position — `0 == x` is exactly as meaningful as `x == 0` — so whichever side fails to
+/// resolve as a constant is taken to be it; if both sides resolve, or neither does, this
+/// chain is not a shape this scan can tell apart from an ordinary comparison, and it stays
+/// unrecognised rather than guessed at.
+fn if_chain_condition_value(
+    cond: &syn::Expr,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<(String, i128)> {
+    let cond = match cond {
+        syn::Expr::Paren(paren) => paren.expr.as_ref(),
+        syn::Expr::Group(group) => group.expr.as_ref(),
+        other => other,
+    };
+    let syn::Expr::Binary(binary) = cond else {
+        return None;
+    };
+    if !matches!(binary.op, syn::BinOp::Eq(_)) {
+        return None;
+    }
+    let left_value = literal_or_const_value(&binary.left, resolve);
+    let right_value = literal_or_const_value(&binary.right, resolve);
+    match (left_value, right_value) {
+        (None, Some(value)) => Some((binary.left.to_token_stream().to_string(), value)),
+        (Some(value), None) => Some((binary.right.to_token_stream().to_string(), value)),
+        _ => None,
+    }
+}
+
+/// `node`'s own scrutinee and arms, read as the identical [`FoundMatch`] shape a real
+/// `match` over the same values already produces — so the density check downstream never
+/// has to know which syntax the source used. `None` when `node` is not, structurally, a
+/// chain of `scrutinee == literal` comparisons over one consistent scrutinee ending in an
+/// unconditional `else`: a chain with no final `else` cannot type-check as an integer value
+/// in real Rust (the missing branch would have to produce `()`, the same reasoning
+/// [`literal_or_const_value`]'s own `Expr::If` case already rests on), a link whose
+/// condition is not `scrutinee == literal` is not this shape at all, and a link naming a
+/// *different* scrutinee than the chain's first link is two unrelated comparisons that
+/// happen to share an `else if`, not one dense table.
+fn extract_if_chain(
+    node: &syn::ExprIf,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<(String, Vec<FoundArm>)> {
+    let (scrutinee, first_value) = if_chain_condition_value(&node.cond, resolve)?;
+    let mut arms = vec![FoundArm {
+        pattern: vec![first_value],
+        is_wild: false,
+        call: call_shape_of(&block_as_expr(&node.then_branch), resolve),
+    }];
+    let mut current = node;
+    loop {
+        let (_, else_expr) = current.else_branch.as_ref()?;
+        match else_expr.as_ref() {
+            syn::Expr::If(next_if) => {
+                let (next_scrutinee, next_value) =
+                    if_chain_condition_value(&next_if.cond, resolve)?;
+                if next_scrutinee != scrutinee {
+                    return None;
+                }
+                arms.push(FoundArm {
+                    pattern: vec![next_value],
+                    is_wild: false,
+                    call: call_shape_of(&block_as_expr(&next_if.then_branch), resolve),
+                });
+                current = next_if;
+            }
+            syn::Expr::Block(else_block) if else_block.label.is_none() => {
+                arms.push(FoundArm {
+                    pattern: Vec::new(),
+                    is_wild: true,
+                    call: call_shape_of(&block_as_expr(&else_block.block), resolve),
+                });
+                break;
+            }
+            _ => return None,
+        }
+    }
+    Some((scrutinee, arms))
 }
 
 /// `path`'s value as a *qualified* reference (`module::P0`, or a longer chain reaching one),
@@ -4142,6 +4315,59 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             .collect();
         self.found.push(FoundMatch { selector, arms });
         syn::visit::visit_expr_match(self, node);
+    }
+
+    // Codex's forty-seventh-round finding: this scan only ever looked at `match`
+    // expressions, but a hand-written `if x == 0 { .. } else if x == 1 { .. } else { .. }`
+    // chain over one consistent scrutinee compiles to the identical indexed table a
+    // `match` over the same arms would, and nothing here had ever read an `Expr::If` this
+    // way. [`extract_if_chain`] recognises the shape and answers in the identical
+    // `FoundMatch` shape [`visit_expr_match`] already produces, so the density check
+    // downstream runs over it unchanged — this override's only job is finding the chain
+    // and not double-counting it.
+    //
+    // A recognised chain is *not* also walked by the default visitor: `syn::visit`'s own
+    // walk would descend into `node`'s `else_branch`, reaching each `else if` link as its
+    // own, separate `Expr::If` node and re-extracting the same chain a second time,
+    // shorter by one link each time. Every arm body is still visited by hand instead —
+    // `self.visit_block`, once per link — so a match or a nested `if` chain written
+    // *inside* one arm's own body is still found. A chain this function does not
+    // recognise (no `else`, an inconsistent scrutinee, a condition that is not `scrutinee
+    // == literal`) falls through to the ordinary default walk, which is what lets a
+    // genuine chain nested inside an unrelated `if`'s own branches still be reached on its
+    // own later visit.
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        let ctx = ResolutionContext {
+            scopes: &self.scopes,
+            use_scopes: &self.use_scopes,
+            qualified: &self.qualified,
+            module_path: &self.module_path,
+            module_scope_depths: &self.module_scope_depths,
+            function_path: &self.function_path,
+            block_path: &self.block_path,
+            self_type_path: &self.self_type_path,
+        };
+        let resolve = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
+        if let Some((selector, arms)) = extract_if_chain(node, &resolve) {
+            self.found.push(FoundMatch { selector, arms });
+            self.visit_block(&node.then_branch);
+            let mut current = node;
+            while let Some((_, else_expr)) = &current.else_branch {
+                match else_expr.as_ref() {
+                    syn::Expr::If(next_if) => {
+                        self.visit_block(&next_if.then_branch);
+                        current = next_if;
+                    }
+                    syn::Expr::Block(else_block) => {
+                        self.visit_block(&else_block.block);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            return;
+        }
+        syn::visit::visit_expr_if(self, node);
     }
 }
 
