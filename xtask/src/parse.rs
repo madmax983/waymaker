@@ -414,7 +414,11 @@ fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<Str
         let Some(first) = segments.first().cloned() else {
             break;
         };
-        let Some(alias) = aliases.iter().rev().find(|candidate| candidate.local == first) else {
+        let Some(alias) = aliases
+            .iter()
+            .rev()
+            .find(|candidate| candidate.local == first)
+        else {
             break;
         };
         let mut resolved = alias.target.clone();
@@ -1318,7 +1322,9 @@ pub fn struct_literal_counts(
             // alias is ever written against; a multi-segment path and module descent stay
             // `resolve_segments`'s own job over the file's item-slice stack.
             let local = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-                .then(|| ident_name(&node.path.segments[0].ident))
+                .then(|| node.path.segments.first())
+                .flatten()
+                .map(|segment| ident_name(&segment.ident))
                 .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
             let resolved = local.unwrap_or_else(|| resolve_segments(&node.path, &self.stack));
             if resolved

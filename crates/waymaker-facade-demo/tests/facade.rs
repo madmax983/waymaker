@@ -11,8 +11,8 @@ use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
 use waymaker_drive::{
-    Activities, Answered, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Handoff,
-    Identity, Performed, Scratch, Suspended, Workflow,
+    Activities, Answered, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Handoff, Identity,
+    Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
 use waymaker_facade_demo::Bridge;
