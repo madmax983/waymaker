@@ -8322,27 +8322,37 @@ fn checksum_declared_once(
 ) -> Option<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
-    match crate::parse::fn_declaration_count(&source.contents, function) {
-        Ok(1) => None,
-        Ok(declarations) => Some(Violation::new(
-            RULE,
-            ADAPTER,
-            format!(
-                "{INTEGRITY_CHECK_PATH} declares `fn {function}` {declarations} times, not \
-                 once — counted structurally, so `fn r#{function}` counts as the same \
-                 declaration; the {pin} pin reads the first one a textual scan finds, so \
-                 more than one leaves it checking a function nobody ships",
-            ),
-        )),
-        Err(error) => Some(Violation::new(
+    if let Err(error) = crate::parse::parse_rust(&source.contents) {
+        return Some(Violation::new(
             RULE,
             ADAPTER,
             format!(
                 "{INTEGRITY_CHECK_PATH} could not be parsed ({error}); an unreadable source \
                  fails closed rather than approving what it cannot see"
             ),
-        )),
+        ));
     }
+    // `fns_named` is `fn_declaration_count`'s twin with one more thing un-raws right:
+    // it already skips `#[cfg(test)]` items, the way `without_test_modules` blanks them
+    // for every other check in this rule. Codex found that `fn_declaration_count` alone
+    // does not, so a test-only helper sharing a pinned checksum's name — a reference
+    // implementation used by nothing but a test, say — was reported as a second shipped
+    // declaration and failed the gate over code that never ships.
+    let declarations = crate::parse::fns_named(&source.contents, function).len();
+    if declarations == 1 {
+        return None;
+    }
+    Some(Violation::new(
+        RULE,
+        ADAPTER,
+        format!(
+            "{INTEGRITY_CHECK_PATH} declares `fn {function}` {declarations} times, not once \
+             — counted structurally and outside `#[cfg(test)]`, so `fn r#{function}` counts \
+             as the same declaration and a test-only one of this name does not; the {pin} \
+             pin reads the first one a textual scan finds, so more than one leaves it \
+             checking a function nobody ships",
+        ),
+    ))
 }
 
 /// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
@@ -8778,6 +8788,30 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
+/// Whether `text` carries `=>` at bracket depth zero — the fat arrow a real match arm's
+/// pattern is separated from its value by, as opposed to one nested inside the text's own
+/// sub-expression (a nested `match`'s own arms, say). [`match_expressions`]'s guard against
+/// mistaking a block scrutinee for the arm list needs exactly this distinction: a plain
+/// `.contains("=>")` is satisfied by a `=>` buried inside a nested `match`, which is a
+/// property of the *scrutinee*'s own content rather than a signal that the candidate block
+/// holds real arms.
+#[must_use]
+fn contains_top_level_arrow(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth = 0_i32;
+    let mut index = 0_usize;
+    while let Some(&character) = chars.get(index) {
+        match character {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            '=' if depth == 0 && chars.get(index + 1) == Some(&'>') => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 /// The content of the brace-balanced block opening at `text[open..]` — `open` must be the
 /// byte offset of the `{` itself — and the offset in `text` immediately after its matching
 /// `}`.
@@ -8813,10 +8847,17 @@ fn balanced_brace_block(text: &str, open: usize) -> Option<(&str, usize)> {
 /// Codex found the one case that assumption misses: a scrutinee that is *itself* a block
 /// expression — `match { let key = nibble & 0xF; key } { 0 => .., .. }` is legal Rust, and
 /// the first `{` found belongs to the scrutinee rather than the arms. A block found there
-/// contains no `=>` at all, which a real arm list always does, so that is the signal used to
-/// tell the two apart: a candidate block with no `=>` in it is taken as the scrutinee and
-/// skipped, and the *next* brace-balanced block immediately after it (whitespace aside) is
-/// tried as the arms instead.
+/// carries no `=>` of its own at the block's own nesting level, which a real arm list
+/// always does, so that is the signal used to tell the two apart: a candidate block with no
+/// *top-level* `=>` in it is taken as the scrutinee and skipped, and the *next*
+/// brace-balanced block immediately after it (whitespace aside) is tried as the arms
+/// instead. Depth rather than a plain `.contains` — Codex's second finding — because a
+/// scrutinee block can itself contain a nested `match` with arms of its own: `match { match
+/// nibble { value => value & 0xF } } { 0 => .., .. }`'s scrutinee block carries a `=>` too,
+/// nested one `match` deeper, and a presence check would have read that as "this is the arm
+/// list", accepted the scrutinee, found it not dense (one non-arm segment), and never looked
+/// at the real arms that follow — the same bypass a missing depth check leaves everywhere
+/// else in this file.
 #[must_use]
 fn match_expressions(code: &str) -> Vec<(&str, &str)> {
     const KEYWORD: &str = "match";
@@ -8850,7 +8891,7 @@ fn match_expressions(code: &str) -> Vec<(&str, &str)> {
             else {
                 break (None, open_relative);
             };
-            if block.contains("=>") {
+            if contains_top_level_arrow(block) {
                 break (Some(block), open_relative);
             }
             // Not an arm list — most likely the scrutinee is itself a block expression.
@@ -8936,24 +8977,31 @@ const fn continues_an_expression(character: char) -> bool {
     )
 }
 
-/// Whether `chars[start..]` begins with the keyword `as` at a word boundary — the cast
-/// operator, invisible to [`continues_an_expression`]'s single-character check because it
-/// is spelled with letters rather than a symbol.
+/// Whether `chars[start..]` begins with `keyword` at a word boundary — a keyword continuing
+/// the same expression a block just closed, invisible to [`continues_an_expression`]'s
+/// single-character check because it is spelled with letters rather than a symbol.
 ///
-/// Codex's finding: `0 => { 0x7707_3096 } as u32,` is a legal arm value — a cast applied to
-/// a block operand — and without this, [`with_synthetic_arm_separators`] cuts it into a
-/// block segment and a standalone `as u32` segment, neither of which [`parse_dense_arms`]
-/// can read as `pattern => expression`, so the whole match is refused as unparseable and the
-/// module-wide scan never sees it at all — the same failure mode `continues_an_expression`
-/// itself exists to avoid for `.`, `?` and the rest.
+/// Two keywords use this. `as`: `0 => { 0x7707_3096 } as u32,` is a legal arm value — a cast
+/// applied to a block operand — and without recognising it,
+/// [`with_synthetic_arm_separators`] cuts it into a block segment and a standalone `as u32`
+/// segment, neither of which [`parse_dense_arms`] can read as `pattern => expression`, so
+/// the whole match is refused as unparseable and the module-wide scan never sees it at all.
+/// `else`: `0 => if COND { A } else { B },` is a legal arm value too — an `if` expression
+/// with a block operand of its own — and the same cut happens between `{ A }` and
+/// `else { B }` without it. Both are the same failure mode `continues_an_expression` itself
+/// exists to avoid for `.`, `?` and the rest.
 #[must_use]
-fn continues_with_a_cast(chars: &[char], start: usize) -> bool {
-    let is_letter = |offset: usize| chars.get(start + offset);
-    if is_letter(0) != Some(&'a') || is_letter(1) != Some(&'s') {
+fn continues_with_keyword(chars: &[char], start: usize, keyword: &str) -> bool {
+    let letters: Vec<char> = keyword.chars().collect();
+    if !letters
+        .iter()
+        .enumerate()
+        .all(|(offset, letter)| chars.get(start + offset) == Some(letter))
+    {
         return false;
     }
     !chars
-        .get(start + 2)
+        .get(start + letters.len())
         .is_some_and(|character| character.is_alphanumeric() || *character == '_')
 }
 
@@ -8993,7 +9041,8 @@ fn with_synthetic_arm_separators(arms: &str) -> String {
                     let continues = chars
                         .get(lookahead)
                         .is_some_and(|c| continues_an_expression(*c))
-                        || continues_with_a_cast(&chars, lookahead);
+                        || continues_with_keyword(&chars, lookahead, "as")
+                        || continues_with_keyword(&chars, lookahead, "else");
                     if !continues {
                         result.push(',');
                     }
@@ -15227,6 +15276,33 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_behind_a_scrutinee_with_its_own_nested_match_is_reported() {
+        // Codex's tenth-round finding: the fix above told a scrutinee block from an arm
+        // block by whether the block contained `=>` at all, and a scrutinee can itself
+        // hold a nested `match` with arms of its own — `match { match nibble { value =>
+        // value & 0xF } } { 0 => .., .. }`'s scrutinee block carries a `=>`, one `match`
+        // deeper, and a plain `.contains` read that as "this is the arm list": it
+        // accepted the scrutinee, found it not dense (one non-arm segment), and the real
+        // arms that follow were never examined at all — the table hid behind them with
+        // the gate green. The arrow now has to be at the candidate block's own bracket
+        // depth zero, which the nested match's own braces rule out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn nested_scrutinee_table(nibble: u8) -> u32 {\n    match { match nibble \
+             { value => value & 0xF } } {\n        0 => crc32_nibble(0),\n        \
+             1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_postfixed_block_values_is_reported() {
         // Codex's seventh-round finding, the sharper half: the synthetic-separator fix for
         // comma-less block arms used to insert a separator after *every* top-level `}`,
@@ -15270,6 +15346,34 @@ mod deferred_answer_pins {
              0 => { 0x0000_0000 } as u32,\n        1 => { 0x7707_3096 } as u32,\n        \
              2 => { 0xEE0E_612C } as u32,\n        3 => { 0x9909_57BA } as u32,\n        \
              _ => { 0x0000_0000 } as u32,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_if_else_block_values_is_reported() {
+        // Codex's tenth-round finding: neither continuation check recognised the keyword
+        // `else`, so `0 => if COND { A } else { B },` — a legal arm value, an `if`
+        // expression with a block operand of its own — had a synthetic comma inserted
+        // between `{ A }` and `else { B }` exactly as an unrecognised cast once did
+        // between a block and `as`. `parse_dense_arms` then met an `else { B }` segment
+        // with no `=>` in it and refused the whole match, even though a constant
+        // condition still lets this fold into the same lookup-table shape. `else` is
+        // recognised now, alongside `as`, so this is reported as an unauthorised table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_else_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => if true { 0x0000_0000 } else { 0x0000_0000 },\n        \
+             1 => if true { 0x7707_3096 } else { 0x0000_0000 },\n        \
+             2 => if true { 0xEE0E_612C } else { 0x0000_0000 },\n        \
+             3 => if true { 0x9909_57BA } else { 0x0000_0000 },\n        \
+             _ => if true { 0x0000_0000 } else { 0x0000_0000 },\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
@@ -15426,8 +15530,8 @@ mod deferred_answer_pins {
         // a textual count sees exactly one `fn crc32` (the decoy) and waves every pin
         // through to check it, while the unqualified `crc32` the shipped `Catalogued`
         // binding calls still resolves the altered `r#crc32`. Counting structurally with
-        // `crate::parse::fn_declaration_count`, which un-raws identifiers before
-        // comparing, is what catches the pair as two declarations of the same name.
+        // `crate::parse::fns_named`, which un-raws identifiers before comparing, is what
+        // catches the pair as two declarations of the same name.
         const DECOY: &str = "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const \
              fn crc32(bytes: &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        \
              let _ = crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n";
@@ -15445,6 +15549,31 @@ mod deferred_answer_pins {
             violations.iter().any(|violation| violation
                 .detail
                 .contains("declares `fn crc32` 2 times, not once")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_only_reference_of_a_pinned_name_is_not_a_second_declaration() {
+        // Codex's tenth-round finding: the structural count the raw-identifier fix above
+        // added did not skip `#[cfg(test)]` items, even though every other check in this
+        // rule works from `without_test_modules`-stripped text for exactly that reason. A
+        // `#[cfg(test)] mod tests { fn crc32(..) { .. } }` — an unrelated reference
+        // implementation used only by a test, sharing a pinned name by coincidence — was
+        // therefore counted as a second shipped declaration and failed every checksum
+        // pin, over code that never ships. `checksum_declared_once` now counts through
+        // `crate::parse::fns_named`, which already skips `#[cfg(test)]` the same way the
+        // rest of this rule does, so this passes clean.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[cfg(test)]\nmod tests {\n    fn crc32(_bytes: &[u8]) -> u32 {\n        0\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("fn crc32")),
             "{violations:?}"
         );
     }
