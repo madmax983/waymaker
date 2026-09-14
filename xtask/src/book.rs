@@ -744,18 +744,41 @@ fn skips_execution(attribute: &str) -> bool {
     })
 }
 
+/// The running total of `(`, `[` and `{` in `text` minus `)`, `]` and `}`.
+///
+/// An attribute is still open while this is above zero: `#[cfg_attr(` alone is `+2` (one for
+/// each of `[` and `(`), and only the line carrying the matching `)]` brings a line-by-line
+/// running total back to the zero an attribute starts and ends at.
+fn bracket_balance(text: &str) -> i32 {
+    text.chars()
+        .map(|character| match character {
+            '(' | '[' | '{' => 1,
+            ')' | ']' | '}' => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Where `sample` declares `#[test] fn name(`, or why it does not.
 ///
 /// The whole contiguous attribute run before the function is read, in both directions:
 /// attribute order is free, and review of this change put `#[ignore]` *above* the anchor
 /// marker, where a reader of the book never sees it and the test never runs.
+///
+/// An attribute spanning several lines is read as one (Codex, review round 3 of issue #97):
+/// `#[cfg_attr(\n  all(), ignore\n)]` is legal and still skips the test it decorates, and a
+/// scan that reset its run on every line without a leading `#[` read the continuation lines
+/// as unrelated code, dropped the attribute, and let the `#[test]` below it vouch alone.
+/// [`bracket_balance`] tracks whether an attribute opened on an earlier line is still open,
+/// and a still-open line is appended to the attribute in progress rather than judged alone.
 fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
     let opening = format!("fn {name}(");
-    let mut run: Vec<&str> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let mut open = 0;
     for (at, line) in sample.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with(&opening) {
-            if !run.contains(&"#[test]") {
+        if open == 0 && trimmed.starts_with(&opening) {
+            if !run.iter().any(|attribute| attribute == "#[test]") {
                 run.clear();
                 continue;
             }
@@ -767,8 +790,15 @@ fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
             }
             return Ok(at);
         }
-        if trimmed.starts_with("#[") {
-            run.push(trimmed);
+        if open > 0 {
+            if let Some(last) = run.last_mut() {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            open += bracket_balance(trimmed);
+        } else if trimmed.starts_with("#[") {
+            run.push(trimmed.to_owned());
+            open += bracket_balance(trimmed);
         } else if !(trimmed.is_empty() || trimmed.starts_with("//")) {
             run.clear();
         }
@@ -2533,6 +2563,9 @@ mod tests {
             // Codex, review round 2 of issue #97: a second outer attribute on the same
             // line must not hide behind the first one checked.
             "#[allow(dead_code)] #[cfg_attr(all(), ignore)]",
+            // Codex, review round 3 of issue #97: an attribute broken over several lines
+            // must not lose the run that came before it.
+            "#[cfg_attr(\n    all(),\n    ignore\n)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(

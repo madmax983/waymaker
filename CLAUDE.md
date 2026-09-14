@@ -3237,4 +3237,16 @@ Codex found a third on the same PR: `parse_outer` returns every outer attribute 
 and the first version of `skips_execution` read only `parsed.first()` — so
 `#[allow(dead_code)] #[cfg_attr(all(), ignore)]`, two attributes on one line, hid the second
 behind the first. `skips_execution` now checks every parsed attribute rather than the first
-one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+one.
+
+Codex found a fourth: `declares_test` reset its whole run on any line that did not open with
+`#[`, so `#[cfg_attr(\n  all(), ignore\n)]` — legal, and still skipping — lost its own
+continuation lines to that reset and left only the `#[test]` after it standing. A
+line-by-line scan cannot see that an attribute is still open without counting the brackets
+that opened it, so it now does: `bracket_balance` sums `(`/`[`/`{` against `)`/`]`/`}` across
+each line, and a run whose balance has not returned to zero appends the next line to the
+attribute in progress instead of judging it alone or discarding it. `crate::parse::declares_test`
+never had this bug — a real parser has no such thing as a line — which is the argument for
+moving `book`'s scanner onto `syn` structurally rather than patching the heuristic a fourth
+time, and is worth doing the day this scanner needs another patch. No new ADR: nothing here
+moves a must-not-own cell, a dependency edge, or a rule id.
