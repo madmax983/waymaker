@@ -17100,6 +17100,91 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_ref_binding_catchall_is_reported() {
+        // Codex's fortieth-round finding: `ref other => 199` is exactly as
+        // irrefutable as `other` itself — `ref` changes only how the match binds the
+        // value, never whether the pattern matches — but the whole arm was gated on
+        // `named.by_ref.is_none()`, so a catch-all spelled this way was not
+        // recognised as one, and a table ending in it failed both density checks
+        // instead of being reported.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ref_binding_catchall_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn ref_binding_catchall_table(nibble: u8) -> u32 \
+             {\n    match nibble & 0xF {\n        0 => \
+             ref_binding_catchall_helper(0),\n        1 => \
+             ref_binding_catchall_helper(1),\n        2 => \
+             ref_binding_catchall_helper(2),\n        ref other => \
+             ref_binding_catchall_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_call_nested_inside_a_block_initializer_is_reported() {
+        // Codex's fortieth-round finding: the first version of the const-call scan
+        // only looked for a call at an initializer's own top level, seen through a
+        // `Paren` or a `Group` — but `const P0: u8 = { let value = identity(0);
+        // value };` buries the call one level deeper, inside a `let` statement
+        // `literal_or_const_value`'s own block handling does not understand either
+        // (it only follows a block whose every leading statement is a local `const`
+        // item), so the constant stayed silently unresolved and unflagged. The
+        // initializer's whole expression tree is now searched for a call wherever it
+        // sits.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn identity(value: u8) -> u8 {\n    value\n}\n\nconst P0: u8 \
+             = {\n    let value = identity(0);\n    value\n};\nconst P1: u8 = {\n    \
+             let value = identity(1);\n    value\n};\nconst P2: u8 = {\n    let \
+             value = identity(2);\n    value\n};\nconst P3: u8 = {\n    let value = \
+             identity(3);\n    value\n};\n\nconst fn nested_call_pattern_table(nibble: \
+             u8) -> u32 {\n    match nibble & 0xF {\n        P0 => 0,\n        P1 => \
+             1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_match_arm_is_not_counted_toward_density() {
+        // Codex's fortieth-round finding: an individual match arm can carry its own
+        // `#[cfg(test)]`, and `rustc` strips such an arm from a production build
+        // exactly as it does a gated item — but nothing here had ever read an arm's
+        // own attributes, so three test-gated numbered arms plus one production
+        // wildcard were read as a four-arm dense table, even though the shipped
+        // match holds only the wildcard, and reported as a violation the real code
+        // does not commit.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cfg_gated_arm_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn cfg_gated_arm_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        #[cfg(test)]\n        0 => \
+             cfg_gated_arm_helper(0),\n        #[cfg(test)]\n        1 => \
+             cfg_gated_arm_helper(1),\n        #[cfg(test)]\n        2 => \
+             cfg_gated_arm_helper(2),\n        _ => cfg_gated_arm_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

@@ -1144,6 +1144,19 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
 /// evaluate to, or which calls are safe to interpret, a `const` whose own initializer is
 /// a call is refused outright, independent of whether anything ever pattern-matches on it.
 ///
+/// Codex's next-round finding: the first version of this only looked for a call at the
+/// initializer's own top level, seen through a `Paren` or a `Group` — the same two
+/// wrappers `literal_or_const_value` sees through for every other shape it resolves —
+/// but `const P0: u8 = { let value = index(0); value };` buries the call one level
+/// deeper, inside a `let` statement `literal_or_const_value`'s own block handling does
+/// not understand either (it only follows a block whose every leading statement is a
+/// local `const` item), so neither function saw the call at all and the constant simply
+/// stayed silently unresolved. The initializer's *whole* expression tree is now searched
+/// for a call wherever it sits, not only at the top, which is the more conservative
+/// answer named as the alternative to evaluating one: a `const` referencing a call
+/// anywhere in how it computes its own value is refused, rather than this scan trying to
+/// decide which levels of nesting are safe to see through and which are not.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
@@ -1152,16 +1165,20 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
         found: Vec<String>,
     }
 
-    /// Whether `expr` is a call once any parentheses or brace-group wrapping have been
-    /// seen through — the same two wrappers [`literal_or_const_value`] already sees
-    /// through for every other shape it resolves.
-    fn is_call_shaped(expr: &syn::Expr) -> bool {
-        match expr {
-            syn::Expr::Paren(inner) => is_call_shaped(&inner.expr),
-            syn::Expr::Group(inner) => is_call_shaped(&inner.expr),
-            syn::Expr::Call(_) => true,
-            _ => false,
+    /// Whether `expr`'s own tree contains a call anywhere within it.
+    fn contains_call(expr: &syn::Expr) -> bool {
+        struct FindCall {
+            found: bool,
         }
+        impl<'ast> syn::visit::Visit<'ast> for FindCall {
+            fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+                self.found = true;
+                syn::visit::visit_expr_call(self, node);
+            }
+        }
+        let mut finder = FindCall { found: false };
+        finder.visit_expr(expr);
+        finder.found
     }
 
     impl<'ast> syn::visit::Visit<'ast> for ConstCallInitializers {
@@ -1170,7 +1187,7 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
                 return;
             }
             if let syn::Item::Const(constant) = node {
-                if is_call_shaped(&constant.expr) {
+                if contains_call(&constant.expr) {
                     self.found.push(ident_name(&constant.ident));
                 }
             }
@@ -1182,7 +1199,7 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
                 return;
             }
             if let syn::ImplItem::Const(constant) = node {
-                if is_call_shaped(&constant.expr) {
+                if contains_call(&constant.expr) {
                     self.found.push(ident_name(&constant.ident));
                 }
             }
@@ -2753,6 +2770,14 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
 /// a spelling requirement `rustc`'s own exhaustiveness check does not share. `guarded` is the
 /// caller's to pass, since a guard (`other if cond => ..`) makes even a binding pattern
 /// refutable and this function sees only the pattern, not the arm it belongs to.
+///
+/// Codex's next-round finding: `ref other => VALUE15` is exactly as irrefutable as `other`
+/// itself — `ref` changes only how the match binds the value, never whether the pattern
+/// matches — but the whole arm was gated on `named.by_ref.is_none()`, so a catch-all
+/// spelled this way was not recognised as one, and a dense-looking table ending in it
+/// failed both density checks (no `_`, and `missing_value`'s own numbered-arms-plus-one
+/// window one arm short) rather than being reported. `mut other` never needed the
+/// equivalent fix: `named.mutability` was never part of this guard to begin with.
 #[must_use]
 fn is_catchall_pattern(
     pattern: &syn::Pat,
@@ -2764,7 +2789,7 @@ fn is_catchall_pattern(
     }
     match pattern {
         syn::Pat::Wild(_) => true,
-        syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
+        syn::Pat::Ident(named) if named.subpat.is_none() => {
             resolve(&syn::Path::from(named.ident.clone())).is_none()
         }
         _ => false,
@@ -3645,9 +3670,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         };
         let resolve = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let selector = node.expr.to_token_stream().to_string();
+        // Codex's finding: an individual arm can carry its own `#[cfg(test)]`
+        // (`syn::Arm` has its own `attrs`, the same as an item or a statement does),
+        // and `rustc` strips such an arm from a production build exactly as it does a
+        // gated item — but nothing here had ever read an arm's own attributes, so a
+        // table whose numbered arms are all test-only and whose one production arm is
+        // an unrelated wildcard was read as though every arm shipped, undercounting
+        // what the real, shipped match looks like.
         let arms = node
             .arms
             .iter()
+            .filter(|arm| !has_cfg_test(&arm.attrs))
             .map(|arm| FoundArm {
                 pattern: pattern_literal(&arm.pat, &resolve),
                 is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), &resolve),
