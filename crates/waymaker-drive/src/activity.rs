@@ -9,7 +9,7 @@
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
 
-use crate::effect::DurableIntent;
+use crate::effect::{CheckedInput, DurableIntent};
 
 /// What an activity did.
 ///
@@ -75,12 +75,13 @@ pub trait Activities {
     ///
     /// `intent` is design document §07 step 4's argument. Some boot committed the schedule
     /// record for it before this call — this one, or an earlier one that a reset or a retry
-    /// redelivered. [`DurableIntent::kind`] is which activity to run; there is no second
+    /// redelivered. [`DurableIntent::kind`] is which activity to run. There is no second
     /// argument that could name a different one.
     ///
-    /// `input` reaches an implementor only through [`Dispatchable::perform`](crate::Dispatchable::perform),
-    /// which checks it against the digest `intent` was scheduled under first — so by the
-    /// time this call happens, `input` is the same bytes the schedule record names.
+    /// `input` is a [`CheckedInput`]: bytes [`Dispatchable::perform`](crate::Dispatchable::perform)
+    /// has already checked against the digest `intent` was scheduled under. Its field is
+    /// private, so this function has no other way to receive bytes the schedule record does
+    /// not name — call [`CheckedInput::bytes`] to read them.
     ///
     /// # Postconditions
     ///
@@ -92,7 +93,12 @@ pub trait Activities {
     /// [`Performed::Exhausted`] when the answer is wider. An implementor that writes what
     /// fits and reports `Completed(out.len())` records a short result, and every replay of
     /// the run returns that short result: the driver cannot tell it from a complete one.
-    fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed;
+    fn perform(
+        &mut self,
+        intent: DurableIntent,
+        input: CheckedInput<'_>,
+        out: &mut [u8],
+    ) -> Performed;
 }
 
 /// The clocks a driver may read.

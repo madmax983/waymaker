@@ -13,8 +13,8 @@ use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
 use waymaker_drive::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_drive::{
-    Activities, Answered, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Handoff,
-    Identity, Performed, Scratch, Suspended, Workflow,
+    Activities, Answered, Boundary, Bridge, CheckedInput, Clocks, DriveError, Driver,
+    DurableIntent, Handoff, Identity, Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
 use waymaker_fault::{Device, FaultError};
@@ -57,7 +57,12 @@ fn reserve() -> Reserve {
 struct Idle;
 
 impl Activities for Idle {
-    fn perform(&mut self, _intent: DurableIntent, _input: &[u8], _out: &mut [u8]) -> Performed {
+    fn perform(
+        &mut self,
+        _intent: DurableIntent,
+        _input: CheckedInput<'_>,
+        _out: &mut [u8],
+    ) -> Performed {
         Performed::Pending
     }
 }

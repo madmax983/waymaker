@@ -29,7 +29,8 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::{KernelError, RecordKind, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
-    Activities, Clocks, Conclusion, DriveError, Driver, DurableIntent, Performed, Progress, Scratch,
+    Activities, CheckedInput, Clocks, Conclusion, DriveError, Driver, DurableIntent, Performed,
+    Progress, Scratch,
 };
 use waymaker_embassy::clock::PersistentClock;
 use waymaker_fault::Device;
@@ -233,7 +234,12 @@ impl<C: PersistentClock> Clocks for Board<C> {
 }
 
 impl<C> Activities for Board<C> {
-    fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed {
+    fn perform(
+        &mut self,
+        intent: DurableIntent,
+        input: CheckedInput<'_>,
+        out: &mut [u8],
+    ) -> Performed {
         self.world.perform(intent, input, out)
     }
 }

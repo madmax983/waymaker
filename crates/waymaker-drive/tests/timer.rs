@@ -16,8 +16,8 @@ use waymaker_core::version::VersionRange;
 use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
-    Performed, Progress, Scratch, Suspended, Workflow,
+    Activities, Boundary, CheckedInput, Clocks, Conclusion, DriveError, Driver, DurableIntent,
+    Identity, Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
@@ -576,7 +576,12 @@ impl Clocks for Ticking {
 }
 
 impl Activities for Ticking {
-    fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed {
+    fn perform(
+        &mut self,
+        intent: DurableIntent,
+        input: CheckedInput<'_>,
+        out: &mut [u8],
+    ) -> Performed {
         self.world.perform(intent, input, out)
     }
 }
@@ -681,7 +686,12 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
     }
 
     impl Activities for Regressing {
-        fn perform(&mut self, _intent: DurableIntent, _input: &[u8], _out: &mut [u8]) -> Performed {
+        fn perform(
+            &mut self,
+            _intent: DurableIntent,
+            _input: CheckedInput<'_>,
+            _out: &mut [u8],
+        ) -> Performed {
             Performed::Pending
         }
     }

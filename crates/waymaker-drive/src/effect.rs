@@ -17,10 +17,14 @@
 //!
 //! # What makes step 4 unmistakable
 //!
-//! A [`DurableIntent`] carries the kind and the input digest step 3 committed, not only the
-//! sequence. [`Dispatchable::perform`] is the one route from that value and raw bytes to a
-//! dispatched effect, and it checks the bytes against the digest first. So a caller cannot
-//! dispatch effect A's identity under effect B's kind or input, by construction — see
+//! A [`DurableIntent`] carries the kind and the input digest, not only the sequence, so
+//! [`Activities::perform`] reads the kind from `intent` and has no second argument to read a
+//! different one from. [`Dispatchable::perform`] is the one route from a proof and raw bytes
+//! to a dispatched effect. It checks the bytes against the digest, then wraps them in a
+//! [`CheckedInput`] — a type with a private field, built nowhere else. So a caller cannot use
+//! effect A's identity to dispatch effect B's kind, and cannot reach `Activities::perform`
+//! with effect B's input either, because there is no way to build the value that argument
+//! takes except by passing this check first. See
 //! [issue #92](https://github.com/madmax983/waymaker/issues/92).
 //!
 //! # Why this crate
@@ -38,10 +42,10 @@ use waymaker_flash::storage::StableStorage;
 use crate::activity::{Activities, Performed};
 use crate::drive::DriveError;
 
-/// Proof that §07 step 3 completed for one effect, for one request.
+/// Proof that §07 step 3 completed, for one effect and its request.
 ///
-/// Step 4 accepts no other proof. It carries the [`EffectRequest`] step 3 committed, so the
-/// kind an activity dispatches under cannot be some other kind: there is no second way to
+/// Step 4 accepts no other proof. It carries the [`EffectRequest`] step 3 committed. So the
+/// kind an activity dispatches under cannot be some other kind. There is no second way to
 /// name one. See [`Dispatchable::perform`] for the same guarantee over the input bytes.
 ///
 /// # Why the field is private
@@ -239,11 +243,10 @@ impl<C: IntegrityCheck> Effect<C> {
     /// §08's redelivery row. Committed history holds the schedule record and no outcome, so
     /// steps 1 to 3 already happened and this writes nothing.
     ///
-    /// `request` is the caller's *current* call, already checked against that schedule
-    /// record by [`waymaker_core::ReplayMachine::intent`] — a replay that disagreed would
-    /// have stopped there rather than reach this function. Passing it through binds the
-    /// redelivered identity to the same kind and input the schedule record names, with no
-    /// second read of media.
+    /// `request` is the caller's *current* call. [`waymaker_core::ReplayMachine::intent`]
+    /// already checked it against the schedule record — a replay that disagreed would have
+    /// stopped there. Passing `request` through binds the redelivered identity to the kind
+    /// and input the schedule record names. No second read of media is needed.
     ///
     /// # Why it is not public
     ///
@@ -275,6 +278,30 @@ impl<C: IntegrityCheck> Effect<C> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InputMismatch;
 
+/// Bytes [`Dispatchable::perform`] has checked against the recorded digest.
+///
+/// The only way to build one is inside [`Dispatchable::perform`], after the check passes.
+/// Its field is private, so no caller — inside this crate or outside it — can hand
+/// [`Activities::perform`] bytes the digest never vouched for.
+///
+/// ```compile_fail,E0451
+/// use waymaker_drive::CheckedInput;
+///
+/// let forged = CheckedInput { bytes: b"anything" };
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedInput<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CheckedInput<'a> {
+    /// The checked bytes.
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
 /// An effect whose intent is durable: step 4 is legal, and steps 5 to 7 end it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Dispatchable<C: IntegrityCheck = Catalogued> {
@@ -291,11 +318,12 @@ impl<C: IntegrityCheck> Dispatchable<C> {
 
     /// §07 step 4: ask `activities` to perform this identity's effect.
     ///
-    /// Checks `input` against what step 3 committed before `activities` ever sees it. This
-    /// is the whole of the guarantee [`DurableIntent`] states: the kind cannot be a
-    /// different kind, because there is no second argument to read one from, and the input
-    /// cannot be different bytes, because this is the one route from a [`Dispatchable`] and
-    /// raw bytes to a [`Performed`] answer, and it checks first.
+    /// Checks `input` against what step 3 committed, before `activities` ever sees it. This
+    /// is the whole guarantee [`DurableIntent`] states. The kind cannot be a different kind:
+    /// there is no second argument to read one from. The input cannot be different bytes
+    /// either: [`Activities::perform`] takes a [`CheckedInput`], and this is the only place
+    /// that builds one. A caller cannot skip the check by calling `Activities::perform`
+    /// directly, because it has no bytes to pass it that were not checked here first.
     ///
     /// # Errors
     ///
@@ -313,7 +341,7 @@ impl<C: IntegrityCheck> Dispatchable<C> {
         {
             return Err(InputMismatch);
         }
-        Ok(activities.perform(self.intent, input, out))
+        Ok(activities.perform(self.intent, CheckedInput { bytes: input }, out))
     }
 
     /// §07 steps 5, 6 and 7: the outcome frame, the payload barrier, and the seal.
@@ -374,7 +402,7 @@ mod tests {
 
     use super::{Effect, InputMismatch, Resolution};
     use crate::activity::{Activities, Performed};
-    use crate::effect::DurableIntent;
+    use crate::effect::{CheckedInput, DurableIntent};
 
     const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
 
@@ -455,7 +483,13 @@ mod tests {
     }
 
     impl Activities for Recording {
-        fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed {
+        fn perform(
+            &mut self,
+            intent: DurableIntent,
+            input: CheckedInput<'_>,
+            out: &mut [u8],
+        ) -> Performed {
+            let input = input.bytes();
             let mut bytes = [0_u8; 3];
             let taken = input.len().min(bytes.len());
             if let (Some(from), Some(into)) = (input.get(..taken), bytes.get_mut(..taken)) {
@@ -470,9 +504,9 @@ mod tests {
         }
     }
 
-    /// `Dispatchable::perform` is the guarantee issue #92 asks for: the kind travels with
-    /// the identity because `Activities::perform` has no separate argument to read one from,
-    /// and the input is checked against what step 3 recorded before the world ever sees it.
+    /// `Dispatchable::perform` is the guarantee issue #92 asks for. The kind travels with
+    /// the identity: `Activities::perform` has no separate argument to read one from. The
+    /// input is checked against what step 3 recorded, before the world ever sees it.
     #[test]
     fn perform_refuses_input_that_disagrees_with_what_was_scheduled() {
         let mut device = Device::new(geometry());

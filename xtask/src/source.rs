@@ -3976,14 +3976,15 @@ pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
 /// from a sequence number — which is a forge in any hand but the driver's beside it. It is
 /// `pub(crate)`, and [`EFFECT_TYPE_METHODS`] is what keeps it declared.
 ///
-/// `kind` and `perform` are issue [#92](https://github.com/madmax983/waymaker/issues/92)'s:
+/// `kind`, `perform` and `bytes` are issue [#92](https://github.com/madmax983/waymaker/issues/92)'s:
 /// `DurableIntent::kind` reads the activity step 3 committed rather than a second argument
 /// naming one, and `Dispatchable::perform` is the one route from a proof and raw bytes to a
-/// dispatch — it checks the bytes against the digest step 3 committed before an activity
-/// ever sees them.
+/// dispatch — it checks the bytes against the digest step 3 committed, then wraps them in a
+/// `CheckedInput`, whose one method, `bytes`, is how an implementor reads them back.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
+    "bytes",
     "id",
     "intent",
     "into_writer",
@@ -4005,7 +4006,8 @@ pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
 /// rather than the keyword in front of it.
 ///
 /// Each list is sorted, so the comparison can be a set comparison.
-pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 3] = [
+pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 4] = [
+    ("CheckedInput", &["bytes"]),
     ("DurableIntent", &["id", "kind"]),
     ("Dispatchable", &["intent", "perform", "resolve"]),
     (
@@ -4030,8 +4032,11 @@ pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
 /// The construction scan counts a type's *name*, so `Self { .. }` inside the type's own
 /// `impl` is a construction it cannot see. Review of this change used exactly that, beside a
 /// `pub(crate)` constructor, to mint a `DurableIntent` with the gate green. `Effect` is not
-/// here: it is not a proof of anything, and its own constructor is a `Self`.
-pub const EFFECT_NO_SELF_LITERAL: [&str; 2] = ["DurableIntent", "Dispatchable"];
+/// here: it is not a proof of anything, and its own constructor is a `Self`. `CheckedInput`
+/// is issue [#92](https://github.com/madmax983/waymaker/issues/92)'s: a trait impl that built
+/// one from arbitrary bytes would let a caller hand `Activities::perform` input the digest
+/// never checked.
+pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedInput", "DurableIntent", "Dispatchable"];
 
 /// The type that owns each body §07's storage steps happen in, and that body's name.
 ///
@@ -15186,6 +15191,18 @@ impl DurableIntent {
     /// The kind step 3 scheduled.
     pub const fn kind(self) -> u8 {
         0
+    }
+}
+
+/// Bytes step 4 has checked against the recorded digest.
+pub struct CheckedInput<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CheckedInput<'a> {
+    /// The checked bytes.
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
     }
 }
 

@@ -18,8 +18,8 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome, RecordKind, RunId};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, Driver, DurableIntent, Identity, Performed, Progress,
-    Scratch, Suspended, Workflow,
+    Activities, Boundary, CheckedInput, Clocks, Conclusion, Driver, DurableIntent, Identity,
+    Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::clock::PersistentClock;
 use waymaker_fault::Device;
@@ -116,7 +116,12 @@ impl World {
 }
 
 impl Activities for World {
-    fn perform(&mut self, intent: DurableIntent, _input: &[u8], out: &mut [u8]) -> Performed {
+    fn perform(
+        &mut self,
+        intent: DurableIntent,
+        _input: CheckedInput<'_>,
+        out: &mut [u8],
+    ) -> Performed {
         let kind = intent.kind();
         self.performed += 1;
         let reading = self.clock.to_le_bytes();

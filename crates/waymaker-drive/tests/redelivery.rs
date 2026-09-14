@@ -301,8 +301,8 @@ fn what_redelivery_answers_is_not_what_a_fresh_mint_would() {
 
 #[test]
 fn a_redelivered_effect_is_offered_under_the_kind_its_schedule_record_named() {
-    // Issue #92: `DurableIntent` now carries the kind step 3 committed, so a redelivered
-    // effect cannot be offered under some other one. Checked here at the driver's real
+    // Issue #92: `DurableIntent` now carries the kind step 3 committed. So a redelivered
+    // effect cannot be offered under a different kind. Checked here at the driver's real
     // dispatch point, where `demo::World` records what it was actually asked.
     let mut world = World::pending_at(1);
     let mut workflow = Pipeline::new();
