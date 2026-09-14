@@ -186,6 +186,38 @@ pub fn extern_crate_names(contents: &str) -> Result<Vec<String>, syn::Error> {
         .collect())
 }
 
+/// Every `mod <name>` declaration in `contents`: inline or out-of-line, at any
+/// nesting depth.
+///
+/// A local module can shadow an external crate of the same name at the point it
+/// is declared, so a caller judging that needs every name this file declares, not
+/// only its top-level ones. Items under exactly `#[cfg(test)]` are skipped,
+/// structurally — test code declares no module a shipped build sees.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn declared_module_names(contents: &str) -> Result<Vec<String>, syn::Error> {
+    let file = parse_rust(contents)?;
+    let mut names = Vec::new();
+    collect_module_names(&file.items, &mut names);
+    Ok(names)
+}
+
+fn collect_module_names(items: &[syn::Item], names: &mut Vec<String>) {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        if let syn::Item::Mod(module) = item {
+            names.push(ident_name(&module.ident));
+            if let Some((_, nested)) = module.content.as_ref() {
+                collect_module_names(nested, names);
+            }
+        }
+    }
+}
+
 /// One `use` binding: the name it introduces and the path it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UseAlias {
