@@ -17893,6 +17893,35 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_let_bound_block_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let value = 0; value };` is
+        // exactly as resolvable as a local `const` block `evaluate_block` already folds,
+        // but a `let` is `syn::Stmt::Local`, a different statement kind from the local
+        // `const` items `block_const_exprs` recognised — and the const-call backstop does
+        // not catch it either, since a bare `let` names no call. `block_let_exprs` now
+        // reads a plain `let NAME = EXPR;` the same narrow way a local `const` already is,
+        // so `P0` through `P3` resolve to `0..3`, the dense sequence the outer match's
+        // patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn let_bound_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { let value = 0; value };\n    \
+             const P1: u8 = { let value = 1; value };\n    \
+             const P2: u8 = { let value = 2; value };\n    \
+             const P3: u8 = { let value = 3; value };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

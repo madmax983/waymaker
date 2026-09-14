@@ -2224,6 +2224,52 @@ fn block_const_exprs(block: &syn::Block) -> std::collections::HashMap<String, sy
         .collect()
 }
 
+/// The unevaluated initializer of every plain `let NAME = EXPR;` declared *directly* as a
+/// statement in `block`.
+///
+/// Codex's next-round finding: `const P0: u8 = { let value = 0; value };` is exactly as
+/// resolvable as the local-`const` block [`evaluate_block`] already folds, but a `let`
+/// statement is not a local *item* at all (`syn::Stmt::Local`, not `syn::Stmt::Item`), so
+/// [`block_const_exprs`] never saw it and the block stayed unresolved — the const-call
+/// backstop does not catch it either, since a bare `let` is neither a call. Scoped
+/// narrowly, the same way a local `const`'s own initializer already is: the pattern must
+/// name exactly one identifier, with no destructuring and no `@` sub-pattern, and at most
+/// one layer of type ascription (`let value: u8 = 0;` is `Pat::Type` wrapping `Pat::Ident`,
+/// unwrapped here the same way this scan already unwraps a `Paren` or a `Group`); the
+/// initializer must be a plain `= EXPR` with no `let-else` diverge arm, whose value depends
+/// on a branch this scan does not evaluate. A `let mut` is not excluded — nothing in this
+/// narrow shape lets it be reassigned, since a bare assignment statement is neither this
+/// nor a local `const` item, and [`evaluate_block`]'s own statement-count check already
+/// refuses a block holding one.
+fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn::Expr> {
+    fn binding_name(pat: &syn::Pat) -> Option<String> {
+        match pat {
+            syn::Pat::Type(pat_type) => binding_name(&pat_type.pat),
+            syn::Pat::Ident(ident) if ident.subpat.is_none() => Some(ident_name(&ident.ident)),
+            _ => None,
+        }
+    }
+
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return None;
+            };
+            if has_cfg_test(&local.attrs) {
+                return None;
+            }
+            let init = local.init.as_ref()?;
+            if init.diverge.is_some() {
+                return None;
+            }
+            let name = binding_name(&local.pat)?;
+            Some((name, (*init.expr).clone()))
+        })
+        .collect()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -2522,24 +2568,41 @@ fn as_bool_literal(expr: &syn::Expr) -> Option<bool> {
 }
 
 /// `block`'s own value as a constant-initializer expression: its own tail expression,
-/// once any local `const` declarations feeding that tail are resolved first — a
-/// block-scoped mirror of `resolve_scope_consts`'s own fixed point, self-contained here
-/// since this function carries no `ConstScopes` of its own, only the caller's flat
+/// once any local `const` declaration or plain `let` binding feeding that tail is resolved
+/// first — a block-scoped mirror of `resolve_scope_consts`'s own fixed point, self-contained
+/// here since this function carries no `ConstScopes` of its own, only the caller's flat
 /// `resolve`. Scoped narrowly: every statement but the last must be a local `const` item
-/// (`block_const_exprs` is what recognises one), and the last must be a semicolon-less
-/// tail expression — a block holding a `let`, a loop, or any other statement shape stays
-/// unresolved rather than guessed at, and so does a labelled block (`'a: { .. }`), whose
-/// tail a `break 'a value;` elsewhere in the block could also supply — a labelled block
-/// is the caller's to refuse, since a `syn::Block` carries no label of its own to check.
+/// (`block_const_exprs` is what recognises one) or a plain `let` binding
+/// (`block_let_exprs`), and the last must be a semicolon-less tail expression — a block
+/// holding a loop, an assignment, or any other statement shape stays unresolved rather than
+/// guessed at, and so does a labelled block (`'a: { .. }`), whose tail a `break 'a value;`
+/// elsewhere in the block could also supply — a labelled block is the caller's to refuse,
+/// since a `syn::Block` carries no label of its own to check. A `const` and a `let` sharing
+/// one name — shadowing either way — is refused the same way: the two maps merge into one
+/// by name, so a collision silently drops an entry and the statement count no longer
+/// matches, which is caught below exactly as an unrecognised statement shape is.
+///
+/// Codex's next-round finding: `const P0: u8 = { let value = 0; value };` is exactly as
+/// resolvable as a local `const` already folded here, but a `let` is a different statement
+/// kind (`syn::Stmt::Local`) that nothing here had ever read. [`block_let_exprs`] is that
+/// reading, narrowed to a bare identifier binding with no destructuring and no `let-else`.
 ///
 /// Factored out of [`literal_or_const_value`]'s own `Expr::Block` case so `Expr::If`'s
 /// `then` branch — itself a plain `syn::Block` — can be evaluated the identical way,
-/// rather than duplicating the local-`const` fixed point a second time.
+/// rather than duplicating the local-binding fixed point a second time.
 fn evaluate_block(
     block: &syn::Block,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
 ) -> Option<i128> {
-    let locals = block_const_exprs(block);
+    let mut locals = block_const_exprs(block);
+    let lets = block_let_exprs(block);
+    let combined_len = locals.len() + lets.len();
+    for (name, expr) in lets {
+        locals.insert(name, expr);
+    }
+    if locals.len() != combined_len {
+        return None;
+    }
     let (tail, rest) = block.stmts.split_last()?;
     if rest.len() != locals.len() {
         return None;
