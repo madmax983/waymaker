@@ -3269,23 +3269,43 @@ block is a real scope boundary in Rust while a function, `impl`, `const`, `enum`
 the caller passes down.
 
 Round 21 found two more, both closing an asymmetry round 20's own fix left standing rather
-than opening a new one. The plain-path type aliases `collect_type_aliases` collects have
-reached any nesting depth `nested_body_items` covers since round 17 — a local `type R =
-super::Recovery;` inside a function body — but the parallel `use`-alias loop
-`module_scope_aliases` runs only ever read a scope's own direct items, never descending into
-a body: `fn install() { use core::clone::Clone as C; impl C for Recovery { .. } }` is legal
-Rust exactly like round 17's local type alias, and resolved `C` to nothing. A new
-`collect_use_aliases_in_scope` gives the `use`-alias half the identical nested-body descent
-the type-alias half already had, stopping at the same `Item::Mod` boundary
-`module_scope_aliases` itself does not cross. And every prior round that walked a function or
-method descended only into its *body* — never its own parameter types or return type, which
-can carry a buried block exactly the way a type alias's, a struct field's, or an enum variant
-field's own type already could (`fn hidden(_: [(); { impl Clone for super::Recovery { .. };
-0 }]) {}`). A new `fn_signature_type_items` walks a signature's inputs and output with
-`type_items`, used everywhere a function or method's body already was — `nested_body_items`'s
-`Fn`/`Impl`/`Trait` arms, `impl_member_bodies`, `trait_member_bodies` (now producing an entry
-for a trait method with no default body too, since its signature is parsed either way), and
+than opening a new one. Plain-path type aliases had reached any nesting depth
+`nested_body_items` covers since round 17 — a local `type R = super::Recovery;` inside a
+function body — but the parallel `use`-alias table only ever read a scope's own direct items,
+never descending into a body: `fn install() { use core::clone::Clone as C; impl C for
+Recovery { .. } }` is legal Rust exactly like round 17's local type alias, and resolved `C` to
+nothing. And every prior round that walked a function or method descended only into its
+*body* — never its own parameter types or return type, which can carry a buried block exactly
+the way a type alias's, a struct field's, or an enum variant field's own type already could
+(`fn hidden(_: [(); { impl Clone for super::Recovery { .. }; 0 }]) {}`). A new
+`fn_signature_type_items` walks a signature's inputs and output with `type_items`, used
+everywhere a function or method's body already was — `nested_body_items`'s `Fn`/`Impl`/`Trait`
+arms, `impl_member_bodies`, `trait_member_bodies` (now producing an entry for a trait method
+with no default body too, since its signature is parsed either way), and
 `collect_child_modules`'s own `Fn` arm.
+
+Round 22 then found that round 21's own fix for the `use`-alias gap had reintroduced round
+20's exact false positive one level down. Giving the `use`-alias table the same nested-body
+descent the type-alias half already had meant recursing into *every* function body in a
+scope and accumulating all of their aliases into one table shared across every other item in
+that same scope — so an unrelated function's own local `use core::clone::Clone as C;` could
+resolve an unrelated `impl C for Recovery` in a *different* function, or at the module's own
+top level, exactly the shape of false positive round 20 closed for `mod` blocks. The fix
+redesigns how a body's own local aliases are threaded rather than patching the symptom:
+`collect_type_aliases` and the round-21 `use`-alias walk are both retired, replaced by
+`direct_scope_aliases` — one flat item list's own directly-declared `use` and `type` aliases,
+with no recursion into anything, module or body alike — and `collect_trait_implementors`
+itself now computes a *fresh* extension of the ambient table from each item's own
+`nested_body_items`, immediately before recursing into that one item alone, so no two
+sibling items (two functions, two impl blocks, one of each) ever share an extension.
+`module_scope_aliases` is now a thin wrapper over `direct_scope_aliases`, used only for file
+scope and each nested module's own fresh table, matching round 20's original design. Round
+22 also found two findings of its own established shape: a `union`'s own field types can
+carry a buried block exactly the way a struct's or an enum variant's already could, closed
+the same way with a new `union_field_bodies` mirroring `struct_field_bodies`; and a function
+signature's own generics — a type parameter's bounds and default, and a `where` clause
+predicate's bounded type and bounds — can carry one too, closed by a new `generics_items`
+chained into `fn_signature_type_items` alongside its parameter and return types.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four

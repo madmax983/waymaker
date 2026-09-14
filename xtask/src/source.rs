@@ -11696,6 +11696,110 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_in_an_unrelated_function_body_does_not_leak_into_a_different_scope() {
+        // Found by Codex review of this change (PR #143), round 22: round 21's own fix
+        // for a block-local `use` alias recursed into every function body in a scope
+        // and accumulated all of their aliases into one shared table, reintroducing
+        // round 20's false positive one level down — an unrelated function's own local
+        // `use core::clone::Clone as C;` could resolve an unrelated `impl C for
+        // Recovery` at the module's own top level. `Recovery` here implements only a
+        // local, harmless marker trait, never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as C;\n",
+            "#[allow(dead_code)]\n",
+            "fn unrelated() {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use core::clone::Clone as C;\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "impl C for Recovery {}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_where_clause_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 22: every prior round
+        // that walked a function or method signature descended only into its
+        // parameter and return types, never its generics — but a `where` clause
+        // predicate's bounded type can carry a buried block exactly the way a
+        // parameter type already could.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Wrapper<const N: usize>;\n",
+                "trait Trait {}\n",
+                "impl Trait for Wrapper<0> {}\n",
+                "fn hidden<T>()\n",
+                "where\n",
+                "    Wrapper<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>: Trait,\n",
+                "{\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_union_field_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 22: a `union`'s own
+        // field types can each carry a buried block exactly the way a struct's or an
+        // enum variant's field types already could, and neither scanner read
+        // `Item::Union` at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "union U {\n",
+                "    field: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }],\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
