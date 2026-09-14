@@ -1905,7 +1905,14 @@ pub fn match_expressions_with_prefix(
     prefix: &[String],
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
-    let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
+    let base = resolve_scope_consts(
+        &item_const_exprs(&file.items),
+        &ConstScopes(Vec::new()),
+        external_qualified,
+        prefix,
+        &[],
+        &[],
+    );
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
@@ -1977,7 +1984,14 @@ pub fn qualified_constants_with_prefix(
     prefix: &[String],
 ) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
     let file = parse_rust(contents)?;
-    let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
+    let base = resolve_scope_consts(
+        &item_const_exprs(&file.items),
+        &ConstScopes(Vec::new()),
+        &std::collections::HashMap::new(),
+        prefix,
+        &[],
+        &[],
+    );
     let mut qualified = std::collections::HashMap::new();
     if !prefix.is_empty() {
         for (name, value) in &base {
@@ -2241,14 +2255,37 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
 }
 
 /// `own`'s constants, each resolved to an integer where its initializer allows — directly,
-/// through a chain of references to other constants `own` itself declares, or through one
-/// already visible in `outer`. Declaration order within `own` does not matter: Rust's own
-/// name resolution does not require one, so a fixed-point pass (bounded, since a real
-/// dependency chain among a handful of constants in one scope is shallow) is what a single
-/// top-to-bottom scan would get wrong for a constant that names a later one.
+/// through a chain of references to other constants `own` itself declares, through one
+/// already visible in `outer`, or through a module-qualified path already recorded in
+/// `qualified` (searched at every depth [`resolve_qualified_path_at_any_depth`] tries,
+/// relative to the scope `own` itself sits in — `module_path`, `function_path` and
+/// `block_path`, exactly as a match arm's own qualified pattern is). Declaration order
+/// within `own` does not matter: Rust's own name resolution does not require one, so a
+/// fixed-point pass (bounded, since a real dependency chain among a handful of constants in
+/// one scope is shallow) is what a single top-to-bottom scan would get wrong for a constant
+/// that names a later one.
+///
+/// Codex's forty-second-round finding: a qualified initializer such as
+/// `const P0: u8 = base::BASE + 0;`, naming a sibling module's constant already indexed in
+/// `qualified` by an earlier-visited part of the same walk, was rejected outright — the
+/// `resolve` closure below only ever accepted `path.get_ident()`, a single bare segment,
+/// so every multi-segment path answered `None` regardless of whether `qualified` already
+/// held it.
+///
+/// Codex's next-round finding: the first fix asked only one fixed combination —
+/// `module_path + function_path + block_path`, the scope `own` itself sits in — which
+/// answers for a module declared local to that exact function or block, but not for one
+/// declared at ordinary, shallower scope (a sibling of the function, or of the whole file),
+/// which is the far more common shape and the one Codex's own repro used. Widened to
+/// [`resolve_qualified_path_at_any_depth`]'s full most-specific-first search, the same one
+/// [`resolve_pattern_path`] already runs for a pattern.
 fn resolve_scope_consts(
     own: &std::collections::HashMap<String, syn::Expr>,
     outer: &ConstScopes,
+    qualified: &std::collections::HashMap<String, i128>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
 ) -> std::collections::HashMap<String, i128> {
     let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
     for _ in 0..own.len().max(1) {
@@ -2257,16 +2294,21 @@ fn resolve_scope_consts(
             if resolved.contains_key(name) {
                 continue;
             }
-            // Bare names only: a same-scope or an outer-scope reference, never a qualified
-            // path. Qualifying a constant's own initializer with a module path is a far
-            // deeper reach than the finding this scope machinery closes, and unsupported
-            // here means "not resolved" rather than "resolved wrongly".
             let resolve = |path: &syn::Path| {
-                let candidate = ident_name(path.get_ident()?);
-                resolved
-                    .get(&candidate)
-                    .copied()
-                    .or_else(|| outer.resolve(&candidate))
+                if let Some(ident) = path.get_ident() {
+                    let candidate = ident_name(ident);
+                    return resolved
+                        .get(&candidate)
+                        .copied()
+                        .or_else(|| outer.resolve(&candidate));
+                }
+                resolve_qualified_path_at_any_depth(
+                    path,
+                    qualified,
+                    module_path,
+                    function_path,
+                    block_path,
+                )
             };
             if let Some(value) = literal_or_const_value(expr, &resolve) {
                 resolved.insert(name.clone(), value);
@@ -2557,10 +2599,24 @@ fn literal_or_const_value(
 /// the two candidates; the bare, unprefixed form stays the fallback for the common case
 /// where the trait is referenced bare (`<u8 as Indices>::P0`) and both scan the same
 /// tree's own top level.
+///
+/// Codex's next-round finding after that: the trait's own declared module is not
+/// necessarily the *impl's* module at all — `impl traits::Indices for u8 { .. }` can sit
+/// in a sibling `mod implementations` of the module the trait itself is declared in, and
+/// [`MatchVisitor::visit_item_impl`] indexes a trait impl's constants under the *impl's*
+/// own lexical module, never the trait's. Neither candidate above names that module (this
+/// function only ever sees the *pattern's* own path, never where the impl actually sits),
+/// so both failed and the arm stayed unresolved. The fallback below searches every key
+/// `qualified` holds for the one ending in exactly `type_name::member` — the suffix every
+/// [`MatchVisitor::visit_item_impl`] insertion carries regardless of which module recorded
+/// it — and answers only when that search is unambiguous, the same standing every other
+/// unsupported shape in this scan already has: a second impl of the same type existing
+/// somewhere else in the tree leaves this unresolved rather than guessing between them.
 fn resolve_qself_associated_const(
     qself: &syn::QSelf,
     path: &syn::Path,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    qualified: &std::collections::HashMap<String, i128>,
 ) -> Option<i128> {
     let type_name = single_segment_type_name(&qself.ty)?;
     let member = ident_name(&path.segments.last()?.ident);
@@ -2582,7 +2638,16 @@ fn resolve_qself_associated_const(
         }
     }
     let synthetic = syn::parse_str::<syn::Path>(&format!("{type_name}::{member}")).ok()?;
-    resolve(&synthetic)
+    if let Some(value) = resolve(&synthetic) {
+        return Some(value);
+    }
+    let suffix = format!("::{type_name}::{member}");
+    let mut candidates = qualified.keys().filter(|key| key.ends_with(&suffix));
+    let unique = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    qualified.get(unique).copied()
 }
 
 /// The most values [`pattern_literal`]'s `Pat::Range` case will ever expand a single
@@ -2628,7 +2693,11 @@ fn single_discriminating_field<'a>(
     found
 }
 
-fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i128>) -> Vec<i128> {
+fn pattern_literal(
+    pattern: &syn::Pat,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    qualified: &std::collections::HashMap<String, i128>,
+) -> Vec<i128> {
     match pattern {
         syn::Pat::Lit(literal) => lit_value(&literal.lit).into_iter().collect(),
         syn::Pat::Ident(named) => match &named.subpat {
@@ -2643,7 +2712,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             // instead — but `ref`, `mut` and `ref mut` change only how the match binds the
             // value, never which value the pattern matches, so the subpattern is resolved
             // the same way regardless of the binding's own mode.
-            Some((_, subpat)) => pattern_literal(subpat, resolve),
+            Some((_, subpat)) => pattern_literal(subpat, resolve, qualified),
             // A bare identifier with no subpattern is the one shape where the mode still
             // matters: `ref`/`mut` are legal only on a genuine new binding, never on
             // Rust's own path-pattern spelling of a constant, so a bare `ref name` can
@@ -2664,7 +2733,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         syn::Pat::Path(path) => path.qself.as_ref().map_or_else(
             || resolve(&path.path).into_iter().collect(),
             |qself| {
-                resolve_qself_associated_const(qself, &path.path, resolve)
+                resolve_qself_associated_const(qself, &path.path, resolve, qualified)
                     .into_iter()
                     .collect()
             },
@@ -2743,7 +2812,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // its own referent, over a scrutinee that is itself a reference — a shape a dense
         // table's own selector can be, and one `rustc` lowers to the identical indexed
         // table a by-value match would.
-        syn::Pat::Reference(reference) => pattern_literal(&reference.pat, resolve),
+        syn::Pat::Reference(reference) => pattern_literal(&reference.pat, resolve, qualified),
         // Codex's finding: `Some(0)` through `Some(14)` over an `Option<u8>` scrutinee is
         // exactly as dense as its bare-integer twin — `rustc` lowers a single-field
         // tuple-struct constructor pattern to the identical indexed table a plain integer
@@ -2761,7 +2830,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // and stays unresolved, the same standing a multi-field pattern already had.
         syn::Pat::TupleStruct(tuple_struct) => {
             single_discriminating_field(&tuple_struct.elems, resolve)
-                .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve))
+                .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve, qualified))
         }
         // Codex's next-round finding: a plain one-tuple pattern (`(0,)` through `(14,)`)
         // is `Pat::Tuple` rather than `Pat::TupleStruct` — no constructor name, just a
@@ -2770,7 +2839,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // discriminating-field scoping applies for the identical reason, generalised the
         // same way the tuple-struct case above was.
         syn::Pat::Tuple(tuple) => single_discriminating_field(&tuple.elems, resolve)
-            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve, qualified)),
         // Codex's next-round finding: `Key { n: 0, ignored: _ }` through
         // `Key { n: 14, ignored: _ }` is exactly as dense once more, since `rustc`
         // indexes on the one named field that varies and ignores a field that is
@@ -2783,16 +2852,21 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             pat_struct.fields.iter().map(|field| field.pat.as_ref()),
             resolve,
         )
-        .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+        .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve, qualified)),
         // Codex's next-round finding: `[0]` through `[14]` over a `[u8; 1]` scrutinee,
         // or `[0, _]` through `[14, _]` over a wider slice, is exactly as dense once
         // more — a slice pattern is a fourth shape the discriminating-field reasoning
         // applies to, over its own explicitly-listed elements the same way a tuple's
-        // are (a `..` rest element is simply never irrefutable by this test, so it
-        // counts as a second discriminating "field" and correctly makes such a
-        // pattern ambiguous rather than guessed at).
+        // are.
+        //
+        // Codex's next-round finding: `[0, ..]` through `[14, ..]` still evaded it — `..`
+        // is `Pat::Rest`, which `is_catchall_pattern` did not recognise, so it counted as
+        // a *second* discriminating field beside the literal and made every such arm
+        // read as ambiguous. `Pat::Rest` matches every remaining element and names no
+        // value of its own, exactly as irrefutable as a wildcard; `is_catchall_pattern`
+        // now treats it as one.
         syn::Pat::Slice(pat_slice) => single_discriminating_field(&pat_slice.elems, resolve)
-            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve, qualified)),
         // Codex's finding: `0 | 1 => VALUE` covers two values in a single arm, and
         // `rustc` still lowers a match built this way to the identical indexed table a
         // one-value-per-arm spelling gets — this fell to the `_ => Vec::new()` case
@@ -2804,7 +2878,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         syn::Pat::Or(or_pattern) => {
             let mut values = Vec::with_capacity(or_pattern.cases.len());
             for case in &or_pattern.cases {
-                let case_values = pattern_literal(case, resolve);
+                let case_values = pattern_literal(case, resolve, qualified);
                 if case_values.is_empty() {
                     return Vec::new();
                 }
@@ -2844,7 +2918,14 @@ fn is_catchall_pattern(
         return false;
     }
     match pattern {
-        syn::Pat::Wild(_) => true,
+        // Codex's forty-second-round finding: `[0, ..]` through `[14, ..]` over a
+        // `[u8; 2]` scrutinee left `..` — `Pat::Rest`, matching every remaining element
+        // and never itself a discriminating value — falling to the `_ => false` arm, so
+        // `single_discriminating_field` saw *two* fields it could not rule out (the
+        // literal and the rest) and answered `None` for every arm. `Pat::Rest` carries no
+        // value of its own to discriminate on, exactly like a wildcard, which is why the
+        // two share one arm here.
+        syn::Pat::Wild(_) | syn::Pat::Rest(_) => true,
         syn::Pat::Ident(named) if named.subpat.is_none() => {
             resolve(&syn::Path::from(named.ident.clone())).is_none()
         }
@@ -3164,6 +3245,45 @@ struct ResolutionContext<'a> {
     self_type_path: &'a [String],
 }
 
+/// `path`'s own value against `qualified`, searched at every depth a bare or qualified
+/// reference written inside `module_path`/`function_path`/`block_path` could resolve at:
+/// the full combination first (a module local to this exact function or block), each
+/// trailing `block_path` segment peeled off in turn, then `function_path` dropped
+/// entirely, and finally `module_path` alone (a module declared at ordinary, file-level
+/// scope) — the same most-specific-first order [`resolve_pattern_path`]'s own fallback
+/// uses, factored out so a second caller can search identically rather than fixing one
+/// combination and missing every declaration not keyed at exactly that depth.
+///
+/// Codex's forty-second-round finding: [`resolve_scope_consts`]'s own qualified-initializer
+/// lookup did exactly that — one fixed `module_path + function_path + block_path`
+/// combination — so `const P0: u8 = base::BASE + 0;`, written inside a function whose
+/// enclosing module is where `mod base` actually sits, searched only
+/// `enclosing_module::this_function::base::BASE`, never `enclosing_module::base::BASE`
+/// itself, and the whole initializer stayed unresolved even though the qualified map
+/// already held it.
+fn resolve_qualified_path_at_any_depth(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+) -> Option<i128> {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined_module = module_path.to_vec();
+        combined_module.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined_module.extend(prefix.iter().cloned());
+        }
+        if let Some(value) = resolve_qualified_path(path, qualified, &combined_module) {
+            return Some(value);
+        }
+    }
+    if function_path.is_empty() && block_path.is_empty() {
+        return None;
+    }
+    resolve_qualified_path(path, qualified, module_path)
+}
+
 fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option<i128> {
     if let Some(ident) = path.get_ident() {
         let name = ident_name(ident);
@@ -3300,20 +3420,13 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
     // real collision between two same-named, equally-nested local modules is what this
     // fallback cannot silently paper over, because each was keyed under its own block's
     // place in the walk and neither can be reached from the other's.
-    for depth in (0..=ctx.block_path.len()).rev() {
-        let mut combined_module = ctx.module_path.to_vec();
-        combined_module.extend(ctx.function_path.iter().cloned());
-        if let Some(prefix) = ctx.block_path.get(..depth) {
-            combined_module.extend(prefix.iter().cloned());
-        }
-        if let Some(value) = resolve_qualified_path(path, ctx.qualified, &combined_module) {
-            return Some(value);
-        }
-    }
-    if ctx.function_path.is_empty() && ctx.block_path.is_empty() {
-        return None;
-    }
-    resolve_qualified_path(path, ctx.qualified, ctx.module_path)
+    resolve_qualified_path_at_any_depth(
+        path,
+        ctx.qualified,
+        ctx.module_path,
+        ctx.function_path,
+        ctx.block_path,
+    )
 }
 
 /// `trait_name`'s own default associated constants, found by the identical
@@ -3470,7 +3583,6 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             syn::visit::visit_item_mod(self, node);
             return;
         };
-        let scope = resolve_scope_consts(&item_const_exprs(items), &self.scopes);
         // Codex's finding: two different functions each declaring their own local
         // `mod indices { .. }` are both real modules named `indices` under the same
         // ancestor `module_path`, so keying solely on `module_path` (below) let the
@@ -3483,6 +3595,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let mut key_path = self.module_path.clone();
         key_path.extend(self.function_path.iter().cloned());
         key_path.extend(self.block_path.iter().cloned());
+        let scope = resolve_scope_consts(
+            &item_const_exprs(items),
+            &self.scopes,
+            &self.qualified,
+            &self.module_path,
+            &self.function_path,
+            &self.block_path,
+        );
         key_path.push(ident_name(&node.ident));
         self.module_path.push(ident_name(&node.ident));
         for (name, value) in &scope {
@@ -3517,10 +3637,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // same way `resolve_pattern_path` already tells two same-named local modules
         // apart.
         if !has_cfg_test(&node.attrs) {
-            let scope = resolve_scope_consts(&trait_const_exprs(&node.items), &self.scopes);
             let mut key_path = self.module_path.clone();
             key_path.extend(self.function_path.iter().cloned());
             key_path.extend(self.block_path.iter().cloned());
+            let scope = resolve_scope_consts(
+                &trait_const_exprs(&node.items),
+                &self.scopes,
+                &self.qualified,
+                &self.module_path,
+                &self.function_path,
+                &self.block_path,
+            );
             key_path.push(ident_name(&node.ident));
             self.trait_defaults.insert(key_path.join("::"), scope);
         }
@@ -3590,13 +3717,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                         })
                         .cloned()
                         .unwrap_or_default();
-                    scope.extend(resolve_scope_consts(
-                        &impl_const_exprs(&node.items),
-                        &self.scopes,
-                    ));
                     let mut path = self.module_path.clone();
                     path.extend(self.function_path.iter().cloned());
                     path.extend(self.block_path.iter().cloned());
+                    scope.extend(resolve_scope_consts(
+                        &impl_const_exprs(&node.items),
+                        &self.scopes,
+                        &self.qualified,
+                        &self.module_path,
+                        &self.function_path,
+                        &self.block_path,
+                    ));
                     let name = ident_name(&segment.ident);
                     path.push(name.clone());
                     for (const_name, value) in &scope {
@@ -3681,7 +3812,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
-        let scope = resolve_scope_consts(&block_const_exprs(node), &self.scopes);
+        let scope = resolve_scope_consts(
+            &block_const_exprs(node),
+            &self.scopes,
+            &self.qualified,
+            &self.module_path,
+            &self.function_path,
+            &self.block_path,
+        );
         self.scopes.0.push(scope);
         self.use_scopes.0.push(block_use_imports(node));
         // Codex's finding: two sibling blocks of one function each declaring their own
@@ -3738,7 +3876,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             .iter()
             .filter(|arm| !has_cfg_test(&arm.attrs))
             .map(|arm| FoundArm {
-                pattern: pattern_literal(&arm.pat, &resolve),
+                pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
                 is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), &resolve),
                 call: call_shape_of(&arm.body, &resolve),
             })

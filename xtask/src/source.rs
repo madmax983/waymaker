@@ -9005,6 +9005,69 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
+/// `values` laid out against `slots` consecutive offsets from `base`, under wrapping
+/// (modulo 2^128) arithmetic: `Some` of the coverage bitmap when every value lands on its
+/// own distinct offset in `0..slots`, `None` the moment one lands out of range or repeats
+/// one another value already claimed.
+///
+/// Wrapping rather than checked arithmetic is what lets this answer the same question
+/// whether `base` truly is the window's lowest value (the ordinary case, where wrapping and
+/// checked subtraction agree because nothing overflows) or the window straddles the point
+/// where [`lit_value`]'s own two's-complement reinterpretation of a `u128` literal at or
+/// above `2^127` turns an ascending run into one that wraps through `i128::MIN` — there,
+/// `value.wrapping_sub(base)`'s own bit pattern, read as `u128`, is exactly the forward
+/// circular distance from `base` to `value`, agreeing with the unsigned domain the literal
+/// came from regardless of which half of it `lit_value` had to reinterpret as negative.
+fn try_window_layout(values: &[i128], slots: usize, base: i128) -> Option<Vec<bool>> {
+    let mut covered = vec![false; slots];
+    for &value in values {
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "wrapping_sub's own two's-complement bit pattern, reinterpreted as an \
+                      unsigned circular offset from `base` rather than converted as a value"
+        )]
+        let offset_bits = value.wrapping_sub(base) as u128;
+        let offset = usize::try_from(offset_bits).ok()?;
+        let slot = covered.get_mut(offset)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+    }
+    Some(covered)
+}
+
+/// `values` laid out as a window of `slots` consecutive integers, together with the base
+/// that window starts at — tried first at the plain signed minimum, which is the window's
+/// true base and the only candidate needed whenever nothing straddles the u128-reinterpretation
+/// wrap point [`try_window_layout`]'s own doc comment describes.
+///
+/// Codex's forty-second-round finding: the plain signed minimum is not always the window's
+/// true base once `lit_value` can answer for a `u128` literal at or above `2^127` — a
+/// consecutive run of such literals spanning that boundary has its *smallest* values (just
+/// below `2^127`) reinterpreted as large *positive* `i128`s and its *largest* values (at or
+/// above `2^127`) reinterpreted as very *negative* ones, so the plain signed minimum lands
+/// in the middle of the window rather than at its start, and subtracting it from the large
+/// positive end overflows `i128` outright — which `missing_value`'s own prior `checked_sub`
+/// read as an unresolvable arm and skipped the whole match rather than recognising the
+/// window it still is. Every value is tried as a candidate base in turn, under
+/// [`try_window_layout`]'s wrapping arithmetic, so the search finds whichever one is the
+/// window's true circular start without needing to know in advance which half of `i128`'s
+/// range it sits in.
+fn window_layout(values: &[i128], slots: usize) -> Option<(i128, Vec<bool>)> {
+    if let Some(&base) = values.iter().min() {
+        if let Some(covered) = try_window_layout(values, slots, base) {
+            return Some((base, covered));
+        }
+    }
+    for &base in values {
+        if let Some(covered) = try_window_layout(values, slots, base) {
+            return Some((base, covered));
+        }
+    }
+    None
+}
+
 /// The single value in the window starting at the numbered arms' own lowest covered value
 /// and as wide as the number of values they cover *plus one*, that no numbered
 /// (non-wildcard) arm's pattern names — the value a dense table's own wildcard arm covers.
@@ -9048,22 +9111,13 @@ fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
         values.extend(arm.pattern.iter().copied());
     }
     let total = values.len().checked_add(1)?;
-    let base = *values.iter().min()?;
-    let mut covered = vec![false; total];
-    for value in values {
-        let offset = usize::try_from(value.checked_sub(base)?).ok()?;
-        let slot = covered.get_mut(offset)?;
-        if *slot {
-            return None;
-        }
-        *slot = true;
-    }
+    let (base, covered) = window_layout(&values, total)?;
     let mut gaps = covered.iter().enumerate().filter(|(_, seen)| !**seen);
     let (gap, _) = gaps.next()?;
     if gaps.next().is_some() {
         return None;
     }
-    base.checked_add(i128::try_from(gap).ok()?)
+    Some(base.wrapping_add(i128::try_from(gap).ok()?))
 }
 
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
@@ -9128,25 +9182,12 @@ fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
         }
         values.extend(arm.pattern.iter().copied());
     }
-    let Some(base) = values.iter().copied().min() else {
+    if values.is_empty() {
+        return false;
+    }
+    let Some((_, covered)) = window_layout(&values, values.len()) else {
         return false;
     };
-    let mut covered = vec![false; values.len()];
-    for value in values {
-        let Some(offset) = value
-            .checked_sub(base)
-            .and_then(|offset| usize::try_from(offset).ok())
-        else {
-            return false;
-        };
-        let Some(slot) = covered.get_mut(offset) else {
-            return false;
-        };
-        if *slot {
-            return false;
-        }
-        *slot = true;
-    }
     covered.iter().all(|seen| *seen)
 }
 
@@ -17263,6 +17304,131 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_spanning_the_u128_sign_boundary_is_reported() {
+        // Codex's forty-second-round finding: reinterpreting a `u128` literal at or above
+        // `2^127` as its own two's-complement `i128` bit pattern (the prior round's fix)
+        // breaks plain signed ordering for a window that straddles the boundary — the
+        // values just below `2^127` stay near `i128::MAX`, while the values at or above
+        // it wrap to near `i128::MIN`. `missing_value`'s own plain signed minimum then
+        // picks a value from the *middle* of the true window as its base, and subtracting
+        // it from the far end overflows `i128` outright, which `checked_sub` read as an
+        // unresolvable arm — skipping a match that is still exactly the dense window it
+        // was written as. `2^127-2`, `2^127-1`, `2^127+1` and `2^127+2` cover four of a
+        // five-value window; the wildcard covers the fifth, `2^127`, sitting exactly on
+        // the boundary the four explicit arms straddle.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn u128_boundary_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105726 => \
+             u128_boundary_helper(0),\n        \
+             170141183460469231731687303715884105727 => \
+             u128_boundary_helper(1),\n        \
+             170141183460469231731687303715884105729 => \
+             u128_boundary_helper(2),\n        \
+             170141183460469231731687303715884105730 => \
+             u128_boundary_helper(3),\n        _ => u128_boundary_helper(4),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_slice_patterns_with_a_rest_element_is_reported() {
+        // Codex's forty-second-round finding: `[0, ..]` through `[14, ..]` over a wider
+        // slice still evaded the slice handling the prior round added — `..` is
+        // `Pat::Rest`, which `is_catchall_pattern` did not recognise, so
+        // `single_discriminating_field` saw *two* fields it could not rule out (the
+        // literal and the rest element) for every arm and answered `None` throughout.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn slice_rest_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn slice_rest_table(nibble: [u8; 2]) -> u32 \
+             {\n    match nibble {\n        [0, ..] => slice_rest_helper(0),\n        \
+             [1, ..] => slice_rest_helper(1),\n        [2, ..] => \
+             slice_rest_helper(2),\n        _ => slice_rest_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_implemented_in_a_sibling_module_is_reported() {
+        // Codex's forty-second-round finding: the trait's own declared module is not
+        // necessarily the impl's module at all. `traits::Indices` is declared in `mod
+        // traits`, but `impl traits::Indices for u8` sits in the sibling `mod
+        // implementations` — so `visit_item_impl` indexes the constants under
+        // `implementations::u8::P0`, while the prior round's fix built its lookup key
+        // from the *trait's* own path segments (`traits`), asking for `traits::u8::P0`
+        // instead. Neither that candidate nor the bare `u8::P0` fallback matches, and
+        // every numbered arm stayed unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod implementations {\n    impl super::traits::Indices for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             const fn sibling_module_trait_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        <u8 as traits::Indices>::P0 => 0,\n        \
+             <u8 as traits::Indices>::P1 => 1,\n        <u8 as traits::Indices>::P2 => \
+             2,\n        <u8 as traits::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_qualified_initializers_is_reported() {
+        // Codex's forty-second-round finding: `const P0: u8 = base::BASE + 0;` names a
+        // qualified path already recorded in the qualified-constants map by an
+        // earlier-visited sibling module, but `resolve_scope_consts`'s own `resolve`
+        // closure only ever accepted `path.get_ident()` — a single bare segment — so a
+        // multi-segment initializer answered `None` regardless of whether `base::BASE`
+        // was already known, and every one of `P0` through `P3` stayed unresolved.
+        // Closing that alone was not enough: `base` sits beside `crc` (the whole file's
+        // own root), not beside `qualified_initializer_table` (the function `P0` is
+        // declared in), so a search fixed at exactly
+        // `module_path + function_path + block_path` still missed it, and
+        // `resolve_scope_consts` needed the same full most-specific-first search a match
+        // arm's own qualified pattern already gets, rather than one fixed combination.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod base {\n    pub const BASE: u8 = 10;\n}\n\n\
+             const fn qualified_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = base::BASE + 0;\n    const P1: u8 = base::BASE + 1;\n    \
+             const P2: u8 = base::BASE + 2;\n    const P3: u8 = base::BASE + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
             "{violations:?}"
         );
     }
