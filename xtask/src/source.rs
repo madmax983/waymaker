@@ -7640,6 +7640,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_effect_constructions(&source.contents));
     violations.extend(check_checked_dispatch_construction(&source.contents));
     violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
+    violations.extend(check_no_projected_type_aliases(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -7940,6 +7941,47 @@ fn check_effect_proof_fields_are_not_rebound(contents: &str) -> Vec<Violation> {
                     "{found:?} written to outside a struct literal in {EFFECT_PROTOCOL_PATH}: \
                      a proof's identity, kind or bytes has to come from the one place that \
                      built it, not from a later assignment or a `&mut` reference taken to it"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` names no `type` alias whose target is a qualified associated-type
+/// projection.
+///
+/// `<T as Trait>::Assoc` can resolve to any struct the trait's `impl` chooses —
+/// `CheckedDispatch` included — and nothing here can follow it without type inference.
+/// `type_alias_target` already resolves a plain path and one wrapped in parens; a projection
+/// is the one shape it cannot safely treat as "not an alias" the way it treats a tuple, a
+/// reference or a trait object, because unlike those it genuinely can name a struct usable
+/// in `Name { .. }` position. So the alias itself is refused outright, rather than silently
+/// passed over the way an unresolvable non-struct shape is.
+fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::qself_type_alias_names(contents) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} aliases a qualified associated-type projection in \
+                     {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
+                     trait's `impl` chooses, which no construction pin here can follow, so \
+                     the alias itself is refused"
                 ),
             )]
         }
@@ -12286,6 +12328,42 @@ mod deferred_answer_pins {
         let details = effect_details(&source);
         assert!(
             details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_ref_mut_pattern_binding_is_reported() {
+        // Codex, issue #92's ninth round: `let CheckedDispatch { bytes: ref mut slot, .. } =
+        // dispatch;` borrows `bytes` mutably through the pattern itself — no `=`, no `&mut`
+        // expression, no method call, so none of the first three rounds' routes saw it.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(dispatch: CheckedDispatch<'a>, other: &'a [u8]) -> CheckedDispatch<'a> {\n\
+               \x20   let CheckedDispatch { bytes: ref mut slot, .. } = dispatch;\n\
+               \x20   *slot = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_qself_type_alias_is_reported() {
+        // Codex, issue #92's ninth round: `<T as Trait>::Assoc` can resolve to any struct the
+        // trait's `impl` chooses, and `type_alias_target` deliberately skips every qualified
+        // path rather than guess. Skipping is not the same as permitting: this pin refuses
+        // the alias outright instead.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<'a> = <Via as Alias>::Dispatch;\n\
+               pub(crate) fn forge<'a>(intent: DurableIntent) -> Unchecked<'a> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("Unchecked") && detail.contains("projection")),
             "{details:?}"
         );
     }

@@ -147,6 +147,30 @@ called directly on one of these fields anywhere in `effect.rs` today, only on th
 value through its own accessor (`dispatch.bytes()`, whose receiver is a plain path, not a
 field access, and stays unaffected).
 
+**A ninth round found two more gaps, in two different mechanisms.** The first is a fourth
+route to the field-rebinding problem the seventh and eighth rounds closed:
+`let CheckedDispatch { bytes: ref mut slot, .. } = dispatch;` borrows `bytes` mutably through
+the pattern itself, with no assignment, no `&mut` expression and no method call anywhere for
+the first three routes to see. `mutated_field_names` now also refuses a `ref mut` binding on
+a guarded field in any struct pattern, walked with a nested visitor so a binding nested
+arbitrarily deep (behind a second guarded field, say) is found the same way regardless of
+depth. A field bound `mut slot` with no `ref` is deliberately left alone: it moves or copies
+the value into a fresh local, which is a read, and reconstructing `CheckedDispatch` from that
+local afterward is a struct literal the construction pins already cover.
+
+The second is in the type-alias resolution itself: `type Unchecked = <Via as Alias>::Dispatch;`
+is a qualified associated-type projection, and `type_alias_target` explicitly skips every
+`Type::Path` with a `qself` — deliberately, since resolving what a trait's `impl` names as its
+associated type needs type inference this scanner does not have. Skipping was silently
+permissive: the alias built nothing, so it counted as nothing, while the projection itself
+could name `CheckedDispatch`. Unlike a tuple, a reference or a trait object — none of which
+can ever appear where `Name { .. }` construction syntax is legal — a projection genuinely can
+resolve to a struct usable that way, so "cannot resolve" cannot mean "therefore safe" here the
+way it does for those other shapes. `qself_type_alias_names` reports every such alias instead,
+and a new check refuses the file outright over it — a hard refusal of the construct, in the
+same spirit as `effect-protocol`'s ban on a module declared anywhere in this file, rather than
+an attempt at the type resolution neither `syn` nor this scanner can safely do.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
