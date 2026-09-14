@@ -18108,6 +18108,63 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_indexed_array_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = [0u8][0];` is `Expr::Index` over an
+        // array *literal*, built solely so the indexing yields a constant — which fell to
+        // the wildcard `_ => None` case in `literal_or_const_value` and left every such
+        // constant unresolved. Neither backstop catches it: the const-call scan finds no
+        // call, and the array-vocabulary ban reads a *declared type* (`const P0: [u8; N]`),
+        // never an initializer's own shape — each of these constants is still plainly typed
+        // `u8`. The new `Expr::Index` case evaluates the array literal's own element at the
+        // resolved index through this same pipeline.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn indexed_array_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = [0u8][0];\n    const P1: u8 = [1u8][0];\n    \
+             const P2: u8 = [2u8][0];\n    const P3: u8 = [3u8][0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_cast_into_the_upper_half_of_u128_is_reported() {
+        // Codex's next-round finding: `apply_integer_cast`'s own `u128`-destination branch
+        // at full width used `i128::try_from(bits).ok()`, which fails closed the moment
+        // `bits` exceeds `i128::MAX` — exactly the upper half of `u128`'s own range, and
+        // exactly the domain `lit_value`'s `Lit::Int` case already stores as a wrapped,
+        // negative `i128` for an *oversized u128 literal* too wide for `i128` to parse.
+        // `(-4i128) as u128` through `(-1i128) as u128` *land* in that same upper half —
+        // each cast's own 128-bit pattern is a large positive `u128` no `i128` can hold as
+        // a positive value — and was refused instead of reinterpreted the identical way.
+        // Both destinations now share the one 128-bit reinterpretation, so `P0` through
+        // `P3` resolve to four wrapping-consecutive values near `u128::MAX`, the dense
+        // window `window_layout`'s own mod-2^128 arithmetic already lays out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_cast_upper_half_table(nibble: u128) -> u32 {\n    \
+             const P0: u128 = (-4i128) as u128;\n    const P1: u128 = (-3i128) as u128;\n    \
+             const P2: u128 = (-2i128) as u128;\n    const P3: u128 = (-1i128) as u128;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

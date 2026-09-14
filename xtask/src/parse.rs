@@ -2506,16 +2506,24 @@ fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
     )]
     let bits = value as u128;
     if width >= 128 {
-        return if signed {
-            #[allow(
-                clippy::cast_possible_wrap,
-                reason = "u128 to i128 at equal width is the same reinterpretation, not a value conversion"
-            )]
-            let reinterpreted = bits as i128;
-            Some(reinterpreted)
-        } else {
-            i128::try_from(bits).ok()
-        };
+        // Codex's next-round finding: the `!signed` (`u128` destination) arm used
+        // `i128::try_from(bits).ok()`, which fails closed the moment `bits` exceeds
+        // `i128::MAX` — exactly the upper half of `u128`'s own range, and exactly the
+        // domain `lit_value`'s own `Lit::Int` case already stores as a wrapped, negative
+        // `i128` for a `u128` literal too wide for `i128` to parse directly. A cast
+        // *landing* in that same upper half (`(-15i128) as u128`, whose 128-bit pattern is
+        // a large positive `u128` no `i128` can hold as a positive value) was refused
+        // instead of reinterpreted the identical way. `i128` and `u128` share one 128-bit
+        // storage representation in this scan regardless of which one Rust's own type
+        // system would call it, so both destinations reinterpret the same bit pattern
+        // rather than converting a value — there is nothing left for `signed` to decide at
+        // this width.
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "u128 to i128 at equal width is the same bit-pattern reinterpretation, not a value conversion"
+        )]
+        let reinterpreted = bits as i128;
+        return Some(reinterpreted);
     }
     let masked = bits & ((1_u128 << width) - 1);
     if signed && masked & (1_u128 << (width - 1)) != 0 {
@@ -2842,6 +2850,25 @@ fn literal_or_const_value(
         // is nothing more than routing that body to the same function — no local `const` or
         // `let` fixed point of its own to invent.
         syn::Expr::Const(expr_const) => evaluate_block(&expr_const.block, resolve),
+        // Codex's next-round finding: `const P0: u8 = [0u8][0];` is `Expr::Index` over an
+        // array *literal*, built solely so the indexing yields a constant — which fell to
+        // the wildcard `_ => None` case below and left every such arm unresolved, the
+        // const-call and array-vocabulary backstops both included, since each declared
+        // constant's own type is a plain `u8` and neither backstop reads an initializer's
+        // *shape*. Scoped to exactly that shape, the same way the tuple- and
+        // struct-literal `Expr::Field` cases above are: the indexed expression must itself
+        // be an `Expr::Array` literal — nothing reaches outside this expression for a
+        // value, so indexing a path or a slice reference is not attempted — and the index
+        // itself resolved through this same pipeline; an index outside the array's own
+        // bounds, or one this scan cannot resolve to a value, stays unresolved rather than
+        // guessed at.
+        syn::Expr::Index(indexed) => {
+            let syn::Expr::Array(array) = indexed.expr.as_ref() else {
+                return None;
+            };
+            let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
+            literal_or_const_value(array.elems.get(index)?, resolve)
+        }
         _ => None,
     }
 }
