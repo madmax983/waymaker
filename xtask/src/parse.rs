@@ -2335,6 +2335,60 @@ fn literal_or_const_value(
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
             literal_or_const_value(&unary.expr, resolve)?.checked_neg()
         }
+        // Codex's finding: `const P0: u8 = { const N: u8 = 0; N };` is `Expr::Block` — a
+        // block used as an expression, most often to give an initializer a scope of its
+        // own — and was not unwrapped at all, so a table whose numbered arms are spelled
+        // this way read as unresolved on every arm. A block is exactly as evaluable as
+        // its own tail expression, once any local `const` declarations feeding that tail
+        // are resolved first — a small, block-scoped mirror of `resolve_scope_consts`'s
+        // own fixed point, self-contained here since this function carries no
+        // `ConstScopes` of its own, only the caller's flat `resolve`. Scoped narrowly:
+        // every statement but the last must be a local `const` item (`block_const_exprs`
+        // is what recognises one), and the last must be a semicolon-less tail
+        // expression — a block holding a `let`, a loop, or any other statement shape
+        // stays unresolved rather than guessed at, and so does a labelled block
+        // (`'a: { .. }`), whose tail a `break 'a value;` elsewhere in the block could
+        // also supply.
+        syn::Expr::Block(block_expr) if block_expr.label.is_none() => {
+            let locals = block_const_exprs(&block_expr.block);
+            let (tail, rest) = block_expr.block.stmts.split_last()?;
+            if rest.len() != locals.len() {
+                return None;
+            }
+            let syn::Stmt::Expr(tail_expr, None) = tail else {
+                return None;
+            };
+            let mut resolved: std::collections::HashMap<String, i128> =
+                std::collections::HashMap::new();
+            for _ in 0..locals.len().max(1) {
+                let mut progressed = false;
+                for (name, local_expr) in &locals {
+                    if resolved.contains_key(name) {
+                        continue;
+                    }
+                    let local_resolve = |path: &syn::Path| {
+                        path.get_ident()
+                            .map(ident_name)
+                            .and_then(|candidate| resolved.get(&candidate).copied())
+                            .or_else(|| resolve(path))
+                    };
+                    if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
+                        resolved.insert(name.clone(), value);
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            let block_resolve = |path: &syn::Path| {
+                path.get_ident()
+                    .map(ident_name)
+                    .and_then(|candidate| resolved.get(&candidate).copied())
+                    .or_else(|| resolve(path))
+            };
+            literal_or_const_value(tail_expr, &block_resolve)
+        }
         _ => None,
     }
 }
@@ -2402,6 +2456,34 @@ fn resolve_qself_associated_const(
 ///
 /// [ADR 0010]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md
 const MAX_RANGE_PATTERN_VALUES: usize = 4096;
+
+/// The single field of `elems` that is not itself irrefutable — `_`, or an unguarded
+/// binding naming no known constant, via the exact same test [`is_catchall_pattern`]
+/// applies to a whole arm's own pattern — or `None` when zero or more than one field
+/// qualifies.
+///
+/// A tuple or tuple-struct pattern with any number of fields, all but one of them a
+/// catch-all, is exactly as dense a table row as that one field alone: `rustc` still
+/// indexes on the one field that actually varies and ignores every field that always
+/// matches. Two or more non-catch-all fields is genuinely ambiguous — nothing here says
+/// which one a table would be keyed on — and is refused the same as zero, rather than
+/// guessing.
+fn single_discriminating_field<'a>(
+    elems: impl IntoIterator<Item = &'a syn::Pat>,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<&'a syn::Pat> {
+    let mut found: Option<&syn::Pat> = None;
+    for elem in elems {
+        if is_catchall_pattern(elem, false, resolve) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(elem);
+    }
+    found
+}
 
 fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i128>) -> Vec<i128> {
     match pattern {
@@ -2524,22 +2606,27 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // tuple-struct constructor pattern to the identical indexed table a plain integer
         // pattern gets — but every such arm is a `Pat::TupleStruct`, which fell to the
         // wildcard `_ => Vec::new()` case below regardless of which constructor it named.
-        // Scoped to exactly one field: a multi-field tuple struct has no single value
-        // this scan could point a table row at, and is left unresolved rather than
-        // guessed at.
-        syn::Pat::TupleStruct(tuple_struct) if tuple_struct.elems.len() == 1 => tuple_struct
-            .elems
-            .first()
-            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+        //
+        // Codex's next-round finding: scoping this to exactly one field left a second
+        // shape open — `(0, _)` through `(14, _)` over a `(u8, bool)` scrutinee is
+        // exactly as dense again, since `rustc` still indexes on the one field that
+        // varies and ignores the one that is always a catch-all, but a tuple struct with
+        // *two* fields failed the `elems.len() == 1` guard outright. Generalised to
+        // [`single_discriminating_field`]: any number of fields, exactly one of which is
+        // not itself irrefutable, is exactly as dense as that one field alone — two or
+        // more non-catch-all fields is genuinely ambiguous (which one indexes the table?)
+        // and stays unresolved, the same standing a multi-field pattern already had.
+        syn::Pat::TupleStruct(tuple_struct) => {
+            single_discriminating_field(&tuple_struct.elems, resolve)
+                .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve))
+        }
         // Codex's next-round finding: a plain one-tuple pattern (`(0,)` through `(14,)`)
         // is `Pat::Tuple` rather than `Pat::TupleStruct` — no constructor name, just a
         // single parenthesized, comma-terminated field — and `rustc` lowers a match built
         // from it to the identical indexed table the tuple-struct form gets. The identical
-        // single-field scoping applies for the identical reason: a multi-field tuple's
-        // pattern has no one value to point a table row at.
-        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => tuple
-            .elems
-            .first()
+        // discriminating-field scoping applies for the identical reason, generalised the
+        // same way the tuple-struct case above was.
+        syn::Pat::Tuple(tuple) => single_discriminating_field(&tuple.elems, resolve)
             .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
         // Codex's finding: `0 | 1 => VALUE` covers two values in a single arm, and
         // `rustc` still lowers a match built this way to the identical indexed table a

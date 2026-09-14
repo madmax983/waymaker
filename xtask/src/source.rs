@@ -16906,6 +16906,57 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_with_a_block_valued_constant_initializer_is_reported() {
+        // Codex's thirty-eighth-round finding: `const P0: u8 = { const N: u8 = 0; N };`
+        // is `Expr::Block` — a block used as an expression, most often to give an
+        // initializer a scope of its own — and `literal_or_const_value` never unwrapped
+        // one at all, so a table whose numbered arms are spelled with block-valued
+        // initializers this way read as unresolved on every arm.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = {\n    const N: u8 = 0;\n    N\n};\nconst P1: u8 = \
+             {\n    const N: u8 = 1;\n    N\n};\nconst P2: u8 = {\n    const N: u8 \
+             = 2;\n    N\n};\nconst P3: u8 = {\n    const N: u8 = 3;\n    N\n};\n\n\
+             const fn block_valued_pattern_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_multi_field_tuple_patterns_with_one_discriminating_field_is_reported() {
+        // Codex's thirty-eighth-round finding: `(0, _)` through `(14, _)` over a
+        // `(u8, bool)` scrutinee is exactly as dense as the single-field tuple form —
+        // `rustc` still indexes on the one field that varies and ignores the field
+        // that is always a catch-all — but the previous round's fix required the tuple
+        // to contain exactly one field, so a second, irrelevant field defeated it
+        // entirely.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn two_field_tuple_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn two_field_tuple_table(nibble: (u8, bool)) -> u32 \
+             {\n    match nibble {\n        (0, _) => two_field_tuple_helper(0),\n        \
+             (1, _) => two_field_tuple_helper(1),\n        (2, _) => \
+             two_field_tuple_helper(2),\n        _ => two_field_tuple_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
