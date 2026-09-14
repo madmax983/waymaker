@@ -3207,7 +3207,22 @@ back to a harmless natural sibling; a parenthesized type-alias target (`type R =
 (super::Recovery);`), the alias-declaration side of the parenthesizing round 14 had already
 closed on the self-type side; and a self-type reached through a type-position macro
 invocation, which `declares_item_macro` now flags alongside the item- and
-statement-position macros it already caught.
+statement-position macros it already caught. Round 17 found three more. A local `type`
+alias declared inside the same function body as the `impl` that names it was invisible to
+`collect_type_aliases`, which read only `Item::Mod` even though `collect_trait_implementors`
+had descended into function bodies since round 15 — so `collect_type_aliases` gained the
+same descent, into a free function, an `impl` block's own methods and associated consts, a
+trait's default method bodies and default associated consts, and a `const`/`static`
+initializer, all via a shared `nested_body_items` the trait-implementor scan now uses too,
+closing a `const _: () = { impl Clone for super::Recovery { .. } }; };` reaching neither
+scanner at all. And round 16's own fix had a bug: it put a `cfg_attr`-nested `path` target
+into the *same* flat candidate list as the natural `name.rs`/`name/mod.rs` pair, so a real,
+legal layout — both files present, for two different builds — made the exact-one resolver
+misreport the workspace as `Ambiguous`. `ChildModule::candidates` is now grouped rather than
+flat: each group (the natural pair, or one `cfg_attr` target) resolves independently to at
+most one file, and every group's resolution is scanned rather than requiring exactly one
+across the whole thing — ambiguous only when rustc itself would reject one group, never
+because two different builds legally pick two different files.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four

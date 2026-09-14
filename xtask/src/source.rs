@@ -8611,49 +8611,65 @@ impl From<syn::Error> for ModuleTreeError {
     }
 }
 
-/// The scanned file `child` — declared in `parent_path` — resolves to (issue #59).
+/// The scanned files `child` — declared in `parent_path` — resolves to (issue #59).
 ///
 /// A `#[path]` attribute names exactly the file `rustc` reads: no natural-directory
 /// fallback is offered, because a fallback would scan a file the compiler never reads.
 /// A plain `mod name;` probes `name.rs` then `name/mod.rs`, in `rustc`'s order.
 ///
-/// Both directions fail closed. A declaration with no matching scanned file is a module
-/// the walk cannot see, and a checksum that cannot see a file approves it unseen; a
-/// declaration matching two files is a tree `rustc` itself rejects, and silently taking
-/// the first would scan a tree the compiler never builds.
+/// `child.candidates` is grouped rather than flat (see [`crate::parse::ChildModule`]'s
+/// own doc, and round 17 of Codex review on this change, PR #143): each group is
+/// resolved independently, to at most one scanned file, and every group's resolution is
+/// returned rather than requiring exactly one across the whole thing — a natural file
+/// and a `cfg_attr` target can legally coexist for two different builds, and that is not
+/// the ambiguity a plain `mod name;` matching both `name.rs` and `name/mod.rs` is.
+///
+/// Both directions still fail closed. A `mod` with no matching scanned file in any
+/// group is a module the walk cannot see, and a checksum that cannot see a file approves
+/// it unseen; a single group matching two files is a tree `rustc` itself rejects for
+/// *that* group, and silently taking the first would scan a tree the compiler never
+/// builds.
 ///
 /// # Errors
 ///
-/// Returns [`ModuleTreeError::Missing`] when no candidate is among `sources`, and
-/// [`ModuleTreeError::Ambiguous`] when more than one is.
+/// Returns [`ModuleTreeError::Missing`] when no group has a candidate among `sources`,
+/// and [`ModuleTreeError::Ambiguous`] when some one group has more than one.
 fn resolve_child(
     sources: &[crate::size::LayerSource],
     parent_path: &str,
     child: &crate::parse::ChildModule,
-) -> Result<String, ModuleTreeError> {
-    let present: Vec<&str> = child
-        .candidates
-        .iter()
-        .map(String::as_str)
-        .filter(|candidate| {
-            sources
-                .iter()
-                .any(|source| source.path.replace('\\', "/") == *candidate)
-        })
-        .collect();
-    match present.as_slice() {
-        [single] => Ok((*single).to_owned()),
-        [] => Err(ModuleTreeError::Missing {
-            parent: parent_path.to_owned(),
-            module: child.name.clone(),
-            candidates: child.candidates.clone(),
-        }),
-        _ => Err(ModuleTreeError::Ambiguous {
-            parent: parent_path.to_owned(),
-            module: child.name.clone(),
-            candidates: present.iter().map(ToString::to_string).collect(),
-        }),
+) -> Result<Vec<String>, ModuleTreeError> {
+    let mut resolved = Vec::new();
+    for group in &child.candidates {
+        let present: Vec<&str> = group
+            .iter()
+            .map(String::as_str)
+            .filter(|candidate| {
+                sources
+                    .iter()
+                    .any(|source| source.path.replace('\\', "/") == *candidate)
+            })
+            .collect();
+        match present.as_slice() {
+            [] => {}
+            [single] => resolved.push((*single).to_owned()),
+            _ => {
+                return Err(ModuleTreeError::Ambiguous {
+                    parent: parent_path.to_owned(),
+                    module: child.name.clone(),
+                    candidates: present.iter().map(ToString::to_string).collect(),
+                });
+            }
+        }
     }
+    if resolved.is_empty() {
+        return Err(ModuleTreeError::Missing {
+            parent: parent_path.to_owned(),
+            module: child.name.clone(),
+            candidates: child.candidates.iter().flatten().cloned().collect(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// The module tree rooted at `root`: every file it reaches at production gating through
@@ -8702,8 +8718,9 @@ fn module_tree(
             continue;
         };
         for child in crate::parse::child_modules(&path, contents)? {
-            let resolved = resolve_child(sources, &path, &child)?;
-            stack.push((resolved, test_gated || child.test_gated));
+            for resolved in resolve_child(sources, &path, &child)? {
+                stack.push((resolved, test_gated || child.test_gated));
+            }
         }
     }
     let test_only: BTreeSet<String> = test_reachable
@@ -11243,6 +11260,150 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
             violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_type_alias_declared_inside_a_function_body_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 17: a reached child
+        // file can write `fn install() { type R = super::Recovery; impl Clone for R
+        // { .. } }` — a local type alias declared in the same function body as the
+        // impl that names it. `collect_trait_implementors` has descended into a
+        // function body since round 15 and found the `impl` there, but
+        // `collect_type_aliases` read only `Item::Mod`, so `R` resolved to nothing
+        // and the impl went unmatched even though the alias sits in the very body
+        // the impl scan already reaches.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    type R = super::Recovery;\n",
+                "    impl Clone for R {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_const_initializer_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 17: a reached child
+        // file can write `const _: () = { impl Clone for super::Recovery { .. } };`
+        // — a non-local `impl` inside a `const` initializer's own block, applying
+        // globally the same way one inside a function body does — and neither the
+        // handwritten-impl scan nor the macro scan read `Item::Const` at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "const _: () = {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "};\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_natural_file_and_a_cfg_attr_target_coexisting_is_not_ambiguous() {
+        // Found by Codex review of this change (PR #143), round 17: round 16's fix
+        // put a `cfg_attr`-nested `path` target into the same flat candidate list as
+        // the natural `name.rs`/`name/mod.rs` pair, so a real, legal layout — both
+        // files present, for two different builds — made `resolve_child`'s
+        // exact-one resolver misreport the workspace as `Ambiguous` even when
+        // neither file is `Clone`. Each is now its own resolution group, and a
+        // group resolving is not the ambiguity a single group matching two files
+        // (`rustc`'s own refusal) is.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(feature = \"alt\", path = \"recovery/alt.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/child.rs".to_owned(),
+            contents: "// the natural file: no Clone impl here.\n".to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/alt.rs".to_owned(),
+            contents: "// the cfg_attr target: no Clone impl here either.\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_in_either_branch_of_a_coexisting_cfg_attr_target_is_rejected() {
+        // The other half of the same fix: whichever of the two coexisting files
+        // carries the `Clone` impl, the scan has to catch it, because the branch
+        // this build does not take may be the one a different build does.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(feature = \"alt\", path = \"recovery/alt.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/child.rs".to_owned(),
+            contents: "// the natural file: no Clone impl here.\n".to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/alt.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
             "{}",
             violations[0].detail
         );

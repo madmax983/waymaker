@@ -538,7 +538,19 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
 /// `#[allow(unused_parens)] type R = (super::Recovery);` is legal Rust whose target is
 /// `Type::Paren` rather than `Type::Path`, on the *alias declaration* side of the same
 /// parenthesizing that round 14 had already closed on the self-type side.
-fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
+///
+/// Reached at any nesting depth `nested_body_items` covers too — a function, method, or
+/// default trait-method body; a `const`/`static` initializer; an associated const's
+/// default — not only file scope and inline modules. Round 17 of Codex review on this
+/// change (PR #143) found `fn install() { type R = super::Recovery; impl Clone for R {
+/// .. } }`: `collect_trait_implementors` has descended into a function body since round
+/// 15 and found the `impl` there, but this function read only `Item::Mod`, so `R`
+/// resolved to nothing and the impl went unmatched even though the alias sits in the
+/// very same body as the impl that names it.
+fn collect_type_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    aliases: &mut Vec<UseAlias>,
+) {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
@@ -561,6 +573,13 @@ fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_type_aliases(nested, aliases);
                 }
+            }
+            syn::Item::Fn(_)
+            | syn::Item::Impl(_)
+            | syn::Item::Trait(_)
+            | syn::Item::Const(_)
+            | syn::Item::Static(_) => {
+                collect_type_aliases(nested_body_items(item), aliases);
             }
             _ => {}
         }
@@ -631,68 +650,41 @@ fn collect_trait_implementors<'a>(
                         }
                     }
                 }
-                // An `impl` block's own methods can themselves declare a further
-                // `impl` as a local item (round 15's finding, below) — an `impl`
-                // block is not only a place a trait implementation is checked, it is
-                // also a place a function body starts. `implementation.attrs` is not
-                // re-checked: the loop's own top-of-body `has_cfg_test` already
-                // excluded this arm entirely when the `impl` itself is `#[cfg(test)]`.
-                for member in &implementation.items {
-                    if let syn::ImplItem::Fn(method) = member {
-                        if has_cfg_test(&method.attrs) {
-                            continue;
-                        }
-                        collect_trait_implementors(
-                            block_items(&method.block),
-                            aliases,
-                            trait_name,
-                            implementors,
-                        );
-                    }
-                }
+                // The `impl` block's own methods and associated consts can themselves
+                // declare a further `impl` as a local item (round 15's and round 17's
+                // findings, below) — an `impl` block is not only a place a trait
+                // implementation is checked, it is also a place a body or an
+                // initializer starts. `implementation.attrs` is not re-checked: the
+                // loop's own top-of-body `has_cfg_test` already excluded this arm
+                // entirely when the `impl` itself is `#[cfg(test)]`.
+                collect_trait_implementors(
+                    nested_body_items(item),
+                    aliases,
+                    trait_name,
+                    implementors,
+                );
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_trait_implementors(nested, aliases, trait_name, implementors);
                 }
             }
-            // Round 15 of Codex review on this change (PR #143): a reached child file
-            // can write `#[allow(non_local_definitions)] fn install() { impl Clone for
-            // super::Recovery { .. } }` — an `impl` declared as a local item inside a
-            // function body, which Rust's own `non_local_definitions` lint documents as
-            // never actually scoped to the function, however it looks written down.
-            // The old recursion here read only `syn::Item::Impl` and `syn::Item::Mod` at
-            // whatever level it was called with, never descending into a function,
-            // method, or default trait-method body at all — mirroring
-            // `collect_child_modules`'s three function-like shapes, and reusing
-            // `block_items`, which round 15's *other* finding already teaches to reach
-            // any control-flow nesting depth within one.
-            syn::Item::Fn(function) => {
-                // `function.attrs` is not re-checked, for the reason given above.
+            // Round 15 of Codex review on this change (PR #143) found an `impl`
+            // declared as a local item inside a function body —
+            // `#[allow(non_local_definitions)] fn install() { impl Clone for
+            // super::Recovery { .. } }` — which Rust's own `non_local_definitions`
+            // lint documents as never actually scoped to the function, however it
+            // looks written down; round 17 found the same non-local shape reachable
+            // through a `const`/`static` initializer's own block too, and through a
+            // trait's own default method bodies and default associated consts.
+            // `item.attrs` is not re-checked, for the reason given above.
+            syn::Item::Fn(_) | syn::Item::Const(_) | syn::Item::Static(_) | syn::Item::Trait(_) => {
                 collect_trait_implementors(
-                    block_items(&function.block),
+                    nested_body_items(item),
                     aliases,
                     trait_name,
                     implementors,
                 );
-            }
-            syn::Item::Trait(trait_item) => {
-                // `trait_item.attrs` is not re-checked, for the reason given above.
-                for member in &trait_item.items {
-                    if let syn::TraitItem::Fn(method) = member {
-                        if has_cfg_test(&method.attrs) {
-                            continue;
-                        }
-                        if let Some(block) = &method.default {
-                            collect_trait_implementors(
-                                block_items(block),
-                                aliases,
-                                trait_name,
-                                implementors,
-                            );
-                        }
-                    }
-                }
             }
             _ => {}
         }
@@ -1789,9 +1781,21 @@ pub fn declares_test(contents: &str, name: &str) -> bool {
 pub struct ChildModule {
     /// The declared `mod` name.
     pub name: String,
-    /// Candidate workspace-relative paths for the child's file, in `rustc`'s probe
-    /// order (see [`child_modules`]).
-    pub candidates: Vec<String>,
+    /// Candidate workspace-relative paths for the child's file, grouped by which
+    /// build selects them — in `rustc`'s probe order within a group (see
+    /// [`child_modules`]).
+    ///
+    /// A caller resolves each group independently to at most one scanned file
+    /// (ambiguous only *within* a group — the shape `rustc` itself rejects, such as
+    /// both `name.rs` and `name/mod.rs` present at once) and scans every group's
+    /// resolution, rather than requiring exactly one match across the whole thing.
+    /// Round 17 of Codex review on this change (PR #143) found why the two cannot be
+    /// merged into one flat list: a natural `name.rs` and a `#[cfg_attr(feature =
+    /// "x", path = "alt.rs")] mod name;` target can both legally exist in the source
+    /// tree at once — two different builds pick different files, which `rustc` does
+    /// not consider ambiguous — and a flat candidate list that saw both present would
+    /// misreport a real, legal layout as `ModuleTreeError::Ambiguous`.
+    pub candidates: Vec<Vec<String>>,
     /// Whether the declaration is test-only: it carries exactly `#[cfg(test)]` itself,
     /// or it sits inside an inline module that does.
     pub test_gated: bool,
@@ -1901,23 +1905,100 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
 /// function again on its body; visiting through the item here as well would walk that
 /// same nested body twice.
 fn block_items(block: &syn::Block) -> Vec<&syn::Item> {
-    struct BlockItemVisitor<'ast> {
-        items: Vec<&'ast syn::Item>,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
-        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
-            if let syn::Stmt::Item(item) = stmt {
-                self.items.push(item);
-                return;
-            }
-            syn::visit::visit_stmt(self, stmt);
-        }
-    }
-
     let mut visitor = BlockItemVisitor { items: Vec::new() };
     visitor.visit_block(block);
     visitor.items
+}
+
+/// [`block_items`], starting from an expression rather than a block — a `const` or
+/// `static` initializer, or an associated const's default, is an [`syn::Expr`] rather
+/// than a [`syn::Block`], and round 17 of Codex review on this change (PR #143) found
+/// `const _: () = { impl Clone for super::Recovery { .. } };` reaching none of the
+/// scanners that already recurse into a function or method body: the initializer *can*
+/// itself be exactly such a block, and this is the same walk one layer up.
+fn expr_items(expr: &syn::Expr) -> Vec<&syn::Item> {
+    let mut visitor = BlockItemVisitor { items: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.items
+}
+
+/// The shared walk [`block_items`] and [`expr_items`] each drive: every `Stmt::Item` at
+/// any nesting depth of control flow, stopping at the item itself rather than
+/// descending into it — every caller of either function already recurses into a found
+/// `Item::Fn`/`Item::Impl`/`Item::Trait`/`Item::Const`/`Item::Static` itself, so walking
+/// through the item here too would walk its own body twice.
+struct BlockItemVisitor<'ast> {
+    items: Vec<&'ast syn::Item>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if let syn::Stmt::Item(item) = stmt {
+            self.items.push(item);
+            return;
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+}
+
+/// The items nested inside `item`'s own body or initializer, for every shape besides
+/// `Item::Mod` whose contents can themselves declare further items: a free function's
+/// body; an `impl` block's own methods' bodies and associated consts' initializers; a
+/// trait's default method bodies and default associated consts; and a free `const` or
+/// `static`'s initializer. A member itself `#[cfg(test)]` is skipped rather than
+/// walked — this is the production-only half `collect_trait_implementors` and
+/// `collect_type_aliases` both need, matching every other production-only scan in this
+/// file; a caller that needs to track *test*-gating instead (`collect_child_modules`)
+/// walks these shapes itself rather than through this function.
+///
+/// `Item::Mod` is not one of these shapes: its content is a list of further items
+/// directly, with no body or initializer to walk into, and a caller recurses into it
+/// with its own context (a child directory, in `collect_child_modules`'s case) that
+/// this function has no business choosing.
+///
+/// Round 17 of Codex review on this change (PR #143) found two gaps this closes. A
+/// local `type` alias declared inside a function body, next to a handwritten `impl`
+/// that names it, was invisible to `collect_type_aliases`, which read only `Item::Mod`
+/// — so `fn install() { type R = super::Recovery; impl Clone for R { .. } }` resolved
+/// `R` to nothing and the impl went unmatched even though `collect_trait_implementors`
+/// (since round 15) already descends into the very same function body to find the
+/// `impl` itself. And `const _: () = { impl Clone for super::Recovery { .. } }; };` —
+/// a non-local `impl` inside a `const` initializer's own block — reached neither
+/// scanner at all, because neither read `Item::Const` or `Item::Static`.
+fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
+    match item {
+        syn::Item::Fn(function) => block_items(&function.block),
+        syn::Item::Impl(implementation) => implementation
+            .items
+            .iter()
+            .flat_map(|member| match member {
+                syn::ImplItem::Fn(method) if !has_cfg_test(&method.attrs) => {
+                    block_items(&method.block)
+                }
+                syn::ImplItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
+                    expr_items(&constant.expr)
+                }
+                _ => Vec::new(),
+            })
+            .collect(),
+        syn::Item::Trait(trait_item) => trait_item
+            .items
+            .iter()
+            .flat_map(|member| match member {
+                syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => {
+                    method.default.as_ref().map_or_else(Vec::new, block_items)
+                }
+                syn::TraitItem::Const(constant) if !has_cfg_test(&constant.attrs) => constant
+                    .default
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, expr)| expr_items(expr)),
+                _ => Vec::new(),
+            })
+            .collect(),
+        syn::Item::Const(constant) => expr_items(&constant.expr),
+        syn::Item::Static(statik) => expr_items(&statik.expr),
+        _ => Vec::new(),
+    }
 }
 
 /// The out-of-line `mod`s in `items`, appending to `found` in source order.
@@ -1961,21 +2042,26 @@ fn collect_child_modules<'a>(
                             // module does not evaluate a `cfg`'s condition, so every
                             // build's candidate — the natural pair *and* every path a
                             // `cfg_attr` could select, at any nesting depth — is
-                            // scanned.
-                            let mut candidates = vec![
+                            // scanned. Each is its own group (see `ChildModule`'s own
+                            // doc): round 17 found that merging them into one flat
+                            // list made a real, legal layout — the natural file *and*
+                            // the `cfg_attr` target both present, for two different
+                            // builds — misreport as `Ambiguous`.
+                            let mut groups = vec![vec![
                                 format!("{child_dir}{name}.rs"),
                                 format!("{child_dir}{name}/mod.rs"),
-                            ];
+                            ]];
                             for attr in &module.attrs {
                                 for path in cfg_attr_path_values(attr) {
-                                    candidates.push(normalize_path(&format!("{parent_dir}{path}")));
+                                    groups
+                                        .push(vec![normalize_path(&format!("{parent_dir}{path}"))]);
                                 }
                             }
-                            candidates
+                            groups
                         },
                         // An unconditional `#[path = "..."]`: `rustc` consults
                         // exactly this one path (see above), so no fallback.
-                        |path| vec![normalize_path(&format!("{parent_dir}{path}"))],
+                        |path| vec![vec![normalize_path(&format!("{parent_dir}{path}"))]],
                     );
                     found.push(ChildModule {
                         name,
@@ -2242,6 +2328,7 @@ mod raw_identifier_tests {
             modules[0]
                 .candidates
                 .iter()
+                .flatten()
                 .any(|candidate| candidate.ends_with("type.rs")),
             "{:?}",
             modules[0].candidates
