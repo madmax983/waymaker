@@ -2698,13 +2698,13 @@ fn block_let_statement_count(block: &syn::Block) -> usize {
         .count()
 }
 
-/// `pat`'s own bound name and the value `expr` initializes it to, unwrapping a type
-/// ascription (`Pat::Type`), an `@` sub-pattern (`Pat::Ident` with `subpat: Some(..)`) and a
-/// one-element tuple destructure (`Pat::Tuple`) the same way [`literal_or_const_value`]'s own
-/// `Expr::Tuple` case and [`match_arm_matches_constant`]'s own `Pat::Tuple` case already do
-/// for a scrutinee and a pattern — `None` for anything else, `_` and any destructuring wider
-/// than one element included, since neither binds a single name this scan could later
-/// resolve a reference to.
+/// Every name `pat` binds, each paired with the value `expr` initializes it to — unwrapping
+/// a type ascription (`Pat::Type`), an `@` sub-pattern (`Pat::Ident` with `subpat: Some(..)`)
+/// and a tuple destructure (`Pat::Tuple`) of any arity, element-wise, the same way
+/// [`literal_or_const_value`]'s own `Expr::Tuple` case and [`match_arm_matches_constant`]'s
+/// own `Pat::Tuple` case already do for a scrutinee and a pattern — no bindings at all for
+/// `_` or an unrecognised shape, since neither binds a name this scan could later resolve a
+/// reference to.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let (x,) = (0u8,); x };` names a `let` whose
 /// pattern is `Pat::Tuple` rather than `Pat::Ident`, which the version of this function
@@ -2743,6 +2743,18 @@ fn block_let_statement_count(block: &syn::Block) -> usize {
 /// instead of keeping one entry per statement, and [`block_let_statement_count`] is the
 /// statement-counting half [`evaluate_block`]'s own `rest.len()` check now reads instead of
 /// counting binding names, since one statement can bind more than one name.
+///
+/// Codex's next-round finding: `let (x, _) = (0u8, ()); x;` names a *two*-element tuple
+/// pattern over a two-element tuple initializer, which the version of this function scoped
+/// to exactly one element fell through to `_ => Vec::new()` for — the identical shape of
+/// gap the one-element case itself closed, one arity wider. Generalised to any arity: a
+/// tuple pattern and a tuple expression of the identical length are paired element-wise,
+/// each pair recursed through the identical way a one-element tuple's own single pair
+/// already was, and every element's own bindings are flattened together — `_` contributing
+/// none of its own, the same way it already does outside a tuple. An arity mismatch, or an
+/// initializer that is not itself a literal tuple expression, is declined rather than
+/// guessed at, since this scan folds no other tuple shape into a value it could hand back
+/// here.
 fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::Expr)> {
     match pat {
         syn::Pat::Type(pat_type) => destructured_binding(&pat_type.pat, expr),
@@ -2753,17 +2765,19 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
             }
             bindings
         }
-        syn::Pat::Tuple(pat_tuple) if pat_tuple.elems.len() == 1 => {
+        syn::Pat::Tuple(pat_tuple) => {
             let syn::Expr::Tuple(expr_tuple) = strip_parens(expr) else {
                 return Vec::new();
             };
-            if expr_tuple.elems.len() != 1 {
+            if pat_tuple.elems.len() != expr_tuple.elems.len() {
                 return Vec::new();
             }
-            match (pat_tuple.elems.first(), expr_tuple.elems.first()) {
-                (Some(inner_pat), Some(inner_expr)) => destructured_binding(inner_pat, inner_expr),
-                _ => Vec::new(),
-            }
+            pat_tuple
+                .elems
+                .iter()
+                .zip(expr_tuple.elems.iter())
+                .flat_map(|(inner_pat, inner_expr)| destructured_binding(inner_pat, inner_expr))
+                .collect()
         }
         _ => Vec::new(),
     }

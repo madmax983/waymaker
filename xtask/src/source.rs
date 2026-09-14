@@ -9406,26 +9406,26 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
                     // arm 0's own guard and finding it false is exactly how execution
                     // *reaches* arm 1, so the numbered arms after it still lower to the
                     // identical indexed table they would if arm 0 were not written at
-                    // all, and a real device runs it every time `flag` is false. Tried at
-                    // every possible start rather than only at position 0 — a numbered
-                    // arm can itself carry an unresolvable guard, so a real table can
-                    // begin after more than one such barrier — and `suffix.len()` only
-                    // shrinks as `start` grows, so the moment a suffix (plus the
-                    // wildcard) is too small to be worth flagging, every later start is
-                    // too small as well.
-                    for start in 0..numbered.len() {
-                        let Some(suffix) = numbered.get(start..) else {
-                            break;
-                        };
-                        if suffix.len().saturating_add(1) < MINIMUM_DENSE_TABLE_ARMS {
-                            break;
-                        }
-                        if missing_value(suffix).is_some() {
-                            return true;
-                        }
-                        if compact_window_with_gaps(suffix) {
-                            return true;
-                        }
+                    // all, and a real device runs it every time `flag` is false.
+                    //
+                    // Codex's next-round finding: trying only a *suffix* at every start
+                    // still missed `0 => .., 1 => .., .., 14 => .., _ if flag => .., _ =>
+                    // ..` — the dense run here is a *prefix* of `numbered`, ending before
+                    // the barrier arm rather than beginning after one, and every suffix
+                    // this used to try still carried that barrier arm along with it
+                    // (it sits at the very end of `numbered`, so no suffix ever excludes
+                    // it short of the empty one). `rustc` does not need the barrier to
+                    // have been reached first either way: `0` through `14` are literal
+                    // patterns tried by value before any guard is evaluated at all, so the
+                    // dense run they form is a real table candidate on its own, wherever a
+                    // barrier arm sits relative to it. Tried at every contiguous sub-slice
+                    // now, not only every suffix, which subsumes the suffix search above
+                    // as the case where the sub-slice happens to run to the end.
+                    let min_len = MINIMUM_DENSE_TABLE_ARMS.saturating_sub(1);
+                    if any_dense_sub_slice(numbered, min_len, |slice| {
+                        missing_value(slice).is_some() || compact_window_with_gaps(slice)
+                    }) {
+                        return true;
                     }
                 }
             }
@@ -9442,6 +9442,40 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
     fully_dense_arm_patterns(&found.arms)
 }
 
+/// Whether any contiguous sub-slice of `arms` at least `min_len` elements wide satisfies
+/// `check` — the sub-slice search both [`has_dense_arm_patterns`]'s own numbered scan and
+/// [`fully_dense_arm_patterns`] need, factored out so the nested search is written once.
+/// Tried at every `(start, end)` pair rather than only every suffix (`end` fixed at the
+/// slice's own length): a dense run can end *before* a barrier arm — one whose own pattern
+/// carries no values, the identical shape an unresolvable guard produces — just as much as
+/// it can begin after one, and the two are independent: a barrier can sit on either side of
+/// the run, or on both. `start`'s own upper bound shrinks as `min_len` cannot fit before
+/// the slice's own end, so the search stops rather than trying a `start` no `end` could
+/// ever reach `min_len` from.
+fn any_dense_sub_slice(
+    arms: &[crate::parse::FoundArm],
+    min_len: usize,
+    mut check: impl FnMut(&[crate::parse::FoundArm]) -> bool,
+) -> bool {
+    for start in 0..arms.len() {
+        let Some(first_end) = start.checked_add(min_len) else {
+            break;
+        };
+        if first_end > arms.len() {
+            break;
+        }
+        for end in first_end..=arms.len() {
+            let Some(slice) = arms.get(start..end) else {
+                continue;
+            };
+            if check(slice) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether every one of `arms`' patterns resolves, together covering a run of
 /// consecutive integers with no gap at all — the wildcard-free twin of the single-gap
 /// window [`missing_value`] looks for, for a match that names every value explicitly
@@ -9452,20 +9486,14 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
 /// with no values, and the single top-to-bottom pass below used to bail at the first one
 /// regardless of where it sat, even though every arm after it can still be the dense,
 /// gap-free run `rustc` compiles into a table once that arm's own guard is false. Tried
-/// at every possible start the identical way, for the identical reason.
+/// at every contiguous sub-slice now, through [`any_dense_sub_slice`], the identical way
+/// and for the identical reason `has_dense_arm_patterns`'s own scan is.
 fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
-    for start in 0..arms.len() {
-        let Some(suffix) = arms.get(start..) else {
-            break;
-        };
-        if suffix.len() < MINIMUM_DENSE_TABLE_ARMS {
-            break;
-        }
-        if fully_dense_arm_patterns_from(suffix) {
-            return true;
-        }
-    }
-    false
+    any_dense_sub_slice(
+        arms,
+        MINIMUM_DENSE_TABLE_ARMS,
+        fully_dense_arm_patterns_from,
+    )
 }
 
 /// [`fully_dense_arm_patterns`]'s own single-pass check over exactly the slice it is
@@ -21272,6 +21300,66 @@ mod deferred_answer_pins {
              const P1: u8 = match (0u8, 2u8) { (0, 2) => 1, _ => 101 };\n    \
              const P2: u8 = match (0u8, 3u8) { (0, 3) => 2, _ => 102 };\n    \
              const P3: u8 = match (0u8, 4u8) { (0, 4) => 3, _ => 103 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_prefix_ending_before_a_trailing_unresolved_guarded_arm_is_reported() {
+        // Codex's next-round finding: the dense-suffix fix tried only a *suffix* at every
+        // start, which still missed `0 => .., 1 => .., 2 => .., 3 => .., _ if flag => ..,
+        // _ => ..` — the dense run here is a *prefix* of the numbered arms, ending before
+        // the barrier arm rather than beginning after one, and the barrier sits at the very
+        // end of the numbered prefix, so every suffix that used to be tried still carried it
+        // along (no suffix short of the empty one excludes an arm at the very end). `rustc`
+        // does not need the barrier reached first either way: `0` through `3` are literal
+        // patterns tried by value before any guard is evaluated at all, so the dense run
+        // they form is a real table candidate on its own regardless of what follows it.
+        // `has_dense_arm_patterns` now tries every contiguous sub-slice, not only every
+        // suffix, so a dense run ending before a barrier is found the same way one
+        // beginning after one already is.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_prefix_before_trailing_guard_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        3 => 3,\n        _ if flag => 999,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_multi_element_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `let (x, _) = (0u8, ()); x` names a *two*-element
+        // tuple pattern over a two-element tuple initializer, which `destructured_binding`'s
+        // own tuple case — scoped to exactly one element — fell through to `_ =>
+        // Vec::new()` for, the identical shape of gap the one-element case itself closed,
+        // one arity wider: the whole statement went uncounted, and the block it sat in read
+        // as unresolved. `destructured_binding`'s tuple case is now generalised to any
+        // arity: a tuple pattern and a tuple expression of the identical length are paired
+        // element-wise, each pair recursed through the identical way a one-element tuple's
+        // own single pair already was, and `_` contributes none of its own bindings the
+        // same way it already does outside a tuple.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_element_tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let (x, _) = (0u8, ()); x };\n    \
+             const P1: u8 = { let (x, _) = (1u8, ()); x };\n    \
+             const P2: u8 = { let (x, _) = (2u8, ()); x };\n    \
+             const P3: u8 = { let (x, _) = (3u8, ()); x };\n    \
              match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
              P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
         );
