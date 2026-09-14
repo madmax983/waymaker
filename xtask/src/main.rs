@@ -242,7 +242,19 @@ fn run_size(args: &[String]) -> ExitCode {
 
     print!("{}", baseline_diff(&root, &options, &report));
 
-    report.shortfall_report().map_or_else(
+    // Issue #115: the row *set* is not taken at its word either, gated or not — a
+    // per-feature row's statics count against `runtime_ram_total`'s one ceiling, so a
+    // document missing one is a wrong composition rather than a smaller one.
+    let mut shortfalls = report.shortfalls();
+    match xtask::size::completeness_shortfalls(&root, &report) {
+        Ok(missing) => shortfalls.extend(missing),
+        Err(error) => {
+            eprintln!("xtask: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    xtask::size::render_shortfall_report(&shortfalls).map_or_else(
         || {
             println!("size: ok");
             ExitCode::SUCCESS
