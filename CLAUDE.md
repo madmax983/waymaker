@@ -1141,9 +1141,12 @@ Stated so that nobody mistakes silence for coverage:
   comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
   them. Parsing is not name resolution: glob imports are not followed, macros are not
   expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Alias
-  resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
-  within one file (issue #109), but an alias declared in one module and reached through a
-  `use` in another is invisible, the same limit `capacity-reserve`, `recovery-surface` and
+  resolution also stops at the file it reads and at the module that declares it: a chain of
+  `use .. as ..` renames resolves within one module (issue #109), a nested module does not
+  inherit an outer one's aliases, `self::` in a chain resolves within that same module,
+  `crate::` does not — closing it would need the file root's aliases threaded into every
+  nested scope — and an alias declared in one module and reached through a `use` in another
+  *file* is invisible outright, the same limit `capacity-reserve`, `recovery-surface` and
   `storage-contract` each record for the one file they pin. Markdown parsing does not check
   that a rendered claim is true, only that it is rendered prose rather than a code fence.
   The scanners that stayed textual are the ones whose rule is

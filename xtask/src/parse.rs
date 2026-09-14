@@ -344,13 +344,19 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module keeps its own aliases only (issue #109 review):
-            // swap in scope, walk it, then restore the enclosing scope.
-            let Some((_, items)) = node.content.as_ref() else {
-                return;
-            };
-            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            // swap in scope, walk it, then restore the enclosing scope. An
+            // out-of-line declaration (`mod x;`) has no body to re-scope, but
+            // its own name and attributes must still be visited the default
+            // way — an early return here had skipped them (Codex review,
+            // PR #160), hiding a banned identifier spelled as a module name.
+            let outer = node
+                .content
+                .as_ref()
+                .map(|(_, items)| core::mem::replace(&mut self.aliases, own_aliases(items)));
             syn::visit::visit_item_mod(self, node);
-            self.aliases = outer;
+            if let Some(outer) = outer {
+                self.aliases = outer;
+            }
         }
 
         fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -385,6 +391,11 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     // per alias in the file. This bound stops a crafted cycle
     // (`use a as b; use b as a;`) from looping forever.
     for _ in 0..aliases.len() {
+        // `self::X` names X in this same scope (Codex review, PR #160): a
+        // chain may cross one, e.g. `pub use self::Pollable as Awaitable;`.
+        // Drop it before the lookup below, or `self` is searched for as an
+        // alias, finds none, and the chain stops one hop short.
+        strip_leading_self(&mut segments);
         let Some(first) = segments.first() else {
             break;
         };
@@ -395,7 +406,19 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
         resolved.extend(segments.drain(1..));
         segments = resolved;
     }
+    strip_leading_self(&mut segments);
     segments
+}
+
+/// Drops a leading `self` segment: `self::X` names `X` in the scope that wrote
+/// it, so it resolves the same way `X` alone would (Codex review, PR #160).
+/// `crate`-qualified hops are a residual limit: `crate::X` names `X` at the
+/// file root, which a nested scope's own aliases cannot see, and resolving it
+/// would need the root's aliases threaded down to every scope.
+fn strip_leading_self(segments: &mut Vec<String>) {
+    if segments.first().is_some_and(|first| first == "self") {
+        segments.remove(0);
+    }
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
@@ -627,13 +650,19 @@ pub fn struct_literal_counts(
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module keeps its own aliases only (issue #109 review):
-            // swap in scope, walk it, then restore the enclosing scope.
-            let Some((_, items)) = node.content.as_ref() else {
-                return;
-            };
-            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            // swap in scope, walk it, then restore the enclosing scope. An
+            // out-of-line declaration (`mod x;`) has no body to re-scope, but
+            // its own name and attributes must still be visited the default
+            // way — an early return here had skipped them (Codex review,
+            // PR #160), hiding a banned identifier spelled as a module name.
+            let outer = node
+                .content
+                .as_ref()
+                .map(|(_, items)| core::mem::replace(&mut self.aliases, own_aliases(items)));
             syn::visit::visit_item_mod(self, node);
-            self.aliases = outer;
+            if let Some(outer) = outer {
+                self.aliases = outer;
+            }
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
@@ -1025,13 +1054,19 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module keeps its own aliases only (issue #109 review):
-            // swap in scope, walk it, then restore the enclosing scope.
-            let Some((_, items)) = node.content.as_ref() else {
-                return;
-            };
-            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            // swap in scope, walk it, then restore the enclosing scope. An
+            // out-of-line declaration (`mod x;`) has no body to re-scope, but
+            // its own name and attributes must still be visited the default
+            // way — an early return here had skipped them (Codex review,
+            // PR #160), hiding a banned identifier spelled as a module name.
+            let outer = node
+                .content
+                .as_ref()
+                .map(|(_, items)| core::mem::replace(&mut self.aliases, own_aliases(items)));
             syn::visit::visit_item_mod(self, node);
-            self.aliases = outer;
+            if let Some(outer) = outer {
+                self.aliases = outer;
+            }
         }
 
         fn visit_ident(&mut self, node: &'ast syn::Ident) {
@@ -1682,5 +1717,50 @@ mod alias_scope_tests {
             paths.iter().any(|path| path.segments == ["Marker", "x"]),
             "module b's own, unaliased path went missing: {paths:?}"
         );
+    }
+
+    #[test]
+    fn a_self_qualified_hop_still_resolves_the_chain() {
+        // Codex review of the scoping fix (PR #160): `pub use self::Pollable
+        // as Awaitable;` chains through a `self::`-qualified target. The
+        // first substitution produces `self::Pollable`; without stripping
+        // `self`, the next lookup searches for an alias named `self`, finds
+        // none, and the chain stops one hop short of `Future`.
+        let code = "pub use core::future::Future as Pollable;\n\
+             pub use self::Pollable as Awaitable;\n\
+             struct Sneaky;\n\
+             impl Awaitable for Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_directly_self_qualified_path_resolves_to_its_full_name() {
+        // The same stripping must apply to a path written with `self::`
+        // directly, not only to an alias target that produced one: `self`
+        // names this scope, so `self::Marker` and `Marker` resolve alike.
+        // `future_trait_implementors` cannot tell them apart — it reads only
+        // the last segment, which `self` never is — so this checks the full
+        // resolved path instead.
+        let code = "use core::future::Future as Marker;\nfn f() { let _ = self::Marker::x; }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future", "x"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_line_module_declaration_still_names_its_own_identifier() {
+        // Codex review of the scoping fix (PR #160): `mod Step;` (no inline
+        // body) has nothing to re-scope, but the declaration's own name must
+        // still be visited the ordinary way. An early return on no content
+        // had skipped it, so `check_kernel_boundary`'s
+        // `names_word("Step")` would miss a banned identifier spelled as an
+        // out-of-line module name.
+        let uses = name_uses("#[allow(non_snake_case)]\nmod Step;\n").expect("the fixture parses");
+        assert!(uses.names_word("Step"), "{uses:?}");
     }
 }
