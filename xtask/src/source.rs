@@ -10624,6 +10624,27 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_identifier_derive_attribute_is_still_rejected() {
+        // Found while merging main's raw-identifier fix (issue #90, PR #148): that fix
+        // patched `path_attr_value`'s own `#[path]` check to strip a raw marker before
+        // comparing, but `attr_introduces_cfg`, `meta_introduces_cfg`, and
+        // `collect_derive_names_from_meta` — all written for this change — still used
+        // `syn::Path::is_ident` directly, which keeps the raw marker. `#[r#derive(Clone)]`
+        // is legal Rust naming the same `derive` macro a plain `#[derive(Clone)]` would,
+        // and the unpatched check would have read it as an attribute named something
+        // other than `"derive"` and skipped it.
+        let raw_attribute_name =
+            recovery_source_with_struct("#[r#derive(Clone, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&raw_attribute_name);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_clone_hidden_behind_a_duplicate_conditional_alias_is_still_rejected() {
         // Found by Codex review of this change (PR #143): mutually exclusive `cfg`s can
         // validly bind one local name to two different targets —

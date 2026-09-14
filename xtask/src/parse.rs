@@ -426,11 +426,10 @@ pub const UNRESOLVED_DERIVE: &str = "<unresolved derive>";
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     const MAX_CANDIDATES: usize = 64;
 
-    // `.unraw()`: see `resolve_segments`.
     let segments: Vec<String> = path
         .segments
         .iter()
-        .map(|segment| segment.ident.unraw().to_string())
+        .map(|segment| ident_name(&segment.ident))
         .collect();
     if path.leading_colon.is_some() {
         return segments.last().cloned().into_iter().collect();
@@ -543,13 +542,12 @@ fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
             syn::Item::Type(type_item) => {
                 if let syn::Type::Path(target) = type_item.ty.as_ref() {
                     aliases.push(UseAlias {
-                        local: type_item.ident.unraw().to_string(),
-                        // `.unraw()`: see `resolve_segments`.
+                        local: ident_name(&type_item.ident),
                         target: target
                             .path
                             .segments
                             .iter()
-                            .map(|segment| segment.ident.unraw().to_string())
+                            .map(|segment| ident_name(&segment.ident))
                             .collect(),
                     });
                 }
@@ -710,8 +708,8 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
             continue;
         }
         if let syn::Item::Struct(found) = item {
-            // `.unraw()`: `pub struct r#Recovery` declares the same item `Recovery` would.
-            if found.ident.unraw() == name {
+            // `ident_is`: `pub struct r#Recovery` declares the same item `Recovery` would.
+            if ident_is(&found.ident, name) {
                 declared = true;
                 for attr in &found.attrs {
                     collect_derive_names_from_meta(&attr.meta, &aliases, &mut derives);
@@ -810,10 +808,10 @@ fn has_any_cfg(attrs: &[syn::Attribute]) -> bool {
 /// depth. Unreadable `cfg_attr` arguments answer `true`: an attribute this scan cannot
 /// read is not evidence of an unconditional declaration.
 fn attr_introduces_cfg(attr: &syn::Attribute) -> bool {
-    if attr.path().is_ident("cfg") {
+    if path_is_ident(attr.path(), "cfg") {
         return true;
     }
-    if !attr.path().is_ident("cfg_attr") {
+    if !path_is_ident(attr.path(), "cfg_attr") {
         return false;
     }
     let Ok(metas) = attr.parse_args_with(
@@ -830,10 +828,10 @@ fn meta_introduces_cfg(meta: &syn::Meta) -> bool {
     let syn::Meta::List(list) = meta else {
         return false;
     };
-    if list.path.is_ident("cfg") {
+    if path_is_ident(&list.path, "cfg") {
         return true;
     }
-    if !list.path.is_ident("cfg_attr") {
+    if !path_is_ident(&list.path, "cfg_attr") {
         return false;
     }
     let Ok(nested) = list.parse_args_with(
@@ -857,7 +855,7 @@ fn collect_derive_names_from_meta(
     let syn::Meta::List(list) = meta else {
         return;
     };
-    if list.path.is_ident("derive") {
+    if path_is_ident(&list.path, "derive") {
         if let Ok(paths) = list.parse_args_with(
             syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
         ) {
@@ -865,7 +863,7 @@ fn collect_derive_names_from_meta(
         }
         return;
     }
-    if !list.path.is_ident("cfg_attr") {
+    if !path_is_ident(&list.path, "cfg_attr") {
         return;
     }
     // `cfg_attr(condition, attr, attr, ..)`: the first argument is the condition and
