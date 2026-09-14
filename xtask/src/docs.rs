@@ -7494,6 +7494,111 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_id_split_by_a_block_event_br_tag_does_not_count() {
+        // Codex, pull request #138, round 42, finding 1: `<br>` reaches
+        // `visible_html_ranges` through the independent `Markup` branch when it sits
+        // inside a raw HTML *block* — `<div>head<br>line</div>`, all one
+        // `Event::Html` line — rather than through `Event::InlineHtml`'s own,
+        // already-fixed handling (round 37). `is_html_block_tag` correctly does not
+        // classify `<br>` as block-level (it is `CommonMark` §4.6 type 6's own
+        // omission, not a bug), so stripping its markup left nothing between the
+        // text on either side, fusing `head` and `line` into the literal contiguous
+        // run `headline` a browser never renders that way: `<br>` forces a line
+        // break wherever it appears, block context or not. The `Markup` branch now
+        // also checks `is_line_break_tag`, inserting the same
+        // `VisibleHtmlSpan::Break` a block tag's own markup already does.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        let (first_half, second_half) = second.id.split_at(second.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{first_half}<br>{second_half} {}</div>\n",
+                    second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision id split by a block-event <br> tag still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_tag_whose_quoted_attribute_itself_crosses_a_line_still_counts() {
+        // Codex, pull request #138, round 42, finding 2: the pending-tag scan
+        // introduced in round 41 always started a fresh line's resumed search from
+        // `quote: None`, discarding whatever quote state the *first* line's own scan
+        // had actually reached. `<div title="first\nsecond">decision-id
+        // headline</div>` is a legal tag whose quoted attribute value itself spans
+        // the line break `pulldown-cmark` splits the block on, so the real close
+        // quote on the second line — `second">` — was read as a fresh *opening*
+        // quote instead, and the tag's own real `>` right after it was then read as
+        // still inside a (nonexistent) quoted value. The tag never resolved, and
+        // the visible decision text after it was discarded along with it, all the
+        // way to end of document. The quote state reached at the end of the first
+        // line's own scan is now captured and carried into `PendingTag`, the same
+        // way its name and closing/opening kind already are.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div title=\"first\nsecond\">{} {}</div>\n",
+                    third.id, third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == third.id),
+            "a decision after a tag whose quoted attribute itself crosses a line was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_by_a_div_carrying_the_hidden_attribute_does_not_count() {
+        // Codex, pull request #138, round 42, finding 3: `visible_html_ranges` only
+        // suppressed the body of the three fixed non-rendering elements
+        // (`<script>`, `<style>`, `<template>`); an *arbitrary* element carrying the
+        // standard HTML `hidden` boolean attribute — `<div hidden>decision-id
+        // headline</div>` — is just as invisible to a browser, and everything
+        // inside it, but only the `<div>` tag's own markup was excluded, leaving its
+        // real, hidden text content exposed as ordinary visible prose. A new
+        // `find_any_hidden_opening_tag` recognizes any non-void opening tag carrying
+        // `hidden` and tracks it on the same non-rendering stack the three fixed
+        // elements already use — widened from `Vec<&'static str>` to `Vec<String>`
+        // to hold an arbitrary name — closed by its own first matching close tag.
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden>{} {}</div>\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision id hidden by a div carrying the hidden attribute still \
+             counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn the_settled_decision_ids_are_unique() {
         let mut ids: Vec<&str> = SETTLED_DECISIONS.iter().map(|d| d.id).collect();
         let count = ids.len();
