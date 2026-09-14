@@ -427,20 +427,22 @@ fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
 
 /// Consumes leading `self`/`super` segments, moving `scope` — an index
 /// into the alias stack — to match: `self` leaves it where it is, and
-/// `super` moves it one level toward the file this scan read (never past
-/// it). A leading `crate` is left in place rather than consumed: this
-/// scan never has the crate root's aliases to jump to (see
-/// [`resolve_segments`]), so a `crate`-qualified path is left unresolved
-/// rather than guessed against the wrong scope.
+/// `super` moves it one level toward the file this scan read. A `super`
+/// consumed while `scope` is already at that file's own top level (index
+/// 0) would need to step *above* the file — the module that declared it
+/// as `mod child;`, which this per-file scan never sees — so it is left
+/// in place instead, the same reason a leading `crate` is (Codex review,
+/// PR #160, round 7: `scope`'s floor at 0 had silently stood in for that
+/// unknown outer module rather than refusing to answer).
 fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
     loop {
         match segments.first().map(String::as_str) {
             Some("self") => {
                 segments.remove(0);
             }
-            Some("super") => {
+            Some("super") if *scope > 0 => {
                 segments.remove(0);
-                *scope = scope.saturating_sub(1);
+                *scope -= 1;
             }
             _ => break,
         }
@@ -1836,6 +1838,26 @@ mod alias_scope_tests {
             !implementors.contains(&"Innocent".to_owned()),
             "a `crate`-qualified path resolved through this file's own aliases, as though this \
              file were necessarily the crate root: {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_top_level_super_does_not_falsely_resolve_through_this_files_own_top() {
+        // Codex review, round 7: `super` at the very top of the scanned
+        // file (no enclosing `mod {}` written in this file) steps one
+        // level above the file's own top-level scope — the module that
+        // declared this file as `mod child;`, which this per-file scan
+        // never sees, the same reason `crate` is left unresolved.
+        // `saturating_sub` had clamped that step at scope 0 instead,
+        // silently resolving `super::X` against this file's own aliases
+        // as though scope 0 stood in for that unknown outer module.
+        let code = "use core::future::Future as Pollable;\nstruct Innocent;\nimpl super::Pollable \
+             for Innocent {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "a top-level `super`-qualified path resolved through this file's own aliases, as \
+             though scope 0 were the module above this file: {implementors:?}"
         );
     }
 

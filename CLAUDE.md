@@ -1145,14 +1145,20 @@ Stated so that nobody mistakes silence for coverage:
   within one module (issue #109), a nested module does not inherit an outer one's aliases,
   and `self::` and `super::` reach the scope each names explicitly rather than by
   inheritance — a stack of each module's own aliases from the file this scan read down makes
-  both well-defined regardless of nesting depth. `crate::` does not: this scan sees one file
-  and never the crate, so it has no way to tell whether that file is really the crate root —
-  treating its own top level as `crate`'s target was tried (Codex review, PR #160, round 5)
-  and reverted (round 6), because it is right only for the one file that happens to be
-  `lib.rs` and a guess everywhere else, catching an unrelated `impl crate::X for Y` as a
-  false fifth future in one file and staying silent on a real one reached through a named
-  submodule (`crate::traits::X`) in another — the same shape of over- vs under-matching
-  namespace ambiguity settles below, decided the same way. An alias declared in one module
+  both well-defined *within that file's own nesting*. `crate::` is not well-defined at all:
+  this scan sees one file and never the crate, so it has no way to tell whether that file is
+  really the crate root — treating its own top level as `crate`'s target was tried (Codex
+  review, PR #160, round 5) and reverted (round 6), because it is right only for the one file
+  that happens to be `lib.rs` and a guess everywhere else, catching an unrelated
+  `impl crate::X for Y` as a false fifth future in one file and staying silent on a real one
+  reached through a named submodule (`crate::traits::X`) in another — the same shape of
+  over- vs under-matching namespace ambiguity settles below, decided the same way. `super::`
+  has the identical edge once it is asked to step *above* the file's own top level — a
+  `super::X` written with no enclosing `mod {}` inside the scanned file names the module that
+  declared that file as `mod child;`, which this scan equally never sees, and the stack's own
+  floor at index 0 had silently stood in for it (round 7) exactly the way index 0 had stood
+  in for the crate root; it is left unresolved the same way `crate::` is, rather than guessed
+  against the file's own aliases. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
   they pin. Nor does
