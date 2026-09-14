@@ -114,6 +114,27 @@ unwraps `Type::Paren`, and `Type::Group` beside it for the same reason (a macro'
 grouping is the same shape), recursively — `((CheckedDispatch))` reaches the same target in
 two hops.
 
+**A seventh round found a gap in a different shape: rewriting a field in place, rather than
+building a fresh value.** `CheckedDispatch`'s, `DurableIntent`'s and `Dispatchable`'s fields
+are private to the *module* `effect.rs` declares, not to the type — Rust has no finer
+grain — so any sibling function in that module can already write `dispatch.bytes = other;`
+on an otherwise legitimate value, with no struct literal anywhere for a construction pin to
+count. A `&mut` reference taken to the field is the same capability under a second spelling:
+`core::mem::swap`, `core::mem::replace`, or passing the reference to an arbitrary
+`&mut`-taking function all rewrite the field without an `=` in the source at all.
+`source::EFFECT_PROOF_FIELDS` names the four fields this matters for — `id` and `request`
+from `DurableIntent`, `intent` from `Dispatchable` and `CheckedDispatch` (spelled once, since
+both name it the same way), and `bytes` from `CheckedDispatch` — and a new check,
+`check_effect_proof_fields_are_not_rebound`, refuses both an assignment and a `&mut`
+reference to any of them, anywhere in the file. `Effect`'s and `Dispatchable`'s `writer`
+field is deliberately not on the list: it carries no identity, kind or byte binding, so
+rewriting it is not the guarantee this list exists for. Nesting `CheckedDispatch` in a
+private submodule of its own — the usual way Rust narrows field visibility below module
+scope — was considered and rejected: `effect-protocol` already refuses a module declared
+anywhere in this file, precisely so a construction site cannot hide from a scan that reads
+`effect.rs` as one flat file, and a submodule added for this reason would open exactly the
+hole that rule exists to close.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
@@ -123,10 +144,13 @@ every caller there is or will be — including a caller who calls `Activities::p
 directly, bypassing `Dispatchable::perform`, since there is still no value it could pass that
 argument except one already checked. This is closer to absolute than most guarantees a trait
 boundary between two crates can state. What is left is a caller inside `waymaker-drive`
-itself reaching into `effect.rs`'s own module to build a `CheckedDispatch` by hand — a source
-change to this crate, not a misuse of its public API — and `CHECKED_DISPATCH_CONSTRUCTION`
-closes even that: `effect-protocol` fails a build in which any body but
-`Dispatchable::perform` does it.
+itself reaching into `effect.rs`'s own module — a source change to this crate, not a misuse
+of its public API. `CHECKED_DISPATCH_CONSTRUCTION` closes the first shape that takes:
+building a `CheckedDispatch` by hand; `effect-protocol` fails a build in which any body but
+`Dispatchable::perform` does it. `EFFECT_PROOF_FIELDS` closes the second shape, found on a
+later round: rewriting a field of an already-legitimate value in place, by assignment or by a
+`&mut` reference, rather than building a fresh one — a route no struct-literal count could
+ever see, because it builds nothing.
 
 `DurableIntent` doubles in size: an `EffectId` plus an `EffectRequest`. Both are `Copy` and
 stack-passed. So nothing here touches a heap — this engine has none. `CheckedDispatch` costs

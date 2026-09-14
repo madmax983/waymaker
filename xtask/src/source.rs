@@ -4047,6 +4047,22 @@ pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
 /// the body a first-match scan reads.
 pub const CHECKED_DISPATCH_CONSTRUCTION: (&str, &str) = ("Dispatchable", "perform");
 
+/// The proof-carrying field names no body outside a struct literal may write to.
+///
+/// `EFFECT_NO_SELF_LITERAL` and `CHECKED_DISPATCH_CONSTRUCTION` stop a caller from *building*
+/// a forged proof; neither stops a caller from taking a legitimate one and rewriting one of
+/// its fields in place. A field private to a *module* is writable from any sibling function
+/// in that module, not only from the type's own `impl` — so a `pub(crate)` helper elsewhere
+/// in `effect.rs` can already write `dispatch.bytes = other_bytes;` today, and the gate has
+/// nothing pinning against it. Codex found this on review of issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s construction-site pin, past that
+/// pin's own round. `id` and `request` are `DurableIntent`'s; `intent` is `Dispatchable`'s
+/// and `CheckedDispatch`'s, spelled once because both name it the same way; `bytes` is
+/// `CheckedDispatch`'s. `writer` — on `Effect` and `Dispatchable` alike — is not here: it
+/// carries no identity, kind or byte binding, so rewriting it is not the guarantee this list
+/// exists for.
+pub const EFFECT_PROOF_FIELDS: &[&str] = &["bytes", "id", "intent", "request"];
+
 /// The proof types whose own `impl` blocks may not build a `Self`.
 ///
 /// The construction scan counts a type's *name*, so `Self { .. }` inside the type's own
@@ -7623,6 +7639,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_effect_types(&code, &source.contents));
     violations.extend(check_effect_constructions(&source.contents));
     violations.extend(check_checked_dispatch_construction(&source.contents));
+    violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -7899,6 +7916,42 @@ fn check_checked_dispatch_construction(contents: &str) -> Vec<Violation> {
         ));
     }
     violations
+}
+
+/// [`EFFECT_PROOF_FIELDS`], over one file's text: no proof field is rewritten in place.
+///
+/// A struct literal builds a fresh value; an assignment or a `&mut` reference rewrites an
+/// existing one's field without going through either construction pin. The two are different
+/// AST shapes, so this is a check of its own rather than an extra case in
+/// [`check_checked_dispatch_construction`] or [`check_effect_constructions`].
+fn check_effect_proof_fields_are_not_rebound(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::mutated_field_names(contents, EFFECT_PROOF_FIELDS) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} written to outside a struct literal in {EFFECT_PROTOCOL_PATH}: \
+                     a proof's identity, kind or bytes has to come from the one place that \
+                     built it, not from a later assignment or a `&mut` reference taken to it"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
 }
 
 /// §07's storage steps, in §07's order, over one file's text.
@@ -12183,6 +12236,40 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_field_assignment_is_reported() {
+        // Codex, issue #92's seventh round: `CheckedDispatch`'s fields are private to the
+        // *module*, not to the type, so a sibling `pub(crate)` helper elsewhere in
+        // `effect.rs` can already write `dispatch.bytes = other;` on a legitimately built
+        // value — no struct literal anywhere, so every construction pin sees nothing.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(\n\
+               \x20   mut dispatch: CheckedDispatch<'a>,\n\
+               \x20   other: &'a [u8],\n\
+               ) -> CheckedDispatch<'a> {\n\
+               \x20   dispatch.bytes = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_mutable_reference_is_reported() {
+        // The same rewrite without an `=` in sight: `mem::swap` (and `mem::replace`, and any
+        // other function taking `&mut T`) all start from a `&mut` reference to the field.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(dispatch: &mut CheckedDispatch<'a>, other: &mut &'a [u8]) {\n\
+               \x20   core::mem::swap(&mut dispatch.bytes, other);\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
             "{details:?}"
         );
     }

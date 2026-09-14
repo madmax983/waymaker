@@ -526,6 +526,82 @@ fn collect_future_implementors(
     }
 }
 
+/// Every name in `names` that `contents` writes to as a struct field, outside
+/// `#[cfg(test)]` — in either of the two ways a field's value can be rewritten in place
+/// rather than rebuilt.
+///
+/// A plain assignment, `x.field = value;`, is one route. A `&mut` reference taken to the
+/// field is the other — `std::mem::swap(&mut x.field, &mut y.field)`,
+/// `std::mem::replace(&mut x.field, value)`, and passing the reference to an arbitrary
+/// function that takes `&mut T` are all routes to the same rewrite that spell no `=` at all,
+/// and all three need a `&mut` to the field first, which is the shape this refuses.
+///
+/// A name is matched on the field member alone, not on the receiver's type — `syn` sees
+/// syntax, not types, so `x.bytes = value` is refused for any `x` once `"bytes"` is in
+/// `names`, whatever `x` turns out to be. That is deliberately broader than exact: a
+/// coincidental field of the same name elsewhere in the file becomes a review question
+/// rather than a silent gap, the same standing `wire-format`'s literal comparison and
+/// `effect-scheduled-fields`'s name comparison already have.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>, syn::Error> {
+    struct Mutations<'a> {
+        names: &'a [&'a str],
+        found: Vec<String>,
+    }
+
+    impl Mutations<'_> {
+        fn note(&mut self, expr: &syn::Expr) {
+            if let syn::Expr::Field(field) = expr {
+                if let syn::Member::Named(ident) = &field.member {
+                    let name = ident_name(ident);
+                    if self.names.contains(&name.as_str()) {
+                        self.found.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+            self.note(&node.left);
+            syn::visit::visit_expr_assign(self, node);
+        }
+
+        fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+            if node.mutability.is_some() {
+                self.note(&node.expr);
+            }
+            syn::visit::visit_expr_reference(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = Mutations {
+        names,
+        found: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
 /// How many `fn name` items `contents` declares, at any nesting depth.
 ///
 /// Free functions, trait declarations, trait method defaults, and inherent methods
@@ -1522,8 +1598,8 @@ mod raw_identifier_tests {
     //! every other parser in this file against the same rule.
     use super::{
         FnScope, child_modules, declares_test, fn_declaration_count, future_trait_implementors,
-        inner_attributes, name_uses, resolved_path_uses, struct_literal_counts, trait_impls,
-        use_aliases,
+        inner_attributes, mutated_field_names, name_uses, resolved_path_uses,
+        struct_literal_counts, trait_impls, use_aliases,
     };
 
     #[test]
@@ -1751,6 +1827,68 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_plain_field_assignment_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo) -> Foo {\n\
+             \x20   dispatch.bytes = other;\n\
+             \x20   dispatch\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_mutable_reference_to_a_field_is_reported() {
+        // `mem::swap`/`mem::replace`/an arbitrary `&mut`-taking call all start here, and
+        // none of them spells `=`.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: &mut Bytes) {\n\
+             \x20   core::mem::swap(&mut dispatch.bytes, other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_shared_reference_to_a_field_is_not_reported() {
+        // `&x.field` cannot mutate anything, so it is not a rewrite route.
+        let found = mutated_field_names(
+            "fn read(dispatch: &Foo) -> &Bytes {\n\
+             \x20   &dispatch.bytes\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_unnamed_field_name_is_not_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo) {\n\
+             \x20   dispatch.0 = other;\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_field_write_under_cfg_test_is_not_reported() {
+        let found = mutated_field_names(
+            "#[cfg(test)]\n\
+             mod tests {\n\
+             \x20   fn tamper(mut dispatch: super::Foo) {\n\
+             \x20       dispatch.bytes = other;\n\
+             \x20   }\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
