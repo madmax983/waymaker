@@ -614,7 +614,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any *gated* row — issue [#115](https://github.com/madmax983/waymaker/issues/115) narrowed this from "any row", closing a gap where a document omitting a per-feature row could compose a smaller, wrong total |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row — every row, gated or not, since issue [#115](https://github.com/madmax983/waymaker/issues/115) closed a gap where a `--report` document could omit the row with the largest delta and compose a smaller, wrong total; the document's row *set* is now held to what `matrix` derives for the workspace |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
 | Incremental code flash | ≤ 13 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic, and [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) takes it to 13 KiB for §08's versioning) |
@@ -1631,24 +1631,26 @@ Stated so that nobody mistakes silence for coverage:
   "not compared". A future that grew is visible in the run that measured it and nowhere else.
 - **How deep the call chain goes, in this composed figure.** Runtime RAM is now composed
   rather than sampled — the caller's scratch page, the kernel-state registry, the context,
-  and the largest statics delta of any *gated* row, gated against §04's 768 B. Three of
-  those four live on the stack, and what is still unaccounted *here* is the *depth* of the
-  chain holding them: a deeper one moves no writable section and no type size. The report
-  says so where it prints the total rather than printing "runtime RAM: ok". Depth is
-  measured elsewhere now, by painting the stack rather than by a call graph — see the "Stack
-  usage" entry below — and that figure is the whole emulated image's, not this composed
-  one's, so this bullet's own gap stands even though the workspace is no longer silent about
-  call-chain depth everywhere.
-- **A per-feature row's own RAM cost, in the composed total.** The statics term is the
-  largest `Δram` of a *gated* row alone — `default` and `facade`, both required and pinned
-  by `gated_row_shortfalls` — never a per-feature row's. `--report` reads a document this
-  process did not produce, and a per-feature row carries neither requirement: before issue
-  [#115](https://github.com/madmax983/waymaker/issues/115), a document that omitted the row
-  with the largest `Δram` composed a smaller, wrong total and could pass a budget a complete
-  document would have failed. Design document §04 sets no per-feature RAM budget, so the
-  fix narrows the claim rather than widening the check — a per-feature row's own `Δram` is
-  still reported in the table, the same way its flash cost already was, but is not composed
-  into this total. `runtime_ram_total`'s own documentation says so.
+  and the largest statics delta of any row, gated against §04's 768 B. Three of those four
+  live on the stack, and what is still unaccounted *here* is the *depth* of the chain holding
+  them: a deeper one moves no writable section and no type size. The report says so where it
+  prints the total rather than printing "runtime RAM: ok". Depth is measured elsewhere now,
+  by painting the stack rather than by a call graph — see the "Stack usage" entry below — and
+  that figure is the whole emulated image's, not this composed one's, so this bullet's own gap
+  stands even though the workspace is no longer silent about call-chain depth everywhere.
+- **That a document's row set is complete, without a live build.** `runtime_ram_total`
+  composes the largest `Δram` of *every* row, gated or not — a per-feature row is a
+  configuration somebody ships, and §04 states one runtime-RAM ceiling for the device, not
+  one per configuration. `--report` reads a document this process did not produce, and
+  before issue [#115](https://github.com/madmax983/waymaker/issues/115) nothing checked that
+  the row set itself was complete: a document that omitted the row with the largest `Δram`
+  composed a smaller, wrong total and could pass a budget a complete document would fail.
+  `completeness_shortfalls` closes it by resolving `cargo metadata` for the workspace at
+  `--report`'s own path and holding the document's rows to what `matrix` derives from it —
+  cheap, since it links nothing, which is what keeps `--report` usable without a firmware
+  build. What it cannot see is a document read against a *different* checkout than the one
+  on disk: the comparison is against *this* workspace's `cargo metadata`, not against
+  whatever commit actually produced the document.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -3569,21 +3571,38 @@ one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 
 Issue #115 closes a gap Codex found on the fourth review round of issue #39's own pull
 request: `SizeReport::runtime_ram_total` composed the statics term from the largest `Δram`
-of *every* row the document held, gated or not, and `--report` reads a document this
-process did not produce. A document that left out the per-feature row with the largest
-`Δram` composed a smaller, wrong total and could pass a budget a complete document would
-have failed — the one figure this gate takes *across* rows rather than gating each row on
-its own. Of the three shapes the issue names, the fourth and smallest wins: the claim is
-narrowed rather than the check widened. `runtime_ram_total` now takes the largest `Δram` of
-a *gated* row alone. `default` and `facade` are the only gated rows, and
-`gated_row_shortfalls` already requires both to be present with their feature selection
-pinned to `PINNED_ROW_FEATURES` — so neither can be omitted or narrowed without failing the
-gate first, and the composition can no longer be starved by a missing row. A per-feature
-row's own `Δram` is still in the table, unchanged, but design document §04 sets no
-per-feature RAM budget, so it is not composed here — the same treatment its flash cost
-already had. Two tests drive the fix: one shows a per-feature row's large `Δram` no longer
-raises the total, and the other shows the total does not move whether that row is present
-in the document or missing from it, which is the omission the issue names. No new ADR:
-nothing here moves a must-not-own cell, a dependency edge, or a rule id — see
+of *every* row the document held, and `--report` reads a document this process did not
+produce, so nothing checked that the row *set* was the one the workspace actually derives.
+A document that left out the row with the largest `Δram` composed a smaller, wrong total and
+could pass a budget a complete document would have failed — the one figure this gate takes
+*across* rows rather than gating each row on its own.
+
+The first version of this fix took the issue's fourth, smallest option: narrow the
+composition to gated rows alone, which are pinned and required, so an omitted row could no
+longer starve it. Codex's review of that version on this pull request found the cost of
+narrowing: a per-feature row is a configuration somebody ships, and design document §04
+states one runtime-RAM ceiling for the *device*, not one per configuration — ADR 0035's own
+words for the original design were "a per-feature row is a configuration somebody ships, and
+taking the largest is the direction that fails closed". Narrowing to gated rows stopped
+gating every configuration that enables an optional feature, silently, forever, which is a
+real regression rather than only the closing of an adversarial-document hole — and it is
+exactly the cost issue #115 named for its first option and did not take.
+
+The fix taken instead is that first option, made affordable: `runtime_ram_total` composes
+the largest `Δram` of *every* row again, matching ADR 0035 unchanged, and a new function,
+`completeness_shortfalls`, closes the omission by resolving `cargo metadata` for the
+workspace and holding the document's row set to what `matrix` derives from it — a row
+`matrix` would produce and the document lacks, by name or by feature selection, is refused.
+Resolving metadata costs nothing a firmware build would: no image is linked, which is what
+keeps `--report` usable without one. `main.rs`'s `run_size` runs it alongside
+`SizeReport::shortfalls` and renders both lists as one report. Three tests drive it: a
+per-feature row's large `Δram` raising the total again, `missing_rows` catching a document
+missing a row `matrix` derives, and catching a row whose name is reused with a narrowed
+feature selection. Review also found an out-of-scope, genuinely separate gap — a gated row's
+own `ram`/`bss` fields carry no non-zero floor, unlike `flash`'s — filed as issue
+[#172](https://github.com/madmax983/waymaker/issues/172) rather than folded in, since `0 B`
+is this engine's real, current statics figure and a floor there would fail every honest
+report. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id — see
 [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md), which this
-corrects rather than supersedes.
+leaves exactly as accepted.
