@@ -3728,3 +3728,16 @@ everywhere but the one record `diverging` names, and a workload of another lengt
 that shape. Reproduced first from a crash point that left only `RunStarted` durable and a
 narrower declared workload: the unfixed code dispatched the first effect and only then
 answered `Breach::RecordDiffers` at the index where the shapes finally disagreed.
+
+A seventh was the per-record check's own placement, in the same shape once more: it ran
+*inside* the write loop, so a record that genuinely agreed with this rig's own truth was
+still written — and dispatched, if it scheduled an effect — before the loop reached
+whichever later index `declared` actually disagreed at. Row 10's own promise, "no further
+execution and history untouched", is about the whole declaration, not only the one record
+that turns out to disagree. The check now runs once, over every record this resume would
+still need to write, before the outstanding-effect redelivery or the write loop touch
+anything — so a disagreement anywhere in what is left of the run refuses before the first
+agreeing record in front of it is touched, not only before the disagreeing one itself.
+Reproduced first from a crash point that left only `RunStarted` durable, with a `declared`
+diverging at the *second* effect: the unfixed code dispatched the first effect — which
+agreed with `declared` — before reaching the second and refusing there.

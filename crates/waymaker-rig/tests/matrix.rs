@@ -2652,3 +2652,81 @@ fn resume_declaring_refuses_a_narrower_workload_before_dispatching_anything() {
     }
     assert!(checked > 0, "no crash point left only RunStarted durable");
 }
+
+/// Round 10: round 8's per-record check runs inside the write loop, so a record that
+/// *agrees* with this rig's own truth is still written and, if it schedules an effect,
+/// dispatched — before the loop ever reaches the index where `declared` disagrees. Row 10's
+/// own promise is "no further execution and history untouched", for the whole declaration,
+/// not only for the one record that turns out to disagree.
+///
+/// The fix moves the check ahead of everything: every record `resume_as` would still need
+/// to write is compared against this rig's own truth in one pass, before the outstanding-
+/// effect redelivery and the write loop both run, so a disagreement anywhere in what is
+/// left of the run refuses before the first agreeing record in front of it is touched.
+#[test]
+fn resume_declaring_refuses_before_running_any_record_that_agrees_ahead_of_the_divergence() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(diverging_at);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Only `RunStarted` durable: effect 0's schedule and completion — both of which
+        // agree with `declared`, since divergence is only at effect 1's schedule — are
+        // still ahead of the loop, in front of the record that actually disagrees.
+        if !matches!(
+            (evidence.attempted, evidence.recovered_it),
+            (Role::Start, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(RigError::Breach(Breach::RecordDiffers { index })) if index == diverging_at
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            dispatcher.entered.is_empty(),
+            "effect 0 was dispatched before the later divergence was caught"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "effect 0's records were written before the later divergence was caught"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(checked > 0, "no crash point left only RunStarted durable");
+}
