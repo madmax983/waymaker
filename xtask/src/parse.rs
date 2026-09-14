@@ -1366,18 +1366,23 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
     Some(value.value())
 }
 
-/// True if `text` is a string or byte-string literal.
+/// True if `text` is a string, byte-string, or C-string literal.
 ///
-/// The four forms this function matches:
+/// The six forms this function matches:
 /// - `"..."` — a string
 /// - `r"..."` or `r#"..."#` — a raw string
 /// - `b"..."` — a byte string
 /// - `br"..."` or `br#"..."#` — a raw byte string
+/// - `c"..."` — a C string (stable since Rust 1.77)
+/// - `cr"..."` or `cr#"..."#` — a raw C string
 ///
 /// A char literal (`'x'`) or a byte literal (`b'x'`) holds one character. It cannot
 /// spell a callee name. This function does not match these two forms.
 fn is_string_literal(text: &str) -> bool {
-    let text = text.strip_prefix('b').unwrap_or(text);
+    let text = text
+        .strip_prefix('b')
+        .or_else(|| text.strip_prefix('c'))
+        .unwrap_or(text);
     text.strip_prefix('r').map_or_else(
         || text.starts_with('"'),
         |rest| rest.trim_start_matches('#').starts_with('"'),
