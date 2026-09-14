@@ -4,7 +4,7 @@
 //! delete without anything on the host noticing. Checking for them here means the deletion
 //! fails a pull request rather than surfacing later as a firmware build error.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Violation;
 use crate::policy::LAYERS;
@@ -1041,6 +1041,20 @@ pub const TIMER_TYPE_METHODS: &[(&str, &[&str])] = &[
 /// `DurableIntent`, and for the same reason: a public field is a constructor.
 pub const TIMER_BRACED_STRUCTS: &[&str] = &["Timer"];
 
+/// `ClockKind`'s two constants, name and value both.
+///
+/// `ClockKind` is a `u8` newtype, not an enum: [`TIMER_TYPE_METHODS`] pins methods and
+/// [`TIMER_TYPES`] pins enum members, and neither reads a constant. §11 says a persistent
+/// timer record carries its clock kind "so recovery cannot silently reinterpret one policy
+/// as another", and issue [#33](https://github.com/madmax983/waymaker/issues/33) spends
+/// these two numbers on media for the life of the format. A renumbering passes every
+/// round-trip test in this repository and means something else to a device that already
+/// wrote the old byte — issue [#99](https://github.com/madmax983/waymaker/issues/99).
+///
+/// Sorted, so the comparison can be a set comparison.
+pub const CLOCK_KIND_CONSTANTS: &[(&str, &str)] =
+    &[("AFTER_BOOT", "Self(1)"), ("AT_PERSISTENT_TIME", "Self(2)")];
+
 /// The one way `waymaker-embassy`'s clock module may name a `TimerSpec`.
 ///
 /// An identifier blacklist closes one spelling at a time, and review of this change walked
@@ -1208,6 +1222,7 @@ pub fn check_timer_capability(
             violations.extend(check_boundary_type(&pin, &code, pinned));
         }
         violations.extend(check_timer_types(&code));
+        violations.extend(check_clock_kind_constants(&code));
     }
     violations.extend(check_timer_root_reexport(sources));
 
@@ -1620,6 +1635,74 @@ fn check_timer_types(code: &str) -> Vec<Violation> {
         }
     }
 
+    violations
+}
+
+/// `ClockKind` declares exactly [`CLOCK_KIND_CONSTANTS`], name and value both.
+///
+/// A wire-format pin rather than a "no constant" one, because these two are legitimate:
+/// they are the byte a `TimerScheduled` record carries. A missing name, an extra one, or a
+/// renumbered value are three ways to give issue #33's "recovery cannot silently
+/// reinterpret one policy as another" back, and all three are reported.
+fn check_clock_kind_constants(code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const KERNEL: &str = "waymaker-core";
+    const CLOCK_KIND: &str = "ClockKind";
+
+    let blocks = inherent_impl_bodies(code, CLOCK_KIND);
+    if blocks.is_empty() {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{TIMER_SEMANTICS_PATH} declares no inherent `impl` for `{CLOCK_KIND}`, so \
+                 its two constants are pinned against nothing"
+            ),
+        )];
+    }
+    let body = blocks.join("\n");
+    let declared: BTreeMap<String, String> = declared_associated_constant_values(&body)
+        .into_iter()
+        .collect();
+
+    let mut violations = Vec::new();
+    for (name, value) in CLOCK_KIND_CONSTANTS {
+        match declared.get(*name) {
+            None => violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` no longer declares `{name}`, which `CLOCK_KIND_CONSTANTS` \
+                     pins; a persistent timer record carries this byte for the life of the \
+                     format"
+                ),
+            )),
+            Some(found) if found != value => violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}::{name}` is `{found}` rather than `{value}`: a renumbering \
+                     passes every round-trip test here and means something else to a device \
+                     that already wrote the old byte"
+                ),
+            )),
+            _ => {}
+        }
+    }
+    let pinned: BTreeSet<&str> = CLOCK_KIND_CONSTANTS.iter().map(|(name, _)| *name).collect();
+    for name in declared.keys() {
+        if !pinned.contains(name.as_str()) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` declares `{name}`, which `CLOCK_KIND_CONSTANTS` does not \
+                     pin; a third clock kind is a number spent on media for the life of the \
+                     format"
+                ),
+            ));
+        }
+    }
     violations
 }
 
@@ -3147,7 +3230,7 @@ fn declared_function_names(body: &str) -> Vec<String> {
     names
 }
 
-/// The associated constants an `impl` body declares, at any visibility.
+/// The associated constants an `impl` body declares, at any visibility, name and value both.
 ///
 /// [`declared_function_names`]'s twin, and it exists because that one reads `fn`. A
 /// `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 };` on `impl TimerSpec` adds no
@@ -3156,9 +3239,14 @@ fn declared_function_names(body: &str) -> Vec<String> {
 ///
 /// Depth-zero lines only, for [`declared_function_names`]'s reason: a `const` inside a
 /// function body is a local, not a door.
-fn declared_associated_constants(body: &str) -> Vec<String> {
+///
+/// The value is text on the same line, after the first `=`. A right-hand side that wraps to
+/// a second line reports an empty value rather than none: the name is still caught, because
+/// [`declared_associated_constants`] needs only that, and a caller that pins a value —
+/// [`check_clock_kind_constants`] — meets a mismatch rather than a silent pass.
+fn declared_associated_constant_values(body: &str) -> Vec<(String, String)> {
     let mut depth = 0_i32;
-    let mut names = Vec::new();
+    let mut values = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
         if depth == 0
@@ -3178,14 +3266,29 @@ fn declared_associated_constants(body: &str) -> Vec<String> {
             && !name.is_empty()
             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
-            names.push(name.to_owned());
+            let value = declaration
+                .split_once('=')
+                .map(|(_, value)| value.trim().trim_end_matches(';').trim().to_owned())
+                .unwrap_or_default();
+            values.push((name.to_owned(), value));
         }
         let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
         let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
         depth = depth.saturating_add(opens).saturating_sub(closes);
     }
-    names.sort_unstable();
-    names
+    values.sort_unstable();
+    values
+}
+
+/// The associated constants an `impl` body declares, at any visibility.
+///
+/// [`declared_associated_constant_values`]'s name-only half, for a caller that only asks
+/// whether one exists.
+fn declared_associated_constants(body: &str) -> Vec<String> {
+    declared_associated_constant_values(body)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The file whose `EffectScheduled` field set [`EFFECT_SCHEDULED_FIELDS`] pins.
@@ -7710,6 +7813,21 @@ fn check_effect_methods(
             ),
         ));
     }
+    // An associated constant is neither a function nor a member, so the pin above is blind
+    // to it — the same shape `TimerSpec::BEST_EFFORT` used against `timer-capability`
+    // (issue #99). None of the three types has an honest one: every value they carry comes
+    // from a barrier that returned, and a constant is a value any caller reaches without one.
+    for constant in declared_associated_constants(&joined) {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{type_name}` declares the associated constant `{constant}`, which the \
+                 method pin cannot see; a proof of durable intent should come from a \
+                 barrier, not from a value any caller can reach"
+            ),
+        ));
+    }
     if EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
         violations.push(Violation::new(
             RULE,
@@ -8048,6 +8166,7 @@ pub fn check_kernel_boundary(
             };
             for pinned in BOUNDARY_TYPES {
                 violations.extend(check_boundary_type(&pin, &code, pinned));
+                violations.extend(check_boundary_type_has_no_constant(&pin, &code, pinned));
             }
         }
     }
@@ -8196,6 +8315,43 @@ fn check_boundary_type(pin: &MemberPin<'_>, code: &str, pinned: &BoundaryType) -
         ));
     }
     violations
+}
+
+/// One pinned boundary type declares no associated constant.
+///
+/// `check_boundary_type` pins members; it reads no `impl`, so a constant is invisible to it
+/// the same way one is invisible to a method pin — `TimerSpec::BEST_EFFORT`'s shape, against
+/// `timer-capability` (issue #99). None of §06's boundary types has an honest one: every
+/// value that crosses this boundary comes from replaying a record, not from a name a caller
+/// reaches on its own.
+///
+/// A type with no inherent `impl` at all is not reported: there is nothing to pin against,
+/// and `check_boundary_type` above already answers whether the type itself still exists.
+fn check_boundary_type_has_no_constant(
+    pin: &MemberPin<'_>,
+    code: &str,
+    pinned: &BoundaryType,
+) -> Vec<Violation> {
+    let MemberPin { rule, subject, .. } = *pin;
+    let Some(name) = pinned.header.rsplit(' ').next() else {
+        return Vec::new();
+    };
+    let body = inherent_impl_bodies(code, name).join("\n");
+
+    declared_associated_constants(&body)
+        .into_iter()
+        .map(|constant| {
+            Violation::new(
+                rule,
+                subject,
+                format!(
+                    "`{name}` declares the associated constant `{constant}`, which no method \
+                     pin can see; a value that crosses \u{a7}06's boundary comes from \
+                     replaying a record, not from a name any caller can reach"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
@@ -11638,6 +11794,48 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_renumbered_clock_kind_constant_is_reported() {
+        // Issue #99: `ClockKind` is a `u8` newtype, not an enum, so no member pin and no
+        // method pin sees its two constants. A renumbering passes every round-trip test and
+        // means something else to a device that already wrote the old byte.
+        let module = tests_support::clean_timer_module().replace("Self(2)", "Self(9)");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("AT_PERSISTENT_TIME") && detail.contains("Self(9)")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_clock_kind_constant_is_reported() {
+        let module = tests_support::clean_timer_module()
+            .replace("    pub const AFTER_BOOT: Self = Self(1);\n", "");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no longer declares `AFTER_BOOT`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_extra_clock_kind_constant_is_reported() {
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const BEST_EFFORT: Self = Self(1);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("BEST_EFFORT")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_spec_whose_name_merely_starts_with_the_pinned_one_is_reported() {
         // Codex round 3: `starts_with` accepted `TimerSpec::AtPersistentTimeFallback`, and an
         // associated constant of that name — invisible to a method pin that reads `fn` — can
@@ -12067,6 +12265,32 @@ mod deferred_answer_pins {
             let details = effect_details(&source);
             assert!(
                 details.iter().any(|detail| detail.contains("public field")),
+                "{opaque}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_proof_type_is_reported() {
+        // Issue #99: an associated constant is neither a function nor a member, so the
+        // method pin above is blind to it — the same shape as `TimerSpec::BEST_EFFORT`
+        // against `timer-capability`.
+        for (opaque, anchor) in [
+            (
+                "DurableIntent",
+                "    /// The identity step 4 dispatches under.",
+            ),
+            ("Effect", "    /// The protocol over a writer."),
+            ("Dispatchable", "    /// What step 4 dispatches under."),
+        ] {
+            let source = tests_support::clean_effect_module().replacen(
+                anchor,
+                &format!("    pub const FORGE: usize = 0;\n\n{anchor}"),
+                1,
+            );
+            let details = effect_details(&source);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
                 "{opaque}: {details:?}"
             );
         }
@@ -13563,6 +13787,22 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_associated_constant_on_a_boundary_type_is_reported() {
+        // Issue #99: an associated constant is neither a function nor a member, so
+        // `check_boundary_type` above is blind to it — the same shape as
+        // `TimerSpec::BEST_EFFORT` against `timer-capability`.
+        let mutant = format!(
+            "{}\nimpl Resolve<'_> {{\n    pub const FORGE: usize = 0;\n}}\n",
+            real_transition_module()
+        );
+        let violations = boundary_violations(&mutant, &real_driver_module());
+        assert!(
+            violations.iter().any(|one| one.detail.contains("FORGE")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_field_added_to_the_request_is_rejected() {
         let mutant = real_transition_module().replace(
             "    pub input_crc: u32,",
@@ -14916,17 +15156,17 @@ pub mod tests_support {
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_ROUTING_PATH,
         BANK_SEALING_FUNCTIONS, BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL,
         CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE,
-        CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES, CTX_JOURNAL_SURFACE,
-        CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION, DISPATCH_SURFACE,
-        EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
-        INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
-        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
-        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
-        VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE, VERSION_RANGE_METHODS,
-        VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE, WIRING_TYPE_FIELDS,
-        WIRING_TYPE_METHODS,
+        CLOCK_KIND_CONSTANTS, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES,
+        CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION,
+        DISPATCH_SURFACE, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
+        INTEGRITY_CHECK_PARAMETERS, INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS,
+        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
+        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TIMER_BRACED_STRUCTS,
+        TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
+        VERSION_GATE_SURFACE, VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE,
+        VERSION_RANGE_METHODS, VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE,
+        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -15002,6 +15242,11 @@ pub mod tests_support {
             }
             source.push_str("}\n");
         }
+        source.push_str("impl ClockKind {\n");
+        for (name, value) in CLOCK_KIND_CONSTANTS {
+            let _ = writeln!(source, "    pub const {name}: Self = {value};");
+        }
+        source.push_str("}\n");
         source
     }
 
