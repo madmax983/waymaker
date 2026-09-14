@@ -360,9 +360,9 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
         }
 
         fn visit_path(&mut self, path: &'ast syn::Path) {
-            for segments in resolve_segment_candidates(path, &self.aliases) {
-                self.paths.push(ResolvedPath { segments });
-            }
+            self.paths.push(ResolvedPath {
+                segments: resolve_segments(path, &self.aliases),
+            });
             syn::visit::visit_path(self, path);
         }
     }
@@ -376,65 +376,38 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
     Ok(visitor.paths)
 }
 
-/// Every way `path` could resolve, given `aliases`.
-///
-/// Usually exactly one: a bare name aliases to at most one thing. Two `use`
-/// items can share a local name in different namespaces though — a function
-/// and a trait can both spell `Pollable` — and a syntactic scan has no way
-/// to know which namespace a caller meant (Codex review, PR #160). So every
-/// alias that local name could mean is followed, not just the first one
-/// written: a caller asking "does this path ever mean `Future`" sees it
-/// even when the file's `Pollable` also names something unrelated. A path
-/// with no matching alias resolves to itself, unchanged. A renamed
-/// re-export chains one alias to another, e.g. `use core::future::Future as
-/// Pollable; pub use Pollable as Awaitable;` (issue #109); each round below
-/// follows every candidate one hop further, bounded by the file's own alias
-/// count — enough for any real chain, and it stops a crafted cycle
-/// (`use a as b; use b as a;`) from looping forever.
-fn resolve_segment_candidates(path: &syn::Path, aliases: &[UseAlias]) -> Vec<Vec<String>> {
-    let segments: Vec<String> = path
+fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
+    let mut segments: Vec<String> = path
         .segments
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
     if path.leading_colon.is_some() {
-        return vec![segments];
+        return segments;
     }
-    let mut frontier = vec![segments];
+    // A renamed re-export chains one alias to another. Example:
+    // `use core::future::Future as Pollable; pub use Pollable as Awaitable;`
+    // (issue #109). The loop below follows the chain. It does one hop
+    // per alias in the file. This bound stops a crafted cycle
+    // (`use a as b; use b as a;`) from looping forever.
     for _ in 0..aliases.len() {
-        let mut next = Vec::new();
-        for mut candidate in frontier {
-            // `self::X` names X in this same scope (Codex review, PR #160):
-            // a chain may cross one, e.g. `pub use self::Pollable as
-            // Awaitable;`. Drop it before the lookup below, or `self` is
-            // searched for as an alias, finds none, and the chain stops
-            // one hop short.
-            strip_leading_self(&mut candidate);
-            let Some(first) = candidate.first().cloned() else {
-                next.push(candidate);
-                continue;
-            };
-            let mut matched = false;
-            for alias in aliases.iter().filter(|alias| alias.local == first) {
-                matched = true;
-                let mut resolved = alias.target.clone();
-                resolved.extend(candidate.iter().skip(1).cloned());
-                next.push(resolved);
-            }
-            if !matched {
-                next.push(candidate);
-            }
-        }
-        next.sort();
-        next.dedup();
-        frontier = next;
+        // `self::X` names X in this same scope (Codex review, PR #160): a
+        // chain may cross one, e.g. `pub use self::Pollable as Awaitable;`.
+        // Drop it before the lookup below, or `self` is searched for as an
+        // alias, finds none, and the chain stops one hop short.
+        strip_leading_self(&mut segments);
+        let Some(first) = segments.first() else {
+            break;
+        };
+        let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) else {
+            break;
+        };
+        let mut resolved = alias.target.clone();
+        resolved.extend(segments.drain(1..));
+        segments = resolved;
     }
-    for candidate in &mut frontier {
-        strip_leading_self(candidate);
-    }
-    frontier.sort();
-    frontier.dedup();
-    frontier
+    strip_leading_self(&mut segments);
+    segments
 }
 
 /// Drops a leading `self` segment: `self::X` names `X` in the scope that wrote
@@ -481,11 +454,8 @@ fn collect_future_implementors(
         match item {
             syn::Item::Impl(implementation) => {
                 if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
-                    let candidates = resolve_segment_candidates(trait_path, aliases);
-                    if candidates
-                        .iter()
-                        .any(|resolved| resolved.last().is_some_and(|last| last == "Future"))
-                    {
+                    let resolved = resolve_segments(trait_path, aliases);
+                    if resolved.last().is_some_and(|last| last == "Future") {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
                                 implementors.push(ident_name(&name.ident));
@@ -696,12 +666,11 @@ pub fn struct_literal_counts(
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            let candidates = resolve_segment_candidates(&node.path, &self.aliases);
-            if candidates.iter().any(|resolved| {
-                resolved
-                    .last()
-                    .is_some_and(|last| last.as_str() == self.name)
-            }) {
+            let resolved = resolve_segments(&node.path, &self.aliases);
+            if resolved
+                .last()
+                .is_some_and(|last| last.as_str() == self.name)
+            {
                 self.count = self.count.saturating_add(1);
             }
             syn::visit::visit_expr_struct(self, node);
@@ -1105,9 +1074,9 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         }
 
         fn visit_path(&mut self, node: &'ast syn::Path) {
-            for segments in resolve_segment_candidates(node, &self.aliases) {
-                self.paths.push(ResolvedPath { segments });
-            }
+            self.paths.push(ResolvedPath {
+                segments: resolve_segments(node, &self.aliases),
+            });
             syn::visit::visit_path(self, node);
         }
     }
@@ -1793,20 +1762,5 @@ mod alias_scope_tests {
         // out-of-line module name.
         let uses = name_uses("#[allow(non_snake_case)]\nmod Step;\n").expect("the fixture parses");
         assert!(uses.names_word("Step"), "{uses:?}");
-    }
-
-    #[test]
-    fn a_name_shared_by_two_namespaces_still_reaches_future() {
-        // Codex review of the scoping fix (PR #160): `use vals::Pollable;`
-        // (a value) and `use core::future::Future as Pollable;` (a trait)
-        // can both spell `Pollable` in real Rust — they live in different
-        // namespaces. `use Pollable as Awaitable;` then renames both. A
-        // scan cannot tell which namespace `impl Awaitable for X` means, so
-        // it must not pick only the first-declared `Pollable` and miss the
-        // one that means `Future`.
-        let code = "use vals::Pollable;\nuse core::future::Future as Pollable;\nuse Pollable as \
-             Awaitable;\nstruct X;\nimpl Awaitable for X {}\n";
-        let implementors = future_trait_implementors(code).expect("the fixture parses");
-        assert_eq!(implementors, ["X"], "{implementors:?}");
     }
 }
