@@ -8525,10 +8525,68 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
                 ),
             ));
         }
+
+        // Codex's fifth-round finding: `braced_body` starts reading at the `fn` header and
+        // never looks at what precedes it, so downgrading or removing either function's
+        // `#[inline(always)]` passed every check above — even though ADR 0044's whole
+        // argument for this table's shape is that LLVM only builds the lookup table when
+        // `crc32_nibble` is force-inlined into each of `crc32_nibble_table`'s arms first; a
+        // soft `#[inline]` measured as a real function call per nibble instead, 5-21%
+        // slower on the workloads ADR 0044 profiled.
+        for header_name in [table.function, table.helper] {
+            let header = format!("fn {header_name}");
+            if !declares_inline_always(code, &header) {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{header_name}` in {INTEGRITY_CHECK_PATH} is not declared \
+                         `#[inline(always)]` immediately before its `fn` — ADR 0044's table \
+                         is only a lookup table because both `{}` and `{}` are force-inlined \
+                         into each arm before LLVM's switch-to-lookup-table pass runs",
+                        table.helper, table.function
+                    ),
+                ));
+            }
+        }
     }
 
     violations.extend(check_integrity_check_routing(code));
     violations
+}
+
+/// Whether `code` carries `#[inline(always)]` as an attribute of the item declared by
+/// `header` — read backward from `header`'s own position rather than forward from it, which
+/// is the direction every other pin in this module reads in.
+///
+/// [`braced_body`] starts at `header` and reads only what follows; an attribute is what
+/// precedes it, so nothing else here would notice one downgraded to a soft `#[inline]` or
+/// removed outright. The search window is bounded by the previous item's own closing brace,
+/// so an `#[inline(always)]` on some earlier, unrelated function does not vouch for this one.
+#[must_use]
+fn declares_inline_always(code: &str, header: &str) -> bool {
+    const ATTRIBUTE: &str = "#[inline(always)]";
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+
+    let Some(index) = code.match_indices(header).find_map(|(index, _)| {
+        let before_is_boundary = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        let after_is_boundary = code
+            .get(index + header.len()..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|character| !continues(character));
+        (before_is_boundary && after_is_boundary).then_some(index)
+    }) else {
+        return false;
+    };
+
+    let preceding = code.get(..index).unwrap_or_default();
+    let scope_start = preceding.rfind('}').map_or(0, |at| at + 1);
+    preceding
+        .get(scope_start..)
+        .is_some_and(|window| window.contains(ATTRIBUTE))
 }
 
 /// [`INTEGRITY_CHECK_ROUTING`]'s half of `check_integrity_check_tables`, factored out to
@@ -8764,9 +8822,47 @@ fn parse_dense_arms(arms: &str) -> Option<Vec<DenseArm<'_>>> {
     Some(parsed)
 }
 
+/// The integer-type suffixes a Rust integer literal may carry, checked as exact trailing
+/// matches by [`parse_integer_literal`] rather than guessed at by scanning for digits — a
+/// hex literal's own digits (`0`-`9`) overlap the digits of a suffix like `u8`, so a scan
+/// that looked for "the last digit character" would read `0xFu8`'s suffix as part of its
+/// numeral.
+const INTEGER_SUFFIXES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+];
+
+/// Parses `text` as a Rust integer literal's *value*, whatever base or suffix it is spelled
+/// with — `0`, `0x0`, `0b0` and `0u8` all name the same arm pattern.
+///
+/// Codex found, on review of the pull request that added [`has_dense_arm_patterns`], that
+/// comparing a pattern's *spelling* against `index.to_string()` accepted only the plain
+/// decimal form: a table whose patterns were written `0x0` through `0xE` and `_` — which
+/// LLVM compiles into the identical lookup table — was not dense by that comparison and so
+/// was skipped by the scan entirely, rather than being caught as an unauthorised one.
+#[must_use]
+fn parse_integer_literal(text: &str) -> Option<u128> {
+    const RADIX_PREFIXES: &[(&str, u32)] = &[("0x", 16), ("0o", 8), ("0b", 2)];
+
+    let text = text.trim();
+    let (text, radix) = RADIX_PREFIXES
+        .iter()
+        .find_map(|(prefix, radix)| text.strip_prefix(prefix).map(|rest| (rest, *radix)))
+        .unwrap_or((text, 10));
+    let text = INTEGER_SUFFIXES
+        .iter()
+        .find_map(|suffix| text.strip_suffix(suffix))
+        .unwrap_or(text);
+    let digits: String = text.chars().filter(|character| *character != '_').collect();
+    if digits.is_empty() {
+        return None;
+    }
+    u128::from_str_radix(&digits, radix).ok()
+}
+
 /// Whether `parsed`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: literal `0` through `n - 2` in order, then a final wildcard arm,
-/// with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
+/// into a lookup table: `0` through `n - 2` in order, whatever base or suffix each is
+/// spelled with, then a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms
+/// in total.
 ///
 /// Independent of what each arm's own *value* is — a call, a bare literal, anything else —
 /// because a lookup table is exactly as much of one whichever shape backs it: `0 =>
@@ -8781,15 +8877,24 @@ fn has_dense_arm_patterns(parsed: &[DenseArm<'_>]) -> bool {
     let Some(last) = parsed.len().checked_sub(1) else {
         return false;
     };
-    parsed.len() >= MINIMUM_DENSE_TABLE_ARMS
-        && parsed.iter().enumerate().all(|(index, arm)| {
-            let expected = if index == last {
-                "_".to_string()
-            } else {
-                index.to_string()
-            };
-            arm.pattern == expected
-        })
+    if parsed.len() < MINIMUM_DENSE_TABLE_ARMS {
+        return false;
+    }
+    for (index, arm) in parsed.iter().enumerate() {
+        if index == last {
+            if arm.pattern != "_" {
+                return false;
+            }
+            continue;
+        }
+        let Ok(expected) = u128::try_from(index) else {
+            return false;
+        };
+        if parse_integer_literal(arm.pattern) != Some(expected) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `expression` is a call `callee(argument)`, both trimmed — the one value shape
@@ -8814,13 +8919,18 @@ fn call_shape(expression: &str) -> Option<(&str, &str)> {
 /// once [`has_dense_arm_patterns`] has already said the patterns are dense. Returns the
 /// callee when it is, so a caller can compare it and the arm count against
 /// [`INTEGRITY_CHECK_TABLES`] without caring which function, or which selector, the match
-/// happens to sit under.
+/// happens to sit under. The argument is compared by [`parse_integer_literal`]'s value
+/// rather than by spelling, for [`has_dense_arm_patterns`]'s reason.
 #[must_use]
 fn call_shaped_uniformly<'a>(parsed: &[DenseArm<'a>]) -> Option<&'a str> {
     let callee = call_shape(parsed.first()?.value)?.0;
     for (index, arm) in parsed.iter().enumerate() {
         let (this_callee, argument) = call_shape(arm.value)?;
-        if this_callee != callee || argument != index.to_string() {
+        let expected = u128::try_from(index).ok()?;
+        if this_callee != callee {
+            return None;
+        }
+        if parse_integer_literal(argument) != Some(expected) {
             return None;
         }
     }
@@ -14833,6 +14943,50 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_hex_spelled_patterns_is_reported() {
+        // Codex's fifth-round finding: the pattern comparison matched a pattern's
+        // *spelling* against `index.to_string()`, so a table whose patterns were written
+        // in hex (`0x0` through `0xE`) rather than decimal was not recognised as dense at
+        // all and the scan skipped it in silence, rather than reporting it as an
+        // unauthorised table. `parse_integer_literal` compares values now, not spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn hex_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0x0 => crc32_nibble(0),\n        0x1 => crc32_nibble(1),\n        \
+             0x2 => crc32_nibble(2),\n        0x3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_downgraded_inline_always_is_reported() {
+        // Codex's fifth-round finding: `braced_body` starts reading at a function's `fn`
+        // header and never looks at what precedes it, so removing `#[inline(always)]`
+        // from `crc32_nibble_table` passed every check above even though ADR 0044's whole
+        // shape argument depends on it — a soft `#[inline]` here measured as a real
+        // function call per nibble rather than the table LLVM otherwise builds.
+        let source = tests_support::clean_checksum_module().replace(
+            "#[inline(always)]\nconst fn crc32_nibble_table",
+            "const fn crc32_nibble_table",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("is not declared `#[inline(always)]`")
+                && violation.detail.contains("crc32_nibble_table")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_byte_identical_second_copy_of_the_pinned_table_is_reported() {
         // The sharper case beside the one above: a second table that reuses the pinned
         // table's own selector, helper and arm count under a different function name is
@@ -16241,8 +16395,21 @@ mod tests {
             bodies.insert(route.function, expected_route_body(route));
         }
 
+        // `declares_inline_always` reads backward from a function's own `fn` header, so
+        // every function ADR 0044 pins that way — a table's own function and the helper
+        // every one of its arms calls — needs the attribute here too, or the clean fixture
+        // would fail the pin it is meant to satisfy.
+        let needs_inline_always = |name: &str| {
+            INTEGRITY_CHECK_TABLES
+                .iter()
+                .any(|table| table.function == name || table.helper == name)
+        };
+
         let mut source = String::from("//! Two checksums.\n");
         for (function, body) in bodies {
+            if needs_inline_always(function) {
+                source.push_str("#[inline(always)]\n");
+            }
             let _ = writeln!(
                 source,
                 "pub(crate) const fn {function}(bytes: &[u8]) -> u32 {{{body} }}"
@@ -16253,6 +16420,7 @@ mod tests {
         // arm in order mapped to the identically-numbered call, nothing else — rendered
         // from the pin so a table added to it arrives in this fixture too.
         for table in INTEGRITY_CHECK_TABLES {
+            source.push_str("#[inline(always)]\n");
             let _ = writeln!(source, "const fn {}(nibble: u8) -> u32 {{", table.function);
             let _ = write!(source, "    match {} {{", table.selector);
             for arm in 0..table.arms {
