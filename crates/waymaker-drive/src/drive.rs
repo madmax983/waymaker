@@ -503,13 +503,25 @@ enum BankRead {
     /// a reason no larger a page would ever fix.
     Absent,
     /// Genuinely sealed, at `claimed_generation`, but `page` was not large enough to read
-    /// and validate this bank's header. `needed` is the best figure available: the header's
-    /// own checksum-protected declared length, where enough of the header was readable to
-    /// checksum it, or this bank's own ceiling otherwise.
+    /// and validate this bank's header. `needed` is the best figure available, rounded up to
+    /// a whole read unit so that a caller retrying with exactly `needed` bytes gets a `page`
+    /// this same rounding cannot then read back down to something smaller: the header's own
+    /// checksum-protected declared length, where enough of the header was readable to
+    /// checksum it, or just enough to read that much of the next attempt otherwise.
     Oversized {
         claimed_generation: bank::Generation,
         needed: usize,
     },
+}
+
+/// `len` rounded up to a whole number of `unit`s, or [`None`] on overflow.
+///
+/// `unit` is a power of two on every path that reaches here — [`Geometry`](waymaker_flash::storage::Geometry)
+/// refuses anything else — so this is an add and a mask rather than a division, the same
+/// shape `waymaker_flash::recovery`'s own private `round_up` is.
+fn round_up_to_unit(len: usize, unit: u32) -> Option<usize> {
+    let mask = (unit as usize).wrapping_sub(1);
+    len.checked_add(mask).map(|sum| sum & !mask)
 }
 
 /// Reads bank `id`'s header and seal, and says what it is worth.
@@ -597,17 +609,31 @@ where
     {
         return Ok(match bank::header_len_of_with::<C>(header_buf) {
             // The prefix itself checksums cleanly: this bank really is sealed, and only
-            // failed to fit because `page` did not reach far enough. `needed` is exact.
+            // failed to fit because `page` did not reach far enough. `header_len_of_with`
+            // answers the *unpadded* frame length, which need not itself be a multiple of
+            // the read unit — Codex found that reporting it verbatim let a caller converge
+            // on a length this same rounding then read down again, forever. Rounded up, a
+            // caller that retries with exactly `needed` bytes gets a `page` this function's
+            // own rounding cannot shrink further.
             Ok(needed) => BankRead::Oversized {
                 claimed_generation: seal.generation,
-                needed,
+                needed: round_up_to_unit(needed, read_unit)
+                    .unwrap_or(payload_bytes)
+                    .min(payload_bytes),
             },
-            // Not even the checksum-protected prefix fit, so there is no better figure than
-            // this bank's own ceiling to offer — but a real, larger header cannot be ruled
-            // out either, so this is undecided rather than absent.
+            // Not even the checksum-protected prefix fit. Codex found that this bank's own
+            // ceiling was a poor answer here too: a caller with a page shorter than
+            // `HEADER_PREFIX_BYTES` learns nothing from being told to try a page several KiB
+            // wide when a page merely wide enough for the *prefix* would already answer this
+            // bank's real length on its very next call — the read that got this far already
+            // holds the header's own declared length ready to be reported, one retry away. A
+            // real, larger header cannot be ruled out either, so this is undecided rather
+            // than absent.
             Err(DecodeError::Truncated) => BankRead::Oversized {
                 claimed_generation: seal.generation,
-                needed: payload_bytes,
+                needed: round_up_to_unit(bank::HEADER_PREFIX_BYTES, read_unit)
+                    .unwrap_or(payload_bytes)
+                    .min(payload_bytes),
             },
             // Unreachable: `decode_header_with` just failed with `Truncated` on this exact
             // buffer, which means its own prefix check already passed (a magic, a checksum

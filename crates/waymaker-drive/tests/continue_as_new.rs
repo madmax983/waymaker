@@ -1275,3 +1275,140 @@ fn a_page_too_small_for_an_oversized_header_reports_the_actual_size_it_needs() {
          whole payload region"
     );
 }
+
+#[test]
+fn a_page_too_small_for_even_the_prefix_reports_the_prefix_size_not_the_whole_bank() {
+    // Codex found this on round 6: when even the header's own checksum-protected prefix
+    // does not fit, the old fallback reported this bank's whole payload region (a few KiB)
+    // -- but the read that got this far already knows a page merely wide enough for the
+    // *prefix*, rounded to a whole read unit, would answer this bank's real length on its
+    // very next call. Reporting the ceiling instead could make a constrained caller give up
+    // on an otherwise perfectly bootable bank.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+
+    // Enough for the seal (16 bytes at this align), rounded down to an 8-byte read unit,
+    // deliberately short of the 22-byte header prefix.
+    let mut page = vec![0_u8; 20];
+    let mut result = [0_u8; 16];
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("a page too small for even the prefix must still refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, 24,
+        "the reported figure must be the prefix rounded to a read unit, not this bank's \
+         whole payload region"
+    );
+}
+
+#[test]
+fn the_reported_size_is_rounded_up_so_a_caller_retrying_with_it_exactly_converges() {
+    // Codex found this on round 6, in the very fix the previous round landed: an unpadded
+    // header length need not itself be a multiple of the device's read unit, so reporting it
+    // verbatim let a caller retry with exactly that many bytes and get the identical
+    // `PageTooSmall` forever -- `read_bank`'s own rounding-down of the page length shrank
+    // the caller's "exact" retry straight back below what was asked for.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    // Unpadded frame_len = HEADER_OVERHEAD_BYTES(26) + 63 = 89, not a multiple of 8.
+    let unaligned_input = [b'x'; 63];
+    let header = BankHeader {
+        align: layout.align(),
+        input: &unaligned_input,
+        ..first_header()
+    };
+    install_on(&mut device, layout, BankId::A, Generation::FIRST, &header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(padded_len) = bank::encode_header(&header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(encoded) = staging.get(..padded_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let Ok(unpadded_needed) = bank::header_len_of(encoded) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected prefix"
+        )
+    };
+    assert_eq!(
+        unpadded_needed, 89,
+        "the fixture needs an unaligned unpadded header length"
+    );
+
+    let mut page = vec![0_u8; unpadded_needed];
+    let mut result = [0_u8; 16];
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: &unaligned_input,
+        },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!(
+            "an 89-byte page must still refuse an 89-byte unpadded header on an 8-byte read \
+             unit: {progress:?}"
+        )
+    };
+    assert_eq!(
+        needed % 8,
+        0,
+        "the reported figure must itself be a whole read unit, not the raw unpadded length: \
+         {needed}"
+    );
+    assert!(
+        needed >= unpadded_needed,
+        "the reported figure must be enough to actually work: {needed}"
+    );
+
+    // Retrying with exactly `needed` bytes must now succeed rather than refuse again.
+    let mut page2 = vec![0_u8; needed];
+    let mut result2 = [0_u8; 16];
+    let progress2 = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: &unaligned_input,
+        },
+        Scratch {
+            page: &mut page2,
+            result: &mut result2,
+        },
+    );
+    assert!(
+        matches!(
+            progress2,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "retrying with exactly the reported size must converge rather than refuse again: \
+         {progress2:?}"
+    );
+}
