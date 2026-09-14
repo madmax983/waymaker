@@ -15,9 +15,9 @@
 //! * [`Activities`], [`Performed`] and [`Clocks`] — the world's half: what a run asks of
 //!   the world, bounded by the run's declared result bound, and the clocks its deadlines
 //!   are measured against.
-//! * [`Effect`], [`Dispatchable`], [`DurableIntent`], [`Resolution`], [`Scheduled`] and
-//!   [`Resolved`] — design document §07's seven steps, in an order that is the only order
-//!   that compiles.
+//! * [`Effect`], [`Dispatchable`], [`DurableIntent`], [`CheckedDispatch`], [`InputMismatch`],
+//!   [`Resolution`], [`Scheduled`] and [`Resolved`] — design document §07's seven steps, in
+//!   the only order that compiles, with a kind and an input bound to this effect alone.
 //! * [`Driver`], [`Progress`] and [`DriveError`] — the loop: `waymaker-flash`'s recovery
 //!   scan and two-barrier writer joined to the kernel's transition table.
 //! * [`demo`] — a reference workflow and world, in the library so that the firmware target
@@ -113,7 +113,10 @@ mod workflow;
 pub use activity::{Activities, Clocks, Performed};
 pub use boundary::{Answered, Boundary, Handoff, Suspended};
 pub use drive::{Conclusion, DriveError, Driver, Progress, Scratch};
-pub use effect::{Dispatchable, DurableIntent, Effect, Resolution, Resolved, Scheduled};
+pub use effect::{
+    CheckedDispatch, Dispatchable, DurableIntent, Effect, InputMismatch, Resolution, Resolved,
+    Scheduled,
+};
 #[cfg(not(feature = "without-facade"))]
 pub use facade::Bridge;
 pub use workflow::{Identity, Workflow};

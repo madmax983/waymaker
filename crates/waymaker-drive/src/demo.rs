@@ -18,7 +18,7 @@ use waymaker_core::version::GateId;
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
-use crate::effect::DurableIntent;
+use crate::effect::CheckedDispatch;
 use waymaker_flash::capacity::Bounds;
 
 use crate::activity::{Activities, Clocks, Performed};
@@ -484,13 +484,9 @@ impl Default for World {
 }
 
 impl Activities for World {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        _input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+        let intent = dispatch.durable_intent();
+        let kind = intent.kind();
         // Recorded before anything is decided, so a declined attempt is an offer like any
         // other. Counted whether or not the log had room, for the reason `count` is.
         if let Some(slot) = self.offers.get_mut(self.offered) {

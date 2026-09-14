@@ -4149,9 +4149,29 @@ pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
 /// from a sequence number — which is a forge in any hand but the driver's beside it. It is
 /// `pub(crate)`, and [`EFFECT_TYPE_METHODS`] is what keeps it declared.
 ///
+/// `kind`, `perform`, `bytes` and `durable_intent` are issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s: `DurableIntent::kind` reads the
+/// activity step 3 committed rather than a second argument naming one, and
+/// `Dispatchable::perform` is the one route from a proof and raw bytes to a dispatch — it
+/// checks the bytes against the digest step 3 committed, then binds the identity and the
+/// bytes into one `CheckedDispatch`, whose two methods, `durable_intent` and `bytes`, are how
+/// an implementor reads them back. Two methods rather than one so that an implementor cannot
+/// read one effect's identity beside another effect's bytes: both come from the one value
+/// this file builds once, and nowhere else.
+///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
-pub const EFFECT_PROTOCOL_SURFACE: &[&str] =
-    &["id", "intent", "into_writer", "over", "resolve", "schedule"];
+pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
+    "bytes",
+    "durable_intent",
+    "id",
+    "intent",
+    "into_writer",
+    "kind",
+    "over",
+    "perform",
+    "resolve",
+    "schedule",
+];
 
 /// Every type §07's protocol is made of, and every method it may declare — at any visibility.
 ///
@@ -4164,9 +4184,10 @@ pub const EFFECT_PROTOCOL_SURFACE: &[&str] =
 /// rather than the keyword in front of it.
 ///
 /// Each list is sorted, so the comparison can be a set comparison.
-pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 3] = [
-    ("DurableIntent", &["id"]),
-    ("Dispatchable", &["intent", "resolve"]),
+pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 4] = [
+    ("CheckedDispatch", &["bytes", "durable_intent"]),
+    ("DurableIntent", &["id", "kind"]),
+    ("Dispatchable", &["intent", "perform", "resolve"]),
     (
         "Effect",
         &["into_writer", "over", "redelivering", "schedule"],
@@ -4184,13 +4205,47 @@ pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
     ("Dispatchable", ["schedule", "redelivering"]),
 ];
 
+/// The one body that may build a `CheckedDispatch`, and the type that owns it.
+///
+/// One body rather than `EFFECT_CONSTRUCTIONS`' two, because `CheckedDispatch` has one
+/// legitimate origin: the moment `Dispatchable::perform` has just checked an input against
+/// the identity it was scheduled under. A second construction site — a `pub(crate)` helper
+/// elsewhere in this file, say — would be a second, uninspected route to the one value
+/// `Activities::perform` trusts to pair an identity with its own bytes, which is issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s second round: Codex found that
+/// `EFFECT_NO_SELF_LITERAL` alone refuses a trait impl and a `Self` literal inside
+/// `CheckedDispatch`'s own `impl`, but says nothing about a sibling function building one
+/// with ordinary field names. Read out of `Dispatchable`'s own `impl` blocks rather than out
+/// of the file, for [`EFFECT_STEP_BODIES`]' reason: a free `fn perform` above the real one is
+/// the body a first-match scan reads.
+pub const CHECKED_DISPATCH_CONSTRUCTION: (&str, &str) = ("Dispatchable", "perform");
+
+/// The proof-carrying field names no body outside a struct literal may write to.
+///
+/// `EFFECT_NO_SELF_LITERAL` and `CHECKED_DISPATCH_CONSTRUCTION` stop a caller from *building*
+/// a forged proof; neither stops a caller from taking a legitimate one and rewriting one of
+/// its fields in place. A field private to a *module* is writable from any sibling function
+/// in that module, not only from the type's own `impl` — so a `pub(crate)` helper elsewhere
+/// in `effect.rs` can already write `dispatch.bytes = other_bytes;` today, and the gate has
+/// nothing pinning against it. Codex found this on review of issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s construction-site pin, past that
+/// pin's own round. `id` and `request` are `DurableIntent`'s; `intent` is `Dispatchable`'s
+/// and `CheckedDispatch`'s, spelled once because both name it the same way; `bytes` is
+/// `CheckedDispatch`'s. `writer` — on `Effect` and `Dispatchable` alike — is not here: it
+/// carries no identity, kind or byte binding, so rewriting it is not the guarantee this list
+/// exists for.
+pub const EFFECT_PROOF_FIELDS: &[&str] = &["bytes", "id", "intent", "request"];
+
 /// The proof types whose own `impl` blocks may not build a `Self`.
 ///
 /// The construction scan counts a type's *name*, so `Self { .. }` inside the type's own
 /// `impl` is a construction it cannot see. Review of this change used exactly that, beside a
 /// `pub(crate)` constructor, to mint a `DurableIntent` with the gate green. `Effect` is not
 /// here: it is not a proof of anything, and its own constructor is a `Self`.
-pub const EFFECT_NO_SELF_LITERAL: [&str; 2] = ["DurableIntent", "Dispatchable"];
+/// `CheckedDispatch` is issue [#92](https://github.com/madmax983/waymaker/issues/92)'s: a
+/// trait impl that built one from an arbitrary identity and arbitrary bytes would let a
+/// caller hand `Activities::perform` a pair the check never vouched for.
+pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedDispatch", "DurableIntent", "Dispatchable"];
 
 /// The type that owns each body §07's storage steps happen in, and that body's name.
 ///
@@ -7756,6 +7811,9 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     let code = without_test_modules(&code_only(&source.contents));
     violations.extend(check_effect_types(&code, &source.contents));
     violations.extend(check_effect_constructions(&source.contents));
+    violations.extend(check_checked_dispatch_construction(&source.contents));
+    violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
+    violations.extend(check_no_projected_type_aliases(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -8012,6 +8070,133 @@ fn check_effect_constructions(contents: &str) -> Vec<Violation> {
         }
     }
     violations
+}
+
+/// [`CheckedDispatch`]'s one construction site, over one file's text.
+///
+/// `EFFECT_CONSTRUCTIONS`'s twin for a type with one legitimate origin rather than two:
+/// `CheckedDispatch` binds an identity to bytes `Dispatchable::perform` has just checked, and
+/// a second construction site anywhere in this file would be a second, uninspected route to
+/// that pairing.
+fn check_checked_dispatch_construction(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+    const VALUE: &str = "CheckedDispatch";
+
+    let mut violations = Vec::new();
+    let (ty, body) = CHECKED_DISPATCH_CONSTRUCTION;
+    let Some(counts) = struct_literal_counts_or_violation(
+        contents,
+        VALUE,
+        crate::parse::FnScope::InherentFns { ty, name: body },
+        RULE,
+        DRIVER,
+        EFFECT_PROTOCOL_PATH,
+        &mut violations,
+    ) else {
+        return violations;
+    };
+    if counts.inside == 0 {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{VALUE}` is not built inside `{ty}::{body}`: it is the one value that binds \
+                 an identity to bytes checked against it, and it has to come from the one \
+                 place that checked them"
+            ),
+        ));
+    }
+    if counts.total != counts.inside {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{VALUE}` is built {} time(s), {} of them inside `{ty}::{body}`: a second \
+                 construction site is a second, uninspected route to a pairing \
+                 `Activities::perform` trusts",
+                counts.total, counts.inside
+            ),
+        ));
+    }
+    violations
+}
+
+/// [`EFFECT_PROOF_FIELDS`], over one file's text: no proof field is rewritten in place.
+///
+/// A struct literal builds a fresh value; an assignment or a `&mut` reference rewrites an
+/// existing one's field without going through either construction pin. The two are different
+/// AST shapes, so this is a check of its own rather than an extra case in
+/// [`check_checked_dispatch_construction`] or [`check_effect_constructions`].
+fn check_effect_proof_fields_are_not_rebound(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::mutated_field_names(contents, EFFECT_PROOF_FIELDS) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} written to outside a struct literal in {EFFECT_PROTOCOL_PATH}: \
+                     a proof's identity, kind or bytes has to come from the one place that \
+                     built it, not from a later assignment or a `&mut` reference taken to it"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` names no `type` alias whose target is a qualified associated-type
+/// projection.
+///
+/// `<T as Trait>::Assoc` can resolve to any struct the trait's `impl` chooses —
+/// `CheckedDispatch` included — and nothing here can follow it without type inference.
+/// `type_alias_target` already resolves a plain path and one wrapped in parens; a projection
+/// is the one shape it cannot safely treat as "not an alias" the way it treats a tuple, a
+/// reference or a trait object, because unlike those it genuinely can name a struct usable
+/// in `Name { .. }` position. So the alias itself is refused outright, rather than silently
+/// passed over the way an unresolvable non-struct shape is.
+fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::qself_type_alias_names(contents) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} aliases a qualified associated-type projection in \
+                     {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
+                     trait's `impl` chooses, which no construction pin here can follow, so \
+                     the alias itself is refused"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
 }
 
 /// §07's storage steps, in §07's order, over one file's text.
@@ -12661,6 +12846,205 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_outside_perform_is_reported() {
+        // Issue #92's second round: `CheckedDispatch` has one legitimate origin, and a
+        // sibling `pub(crate)` forge — invisible to the surface pin, which counts `pub ` and
+        // not `pub(` — is exactly the hole `EFFECT_NO_SELF_LITERAL` alone leaves open.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {\n\
+               \x20   CheckedDispatch { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_type_alias_is_reported() {
+        // Codex, issue #92's third round: `type Unchecked<'a> = CheckedDispatch<'a>;`
+        // followed by a literal spelled `Unchecked { .. }` is a second construction site a
+        // scan that resolved only `use` aliases could not see. `struct_literal_counts` now
+        // resolves `type` aliases too, so this is caught the same way the plain sibling
+        // forge above is.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<'a> = CheckedDispatch<'a>;\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Unchecked<'static> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_function_local_type_alias_is_reported() {
+        // Codex, issue #92's fifth round: a `type` alias declared *inside* a helper's own
+        // body is legal Rust, and the earlier fix only walked file items and inline modules
+        // — a function-local one was invisible to it. `struct_literal_counts` now gives
+        // every block its own alias scope, so this forge is caught the same way a
+        // file-scoped one already is.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {\n\
+               \x20   type Unchecked<'a> = CheckedDispatch<'a>;\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_parenthesized_type_alias_is_reported() {
+        // Codex, issue #92's sixth round: `(CheckedDispatch<'a>)` is valid Rust on a `type`
+        // alias's right-hand side — `#[allow(unused_parens)]` lets it through `-D warnings`
+        // — and `syn` represents it as `Type::Paren`, which the earlier fix's `Type::Path`
+        // match did not see through. `type_alias_target` now unwraps parens (and macro
+        // hygiene groups) recursively, so this forge is caught the same way an unparenthesized
+        // one already is.
+        let source = tests_support::clean_effect_module()
+            + "#[allow(unused_parens)]\n\
+               type Unchecked<'a> = (CheckedDispatch<'a>);\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Unchecked<'static> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_field_assignment_is_reported() {
+        // Codex, issue #92's seventh round: `CheckedDispatch`'s fields are private to the
+        // *module*, not to the type, so a sibling `pub(crate)` helper elsewhere in
+        // `effect.rs` can already write `dispatch.bytes = other;` on a legitimately built
+        // value — no struct literal anywhere, so every construction pin sees nothing.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(\n\
+               \x20   mut dispatch: CheckedDispatch<'a>,\n\
+               \x20   other: &'a [u8],\n\
+               ) -> CheckedDispatch<'a> {\n\
+               \x20   dispatch.bytes = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_mutable_reference_is_reported() {
+        // The same rewrite without an `=` in sight: `mem::swap` (and `mem::replace`, and any
+        // other function taking `&mut T`) all start from a `&mut` reference to the field.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(dispatch: &mut CheckedDispatch<'a>, other: &mut &'a [u8]) {\n\
+               \x20   core::mem::swap(&mut dispatch.bytes, other);\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_mutating_method_call_is_reported() {
+        // Codex, issue #92's eighth round: `x.field.clone_from(&other)` reassigns the field
+        // through an *implicit* `&mut self` autoref — no `=`, no explicit `&mut` anywhere in
+        // the source, so neither of the previous round's two routes saw it.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(mut dispatch: CheckedDispatch<'a>, other: &'a [u8]) -> CheckedDispatch<'a> {\n\
+               \x20   dispatch.bytes.clone_from(&other);\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_ref_mut_pattern_binding_is_reported() {
+        // Codex, issue #92's ninth round: `let CheckedDispatch { bytes: ref mut slot, .. } =
+        // dispatch;` borrows `bytes` mutably through the pattern itself — no `=`, no `&mut`
+        // expression, no method call, so none of the first three rounds' routes saw it.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(dispatch: CheckedDispatch<'a>, other: &'a [u8]) -> CheckedDispatch<'a> {\n\
+               \x20   let CheckedDispatch { bytes: ref mut slot, .. } = dispatch;\n\
+               \x20   *slot = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_qself_type_alias_is_reported() {
+        // Codex, issue #92's ninth round: `<T as Trait>::Assoc` can resolve to any struct the
+        // trait's `impl` chooses, and `type_alias_target` deliberately skips every qualified
+        // path rather than guess. Skipping is not the same as permitting: this pin refuses
+        // the alias outright instead.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<'a> = <Via as Alias>::Dispatch;\n\
+               pub(crate) fn forge<'a>(intent: DurableIntent) -> Unchecked<'a> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("Unchecked") && detail.contains("projection")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_assignment_beneath_a_guarded_ancestor_is_reported() {
+        // Codex, issue #92's tenth round: `dispatch.intent.id.run = other;` assigns to
+        // `run`, not to a guarded name directly — but `intent` and `id` are both guarded
+        // ancestors in the chain, and rewriting through either reaches the same identity the
+        // earlier field-rebinding fixes exist to protect.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper(mut dispatch: CheckedDispatch<'static>, other: RunId) -> CheckedDispatch<'static> {\n\
+               \x20   dispatch.intent.id.run = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("intent") || detail.contains("id")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_never_built_inside_perform_is_reported() {
+        let source = tests_support::clean_effect_module().replace(
+            "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",
+            "pub fn perform(&self) -> u8 {\n        0\n    }",
+        );
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("it has to come from the one place")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_submodule_in_the_pinned_file_is_reported() {
         // `inherent_impl_bodies` reads `impl` at column zero, so an indented one in a nested
         // module escapes every method pin above.
@@ -16006,6 +16390,29 @@ impl DurableIntent {
     pub const fn id(self) -> EffectId {
         self.id
     }
+
+    /// The kind step 3 scheduled.
+    pub const fn kind(self) -> u8 {
+        0
+    }
+}
+
+/// An identity and its bytes, bound together after the check passes.
+pub struct CheckedDispatch<'a> {
+    intent: DurableIntent,
+    bytes: &'a [u8],
+}
+
+impl<'a> CheckedDispatch<'a> {
+    /// The identity this dispatch is under.
+    pub const fn durable_intent(self) -> DurableIntent {
+        self.intent
+    }
+
+    /// The checked bytes.
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 /// The protocol between effects.
@@ -16061,6 +16468,14 @@ impl<C: IntegrityCheck> Dispatchable<C> {
     /// What step 4 dispatches under.
     pub const fn intent(&self) -> DurableIntent {
         self.intent
+    }
+
+    /// Step 4, checked against what step 3 recorded.
+    pub fn perform(&self) -> CheckedDispatch<'_> {
+        CheckedDispatch {
+            intent: self.intent,
+            bytes: &[],
+        }
     }
 
     /// Steps 5, 6 and 7.

@@ -217,13 +217,35 @@ pub fn use_aliases(contents: &str) -> Result<Vec<UseAlias>, syn::Error> {
     Ok(aliases)
 }
 
-fn collect_item_aliases(
-    items: &[syn::Item],
+/// Every `use` binding and `type` alias declared by `items`, recursing into inline modules.
+///
+/// A `use` alias and a `type` alias resolve the same way: both map a local name to the path
+/// it stands for, so `use Sealable as S;` followed by `S { .. }` and
+/// `type Unchecked<'a> = CheckedDispatch<'a>;` followed by `Unchecked { .. }` are one shape
+/// to every caller that resolves through this list — `struct_literal_counts`,
+/// `resolved_path_uses` and `future_trait_implementors` all do. Codex found the type-alias
+/// gap on a third round of review of issue #92's construction-site pin: a `type` alias
+/// forwarded to `CheckedDispatch`, and a literal spelled through the alias's name was
+/// invisible to a scan that resolved only `use` bindings.
+///
+/// A `type` alias's right-hand side counts only when it is a plain type path — generics on
+/// either side are not part of a struct literal's path and are dropped. A right-hand side
+/// that is not a type path (a tuple, a reference, a trait object, a qualified
+/// `<T as Trait>::Type`) introduces no alias: there is no single final segment for a struct
+/// literal to be counted against.
+///
+/// `items` need not be a whole file's items: [`struct_literal_counts`] calls this once more
+/// per block, over the items declared directly in that block's own statements, to resolve a
+/// function-local alias in the scope it is actually visible in (issue #92, Codex's fifth
+/// round: a `type` alias declared inside a function body is invisible to a scan that walks
+/// only file items and inline modules).
+fn collect_item_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
     prefix: &mut Vec<String>,
     aliases: &mut Vec<UseAlias>,
 ) {
     for item in items {
-        // A `#[cfg(test)]` import is not in the shipped code, so it resolves nothing —
+        // A `#[cfg(test)]` declaration is not in the shipped code, so it resolves nothing —
         // the structural half of what `without_test_modules` did textually (issue #51).
         if has_cfg_test(item_attrs(item)) {
             continue;
@@ -235,6 +257,15 @@ fn collect_item_aliases(
                 prefix,
                 aliases,
             ),
+            syn::Item::Type(type_item) => {
+                if let Some(target) = type_alias_target(&type_item.ty) {
+                    aliases.push(UseAlias {
+                        local: ident_name(&type_item.ident),
+                        target,
+                        absolute: false,
+                    });
+                }
+            }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_item_aliases(nested, prefix, aliases);
@@ -245,7 +276,7 @@ fn collect_item_aliases(
     }
 }
 
-/// The `use` bindings `items` declares directly, at its own level only.
+/// The `use` and `type` bindings `items` declares directly, at its own level only.
 ///
 /// Unlike [`collect_item_aliases`], this does not recurse into a nested `mod`.
 /// Real Rust scopes a `use` binding to the module that declares it: an inner
@@ -255,21 +286,135 @@ fn collect_item_aliases(
 /// rename and report a real, correct `impl` as a fifth future (issue #109
 /// review). Each caller that walks into a nested module must call this again
 /// on that module's own items, so every scope stays its own.
+///
+/// A `type` alias is scoped the same way — a module-local `type Unchecked = Foo;` is no
+/// more visible outside its module than a `use` rename is, so it is collected here rather
+/// than only at [`block_own_aliases`]'s function-body granularity.
 fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
     let mut aliases = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
-        if let syn::Item::Use(use_item) = item {
-            collect_tree_aliases(
+        match item {
+            syn::Item::Use(use_item) => collect_tree_aliases(
                 &use_item.tree,
                 use_item.leading_colon.is_some(),
                 &mut Vec::new(),
                 &mut aliases,
-            );
+            ),
+            syn::Item::Type(type_item) => {
+                if let Some(target) = type_alias_target(&type_item.ty) {
+                    aliases.push(UseAlias {
+                        local: ident_name(&type_item.ident),
+                        target,
+                        absolute: false,
+                    });
+                }
+            }
+            _ => {}
         }
     }
+    aliases
+}
+
+/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
+fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => Some(
+            type_path
+                .path
+                .segments
+                .iter()
+                .map(|segment| ident_name(&segment.ident))
+                .collect(),
+        ),
+        // `(CheckedDispatch<'a>)` is valid Rust — `#[allow(unused_parens)]` even lets it
+        // through `-D warnings` — and `syn` keeps the parens as their own node rather than
+        // discarding them, so the path underneath is invisible without unwrapping one more
+        // layer. `Type::Group` is the same shape, for a macro's own hygiene grouping. Both
+        // recurse, so `((CheckedDispatch))` unwraps to the same target in two hops.
+        syn::Type::Paren(inner) => type_alias_target(&inner.elem),
+        syn::Type::Group(inner) => type_alias_target(&inner.elem),
+        _ => None,
+    }
+}
+
+/// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names a qualified
+/// associated-type projection — `<T as Trait>::Assoc`, or `<T>::Assoc` with no `as`.
+fn type_is_qself_projection(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) => type_path.qself.is_some(),
+        syn::Type::Paren(inner) => type_is_qself_projection(&inner.elem),
+        syn::Type::Group(inner) => type_is_qself_projection(&inner.elem),
+        _ => false,
+    }
+}
+
+/// Every `type` alias `contents` declares — at file scope, in an inline module, or inside a
+/// function body — whose right-hand side is a qualified associated-type projection, outside
+/// `#[cfg(test)]`.
+///
+/// `<T as Trait>::Assoc` can name any struct the trait's `impl` chooses — `CheckedDispatch`
+/// included — and following it needs type inference `syn` does not have. A plain type alias
+/// already resolves a plain path and one wrapped in parens; a projection is the one shape it
+/// cannot safely treat as "not an alias" the way it treats a
+/// tuple, a reference or a trait object, because unlike those a projection genuinely can
+/// resolve to a struct usable in `Name { .. }` position. So this reports the alias's own
+/// name instead of silently skipping it, for a caller to refuse the file outright rather
+/// than resolve what it cannot see.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error> {
+    struct QSelfAliases {
+        found: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for QSelfAliases {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+            if type_is_qself_projection(&node.ty) {
+                self.found.push(ident_name(&node.ident));
+            }
+            syn::visit::visit_item_type(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = QSelfAliases { found: Vec::new() };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
+/// The `use` and `type` aliases `block` declares directly in its own statements — not in a
+/// nested block, which gets its own scope when [`struct_literal_counts`]'s visitor reaches it
+/// (issue #92, Codex's fifth round: a function-local alias is invisible to a scan built for
+/// module-level declarations only).
+fn block_own_aliases(block: &syn::Block) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    collect_item_aliases(
+        block.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        }),
+        &mut Vec::new(),
+        &mut aliases,
+    );
     aliases
 }
 
@@ -331,7 +476,7 @@ impl ResolvedPath {
     }
 }
 
-/// Every path written in `contents`, with the file's `use` aliases resolved.
+/// Every path written in `contents`, with the file's `use` and `type` aliases resolved.
 ///
 /// The visitor skips `use` items themselves: importing a name is not using it.
 /// Paths inside macro invocations are invisible to `syn`'s visitor, so a pinned
@@ -421,7 +566,10 @@ fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
     }
     let mut scope = stack.len().saturating_sub(1);
     // A renamed re-export chains one alias to another, possibly through
-    // another scope (issue #109). Bounded by every alias reachable from
+    // another scope (issue #109), and a `type` alias chains the same way —
+    // `type A = B; type B = CheckedDispatch;` is two aliases, and a literal
+    // spelled `A { .. }` has to reach `CheckedDispatch` through both (issue
+    // #92, Codex's fourth round). Bounded by every alias reachable from
     // here, across the whole stack: enough for any real chain, and it
     // stops a crafted cycle (`use a as b; use b as a;`) from looping
     // forever.
@@ -472,6 +620,62 @@ fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
             _ => break,
         }
     }
+}
+
+/// [`resolve_segments`], over a stack that mixes module scopes (opaque) and block scopes
+/// (transparent) — [`struct_literal_counts`]'s own need, for issue #92's local `type`
+/// alias.
+///
+/// A module does not inherit an outer scope's aliases just by lexical nesting (issue #109);
+/// a block does — real Rust resolves a bare name against every block it is lexically inside
+/// of, with no `super::` needed, before it falls back to the enclosing module. So a lookup
+/// that misses at `scope` continues outward only while each scope it crosses is marked
+/// transparent (`true`), stopping at — but still checking — the first opaque one.
+fn resolve_segments_through_blocks(
+    path: &syn::Path,
+    stack: &[(Vec<UseAlias>, bool)],
+) -> Vec<String> {
+    let mut segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    if path.leading_colon.is_some() {
+        return segments;
+    }
+    let mut scope = stack.len().saturating_sub(1);
+    let bound: usize = stack.iter().map(|(aliases, _)| aliases.len()).sum();
+    for _ in 0..=bound {
+        consume_scope_prefix(&mut segments, &mut scope);
+        let Some(first) = segments.first() else {
+            break;
+        };
+        let mut probe = scope;
+        let found = loop {
+            let Some((aliases, transparent)) = stack.get(probe) else {
+                break None;
+            };
+            if let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) {
+                break Some(alias);
+            }
+            if *transparent && probe > 0 {
+                probe -= 1;
+            } else {
+                break None;
+            }
+        };
+        let Some(alias) = found else {
+            break;
+        };
+        let mut resolved = alias.target.clone();
+        resolved.extend(segments.drain(1..));
+        segments = resolved;
+        if alias.absolute {
+            return segments;
+        }
+    }
+    consume_scope_prefix(&mut segments, &mut scope);
+    segments
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
@@ -533,6 +737,157 @@ fn collect_future_implementors(
             _ => {}
         }
     }
+}
+
+/// Every name in `names` that `contents` writes to as a struct field, outside
+/// `#[cfg(test)]` — in any of the three ways a field's value can be rewritten in place
+/// rather than rebuilt.
+///
+/// A plain assignment, `x.field = value;`, is one route. A `&mut` reference taken to the
+/// field is the second — `std::mem::swap(&mut x.field, &mut y.field)`,
+/// `std::mem::replace(&mut x.field, value)`, and passing the reference to an arbitrary
+/// function that takes `&mut T` are all routes to the same rewrite that spell no `=` at all,
+/// and all three need a `&mut` to the field first, which is the shape this refuses. A
+/// *method* call on the field is the third, and the one that needs neither: `x.field.
+/// clone_from(&other)` autorefs `&mut x.field` implicitly, with no `&mut` token written
+/// anywhere — so every method call on a guarded field is refused outright, since telling a
+/// mutating method from a read-only one needs type inference `syn` does not have. A method
+/// called on the whole *value* (`x.field()`, an accessor) is unaffected: its receiver is a
+/// plain path, not a field access. A `ref mut` binding in a struct pattern is the fourth:
+/// `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the pattern
+/// itself, with no assignment, no `&mut` expression and no method call anywhere for the
+/// first three routes to see. A field bound `mut slot` with no `ref` is not this: it moves
+/// or copies the value into a fresh local, which is a read, and rebuilding `x` from that
+/// local afterward is a struct literal the construction pins already cover.
+///
+/// A name is matched on the field member alone, not on the receiver's type — `syn` sees
+/// syntax, not types, so `x.bytes = value` is refused for any `x` once `"bytes"` is in
+/// `names`, whatever `x` turns out to be. That is deliberately broader than exact: a
+/// coincidental field of the same name elsewhere in the file becomes a review question
+/// rather than a silent gap, the same standing `wire-format`'s literal comparison and
+/// `effect-scheduled-fields`'s name comparison already have.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>, syn::Error> {
+    /// Whether `pat`, or any sub-pattern it contains, binds by `ref mut`.
+    ///
+    /// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
+    /// [`syn::Pat`] variant, so a `ref mut` nested inside a struct, tuple, tuple-struct,
+    /// slice or paren pattern is found the same way regardless of how deep it sits — the
+    /// traversal is `syn`'s own, only the question asked at each identifier is new.
+    fn pattern_binds_ref_mut(pat: &syn::Pat) -> bool {
+        struct RefMutBinding(bool);
+
+        impl<'ast> syn::visit::Visit<'ast> for RefMutBinding {
+            fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+                if node.by_ref.is_some() && node.mutability.is_some() {
+                    self.0 = true;
+                }
+                syn::visit::visit_pat_ident(self, node);
+            }
+        }
+
+        let mut visitor = RefMutBinding(false);
+        visitor.visit_pat(pat);
+        visitor.0
+    }
+
+    struct Mutations<'a> {
+        names: &'a [&'a str],
+        found: Vec<String>,
+    }
+
+    impl Mutations<'_> {
+        fn note(&mut self, expr: &syn::Expr) {
+            // Walks the whole chain of field accesses, not only the outermost one:
+            // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent` and
+            // `request` are guarded *ancestors* in the same chain, and rewriting through
+            // either is the rewrite this whole family of checks exists to catch (issue #92,
+            // Codex's tenth round). Stops at the first non-field expression, which is the
+            // root the chain is built on.
+            let mut current = expr;
+            while let syn::Expr::Field(field) = current {
+                if let syn::Member::Named(ident) = &field.member {
+                    let name = ident_name(ident);
+                    if self.names.contains(&name.as_str()) {
+                        self.found.push(name);
+                    }
+                }
+                current = &field.base;
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+            self.note(&node.left);
+            syn::visit::visit_expr_assign(self, node);
+        }
+
+        fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+            if node.mutability.is_some() {
+                self.note(&node.expr);
+            }
+            syn::visit::visit_expr_reference(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            // `x.field.clone_from(&other)` reassigns `field` through an *implicit* `&mut
+            // self` autoref: nothing in the source spells `=` or `&mut`, so this is a third
+            // route neither `visit_expr_assign` nor `visit_expr_reference` can see. Which
+            // method is called, and whether it really takes `&mut self`, needs type
+            // inference `syn` does not have — so every method call on a guarded field is
+            // refused, not only the ones a reviewer could confirm are mutating. A method
+            // called on the whole *value* (`dispatch.bytes()`, the accessor every legitimate
+            // caller already uses) has a receiver that is a plain path, not a field access,
+            // so it is unaffected.
+            self.note(&node.receiver);
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+            // `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the
+            // pattern itself — no `Expr::Assign`, no `Expr::Reference`, and no method call
+            // anywhere, so none of the three routes above sees it. A field bound `mut slot`
+            // with no `ref` just moves or copies the value into a fresh local, which is a
+            // read: rebinding that local cannot write back to `x.field`, and rebuilding `x`
+            // from `slot` afterward is a struct literal the construction pins already cover.
+            // So the shape that matters is `ref mut` specifically, and it can be arbitrarily
+            // nested (`field: Inner { deeper: ref mut slot, .. }`), which is why this walks
+            // the whole sub-pattern rather than checking only its outermost shape.
+            if let syn::Member::Named(ident) = &node.member {
+                let name = ident_name(ident);
+                if self.names.contains(&name.as_str()) && pattern_binds_ref_mut(&node.pat) {
+                    self.found.push(name);
+                }
+            }
+            syn::visit::visit_field_pat(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = Mutations {
+        names,
+        found: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
 }
 
 /// How many `fn name` items `contents` declares, at any nesting depth.
@@ -657,13 +1012,16 @@ pub struct LiteralCounts {
 }
 
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
-/// resolving the file's `use` aliases — in total and inside a function body.
+/// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
 /// `use Sealable as S;` followed by `S { .. }` counts (issue #99): the literal's path
 /// resolves through the alias to the segments of `Sealable`'s import path, so the final
-/// segment is `Sealable` whatever the construction site spells. Items under exactly
-/// `#[cfg(test)]` are skipped, structurally — the old textual pipeline blanked them
-/// after lexing comments and strings out, and `syn` sees attributes directly (issue #51).
+/// segment is `Sealable` whatever the construction site spells. `type Unchecked<'a> =
+/// CheckedDispatch<'a>;` followed by `Unchecked { .. }` counts the same way (issue #92,
+/// Codex's third round): a `type` alias is resolved exactly like a `use` alias, chased
+/// through a chain of either. Items under exactly `#[cfg(test)]` are skipped, structurally —
+/// the old textual pipeline blanked them after lexing comments and strings out, and `syn`
+/// sees attributes directly (issue #51).
 ///
 /// Struct literals, not declarations or patterns: `syn` reads [`syn::ExprStruct`], so
 /// `struct Sealable {`, `impl Sealable {`, `fn barrier(self) -> Sealable {`, and
@@ -686,7 +1044,11 @@ pub fn struct_literal_counts(
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
     struct Literals {
-        stack: Vec<Vec<UseAlias>>,
+        // `stack[0]` is the file's top-level aliases; a later entry is one module or block
+        // nested inside the last, pushed on entry and popped on exit by `visit_item_mod` and
+        // `visit_block`. The `bool` is whether a lookup that misses here falls through to
+        // the scope below — see `resolve_segments_through_blocks`.
+        stack: Vec<(Vec<UseAlias>, bool)>,
         name: String,
         count: usize,
     }
@@ -715,9 +1077,11 @@ pub fn struct_literal_counts(
             // its own name and attributes must still be visited the default
             // way — an early return here had skipped them (Codex review,
             // PR #160), hiding a banned identifier spelled as a module name.
+            // A module is opaque (`false`): unlike a block, a name that misses here does
+            // not fall through to the enclosing scope without an explicit `super::`.
             let pushed = node.content.is_some();
             if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(own_aliases(items));
+                self.stack.push((own_aliases(items), false));
             }
             syn::visit::visit_item_mod(self, node);
             if pushed {
@@ -725,8 +1089,20 @@ pub fn struct_literal_counts(
             }
         }
 
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            // A function-local `use` or `type` alias is visible only inside the block that
+            // declares it (issue #92, Codex's fifth round), so every block gets its own
+            // scope rather than one flat, file-wide list — the same rule `visit_item_mod`
+            // enforces for a module, on the same stack. A block is transparent (`true`):
+            // real Rust resolves a bare name against every enclosing block, with no
+            // `super::` needed, unlike a module.
+            self.stack.push((block_own_aliases(node), true));
+            syn::visit::visit_block(self, node);
+            self.stack.pop();
+        }
+
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            let resolved = resolve_segments(&node.path, &self.stack);
+            let resolved = resolve_segments_through_blocks(&node.path, &self.stack);
             if resolved
                 .last()
                 .is_some_and(|last| last.as_str() == self.name)
@@ -740,7 +1116,7 @@ pub fn struct_literal_counts(
     let file = parse_rust(contents)?;
 
     let mut total = Literals {
-        stack: vec![own_aliases(&file.items)],
+        stack: vec![(own_aliases(&file.items), false)],
         name: name.to_owned(),
         count: 0,
     };
@@ -749,7 +1125,11 @@ pub fn struct_literal_counts(
     let mut inside_count = 0_usize;
     for target in inside_targets(&file, &inside) {
         let mut visitor = Literals {
-            stack: target.stack().to_vec(),
+            stack: target
+                .stack()
+                .iter()
+                .map(|module_scope| (module_scope.clone(), false))
+                .collect(),
             name: name.to_owned(),
             count: 0,
         };
@@ -1747,8 +2127,8 @@ mod raw_identifier_tests {
     //! every other parser in this file against the same rule.
     use super::{
         FnScope, child_modules, declares_test, fn_declaration_count, future_trait_implementors,
-        inner_attributes, name_uses, resolved_path_uses, struct_literal_counts, trait_impls,
-        use_aliases,
+        inner_attributes, mutated_field_names, name_uses, qself_type_alias_names,
+        resolved_path_uses, struct_literal_counts, trait_impls, use_aliases,
     };
 
     #[test]
@@ -1846,6 +2226,352 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.inside, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_resolves_to_the_type_it_stands_for() {
+        // Codex, issue #92's third round: a `type` alias must resolve the same way a `use`
+        // alias does, or `Unchecked { .. }` hides a `CheckedDispatch` construction from a
+        // scan that only chased `use` bindings.
+        let counts = struct_literal_counts(
+            "type Unchecked<'a> = Foo<'a>; fn forge() -> Unchecked<'static> { Unchecked {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chained_type_alias_still_resolves() {
+        // `type A = B; type B = Foo;` is two aliases, and `A { .. }` has to reach `Foo`
+        // through both — a one-hop resolver would stop at `B` and count nothing.
+        let counts = struct_literal_counts(
+            "type A = B; type B = Foo; fn forge() -> A { A {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_of_a_use_alias_still_resolves() {
+        // A chain need not be all one kind: `use Sealable as S; type Unchecked = S;` mixes a
+        // `use` alias and a `type` alias, and both have to be chased to reach `Sealable`.
+        let counts = struct_literal_counts(
+            "use Sealable as S; type Unchecked = S; fn forge() -> Unchecked { Unchecked {} }",
+            "Sealable",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_function_local_type_alias_still_resolves() {
+        // Codex, issue #92's fifth round: a `type` alias declared *inside* a function body
+        // is legal Rust and was invisible to a scan that only walked file items and inline
+        // modules. `Unchecked` here exists only within `forge`'s block.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = Foo;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_in_a_nested_block_still_resolves() {
+        // The alias need not be at the top of the function body: an `if` arm's own block is
+        // a block too, and gets its own scope when the visitor reaches it.
+        let counts = struct_literal_counts(
+            "fn forge(flag: bool) -> u8 {\n\
+             \x20   if flag {\n\
+             \x20       type Unchecked = Foo;\n\
+             \x20       let _ = Unchecked {};\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_local_alias_does_not_leak_into_a_sibling_scope() {
+        // A block-local alias shadows only its own scope. `Unchecked` in `other` means
+        // something else, so its literal must not be counted as `Foo`.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = Foo;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }\n\
+             fn other() -> u8 {\n\
+             \x20   type Unchecked = Bar;\n\
+             \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_type_alias_still_resolves() {
+        // Codex, issue #92's sixth round: `(Foo)` is valid Rust on a `type` alias's
+        // right-hand side, `#[allow(unused_parens)]` lets it through `-D warnings`, and
+        // `syn` keeps the parens as their own `Type::Paren` node rather than discarding
+        // them — so the path underneath was invisible without unwrapping one more layer.
+        let counts = struct_literal_counts(
+            "#[allow(unused_parens)]\n\
+             type Unchecked<'a> = (Foo<'a>);\n\
+             fn forge() -> Unchecked<'static> { Unchecked {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_doubly_parenthesized_type_alias_still_resolves() {
+        // Nested parens unwrap in more than one hop.
+        let counts = struct_literal_counts(
+            "#[allow(unused_parens)]\n\
+             type Unchecked<'a> = ((Foo<'a>));\n\
+             fn forge() -> Unchecked<'static> { Unchecked {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_plain_field_assignment_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo) -> Foo {\n\
+             \x20   dispatch.bytes = other;\n\
+             \x20   dispatch\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_mutable_reference_to_a_field_is_reported() {
+        // `mem::swap`/`mem::replace`/an arbitrary `&mut`-taking call all start here, and
+        // none of them spells `=`.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: &mut Bytes) {\n\
+             \x20   core::mem::swap(&mut dispatch.bytes, other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_shared_reference_to_a_field_is_not_reported() {
+        // `&x.field` cannot mutate anything, so it is not a rewrite route.
+        let found = mutated_field_names(
+            "fn read(dispatch: &Foo) -> &Bytes {\n\
+             \x20   &dispatch.bytes\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_unnamed_field_name_is_not_reported() {
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo) {\n\
+             \x20   dispatch.0 = other;\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_field_write_under_cfg_test_is_not_reported() {
+        let found = mutated_field_names(
+            "#[cfg(test)]\n\
+             mod tests {\n\
+             \x20   fn tamper(mut dispatch: super::Foo) {\n\
+             \x20       dispatch.bytes = other;\n\
+             \x20   }\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_mutating_method_call_on_a_field_is_reported() {
+        // Codex, issue #92's eighth round: `x.field.clone_from(&other)` reassigns the field
+        // through an *implicit* `&mut self` autoref — no `=` and no explicit `&mut` anywhere
+        // in the source, so neither of the other two routes sees it.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: &Bytes) {\n\
+             \x20   dispatch.bytes.clone_from(other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_method_call_on_the_whole_value_is_not_reported() {
+        // `dispatch.bytes()` calls a method *named* `bytes` on `dispatch` — the receiver is
+        // `dispatch`, not a field access — which must stay legal: it is how every accessor in
+        // this file is called.
+        let found = mutated_field_names(
+            "fn read(dispatch: Foo) -> Bytes {\n\
+             \x20   dispatch.bytes()\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_ref_mut_struct_pattern_binding_is_reported() {
+        // Codex, issue #92's ninth round: `field: ref mut slot` borrows the field mutably
+        // through the pattern itself — no `=`, no `&mut` expression, no method call
+        // anywhere, so none of the first three routes sees it.
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo) {\n\
+             \x20   let Foo { bytes: ref mut slot, .. } = dispatch;\n\
+             \x20   *slot = other;\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_nested_ref_mut_struct_pattern_binding_is_reported() {
+        // The binding can sit arbitrarily deep, e.g. behind a second guarded field.
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo) {\n\
+             \x20   let Foo { intent: Bar { id: ref mut slot, .. }, .. } = dispatch;\n\
+             \x20   *slot = other;\n}",
+            &["id"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["id"], "{found:?}");
+    }
+
+    #[test]
+    fn a_by_value_struct_pattern_binding_is_not_reported() {
+        // `field: mut slot` (no `ref`) moves or copies the value into a fresh local: rebinding
+        // that local cannot write back to the original place.
+        let found = mutated_field_names(
+            "fn read(dispatch: Foo) {\n\
+             \x20   let Foo { bytes: mut slot, .. } = dispatch;\n\
+             \x20   slot = other;\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_qself_type_alias_is_reported() {
+        // Codex, issue #92's ninth round: `<T as Trait>::Assoc` can name any struct the
+        // trait's `impl` chooses, and following it needs type inference `syn` does not have.
+        let found = qself_type_alias_names("type Unchecked = <Via as Alias>::Dispatch;")
+            .expect("the fixture parses");
+        assert_eq!(found, ["Unchecked"], "{found:?}");
+    }
+
+    #[test]
+    fn a_qself_type_alias_with_no_trait_is_reported() {
+        // `<T>::Assoc`, with no `as Trait`, is the same projection shape.
+        let found = qself_type_alias_names("type Unchecked = <Via>::Dispatch;")
+            .expect("the fixture parses");
+        assert_eq!(found, ["Unchecked"], "{found:?}");
+    }
+
+    #[test]
+    fn a_plain_type_alias_is_not_a_qself_projection() {
+        let found = qself_type_alias_names("type Unchecked = Foo;").expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_qself_type_alias_is_reported() {
+        let found = qself_type_alias_names(
+            "#[allow(unused_parens)]\ntype Unchecked = (<Via as Alias>::Dispatch);",
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["Unchecked"], "{found:?}");
+    }
+
+    #[test]
+    fn a_qself_type_alias_under_cfg_test_is_not_reported() {
+        let found = qself_type_alias_names(
+            "#[cfg(test)]\nmod tests {\n    type Unchecked = <Via as Alias>::Dispatch;\n}",
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_assignment_beneath_a_guarded_ancestor_field_is_reported() {
+        // Codex, issue #92's tenth round: `dispatch.intent.request.kind = x;` assigns to
+        // `kind`, not to a guarded name directly — but `intent` and `request` are both
+        // guarded ancestors in the chain, and rewriting through either is the same rewrite
+        // this whole family of checks exists to catch.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, x: u8) {\n\
+             \x20   dispatch.intent.request.kind = x;\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_mutable_reference_beneath_a_guarded_ancestor_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo) {\n\
+             \x20   let r = &mut dispatch.intent.id.seq;\n}",
+            &["intent", "id"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["id", "intent"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_method_call_beneath_a_guarded_ancestor_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo, other: u8) {\n\
+             \x20   dispatch.intent.request.kind.clone_from(&other);\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
     }
 
     #[test]

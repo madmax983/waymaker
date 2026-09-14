@@ -25,7 +25,7 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::{
-    Activities, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Identity, Performed,
+    Activities, Boundary, Bridge, CheckedDispatch, Clocks, DriveError, Driver, Identity, Performed,
     Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
@@ -218,13 +218,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }

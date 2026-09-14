@@ -13,10 +13,10 @@
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
+use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
@@ -576,14 +576,8 @@ impl Clocks for Ticking {
 }
 
 impl Activities for Ticking {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
-        self.world.perform(intent, kind, input, out)
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+        self.world.perform(dispatch, out)
     }
 }
 
@@ -687,13 +681,7 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
     }
 
     impl Activities for Regressing {
-        fn perform(
-            &mut self,
-            _intent: DurableIntent,
-            _kind: ActivityKind,
-            _input: &[u8],
-            _out: &mut [u8],
-        ) -> Performed {
+        fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
             Performed::Pending
         }
     }
