@@ -666,12 +666,12 @@ pub const STORAGE_SHAPES: &[StorageShape] = &[
     StorageShape {
         id: "program-single-unit",
         sentence: "A program of exactly one program unit.",
-        issued_by: "the commit seal in `append::Sealable::commit` and `swap::Sealable::commit`",
+        issued_by: "`append::Sealable::commit`'s record commit seal, always exactly one unit by construction; and `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, on a program unit wide enough that the padded value fits one",
     },
     StorageShape {
         id: "program-multi-unit",
         sentence: "A program of more than one program unit in one call.",
-        issued_by: "the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage`",
+        issued_by: "`append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit",
     },
     StorageShape {
         id: "erase-single-block",
@@ -2537,6 +2537,17 @@ fn check_storage_shapes_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
             ));
             continue;
         };
+        if !row.contains(shape.sentence) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "{STORAGE_SHAPES_ADR}'s table row does not state this shape as `{}`, so \
+                     the record and the gate disagree about what the shape is",
+                    shape.sentence
+                ),
+            ));
+        }
         if !row.contains(shape.issued_by) {
             violations.push(Violation::new(
                 "storage-shapes",
@@ -4714,12 +4725,15 @@ pub mod tests_support {
     #[must_use]
     pub fn clean_storage_shapes_adr() -> String {
         let mut body = clean_adr("the storage-shape catalogue");
-        line(&mut body, format_args!("| Shape | Issued by |"));
-        line(&mut body, format_args!("| --- | --- |"));
+        line(&mut body, format_args!("| Shape | Sentence | Issued by |"));
+        line(&mut body, format_args!("| --- | --- | --- |"));
         for shape in STORAGE_SHAPES {
             line(
                 &mut body,
-                format_args!("| `{}` | {} |", shape.id, shape.issued_by),
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
             );
         }
         body

@@ -234,8 +234,8 @@ All 6 storage shapes, with the id to cite when a change touches one:
 
 | Id | Sentence | Issued by |
 | --- | --- | --- |
-| `program-single-unit` | A program of exactly one program unit. | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
-| `program-multi-unit` | A program of more than one program unit in one call. | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
+| `program-single-unit` | A program of exactly one program unit. | `append::Sealable::commit`'s record commit seal, always exactly one unit by construction; and `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, on a program unit wide enough that the padded value fits one |
+| `program-multi-unit` | A program of more than one program unit in one call. | `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit |
 | `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
 | `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
 | `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |

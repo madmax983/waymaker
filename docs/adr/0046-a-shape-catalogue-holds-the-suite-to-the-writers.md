@@ -15,11 +15,14 @@ multi-round effort.
 
 Item 2 is this ADR's: "every legal operation shape the firmware issues must appear in the
 suite". `waymaker-flash`'s writers issue a program or an erase of one unit and of more than
-one — the journal's frame body and the bank swap's header are wider than a single program
-unit for any non-trivial record, and the bank swap's erase spans more than one erase block on
-any device with at least four erase blocks — `BankLayout::new` sizes a bank at
-`erase_blocks >> 1`, so a three-block device still has a one-block bank. Before this, the
-suite's two multi-unit cases
+one. The journal's frame body, the bank swap's header and its generation seal are each
+*padded to the device's program unit*, so which shape any one of them has is a function of
+the record or header's own width and the geometry rather than fixed per writer — the same
+bank seal that pads to one program unit on a wide part pads to three on a narrow one. The bank
+swap's erase spans more than one erase block on any device with at least four erase blocks —
+`BankLayout::new` sizes a bank at `erase_blocks >> 1`, so a three-block device still has a
+one-block bank, and that shape *is* fixed per device, because a bank's size does not vary
+call to call. Before this, the suite's two multi-unit cases
 proved the *category* legal at a width of exactly two, and nothing stopped a *third* shape
 from going unexercised the way earlier review rounds found a *fourth* one had. A hand-written
 table would say so and rot the moment a case changed; what was missing was a check that fails
@@ -38,17 +41,18 @@ of one read unit and of more than one. A read wider than a record — the erased
 `recovery::Recovery` makes — is not a seventh row: it is still a multi-unit read, the same
 shape a wide record's read has, and a caller-chosen chunk size is not a shape of its own.
 
-**Each row names who issues it**, transcribed by a reviewer from `waymaker-flash`'s source
-the way `STORAGE_CONTRACT_CLAUSES` transcribes design document §12 rather than deriving it:
+**Each row states the shape and names who issues it**, transcribed by a reviewer from
+`waymaker-flash`'s source the way `STORAGE_CONTRACT_CLAUSES` transcribes design document §12
+rather than deriving it:
 
-| Shape | Issued by |
-| --- | --- |
-| `program-single-unit` | the commit seal in `append::Sealable::commit` and `swap::Sealable::commit` |
-| `program-multi-unit` | the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage` |
-| `erase-single-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
-| `erase-multi-block` | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
-| `read-single-unit` | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |
-| `read-multi-unit` | `recovery::Recovery::stage`'s whole-record read and its erased-tail walk |
+| Shape | Sentence | Issued by |
+| --- | --- | --- |
+| `program-single-unit` | A program of exactly one program unit. | `append::Sealable::commit`'s record commit seal, always exactly one unit by construction; and `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, on a program unit wide enough that the padded value fits one |
+| `program-multi-unit` | A program of more than one program unit in one call. | `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit |
+| `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
+| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
+| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |
+| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read and its erased-tail walk |
 
 **`shape::ShapeWitness` proves the claim rather than only stating it.** It wraps a
 `StableStorage` and, for every call the wrapped adapter *accepts*, records which shape it

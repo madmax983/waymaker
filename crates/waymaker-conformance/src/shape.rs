@@ -37,12 +37,12 @@ pub const SHAPES: &[Shape] = &[
     Shape {
         id: "program-single-unit",
         sentence: "A program of exactly one program unit.",
-        issued_by: "the commit seal in `append::Sealable::commit` and `swap::Sealable::commit`",
+        issued_by: "`append::Sealable::commit`'s record commit seal, always exactly one unit by construction; and `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, on a program unit wide enough that the padded value fits one",
     },
     Shape {
         id: "program-multi-unit",
         sentence: "A program of more than one program unit in one call.",
-        issued_by: "the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage`",
+        issued_by: "`append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit",
     },
     Shape {
         id: "erase-single-block",
