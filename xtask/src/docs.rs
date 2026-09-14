@@ -5222,6 +5222,125 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_an_inline_script_does_not_settle_anything() {
+        // Codex, pull request #138, round 31, finding 2: an inline `<script>` — one
+        // that opens mid-paragraph rather than starting its own block — reaches
+        // `Event::InlineHtml` for its own tags and ordinary `Event::Text` for its body,
+        // and nothing updated `open_non_rendering_tag` from an `InlineHtml` event, so
+        // the body between the tags reached `out` unhidden even though the tags
+        // themselves did not.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-an-inline-script.md".to_owned(),
+            contents: format!(
+                "{}\n\nbefore <script>{DEFERRED_QUESTION_MARKER} {}</script> after\n",
+                clean_adr("hidden in an inline script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside an inline script settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_between_nested_template_closes_does_not_settle_anything() {
+        // Codex, pull request #138, round 31, finding 3: a bare flag cleared on the
+        // first matching close treated a *nested* `<template>`'s own close as ending
+        // the whole element, even though the outer `<template>` — genuinely still open,
+        // since `<template>` content is parsed as ordinary HTML and really can nest —
+        // was not done yet. A marker between the inner close and the outer one read as
+        // visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-between-nested-templates.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n<template>\ninner\n</template>\n{DEFERRED_QUESTION_MARKER} \
+                 {}\n</template>\n",
+                clean_adr("hidden between nested templates"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker between nested template closes settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_commented_out_script_still_counts() {
+        // Codex, pull request #138, round 31, finding 4: the non-rendering tracker ran
+        // blind to comment spans, so a `<script>` written *inside* a closed HTML
+        // comment — `<div><!-- <script> --></div>` — was read as a real opening tag
+        // with no real close ever coming, hiding every line after it for good, this
+        // decision included.
+        //
+        // `check_deferred_questions` is not the vehicle for this one: it runs its own,
+        // separate `without_html_comments` over an ADR's *raw* contents before ever
+        // reaching `markdown_prose`, so a comment — real or, as here, one merely
+        // containing a decoy tag — is already gone by the time this module's own
+        // comment-and-tag scanning would see it, and a bug in that scanning could never
+        // surface through that path. `check_settled_decisions` calls `markdown_prose`
+        // directly on an ADR's raw contents, with no such pre-stripping, so it is what
+        // this fix actually has to be verified against.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- <script> --></div>\n\n{}\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after a commented-out script did not count: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_before_a_same_line_script_still_counts() {
+        // Codex, pull request #138, round 31, finding 1: when one `Event::Html` line
+        // opens and closes a non-rendering element without the whole line being
+        // non-rendering — `<div>id<script>hidden</script>headline</div>` — the
+        // line-consuming design of round 30 discarded the whole line rather than only
+        // the `<script>` element's own subrange, so the real, visible id before it and
+        // headline after it were both lost along with it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{}<script>hidden</script>{}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision around a same-line script did not count: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the
