@@ -3555,3 +3555,15 @@ kind of input this design has never claimed to survive: this function's whole po
 check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #153 asks a specific question: does a host-side instruction profile justify a CRC
+lookup table? For `crc32` the answer is no. ADR 0010 requires evidence from real flash,
+measured against a stated latency limit. A host profile is not that evidence. Its table
+stays declined. For `crc16` the question does not apply. `0x1021`'s three set bits each
+land a 4-bit nibble in its own span, with no overlap. So a nibble's four bitwise rounds
+equal one multiply. No table is needed. `crc16` now folds two nibble-rounds per byte this
+way; `crc32`'s reflected polynomial has overlapping spans and keeps its eight-round
+bitwise loop. Same algorithms, same outputs, checked
+exhaustively in `crates/waymaker-flash/src/crc.rs`. See
+[ADR 0046](docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md),
+which supersedes one sentence of ADR 0010's decision text and nothing else in it.
