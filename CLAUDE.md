@@ -1413,7 +1413,13 @@ Stated so that nobody mistakes silence for coverage:
   two lines neither of which reads as a whole declaration, the same shape the wrapped-value
   residual above is. Both need a token parser rather than a line scanner, which is a larger
   change than this issue's three bans; each is a hand-written, `#[rustfmt::skip]`-guarded
-  spelling rather than one `cargo fmt` produces.
+  spelling rather than one `cargo fmt` produces. A third stays open for the same reason and
+  needs more than a token parser: `implements_trait_for` compares a written name, so
+  `type Alias = ClockKind; impl Forge for Alias { .. }` is invisible to it, the same way a
+  glob import is invisible to the `syn`-based scanners issue #51 built — "what the parsed
+  scanners cannot resolve", above, in [what is not checked](#what-is-not-checked), is the
+  same floor, one scanner over. Resolving an alias needs a name-resolution pass this
+  workspace's gate does not have for any of its scanners, textual or parsed.
 - **That a pinned timer type is the type the crate ships.** `timer-capability`'s member pin
   reads a header string, so a rename that carries the crate root with it — `TimerSpec` becomes
   `TimerSpecV2`, a decoy `mod compat` keeps the pinned name and the pinned members — leaves it
