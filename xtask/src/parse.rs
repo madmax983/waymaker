@@ -1429,21 +1429,107 @@ pub struct FoundArm {
 /// argument is, against every `const` visible at the match's own position, rather than read
 /// as "not a literal" and let through unclassified.
 ///
+/// `contents` is walked *twice*. Codex's finding: a single pass populates `qualified` only
+/// as it *reaches* each module, so a match textually before the `mod` it qualifies a
+/// pattern against read every one of that module's constants as unresolved — Rust's own
+/// item lookup does not care about declaration order, and a single left-to-right walk
+/// cannot honour that. The first pass exists only to finish `qualified`, its own matches
+/// discarded; the second is the real one, with every module-qualified constant `contents`
+/// declares already in view regardless of where in the file it sits. `external_qualified`
+/// seeds both passes, so a caller can fold in constants declared in another file of the
+/// same checksum module tree — a qualified reference is not confined to the file that
+/// declares the module it names.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust — the caller fails closed
 /// on this, the same as every other structural query in this module.
-pub fn match_expressions(contents: &str) -> Result<Vec<FoundMatch>, syn::Error> {
+#[allow(
+    clippy::implicit_hasher,
+    reason = "this crate never receives a caller-chosen hasher; every map it builds and \
+              passes is `std::collections::HashMap`'s default, so generalising the \
+              parameter buys no caller anything and only widens the signature"
+)]
+pub fn match_expressions(
+    contents: &str,
+    external_qualified: &std::collections::HashMap<String, u128>,
+) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         module_path: Vec::new(),
-        qualified: std::collections::HashMap::new(),
+        qualified: external_qualified.clone(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
+    visitor.found.clear();
+    visitor.visit_file(&file);
     Ok(visitor.found)
+}
+
+/// Every module-qualified `const` `contents` declares on its own, independent of whether any
+/// match anywhere references it.
+///
+/// The half of [`match_expressions`]'s own two-pass resolution a caller needs *before*
+/// scanning any file of a multi-file checksum module tree: Codex's finding is that a
+/// qualified reference is not confined to the file that declares the module it names, so a
+/// single file's own two-pass walk is not enough on its own — a caller combines every
+/// file's own [`qualified_constants`] first and passes the result to [`match_expressions`]
+/// as `external_qualified` for every file in the tree.
+///
+/// Equivalent to [`qualified_constants_with_prefix`] with an empty prefix: for a file that
+/// is not itself the out-of-line body of a `mod` declared somewhere else, that is the whole
+/// answer, because every constant this function can see either sits at that file's own
+/// root — with no module of its own to be qualified under — or inside a `mod { ... }` this
+/// file declares inline, which `qualified_constants_with_prefix` already walks into either
+/// way.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn qualified_constants(
+    contents: &str,
+) -> Result<std::collections::HashMap<String, u128>, syn::Error> {
+    qualified_constants_with_prefix(contents, &[])
+}
+
+/// [`qualified_constants`], with `prefix` seeded as the module path `contents`' own file
+/// sits at.
+///
+/// `prefix` is the segments an out-of-line `mod name;` declared in some *other* file
+/// gives it, empty for a file nothing declares this way. Codex's finding: an out-of-line
+/// declaration's content lives in a different file than the `mod` keyword that names it,
+/// so nothing before this ever told `contents`'s own root scope what module path it
+/// answers to — `visit_item_mod` only records a module's constants when it can see that
+/// module's content, and this file's root items are never inside a `mod { ... }` node *of
+/// their own*. Seeding `prefix` closes that: the visitor's module path starts there
+/// instead of empty, and this file's own top-level constants are recorded under it
+/// explicitly, the one thing a walk of `contents` alone has no way to know on its own.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn qualified_constants_with_prefix(
+    contents: &str,
+    prefix: &[String],
+) -> Result<std::collections::HashMap<String, u128>, syn::Error> {
+    let file = parse_rust(contents)?;
+    let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
+    let mut qualified = std::collections::HashMap::new();
+    if !prefix.is_empty() {
+        for (name, value) in &base {
+            qualified.insert(format!("{}::{name}", prefix.join("::")), *value);
+        }
+    }
+    let mut visitor = MatchVisitor {
+        scopes: ConstScopes(vec![base]),
+        module_path: prefix.to_vec(),
+        qualified,
+        found: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.qualified)
 }
 
 /// A stack of constant scopes, outermost first, each mapping a `const` name declared

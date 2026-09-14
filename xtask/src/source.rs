@@ -8469,6 +8469,28 @@ fn check_integrity_check_module_tree(
     // tree is a candidate, and one is only excused when it is, exactly, the one table
     // `INTEGRITY_CHECK_TABLES` names — counted, so a byte-identical copy under a second
     // function name is still a second table rather than a coincidence.
+    // Codex's finding: `qualified` used to start empty and grow only as `match_expressions`
+    // reached each inline module, so a match textually *before* the `mod` it references
+    // — or one in another file of the same tree entirely — never resolved. Rust's own item
+    // lookup is neither order- nor file-dependent inside one module tree, so this collects
+    // every module-qualified constant the whole tree declares, from every scanned source,
+    // before any of them is checked for a dense match. `module_path_prefixes` is what makes
+    // an out-of-line `mod indices;` resolve at all: without a declaration's own name seeded
+    // as that file's prefix, `indices.rs`'s own top-level constants have no module to be
+    // qualified under, because the declaration naming them lives in a different file.
+    let mut qualified = std::collections::HashMap::new();
+    let prefixes = module_path_prefixes(sources, source).unwrap_or_default();
+    for scanned in &scanned_sources {
+        let prefix = prefixes
+            .iter()
+            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
+            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+        if let Ok(found) = crate::parse::qualified_constants_with_prefix(&scanned.contents, &prefix)
+        {
+            qualified.extend(found);
+        }
+    }
+
     let mut allowed_table_hits = vec![0_usize; INTEGRITY_CHECK_TABLES.len()];
     for scanned in scanned_sources {
         let scanned_code = without_test_modules(&code_only(&scanned.contents));
@@ -8489,7 +8511,12 @@ fn check_integrity_check_module_tree(
             ));
         }
 
-        check_checksum_module_dense_matches(scanned, &mut allowed_table_hits, &mut violations);
+        check_checksum_module_dense_matches(
+            scanned,
+            &qualified,
+            &mut allowed_table_hits,
+            &mut violations,
+        );
     }
     for (table, count) in INTEGRITY_CHECK_TABLES.iter().zip(&allowed_table_hits) {
         if *count != 1 {
@@ -8517,13 +8544,14 @@ fn check_integrity_check_module_tree(
 /// pushing a violation for anything else dense enough to be a second table.
 fn check_checksum_module_dense_matches(
     scanned: &crate::size::LayerSource,
+    qualified: &std::collections::HashMap<String, u128>,
     allowed_table_hits: &mut [usize],
     violations: &mut Vec<Violation>,
 ) {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
-    let matches = match crate::parse::match_expressions(&scanned.contents) {
+    let matches = match crate::parse::match_expressions(&scanned.contents, qualified) {
         Ok(matches) => matches,
         Err(error) => {
             violations.push(Violation::new(
@@ -9107,6 +9135,55 @@ fn module_tree(
         .cloned()
         .collect();
     Ok((production_reachable, test_only))
+}
+
+/// Every file reachable from `root` through an out-of-line `mod` declaration, paired with
+/// the module-path segments that declaration chain gives it — empty for `root` itself.
+///
+/// Codex's finding: `qualified_constants` only ever sees one file, so a `mod indices;`
+/// pointing at a sibling file is never added to that file's own `qualified` map at
+/// all — `visit_item_mod` only records a module's constants when it can see that
+/// module's *content*, and an out-of-line declaration's content lives in a file this
+/// walk has not visited yet. This is the missing half: for each out-of-line child, the
+/// declaring file names it and this walk resolves which scanned file that is, so the
+/// child's own file can be scanned with the declaration's name seeded as its module-path
+/// prefix rather than as an empty one.
+///
+/// An out-of-line module nested inside an *inline* one loses that inline module's own
+/// name from the chain — `crate::parse::child_modules` reports only the out-of-line
+/// leaf's bare name for such a case, the same limitation `module_tree`'s test-gating
+/// already carries for the identical reason. The checksum module tree this rule scans
+/// has no such nesting today.
+///
+/// Paths use `/` separators, the way the scan compares them.
+fn module_path_prefixes(
+    sources: &[crate::size::LayerSource],
+    root: &crate::size::LayerSource,
+) -> Result<Vec<(String, Vec<String>)>, ModuleTreeError> {
+    let mut prefixes = Vec::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![(root.path.replace('\\', "/"), Vec::new())];
+    while let Some((path, prefix)) = stack.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let Some(contents) = sources
+            .iter()
+            .find(|source| source.path.replace('\\', "/") == path)
+            .map(|source| source.contents.as_str())
+        else {
+            prefixes.push((path, prefix));
+            continue;
+        };
+        for child in crate::parse::child_modules(&path, contents)? {
+            let resolved = resolve_child(sources, &path, &child)?;
+            let mut child_prefix = prefix.clone();
+            child_prefix.push(child.name.clone());
+            stack.push((resolved, child_prefix));
+        }
+        prefixes.push((path, prefix));
+    }
+    Ok(prefixes)
 }
 
 /// How many times `code` contains `token` as a whole token.
@@ -15120,6 +15197,68 @@ mod deferred_answer_pins {
              indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_before_the_module_it_qualifies_its_patterns_against_is_reported() {
+        // Codex's fifteenth-round finding, first half: `qualified` used to start empty
+        // and grow only as `match_expressions`'s single left-to-right walk *reached* each
+        // inline module, so a match sitting textually before the `mod indices { ... }` it
+        // names had none of `indices::P0` through `indices::P3` resolved yet, even though
+        // Rust's own item lookup does not care about declaration order at all. The walk is
+        // two-pass now — the first pass exists only to finish `qualified` before the
+        // second, real pass runs — so a table's own position relative to the module it
+        // qualifies against no longer matters. Same fixture as
+        // `a_dense_match_with_qualified_constant_patterns_is_reported`, with the `match`
+        // and the `mod` swapped.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n\n\
+             mod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: u8 \
+             = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = 3;\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_an_out_of_line_module_is_reported() {
+        // Codex's fifteenth-round finding, second half: "an external `mod indices;` is
+        // never added to this per-file map at all" — `qualified_constants` only ever
+        // walked one file, so a `mod indices;` with no `{ ... }` body of its own left the
+        // constants that body actually declares, in a sibling file, entirely unrecorded.
+        // `module_path_prefixes` walks the same out-of-line `mod` declarations
+        // `checksum_sources` already follows to find the file, and seeds that file's own
+        // scan with the declaration's name as its module-path prefix, so `indices.rs`'s
+        // top-level constants are recorded under `indices::` even though no `mod { ... }`
+        // node anywhere names them.
+        let parent = format!(
+            "{}\nmod indices;\n\nconst fn qualified_constant_pattern_table(nibble: u8) -> \
+             u32 {{\n    match nibble & 0xF {{\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "//! Table indices.\npub(crate) const P0: u8 = 0;\npub(crate) const P1: \
+                     u8 = 1;\npub(crate) const P2: u8 = 2;\npub(crate) const P3: u8 = 3;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/indices.rs", child),
+        ]);
         assert!(
             violations
                 .iter()
