@@ -163,6 +163,56 @@ the dependency graph is to move the two modules into a crate of their own, above
 [#106](https://github.com/madmax983/waymaker/issues/106) rather than this change, because a
 restructure taken at the end of a review round is one no round has reviewed.
 
+**Superseded by issue #106.** `without-facade` and the `drive-facadeless` stage are gone.
+`waymaker-facade-demo` now holds `facade`, `ota` and `provisioning` above `waymaker-drive`,
+which names no dependency on `waymaker-embassy` at all — a fact `cargo metadata` states
+rather than a claim a feature flag argued for, and `ctx-facade` now reads that graph
+directly rather than only the identifiers Rust source spells: Codex's review of this change
+found that a manifest edit alone, naming no crate in any `use`, passed every check here
+before this half existed. A direct dependency is refused in any table; a chain of
+`[dependencies]` at any depth is refused too, since a later normal dependency on some other
+crate that itself reaches the façade is exactly the edge a firmware library build would
+link, and Codex's review found the first version of this half missed it. Neither walk
+crosses a `[dev-dependencies]` or `[build-dependencies]` edge, at the root or below —
+`waymaker-drive` dev-depends on `waymaker-rig`, which itself normal-depends on
+`waymaker-embassy` for `PersistentClock` (issue #34), and that edge is neither new nor the
+façade's; the first version of this half's transitive attempt crossed it and misattributed
+that edge to `waymaker-drive` before the walk was narrowed to declared and normal-only
+reach. `ctx-facade`'s source-level driver half keeps its shape, holding every
+`waymaker-drive` module to naming no façade, but its exemption list is now empty because
+there is no in-crate module left to exempt — and the crate-wide vocabulary, static,
+future-set and macro bans that already held `waymaker-embassy` to no authority now hold
+`waymaker-facade-demo` to the same standard, since `Bridge` is the one other caller of this
+boundary and Codex's review found the first version of this half stopped at the crate it
+used to live in. Moving `ota` and `provisioning`
+also moved the one place either built a `Suspended`: a private field an in-crate module
+could reach directly, that a crate above `waymaker-drive` cannot. `Bridge` now keeps the
+real value the boundary returned and hands it back after a poll, rather than a value the
+workflow mints itself — the same fact, carried across the `.await` instead of asserted anew
+on the other side of it. One stall has no boundary call behind it to keep: a dispatcher
+still working answers `Poll::Pending` with nothing recorded, and `Suspended::awaiting_dispatch`
+is the value named for that case, `pub` rather than `pub(crate)` because both examples need
+it and neither can be granted the wider privilege `Suspended::NEW` still keeps.
+
+**The direct-declaration check had a gap of its own.** It had skipped every `Normal`-kind
+manifest entry on the assumption that the walk below it would catch any real one, but an
+*optional* normal dependency the workspace never enables — `facade = { package =
+"waymaker-embassy", optional = true }` with no feature turning it on — stays in `cargo
+metadata`'s `packages[].dependencies` and drops out of `resolve.nodes[].deps` entirely, so
+neither half saw it: Codex's review found the fifth gap in this half. The direct check now
+reads every declared dependency regardless of kind, and since an *enabled* optional
+dependency is then caught by both the direct check and the walk, the two findings are
+deduplicated by crate name before they are reported.
+
+**The root itself was resolved by name.** Both the direct check and the walk found
+`waymaker-drive` with a bare name search over `packages[]`, and `cargo metadata` makes no
+promise that the workspace's own package sorts ahead of a same-named dependency at another
+version or source — Codex's review found the sixth gap this way, on the same pull request.
+A decoy ahead of the real member would have let the real driver declare or reach Embassy
+with neither half noticing. `PackageGraph::find_workspace_member` closes it, checking a
+name match against `workspace_members` as well, and the walk now takes an
+already-resolved root instead of re-deriving one by name.
+
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
 caller's, so §04's runtime-RAM statics gate does not move, but a device running the façade

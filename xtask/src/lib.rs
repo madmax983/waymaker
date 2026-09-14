@@ -310,8 +310,18 @@ fn check_source_rules(inputs: &WorkspaceInputs) -> Vec<Violation> {
         &inputs.driver_sources,
     ));
     violations.extend(source::check_effect_protocol(&inputs.driver_sources));
+    // `waymaker-facade-demo` is `no_std_support_sources`' too, alongside `waymaker-rig`,
+    // `waymaker-conformance` and `waymaker-drive` itself; `ctx-facade`'s authority ban is
+    // about the one crate that holds `Bridge`, so it reads only that slice of it.
+    let facade_demo_sources: Vec<size::LayerSource> = inputs
+        .no_std_support_sources
+        .iter()
+        .filter(|source| source.crate_name == "waymaker-facade-demo")
+        .cloned()
+        .collect();
     violations.extend(source::check_ctx_facade(
         &inputs.layer_sources,
+        &facade_demo_sources,
         &inputs.driver_sources,
     ));
     violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));
@@ -339,6 +349,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(graph::check_dependency_direction(&graph));
     violations.extend(graph::check_kernel_has_no_dependencies(&graph));
     violations.extend(graph::check_embassy_stays_above_flash(&graph));
+    violations.extend(graph::check_driver_reaches_no_embassy(&graph));
     violations.extend(graph::check_empty_default_features(&graph));
     violations.extend(graph::check_workspace_membership(&graph));
     violations.extend(graph::check_layers_are_local(&graph));
@@ -1598,12 +1609,19 @@ mod tests {
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null }],
           "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/drive/src/lib.rs" }] },
+        { "id": "facade-demo", "name": "waymaker-facade-demo", "source": null,
+          "manifest_path": "/w/facade-demo/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-flash", "kind": null },
+                           { "name": "waymaker-drive", "kind": null },
+                           { "name": "waymaker-embassy", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/facade-demo/src/lib.rs" }] },
         { "id": "embedded-storage", "name": "embedded-storage",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "dependencies": [], "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive", "facade-demo"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
@@ -1614,6 +1632,7 @@ mod tests {
         { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
         { "id": "rig", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "drive", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
+        { "id": "facade-demo", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "drive" }, { "pkg": "embassy" }] },
         { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;

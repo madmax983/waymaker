@@ -955,17 +955,17 @@ impl RuntimeRam {
     ///
     /// Host sizes. A `thumbv6m` pointer is narrower, so every figure here is an upper bound
     /// on the target's, and gating it can fail early but never late. The exact check on the
-    /// target is `waymaker_core::assert_context_size!`, which the `drive-firmware` stage
-    /// compiles.
+    /// target is `waymaker_core::assert_context_size!`, which the `facade-demo-firmware`
+    /// stage compiles.
     #[must_use]
     pub fn measured() -> Option<Self> {
         Some(Self {
-            context: waymaker_drive::ota::CONTEXT_BYTES as u64,
+            context: waymaker_facade_demo::ota::CONTEXT_BYTES as u64,
             // Every example's registry, chained: §04 asks each generated future to be
             // reported, and a second example is a second row rather than a second section.
-            workflow_futures: waymaker_drive::ota::WORKFLOW_FUTURES
+            workflow_futures: waymaker_facade_demo::ota::WORKFLOW_FUTURES
                 .iter()
-                .chain(waymaker_drive::provisioning::WORKFLOW_FUTURES.iter())
+                .chain(waymaker_facade_demo::provisioning::WORKFLOW_FUTURES.iter())
                 .map(|(name, size)| ((*name).to_owned(), *size as u64))
                 .collect(),
         })
@@ -1834,7 +1834,7 @@ impl SizeReport {
             |total| format!("{total} B of {RUNTIME_RAM_BUDGET_BYTES} B"),
         );
         format!(
-            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row, gated or not — a per-feature row's own statics count against this one ceiling too. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
+            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row, gated or not — a per-feature row's own statics count against this one ceiling too. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the facade-demo-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
             self.kernel_state.as_ref().map_or(0, |state| state.total),
             runtime.context,
         )

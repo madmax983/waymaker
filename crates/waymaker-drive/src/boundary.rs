@@ -19,15 +19,33 @@ use waymaker_core::{ActivityKind, EffectId, Outcome};
 ///
 /// # Why the field is private
 ///
-/// So that only the driver can make one. A workflow that could build a `Suspended` could
-/// stop a run that nothing asked to stop, and the driver would then report a wait that no
-/// activity is behind.
+/// So that a workflow cannot build one and stop a run that nothing asked to stop, and have
+/// the driver then report a wait that no activity is behind. `NEW` is the driver's own
+/// construction, kept to `waymaker-drive`. [`awaiting_dispatch`](Self::awaiting_dispatch) is
+/// the one sanctioned exception: `waymaker-facade-demo`'s `Workflow` impls call it, not the
+/// driver, because it answers a stop the driver never sees — see its own doc for why that is
+/// still narrow rather than a second `NEW`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Suspended(());
 
 impl Suspended {
     /// The one value, made by the driver only.
     pub(crate) const NEW: Self = Self(());
+
+    /// The run cannot continue because a caller's own dispatch has not answered yet.
+    ///
+    /// A synchronous workflow gets [`Suspended`] by propagating one a boundary call
+    /// returned. A caller driving an opaque `Future` cannot: design document §07 step 4 is
+    /// the world's, so a dispatcher that answers `Poll::Pending` stops the future with
+    /// nothing recorded and nothing to propagate — no boundary call is pending, only the
+    /// world's own answer. This is that stop, named for the one caller it is for and `pub`
+    /// rather than `pub(crate)` because that caller is `waymaker-facade-demo`, one crate up.
+    /// It carries no more state than `NEW` does, so the exception costs nothing
+    /// a misused `Suspended` could not already cost — an idle boot, never a wrong record.
+    #[must_use]
+    pub const fn awaiting_dispatch() -> Self {
+        Self(())
+    }
 }
 
 /// What the driver says about one activity boundary, after design document §07 step 3.
@@ -39,11 +57,12 @@ impl Suspended {
 ///
 /// # Why this vocabulary is the driver's own
 ///
-/// So that removing the façade removes nothing here. Nothing below `facade`, `ota` and
-/// `provisioning` names a `waymaker-embassy` type, and the `without-facade` feature deletes
-/// those modules — which is what makes "the protocol is fully usable through the
-/// synchronous driver" a build rather than a claim. The `drive-facadeless` pipeline stage is
-/// that build.
+/// So that removing the façade removes nothing here. This crate names no dependency on
+/// `waymaker-embassy` at all — issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106) moved `facade`, `ota` and
+/// `provisioning` into `waymaker-facade-demo`, above this crate — which is what makes "the
+/// protocol is fully usable through the synchronous driver" a fact `cargo metadata` states
+/// rather than a claim a feature flag argued for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handoff<'a> {
     /// History holds the outcome. Nothing may be dispatched.

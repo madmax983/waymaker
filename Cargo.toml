@@ -9,6 +9,7 @@ members = [
     "crates/waymaker-conformance",
     "crates/waymaker-rig",
     "crates/waymaker-drive",
+    "crates/waymaker-facade-demo",
     "crates/waymaker-size-probe",
     "crates/waymaker-emu",
     "xtask",
@@ -31,6 +32,9 @@ members = [
 # inspection, but it is a synchronous driver written to prove the kernel boundary rather
 # than firmware this workspace ships, and selecting it by default would build it into the
 # image the code-flash budget is measured against.
+# `waymaker-facade-demo` is excluded for `waymaker-drive`'s reason: it is `#![no_std]` so
+# that its two examples build for the part, but it is a bridge and a demonstration rather
+# than firmware this workspace ships.
 # `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
 # selecting it by default would add a member the firmware build has nothing to build.
 # `waymaker-emu` is excluded for the size probe's reason and one more: it carries
@@ -59,6 +63,7 @@ waymaker-spec = { path = "crates/waymaker-spec", version = "0.0.0", default-feat
 waymaker-conformance = { path = "crates/waymaker-conformance", version = "0.0.0", default-features = false }
 waymaker-rig = { path = "crates/waymaker-rig", version = "0.0.0", default-features = false }
 waymaker-drive = { path = "crates/waymaker-drive", version = "0.0.0", default-features = false }
+waymaker-facade-demo = { path = "crates/waymaker-facade-demo", version = "0.0.0", default-features = false }
 waymaker-emu = { path = "crates/waymaker-emu", version = "0.0.0", default-features = false }
 # The optional codec helpers of issue #37. `default-features = false` so that neither
 # reaches `std`: they are enabled inside a `#![no_std]` layer.
