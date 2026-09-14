@@ -290,7 +290,11 @@ fn collect_item_aliases<'a>(
 /// A `type` alias is scoped the same way — a module-local `type Unchecked = Foo;` is no
 /// more visible outside its module than a `use` rename is, so it is collected here rather
 /// than only at [`block_own_aliases`]'s function-body granularity.
-fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
+///
+/// Takes an iterator, not a slice, so [`block_own_aliases`] can filter a block's statements
+/// down to its item-statements and hand them here directly — a `&[syn::Item]` moves the same
+/// way, since a slice's iterator yields `&syn::Item` too.
+fn own_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
     let mut aliases = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -377,8 +381,8 @@ fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
 /// Every `type` alias `contents` declares whose right-hand side is an associated-type
 /// projection [`syn`] cannot resolve, outside `#[cfg(test)]`.
 ///
-/// At file scope, in an inline module, or inside a function body. See
-/// `type_is_qself_projection` for the three shapes a projection can take. Such a
+/// The alias may be declared at file scope, in an inline module, or inside a function body.
+/// See `type_is_qself_projection` for the three shapes a projection can take. Such a
 /// projection can name any struct the trait's `impl` chooses — `CheckedDispatch`
 /// included — and following it needs type inference `syn` does not have. A plain type alias
 /// already resolves a plain path and one wrapped in parens; a projection is the one shape it
@@ -433,18 +437,15 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// The `use` and `type` aliases `block` declares directly in its own statements — not in a
 /// nested block, which gets its own scope when [`struct_literal_counts`]'s visitor reaches it
 /// (issue #92, Codex's fifth round: a function-local alias is invisible to a scan built for
-/// module-level declarations only).
+/// module-level declarations only) — and not in a nested `mod`, for [`own_aliases`]'s reason.
+/// [`own_aliases`] already refuses to recurse into a `mod`; this shares it rather than going
+/// through [`collect_item_aliases`], which does recurse and would leak a `mod` declared
+/// inside this block's own statements into the block's scope, bypassing the module's opacity.
 fn block_own_aliases(block: &syn::Block) -> Vec<UseAlias> {
-    let mut aliases = Vec::new();
-    collect_item_aliases(
-        block.stmts.iter().filter_map(|stmt| match stmt {
-            syn::Stmt::Item(item) => Some(item),
-            _ => None,
-        }),
-        &mut Vec::new(),
-        &mut aliases,
-    );
-    aliases
+    own_aliases(block.stmts.iter().filter_map(|stmt| match stmt {
+        syn::Stmt::Item(item) => Some(item),
+        _ => None,
+    }))
 }
 
 fn collect_tree_aliases(
@@ -675,7 +676,7 @@ fn resolve_segments_through_blocks(
     let mut scope = stack.len().saturating_sub(1);
     let bound: usize = stack.iter().map(|(aliases, _)| aliases.len()).sum();
     for _ in 0..=bound {
-        consume_scope_prefix(&mut segments, &mut scope);
+        consume_scope_prefix_through_blocks(&mut segments, &mut scope, stack);
         let Some(first) = segments.first() else {
             break;
         };
@@ -703,8 +704,62 @@ fn resolve_segments_through_blocks(
             return segments;
         }
     }
-    consume_scope_prefix(&mut segments, &mut scope);
+    consume_scope_prefix_through_blocks(&mut segments, &mut scope, stack);
     segments
+}
+
+/// The nearest module frame reachable from `level` by walking outward (toward index 0)
+/// through consecutive transparent (block) frames — `level` itself, if it is already a
+/// module.
+///
+/// `self`/`super` name a *module*; a block is not one, so neither can land on a block frame.
+/// A `mod` may be declared directly inside a block (`fn f() { mod inner { .. } }`), so more
+/// than one block can separate two module levels — this walks past all of them, not just one.
+fn nearest_module_at_or_below(stack: &[(Vec<UseAlias>, bool)], level: usize) -> usize {
+    let mut level = level;
+    while level > 0
+        && stack
+            .get(level)
+            .is_some_and(|(_, transparent)| *transparent)
+    {
+        level -= 1;
+    }
+    level
+}
+
+/// [`consume_scope_prefix`], aware that `stack` mixes block scopes with module ones.
+///
+/// `self` and `super` both name a module, never a block, so each first settles `scope` on
+/// the nearest enclosing module — [`nearest_module_at_or_below`] — before doing anything
+/// else: `self::X` looked up from three blocks deep in one function still means "`X` in this
+/// function's own module", not "`X` in the innermost block". `super` then steps one module
+/// further out, past whatever blocks separate the two module levels this time, the same way
+/// [`consume_scope_prefix`] steps past exactly one module when every level is one. At the
+/// file's own top level a `super` is left unconsumed, for the same reason it is there: this
+/// scan sees one file, never the module that declared it, so there is nowhere left to step to
+/// and pretending otherwise would answer a question it cannot see the answer to.
+fn consume_scope_prefix_through_blocks(
+    segments: &mut Vec<String>,
+    scope: &mut usize,
+    stack: &[(Vec<UseAlias>, bool)],
+) {
+    loop {
+        match segments.first().map(String::as_str) {
+            Some("self") => {
+                segments.remove(0);
+                *scope = nearest_module_at_or_below(stack, *scope);
+            }
+            Some("super") => {
+                let module = nearest_module_at_or_below(stack, *scope);
+                if module == 0 {
+                    break;
+                }
+                segments.remove(0);
+                *scope = nearest_module_at_or_below(stack, module - 1);
+            }
+            _ => break,
+        }
+    }
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
@@ -808,9 +863,9 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
     /// Issue #171's finding 1: `syn` sees a pattern's syntax, never the type of the value it
     /// matches, and Rust's match ergonomics (RFC 2005) let that type decide what a *bare*
     /// binding means. `let Foo { field, .. } = dispatch;` moves or copies `field` when
-    /// `dispatch` is owned — a read, safe to ignore — but aliases it as `&mut field`'s type
-    /// when `dispatch: &mut Foo`, with no `ref`, `mut` or `&mut` written anywhere to tell the
-    /// two apart. An explicit `ref mut` is only the loudest of several spellings that reach a
+    /// `dispatch` is owned — a read, safe to ignore — but binds it by mutable reference when
+    /// `dispatch: &mut Foo`, with no `ref`, `mut` or `&mut` written anywhere to tell the two
+    /// apart. An explicit `ref mut` is only the loudest of several spellings that reach a
     /// mutable alias; a bare name and a plain `mut` reach it too, under a `&mut` scrutinee,
     /// and nothing here can rule that scrutinee out. So every named binding on a guarded
     /// field is reported, not only an explicit `ref mut` — the sound answer without type
@@ -2360,6 +2415,73 @@ mod raw_identifier_tests {
              \x20   type Unchecked = Bar;\n\
              \x20   let _ = Unchecked {};\n\
              \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_mod_nested_in_a_block_does_not_leak_its_alias_into_the_block() {
+        // A `mod` may be declared directly inside a function body, and real Rust still keeps
+        // its own aliases private to it: `inner::Decoy` (or a `use` reaching in) would be
+        // needed to see `Decoy` from `outer`'s own body, not a bare name. `block_own_aliases`
+        // used to delegate to `collect_item_aliases`, which *does* recurse into a `mod` — so a
+        // decoy alias declared inside one leaked flat into the enclosing block's own scope,
+        // shadowing whatever a genuine, correctly block-scoped alias of the same name would
+        // otherwise have resolved to. This construction is the dangerous direction: the real
+        // `Foo` below would have been masked and gone uncounted.
+        let counts = struct_literal_counts(
+            "fn outer() {\n\
+             \x20   mod inner {\n\
+             \x20       use Bar as Decoy;\n\
+             \x20   }\n\
+             \x20   use Foo as Decoy;\n\
+             \x20   let _ = Decoy {};\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn super_steps_past_every_block_between_two_module_levels() {
+        // Blocks are not modules, so the number of `super`s a path needs is a function of
+        // module nesting alone — never of how many `{ }` blocks sit between the reference and
+        // its enclosing module. One `super` from anywhere inside `f`'s body, however deep in
+        // nested blocks, reaches `outer`'s parent (the file this scan read).
+        let counts = struct_literal_counts(
+            "use Foo as Alias;\n\
+             mod outer {\n\
+             \x20   fn f() {\n\
+             \x20       {\n\
+             \x20           {\n\
+             \x20               let _ = super::Alias {};\n\
+             \x20           }\n\
+             \x20       }\n\
+             \x20   }\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn self_names_the_enclosing_module_and_bypasses_a_blocks_own_shadow() {
+        // `self::X` always names `X` in the enclosing *module*, not in whichever block the
+        // reference happens to sit in — verified against real `rustc`: a block-local alias of
+        // the same name is not what `self::` reaches, even from inside that very block.
+        let counts = struct_literal_counts(
+            "use Foo as X;\n\
+             fn f() {\n\
+             \x20   use Bar as X;\n\
+             \x20   let _ = self::X {};\n\
              }",
             "Foo",
             FnScope::None,
