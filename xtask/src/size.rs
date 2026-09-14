@@ -3384,15 +3384,26 @@ fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<Str
 /// crate. Every other qualified path — `crate::`, `self::`, `super::`, or a bare
 /// relative path such as `sealed::Sealed` — can still name a trait this crate itself
 /// declares, so its last segment is checked.
+///
+/// Two more things are read from the path itself, matching the "a raw identifier is
+/// the same identifier" convention this codebase already applies elsewhere (issues
+/// #68/#90). A leading `::` — `impl ::core::fmt::Debug for Bank` — is absolute: Rust
+/// resolves it through the extern prelude alone, never through a local module or
+/// import, so such a path is never local, whatever `external_roots` or a local
+/// module of the same name says. And a leading `r#` on any segment — `r#type`, for a
+/// dependency renamed to a Rust keyword — names the same identifier as the bare
+/// spelling, so it is stripped before either segment is read.
 fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Option<(&'a str, bool)> {
     let (before, _after) = line.split_once(" for ")?;
     let before = before.strip_prefix("impl").unwrap_or(before);
     let before = skip_leading_generic_params(before);
     let path = before.split('<').next().unwrap_or(before);
+    let absolute = path.trim_start().starts_with("::");
 
     let mut segments = path
         .split("::")
         .map(str::trim)
+        .map(|segment| segment.strip_prefix("r#").unwrap_or(segment))
         .filter(|segment| !segment.is_empty());
     let first = segments.next()?;
     let mut name = first;
@@ -3401,7 +3412,7 @@ fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Optio
         name = segment;
         qualified = true;
     }
-    let local = !qualified || !external_roots.contains(first);
+    let local = !absolute && (!qualified || !external_roots.contains(first));
     Some((name, local))
 }
 
@@ -7483,6 +7494,63 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["hidden"]);
+    }
+
+    #[test]
+    fn an_absolute_path_is_never_local_even_behind_a_shadowing_module() {
+        // `impl ::core::fmt::Debug` resolves through the extern prelude alone,
+        // never through a local `mod core { .. }` in the same file — a leading
+        // `::` opts out of every local scope. Codex found this on this pull
+        // request's own review.
+        let functions = public_functions_reachable(
+            &kernel(
+                "mod core {\n\
+                 \x20   pub(crate) trait Debug {\n\
+                 \x20       fn hidden(&self);\n\
+                 \x20   }\n\
+                 }\n\
+                 \n\
+                 impl ::core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n",
+            ),
+            &PackageGraph::default(),
+        );
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_dependency_renamed_to_a_keyword_is_read_by_its_raw_spelling() {
+        // Cargo accepts `type = { package = "dep" }`; Rust source must then
+        // spell the crate `r#type`. `r#type` and `type` are the same
+        // identifier, the same convention this codebase already applies to
+        // `extern crate r#alloc;` (issues #68/#90). Codex found this on this
+        // pull request's own review.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core").with_renamed_dependency(
+            "dep",
+            "type",
+            DepKind::Normal,
+        )]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Trait {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl r#type::Trait for Bank {\n    fn run(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["run"]);
     }
 
     #[test]
