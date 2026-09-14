@@ -920,7 +920,7 @@ fn a_run_that_continued_reaches_neither_the_journal_nor_the_world_again() {
 
     let _restarted = poll_once(ctx.continue_as_new(b"next"));
     let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
     let restarted_again = poll_once(ctx.continue_as_new(b"again"));
     let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"late"));
 

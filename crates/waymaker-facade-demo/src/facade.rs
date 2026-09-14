@@ -22,7 +22,7 @@
 //! value to keep; that case reads `None` back and falls to
 //! [`Suspended::awaiting_dispatch`](waymaker_drive::Suspended::awaiting_dispatch) instead.
 
-use waymaker_core::timer::TimerSpec;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_drive::{Answered, Boundary, Handoff, Suspended};
 use waymaker_embassy::journal::{Answer, Halted, Journal};
@@ -106,5 +106,9 @@ impl Journal for Bridge<'_> {
     fn continue_as_new(&mut self, input: &[u8]) -> Halted {
         self.suspended = Some(self.boundary.continue_as_new(input));
         Halted
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        self.boundary.deadline_remaining()
     }
 }
