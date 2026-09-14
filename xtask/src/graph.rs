@@ -295,6 +295,50 @@ impl PackageGraph {
         reached
     }
 
+    /// Returns the names of every package reachable from `name` by following only
+    /// `[dependencies]` edges, excluding `name` itself.
+    ///
+    /// Kind-aware, unlike [`transitive_dependencies`](Self::transitive_dependencies): a
+    /// `[dev-dependencies]` or `[build-dependencies]` edge is never followed, at `name` or
+    /// at any hop below it, so a package reached only through such a path is not in the
+    /// answer. This is what a question about the *shipped library* needs — neither table is
+    /// ever linked into it — where `transitive_dependencies` answers the broader one: what
+    /// building and testing this package needs at all.
+    ///
+    /// Declared names rather than resolved ids, because kind lives on [`ManifestDep`] and
+    /// not on a resolved edge: each hop looks the next package up by the name its declaring
+    /// package named it under.
+    #[must_use]
+    pub fn normal_transitive_dependencies(&self, name: &str) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
+        let Some(root) = self.find(name) else {
+            return reached;
+        };
+
+        let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+        seen_ids.insert(root.id.as_str());
+        let mut queue: VecDeque<&Package> = VecDeque::new();
+        queue.push_back(root);
+
+        while let Some(package) = queue.pop_front() {
+            for dep in &package.manifest_deps {
+                if dep.kind != DepKind::Normal {
+                    continue;
+                }
+                let Some(next) = self.find(&dep.name) else {
+                    continue;
+                };
+                if !seen_ids.insert(next.id.as_str()) {
+                    continue;
+                }
+                reached.insert(next.name.clone());
+                queue.push_back(next);
+            }
+        }
+
+        reached
+    }
+
     /// Returns the shortest path to every package reachable from `name` that is not in
     /// `allowed`, stopping at the first illegal hop on each branch.
     ///
@@ -684,25 +728,33 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
     violations
 }
 
-/// Rule: `waymaker-drive` declares no dependency on an Embassy crate, in any table.
+/// Rule: `waymaker-drive` reaches no Embassy crate through `[dependencies]`, at any depth,
+/// and declares none directly in any other table either.
 ///
 /// `ctx-facade`'s other half — `check_facade_free_driver` in `source.rs` — reads identifiers
 /// in Rust source, so it cannot see a dependency a manifest declares and no `use` ever
-/// names. This is the half issue [#106](https://github.com/madmax983/waymaker/issues/106)
-/// asked for: `waymaker-drive`'s independence from the façade as a fact `cargo metadata`
-/// states, not a scanner's opinion about what its source happens to import today. The edge
-/// belongs in `waymaker-facade-demo`, one crate above.
+/// names, nor one reached only through another crate's own manifest. This is the half issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106) asked for: `waymaker-drive`'s
+/// independence from the façade as a fact `cargo metadata` states, not a scanner's opinion
+/// about what its source happens to import today. The edge belongs in `waymaker-facade-demo`,
+/// one crate above.
 ///
-/// Declared rather than transitive, on purpose: `waymaker-drive` dev-depends on
+/// Two checks, because one kind of edge must stop at the root and the other must not.
+/// Direct declarations are checked in every table, including `[dev-dependencies]` and
+/// `[build-dependencies]`: naming the façade there is still naming it. But the *walk* below
+/// that follows only `[dependencies]` edges, at every hop — `waymaker-drive` dev-depends on
 /// `waymaker-rig`, and `waymaker-rig` normal-depends on `waymaker-embassy` for the
-/// `PersistentClock` two board clocks implement (issue #34, ADR 0031) — a legitimate edge
-/// that predates and is unrelated to this one. Walking the full transitive graph would flag
-/// that dev-only test dependency as though it were the façade edge; declared dependencies
-/// are what the firmware library build actually links, and what issue #106 promises about.
+/// `PersistentClock` two board clocks implement (issue #34, ADR 0031), a legitimate edge
+/// that predates and is unrelated to this one. Walking every kind at every hop would flag
+/// that dev-only test dependency as though it were the façade edge; walking no kind past the
+/// root would miss `waymaker-drive` gaining a normal dependency on some *other* crate that
+/// itself normal-depends on the façade, which is exactly the edge the firmware library build
+/// would link. [`PackageGraph::normal_transitive_dependencies`] is the walk that stops at
+/// the first table and not the other two, at every hop rather than only the first.
 ///
 /// `waymaker-drive` is not in [`LAYERS`], so [`check_embassy_stays_above_flash`] does not
-/// reach it; this is that check's declared-only cousin, narrowed to the one test-support
-/// crate issue #106 makes a promise about.
+/// reach it; this is that check's cousin, narrowed to the one test-support crate issue #106
+/// makes a promise about and to the one table its shipped library actually links.
 #[must_use]
 pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
     const DRIVER: &str = "waymaker-drive";
@@ -711,10 +763,12 @@ pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
         return Vec::new();
     };
 
-    package
+    let mut violations: Vec<Violation> = package
         .manifest_deps
         .iter()
-        .filter(|dep| policy::is_embassy_package(&dep.name))
+        // `Normal` edges are the walk's below; checking them again here would double the
+        // same finding under one name.
+        .filter(|dep| dep.kind != DepKind::Normal && policy::is_embassy_package(&dep.name))
         .map(|dep| {
             Violation::new(
                 "ctx-facade",
@@ -726,7 +780,22 @@ pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
                 ),
             )
         })
-        .collect()
+        .collect();
+
+    for reached in graph.normal_transitive_dependencies(DRIVER) {
+        if policy::is_embassy_package(&reached) {
+            violations.push(Violation::new(
+                "ctx-facade",
+                DRIVER,
+                format!(
+                    "reaches Embassy crate `{reached}` through a chain of [dependencies]; \
+                     the façade edge belongs in waymaker-facade-demo, above this crate"
+                ),
+            ));
+        }
+    }
+
+    violations
 }
 
 /// Rule: every layer and every test-support crate has empty default features.
@@ -1111,6 +1180,35 @@ mod tests {
         assert!(
             check_driver_reaches_no_embassy(&graph).is_empty(),
             "waymaker-rig's own edge to the fa\u{e7}ade must not be attributed to waymaker-drive"
+        );
+    }
+
+    #[test]
+    fn a_normal_dependency_that_itself_normal_depends_on_embassy_is_still_the_drivers_edge() {
+        // Codex's follow-up on the same pull request: a direct-only check misses
+        // `waymaker-drive` gaining a *normal* dependency on some other crate that itself
+        // normal-depends on the façade — a chain the firmware library build would link, and
+        // a shape no `use` in `waymaker-drive`'s own source would ever have to name either.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("innocent-helper").with_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("innocent-helper", DepKind::Normal),
+        ]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "a two-hop normal chain to the fa\u{e7}ade must be caught: {violations:?}"
         );
     }
 
