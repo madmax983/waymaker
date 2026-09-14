@@ -1219,6 +1219,8 @@ fn two_bank_lifecycle() -> usize {
     kept = kept.wrapping_add(
         bank::decode_header_with::<Catalogued>(&page).map_or(0, |decoded| decoded.frame_len()),
     );
+    kept = kept.wrapping_add(bank::header_len_of(&page).unwrap_or(0));
+    kept = kept.wrapping_add(bank::header_len_of_with::<Catalogued>(&page).unwrap_or(0));
 
     kept = kept.wrapping_add(bank_seal_and_selection(&page));
 

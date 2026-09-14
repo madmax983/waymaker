@@ -1151,3 +1151,127 @@ fn header_read_length_is_rounded_down_to_a_whole_read_unit() {
          read unit accepts: {progress:?}"
     );
 }
+
+#[test]
+fn a_retired_banks_oversized_header_never_blocks_the_smaller_authoritative_bank() {
+    // Codex found this on round 5, in the very shape my round-4 fixes were both aimed at:
+    // if reclaim fails after a migration, the retired bank's header size is unrelated to the
+    // new authoritative bank's — it can be arbitrarily large (this one held a much longer
+    // input in an earlier life), while the newly authoritative bank, one generation higher,
+    // can be exactly as small as the run it now carries. A page sized for the new run's own
+    // header must still boot it, whatever the old bank's oversized header would need.
+    let mut device = Device::new(geometry());
+    let long_input = &[b'x'; 60][..];
+    let long_header = BankHeader {
+        input: long_input,
+        ..first_header()
+    };
+    // Bank A: the retired run, generation FIRST, with the wider header a longer-lived
+    // earlier run left behind.
+    install(&mut device, BankId::A, Generation::FIRST, &long_header);
+    // Bank B: the real authority, one generation higher, with a header small enough to fit
+    // the undersized page below easily.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&long_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank B's own header and its seal, deliberately short of bank A's.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank A's declared length to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "the smaller, higher-generation bank must boot even though the retired bank's \
+         header does not fit the page at all: {progress:?}"
+    );
+
+    // Nothing on bank A moved: it was never touched, only ignored.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+#[test]
+fn a_page_too_small_for_an_oversized_header_reports_the_actual_size_it_needs() {
+    // Codex found this on round 5: the reported `needed` used to be this bank's whole
+    // payload region (a few KiB) whenever its header did not fit, even if the header itself
+    // was only a handful of bytes too wide for the page -- which tells an embedded caller
+    // retrying with a bigger buffer that it needs far more room than it really does. Only
+    // bank A is installed and sealed here, so there is nothing to rescue the boot and this
+    // must be the hard refusal `read_bank`'s own `Errors` section describes.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(padded_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(encoded) = staging.get(..padded_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let Ok(actual_needed) = bank::header_len_of(encoded) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected prefix"
+        )
+    };
+    assert!(
+        actual_needed < layout().bank(BankId::A).payload_bytes() as usize,
+        "the fixture needs the header to be far smaller than the whole bank"
+    );
+
+    // A handful of bytes short of what the header actually needs -- nowhere near this
+    // bank's whole payload region.
+    let mut page = vec![0_u8; actual_needed - 4];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("an oversized header on the only sealed bank must refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, actual_needed,
+        "the reported figure must be the header's own declared length, not this bank's \
+         whole payload region"
+    );
+}

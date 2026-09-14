@@ -488,28 +488,48 @@ struct BankFacts {
     input_schema: u16,
 }
 
-/// Reads bank `id`'s header and seal, and says what it is worth — [`None`] for a bank whose
-/// seal does not validate or whose header does not decode.
+/// What [`read_bank`] learned about one bank.
 ///
-/// A bank failing either is not a candidate at any generation, exactly as
-/// [`bank::sealed_generation_with`] documents. This function only adds the two reads that
-/// answer is read *from* rather than handed in, and keeps the scalar fields
-/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
+/// Codex round 5 found that folding the third case into an immediate `Err` — as the two
+/// rounds before it both did, in two different ways — refuses a page too eagerly: a bank
+/// whose *own* header does not fit can still be safely ignored, if the *other* bank turns
+/// out to be a fully validated, higher-generation candidate. Whether that is so is not
+/// knowable until both banks have been looked at, so this carries the undecided case as a
+/// value for [`select_bank`] to weigh rather than deciding it here.
+enum BankRead {
+    /// A fully validated candidate, at the generation its own seal names.
+    Found(BankFacts),
+    /// Not a candidate at any generation — unsealed, or a header that fails to validate for
+    /// a reason no larger a page would ever fix.
+    Absent,
+    /// Genuinely sealed, at `claimed_generation`, but `page` was not large enough to read
+    /// and validate this bank's header. `needed` is the best figure available: the header's
+    /// own checksum-protected declared length, where enough of the header was readable to
+    /// checksum it, or this bank's own ceiling otherwise.
+    Oversized {
+        claimed_generation: bank::Generation,
+        needed: usize,
+    },
+}
+
+/// Reads bank `id`'s header and seal, and says what it is worth.
+///
+/// A bank whose seal does not validate or whose header does not decode is not a candidate at
+/// any generation, exactly as [`bank::sealed_generation_with`] documents. This function only
+/// adds the two reads that answer is read *from* rather than handed in, and keeps the scalar
+/// fields [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
 ///
 /// # Errors
 ///
-/// [`RecoveryError::PageTooSmall`] when `page` cannot hold the seal, or when it holds the
-/// seal but not a header whose own declared length says it needs more room than `page` gave
-/// it. Codex found both, and then found that the fix for the second was still wrong twice
-/// over: treating either as "not a candidate" would let [`select_bank`] fall back to a
-/// lower-generation bank that did fit — silently reviving a retired run — rather than
-/// refusing an undersized page outright.
+/// Only a real device error, or [`RecoveryError::PageTooSmall`] when `page` cannot even hold
+/// this bank's seal — nothing about *this* bank's header ever fails to fit large enough a
+/// page to invalidate the other bank's answer, which is what [`BankRead::Oversized`] is for.
 fn read_bank<S, C>(
     layout: BankLayout,
     id: BankId,
     storage: &mut S,
     page: &mut [u8],
-) -> Result<Option<BankFacts>, DriveError<S::Error>>
+) -> Result<BankRead, DriveError<S::Error>>
 where
     S: StableStorage,
     C: IntegrityCheck,
@@ -526,13 +546,13 @@ where
     //
     // It is read, and decoded to the scalar `Seal` it names, *before* the header ever
     // touches `page` — Codex found both halves of what goes wrong when it is not. Decoded
-    // first, an invalid seal answers `Ok(None)` here without ever looking at this bank's
-    // header at all, so an unsealed bank — one a swap started staging and never finished
-    // sealing, say — can carry any header length whatsoever without costing this call
-    // anything: it was never a candidate, whatever its header says. And decoded to a value
-    // rather than kept as bytes, the seal's own share of `page` is free the moment this call
-    // is done with it, so the header read below gets the *whole* page rather than what a
-    // reservation for the seal left of it — which is what lets a page sized to hold a
+    // first, an invalid seal answers [`BankRead::Absent`] here without ever looking at this
+    // bank's header at all, so an unsealed bank — one a swap started staging and never
+    // finished sealing, say — can carry any header length whatsoever without costing this
+    // call anything: it was never a candidate, whatever its header says. And decoded to a
+    // value rather than kept as bytes, the seal's own share of `page` is free the moment
+    // this call is done with it, so the header read below gets the *whole* page rather than
+    // what a reservation for the seal left of it — which is what lets a page sized to hold a
     // header exactly (and nothing besides, not even that bank's own seal) still read it.
     let seal_len = region.seal_bytes() as usize;
     let Some(seal_buf) = page.get_mut(..seal_len) else {
@@ -544,7 +564,7 @@ where
         .read(region.seal_offset(), seal_buf)
         .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
     let Ok(seal) = bank::decode_seal_with::<C>(seal_buf) else {
-        return Ok(None);
+        return Ok(BankRead::Absent);
     };
 
     // A whole number of the device's own read units, exactly as `recovery::Scan::stage`
@@ -557,30 +577,50 @@ where
     let header_len = (capacity.min(region.payload_bytes())) as usize;
     let Some(header_buf) = page.get_mut(..header_len) else {
         // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
-        return Ok(None);
+        return Ok(BankRead::Absent);
     };
     storage
         .read(region.base(), header_buf)
         .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
-    // A header whose self-declared length reaches past what fit in `page` is refused
-    // outright rather than treated as "not a candidate" — but only now, once the seal above
-    // has already established that this bank is genuinely sealed and so is a candidate at
-    // all. See this function's own `Errors` section.
+    // A header whose self-declared length reaches past what fit in `page` — as opposed to
+    // one this bank's own layout could never have held either, which `seal_for_with` below
+    // still catches on its own — is not refused outright here any more than treated as "not
+    // a candidate" outright. See this function's own `Errors` section and
+    // `BankRead::Oversized`. `header_len_of_with` peeks at only the header's own
+    // checksum-protected prefix, so it can answer even when the rest of the header — the
+    // input, the trailer — never fit at all.
     if header_len < payload_bytes
         && matches!(
             bank::decode_header_with::<C>(header_buf),
             Err(DecodeError::Truncated)
         )
     {
-        return Err(DriveError::Recovery(RecoveryError::PageTooSmall {
-            needed: payload_bytes,
-        }));
+        return Ok(match bank::header_len_of_with::<C>(header_buf) {
+            // The prefix itself checksums cleanly: this bank really is sealed, and only
+            // failed to fit because `page` did not reach far enough. `needed` is exact.
+            Ok(needed) => BankRead::Oversized {
+                claimed_generation: seal.generation,
+                needed,
+            },
+            // Not even the checksum-protected prefix fit, so there is no better figure than
+            // this bank's own ceiling to offer — but a real, larger header cannot be ruled
+            // out either, so this is undecided rather than absent.
+            Err(DecodeError::Truncated) => BankRead::Oversized {
+                claimed_generation: seal.generation,
+                needed: payload_bytes,
+            },
+            // Unreachable: `decode_header_with` just failed with `Truncated` on this exact
+            // buffer, which means its own prefix check already passed (a magic, a checksum
+            // and a version this firmware reads) before it ran out of room — so this
+            // buffer's prefix cannot fail those same checks a second time here.
+            Err(_) => BankRead::Absent,
+        });
     }
     let Ok(expected) = bank::seal_for_with::<C>(header_buf, seal.generation) else {
-        return Ok(None);
+        return Ok(BankRead::Absent);
     };
     if expected != seal {
-        return Ok(None);
+        return Ok(BankRead::Absent);
     }
     let generation = seal.generation;
     // The seal already names this exact header's digest, so this decode cannot fail.
@@ -588,12 +628,12 @@ where
     // `unwrap` and `panic!` and a decoder walking bytes off a device is the last place to
     // make an exception.
     let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
-        return Ok(None);
+        return Ok(BankRead::Absent);
     };
     let Ok(journal) = JournalRegion::of(layout, id, &header) else {
-        return Ok(None);
+        return Ok(BankRead::Absent);
     };
-    Ok(Some(BankFacts {
+    Ok(BankRead::Found(BankFacts {
         id,
         generation,
         run: header.run,
@@ -603,6 +643,50 @@ where
         workflow_version: header.workflow_version,
         input_schema: header.input_schema,
     }))
+}
+
+/// Weighs what [`read_bank`] learned about both banks into design document §10's selection
+/// rule.
+///
+/// Split out of [`select_bank`] so each of the six shapes two [`BankRead`]s can take is a
+/// `match` arm rather than a nest of conditionals — see this function's own tests.
+fn resolve_bank_read<E>(a: BankRead, b: BankRead) -> Result<BankFacts, DriveError<E>> {
+    match (a, b) {
+        (BankRead::Found(a), BankRead::Found(b)) => {
+            match bank::select([Some(a.generation), Some(b.generation)]) {
+                Authority::Bank { id: BankId::A, .. } => Ok(a),
+                Authority::Bank { id: BankId::B, .. } => Ok(b),
+                Authority::Ambiguous { .. } => Err(DriveError::AmbiguousAuthority),
+                // Unreachable: both generations are `Some`, and `select` answers `Unsealed`
+                // only when neither is.
+                Authority::Unsealed => Err(DriveError::NoAuthoritativeBank),
+            }
+        }
+        (BankRead::Found(facts), BankRead::Absent) | (BankRead::Absent, BankRead::Found(facts)) => {
+            Ok(facts)
+        }
+        (BankRead::Absent, BankRead::Absent) => Err(DriveError::NoAuthoritativeBank),
+        (
+            BankRead::Found(facts),
+            BankRead::Oversized {
+                claimed_generation, ..
+            },
+        )
+        | (
+            BankRead::Oversized {
+                claimed_generation, ..
+            },
+            BankRead::Found(facts),
+        ) if claimed_generation < facts.generation => Ok(facts),
+        (BankRead::Oversized { needed: a, .. }, BankRead::Oversized { needed: b, .. }) => {
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall {
+                needed: a.max(b),
+            }))
+        }
+        (BankRead::Oversized { needed, .. }, _) | (_, BankRead::Oversized { needed, .. }) => {
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
+        }
+    }
 }
 
 /// Design document §10's selection rule, over a real device: which bank a
@@ -618,21 +702,7 @@ where
 {
     let a = read_bank::<S, C>(layout, BankId::A, storage, page)?;
     let b = read_bank::<S, C>(layout, BankId::B, storage, page)?;
-    let id = match bank::select([
-        a.map(|facts| facts.generation),
-        b.map(|facts| facts.generation),
-    ]) {
-        Authority::Unsealed => return Err(DriveError::NoAuthoritativeBank),
-        Authority::Ambiguous { .. } => return Err(DriveError::AmbiguousAuthority),
-        Authority::Bank { id, .. } => id,
-    };
-    match id {
-        BankId::A => a,
-        BankId::B => b,
-    }
-    // Unreachable: `select` names a bank only when its generation came from `Some`, which
-    // is only ever produced beside the rest of that same bank's facts.
-    .ok_or(DriveError::NoAuthoritativeBank)
+    resolve_bank_read(a, b)
 }
 
 /// Refuses a boot whose workflow does not match what bank `id`'s own header declares.

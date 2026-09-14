@@ -4196,7 +4196,10 @@ pub const BANK_ROUTING_PATH: &str = "waymaker-flash/src/bank.rs";
 /// statement about each body rather than the loosest thing true of all of them.
 pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
     ("encode_header_with", &["header_check", "frame_check"]),
-    ("decode_header_with", &["header_check", "frame_check"]),
+    // The prefix's own seal is computed in `verify_header_prefix_with`, which this delegates
+    // to; this body's own direct call is the trailer's, over the input `verify_header_prefix_with`
+    // already admitted.
+    ("decode_header_with", &["frame_check"]),
     ("encode_seal_with", &["header_check"]),
     ("decode_seal_with", &["header_check"]),
     ("seal_for_with", &["frame_check"]),
@@ -4207,6 +4210,14 @@ pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
     // function generic over the check to be accounted for. A body that started computing a
     // seal here would be a row somebody has to widen.
     ("sealed_generation_with", &[]),
+    // The one place a header prefix's own seal is computed. `decode_header_with` and
+    // `header_len_of_with` both come through here rather than each destructuring the prefix
+    // for themselves.
+    ("verify_header_prefix_with", &["header_check"]),
+    // Routes by delegation, the same shape as `frame::frame_len_of_with`: it asks
+    // `verify_header_prefix_with` for the prefix and computes a length from the field that
+    // check already admitted, without a checksum call of its own.
+    ("header_len_of_with", &[]),
 ];
 
 /// The one function permitted to call the checksum module from the codec, and what it may
@@ -5932,7 +5943,7 @@ pub const CODEC_DEPENDENCIES: &[&str] = &["postcard", "serde"];
 /// function.
 pub const VERSION_ROUTING_BODIES: &[(&str, &str)] = &[
     ("waymaker-flash/src/frame.rs", "verify_header_with"),
-    ("waymaker-flash/src/bank.rs", "decode_header_with"),
+    ("waymaker-flash/src/bank.rs", "verify_header_prefix_with"),
 ];
 
 /// The predicate every version decision goes through.
@@ -10679,7 +10690,7 @@ mod deferred_answer_pins {
         assert!(
             violations
                 .iter()
-                .any(|v| v.detail.contains("decode_header_with")
+                .any(|v| v.detail.contains("verify_header_prefix_with")
                     && v.detail.contains("does not reach")),
             "a decoder that stopped asking went unseen: {violations:?}"
         );
