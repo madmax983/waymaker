@@ -15496,6 +15496,59 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_reference_patterns_is_reported() {
+        // Codex's twenty-fourth-round finding: over a reference scrutinee, `&0` is exactly
+        // as singleton a pattern as `0` itself, and `rustc` lowers a dense table spelled
+        // either way to the same indexed rodata. `pattern_literal` had no arm for
+        // `Pat::Reference` at all, so every referenced numbered pattern read as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn reference_pattern_table(nibble: &u8) -> u32 {\n    match nibble {\n        \
+             &0 => crc32_nibble(0),\n        &1 => crc32_nibble(1),\n        \
+             &2 => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_to_a_constant_declared_in_another_file_of_the_tree() {
+        // Codex's twenty-fourth-round finding: seeding a file's own module-path prefix
+        // (round 19) fixed the module-qualified case (`super::indices::P0`) but not the
+        // single-segment one — `resolve_ancestor_single_segment`'s local branch only ever
+        // covers modules *this file's own walk entered*, and going further up than that
+        // used to clamp straight to this file's own root, never consulting `qualified` for
+        // an ancestor declared in a *different* file of the same out-of-line tree. Here
+        // `crc.rs` declares `mod outer;`, `outer.rs` declares four plain top-level consts
+        // and `mod inner;`, and `inner.rs`'s own match reads `super::P0`..`super::P3` —
+        // naming `outer.rs`'s own constants, which `inner.rs`'s local scope stack never
+        // held at all.
+        let parent = format!("{}\nmod outer;\n", tests_support::clean_checksum_module());
+        let outer = "const P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+                     3;\n\nmod inner;\n";
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::P0 => 0,\n        super::P1 => \
+                     1,\n        super::P2 => 2,\n        super::P3 => 3,\n        \
+                     _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer.rs", outer),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_reading_super_does_not_find_a_shadowing_child_value() {
         // Codex's twenty-second-round finding: `super::P0` was resolved with a plain,
         // unrestricted `ConstScopes::resolve`, which searches the *entire* live scope
