@@ -971,7 +971,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // A raw-text element's own close tag name matched but its terminating `>` had not
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
-    let mut pending_raw_text_close = false;
+    let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -1253,12 +1253,17 @@ fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usiz
             .get(after_name)
             .is_none_or(|&byte| byte.is_ascii_whitespace() || byte == b'/' || byte == b'>');
         if terminates {
-            let close = line
-                .get(after_name..)
-                .and_then(|rest| rest.find('>'))
-                .map_or(RawTextClose::Pending, |offset| {
-                    RawTextClose::Whole(after_name + offset + 1)
-                });
+            // Quote-aware (Codex, pull request #138, round 46, "Scan raw-text end
+            // tags through an unquoted delimiter"): HTML5's tokenizer keeps parsing
+            // an end tag's own (bogus, but real) attribute-like text quote-aware
+            // exactly like an opening tag's, so `</script data-note=">decision-id
+            // headline">` closes at the *second* `>` — the first sits inside the
+            // quoted attribute value, and a blind search for it stops early,
+            // exposing the rest of that value as ordinary text. The same scan
+            // [`find_any_tag`]'s own markup search already uses.
+            let mut quote: Option<u8> = None;
+            let close = scan_tag_close(line, after_name, &mut quote)
+                .map_or(RawTextClose::Pending(quote), RawTextClose::Whole);
             return Some((start, close));
         }
         cursor = start + 1;
@@ -1270,9 +1275,9 @@ fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usiz
 enum RawTextClose {
     /// The tag closes at this byte offset, `>` included.
     Whole(usize),
-    /// The tag's name matched, but its own `>` was not found before the line ran out;
-    /// not resolved yet.
-    Pending,
+    /// The tag's name matched, but its own `>` was not found before the line ran
+    /// out — not resolved yet, carrying the quote state the scan left off in.
+    Pending(Option<u8>),
 }
 
 /// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
@@ -1306,20 +1311,42 @@ fn is_void_element(name: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
-/// Whether `span` — a complete, well-formed tag's own markup, ending at its own
-/// unquoted `>` — is self-closing: a `/` immediately before that `>`, outside any
-/// quoted attribute value (Codex, pull request #138, round 44, finding 2). Foreign
-/// content — SVG and `MathML` elements, which `HTML_BLOCK_TAG_NAMES` and
-/// [`VOID_ELEMENTS`] both leave unnamed — is the one place ordinary HTML still
-/// honors the self-closing flag XML uses: `<svg hidden />` has no body and no
-/// `</svg>` a document ever writes, so [`find_any_hidden_opening_tag`] must not wait
-/// forever for one, the same way it already never does for a [`VOID_ELEMENTS`]
-/// member.
-fn is_self_closing_tag(span: &str) -> bool {
-    span.len()
-        .checked_sub(2)
-        .and_then(|index| span.as_bytes().get(index))
-        .is_some_and(|&byte| byte == b'/')
+/// Whether `name` is one of the two HTML5 foreign-content namespace roots — SVG and
+/// `MathML` — the only place ordinary HTML still honors a trailing `/` in
+/// `<tag ... />` as bodyless, XML-style self-closing syntax (Codex, pull request
+/// #138, round 46, "Honor self-closing syntax only in foreign content"). Everywhere
+/// else in an HTML document the slash is ignored outright: `<div hidden />` is an
+/// ordinary, unclosed opening tag whose element still needs a real `</div>`, exactly
+/// as if the slash were not there at all — treating it as bodyless the way
+/// [`is_self_closing_tag`] used to, unconditionally, read `<div hidden
+/// />decision-id headline</div>` as carrying nothing after the tag's own markup,
+/// when the decision is really still inside the (still-open) `hidden` element.
+///
+/// Narrower than real foreign content, which extends to every element nested inside
+/// an `<svg>` or `<math>` subtree, not only the two root names themselves — a
+/// residual limit worth documenting rather than building full namespace-region
+/// tracking for the one construct ([`find_any_hidden_opening_tag`]) that needs this
+/// distinction at all.
+fn is_foreign_content_root(name: &str) -> bool {
+    name.eq_ignore_ascii_case("svg") || name.eq_ignore_ascii_case("math")
+}
+
+/// Whether `span` — a complete, well-formed opening tag's own markup, ending at its
+/// own unquoted `>`, for the element named `name` — is self-closing: a `/`
+/// immediately before that `>`, outside any quoted attribute value (Codex, pull
+/// request #138, round 44, finding 2), and only for [`is_foreign_content_root`]
+/// (round 46): `<svg hidden />` has no body and no `</svg>` a document ever writes,
+/// so [`find_any_hidden_opening_tag`] must not wait forever for one, the same way it
+/// already never does for a [`VOID_ELEMENTS`] member — but `<div hidden />` is not
+/// SVG or `MathML`, and a browser gives its `div` a real, still-open body regardless
+/// of the trailing slash.
+fn is_self_closing_tag(span: &str, name: &str) -> bool {
+    is_foreign_content_root(name)
+        && span
+            .len()
+            .checked_sub(2)
+            .and_then(|index| span.as_bytes().get(index))
+            .is_some_and(|&byte| byte == b'/')
 }
 
 /// Whether `span` — a complete, well-formed opening tag's own markup — carries the
@@ -1387,7 +1414,10 @@ fn find_any_hidden_opening_tag(line: &str, from: usize) -> Option<(usize, usize,
         let span = &line[start..end];
         if !span.starts_with("</") {
             let name = markup_tag_name(span);
-            if !is_void_element(name) && !is_self_closing_tag(span) && has_hidden_attribute(span) {
+            if !is_void_element(name)
+                && !is_self_closing_tag(span, name)
+                && has_hidden_attribute(span)
+            {
                 return Some((start, end, name.to_ascii_lowercase()));
             }
         }
@@ -1775,8 +1805,9 @@ enum NonRenderingAdvance {
     Close(usize),
     /// The innermost open element's raw-text close tag name matched, but its own `>`
     /// was not found before the line ran out (Codex, pull request #138, round 45,
-    /// "Finish multiline raw-text close tags before popping") — not resolved yet.
-    PendingClose,
+    /// "Finish multiline raw-text close tags before popping") — not resolved yet,
+    /// carrying the quote state the scan left off in (round 46).
+    PendingClose(Option<u8>),
 }
 
 /// The next thing relevant to the innermost currently-open non-rendering element `top`,
@@ -1816,7 +1847,7 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
     if !non_rendering_element_nests(top) {
         return find_raw_text_closing_tag(line, cursor, top).map(|(_, close)| match close {
             RawTextClose::Whole(end) => NonRenderingAdvance::Close(end),
-            RawTextClose::Pending => NonRenderingAdvance::PendingClose,
+            RawTextClose::Pending(quote) => NonRenderingAdvance::PendingClose(quote),
         });
     }
     let close = find_closing_tag(line, cursor, top)
@@ -1866,7 +1897,7 @@ fn advance_past_non_rendering(
     stack: &mut Vec<String>,
     in_html_comment: &mut bool,
     pending_tag: &mut Option<PendingTag>,
-    pending_raw_text_close: &mut bool,
+    pending_raw_text_close: &mut Option<PendingRawTextClose>,
 ) -> Option<usize> {
     // Cloned rather than borrowed (Codex, pull request #138, round 42, finding 3):
     // the stack widened from `Vec<&'static str>` to `Vec<String>` so it can hold an
@@ -1891,8 +1922,8 @@ fn advance_past_non_rendering(
                 stack.pop();
                 return Some(end);
             }
-            Some(NonRenderingAdvance::PendingClose) => {
-                *pending_raw_text_close = true;
+            Some(NonRenderingAdvance::PendingClose(quote)) => {
+                *pending_raw_text_close = Some(PendingRawTextClose { quote });
                 return None;
             }
             None => {
@@ -1958,6 +1989,18 @@ struct PendingTag {
     /// `<div\n hidden>decision-id headline</div>` — and [`has_hidden_attribute`]
     /// needs the tag's complete markup to answer that.
     text: String,
+}
+
+/// A raw-text element's own end tag, whose name matched but whose own terminating
+/// `>` had not yet appeared when the line it started on ran out (Codex, pull
+/// request #138, round 46, "Scan raw-text end tags through an unquoted delimiter") —
+/// [`PendingTag`]'s twin for [`find_raw_text_closing_tag`]'s own close search, which
+/// scans quote-aware exactly like an ordinary tag's markup does, so the quote state
+/// its scan left off in has to carry into the next line the same way.
+struct PendingRawTextClose {
+    /// The quote character (`"` or `'`) still open where this line's own scan left
+    /// off, if any.
+    quote: Option<u8>,
 }
 
 /// The visible byte ranges of one `Event::Html` line — real block-level HTML
@@ -2054,7 +2097,13 @@ fn resolve_pending_tag(
         // finding 3): `hidden` may sit on any line the tag spans, not only the last
         // one.
         let full_text = text + &line[..end];
-        if has_hidden_attribute(&full_text) {
+        // Self-closing foreign content checked here too, not only in
+        // `find_any_hidden_opening_tag`'s own same-line search (Codex, round 46,
+        // "Skip multiline self-closing foreign hidden tags"): `<svg\n hidden />`
+        // takes this cross-line path, and pushing it regardless left the tracked
+        // state waiting for a `</svg>` a document never writes, hiding everything
+        // after it to end of document.
+        if !is_self_closing_tag(&full_text, &name) && has_hidden_attribute(&full_text) {
             open_non_rendering.push(name);
         }
     }
@@ -2066,7 +2115,7 @@ fn visible_html_ranges(
     in_html_comment: &mut bool,
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
-    pending_raw_text_close: &mut bool,
+    pending_raw_text_close: &mut Option<PendingRawTextClose>,
 ) -> Vec<VisibleHtmlSpan> {
     let mut spans = Vec::new();
     // Resolved before anything else, ahead of even `pending_tag` (Codex, pull request
@@ -2074,16 +2123,18 @@ fn visible_html_ranges(
     // never hold at once, since a raw-text element's own end tag is not scanned like an
     // ordinary one at all — but this is the more specific of the two mid-token states,
     // and the more clearly resolved one first is the same ordering `in_html_comment`
-    // already gets below. A bare, unquoted search for `>`, matching the same-line
-    // search this mirrors: once a raw-text close tag's name has matched, a browser is
-    // still consuming its own markup, not evaluating quotes inside it.
-    let mut cursor = if *pending_raw_text_close {
-        let Some(offset) = line.find('>') else {
+    // already gets below. Quote-aware, not a bare search (Codex, round 46, "Scan
+    // raw-text end tags through an unquoted delimiter"): a browser still tracks quotes
+    // while consuming a raw-text close tag's own trailing markup, so the delimiter can
+    // sit past a quoted attribute value that itself contains an earlier `>`.
+    let mut cursor = if let Some(pending) = pending_raw_text_close.take() {
+        let mut quote = pending.quote;
+        let Some(end) = scan_tag_close(line, 0, &mut quote) else {
+            *pending_raw_text_close = Some(PendingRawTextClose { quote });
             return spans;
         };
         open_non_rendering.pop();
-        *pending_raw_text_close = false;
-        offset + 1
+        end
     } else {
         0
     };
@@ -2469,7 +2520,7 @@ pub fn visible_source(contents: &str) -> String {
     let mut open_non_rendering: Vec<String> = Vec::new();
     let mut non_rendering_start: Option<usize> = None;
     let mut pending_tag: Option<PendingTag> = None;
-    let mut pending_raw_text_close = false;
+    let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
     // state a currently open nesting element carries across lines.
@@ -2668,17 +2719,18 @@ fn hide_non_rendering_in_html_line(
     open_non_rendering: &mut Vec<String>,
     non_rendering_start: &mut Option<usize>,
     pending_tag: &mut Option<PendingTag>,
-    pending_raw_text_close: &mut bool,
+    pending_raw_text_close: &mut Option<PendingRawTextClose>,
     in_template_comment: &mut bool,
     hidden: &mut Vec<(usize, usize)>,
 ) {
-    let mut cursor = if *pending_raw_text_close {
-        let Some(offset) = html.find('>') else {
+    let mut cursor = if let Some(pending) = pending_raw_text_close.take() {
+        let mut quote = pending.quote;
+        let Some(end) = scan_tag_close(html, 0, &mut quote) else {
+            *pending_raw_text_close = Some(PendingRawTextClose { quote });
             return;
         };
         open_non_rendering.pop();
-        *pending_raw_text_close = false;
-        offset + 1
+        end
     } else {
         0
     };
@@ -2810,7 +2862,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // A raw-text element's own close tag name matched but its terminating `>` had not
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
-    let mut pending_raw_text_close = false;
+    let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence
@@ -3011,7 +3063,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     // A raw-text element's own close tag name matched but its terminating `>` had not
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
-    let mut pending_raw_text_close = false;
+    let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
     let mut collecting = false;
     let mut current = String::new();
     let mut lines = Vec::new();
@@ -3117,7 +3169,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // A raw-text element's own close tag name matched but its terminating `>` had not
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
-    let mut pending_raw_text_close = false;
+    let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence

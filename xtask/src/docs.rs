@@ -7449,6 +7449,102 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_inside_a_raw_text_end_tags_own_quoted_delimiter_stays_hidden() {
+        // Codex, pull request #138, round 46, "Scan raw-text end tags through an
+        // unquoted delimiter": `find_raw_text_closing_tag`'s search for the tag's
+        // own terminating `>` was a blind, unquoted search, so `<script>x</script
+        // data-note=">decision-id headline">` — a legal close tag whose own bogus
+        // "attribute" quotes an entire `>decision-id headline` past a first `>`
+        // that sits *inside* that quoted value — popped the stack at the first `>`
+        // it found, exposing everything from there (the real quoted value,
+        // decision text included) as ordinary visible prose. A browser keeps
+        // tracking quotes while consuming an end tag's own trailing markup exactly
+        // like an opening tag's, and the real close is the second, unquoted `>`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>x</script data-note=\">{} {}\">\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a raw-text end tag's own quoted delimiter was \
+             wrongly exposed once the first, quoted `>` was read as the real \
+             close: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_html_elements_ignored_self_closing_slash_stays_hidden() {
+        // Codex, pull request #138, round 46, "Honor self-closing syntax only in
+        // foreign content": `is_self_closing_tag` treated a trailing `/` as
+        // bodyless for *any* tag, but a browser only honors that XML-style syntax
+        // for SVG and MathML elements — `<div hidden />decision-id
+        // headline</div>` still has a real, open `div` whose body includes the
+        // decision, `/` and all, because ordinary HTML ignores the slash outright.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden />{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision after an HTML element's ignored self-closing slash was \
+             wrongly exposed as outside the hidden element: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_self_closing_foreign_element_still_counts() {
+        // Codex, pull request #138, round 46, "Skip multiline self-closing
+        // foreign hidden tags": a self-closing `<svg hidden />` split across
+        // lines — `<svg\n hidden />` — reaches `resolve_pending_tag`'s cross-line
+        // path rather than `find_any_hidden_opening_tag`'s own same-line search
+        // (confirmed via a throwaway `pulldown-cmark` probe: a `<div>` block's
+        // nested `<svg\n hidden />decision-id headline</svg>` splits into four
+        // `Event::Html` lines, with the incomplete `<svg\n` becoming a
+        // `PendingTag`), and `resolve_pending_tag` pushed it onto the tracked
+        // stack solely because it carries `hidden`, without checking whether it
+        // is self-closing — so the scanner treated the text after it as still
+        // inside the (already self-closed) element.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg\n hidden />{} {}</svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_raw_text_end_tag_trapped_in_a_quoted_attribute_still_counts() {
         // Codex, pull request #138, round 40, finding 3: `find_closing_tag`'s
         // quote-aware tokenization, built for `<template>`'s genuinely parsed
