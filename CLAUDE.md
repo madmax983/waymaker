@@ -3214,7 +3214,7 @@ direct `#[ignore]` or `#[cfg(..)]`, so such a test still vouched for its row. Th
 own rewrite for issue #51 had already closed this — `crate::parse::declares_test` reads a
 test function's own attributes through `syn` and refuses `#[cfg_attr(..)]` the same way —
 but no regression test drove that specific attribute through `failure-matrix`'s own check,
-and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same gap.
+and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested gap.
 Both now do: `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` and
 `a_test_that_does_not_run_is_not_a_test` each drive a `#[cfg_attr(all(), ignore)]` row test
 through the real check and require the refusal. No new ADR: nothing here moves a
