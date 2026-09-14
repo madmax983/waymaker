@@ -649,13 +649,21 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
 
     impl Mutations<'_> {
         fn note(&mut self, expr: &syn::Expr) {
-            if let syn::Expr::Field(field) = expr {
+            // Walks the whole chain of field accesses, not only the outermost one:
+            // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent` and
+            // `request` are guarded *ancestors* in the same chain, and rewriting through
+            // either is the rewrite this whole family of checks exists to catch (issue #92,
+            // Codex's tenth round). Stops at the first non-field expression, which is the
+            // root the chain is built on.
+            let mut current = expr;
+            while let syn::Expr::Field(field) = current {
                 if let syn::Member::Named(ident) = &field.member {
                     let name = ident_name(ident);
                     if self.names.contains(&name.as_str()) {
                         self.found.push(name);
                     }
                 }
+                current = &field.base;
             }
         }
     }
@@ -2128,6 +2136,49 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_assignment_beneath_a_guarded_ancestor_field_is_reported() {
+        // Codex, issue #92's tenth round: `dispatch.intent.request.kind = x;` assigns to
+        // `kind`, not to a guarded name directly — but `intent` and `request` are both
+        // guarded ancestors in the chain, and rewriting through either is the same rewrite
+        // this whole family of checks exists to catch.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, x: u8) {\n\
+             \x20   dispatch.intent.request.kind = x;\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_mutable_reference_beneath_a_guarded_ancestor_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo) {\n\
+             \x20   let r = &mut dispatch.intent.id.seq;\n}",
+            &["intent", "id"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["id", "intent"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_method_call_beneath_a_guarded_ancestor_field_is_reported() {
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo, other: u8) {\n\
+             \x20   dispatch.intent.request.kind.clone_from(&other);\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
     }
 
     #[test]

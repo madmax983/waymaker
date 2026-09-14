@@ -171,6 +171,26 @@ and a new check refuses the file outright over it — a hard refusal of the cons
 same spirit as `effect-protocol`'s ban on a module declared anywhere in this file, rather than
 an attempt at the type resolution neither `syn` nor this scanner can safely do.
 
+**A tenth round found a gap in `mutated_field_names` itself: it checked only the outermost
+field of a chain.** `dispatch.intent.request.kind = x;` assigns to `kind`, which is not a
+guarded name — but `intent` and `request` are both guarded *ancestors* in the same chain,
+and rewriting through either reaches the identity or the kind the whole family of checks
+exists to protect, whether or not the leaf field itself is named. `note` now walks the full
+chain of field accesses back to its root, checking every segment rather than only the last
+one, for all three routes (assignment, `&mut` reference, method call) at once, since all
+three share the one helper.
+
+Two further findings from this round — that Rust's match ergonomics can bind a struct
+pattern's field to a mutable alias with *no* `ref`, `mut` or `&mut` written anywhere, purely
+from the scrutinee's own reference-ness, which `syn` cannot see; and that a generic type
+alias with a trait bound (`type Unchecked<T: Alias> = T::Dispatch;`) is an associated-type
+projection with no `qself` for the existing check to key on — are real and are not fixed
+here. Ten review rounds deep, both would need genuinely new detection machinery rather than
+a completion of what already exists, and this project's own review-depth guidance is to stop
+iterating past two or three rounds and open an issue once a fourth still finds real bugs
+rather than continue an unbounded loop. They are tracked in issue
+[#171](https://github.com/madmax983/waymaker/issues/171) instead.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

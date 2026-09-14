@@ -12369,6 +12369,25 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_assignment_beneath_a_guarded_ancestor_is_reported() {
+        // Codex, issue #92's tenth round: `dispatch.intent.id.run = other;` assigns to
+        // `run`, not to a guarded name directly — but `intent` and `id` are both guarded
+        // ancestors in the chain, and rewriting through either reaches the same identity the
+        // earlier field-rebinding fixes exist to protect.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper(mut dispatch: CheckedDispatch<'static>, other: RunId) -> CheckedDispatch<'static> {\n\
+               \x20   dispatch.intent.id.run = other;\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("intent") || detail.contains("id")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_never_built_inside_perform_is_reported() {
         let source = tests_support::clean_effect_module().replace(
             "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",
