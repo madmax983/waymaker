@@ -8901,23 +8901,36 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
-/// The single value in `0..found.arms.len()` no numbered (non-wildcard) arm's pattern
-/// names, if there is exactly one — the value a dense table's own wildcard arm covers.
+/// The single value in the `total`-wide window starting at the numbered arms' own lowest
+/// pattern no numbered (non-wildcard) arm's pattern names, if there is exactly one — the
+/// value a dense table's own wildcard arm covers.
 ///
-/// Codex's finding: the earlier version fixed that value at `found.arms.len() - 1`, on the
-/// assumption a dense table's catch-all always sits at the top of the range. ADR 0044's own
-/// nibble table happens to be written that way, but nothing about the shape it compiles
-/// into requires it — a table whose numbered arms spell `1..=15` and whose `_` covers `0`
-/// folds into the identical lookup table LLVM builds for the other order, over the same
-/// full range `0..found.arms.len()` rather than only the range the numbered arms happen to
-/// leave below their own count. Returns `None` when a numbered arm's pattern is missing,
-/// out of that range, or repeated, or when more than one value in the range is left
-/// uncovered — a real gap rather than one arm's worth of slack for the wildcard.
+/// Codex's finding: the earlier version fixed the window at the literal range
+/// `0..found.arms.len()`, on the assumption a dense table always starts at `0` — true of
+/// every nibble mask this crate writes, but not of the shape LLVM will still lower to an
+/// indexed table: `rustc` builds the identical switch table for `16..=31` with a base
+/// subtracted from the scrutinee first. The window's own base is now the lowest value a
+/// numbered arm actually names, so a table offset by any amount is still recognised.
+///
+/// This still folds two source orders into one answer, the way the fixed-at-`0` window
+/// already did: a table whose numbered arms spell `1..=15` and whose `_` covers `0`, and
+/// one whose numbered arms spell `0..=14` and whose `_` covers `15`, both compile to the
+/// identical lookup table, and windowing from the lowest numbered value reads the second
+/// order directly and the first as an equally valid window one step higher — either
+/// reading agrees that the match is dense, which is the only thing this function's caller
+/// needs from it. Returns `None` when a numbered arm's pattern is missing, would not fit a
+/// `usize`, is repeated, or when more than one value in the window is left uncovered — a
+/// real gap rather than one arm's worth of slack for the wildcard.
 fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<usize> {
-    let mut covered = vec![false; total];
+    let mut values = Vec::with_capacity(numbered.len());
     for arm in numbered {
-        let value = usize::try_from(arm.pattern?).ok()?;
-        let slot = covered.get_mut(value)?;
+        values.push(usize::try_from(arm.pattern?).ok()?);
+    }
+    let base = *values.iter().min()?;
+    let mut covered = vec![false; total];
+    for value in values {
+        let offset = value.checked_sub(base)?;
+        let slot = covered.get_mut(offset)?;
         if *slot {
             return None;
         }
@@ -8928,13 +8941,14 @@ fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<us
     if gaps.next().is_some() {
         return None;
     }
-    Some(gap)
+    base.checked_add(gap)
 }
 
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: every value of `0..found.arms.len()` named exactly once, whatever
-/// base or suffix each was spelled with and in whatever order they were written, except one
-/// left for a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
+/// into a lookup table: every value of some `found.arms.len()`-wide window of consecutive
+/// integers named exactly once, whatever base the window itself sits at, whatever suffix
+/// each pattern was spelled with, and in whatever order they were written, except one left
+/// for a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
 /// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
 /// [ADR 0044]'s own history on pull request #154 is why that matters: a hand-rolled
@@ -15431,6 +15445,36 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_offset_from_zero_is_reported() {
+        // Codex's twenty-ninth-round finding: `missing_value` fixed its window at the
+        // literal range `0..found.arms.len()`, so a table whose numbered arms spell a
+        // nonzero range — `16` through `31` here — indexed `covered` out of bounds on the
+        // very first value and `missing_value` returned `None`, reading the whole match as
+        // not dense. `rustc` still lowers this to an indexed switch table by subtracting
+        // the range's own base first, the same way it does for `0..=15`, so the window's
+        // base is now the numbered arms' own lowest value rather than a literal `0`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 16..32 {
+            let _ = writeln!(arms, "        {value} => offset_table_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn offset_table_helper(value: u32) -> u32 {{\n    value\n}}\n\nconst \
+             fn offset_table(value: u8) -> u32 {{\n    match value as u32 {{\n{arms}        \
+             _ => offset_table_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
             "{violations:?}"
         );
     }
