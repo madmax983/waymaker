@@ -1160,14 +1160,19 @@ Stated so that nobody mistakes silence for coverage:
   in for the crate root; it is left unresolved the same way `crate::` is, rather than guessed
   against the file's own aliases. A *plain relative* path naming a sibling module declared in
   this same file — `traits::Pollable`, where `mod traits { pub use .. as Pollable; }` sits in
-  the same scope, with no `crate`/`super`/`self` prefix at all — is a distinguishable gap
-  rather than the same one: nothing outside this file is needed to resolve it, but the scope
-  stack only tracks the lexical ancestors the visitor happens to be walking through, not an
-  index of named modules reachable by segment from an arbitrary point in the tree (Codex
-  review, PR #160, round 9). Filed as issue
-  [#169](https://github.com/madmax983/waymaker/issues/169) rather than fixed in that PR: it
-  is a miss, not the false positives rounds 5 through 8 kept finding, and closing it needs a
-  materially larger mechanism than a leading-marker check. An alias declared in one module
+  the same scope, with no `crate`/`super`/`self` prefix at all — is resolved (issue
+  [#169](https://github.com/madmax983/waymaker/issues/169)): `resolve_segments` steps into a
+  sibling `mod` block by name when no alias matches, and keeps resolving there, chained
+  through as many levels of nested sibling module as the path names. Three narrower limits are
+  left where descent cannot go. An out-of-line declaration (`mod traits;`, no body in this
+  file) and a module gated on exactly `#[cfg(test)]` are both left unresolved rather than
+  guessed at, the first because the module's real content lives in a file this per-file scan
+  never reads and the second for `own_aliases`'s own reason (issue #51: test code is not
+  shipped code). And once resolution has stepped into a module by name it is off the lexical
+  ancestor stack, so `self::` still resolves inside it but `super::` does not — the same
+  residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
+  a module reached by name has no ancestor this per-file scan can identify past the point it
+  was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
   they pin. Nor does
@@ -3555,3 +3560,21 @@ kind of input this design has never claimed to survive: this function's whole po
 check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #169 closes PR #160 round 9's own finding: `resolve_segments` could not follow a plain
+relative path — `traits::Pollable`, no `crate`/`super`/`self` prefix — into a sibling `mod`
+block declared in the same file, because the scope stack held only precomputed alias lists
+for the lexical ancestors the visitor was walking, not an index of named modules reachable
+from an arbitrary point in the tree. The stack now holds each scope's own item list instead
+of its precomputed aliases, and `resolve_segments` derives `own_aliases` from it as before
+plus a new `own_modules`: when no alias matches, it steps into a same-named sibling `mod`
+block and keeps resolving there, chained through as many levels as the path names. `self::`
+still resolves inside an entered module; `super::` does not, once resolution is off the
+lexical ancestor stack, the same residual-limit shape as `crate::` and a top-level `super::`
+above rather than a guess. An out-of-line `mod name;` and a `#[cfg(test)]`-gated module are
+both left unresolved for the same reason those are already residual limits elsewhere. The
+five call sites sharing this stack (`resolved_path_uses`, `future_trait_implementors`,
+`struct_literal_counts`, `name_uses`, and the `fn_blocks`/`inherent_impls` pair beneath it)
+moved to the new representation together, since they all resolve through one function; the
+existing `alias_scope_tests` suite covers every one of them unchanged. No new ADR: nothing
+here moves a must-not-own cell, a dependency edge, or a rule id.

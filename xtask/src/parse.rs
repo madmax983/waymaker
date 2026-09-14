@@ -273,6 +273,52 @@ fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
     aliases
 }
 
+/// The inline sibling modules `items` declares directly, at its own level only:
+/// `mod name { .. }` and the items inside it.
+///
+/// Issue #169: a plain relative path can name a sibling module instead of a
+/// `use` alias, e.g. `traits::Pollable` beside `mod traits { .. }`.
+/// [`resolve_segments`] uses this to step into that module and keep
+/// resolving there. An out-of-line declaration (`mod name;`) has no body
+/// here to step into, and a `#[cfg(test)]` module is skipped — the same
+/// reason `own_aliases` skips one (issue #51).
+fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
+    items
+        .iter()
+        .filter(|item| !has_cfg_test(item_attrs(item)))
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) => module
+                .content
+                .as_ref()
+                .map(|(_, nested)| (ident_name(&module.ident), nested.as_slice())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A cap on how many alias hops and module descents [`resolve_segments`]
+/// tries before it gives up.
+///
+/// Every hop either shrinks `segments` or moves to a strictly smaller item
+/// subtree, so a real path never needs more hops than there are items in the
+/// file. The only way to need more is a crafted alias cycle
+/// (`use a as b; use b as a;`); this stops that rather than looping forever
+/// (issue #109).
+fn item_count(items: &[syn::Item]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            syn::Item::Mod(module) => {
+                1 + module
+                    .content
+                    .as_ref()
+                    .map_or(0, |(_, nested)| item_count(nested))
+            }
+            _ => 1,
+        })
+        .sum()
+}
+
 fn collect_tree_aliases(
     tree: &syn::UseTree,
     absolute: bool,
@@ -343,12 +389,12 @@ impl ResolvedPath {
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Error> {
-    struct PathVisitor {
-        stack: Vec<Vec<UseAlias>>,
+    struct PathVisitor<'ast> {
+        stack: Vec<&'ast [syn::Item]>,
         paths: Vec<ResolvedPath>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for PathVisitor {
+    impl<'ast> syn::visit::Visit<'ast> for PathVisitor<'ast> {
         fn visit_item_use(&mut self, _use: &'ast syn::ItemUse) {}
 
         fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -361,17 +407,18 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
         }
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own aliases go on top of the stack (issue
-            // #109 review): pushed while walking it, popped afterward, so
-            // `super::`/`crate::` can still reach an ancestor scope while
-            // the module's own scope never inherits it implicitly. An
-            // out-of-line declaration (`mod x;`) has no body to push, but
-            // its own name and attributes must still be visited the default
-            // way — an early return here had skipped them (Codex review,
-            // PR #160), hiding a banned identifier spelled as a module name.
+            // A nested module's own item list goes on top of the stack
+            // (issue #109 review): pushed while walking it, popped
+            // afterward, so `super::`/`crate::` can still reach an ancestor
+            // scope while the module's own scope never inherits it
+            // implicitly. An out-of-line declaration (`mod x;`) has no body
+            // to push, but its own name and attributes must still be
+            // visited the default way — an early return here had skipped
+            // them (Codex review, PR #160), hiding a banned identifier
+            // spelled as a module name.
             let pushed = node.content.is_some();
             if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(own_aliases(items));
+                self.stack.push(items);
             }
             syn::visit::visit_item_mod(self, node);
             if pushed {
@@ -389,20 +436,22 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 
     let file = parse_rust(contents)?;
     let mut visitor = PathVisitor {
-        stack: vec![own_aliases(&file.items)],
+        stack: vec![&file.items],
         paths: Vec::new(),
     };
     visitor.visit_file(&file);
     Ok(visitor.paths)
 }
 
-/// `path`'s segments, resolved against `stack` — the alias scopes from the
-/// file this scan read (index 0) to the current module (the last one),
-/// each holding only what that module declares directly. Real Rust does
-/// not let a nested module inherit an outer one's aliases just by being
-/// written inside it (issue #109 review), but `self::` and `super::` are
-/// not inheritance — each names a scope explicitly, the same way
-/// regardless of nesting depth: `self` is the current scope and `super`
+/// `path`'s segments, resolved against `stack` — the item lists of the
+/// lexical scopes from the file this scan read (index 0) to the current
+/// module (the last one). Each scope's own `use` aliases and sibling `mod`
+/// blocks are read from its item list on demand.
+///
+/// Real Rust does not let a nested module inherit an outer one's aliases
+/// just by being written inside it (issue #109 review), but `self::` and
+/// `super::` are not inheritance — each names a scope explicitly, the same
+/// way regardless of nesting depth: `self` is the current scope and `super`
 /// is one level up (repeatable: `super::super::X`), bounded at the file
 /// this scan read. `crate::` is a residual limit rather than index 0 of
 /// this stack: this function sees one file, never the crate, so it has no
@@ -410,7 +459,16 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// PR #160, round 6). Each is consumed before every lookup, because an
 /// alias's own target can itself start with one, e.g.
 /// `pub use super::Pollable as Awaitable;` (Codex review, PR #160).
-fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
+///
+/// A plain relative path may also name a sibling `mod` block declared in
+/// the same scope, e.g. `traits::Pollable` beside `mod traits { .. }`
+/// (issue #169). Stepping into that module this way leaves the lexical
+/// ancestor stack behind: a module reached by name has no ancestor this
+/// per-file scan can identify past the point it was entered from, so
+/// `self::` still resolves inside it but `super::` does not — the segments
+/// are left as written from there, the same residual-limit shape as
+/// `crate::` and a top-level `super::` above.
+fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     let mut segments: Vec<String> = path
         .segments
         .iter()
@@ -420,34 +478,70 @@ fn resolve_segments(path: &syn::Path, stack: &[Vec<UseAlias>]) -> Vec<String> {
         return segments;
     }
     let mut scope = stack.len().saturating_sub(1);
-    // A renamed re-export chains one alias to another, possibly through
-    // another scope (issue #109). Bounded by every alias reachable from
-    // here, across the whole stack: enough for any real chain, and it
-    // stops a crafted cycle (`use a as b; use b as a;`) from looping
-    // forever.
-    let bound: usize = stack.iter().map(Vec::len).sum();
+    // `None` while resolution is still on the lexical ancestor stack;
+    // `Some(items)` once it has stepped into a sibling module by name
+    // (issue #169), at which point `scope` stops tracking it.
+    let mut entered: Option<&[syn::Item]> = None;
+    // A renamed re-export chains one alias to another, and a plain
+    // relative path can step into a sibling module (issue #169), possibly
+    // more than once. Bounded by the file's own item count: enough for any
+    // real chain or descent, and it stops a crafted alias cycle
+    // (`use a as b; use b as a;`) from looping forever — module descent
+    // cannot cycle on its own, since each step moves to a strictly
+    // smaller, physically nested subtree.
+    let bound = stack.first().map_or(0, |items| item_count(items)) + 1;
     for _ in 0..=bound {
-        consume_scope_prefix(&mut segments, &mut scope);
-        let aliases = stack.get(scope).map(Vec::as_slice).unwrap_or_default();
-        let Some(first) = segments.first() else {
+        let items = if let Some(items) = entered {
+            consume_self_prefix(&mut segments);
+            items
+        } else {
+            consume_scope_prefix(&mut segments, &mut scope);
+            stack.get(scope).copied().unwrap_or_default()
+        };
+        let Some(first) = segments.first().cloned() else {
             break;
         };
-        let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) else {
-            break;
-        };
-        let mut resolved = alias.target.clone();
-        resolved.extend(segments.drain(1..));
-        segments = resolved;
-        // `use ::a::b as c;` reaches the extern prelude directly, past every
-        // local scope on purpose (Codex review, PR #160, round 8): `a` is
-        // never a local alias, whatever else in this file happens to share
-        // its spelling. Stop the chain here rather than looking `a` up.
-        if alias.absolute {
-            return segments;
+        if let Some(alias) = own_aliases(items)
+            .iter()
+            .find(|candidate| candidate.local == first)
+        {
+            let mut resolved = alias.target.clone();
+            resolved.extend(segments.drain(1..));
+            segments = resolved;
+            // `use ::a::b as c;` reaches the extern prelude directly, past
+            // every local scope on purpose (Codex review, PR #160, round
+            // 8): `a` is never a local alias, whatever else in this file
+            // happens to share its spelling. Stop the chain here rather
+            // than looking `a` up.
+            if alias.absolute {
+                return segments;
+            }
+            continue;
         }
+        let Some((_, module_items)) = own_modules(items)
+            .into_iter()
+            .find(|(name, _)| *name == first)
+        else {
+            break;
+        };
+        segments.remove(0);
+        entered = Some(module_items);
     }
-    consume_scope_prefix(&mut segments, &mut scope);
+    match entered {
+        Some(_) => consume_self_prefix(&mut segments),
+        None => consume_scope_prefix(&mut segments, &mut scope),
+    }
     segments
+}
+
+/// Consumes a leading `self` segment, if there is one. The half of
+/// [`consume_scope_prefix`] that still applies once resolution has stepped
+/// into a module by name (issue #169): `self` still names that module, but
+/// there is no ancestor scope left here for `super` to step to.
+fn consume_self_prefix(segments: &mut Vec<String>) {
+    while segments.first().map(String::as_str) == Some("self") {
+        segments.remove(0);
+    }
 }
 
 /// Consumes leading `self`/`super` segments, moving `scope` — an index
@@ -489,15 +583,15 @@ fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn future_trait_implementors(contents: &str) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut stack = vec![own_aliases(&file.items)];
+    let mut stack = vec![file.items.as_slice()];
     let mut implementors = Vec::new();
     collect_future_implementors(&file.items, &mut stack, &mut implementors);
     Ok(implementors)
 }
 
-fn collect_future_implementors(
-    items: &[syn::Item],
-    stack: &mut Vec<Vec<UseAlias>>,
+fn collect_future_implementors<'ast>(
+    items: &'ast [syn::Item],
+    stack: &mut Vec<&'ast [syn::Item]>,
     implementors: &mut Vec<String>,
 ) {
     for item in items {
@@ -519,13 +613,13 @@ fn collect_future_implementors(
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    // The nested module's own aliases go on top of the
+                    // The nested module's own item list goes on top of the
                     // stack (issue #109 review): pushed for the recursion,
                     // popped after, so `super::`/`crate::` inside it can
                     // still reach an ancestor scope on purpose without this
                     // scope's own chain resolving through one of its
                     // renames by accident.
-                    stack.push(own_aliases(nested));
+                    stack.push(nested);
                     collect_future_implementors(nested, stack, implementors);
                     stack.pop();
                 }
@@ -685,13 +779,13 @@ pub fn struct_literal_counts(
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals {
-        stack: Vec<Vec<UseAlias>>,
+    struct Literals<'ast> {
+        stack: Vec<&'ast [syn::Item]>,
         name: String,
         count: usize,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for Literals {
+    impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
@@ -707,17 +801,18 @@ pub fn struct_literal_counts(
         }
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own aliases go on top of the stack (issue
-            // #109 review): pushed while walking it, popped afterward, so
-            // `super::`/`crate::` can still reach an ancestor scope while
-            // the module's own scope never inherits it implicitly. An
-            // out-of-line declaration (`mod x;`) has no body to push, but
-            // its own name and attributes must still be visited the default
-            // way — an early return here had skipped them (Codex review,
-            // PR #160), hiding a banned identifier spelled as a module name.
+            // A nested module's own item list goes on top of the stack
+            // (issue #109 review): pushed while walking it, popped
+            // afterward, so `super::`/`crate::` can still reach an ancestor
+            // scope while the module's own scope never inherits it
+            // implicitly. An out-of-line declaration (`mod x;`) has no body
+            // to push, but its own name and attributes must still be
+            // visited the default way — an early return here had skipped
+            // them (Codex review, PR #160), hiding a banned identifier
+            // spelled as a module name.
             let pushed = node.content.is_some();
             if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(own_aliases(items));
+                self.stack.push(items);
             }
             syn::visit::visit_item_mod(self, node);
             if pushed {
@@ -740,7 +835,7 @@ pub fn struct_literal_counts(
     let file = parse_rust(contents)?;
 
     let mut total = Literals {
-        stack: vec![own_aliases(&file.items)],
+        stack: vec![&file.items],
         name: name.to_owned(),
         count: 0,
     };
@@ -771,13 +866,13 @@ pub fn struct_literal_counts(
 /// module's own, not inherited from where the search started).
 enum InsideTarget<'a> {
     /// A function body.
-    Block(&'a syn::Block, Vec<Vec<UseAlias>>),
+    Block(&'a syn::Block, Vec<&'a [syn::Item]>),
     /// An `impl` block, visited whole.
-    Impl(&'a syn::ItemImpl, Vec<Vec<UseAlias>>),
+    Impl(&'a syn::ItemImpl, Vec<&'a [syn::Item]>),
 }
 
-impl InsideTarget<'_> {
-    fn stack(&self) -> &[Vec<UseAlias>] {
+impl<'a> InsideTarget<'a> {
+    fn stack(&self) -> &[&'a [syn::Item]] {
         match self {
             Self::Block(_, stack) | Self::Impl(_, stack) => stack,
         }
@@ -786,7 +881,7 @@ impl InsideTarget<'_> {
 
 /// The bodies [`FnScope`] selects, in source order.
 fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTarget<'a>> {
-    let root_stack = vec![own_aliases(&file.items)];
+    let root_stack = vec![file.items.as_slice()];
     match *scope {
         FnScope::None => Vec::new(),
         FnScope::FirstFn(name) => {
@@ -827,9 +922,9 @@ fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTar
 /// review), so `super::`/`crate::` inside the body can still reach an ancestor scope.
 fn fn_blocks<'a>(
     items: &'a [syn::Item],
-    stack: &[Vec<UseAlias>],
+    stack: &[&'a [syn::Item]],
     name: &str,
-    blocks: &mut Vec<(&'a syn::Block, Vec<Vec<UseAlias>>)>,
+    blocks: &mut Vec<(&'a syn::Block, Vec<&'a [syn::Item]>)>,
 ) {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -854,7 +949,7 @@ fn fn_blocks<'a>(
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     let mut nested_stack = stack.to_vec();
-                    nested_stack.push(own_aliases(nested));
+                    nested_stack.push(nested);
                     fn_blocks(nested, &nested_stack, name, blocks);
                 }
             }
@@ -868,9 +963,9 @@ fn fn_blocks<'a>(
 /// found: `stack` plus an inline module's own on top of it (issue #109 review).
 fn inherent_impls<'a>(
     items: &'a [syn::Item],
-    stack: &[Vec<UseAlias>],
+    stack: &[&'a [syn::Item]],
     ty: &str,
-) -> Vec<(&'a syn::ItemImpl, Vec<Vec<UseAlias>>)> {
+) -> Vec<(&'a syn::ItemImpl, Vec<&'a [syn::Item]>)> {
     let mut found = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -886,7 +981,7 @@ fn inherent_impls<'a>(
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     let mut nested_stack = stack.to_vec();
-                    nested_stack.push(own_aliases(nested));
+                    nested_stack.push(nested);
                     found.extend(inherent_impls(nested, &nested_stack, ty));
                 }
             }
@@ -1096,13 +1191,13 @@ impl NameUses {
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
-    struct Names {
-        stack: Vec<Vec<UseAlias>>,
+    struct Names<'ast> {
+        stack: Vec<&'ast [syn::Item]>,
         idents: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for Names {
+    impl<'ast> syn::visit::Visit<'ast> for Names<'ast> {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
@@ -1118,17 +1213,18 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         }
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own aliases go on top of the stack (issue
-            // #109 review): pushed while walking it, popped afterward, so
-            // `super::`/`crate::` can still reach an ancestor scope while
-            // the module's own scope never inherits it implicitly. An
-            // out-of-line declaration (`mod x;`) has no body to push, but
-            // its own name and attributes must still be visited the default
-            // way — an early return here had skipped them (Codex review,
-            // PR #160), hiding a banned identifier spelled as a module name.
+            // A nested module's own item list goes on top of the stack
+            // (issue #109 review): pushed while walking it, popped
+            // afterward, so `super::`/`crate::` can still reach an ancestor
+            // scope while the module's own scope never inherits it
+            // implicitly. An out-of-line declaration (`mod x;`) has no body
+            // to push, but its own name and attributes must still be
+            // visited the default way — an early return here had skipped
+            // them (Codex review, PR #160), hiding a banned identifier
+            // spelled as a module name.
             let pushed = node.content.is_some();
             if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(own_aliases(items));
+                self.stack.push(items);
             }
             syn::visit::visit_item_mod(self, node);
             if pushed {
@@ -1151,7 +1247,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
     let file = parse_rust(contents)?;
 
     let mut names = Names {
-        stack: vec![own_aliases(&file.items)],
+        stack: vec![&file.items],
         idents: Vec::new(),
         paths: Vec::new(),
     };
@@ -2068,6 +2164,93 @@ mod alias_scope_tests {
             !implementors.contains(&"Sneaky".to_owned()),
             "an absolute alias target chained through a same-spelled local alias: \
              {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_relative_path_follows_a_sibling_modules_alias() {
+        // Issue #169 (Codex review, PR #160, round 9): `traits` is a sibling
+        // `mod` block in the same scope as the `use` statement that names
+        // it, with no `crate`/`super`/`self` prefix at all. Nothing outside
+        // this file is needed to resolve `traits::Pollable` — unlike
+        // `crate::traits::Pollable`, which stays a residual limit.
+        let code = "mod traits {\n    pub use core::future::Future as Pollable;\n}\nuse \
+             traits::Pollable as Awaitable;\nstruct Sneaky;\nimpl Awaitable for Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_plain_relative_path_follows_a_chain_of_nested_sibling_modules() {
+        // A path may name more than one level of sibling module —
+        // `a::b::Pollable` — not only a single hop.
+        let code = "mod a {\n    mod b {\n        pub use core::future::Future as Pollable;\n    \
+             }\n}\nuse a::b::Pollable as Awaitable;\nstruct Sneaky;\nimpl Awaitable for Sneaky \
+             {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn an_out_of_line_sibling_module_declaration_is_left_unresolved() {
+        // `mod traits;` (issue #169's own out-of-line case) has no body in
+        // this file to step into — the declaring module lives in another
+        // file this per-file scan never reads. An honest miss, not a
+        // guessed match: `Innocent` must not be reported.
+        let code = "mod traits;\nuse traits::Pollable as Awaitable;\nstruct Innocent;\nimpl \
+             Awaitable for Innocent {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "an out-of-line module declaration was treated as though its body were known: \
+             {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_sibling_module_is_not_stepped_into() {
+        // Test code is not shipped code (issue #51): a `mod` gated on
+        // exactly `#[cfg(test)]` must not be treated as a real sibling
+        // module to step into, the same way `own_aliases` already skips a
+        // `#[cfg(test)]` `use` item.
+        let code = "#[cfg(test)]\nmod traits {\n    pub use core::future::Future as Pollable;\n\
+             }\nuse traits::Pollable as Awaitable;\nstruct Innocent;\nimpl Awaitable for \
+             Innocent {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "a #[cfg(test)] module was stepped into as though it shipped: {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_qualified_alias_still_resolves_inside_an_entered_module() {
+        // `self::` still names the module resolution just stepped into
+        // (issue #169's own doc comment): the chain must reach `Future`
+        // through a `self::`-qualified re-export declared inside `traits`.
+        let code = "mod traits {\n    pub use core::future::Future as Pollable;\n    pub use \
+             self::Pollable as Awaitable;\n}\nuse traits::Awaitable as Reexported;\nstruct \
+             Sneaky;\nimpl Reexported for Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_super_qualified_alias_inside_an_entered_module_is_left_unresolved() {
+        // Once resolution has stepped into `traits` by name it is off the
+        // lexical ancestor stack, so `super::Pollable` there is left as
+        // written rather than guessed at — the same residual-limit shape
+        // as `crate::` and a top-level `super::` (rounds 6/7). An honest
+        // miss: `Innocent` must not be reported, even though `Pollable`
+        // really is `Future` one file-scope up.
+        let code = "use core::future::Future as Pollable;\nmod traits {\n    pub use \
+             super::Pollable as Awaitable;\n}\nuse traits::Awaitable as Reexported;\nstruct \
+             Innocent;\nimpl Reexported for Innocent {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "a `super`-qualified alias inside an entered module resolved as though it were \
+             still on the lexical ancestor stack: {implementors:?}"
         );
     }
 
