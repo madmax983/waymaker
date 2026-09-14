@@ -3460,6 +3460,11 @@ fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String
 /// Parsed with [`crate::parse::declared_module_names`], not scanned: nesting a
 /// `mod` inside another is exactly the shape a line scanner miscounts. A file
 /// that fails to parse contributes no name, the safe direction.
+///
+/// A floor, not a proof: per file is not per lexical scope. A `use crate::x as
+/// serde;` local alias reusing a dependency's name shadows it too, in the scope
+/// it is declared, and this function does not see it — issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180).
 fn local_module_names(source: &str) -> HashSet<String> {
     crate::parse::declared_module_names(source)
         .unwrap_or_default()
@@ -3470,18 +3475,26 @@ fn local_module_names(source: &str) -> HashSet<String> {
 /// The names `source`'s own `use` declarations bring in from a root in
 /// `external_roots` — the alias a rename gives it, or the item's own name.
 ///
-/// `use` is scoped to the file that wrote it. So this reads one file, unlike
-/// [`private_trait_names`] and [`local_module_names`], which read the whole crate.
-/// An unqualified `impl <Name> for <Type>` cannot be told from a local trait by
-/// name alone. A name this file imports from an external root settles it for this
-/// file, whatever a same-named private trait elsewhere in the crate says. Codex
-/// found this on this pull request's own review.
+/// `use` is scoped to the file that wrote it, unlike [`private_trait_names`],
+/// which reads the whole crate. An unqualified `impl <Name> for <Type>` cannot be
+/// told from a local trait by name alone. A name this file imports from an
+/// external root settles it for this file, whatever a same-named private trait
+/// elsewhere in the crate says. Codex found this on this pull request's own
+/// review.
 ///
 /// Parsed with [`crate::parse::use_aliases`], not scanned: a `use` item can group,
 /// nest and rename in ways a line scanner reads wrong (issue #51). A file that
 /// fails to parse contributes no name, the safe direction — its unqualified impls
 /// still fall back to the crate-wide private-trait check, exactly as before this
 /// function existed.
+///
+/// A floor, not a proof, in two ways issue [#180](https://github.com/madmax983/waymaker/issues/180)
+/// tracks. `use_aliases` flattens every inline module's imports into one set for
+/// the whole file, so an import nested in one module can settle a name for an
+/// unrelated impl elsewhere in the same file. And a root-renaming import — `use
+/// serde as wire;` — is not credited to `wire` at all, since `external_roots`
+/// only names a dependency by its own declared name or rename, never by an
+/// import alias a file gives it.
 fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> HashSet<String> {
     crate::parse::use_aliases(source)
         .unwrap_or_default()
