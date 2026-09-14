@@ -4,9 +4,14 @@
 //! CRC32C or a smaller table-free CRC implementation", and
 //! [ADR 0010](https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
 //! settles it with measurements taken on `thumbv6m-none-eabi`: CRC-32/ISO-HDLC over the
-//! header and payload, CRC-16/CCITT-FALSE over the header, both table-free. This module is
-//! where that answer is *bound* rather than assumed — [`Catalogued`] is the binding, and
-//! [`IntegrityCheck`] is what makes it one choice among possible ones.
+//! header and payload, CRC-16/CCITT-FALSE over the header, both table-free at the time. This
+//! module is where that answer is *bound* rather than assumed — [`Catalogued`] is the
+//! binding, and [`IntegrityCheck`] is what makes it one choice among possible ones.
+//! [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+//! later supersedes the table-free half for `crc32` alone, once a profile of this
+//! workspace's own workloads showed it worth a 64-byte nibble table; `crc16` needed none.
+//! `Catalogued` is unchanged by either ADR — both bind to the same two free functions,
+//! whichever algorithm each currently is.
 //!
 //! # Why there is a trait at all, when only one implementation ships
 //!

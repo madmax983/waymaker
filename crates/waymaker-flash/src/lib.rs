@@ -12,8 +12,12 @@
 //!
 //! # Status
 //!
-//! [`integrity`] is the seal the codec verifies with — ADR 0010's catalogued, table-free
-//! pair, bound behind a trait so the choice stays swappable and the widths do not.
+//! [`integrity`] is the seal the codec verifies with — ADR 0010's catalogued pair, bound
+//! behind a trait so the choice stays swappable and the widths do not.
+//! [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+//! supersedes ADR 0010's table-free conclusion for `crc32` alone: a profile of this
+//! workspace's own workloads put the two checksums at 33–49% of engine-attributed host
+//! instructions, so `crc32` now spends a 64-byte nibble table and `crc16` stays table-free.
 //! [`frame`] is the record codec — §09's handwritten, fixed-endian, self-delimiting,
 //! bounds-validated frame, its two checksums, and the append scan that turns a bank into a
 //! committed prefix. [`storage`] is §12's contract: the geometry that decides what an
