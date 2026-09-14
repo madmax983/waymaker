@@ -20312,6 +20312,129 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_crate_root_path_inside_a_const_initializer_is_reported() {
+        // Codex's next-round finding: `crate_root_pattern_uses`'s own `CrateRootPatterns`
+        // visitor only ever overrode `visit_pat`, so a crate-anchored path used in *pattern*
+        // position (`crate::R0 => ..`) was refused outright, but the identical path used as
+        // a `const`'s own *initializer* (`const P0: u8 = crate::R0;`) was invisible to it —
+        // `literal_or_const_value` already declines to resolve such a path on purpose
+        // (`resolve_anchored_single_segment` answers `crate::NAME` as always-unresolved),
+        // so the constant simply stayed silently unresolved, and `missing_value`/
+        // `fully_dense_arm_patterns` fail a match's *entire* dense-table check the moment
+        // any one arm is unresolved — the same shape of gap `const_call_initializer_uses`
+        // already closes for a call initializer. Every `const` item's own initializer is
+        // now searched for a crate-anchored path too, independent of whether it is ever
+        // pattern-matched on.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_root_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = crate::R0;\n    const P1: u8 = crate::R1;\n    \
+             const P2: u8 = crate::R2;\n    const P3: u8 = crate::R3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("crate::R0")
+                    && violation
+                        .detail
+                        .contains("anchored at the crate's own root")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_through_a_grouped_self_renamed_import_is_reported() {
+        // Codex's next-round finding: `use indices::{self as idx};` binds `idx` to
+        // `indices` itself — Rust's own grammar for renaming a module import — but
+        // `flatten_use_tree`'s `Rename` arm treated `self` as an ordinary path segment,
+        // appending it literally and recording the target as `indices::self` rather than
+        // `indices`. A pattern spelled `idx::P0` through `idx::P3` therefore searched
+        // `UseScopes` for a target Rust itself would never produce, and stayed unresolved
+        // on every arm. `self` in this position now contributes no segment of its own,
+        // matching the plain, unrenamed `use indices::{self};` (`Pat::Name`) that already
+        // needed the identical fix.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub const P0: u8 = 0;\n    pub const P1: u8 = 1;\n    \
+             pub const P2: u8 = 2;\n    pub const P3: u8 = 3;\n}\n\n\
+             use indices::{self as idx};\n\n\
+             const fn grouped_self_renamed_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        idx::P0 => 0,\n        idx::P1 => 1,\n        \
+             idx::P2 => 2,\n        idx::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_negated_typed_constant_paths_is_reported() {
+        // Codex's next-round finding: `const Q0: u8 = 255; const P0: u8 = !Q0;` names an
+        // operand `is_definitely_unsigned` already confirms is unsigned — `Q0`'s own
+        // declaration is `u8` — but the `!` case in `literal_or_const_value` still required
+        // a *suffixed literal* to learn a width to mask against, and a bare path to an
+        // already-typed sibling constant has no suffix of its own to read, so it stayed
+        // unresolved. `evaluate_bitwise_not` now also reads a bare path's own declared
+        // width through `resolve.width`, a new narrow, bare-name-only resolver mirroring
+        // `resolve.unsigned`'s own scope, so `!Q0` masks to `u8`'s eight bits (`!255u8 ==
+        // 0`) exactly as a width-aware NOT would.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_typed_constant_table(nibble: u8) -> u32 {\n    \
+             const Q0: u8 = 255;\n    const P0: u8 = !Q0;\n    const P1: u8 = !Q0 + 1;\n    \
+             const P2: u8 = !Q0 + 2;\n    const P3: u8 = !Q0 + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_range_pattern_matched_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { 0..=14 => 0, _ => 100 };`
+        // nests a range pattern inside the match that initializes a numbered constant —
+        // `match_arm_matches_constant`, the function `evaluate_match` asks whether an arm's
+        // own pattern matches the scrutinee, recognised a literal, a binding, an or-pattern
+        // and parentheses, but fell to its own `_ => None` for anything else, a range
+        // included, which stops `evaluate_match`'s whole search rather than trying a later
+        // arm. Every one of a table's numbered arms nesting a range-pattern match this way
+        // stayed unresolved. `pattern_literal`'s own `Pat::Range` case already answers the
+        // wider question of every value a range names, bounded so it cannot enumerate an
+        // unreasonably wide one; this only needs whether one value is inside, which is the
+        // same forward-distance-from-`start` arithmetic without enumerating anything.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn range_pattern_matched_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { 0..=14 => 0, _ => 100 };\n    \
+             const P1: u8 = match 1u8 { 0..=14 => 1, _ => 100 };\n    \
+             const P2: u8 = match 2u8 { 0..=14 => 2, _ => 100 };\n    \
+             const P3: u8 = match 3u8 { 0..=14 => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

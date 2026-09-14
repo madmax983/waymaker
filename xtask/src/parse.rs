@@ -1058,10 +1058,56 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
         found: Vec<String>,
     }
 
+    /// Every crate-anchored path (two or more segments, no qualified self, headed by
+    /// `crate`) anywhere within `expr`'s own tree — the identical shape and width
+    /// `visit_pat` below refuses in pattern position, found here in *expression* position
+    /// instead.
+    ///
+    /// Codex's next-round finding: `const P0: u8 = crate::R0;` names a crate-root constant
+    /// this scan cannot see the value of, exactly as much as a pattern spelled the same way
+    /// does — but nothing here had ever looked at a `const` item's own *initializer*, only
+    /// at where a path is *matched against*. `literal_or_const_value` already declines to
+    /// resolve such a path (`resolve_anchored_single_segment` answers `crate::NAME` as
+    /// always-unresolved, on purpose), so the constant simply stayed silently unresolved —
+    /// and `missing_value`/`fully_dense_arm_patterns` fail a match's *entire* dense-table
+    /// check the moment any one arm is unresolved, the identical gap
+    /// [`const_call_initializer_uses`] already closes for a call. Refused outright here
+    /// too, independent of whether anything ever pattern-matches on the constant: the
+    /// whole expression tree is searched, not only its own top level, for the same reason
+    /// `const_call_initializer_uses`'s own `contains_call` does.
+    fn crate_anchored_paths(expr: &syn::Expr) -> Vec<String> {
+        struct FindCrateAnchoredPaths {
+            found: Vec<String>,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for FindCrateAnchoredPaths {
+            fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+                if node.qself.is_none() {
+                    let segments: Vec<String> = node
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| ident_name(&segment.ident))
+                        .collect();
+                    if segments.len() >= 2 && segments.first().map(String::as_str) == Some("crate")
+                    {
+                        self.found.push(segments.join("::"));
+                    }
+                }
+                syn::visit::visit_expr_path(self, node);
+            }
+        }
+        let mut finder = FindCrateAnchoredPaths { found: Vec::new() };
+        finder.visit_expr(expr);
+        finder.found
+    }
+
     impl<'ast> syn::visit::Visit<'ast> for CrateRootPatterns {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
+            }
+            if let syn::Item::Const(constant) = node {
+                self.found.extend(crate_anchored_paths(&constant.expr));
             }
             syn::visit::visit_item(self, node);
         }
@@ -1069,6 +1115,9 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
         fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
             if has_cfg_test(impl_item_attrs(node)) {
                 return;
+            }
+            if let syn::ImplItem::Const(constant) = node {
+                self.found.extend(crate_anchored_paths(&constant.expr));
             }
             syn::visit::visit_impl_item(self, node);
         }
@@ -1930,6 +1979,7 @@ pub fn match_expressions_with_prefix(
         &OwnConsts {
             exprs: &item_const_exprs(&file.items),
             unsigned: &item_const_unsigned(&file.items),
+            types: &item_const_types(&file.items),
         },
         &OuterScopes {
             values: &ConstScopes(Vec::new()),
@@ -2083,6 +2133,7 @@ pub fn qualified_constants_with_prefix(
         &OwnConsts {
             exprs: &item_const_exprs(&file.items),
             unsigned: &item_unsigned,
+            types: &item_const_types(&file.items),
         },
         &OuterScopes {
             values: &ConstScopes(Vec::new()),
@@ -2284,6 +2335,36 @@ fn item_const_unsigned(items: &[syn::Item]) -> std::collections::HashMap<String,
         .collect()
 }
 
+/// [`item_const_exprs`]'s own mirror for a *width*-aware sibling of [`UnsignedConstScopes`]:
+/// every `const` declared *directly* in `items`, by name, against its own type ascription's
+/// single-segment name — `"u8"`, `"i32"`, and so on — wherever it is one, not against the
+/// value it initializes to.
+///
+/// Codex's next-round finding: `const Q0: u8 = 255; const P0: u8 = !Q0;` names an operand
+/// [`is_definitely_unsigned`] already answers `true` for (`Q0`'s own declaration is
+/// `u8`), but the `!` case in [`literal_or_const_value`] still required a suffixed literal
+/// through [`as_suffixed_int_literal`] to learn a width to mask against, and a bare path has
+/// no suffix of its own to read. Confirming a path is unsigned answers a different question
+/// than knowing *how many bits* its own type has, and only the second is enough to negate it
+/// correctly — `!255u8` and `!255u16` are different values. This is that width, read off the
+/// identical declaration [`item_const_unsigned`] already reads a bare `true`/`false` out of,
+/// scoped identically narrowly: only a sibling declared directly in the same item list, not a
+/// name reached through an outer scope or a qualified path, which decline rather than guess.
+fn item_const_types(items: &[syn::Item]) -> std::collections::HashMap<String, String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Const(constant) = item else {
+                return None;
+            };
+            if has_cfg_test(&constant.attrs) {
+                return None;
+            }
+            single_segment_type_name(&constant.ty).map(|name| (ident_name(&constant.ident), name))
+        })
+        .collect()
+}
+
 /// The unevaluated initializer of every associated `const` declared directly in an
 /// inherent `impl`'s own item list — `impl Indices { const P0: u8 = 0; ... }` — mirroring
 /// [`item_const_exprs`] for the other place a scannable constant is declared.
@@ -2366,6 +2447,24 @@ fn block_const_unsigned(block: &syn::Block) -> std::collections::HashMap<String,
                     declared_type_is_unsigned(&constant.ty),
                 )
             })
+        })
+        .collect()
+}
+
+/// [`block_const_exprs`]'s own mirror for the width-aware [`item_const_types`], the same way
+/// [`block_const_unsigned`] mirrors [`item_const_unsigned`].
+fn block_const_types(block: &syn::Block) -> std::collections::HashMap<String, String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Item(syn::Item::Const(constant)) = stmt else {
+                return None;
+            };
+            if has_cfg_test(&constant.attrs) {
+                return None;
+            }
+            single_segment_type_name(&constant.ty).map(|name| (ident_name(&constant.ident), name))
         })
         .collect()
 }
@@ -2509,11 +2608,32 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
             flatten_use_tree(&path.tree, prefix, scope);
             prefix.pop();
         }
+        // Codex's next-round finding: `self` in this position — `use indices::{self};` —
+        // is not another path segment naming a child of `indices`, it is Rust's own way of
+        // binding the *containing* module itself, so `full` must stay exactly `prefix`
+        // rather than gaining a literal `"self"` segment, and the bound name is `prefix`'s
+        // own last segment (`indices`) rather than the word `"self"`. The unqualified
+        // `use indices;` a caller would otherwise have to write is what this is equivalent
+        // to, and it is what `resolve_qualified_path`'s own `self`-skipping already
+        // expects a scope's stored path to look like.
+        syn::UseTree::Name(name) if name.ident == "self" => {
+            if let Some(bound_name) = prefix.last().cloned() {
+                scope.named.insert(bound_name, prefix.clone());
+            }
+        }
         syn::UseTree::Name(name) => {
             let bound_name = ident_name(&name.ident);
             let mut full = prefix.clone();
             full.push(bound_name.clone());
             scope.named.insert(bound_name, full);
+        }
+        // [`flatten_use_tree`]'s `Name` arm above holds the rationale: `self` renamed —
+        // `use indices::{self as idx};` — binds `idx` to `indices` itself, so `full` is
+        // `prefix` unchanged rather than `prefix` plus a literal `"self"` segment.
+        syn::UseTree::Rename(rename) if rename.ident == "self" => {
+            scope
+                .named
+                .insert(ident_name(&rename.rename), prefix.clone());
         }
         syn::UseTree::Rename(rename) => {
             let mut full = prefix.clone();
@@ -2537,6 +2657,11 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
 struct OwnConsts<'a> {
     exprs: &'a std::collections::HashMap<String, syn::Expr>,
     unsigned: &'a std::collections::HashMap<String, bool>,
+    // Codex's next-round finding: `!Q0` over a bare sibling reference needs `Q0`'s own
+    // declared *width*, not only whether it is unsigned — [`item_const_types`]/
+    // [`block_const_types`] are that mirror, scoped only as narrowly as this struct's own
+    // `unsigned` field already is: a sibling declared directly in the same item list.
+    types: &'a std::collections::HashMap<String, String>,
 }
 
 /// [`ConstScopes`] alongside its own [`UnsignedConstScopes`] mirror — [`OwnConsts`]'s own
@@ -2665,9 +2790,19 @@ fn resolve_scope_consts(
                 }
                 well_known_integer_bound(type_name, member).is_some()
             };
+            // [`evaluate_bitwise_not`]'s own doc comment holds the rationale: a bare
+            // sibling's own declared width, answered only as narrowly as `own.types` itself
+            // is scoped — a name reached through an outer scope or a qualified path
+            // declines, which is always sound for a fact this pass does not track that
+            // widely.
+            let resolve_width = |path: &syn::Path| -> Option<&str> {
+                let ident = path.get_ident()?;
+                own.types.get(&ident_name(ident)).map(String::as_str)
+            };
             let bundled = Resolve {
                 value: &resolve,
                 unsigned: &resolve_unsigned,
+                width: &resolve_width,
             };
             if let Some(value) = literal_or_const_value(expr, &bundled) {
                 resolved.insert(name.clone(), value);
@@ -3057,9 +3192,20 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
                 }
                 (resolve.unsigned)(path)
             };
+            // The identical safe decline `local_resolve_unsigned` above takes for a
+            // let-bound local this function never reads a declared type for.
+            let local_resolve_width = |path: &syn::Path| {
+                if let Some(ident) = path.get_ident() {
+                    if resolved.contains_key(&ident_name(ident)) {
+                        return None;
+                    }
+                }
+                (resolve.width)(path)
+            };
             let local_resolve = Resolve {
                 value: &local_resolve_value,
                 unsigned: &local_resolve_unsigned,
+                width: &local_resolve_width,
             };
             if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
                 resolved.insert(name.clone(), value);
@@ -3084,9 +3230,18 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
         }
         (resolve.unsigned)(path)
     };
+    let block_resolve_width = |path: &syn::Path| {
+        if let Some(ident) = path.get_ident() {
+            if resolved.contains_key(&ident_name(ident)) {
+                return None;
+            }
+        }
+        (resolve.width)(path)
+    };
     let block_resolve = Resolve {
         value: &block_resolve_value,
         unsigned: &block_resolve_unsigned,
+        width: &block_resolve_width,
     };
     literal_or_const_value(tail_expr, &block_resolve)
 }
@@ -3187,6 +3342,13 @@ struct Resolve<'a> {
     /// nothing here can tell, which is always the sound answer for a fact this scan cannot
     /// yet confirm, never the sound answer for one it could confirm and got wrong.
     unsigned: &'a dyn Fn(&syn::Path) -> bool,
+    /// `path`'s own declared integer type name (`"u8"`, `"i32"`, ..), when its declaration
+    /// is a bare `const` this scan can see one for — `None` once nothing here can tell,
+    /// the identical safe decline `unsigned` gives for the same reason: this is a narrower
+    /// question `unsigned` cannot answer (a width, not only a sign), needed only by the `!`
+    /// case in [`literal_or_const_value`], so every other caller of this struct declines it
+    /// unconditionally rather than reasoning about a fact it has no use for.
+    width: &'a dyn Fn(&syn::Path) -> Option<&'a str>,
 }
 
 /// Whether `expr` is written with an explicit unsigned integer type — a suffixed literal
@@ -3589,6 +3751,50 @@ fn evaluate_index(indexed: &syn::ExprIndex, resolve: &Resolve<'_>) -> Option<i12
     }
 }
 
+/// `!operand`'s own value — bitwise NOT — for every shape this scan can find a *width* for.
+/// Factored out of [`literal_or_const_value`]'s own `Expr::Unary(Not)` case to keep that
+/// function under clippy's line count.
+///
+/// Codex's forty-third-round finding: `!255u8` — bitwise NOT of a literal — is
+/// `Expr::Unary(Not, ..)`, which fell to the wildcard `_ => None` case, so a table whose
+/// numbered arms were spelled `!255u8` through `!241u8` read as unresolved on every arm.
+/// Rust's `!` flips every bit *within the operand's own width* — `!255u8` is `0`, not the
+/// all-ones `i128` a naive `!raw_value` would give — so this needs that width, and a literal
+/// carrying its own suffix (through any nesting of parentheses or brace groups) is the first
+/// place to find one. `!value` at full `i128` width, then [`apply_integer_cast`]'s own
+/// truncating mask down to the suffix's width, is the same answer a width-aware NOT would
+/// give directly: masking to the low `N` bits after a full-width NOT is bit-for-bit identical
+/// to NOT-ing those `N` bits alone.
+///
+/// Codex's next-round finding: `const Q0: u8 = 255; const P0: u8 = !Q0;` names an operand
+/// with no suffix of its own to read — a bare path to an already-typed sibling constant —
+/// and stayed unresolved even though `Q0`'s own declaration states the width this needs just
+/// as plainly as a literal's suffix would. `resolve.width` is that declaration, read the same
+/// narrow, safe-to-decline way [`is_definitely_unsigned`]'s own `Expr::Path` case reads
+/// `resolve.unsigned`: `None` for anything this scan cannot confirm a width for — a qualified
+/// path, one reached only through an outer scope, or a name with no declared width at all —
+/// stays unresolved rather than guessed at.
+fn evaluate_bitwise_not(operand: &syn::Expr, resolve: &Resolve<'_>) -> Option<i128> {
+    if let Some(boolean) = as_bool_literal(operand) {
+        return Some(i128::from(!boolean));
+    }
+    if let Some(int) = as_suffixed_int_literal(operand) {
+        let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
+        let raw = lit_value(&syn::Lit::Int(int.clone()))?;
+        return apply_integer_cast(!raw, &ty);
+    }
+    let syn::Expr::Path(path) = strip_parens(operand) else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let width_name = (resolve.width)(&path.path)?;
+    let ty = syn::parse_str::<syn::Type>(width_name).ok()?;
+    let raw = literal_or_const_value(operand, resolve)?;
+    apply_integer_cast(!raw, &ty)
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -3648,28 +3854,9 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
             literal_or_const_value(&unary.expr, resolve)?.checked_neg()
         }
-        // Codex's forty-third-round finding: `!255u8` — bitwise NOT of a literal — is
-        // `Expr::Unary(Not, ..)`, which fell to the wildcard `_ => None` case below, so a
-        // table whose numbered arms were spelled `!255u8` through `!241u8` read as
-        // unresolved on every arm. Rust's `!` flips every bit *within the operand's own
-        // width* — `!255u8` is `0`, not the all-ones `i128` a naive `!raw_value` would
-        // give — so this scan needs that width, and the only place it can get one without
-        // guessing is a literal that carries its own suffix: [`as_suffixed_int_literal`]
-        // requires exactly that, seen through any nesting of parentheses or brace groups,
-        // and an operand with no visible suffix (a bare constant reference, or arithmetic)
-        // stays unresolved rather than assumed. `!value` at full `i128` width, then
-        // [`apply_integer_cast`]'s own truncating mask down to the suffix's width, is the
-        // same answer a width-aware NOT would give directly: masking to the low `N` bits
-        // after a full-width NOT is bit-for-bit identical to NOT-ing those `N` bits alone.
+        // [`evaluate_bitwise_not`] holds the rationale for every shape this folds.
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
-            if let Some(boolean) = as_bool_literal(&unary.expr) {
-                Some(i128::from(!boolean))
-            } else {
-                let int = as_suffixed_int_literal(&unary.expr)?;
-                let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
-                let raw = lit_value(&syn::Lit::Int(int.clone()))?;
-                apply_integer_cast(!raw, &ty)
-            }
+            evaluate_bitwise_not(&unary.expr, resolve)
         }
         // Codex's next-round finding: `*&0u8` — dereferencing a reference taken in the
         // same expression — is `Expr::Unary(Deref, Expr::Reference(..))`, which fell to
@@ -3928,6 +4115,47 @@ fn match_arm_matches_constant(
                 }
             }
             Some(matched)
+        }
+        // Codex's next-round finding: `match 0u8 { 0..=14 => 0, _ => 100 }` — a range
+        // pattern over a match this function itself is asked to evaluate — fell to the
+        // wildcard `_ => None` case below and stopped the whole search, so a numbered
+        // constant initialized this way stayed unresolved regardless of whether the
+        // *outer* dense-match check would ever have recognised it. [`pattern_literal`]'s
+        // own `Pat::Range` case already answers the wider question of *every* value a
+        // range names, bounded so it cannot be asked to enumerate an unreasonably wide
+        // one; this only needs to know whether `value` is one of them, which is the
+        // identical forward-distance-from-`start` arithmetic that answers "is this inside"
+        // without enumerating anything at all — sound over the same range width
+        // `pattern_literal`'s own bound exists to guard, and over any wider one too, since
+        // a containment check allocates nothing regardless of how far `start` sits from
+        // `end`.
+        syn::Pat::Range(range) => {
+            let start = range
+                .start
+                .as_deref()
+                .and_then(|expr| literal_or_const_value(expr, resolve))?;
+            let end = range
+                .end
+                .as_deref()
+                .and_then(|expr| literal_or_const_value(expr, resolve))?;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "wrapping_sub's own bit pattern, reinterpreted as the unsigned \
+                          forward distance from start, not a value conversion — the same \
+                          reasoning pattern_literal's own Pat::Range case already uses"
+            )]
+            let span = end.wrapping_sub(start) as u128;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "wrapping_sub's own bit pattern, reinterpreted as the unsigned \
+                          forward distance from start, not a value conversion"
+            )]
+            let offset = value.wrapping_sub(start) as u128;
+            Some(if matches!(range.limits, syn::RangeLimits::Closed(_)) {
+                offset <= span
+            } else {
+                offset < span
+            })
         }
         _ => None,
     }
@@ -5557,6 +5785,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             &OwnConsts {
                 exprs: &item_const_exprs(items),
                 unsigned: &unsigned_names,
+                types: &item_const_types(items),
             },
             &OuterScopes {
                 values: &self.scopes,
@@ -5620,6 +5849,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 &OwnConsts {
                     exprs: &trait_const_exprs(&node.items),
                     unsigned: &std::collections::HashMap::new(),
+                    types: &std::collections::HashMap::new(),
                 },
                 &OuterScopes {
                     values: &self.scopes,
@@ -5752,6 +5982,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                         &OwnConsts {
                             exprs: &impl_const_exprs(&node.items),
                             unsigned: &std::collections::HashMap::new(),
+                            types: &std::collections::HashMap::new(),
                         },
                         &OuterScopes {
                             values: &self.scopes,
@@ -5877,9 +6108,15 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             };
             let resolve_value = |path: &syn::Path| resolve_pattern_path(path, &ctx);
             let resolve_unsigned = |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+            // [`Resolve::width`]'s own doc comment holds the rationale: a match arm's own
+            // guard or pattern has no use for a referenced constant's declared width, only
+            // `evaluate_bitwise_not` does, and that is reached only through a `const`'s own
+            // initializer, resolved by [`resolve_scope_consts`] rather than here.
+            let resolve_width = |_: &syn::Path| None;
             let resolve = Resolve {
                 value: &resolve_value,
                 unsigned: &resolve_unsigned,
+                width: &resolve_width,
             };
             let mut enum_path = self.module_path.clone();
             enum_path.extend(self.function_path.iter().cloned());
@@ -5920,6 +6157,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             &OwnConsts {
                 exprs: &block_const_exprs(node),
                 unsigned: &block_const_unsigned(node),
+                types: &block_const_types(node),
             },
             &OuterScopes {
                 values: &self.scopes,
@@ -5979,9 +6217,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+        let resolve_width = |_: &syn::Path| None;
         let resolve = Resolve {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
+            width: &resolve_width,
         };
         let selector = node.expr.to_token_stream().to_string();
         // Codex's finding: an individual arm can carry its own `#[cfg(test)]`
@@ -6086,9 +6326,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+        let resolve_width = |_: &syn::Path| None;
         let resolve = Resolve {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
+            width: &resolve_width,
         };
         if let Some((selector, arms)) = extract_if_chain(node, &resolve) {
             self.found.push(FoundMatch { selector, arms });
