@@ -8511,9 +8511,14 @@ fn check_integrity_check_module_tree(
             ));
         }
 
+        let prefix = prefixes
+            .iter()
+            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
+            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
         check_checksum_module_dense_matches(
             scanned,
             &qualified,
+            &prefix,
             &mut allowed_table_hits,
             &mut violations,
         );
@@ -8545,27 +8550,29 @@ fn check_integrity_check_module_tree(
 fn check_checksum_module_dense_matches(
     scanned: &crate::size::LayerSource,
     qualified: &std::collections::HashMap<String, u128>,
+    prefix: &[String],
     allowed_table_hits: &mut [usize],
     violations: &mut Vec<Violation>,
 ) {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
-    let matches = match crate::parse::match_expressions(&scanned.contents, qualified) {
-        Ok(matches) => matches,
-        Err(error) => {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{} could not be parsed ({error}); an unreadable source fails closed \
+    let matches =
+        match crate::parse::match_expressions_with_prefix(&scanned.contents, qualified, prefix) {
+            Ok(matches) => matches,
+            Err(error) => {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} could not be parsed ({error}); an unreadable source fails closed \
                      rather than approving what it cannot see",
-                    scanned.path.replace('\\', "/")
-                ),
-            ));
-            return;
-        }
-    };
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+                return;
+            }
+        };
     for found in &matches {
         if !has_dense_arm_patterns(found) {
             continue;
@@ -15408,6 +15415,45 @@ mod deferred_answer_pins {
              }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_across_out_of_line_files_resolves_against_the_tree() {
+        // Codex's nineteenth-round finding: `module_path_prefixes` computes each scanned
+        // file's own position in the tree for constant *collection*, but
+        // `match_expressions` — the other reader of the same file, the one that resolves a
+        // match's own patterns — always started its visitor's module path at `[]`
+        // regardless of where in the tree the file actually sits. A match in an
+        // out-of-line `crc/outer/inner.rs` using `super::indices::P0` therefore popped
+        // `super` from an empty path and searched only `indices::P0`, rather than
+        // `outer::indices::P0` — the entry `outer.rs`'s own inline `mod indices` recorded.
+        // The parent (`crc.rs`) declares a same-named but non-dense root `mod indices`, so
+        // the old bug (falling through to that root entry) would read as non-dense and
+        // miss the real table two directories deep.
+        let parent = format!(
+            "{}\nmod indices {{\n    pub(crate) const P0: u8 = 200;\n    pub(crate) const \
+             P1: u8 = 201;\n    pub(crate) const P2: u8 = 202;\n    pub(crate) const P3: u8 \
+             = 203;\n}}\n\nmod outer;\n",
+            tests_support::clean_checksum_module()
+        );
+        let outer = "mod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const \
+                     P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: \
+                     u8 = 3;\n}\n\nmod inner;\n";
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::indices::P0 => 0,\n        \
+                     super::indices::P1 => 1,\n        super::indices::P2 => 2,\n        \
+                     super::indices::P3 => 3,\n        _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer.rs", outer),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
         assert!(
             violations
                 .iter()

@@ -1440,6 +1440,10 @@ pub struct FoundArm {
 /// same checksum module tree — a qualified reference is not confined to the file that
 /// declares the module it names.
 ///
+/// Equivalent to [`match_expressions_with_prefix`] with an empty prefix — see that
+/// function for what a non-empty one is for and why one file's own two-pass walk still
+/// needs it.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust — the caller fails closed
@@ -1454,11 +1458,44 @@ pub fn match_expressions(
     contents: &str,
     external_qualified: &std::collections::HashMap<String, u128>,
 ) -> Result<Vec<FoundMatch>, syn::Error> {
+    match_expressions_with_prefix(contents, external_qualified, &[])
+}
+
+/// [`match_expressions`], with `prefix` seeded as the module path `contents`' own file sits
+/// at.
+///
+/// The segments an out-of-line `mod name;` declared in some *other* file gives it, empty
+/// for a file nothing declares this way — the same `prefix`
+/// [`qualified_constants_with_prefix`] takes, for the same reason. Codex's finding: a
+/// match's own patterns can be `super`- or module-relative too, and a
+/// visitor that always started `module_path` at the file's own root had no way to answer
+/// that correctly for a file that is not, itself, at the tree's root — an out-of-line
+/// `crc/outer/inner.rs` using `super::indices::P0` needs `module_path` to start at
+/// `["outer", "inner"]`, the position this file sits at in the tree, not at `[]`, or a
+/// leading `super` pops from a path that was never there and resolves against nothing. The
+/// constant-collection half of this already took a prefix; the match-visiting half is the
+/// same fix applied to the same gap in the other reader of the same file.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust — the caller fails closed
+/// on this, the same as every other structural query in this module.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "this crate never receives a caller-chosen hasher; every map it builds and \
+              passes is `std::collections::HashMap`'s default, so generalising the \
+              parameter buys no caller anything and only widens the signature"
+)]
+pub fn match_expressions_with_prefix(
+    contents: &str,
+    external_qualified: &std::collections::HashMap<String, u128>,
+    prefix: &[String],
+) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
-        module_path: Vec::new(),
+        module_path: prefix.to_vec(),
         qualified: external_qualified.clone(),
         found: Vec::new(),
     };
