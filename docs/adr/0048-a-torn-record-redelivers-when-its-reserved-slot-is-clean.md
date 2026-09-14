@@ -1,4 +1,4 @@
-# ADR 0047: a torn record redelivers when its reserved slot is clean
+# ADR 0048: a torn record redelivers when its reserved slot is clean
 
 - Status: accepted
 - Date: 2026-09-14

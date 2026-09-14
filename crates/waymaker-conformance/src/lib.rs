@@ -21,6 +21,9 @@
 //!   before a reset and read after one.
 //! * [`nor`] — [`NorFlashStorage`], an `embedded_storage::nor_flash::NorFlash` presented as
 //!   a `StableStorage`.
+//! * [`mod@shape`] — every `(operation, width)` shape a legal call can have, and
+//!   [`shape::ShapeWitness`], which proves a run really issues each one rather than only
+//!   claiming to.
 //!
 //! # What this crate must not own
 //!
@@ -78,6 +81,7 @@ pub mod clause;
 pub mod durability;
 pub mod nor;
 pub mod region;
+pub mod shape;
 pub mod suite;
 
 pub use case::{CASE_COUNT, CASES, Case, CaseId, Failure, NotApplicable, Outcome, Report, Verdict};
@@ -85,4 +89,5 @@ pub use clause::{CLAUSES, Clause, Discharge};
 pub use durability::{Breach, Reset, WitnessError, WitnessVerdict};
 pub use nor::{NorFlashStorage, PortError, PortGeometryError};
 pub use region::{REQUIRED_ERASE_BLOCKS, Region, RegionError};
+pub use shape::{SHAPES, Shape, ShapeWitness, shape};
 pub use suite::{ERASED, REQUIRED_BUFFER_UNITS, SuiteError, run};

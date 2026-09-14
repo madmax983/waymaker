@@ -45,7 +45,7 @@ A workflow is a value with a method. It declares what it is, and it asks the bou
 each effect in turn.
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_workflow_is_a_value_with_a_method}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_workflow_is_a_value_with_a_method}}
 ```
 
 ## What that buys
@@ -53,7 +53,7 @@ each effect in turn.
 Run the same workflow again over the same journal. Waymaker asks the world nothing.
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_replayed_run_asks_the_world_nothing}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_replayed_run_asks_the_world_nothing}}
 ```
 
 The second boot builds a new `Fetch` value. It shares no memory with the first. The result
