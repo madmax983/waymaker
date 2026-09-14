@@ -31,7 +31,9 @@
 //! façade never widens the kernel's number. A per-feature row is reported with its
 //! incremental cost but not gated, because the design document sets no per-feature budget —
 //! it requires the cost to be *shown*. The base-branch diff is what makes an unbudgeted
-//! row's growth visible in review.
+//! row's growth visible in review. Runtime RAM follows the same split: its statics term
+//! ([`SizeReport::runtime_ram_total`]) is the largest `Δram` of a *gated* row alone, never
+//! a per-feature row's — issue #115.
 //!
 //! # §04's budgets, and what carries each
 //!
@@ -1094,14 +1096,26 @@ impl SizeReport {
 
     /// Design document §04's runtime RAM sentence, composed.
     ///
-    /// The caller's scratch page, the kernel state registry, the context, and whatever
-    /// statics the gated rows own. `None` when a term could not be read, because a total
-    /// with a term missing is a smaller number than the truth and would pass.
+    /// Adds the caller's scratch page, the kernel state registry, the context, and the
+    /// statics term. `None` when a term could not be read, because a total with a term
+    /// missing is smaller than the truth and would pass.
     ///
-    /// The statics term is the *largest* of the rows rather than their sum: the rows are
-    /// separate images of the same firmware, and a device runs one of them. Every row, not
-    /// only the gated ones — a per-feature row is a configuration somebody ships, and taking
-    /// the largest is the direction that fails closed.
+    /// The statics term is the *largest* `Δram` of a *gated* row, never a per-feature row.
+    /// `--report` reads a document this process did not write. [`Self::gated_row_shortfalls`]
+    /// requires the gated rows. It pins their feature selection too. So a document cannot
+    /// omit one.
+    ///
+    /// A per-feature row carries no such requirement. Before issue #115, a document could
+    /// omit the row with the largest `Δram`. That composed a smaller, wrong total — and
+    /// could pass a budget a complete document would fail.
+    ///
+    /// A per-feature row's own `Δram` is still reported in the table. Design document §04
+    /// sets no per-feature RAM budget, so it is not composed here — the same treatment its
+    /// flash cost already gets.
+    ///
+    /// This still trusts a gated row's own `ram`/`bss` fields. Unlike `flash`, they have no
+    /// non-zero floor — `0 B` is the real, current figure for this engine's statics, so a
+    /// floor here would fail every honest report. See issue #172.
     #[must_use]
     pub fn runtime_ram_total(&self) -> Option<u64> {
         let kernel_state = self.kernel_state.as_ref()?;
@@ -1110,6 +1124,7 @@ impl SizeReport {
         let statics = self
             .rows
             .iter()
+            .filter(|row| row.gated)
             .map(|row| row.sizes.saturating_delta(&baseline.sizes).ram)
             .max()
             .unwrap_or(0);
@@ -1486,7 +1501,10 @@ impl SizeReport {
     /// The rows a gated report must carry, and that they are the images their ceilings name.
     ///
     /// `--report` gates a document this process did not produce, so neither the presence of
-    /// a row nor its `gated` flag nor its name is taken at its word.
+    /// a row nor its `gated` flag nor its name is taken at its word. This is also what makes
+    /// [`Self::runtime_ram_total`] safe to compose from gated rows alone: a document that
+    /// omits `default` or `facade`, or narrows either one's feature selection, fails here
+    /// first — issue #115.
     fn gated_row_shortfalls(&self) -> Vec<BudgetShortfall> {
         let mut shortfalls = Vec::new();
         for (row, why) in [
@@ -1738,7 +1756,7 @@ impl SizeReport {
             |total| format!("{total} B of {RUNTIME_RAM_BUDGET_BYTES} B"),
         );
         format!(
-            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
+            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any *gated* row. A per-feature row's own \u{394}ram is in the table above but not in this sum: \u{a7}04 sets no per-feature RAM budget, the same as its code-flash budget. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
             self.kernel_state.as_ref().map_or(0, |state| state.total),
             runtime.context,
         )
@@ -4994,6 +5012,106 @@ mod tests {
     }
 
     #[test]
+    fn a_per_feature_rows_ram_does_not_raise_the_runtime_ram_total() {
+        // Issue #115. The composition used to take the largest `\u{394}ram` of *every* row,
+        // gated or not. Design document \u{a7}04 sets no per-feature budget, so an ungated
+        // row's own large `\u{394}ram` must not raise the figure the gate holds to 768 B.
+        let default = default_row(1_024, 0);
+        let huge = feature_row_with_ram(
+            "waymaker-core/serde",
+            &default,
+            0,
+            RUNTIME_RAM_BUDGET_BYTES + 1_000,
+        );
+        let base = full_report(1_024, 0, 1_024, 0)
+            .runtime_ram_total()
+            .expect("composable");
+        let report = SizeReport::new(
+            vec![baseline_row(), default, facade_row(1_024, 0), huge],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        assert_eq!(report.runtime_ram_total(), Some(base));
+        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+    }
+
+    #[test]
+    fn omitting_a_per_feature_row_does_not_change_the_runtime_ram_total() {
+        // The bug this closes: `--report` reads a document this process did not produce,
+        // and a document that left out the row with the largest `\u{394}ram` used to compose
+        // a smaller total and pass a budget a complete document would have failed. The
+        // gated rows alone now carry the claim, and they are pinned and required, so a
+        // per-feature row's presence or absence must not move the figure at all.
+        let default = default_row(1_024, 0);
+        let huge = feature_row_with_ram(
+            "waymaker-core/serde",
+            &default,
+            0,
+            RUNTIME_RAM_BUDGET_BYTES + 1_000,
+        );
+        let with_row = SizeReport::new(
+            vec![baseline_row(), default.clone(), facade_row(1_024, 0), huge],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        let without_row = SizeReport::new(
+            vec![baseline_row(), default, facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(
+            with_row.runtime_ram_total(),
+            without_row.runtime_ram_total()
+        );
+    }
+
+    #[test]
+    fn the_statics_term_follows_the_gated_flag_rather_than_the_row_name() {
+        // Issue #115's fix reads `row.gated`. A row named after neither pinned row still
+        // counts once marked gated, and a row named `default` does not count once it is
+        // not — pinning the flag as the discriminator rather than the name.
+        let default = default_row(1_024, 0);
+        let mut odd_name_but_gated = feature_row_with_ram(
+            "waymaker-core/serde",
+            &default,
+            0,
+            RUNTIME_RAM_BUDGET_BYTES + 1_000,
+        );
+        odd_name_but_gated.gated = true;
+        let report = SizeReport::new(
+            vec![
+                baseline_row(),
+                default,
+                facade_row(1_024, 0),
+                odd_name_but_gated,
+            ],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(
+            report.runtime_ram_total(),
+            Some(SCRATCH_PAGE_BYTES + 104 + 56 + RUNTIME_RAM_BUDGET_BYTES + 1_000),
+        );
+    }
+
+    #[test]
+    fn a_row_named_default_that_is_not_gated_does_not_raise_the_total() {
+        // The other half of the pair above: the name `default` alone must not count.
+        let mut default_but_ungated = default_row(1_024, RUNTIME_RAM_BUDGET_BYTES + 1_000);
+        default_but_ungated.gated = false;
+        let base = full_report(1_024, 0, 1_024, 0)
+            .runtime_ram_total()
+            .expect("composable");
+        let report = SizeReport::new(
+            vec![baseline_row(), default_but_ungated, facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.runtime_ram_total(), Some(base));
+    }
+
+    #[test]
     fn exceeding_the_runtime_ram_budget_names_the_total() {
         // Through the statics term, over the statics sub-cap as well, so both budgets are
         // named rather than only the first. The case where the composition alone fails is
@@ -6003,6 +6121,18 @@ mod tests {
 
     /// A feature row costing `flash_over_default` more than the `default` row it sits on.
     fn feature_row(name: &str, default: &Row, flash_over_default: u64) -> Row {
+        feature_row_with_ram(name, default, flash_over_default, 0)
+    }
+
+    /// A feature row costing `flash_over_default` more flash and `ram_over_default` more RAM
+    /// than the `default` row it sits on. Ungated, like every per-feature row [`matrix`]
+    /// derives.
+    fn feature_row_with_ram(
+        name: &str,
+        default: &Row,
+        flash_over_default: u64,
+        ram_over_default: u64,
+    ) -> Row {
         Row::new(
             name,
             &[PROBE_FEATURE, ENGINE_FEATURE, name],
@@ -6010,6 +6140,8 @@ mod tests {
             SectionSizes {
                 flash: default.sizes.flash + flash_over_default,
                 text: default.sizes.text + flash_over_default,
+                bss: default.sizes.bss + ram_over_default,
+                ram: default.sizes.ram + ram_over_default,
                 ..default.sizes
             },
             default.probe_flash,
