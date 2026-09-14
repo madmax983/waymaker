@@ -9095,15 +9095,33 @@ fn try_window_layout(values: &[i128], slots: usize, base: i128) -> Option<Vec<bo
 /// [`try_window_layout`]'s wrapping arithmetic, so the search finds whichever one is the
 /// window's true circular start without needing to know in advance which half of `i128`'s
 /// range it sits in.
-fn window_layout(values: &[i128], slots: usize) -> Option<(i128, Vec<bool>)> {
+///
+/// Codex's next-round finding: trying every value as a candidate base is sound only when
+/// wrapping past `i128::MIN` really does mean something — the fact that a `u128` literal at
+/// or above `2^127` came from, per [`try_window_layout`]'s own doc comment. A match whose
+/// patterns are genuinely signed and merely happen to sit near both ends of `i128`
+/// (`i128::MIN`, a constant just under `i128::MAX`, and `i128::MAX` itself) has no such
+/// fact behind it: nothing wraps, and treating those three as three of four consecutive
+/// circular slots reads a match `rustc` still lowers to ordinary comparisons as a table.
+/// `unsigned_domain` — every contributing arm's own [`crate::parse::FoundArm::unsigned`] —
+/// is what tells the two apart; the plain-minimum attempt above needs no such gate, because
+/// [`try_window_layout`]'s wrapping and a genuinely signed span's checked arithmetic already
+/// agree there, so it stays open to every match this scan resolves a value from.
+fn window_layout(
+    values: &[i128],
+    slots: usize,
+    unsigned_domain: bool,
+) -> Option<(i128, Vec<bool>)> {
     if let Some(&base) = values.iter().min() {
         if let Some(covered) = try_window_layout(values, slots, base) {
             return Some((base, covered));
         }
     }
-    for &base in values {
-        if let Some(covered) = try_window_layout(values, slots, base) {
-            return Some((base, covered));
+    if unsigned_domain {
+        for &base in values {
+            if let Some(covered) = try_window_layout(values, slots, base) {
+                return Some((base, covered));
+            }
         }
     }
     None
@@ -9145,14 +9163,16 @@ fn window_layout(values: &[i128], slots: usize) -> Option<(i128, Vec<bool>)> {
 /// than treating one arm as one value.
 fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
     let mut values = Vec::new();
+    let mut unsigned_domain = true;
     for arm in numbered {
         if arm.pattern.is_empty() {
             return None;
         }
+        unsigned_domain &= arm.unsigned;
         values.extend(arm.pattern.iter().copied());
     }
     let total = values.len().checked_add(1)?;
-    let (base, covered) = window_layout(&values, total)?;
+    let (base, covered) = window_layout(&values, total, unsigned_domain)?;
     let mut gaps = covered.iter().enumerate().filter(|(_, seen)| !**seen);
     let (gap, _) = gaps.next()?;
     if gaps.next().is_some() {
@@ -9214,10 +9234,12 @@ const SPARSE_WINDOW_SLOTS_PER_VALUE: usize = 3;
 /// span rather than a full coverage bitmap.
 fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
     let mut values = Vec::new();
+    let mut unsigned_domain = true;
     for arm in numbered {
         if arm.pattern.is_empty() {
             return false;
         }
+        unsigned_domain &= arm.unsigned;
         values.extend(arm.pattern.iter().copied());
     }
     if values.len() < 2 {
@@ -9229,7 +9251,7 @@ fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
     if sorted.len() != values.len() {
         return false;
     }
-    let Some(slots) = compact_span(&values) else {
+    let Some(slots) = compact_span(&values, unsigned_domain) else {
         return false;
     };
     let Some(bound) = values.len().checked_mul(SPARSE_WINDOW_SLOTS_PER_VALUE) else {
@@ -9244,7 +9266,22 @@ fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
 /// reports one inflated by wrapping past it before reaching every value. `values` is assumed
 /// already deduplicated by its caller, the same precondition [`try_window_layout`]'s own
 /// duplicate-offset refusal exists for there.
-fn compact_span(values: &[i128]) -> Option<usize> {
+///
+/// Codex's next-round finding: [`window_layout`]'s own `unsigned_domain` gate holds here
+/// too, for the identical reason — trying every value as a candidate base means treating a
+/// wrap past `i128::MIN` as real, which is only true of the unsigned domain a `u128`
+/// literal at or above `2^127` came from. When `unsigned_domain` is `false` the plain
+/// signed span — `max` minus `min`, checked rather than wrapped — is both the narrowest
+/// span and the only one this scan has any reason to believe in; declining rather than
+/// searching further bases is what a genuinely signed span spanning close to all of `i128`
+/// needs, the same standing [`window_layout`]'s own plain-minimum attempt already has.
+fn compact_span(values: &[i128], unsigned_domain: bool) -> Option<usize> {
+    if !unsigned_domain {
+        let min = *values.iter().min()?;
+        let max = *values.iter().max()?;
+        let span = u128::try_from(max.checked_sub(min)?).ok()?;
+        return usize::try_from(span.checked_add(1)?).ok();
+    }
     let mut narrowest: Option<u128> = None;
     for &base in values {
         let mut widest_offset: u128 = 0;
@@ -9323,16 +9360,18 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
 /// (an exhaustive enum match, most often) rather than leaving one for a catch-all.
 fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
     let mut values = Vec::new();
+    let mut unsigned_domain = true;
     for arm in arms {
         if arm.pattern.is_empty() {
             return false;
         }
+        unsigned_domain &= arm.unsigned;
         values.extend(arm.pattern.iter().copied());
     }
     if values.is_empty() {
         return false;
     }
-    let Some((_, covered)) = window_layout(&values, values.len()) else {
+    let Some((_, covered)) = window_layout(&values, values.len(), unsigned_domain) else {
         return false;
     };
     covered.iter().all(|seen| *seen)
@@ -20665,6 +20704,70 @@ mod deferred_answer_pins {
              const P1: u8 = match (0u8,) { (0,) => 1, _ => 100 };\n    \
              const P2: u8 = match (0u8,) { (0,) => 2, _ => 100 };\n    \
              const P3: u8 = match (0u8,) { (0,) => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_over_genuinely_signed_values_near_both_ends_of_i128_is_not_reported() {
+        // Codex's next-round finding: `window_layout`'s own wrapping search tries every
+        // value as a candidate base, which is sound only because a `u128` literal at or
+        // above `2^127` really does wrap through `i128::MIN` back to the unsigned domain
+        // it came from — but `i128::MIN`, a plain `i128` constant just under `i128::MAX`,
+        // and `i128::MAX` itself are genuinely signed values with no such fact behind
+        // them: nothing about those three is adjacent, and `rustc` lowers a match over
+        // them to ordinary comparisons rather than any lookup table. Treating them as
+        // three of four consecutive circular slots read a match that is not dense as one
+        // that is. `FoundArm::unsigned` — folded in from the match's own scrutinee type
+        // here, since `i128` is signed and neither `i128::MIN` nor `i128::MAX` is confirmed
+        // unsigned — is what keeps the wrapping search closed for a domain with no wrap in
+        // it, so this table is correctly left unreported rather than flagged as a second
+        // one outside `INTEGRITY_CHECK_TABLES`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn signed_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst NEAR_MAX: i128 = i128::MAX - 1;\n\
+             const fn signed_boundary_table(nibble: i128) -> u32 {\n    \
+             match nibble {\n        \
+             i128::MIN => signed_boundary_helper(0),\n        \
+             NEAR_MAX => signed_boundary_helper(1),\n        \
+             i128::MAX => signed_boundary_helper(2),\n        \
+             _ => signed_boundary_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .all(|violation| !violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_one_element_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let (x,) = (0u8,); x };` names a
+        // `let` whose pattern is a one-element tuple rather than a bare identifier —
+        // `block_let_exprs`'s own `binding_name` fell through to `_ => None` for it, which
+        // did not merely decline to fold the initializer, it dropped the statement from the
+        // map entirely while `evaluate_block`'s own statement count still expected it
+        // accounted for, so the whole block read as unresolved. `destructured_binding` now
+        // recurses through a one-element tuple pattern over a one-element tuple initializer
+        // the same way a scrutinee and an arm pattern already do.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let (x,) = (0u8,); x };\n    \
+             const P1: u8 = { let (x,) = (1u8,); x };\n    \
+             const P2: u8 = { let (x,) = (2u8,); x };\n    \
+             const P3: u8 = { let (x,) = (3u8,); x };\n    \
              match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
              P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
         );

@@ -1889,6 +1889,26 @@ pub struct FoundArm {
     /// call with exactly one argument. `None` for anything else, including a call whose
     /// argument this scan cannot resolve to a value.
     pub call: Option<(String, Option<i128>)>,
+    /// Whether the arm's own pattern is confirmed to name an unsigned value — a literal
+    /// suffixed `u8`..`u128`, or a bare path `resolve.unsigned` answers for — the same
+    /// standing `is_definitely_unsigned` already gives an expression. `false` for
+    /// anything this scan cannot make that determination for, ranges and or-patterns
+    /// included, which is the safe default: it only ever *widens* what a window search
+    /// is allowed to try, never what it accepts.
+    ///
+    /// Codex's finding: `window_layout`'s own wrapping search tries every value in
+    /// turn as a candidate base, which is sound only because `lit_value`'s own
+    /// two's-complement reinterpretation of a `u128` literal at or above `2^127` makes
+    /// the wrap a real fact about the unsigned domain the literal came from — not a
+    /// property of `i128` arithmetic in general. A match whose patterns are genuinely
+    /// signed and merely happen to sit near both ends of `i128` (`i128::MIN`, a `i128`
+    /// constant near `i128::MAX`, and `i128::MAX` itself) is not such a domain: nothing
+    /// about those three values is adjacent, and treating them as a dense four-slot
+    /// window the way a real `u128` wrap would be read a match `rustc` still lowers to
+    /// ordinary comparisons as a lookup table. This field is what lets the window search
+    /// tell the two apart before it decides whether wrapping past `i128::MIN` means
+    /// anything at all.
+    pub unsigned: bool,
 }
 
 /// Every `match` expression `contents` declares, anywhere one can appear, outside
@@ -2399,6 +2419,46 @@ fn item_const_types(items: &[syn::Item]) -> std::collections::HashMap<String, St
         .collect()
 }
 
+/// Every plainly-typed parameter `sig` declares, by name, against its own declared type's
+/// single-segment name — the identical shape [`item_const_types`] and [`block_const_types`]
+/// already answer for a `const` and a `let`, extended to a function's own signature so a
+/// bare, unsuffixed literal pattern matched against a named parameter can inherit *its*
+/// declared type the same way real Rust type inference gives it one.
+///
+/// Codex's next-round finding: a scrutinee declared `nibble: u128` settles what an
+/// unsuffixed integer *pattern* against it means — `170141183460469231731687303715884105726`
+/// with no suffix at all is a `u128` literal precisely because nothing else could type-check
+/// against a `u128` scrutinee — but nothing here had ever read a function's own parameter
+/// list, so every such pattern's own unsignedness answered `false` regardless of the
+/// scrutinee it was matched against. Scoped narrowly, the way every declared-type map in
+/// this file is: a parameter pattern that is not a bare identifier (`&self`, a destructured
+/// tuple) answers for no name here, and a type this scan cannot reduce to one path segment
+/// answers for none either.
+fn fn_param_types(sig: &syn::Signature) -> std::collections::HashMap<String, String> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| {
+            let syn::FnArg::Typed(pat_type) = arg else {
+                return None;
+            };
+            let syn::Pat::Ident(ident) = pat_type.pat.as_ref() else {
+                return None;
+            };
+            single_segment_type_name(&pat_type.ty).map(|name| (ident_name(&ident.ident), name))
+        })
+        .collect()
+}
+
+/// [`fn_param_types`]'s own unsigned-only mirror, the identical shape
+/// [`item_const_unsigned`] already answers for a `const`: every plainly-typed parameter
+/// whose declared type is one of the five unsigned primitives, by name.
+fn fn_param_unsigned(sig: &syn::Signature) -> std::collections::HashMap<String, bool> {
+    fn_param_types(sig)
+        .into_iter()
+        .filter_map(|(name, type_name)| is_unsigned_type_name(&type_name).then_some((name, true)))
+        .collect()
+}
+
 /// The unevaluated initializer of every associated `const` declared directly in an
 /// inherent `impl`'s own item list — `impl Indices { const P0: u8 = 0; ... }` — mirroring
 /// [`item_const_exprs`] for the other place a scannable constant is declared.
@@ -2521,14 +2581,6 @@ fn block_const_types(block: &syn::Block) -> std::collections::HashMap<String, St
 /// nor a local `const` item, and [`evaluate_block`]'s own statement-count check already
 /// refuses a block holding one.
 fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn::Expr> {
-    fn binding_name(pat: &syn::Pat) -> Option<String> {
-        match pat {
-            syn::Pat::Type(pat_type) => binding_name(&pat_type.pat),
-            syn::Pat::Ident(ident) if ident.subpat.is_none() => Some(ident_name(&ident.ident)),
-            _ => None,
-        }
-    }
-
     block
         .stmts
         .iter()
@@ -2543,10 +2595,47 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
             if init.diverge.is_some() {
                 return None;
             }
-            let name = binding_name(&local.pat)?;
-            Some((name, (*init.expr).clone()))
+            destructured_binding(&local.pat, &init.expr)
         })
         .collect()
+}
+
+/// `pat`'s own bound name and the value `expr` initializes it to, unwrapping a type
+/// ascription (`Pat::Type`) and a one-element tuple destructure (`Pat::Tuple`) the same way
+/// [`literal_or_const_value`]'s own `Expr::Tuple` case and [`match_arm_matches_constant`]'s
+/// own `Pat::Tuple` case already do for a scrutinee and a pattern — `None` for anything else,
+/// `_` and any destructuring wider than one element included, since neither binds a single
+/// name this scan could later resolve a reference to.
+///
+/// Codex's next-round finding: `const P0: u8 = { let (x,) = (0u8,); x };` names a `let` whose
+/// pattern is `Pat::Tuple` rather than `Pat::Ident`, which the version of this function
+/// scoped to exactly `Pat::Type`-then-`Pat::Ident` fell through to `_ => None` for — not
+/// "declined and left the block's statement count refusing it", which would still be safe,
+/// but silently *excluded from the map entirely* while [`evaluate_block`]'s own statement
+/// count still expected one fewer bound name than the block actually declared, so the whole
+/// block read as unresolved and the constants it feeds stayed empty rather than folding.
+/// A one-element tuple pattern over a one-element tuple *initializer* destructures to
+/// exactly the inner pattern and the inner expression, recursed through the identical way a
+/// scrutinee or an arm pattern already is; an initializer that is not itself a literal
+/// one-element tuple expression is declined rather than guessed at, since this scan folds
+/// no other tuple shape into a value it could hand back here.
+fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Option<(String, syn::Expr)> {
+    match pat {
+        syn::Pat::Type(pat_type) => destructured_binding(&pat_type.pat, expr),
+        syn::Pat::Ident(ident) if ident.subpat.is_none() => {
+            Some((ident_name(&ident.ident), expr.clone()))
+        }
+        syn::Pat::Tuple(pat_tuple) if pat_tuple.elems.len() == 1 => {
+            let syn::Expr::Tuple(expr_tuple) = strip_parens(expr) else {
+                return None;
+            };
+            if expr_tuple.elems.len() != 1 {
+                return None;
+            }
+            destructured_binding(pat_tuple.elems.first()?, expr_tuple.elems.first()?)
+        }
+        _ => None,
+    }
 }
 
 /// [`block_let_exprs`]'s own mirror for a *width*-aware sibling of [`ConstTypeScopes`]:
@@ -3502,6 +3591,31 @@ fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
         // in nothing at all.
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
             is_definitely_unsigned(&unary.expr, resolve)
+        }
+        _ => false,
+    }
+}
+
+/// `pattern`'s own [`is_definitely_unsigned`], for the two arm-pattern shapes
+/// [`FoundArm::unsigned`] needs it for: a suffixed literal, and a bare path
+/// `resolve.unsigned` answers for. Unwraps a reference pattern (`&0u8`) and a
+/// parenthesized one the identical way [`pattern_literal`] already does before it looks at
+/// either shape; declines — `false`, the safe default — for every other pattern this scan
+/// resolves a value from, ranges and or-patterns included, since a range or an or-pattern
+/// mixing operands of different confirmed signedness has no one answer this function could
+/// give without guessing which operand decided it.
+fn pattern_is_definitely_unsigned(pattern: &syn::Pat, resolve: &Resolve<'_>) -> bool {
+    match pattern {
+        syn::Pat::Type(pat_type) => pattern_is_definitely_unsigned(&pat_type.pat, resolve),
+        syn::Pat::Paren(paren) => pattern_is_definitely_unsigned(&paren.pat, resolve),
+        syn::Pat::Reference(reference) => pattern_is_definitely_unsigned(&reference.pat, resolve),
+        syn::Pat::Lit(syn::PatLit {
+            lit: syn::Lit::Int(int),
+            ..
+        }) => is_unsigned_type_name(int.suffix()),
+        syn::Pat::Path(path) if path.qself.is_none() => (resolve.unsigned)(&path.path),
+        syn::Pat::Ident(named) if named.subpat.is_none() && named.by_ref.is_none() => {
+            (resolve.unsigned)(&syn::Path::from(named.ident.clone()))
         }
         _ => false,
     }
@@ -4847,7 +4961,10 @@ fn block_as_expr(block: &syn::Block) -> syn::Expr {
 /// is applied to the unresolved side before its token text is taken, the same normalisation
 /// every other literal- or constant-reading function here already applies before it looks
 /// at an expression's own shape.
-fn if_chain_condition_value(cond: &syn::Expr, resolve: &Resolve<'_>) -> Option<(String, i128)> {
+fn if_chain_condition_value(
+    cond: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<(String, i128, bool)> {
     let cond = strip_parens(cond);
     let syn::Expr::Binary(binary) = cond else {
         return None;
@@ -4861,10 +4978,12 @@ fn if_chain_condition_value(cond: &syn::Expr, resolve: &Resolve<'_>) -> Option<(
         (None, Some(value)) => Some((
             strip_parens(&binary.left).to_token_stream().to_string(),
             value,
+            is_definitely_unsigned(&binary.right, resolve),
         )),
         (Some(value), None) => Some((
             strip_parens(&binary.right).to_token_stream().to_string(),
             value,
+            is_definitely_unsigned(&binary.left, resolve),
         )),
         _ => None,
     }
@@ -4896,18 +5015,19 @@ fn strip_parens(mut expr: &syn::Expr) -> &syn::Expr {
 /// *different* scrutinee than the chain's first link is two unrelated comparisons that
 /// happen to share an `else if`, not one dense table.
 fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String, Vec<FoundArm>)> {
-    let (scrutinee, first_value) = if_chain_condition_value(&node.cond, resolve)?;
+    let (scrutinee, first_value, first_unsigned) = if_chain_condition_value(&node.cond, resolve)?;
     let mut arms = vec![FoundArm {
         pattern: vec![first_value],
         is_wild: false,
         call: call_shape_of(&block_as_expr(&node.then_branch), resolve),
+        unsigned: first_unsigned,
     }];
     let mut current = node;
     loop {
         let (_, else_expr) = current.else_branch.as_ref()?;
         match else_expr.as_ref() {
             syn::Expr::If(next_if) => {
-                let (next_scrutinee, next_value) =
+                let (next_scrutinee, next_value, next_unsigned) =
                     if_chain_condition_value(&next_if.cond, resolve)?;
                 if next_scrutinee != scrutinee {
                     return None;
@@ -4916,6 +5036,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     pattern: vec![next_value],
                     is_wild: false,
                     call: call_shape_of(&block_as_expr(&next_if.then_branch), resolve),
+                    unsigned: next_unsigned,
                 });
                 current = next_if;
             }
@@ -4924,6 +5045,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     pattern: Vec::new(),
                     is_wild: true,
                     call: call_shape_of(&block_as_expr(&else_block.block), resolve),
+                    unsigned: false,
                 });
                 break;
             }
@@ -5932,13 +6054,26 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // resolved against a path that names *this* function, distinguishing it from an
         // unrelated function elsewhere that happens to declare a same-named local module.
         self.function_path.push(ident_name(&node.sig.ident));
+        // Codex's next-round finding: a parameter's own declared type is what an
+        // unsuffixed literal *pattern* matched against it means, the same way a `let`'s
+        // own ascription already feeds `scopes_types`/`scopes_unsigned` — pushed here,
+        // ahead of `visit_item_fn`'s own recursion into the body, so it is visible for
+        // the whole function and pops on the way back out exactly as `function_path` does.
+        self.scopes_types.0.push(fn_param_types(&node.sig));
+        self.scopes_unsigned.0.push(fn_param_unsigned(&node.sig));
         syn::visit::visit_item_fn(self, node);
+        self.scopes_unsigned.0.pop();
+        self.scopes_types.0.pop();
         self.function_path.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         self.function_path.push(ident_name(&node.sig.ident));
+        self.scopes_types.0.push(fn_param_types(&node.sig));
+        self.scopes_unsigned.0.push(fn_param_unsigned(&node.sig));
         syn::visit::visit_impl_item_fn(self, node);
+        self.scopes_unsigned.0.pop();
+        self.scopes_types.0.pop();
         self.function_path.pop();
     }
 
@@ -6405,6 +6540,15 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             width: &resolve_width,
         };
         let selector = node.expr.to_token_stream().to_string();
+        // Codex's next-round finding: an unsuffixed integer pattern's own unsignedness is
+        // not a fact about the pattern alone — `170141183460469231731687303715884105726`
+        // with no suffix at all means `u128` only because the scrutinee it is matched
+        // against does, the same way any other unsuffixed integer literal in Rust takes
+        // its type from context rather than carrying one of its own. Resolved once per
+        // match, through the identical `is_definitely_unsigned` every other expression in
+        // this scan already goes through, and folded into every arm below rather than
+        // asked of the pattern alone.
+        let scrutinee_unsigned = is_definitely_unsigned(&node.expr, &resolve);
         // Codex's finding: an individual arm can carry its own `#[cfg(test)]`
         // (`syn::Arm` has its own `attrs`, the same as an item or a statement does),
         // and `rustc` strips such an arm from a production build exactly as it does a
@@ -6455,6 +6599,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
                 is_wild,
                 call: call_shape_of(&arm.body, &resolve),
+                unsigned: scrutinee_unsigned || pattern_is_definitely_unsigned(&arm.pat, &resolve),
             });
             if is_wild {
                 break;
