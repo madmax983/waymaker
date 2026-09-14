@@ -783,9 +783,9 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
 
 #[test]
 fn a_dropped_terminal_future_cannot_let_a_second_one_overwrite_the_conclusion() {
-    // Issue #107. `TerminalFuture` used to guard on its own `ended` field. Poll `complete`,
-    // drop it, poll `fail`: the second future is new, so its own flag says nothing was
-    // recorded yet, and it overwrote the first decision. The flag must live in the `Ctx`.
+    // Issue #107. `TerminalFuture` guarded on its own `ended` field. Poll `complete`, then
+    // drop it. Poll `fail`. The second future is new, so its flag reports nothing recorded
+    // yet. It overwrites the first decision. The flag must live in the `Ctx`.
     let mut ledger = Ledger::new();
     let mut world = World::silent();
     let mut out = [0_u8; 16];
@@ -803,9 +803,9 @@ fn a_dropped_terminal_future_cannot_let_a_second_one_overwrite_the_conclusion() 
 
 #[test]
 fn a_run_that_continued_reaches_neither_the_journal_nor_the_world_again() {
-    // Issue #107. `continue_as_new` used to mark its own future asked, not the `Ctx`. Poll
-    // it, drop it, and the old workflow could reach the journal again through another
-    // boundary after the run it belonged to was asked to be replaced.
+    // Issue #107. `continue_as_new` marked its own future asked, not the `Ctx`. Poll it,
+    // then drop it. The old workflow could then reach the journal again through another
+    // boundary — even after it asked to replace the run.
     let spec = TimerSpec::AfterBoot { ticks: 1 };
     let mut ledger = Ledger::new();
     let mut world = World::silent();
@@ -816,10 +816,12 @@ fn a_run_that_continued_reaches_neither_the_journal_nor_the_world_again() {
     let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
     let waited = poll_once(ctx.timer(spec));
     let restarted_again = poll_once(ctx.continue_as_new(b"again"));
+    let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"late"));
 
     assert_eq!(after, Poll::Pending);
     assert_eq!(waited, Poll::Pending);
     assert!(restarted_again.is_pending());
+    assert_eq!(ended, Poll::Pending, "a continued run cannot also end");
     assert_eq!(
         ctx.conclusion(),
         None,

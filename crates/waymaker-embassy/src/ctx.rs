@@ -87,10 +87,10 @@ enum Ending {
 
 /// Why a run has no boundaries left.
 ///
-/// One flag, owned by [`Ctx`]. Issue #107: `TerminalFuture` and `ContinueFuture` used to
-/// keep this in a field of their own, so a dropped future took the flag with it and a second
-/// future could re-decide the run. `Continued` is not an [`Ending`]: a continued run has no
-/// terminal record, so [`Ctx::conclusion`] must not answer as though it did.
+/// One flag, owned by [`Ctx`]. Issue #107: `TerminalFuture` and `ContinueFuture` kept this
+/// flag in a field of their own. A dropped future took the flag with it. A second future
+/// could then re-decide the run. `Continued` is not an [`Ending`]: a continued run has no
+/// terminal record. [`Ctx::conclusion`] must not answer as though it did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Closed {
     /// The run ended. [`Ending`] says how.
@@ -225,8 +225,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     ///
     /// A refused payload answers [`Conclusion::Refused`] and never [`None`]. The two are
     /// different runs: one did not finish, the other asked to finish with bytes the caller
-    /// cannot carry. A continued run also answers [`None`]: it has no terminal record, so a
-    /// caller reads it the same way as a run that has not reached a boundary yet.
+    /// cannot carry. A continued run also answers [`None`]. It has no terminal record. A
+    /// caller reads this the same way as a run that has not reached a boundary yet.
     #[must_use]
     pub fn conclusion(&self) -> Option<Conclusion<'_>> {
         match self.closed? {
@@ -435,8 +435,8 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 /// merely unlikely. That is the shape of the operation: the run that asked is replaced.
 ///
 /// It holds `closed` by `&mut`, not `&`. A dropped-then-repolled future must not ask the
-/// journal twice, and the flag that stops it has to survive the drop — so it lives in the
-/// `Ctx`, not here. Issue #107.
+/// journal twice. The flag that stops it must survive the drop. So it lives in the `Ctx`,
+/// not here. Issue #107.
 #[derive(Debug)]
 pub struct ContinueFuture<'b, J: Journal> {
     journal: &'b mut J,
@@ -474,9 +474,9 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 ///
 /// # Why `closed` is shared
 ///
-/// It used to be a field of this future alone. Poll `complete`, drop it, poll `fail`: the
-/// second future had no memory of the first and overwrote its conclusion. The flag now lives
-/// in the `Ctx`, so a dropped future cannot be replaced by one that re-decides the run.
+/// It was a field of this future alone. Poll `complete`, then drop it. Poll `fail`. The
+/// second future has no memory of the first. It overwrites the first conclusion. The flag
+/// now lives in the `Ctx`. A new future cannot overwrite a dropped future's decision.
 /// Issue #107.
 #[derive(Debug)]
 pub struct TerminalFuture<'b, E> {
