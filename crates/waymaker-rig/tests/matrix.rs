@@ -9,21 +9,24 @@
 //!
 //! # What the rig can reach
 //!
-//! Six rows: the schedule, dispatch and completion rows a rig that cuts during those three
-//! writes can land in. Rows 7 to 10 need a swap workload, a capacity refusal and a divergent
-//! replay, and this rig has none of them — issue
-//! [#96](https://github.com/madmax983/waymaker/issues/96).
-//! [`the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`] pins that: [`Matrix::verdict`]
-//! must refuse, naming the first bank row. A census that passed here would be a census of six
-//! cells wearing ten names.
+//! All ten rows. Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the
+//! four this rig used to owe. Six come from the ordinary crash injector: the schedule,
+//! dispatch and completion rows a rig that cuts during those three writes can land in.
+//! Two more come from a swap workload: [`rollover_sweep`] runs a run that rolls over
+//! mid-way, through the same injector, and classifies each crash point by which bank
+//! [`bank::select`] names afterward. The last two are driven rather than swept —
+//! [`row_nine`] and [`row_ten`] each build one crash point by hand, because a capacity
+//! refusal and a declared-workflow mismatch are not media crashes the injector produces.
+//! [`every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned`] pins all ten
+//! counts, so a sweep that quietly thinned fails closed.
 //!
 //! # How a row is read off a run
 //!
-//! From the witness, the recovered count and the journal's ending — all of which a board
-//! has after a reset — plus one thing only the harness has: whether the dispatcher was
-//! entered, and whether it returned. A `Dispatched` mark is written *before* the effect, so
-//! a mark is not evidence of a dispatch; `tests/sweep.rs` says why. Rows 2, 3 and 4 rest on
-//! that evidence, and a board cannot supply it — issue #96 again.
+//! For the six effect rows: from the witness, the recovered count and the journal's
+//! ending — all of which a board has after a reset — plus one thing only the harness
+//! has: whether the dispatcher was entered, and whether it returned. A `Dispatched` mark
+//! is written *before* the effect, so a mark is not evidence of a dispatch; `tests/sweep.rs`
+//! says why. Rows 2, 3 and 4 rest on that evidence, and a board cannot supply it.
 //!
 //! Row 3 is not a crash point of the injector: it is a run whose dispatcher is entered and
 //! does not return, which is the supply going during the effect as the rig sees it. It is
@@ -32,6 +35,11 @@
 //! Row 6 is decided by what recovery produced, so a completion seal that landed whole with
 //! its barrier refused is in it beside the points that are strictly after the barrier; the
 //! model half says the same of rows 2 and 6.
+//!
+//! For the two bank rows: a swap writes no journal record and marks no witness, so there
+//! is no mark to read. [`bank::select`]'s own answer is the whole of it — the old bank
+//! authoritative is row 7, the new bank authoritative is row 8, and nothing else about a
+//! crash point during the swap's own operations needs to be asked.
 
 use std::cell::RefCell;
 
@@ -555,6 +563,353 @@ fn after_completion_barrier_the_completion_is_replayed_and_the_activity_never_ru
 }
 
 // ---------------------------------------------------------------------------------------
+// Rows 7 and 8: the bank swap
+// ---------------------------------------------------------------------------------------
+
+/// How many effects the retiring run completes before it rolls over. Strictly less than
+/// `EFFECTS`, so the swap replaces a run that still had an effect left to schedule rather
+/// than one that had already reached its own end.
+const ROLLOVER_EFFECTS_BEFORE: u16 = EFFECTS - 1;
+
+/// The header the swap installs: a fresh run id, distinct from the retiring one.
+const fn rollover_next_header(rig: &Rig) -> bank::BankHeader<'static> {
+    bank::BankHeader {
+        run: waymaker_core::RunId(rig.workload(0).run().0 ^ 1),
+        align: rig.layout().align(),
+        workflow_kind: Workload::WORKFLOW_KIND,
+        workflow_version: Workload::WORKFLOW_VERSION,
+        input_schema: 0,
+        input: b"n",
+    }
+}
+
+/// Writes the retiring run's opening records: `RunStarted` and
+/// [`ROLLOVER_EFFECTS_BEFORE`] schedule/completion pairs, stopping there.
+fn drive_rollover_prefix(session: &mut waymaker_fault::Session) -> Result<(), String> {
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut dispatcher = Log::default();
+    let mut metered = Metered::new(session);
+    rig.prepare(&mut metered, 0, &mut page)
+        .map_err(|error| format!("prepare: {error:?}"))?;
+    rig.iterate_until_rollover(
+        0,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    )
+    .map_err(|error| format!("iterate_until_rollover: {error:?}"))
+}
+
+/// §10's seven-step swap from the retiring bank into the other one, driven directly the
+/// way [`row_nine`]'s explicit exit is. Returns the engine window — still borrowing
+/// `session`, so the caller can keep writing into the bank it installed — and that bank's
+/// journal, positioned after whatever [`Journal::after`] found there.
+fn perform_rollover_swap(
+    session: &mut waymaker_fault::Session,
+) -> Result<(Window<'_, waymaker_fault::Session>, Journal), String> {
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let Ok(mut engine) = Window::new(session, 0, layout.geometry().capacity()) else {
+        return Err("engine window".to_string());
+    };
+    let region = try_bank_region(&rig, Rig::BANK, &mut engine, &mut page)?;
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        step.map_err(|error| format!("recovery: {error:?}"))?;
+    }
+    let swap = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    )
+    .map_err(|error| format!("swap plan: {error:?}"))?;
+    let prepared = swap
+        .prepare(&mut engine)
+        .map_err(|error| format!("swap prepare: {error:?}"))?;
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let staged = prepared
+        .stage(&mut header_page)
+        .map_err(|error| format!("swap stage: {error:?}"))?;
+    let sealable = staged
+        .payload_barrier()
+        .map_err(|error| format!("swap barrier: {error:?}"))?;
+    let installed = sealable
+        .commit()
+        .map_err(|error| format!("swap commit: {error:?}"))?;
+    let mut new_recovery = installed.recovery();
+    while let Some(step) = new_recovery.next(&mut page) {
+        step.map_err(|error| format!("new recovery: {error:?}"))?;
+    }
+    let Some(new_journal) = Journal::after(new_recovery) else {
+        return Err("new journal not extendable".to_string());
+    };
+    Ok((engine, new_journal))
+}
+
+/// The whole combined run: the retiring prefix, the swap, and a small complete run
+/// written into the bank it installs.
+fn drive_rollover(session: &mut waymaker_fault::Session) -> Result<(), String> {
+    drive_rollover_prefix(session)?;
+    let (mut engine, mut new_journal) = perform_rollover_swap(session)?;
+    try_write_tiny_run(&mut engine, &mut new_journal)?;
+    Ok(())
+}
+
+/// The tiny run [`write_tiny_run`] writes, as records, in order.
+const fn tiny_run_records(input: &[u8; 1]) -> [RecordRef<'_>; 4] {
+    [
+        RecordRef::RunStarted {
+            workflow_kind: Workload::WORKFLOW_KIND,
+            workflow_version: Workload::WORKFLOW_VERSION,
+            input,
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq(0),
+            kind: ActivityKind(1),
+            input_len: 1,
+            input_crc: input_digest(input),
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"ok",
+        },
+        RecordRef::RunCompleted { result: b"done" },
+    ]
+}
+
+/// Continues [`write_tiny_run`]'s run from whatever prefix `recovered` already covers.
+/// Returns the effects dispatched by this call.
+fn continue_tiny_run<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    recovered: u16,
+) -> Vec<u16>
+where
+    S::Error: core::fmt::Debug,
+{
+    let input = b"i";
+    let records = tiny_run_records(input);
+    let mut dispatcher = Log::default();
+    for (index, record) in records.iter().enumerate() {
+        let Ok(index) = u16::try_from(index) else {
+            unreachable!("four records index in a u16")
+        };
+        if index < recovered {
+            continue;
+        }
+        write_record(engine, journal, record);
+        if index == 1 {
+            let Ok(()) = dispatcher.dispatch(0, input) else {
+                unreachable!("the new run's own dispatcher accepts effect 0")
+            };
+        }
+    }
+    dispatcher.entered
+}
+
+/// Which bank is authoritative, read the way [`Rig::verify`] reads it.
+fn authority_of(rig: &Rig, device: &mut Device, page: &mut [u8]) -> bank::Authority {
+    let layout = rig.layout();
+    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut generations = [None, None];
+    for (slot, id) in generations.iter_mut().zip([bank::BankId::A, bank::BankId::B]) {
+        let region = layout.bank(id);
+        let Some(want) = usize::try_from(region.payload_bytes())
+            .ok()
+            .map(|want| want.min(page.len()))
+        else {
+            unreachable!("a header fits a page")
+        };
+        let Some(header_slot) = page.get_mut(..want) else {
+            unreachable!("a header fits a page")
+        };
+        let Ok(()) = engine.read(region.base(), header_slot) else {
+            unreachable!("a readable bank")
+        };
+        let mut seal = [0_u8; Rig::MAX_PROGRAM_BYTES as usize];
+        let Ok(seal_len) = usize::try_from(region.seal_bytes()) else {
+            unreachable!("a seal fits its own width")
+        };
+        let Some(seal_slot) = seal.get_mut(..seal_len) else {
+            unreachable!("a seal fits its own width")
+        };
+        let Ok(()) = engine.read(region.seal_offset(), seal_slot) else {
+            unreachable!("a readable seal")
+        };
+        let Some(header_bytes) = page.get(..want) else {
+            unreachable!("a header fits a page")
+        };
+        *slot = bank::sealed_generation(header_bytes, seal_slot);
+    }
+    bank::select(generations)
+}
+
+/// Which row a crash point of the combined sequence is an instance of, or `None` for a
+/// point before the swap's own operations began — rows 1 to 6 already cover those.
+fn classify_rollover(
+    injection: Injection,
+    swap_start: usize,
+    rig: &Rig,
+    device: &mut Device,
+    page: &mut [u8],
+) -> Option<Row> {
+    if injection.op < swap_start {
+        return None;
+    }
+    match authority_of(rig, device, page) {
+        bank::Authority::Bank { id, .. } if id == Rig::BANK => {
+            Some(Row::DuringInactiveBankEraseOrWrite)
+        }
+        bank::Authority::Bank { .. } => Some(Row::AfterNewBankSealBarrier),
+        bank::Authority::Unsealed | bank::Authority::Ambiguous { .. } => {
+            unreachable!(
+                "the retiring bank is never erased in this sweep, so exactly one bank is \
+                 always a candidate"
+            )
+        }
+    }
+}
+
+/// Every crash point of the combined run, classified into row 7 or row 8.
+fn rollover_sweep() -> Vec<(Injection, Row)> {
+    let rig = rig();
+    let geometry = geometry();
+    let harness = Harness::new(geometry);
+
+    let Ok(prefix_only) = harness.run_fault_free(drive_rollover_prefix) else {
+        unreachable!("the rollover prefix completes fault-free")
+    };
+    let swap_start = prefix_only.ops().len();
+
+    let Ok(runs) = harness.run(|session| drive_rollover(session).map_err(|_| ())) else {
+        unreachable!("the fault-free rollover completes")
+    };
+    let mut points = Vec::new();
+    for run in &runs {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut device = device_after(run);
+        if let Some(row) = classify_rollover(injection, swap_start, &rig, &mut device, &mut page) {
+            points.push((injection, row));
+        }
+    }
+    points
+}
+
+#[test]
+fn during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues_on_the_rig()
+ {
+    let retiring: Vec<Injection> = rollover_sweep()
+        .into_iter()
+        .filter_map(|(injection, row)| (row == Row::DuringInactiveBankEraseOrWrite).then_some(injection))
+        .collect();
+    assert!(
+        !retiring.is_empty(),
+        "no crash point left the retiring bank authoritative"
+    );
+    let rig = rig();
+    for injection in retiring {
+        let Ok(cut) = Harness::new(geometry())
+            .run_one(injection, |session| drive_rollover(session).map_err(|_| ()))
+        else {
+            unreachable!("a deterministic crash point, at {injection:?}")
+        };
+        let mut device = device_after(&cut);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+            unreachable!("a judgeable part, at {injection:?}")
+        };
+        assert_eq!(
+            verdict.outcome(),
+            Outcome::Passed,
+            "the retiring bank's own history is intact, at {injection:?}"
+        );
+        let mut metered = Metered::new(&mut device);
+        let mut dispatcher = Log::default();
+        let resumed = rig.resume(0, &mut metered, &mut dispatcher, &mut page);
+        assert!(
+            matches!(resumed, Ok(Resumed::Completed { .. })),
+            "the old run continues, at {injection:?}: {resumed:?}"
+        );
+    }
+}
+
+#[test]
+fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig()
+ {
+    let installed: Vec<Injection> = rollover_sweep()
+        .into_iter()
+        .filter_map(|(injection, row)| (row == Row::AfterNewBankSealBarrier).then_some(injection))
+        .collect();
+    assert!(
+        !installed.is_empty(),
+        "no crash point left the new bank authoritative"
+    );
+    let rig = rig();
+    for injection in installed {
+        let Ok(cut) = Harness::new(geometry())
+            .run_one(injection, |session| drive_rollover(session).map_err(|_| ()))
+        else {
+            unreachable!("a deterministic crash point, at {injection:?}")
+        };
+        let mut device = device_after(&cut);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+
+        // The old run is never current again: it is not this rig's authoritative bank.
+        {
+            let mut metered = Metered::new(&mut device);
+            let mut dispatcher = Log::default();
+            let resumed = rig.resume(0, &mut metered, &mut dispatcher, &mut page);
+            assert!(
+                matches!(resumed, Err(RigError::Bank)),
+                "the retiring run answered as current, at {injection:?}: {resumed:?}"
+            );
+        }
+
+        // The new bank is authoritative. Where its own journal still has an append point
+        // — every case but a torn first frame, which ADR 0018 refuses rather than
+        // repairs, the same as any other bank — it starts and does work.
+        let layout = rig.layout();
+        let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+            unreachable!("the engine window")
+        };
+        let region = bank_region(&rig, Rig::BANK.other(), &mut engine, &mut page);
+        let mut recovery = Recovery::new(region, &mut engine);
+        let mut recovered = 0_u16;
+        while let Some(step) = recovery.next(&mut page) {
+            match step {
+                Ok(_) => recovered = recovered.saturating_add(1),
+                Err(_) => break,
+            }
+        }
+        if let Some(mut journal) = Journal::after(recovery) {
+            let ran = continue_tiny_run(&mut engine, &mut journal, recovered);
+            assert!(
+                recovered > 0 || !ran.is_empty(),
+                "the new run never started, at {injection:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Row 9: history capacity reached
 // ---------------------------------------------------------------------------------------
 
@@ -607,48 +962,98 @@ fn near_capacity() -> (Rig, Reserve, Device) {
     unreachable!("no declared tail in the search fills after exactly one effect")
 }
 
-/// Bank A's journal region, read the way a boot reads it.
-fn bank_a_region(rig: &Rig, device: &mut Device, page: &mut [u8]) -> JournalRegion {
+/// `bank`'s journal region, read the way a boot reads it. Fails rather than panicking, for
+/// a caller driven by the crash injector — a read this close to a fault point can fail
+/// like any other storage call.
+fn try_bank_region<S: StableStorage>(
+    rig: &Rig,
+    bank: bank::BankId,
+    engine: &mut Window<'_, S>,
+    page: &mut [u8],
+) -> Result<JournalRegion, String> {
     let layout = rig.layout();
-    let region = layout.bank(Rig::BANK);
-    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
-        unreachable!("the engine window")
-    };
+    let region = layout.bank(bank);
     let Some(want) = usize::try_from(region.payload_bytes())
         .ok()
         .map(|want| want.min(page.len()))
     else {
-        unreachable!("a header fits a page")
+        return Err("a header does not fit a page".to_string());
     };
     let Some(slot) = page.get_mut(..want) else {
-        unreachable!("a header fits a page")
+        return Err("a header does not fit a page".to_string());
     };
-    let Ok(()) = engine.read(region.base(), slot) else {
-        unreachable!("a readable bank")
-    };
+    engine
+        .read(region.base(), slot)
+        .map_err(|_| "bank read".to_string())?;
     let Some(bytes) = page.get(..want) else {
-        unreachable!("a header fits a page")
+        return Err("a header does not fit a page".to_string());
     };
-    let Ok(header) = bank::decode_header(bytes) else {
-        unreachable!("an installed bank")
-    };
-    let Ok(region) = JournalRegion::of(layout, Rig::BANK, &header) else {
-        unreachable!("a journal region")
+    let header = bank::decode_header(bytes).map_err(|_| "an unreadable bank header".to_string())?;
+    JournalRegion::of(layout, bank, &header).map_err(|error| format!("journal region: {error:?}"))
+}
+
+/// `bank`'s journal region, read the way a boot reads it.
+///
+/// For a caller inspecting a part the injector has already stopped: every read here is
+/// against media that is no longer changing, so a failure is a bug rather than a crash
+/// point. See [`try_bank_region`] for the fallible twin a live writer needs.
+fn bank_region<S: StableStorage>(
+    rig: &Rig,
+    bank: bank::BankId,
+    engine: &mut Window<'_, S>,
+    page: &mut [u8],
+) -> JournalRegion {
+    let Ok(region) = try_bank_region(rig, bank, engine, page) else {
+        unreachable!("a readable, already-crashed bank")
     };
     region
 }
 
-/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does.
-fn write_record(engine: &mut Window<'_, Device>, journal: &mut Journal, record: &RecordRef<'_>) {
+/// Bank A's journal region, read the way a boot reads it.
+fn bank_a_region(rig: &Rig, device: &mut Device, page: &mut [u8]) -> JournalRegion {
+    let Ok(mut engine) = Window::new(device, 0, rig.layout().geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    bank_region(rig, Rig::BANK, &mut engine, page)
+}
+
+/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does. Fails
+/// rather than panicking, for a caller driven by the crash injector.
+fn try_write_record<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    record: &RecordRef<'_>,
+) -> Result<(), String>
+where
+    S::Error: core::fmt::Debug,
+{
     let mut page = [0_u8; Rig::PAGE_BYTES];
-    let Ok(staged) = journal.stage(engine, record, &mut page) else {
-        unreachable!("room was reserved for this record")
-    };
-    let Ok(sealable) = staged.payload_barrier() else {
-        unreachable!("a fault-free barrier")
-    };
-    let Ok(_amplification) = sealable.commit() else {
-        unreachable!("a fault-free commit")
+    let staged = journal
+        .stage(engine, record, &mut page)
+        .map_err(|error| format!("stage: {error:?}"))?;
+    let sealable = staged
+        .payload_barrier()
+        .map_err(|error| format!("payload barrier: {error:?}"))?;
+    sealable
+        .commit()
+        .map_err(|error| format!("commit: {error:?}"))?;
+    Ok(())
+}
+
+/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does.
+///
+/// For a caller writing into an already-crashed, no-longer-injected device: every step
+/// here is fault-free, so a failure is a bug rather than a crash point. See
+/// [`try_write_record`] for the fallible twin a live writer needs.
+fn write_record<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    record: &RecordRef<'_>,
+) where
+    S::Error: core::fmt::Debug,
+{
+    let Ok(()) = try_write_record(engine, journal, record) else {
+        unreachable!("a fault-free record write")
     };
 }
 
@@ -680,42 +1085,41 @@ fn assert_replay_refuses_without_mutation(
 }
 
 /// Writes one complete, one-effect run into `journal`: `RunStarted`, a schedule and
-/// completion for effect 0, and `RunCompleted`. Returns the effects it dispatched.
-fn write_tiny_run(engine: &mut Window<'_, Device>, journal: &mut Journal) -> Vec<u16> {
+/// completion for effect 0, and `RunCompleted`. Fails rather than panicking, for a caller
+/// driven by the crash injector. Returns the effects it dispatched.
+fn try_write_tiny_run<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+) -> Result<Vec<u16>, String>
+where
+    S::Error: core::fmt::Debug,
+{
     let input = b"i";
-    write_record(
-        engine,
-        journal,
-        &RecordRef::RunStarted {
-            workflow_kind: Workload::WORKFLOW_KIND,
-            workflow_version: Workload::WORKFLOW_VERSION,
-            input,
-        },
-    );
-    write_record(
-        engine,
-        journal,
-        &RecordRef::EffectScheduled {
-            seq: EffectSeq(0),
-            kind: ActivityKind(1),
-            input_len: 1,
-            input_crc: input_digest(input),
-        },
-    );
+    let records = tiny_run_records(input);
     let mut dispatcher = Log::default();
-    let Ok(()) = dispatcher.dispatch(0, input) else {
-        unreachable!("the new run's own dispatcher accepts effect 0")
+    for (index, record) in records.iter().enumerate() {
+        try_write_record(engine, journal, record)?;
+        if index == 1 {
+            dispatcher
+                .dispatch(0, input)
+                .map_err(|error| format!("dispatch: {error:?}"))?;
+        }
+    }
+    Ok(dispatcher.entered)
+}
+
+/// Writes one complete, one-effect run into `journal`, as [`try_write_tiny_run`] does.
+///
+/// For a caller writing into an already-crashed, no-longer-injected device. See
+/// [`try_write_tiny_run`] for the fallible twin a live writer needs.
+fn write_tiny_run<S: StableStorage>(engine: &mut Window<'_, S>, journal: &mut Journal) -> Vec<u16>
+where
+    S::Error: core::fmt::Debug,
+{
+    let Ok(entered) = try_write_tiny_run(engine, journal) else {
+        unreachable!("a fault-free tiny run")
     };
-    write_record(
-        engine,
-        journal,
-        &RecordRef::EffectCompleted {
-            seq: EffectSeq(0),
-            result: b"ok",
-        },
-    );
-    write_record(engine, journal, &RecordRef::RunCompleted { result: b"done" });
-    dispatcher.entered
+    entered
 }
 
 /// §10's explicit exit from the near-capacity state: a swap into the other bank, and a
@@ -899,15 +1303,26 @@ fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_hist
 }
 
 #[test]
-fn the_rig_fills_six_rows_and_names_the_seventh_as_its_gap() {
-    // The honest shape of this rig: six effect rows reached, and a verdict that refuses
-    // rather than a census that stops at six. Rows 7 to 10 are owed — see
-    // `xtask::docs::FAILURE_ROWS` and issue #96.
+fn every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned() {
+    // All ten rows, filled: the six effect rows swept through the ordinary crash
+    // injector, the two bank rows swept through the swap workload, and the two driven
+    // rows — history capacity and replay divergence — credited once each by their own
+    // assertions. Issue #96 closes the gap `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`
+    // used to pin.
     let (points, _) = classified();
     let mut matrix = Matrix::EMPTY;
     for point in points.iter().chain(&row_three()) {
         matrix = matrix.record(point.row);
     }
+    for (_, row) in rollover_sweep() {
+        matrix = matrix.record(row);
+    }
+    for row in [row_nine(), row_ten()] {
+        matrix = matrix.record(row);
+    }
+    matrix
+        .verdict()
+        .expect("every row of §14's table is reached on the rig");
     let counts: Vec<(Row, u32)> = Row::ALL
         .into_iter()
         .map(|row| (row, matrix.iterations(row)))
@@ -922,17 +1337,11 @@ fn the_rig_fills_six_rows_and_names_the_seventh_as_its_gap() {
             (Row::AfterActivityBeforeCompletionBarrier, 42),
             (Row::DuringCompletionWrite, 84),
             (Row::AfterCompletionBarrier, 138),
-            (Row::DuringInactiveBankEraseOrWrite, 0),
-            (Row::AfterNewBankSealBarrier, 0),
-            (Row::HistoryCapacityReached, 0),
-            (Row::ReplayDivergence, 0),
+            (Row::DuringInactiveBankEraseOrWrite, 61),
+            (Row::AfterNewBankSealBarrier, 167),
+            (Row::HistoryCapacityReached, 1),
+            (Row::ReplayDivergence, 1),
         ]
-    );
-    let gap = matrix.verdict().expect_err("four rows are owed");
-    assert_eq!(gap.row(), Row::DuringInactiveBankEraseOrWrite);
-    assert_eq!(
-        gap.to_string(),
-        "no crash point landed in row `during-inactive-bank-erase-or-write`"
     );
 }
 

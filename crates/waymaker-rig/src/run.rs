@@ -672,30 +672,36 @@ impl Rig {
     /// The journal of the bank *this run* was installed in, or `None` if it was never
     /// installed on this part.
     ///
-    /// Three ways to answer `None`, and each of them is a part that has nothing to say about
+    /// Four ways to answer `None`, and each of them is a part that has nothing to say about
     /// `workload`'s run rather than a part that lost something:
     ///
     /// * no bank is authoritative, or two are — preparation was cut before its generation
     ///   seal landed, which is the state every part is in before its first one;
+    /// * a bank *is* authoritative, but it is not [`Rig::BANK`] — a swap has moved authority
+    ///   to the other bank, and [`Rig::BANK`]'s own header, whatever it still says, is a
+    ///   retired run's rather than this one's (issue
+    ///   [#96](https://github.com/madmax983/waymaker/issues/96): `Rig::judge` and
+    ///   `Rig::resume` used to read [`Rig::BANK`] on the strength of its run id alone, which
+    ///   a swap's own header being left untouched on the losing bank made a false positive);
     /// * the authoritative bank's header does not decode — there is no journal region to
     ///   derive, and §14's `frame ignored; previous history prefix wins` is about frames
     ///   inside a journal rather than about the header that names one;
     /// * the header decodes and names a **different run** — the part is still the previous
     ///   iteration's, which is exactly the window a reset during `prepare` opens.
     ///
-    /// The run id is the comparison rather than the whole header because that is what makes a
-    /// bank *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so
-    /// two iterations of one plan never share one.
+    /// The run id is compared as well as the bank, because that is what makes a bank
+    /// *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so two
+    /// iterations of one plan never share one.
     fn installed_journal<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
         workload: Workload,
-        banks: usize,
+        authority: bank::Authority,
         page: &mut [u8],
     ) -> Result<Option<JournalRegion>, RigError<S::Error>> {
-        if banks != 1 {
+        let bank::Authority::Bank { id: Self::BANK, .. } = authority else {
             return Ok(None);
-        }
+        };
         let read = self.read_header(engine, Self::BANK, page)?;
         let Some(bytes) = page.get(..read) else {
             return Err(RigError::ShortPage);
@@ -839,6 +845,109 @@ impl Rig {
             }
         }
         Ok(Stop::Completed)
+    }
+
+    /// Writes `effects_before_swap` of this iteration's scheduled effects — `RunStarted`
+    /// and that many schedule/completion pairs — then stops, without writing the rest of
+    /// the run or its `RunCompleted`.
+    ///
+    /// Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s swap workload: a
+    /// caller that means to roll over mid-run writes this much normally, then drives
+    /// [`waymaker_flash::swap`] itself. This bank's `RunCompleted` is never written; the
+    /// run's continuation is whichever bank the swap leaves authoritative.
+    ///
+    /// No cutter: rows 7 and 8 of the failure matrix are swept by running the whole
+    /// sequence — this call, the swap, and the run it installs — through the crash
+    /// injector, the way the six other rows are swept through [`iterate`](Self::iterate).
+    ///
+    /// # Errors
+    ///
+    /// As [`iterate`](Self::iterate), and [`RigError::Workload`] when
+    /// `effects_before_swap` is not strictly less than [`effects`](Self::effects): a run
+    /// that reaches its own end has nothing left to roll over.
+    pub fn iterate_until_rollover<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+        effects_before_swap: u16,
+    ) -> Result<(), RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        if effects_before_swap >= self.effects {
+            return Err(RigError::Workload);
+        }
+        let workload = self.workload(iteration);
+        let Some(stop_before) = effects_before_swap
+            .checked_mul(2)
+            .and_then(|doubled| doubled.checked_add(1))
+        else {
+            return Err(RigError::Workload);
+        };
+
+        let region = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
+                return Err(RigError::Bank);
+            }
+            self.journal_region(&mut engine, page).map_err(widen)?
+        };
+        let mut journal = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            let mut recovery = Recovery::new(region, &mut engine);
+            while let Some(step) = recovery.next(page) {
+                if let Err(error) = step {
+                    return Err(RigError::Recovery(unwindow_recovery(error)));
+                }
+            }
+            match Journal::after(recovery) {
+                Some(journal) => journal,
+                None => return Err(RigError::Region(RegionError::EmptyRegion)),
+            }
+        };
+
+        let mut witness = Witness::new(self.witness);
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+
+        for index in 0..stop_before {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Attempted),
+                page,
+            )
+            .map_err(widen)?;
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append(part, &mut journal, &record, page).map_err(widen)?;
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Acknowledged),
+                page,
+            )
+            .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                self.mark(
+                    part,
+                    &mut witness,
+                    Mark::new(iteration, index, Stage::Dispatched),
+                    page,
+                )
+                .map_err(widen)?;
+                self.perform(iteration, effect, dispatcher)?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(())
     }
 
     /// Runs the workload with `reserve` gating every append, to completion or to the first
@@ -1069,11 +1178,12 @@ impl Rig {
     ) -> Result<(u16, Option<Journal>), RigError<S::Error>> {
         let region = {
             let mut engine = self.engine(part)?;
-            let banks = self.authoritative_banks(&mut engine, page)?;
+            let authority = self.authority(&mut engine, page)?;
+            let banks = authority_count(authority);
             if banks != 1 {
                 return Err(RigError::Authority { banks });
             }
-            match self.installed_journal(&mut engine, workload, banks, page)? {
+            match self.installed_journal(&mut engine, workload, authority, page)? {
                 Some(region) => region,
                 None => return Err(RigError::Bank),
             }
@@ -1420,6 +1530,20 @@ impl Rig {
         engine: &mut Window<'_, S>,
         page: &mut [u8],
     ) -> Result<usize, RigError<S::Error>> {
+        Ok(authority_count(self.authority(engine, page)?))
+    }
+
+    /// Which bank is authoritative.
+    ///
+    /// §14's `single-authority`, read off media exactly as a boot would read it: each bank's
+    /// header and seal, through [`bank::sealed_generation`], then [`bank::select`]. Unlike
+    /// [`authoritative_banks`](Self::authoritative_banks), this keeps *which* bank it is —
+    /// the fact a swap workload needs and a single-bank rig never had to ask for.
+    fn authority<S: StableStorage>(
+        &self,
+        engine: &mut Window<'_, S>,
+        page: &mut [u8],
+    ) -> Result<bank::Authority, RigError<S::Error>> {
         let mut generations = [None, None];
         for (slot, id) in generations.iter_mut().zip([BankId::A, BankId::B]) {
             let region = self.layout.bank(id);
@@ -1439,11 +1563,7 @@ impl Rig {
                 .map_err(unwindow)?;
             *slot = bank::sealed_generation(header, seal_slot);
         }
-        Ok(match bank::select(generations) {
-            bank::Authority::Unsealed => 0,
-            bank::Authority::Bank { .. } => 1,
-            bank::Authority::Ambiguous { .. } => 2,
-        })
+        Ok(bank::select(generations))
     }
 
     /// Judges what a reset left behind.
@@ -1521,7 +1641,8 @@ impl Rig {
         }
         let workload = self.workload(iteration);
         let mut engine = self.engine(part)?;
-        let banks = self.authoritative_banks(&mut engine, page)?;
+        let authority = self.authority(&mut engine, page)?;
+        let banks = authority_count(authority);
 
         // Ambiguity is decided first and on its own. Two sealed banks means the rig cannot say
         // which journal is this run's history, so every obligation below — what recovery owed
@@ -1549,7 +1670,7 @@ impl Rig {
         // sealed at `n - 1`, and a `judge` that walked whatever bank A held read run `n - 1`'s
         // journal against run `n`'s declarations and reported a §14 violation on a healthy
         // board. An uninstalled part is not a verdict about recovery — see [`uninstalled`].
-        let Some(region) = self.installed_journal(&mut engine, workload, banks, page)? else {
+        let Some(region) = self.installed_journal(&mut engine, workload, authority, page)? else {
             return Ok(uninstalled(workload, progress, banks));
         };
 
@@ -1668,6 +1789,15 @@ const fn finish(audit: Audit, banks: usize) -> Verdict {
         outcome,
         recovered,
         banks,
+    }
+}
+
+/// How many banks `authority` names.
+const fn authority_count(authority: bank::Authority) -> usize {
+    match authority {
+        bank::Authority::Unsealed => 0,
+        bank::Authority::Bank { .. } => 1,
+        bank::Authority::Ambiguous { .. } => 2,
     }
 }
 
