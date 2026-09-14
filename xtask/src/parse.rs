@@ -2671,6 +2671,27 @@ fn literal_or_const_value(
         // silently falling through to a later arm that might answer differently from what
         // `rustc` itself would choose.
         syn::Expr::Match(expr_match) => evaluate_match(expr_match, resolve),
+        // Codex's forty-ninth-round finding: `const P0: u8 = (0u8,).0;` is `Expr::Field` —
+        // a field projection on a tuple *literal*, built solely so the projection yields a
+        // constant — which fell to the wildcard `_ => None` case below and left every such
+        // arm unresolved, the const-call and array backstops included, since a field
+        // projection is neither a call nor an array index. Scoped to exactly that shape:
+        // the base must itself be an `Expr::Tuple` — nothing reaches outside this
+        // expression for a value, so a named-field struct projection or a projection off a
+        // path is not attempted — and the member an unnamed numeric index within that
+        // tuple's own arity; the picked element is then evaluated through this same
+        // pipeline. A named-field member, an index the tuple has no element at, or a base
+        // that is not a tuple literal each stay unresolved rather than guessed at.
+        syn::Expr::Field(field) => {
+            let syn::Expr::Tuple(tuple) = field.base.as_ref() else {
+                return None;
+            };
+            let syn::Member::Unnamed(index) = &field.member else {
+                return None;
+            };
+            let element = tuple.elems.get(usize::try_from(index.index).ok()?)?;
+            literal_or_const_value(element, resolve)
+        }
         _ => None,
     }
 }

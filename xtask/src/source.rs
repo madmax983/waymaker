@@ -17818,6 +17818,32 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_tuple_field_initializers_is_reported() {
+        // Codex's forty-ninth-round finding: `const P0: u8 = (0u8,).0;` is `Expr::Field` —
+        // a field projection on a tuple literal — which fell to the wildcard `_ => None`
+        // case in `literal_or_const_value` and left every such constant unresolved, the
+        // const-call and array backstops included, since a field projection is neither a
+        // call nor an array index. The new `Expr::Field` case evaluates the tuple's own
+        // element at the projected index through this same pipeline, so `P0` through `P3`
+        // resolve to `0..3`, the dense sequence the outer match's patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_field_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = (0u8,).0;\n    const P1: u8 = (1u8,).0;\n    \
+             const P2: u8 = (2u8,).0;\n    const P3: u8 = (3u8,).0;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
