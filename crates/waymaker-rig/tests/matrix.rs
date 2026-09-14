@@ -2173,6 +2173,98 @@ fn resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cann
     );
 }
 
+/// `iterate_reserved` refuses a fresh schedule's own completion bound before dispatching the
+/// effect that schedule is for.
+///
+/// The reserve admits the schedule record on its own — its width does not depend on
+/// `effect_result_bytes` — so the loop used to mark it, append it, and dispatch the effect
+/// before it ever reached the completion record's own index and discovered the zero-width
+/// bound could not hold it. By then the effect had already run once for nothing: refusing at
+/// the completion cannot undo it, and a retry through `resume_reserved` performs it again.
+#[test]
+fn iterate_reserved_refuses_a_narrow_completion_bound_before_dispatching_the_schedule_it_is_for() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut metered = Metered::new(&mut device);
+    let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+        unreachable!("prepare")
+    };
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(outcome, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the schedule's own effect was dispatched before its completion's bound was checked: \
+         {:?}",
+        dispatcher.entered
+    );
+}
+
+/// `resume_reserved` refuses a fresh schedule's own completion bound before dispatching the
+/// effect that schedule is for, the same way [`iterate_reserved`] must.
+///
+/// Distinct from
+/// [`resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cannot_hold`]:
+/// that test's schedule is already durable and the effect is *outstanding*, redelivered
+/// through the branch above the main write loop. This one recovers only `RunStarted`, so the
+/// main loop writes effect 0's schedule fresh — a record the redelivery preflight never
+/// touches — and must not dispatch it before checking that the completion right after it
+/// would fit.
+///
+/// [`iterate_reserved`]: Rig::iterate_reserved
+#[test]
+fn resume_reserved_refuses_a_narrow_completion_bound_before_dispatching_a_fresh_schedule() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut metered = Metered::new(&mut device);
+    // `prepare` writes the bank header and nothing else: the journal is empty, so recovery
+    // finds `recovered == 0` and the main write loop — not the redelivery branch above it,
+    // which needs a durable schedule already recovered — is what reaches effect 0's own
+    // schedule fresh.
+    let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+        unreachable!("prepare")
+    };
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut dispatcher = Log::default();
+    let resumed = rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the fresh schedule's own effect was dispatched before its completion's bound was \
+         checked: {:?}",
+        dispatcher.entered
+    );
+}
+
 /// `verify` does not report a reclaimed, superseded bank as one that lost its acknowledged
 /// records.
 ///

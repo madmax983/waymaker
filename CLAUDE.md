@@ -3741,3 +3741,21 @@ agreeing record in front of it is touched, not only before the disagreeing one i
 Reproduced first from a crash point that left only `RunStarted` durable, with a `declared`
 diverging at the *second* effect: the unfixed code dispatched the first effect — which
 agreed with `declared` — before reaching the second and refusing there.
+
+An eighth returned to row 9, and it is the same shape once more, in `iterate_reserved` and
+`resume_reserved` rather than in `resume_declaring`: `admits` is checked for the record
+about to be written and nothing else, so a schedule that fits a reserve whose
+`effect_result_bytes` is too narrow for the completion still gets marked, appended and
+dispatched — the effect runs — before the loop reaches the completion's own index and
+discovers `Refusal::OverDeclaredBound` there. By then refusing cannot undo the dispatch,
+and every retry through `resume_reserved` performs the effect again. A schedule's own
+width does not depend on `effect_result_bytes`, so the schedule's admission is never
+evidence that its completion's will follow. Both fresh-write loops now preflight the
+completion `Workload::completion_index` names, admitting it against the same reserve
+before the schedule's effect is dispatched — the same shape the redelivery branch above
+each loop already carried for an *outstanding* effect, extended to a schedule written
+fresh in the same call. Reproduced first with a zero-width `effect_result_bytes` reserve
+against a freshly prepared device: `iterate_reserved` dispatched effect 0 and only then
+answered `Refusal::OverDeclaredBound` at its completion's index, and `resume_reserved`
+did the same from a device recovered no further than `RunStarted`, where the main loop
+rather than the redelivery branch reaches the fresh schedule.

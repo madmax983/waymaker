@@ -1049,6 +1049,7 @@ impl Rig {
 
         let mut witness = Witness::new(self.witness);
         let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut completion_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
 
         for index in 0..records {
             let Some(role) = workload.role(index) else {
@@ -1079,6 +1080,22 @@ impl Rig {
             .map_err(widen)?;
 
             if let Role::Schedule(effect) = role {
+                // The reserve admitting `record` above says nothing about the completion
+                // this effect is about to earn: a schedule's width does not depend on
+                // `Bounds::effect_result_bytes`, so a reserve that will refuse the
+                // completion still let the schedule through. Checked here, before the
+                // effect runs: dispatching first and refusing at the completion's own
+                // index — one iteration later — cannot undo the effect, and every retry
+                // through `resume_reserved` would perform it again.
+                let Some(completion_index) = workload.completion_index(effect) else {
+                    return Err(RigError::Workload);
+                };
+                let Some(completion) = workload.record(completion_index, &mut completion_page)
+                else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &completion).map_err(RigError::Capacity)?;
+
                 self.after_schedule(
                     iteration,
                     index,
@@ -1500,6 +1517,7 @@ impl Rig {
         }
         let mut reserved = Reserved::over(journal, reserve).map_err(RigError::Reserve)?;
         let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut completion_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
 
         let outstanding = recovered
             .checked_sub(1)
@@ -1546,6 +1564,20 @@ impl Rig {
             self.mark_above(part, &mut witness, &mut known, mark, page)
                 .map_err(widen)?;
             if let Role::Schedule(effect) = role {
+                // As above in the redelivery branch: the reserve admitting this schedule
+                // says nothing about the completion this effect is about to earn, so that
+                // is checked here, before the effect runs for the first time — not one
+                // iteration later, when refusing at the completion's own index can no
+                // longer undo the dispatch this loop just performed.
+                let Some(completion_index) = workload.completion_index(effect) else {
+                    return Err(RigError::Workload);
+                };
+                let Some(completion) = workload.record(completion_index, &mut completion_page)
+                else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &completion).map_err(RigError::Capacity)?;
+
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
