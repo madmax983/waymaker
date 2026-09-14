@@ -8478,16 +8478,40 @@ fn check_integrity_check_module_tree(
     // an out-of-line `mod indices;` resolve at all: without a declaration's own name seeded
     // as that file's prefix, `indices.rs`'s own top-level constants have no module to be
     // qualified under, because the declaration naming them lives in a different file.
+    // Codex's forty-fourth-round finding: a single pass over the tree, each file scanned
+    // in isolation, cannot resolve a constant whose own initializer names a *different*
+    // file's module — `pub const P0: u8 = super::base::BASE + 0;` in an out-of-line
+    // `indices.rs` sibling to a `base` module declared in another file entirely — because
+    // `qualified_constants_with_prefix` used to see nothing beyond the one file it was
+    // handed, regardless of which order the tree's files were visited in. Run to a fixed
+    // point instead, feeding each pass's accumulated map back in as the next pass's own
+    // seed: a dependency chain across files needs at most as many passes as there are
+    // files to fully resolve, so bounding the loop at `scanned_sources.len()` (mirroring
+    // `resolve_scope_consts`'s own bounded fixed point) is exact rather than a heuristic
+    // cutoff, and a pass that adds nothing new stops the loop early.
     let mut qualified = std::collections::HashMap::new();
     let prefixes = module_path_prefixes(sources, source).unwrap_or_default();
-    for scanned in &scanned_sources {
-        let prefix = prefixes
-            .iter()
-            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
-            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
-        if let Ok(found) = crate::parse::qualified_constants_with_prefix(&scanned.contents, &prefix)
-        {
-            qualified.extend(found);
+    for _ in 0..scanned_sources.len().max(1) {
+        let mut progressed = false;
+        for scanned in &scanned_sources {
+            let prefix = prefixes
+                .iter()
+                .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
+                .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+            if let Ok(found) = crate::parse::qualified_constants_with_prefix(
+                &scanned.contents,
+                &prefix,
+                &qualified,
+            ) {
+                for (name, value) in found {
+                    if qualified.insert(name, value).is_none() {
+                        progressed = true;
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
         }
     }
 
@@ -17520,6 +17544,68 @@ mod deferred_answer_pins {
              P3 => 3,\n        _ => 4,\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_parenthesized_patterns_is_reported() {
+        // Codex's forty-fourth-round finding: `(0)` through `(2)` — a pattern wrapped in
+        // parentheses, legal and warning-free — is `Pat::Paren`, which fell to the
+        // wildcard `_ => Vec::new()` case in `pattern_literal` and left every such arm
+        // unresolved, even though a parenthesized pattern names exactly the value its own
+        // interior does.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn parenthesized_pattern_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn parenthesized_pattern_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        (0) => parenthesized_pattern_helper(0),\n        \
+             (1) => parenthesized_pattern_helper(1),\n        (2) => \
+             parenthesized_pattern_helper(2),\n        _ => \
+             parenthesized_pattern_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_resolves_a_constant_that_references_a_sibling_out_of_line_file_is_reported() {
+        // Codex's forty-fourth-round finding: `qualified_constants_with_prefix` used to
+        // scan each file of the tree in complete isolation, seeded from nothing, so a
+        // constant whose own initializer names a module declared in a *different*
+        // out-of-line file — `pub(crate) const P0: u8 = super::base::BASE + 0;` in
+        // `indices.rs`, naming the sibling out-of-line `base` module — never resolved
+        // regardless of which order the tree's files were scanned in: `indices.rs`'s own
+        // isolated pass had no way to see `base.rs`'s constant, and no later pass ever
+        // came back to retry it. The collection now runs to a fixed point, each file's
+        // scan seeded with everything the tree has accumulated so far.
+        let parent = format!(
+            "{}\nmod base;\nmod indices;\n\nconst fn qualified_constant_pattern_table(nibble: \
+             u8) -> u32 {{\n    match nibble & 0xF {{\n        indices::P0 => \
+             crc32_nibble(0),\n        indices::P1 => crc32_nibble(1),\n        \
+             indices::P2 => crc32_nibble(2),\n        indices::P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let base = "//! Base value.\npub(crate) const BASE: u8 = 10;\n";
+        let indices = "//! Table indices.\npub(crate) const P0: u8 = super::base::BASE + \
+                       0;\npub(crate) const P1: u8 = super::base::BASE + \
+                       1;\npub(crate) const P2: u8 = super::base::BASE + \
+                       2;\npub(crate) const P3: u8 = super::base::BASE + 3;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/base.rs", base),
+            layer("waymaker-flash/src/crc/indices.rs", indices),
+        ]);
         assert!(
             violations
                 .iter()

@@ -1947,12 +1947,13 @@ pub fn match_expressions_with_prefix(
 /// file's own [`qualified_constants`] first and passes the result to [`match_expressions`]
 /// as `external_qualified` for every file in the tree.
 ///
-/// Equivalent to [`qualified_constants_with_prefix`] with an empty prefix: for a file that
-/// is not itself the out-of-line body of a `mod` declared somewhere else, that is the whole
-/// answer, because every constant this function can see either sits at that file's own
-/// root — with no module of its own to be qualified under — or inside a `mod { ... }` this
-/// file declares inline, which `qualified_constants_with_prefix` already walks into either
-/// way.
+/// Equivalent to [`qualified_constants_with_prefix`] with an empty prefix and no
+/// cross-file seed: for a file that is not itself the out-of-line body of a `mod` declared
+/// somewhere else, and whose own constants reference nothing outside this file, that is the
+/// whole answer, because every constant this function can see either sits at that file's
+/// own root — with no module of its own to be qualified under — or inside a `mod { ... }`
+/// this file declares inline, which `qualified_constants_with_prefix` already walks into
+/// either way.
 ///
 /// # Errors
 ///
@@ -1960,11 +1961,14 @@ pub fn match_expressions_with_prefix(
 pub fn qualified_constants(
     contents: &str,
 ) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
-    qualified_constants_with_prefix(contents, &[])
+    qualified_constants_with_prefix(contents, &[], &std::collections::HashMap::new())
 }
 
-/// [`qualified_constants`], with `prefix` seeded as the module path `contents`' own file
-/// sits at.
+/// [`qualified_constants`], with two seeds a lone file cannot supply on its own.
+///
+/// `prefix` is the module path `contents`' own file sits at, and `external_qualified` is
+/// every module-qualified constant already known from the rest of the tree — the
+/// tree-wide accumulation `check_checksum_module_dense_matches`'s own caller builds.
 ///
 /// `prefix` is the segments an out-of-line `mod name;` declared in some *other* file
 /// gives it, empty for a file nothing declares this way. Codex's finding: an out-of-line
@@ -1976,23 +1980,44 @@ pub fn qualified_constants(
 /// instead of empty, and this file's own top-level constants are recorded under it
 /// explicitly, the one thing a walk of `contents` alone has no way to know on its own.
 ///
+/// Codex's forty-fourth-round finding: this function's own doc comment claimed every
+/// constant it can see "sits at that file's own root ... or inside a `mod { ... }` this
+/// file declares inline" — true of where a constant is *declared*, and false of what its
+/// *initializer* can reference. `pub const P0: u8 = super::base::BASE + 0;`, in an
+/// out-of-line `indices.rs` whose sibling `base` module lives in a *different* file
+/// entirely, names a constant this single-file walk has no way to see, because this
+/// function used to seed `resolve_scope_consts` and the visitor's own `qualified` map from
+/// nothing — no amount of file-traversal order fixed that, since each file was scanned in
+/// isolation. `external_qualified` is now threaded through both, exactly the way
+/// [`match_expressions_with_prefix`] already takes one, so a caller that has already
+/// collected the rest of the tree's constants (or is doing so at a fixed point, since one
+/// file's own dependency on another does not respect any particular scan order either) can
+/// hand them to this pass too.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "this crate never receives a caller-chosen hasher; every map it builds and \
+              passes is `std::collections::HashMap`'s default, so generalising the \
+              parameter buys no caller anything and only widens the signature"
+)]
 pub fn qualified_constants_with_prefix(
     contents: &str,
     prefix: &[String],
+    external_qualified: &std::collections::HashMap<String, i128>,
 ) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(
         &item_const_exprs(&file.items),
         &ConstScopes(Vec::new()),
-        &std::collections::HashMap::new(),
+        external_qualified,
         prefix,
         &[],
         &[],
     );
-    let mut qualified = std::collections::HashMap::new();
+    let mut qualified = external_qualified.clone();
     if !prefix.is_empty() {
         for (name, value) in &base {
             qualified.insert(format!("{}::{name}", prefix.join("::")), *value);
@@ -2906,6 +2931,13 @@ fn pattern_literal(
         // table's own selector can be, and one `rustc` lowers to the identical indexed
         // table a by-value match would.
         syn::Pat::Reference(reference) => pattern_literal(&reference.pat, resolve, qualified),
+        // Codex's forty-fourth-round finding: `(0)` through `(14)` — a pattern wrapped in
+        // parentheses, legal and warning-free even with nothing to disambiguate — is
+        // `Pat::Paren`, which fell to the wildcard `_ => Vec::new()` case and left every
+        // such arm unresolved, even though a parenthesized pattern names exactly the value
+        // its own interior does and `rustc` lowers a match built from it to the identical
+        // indexed table an unparenthesized one gets.
+        syn::Pat::Paren(paren) => pattern_literal(&paren.pat, resolve, qualified),
         // Codex's finding: `Some(0)` through `Some(14)` over an `Option<u8>` scrutinee is
         // exactly as dense as its bare-integer twin — `rustc` lowers a single-field
         // tuple-struct constructor pattern to the identical indexed table a plain integer
