@@ -18572,6 +18572,65 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_labelled_loop_pattern_constants_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = 'done: loop { break 'done 0 };` labels
+        // both the loop and its own break with the identical name — the break targets this
+        // loop and no other, so it is exactly as resolvable as the unlabelled `loop { break
+        // 0 }` this scan already folds — but the prior round's fix refused every labelled
+        // break unconditionally, so every one of `P0` through `P3`'s initializers stayed
+        // unresolved and the dense `0..=3` window they pattern-match went undetected.
+        // `evaluate_loop` now compares the break's own label against the loop's, refusing
+        // only a break that targets a *different* (outer) loop.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn labelled_loop_pattern_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = 'done: loop { break 'done 0 };\n    \
+             const P1: u8 = 'done: loop { break 'done 1 };\n    \
+             const P2: u8 = 'done: loop { break 'done 2 };\n    \
+             const P3: u8 = 'done: loop { break 'done 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_typed_constant_comparison_is_pruned_as_dead() {
+        // Codex's next-round finding: the prior round's fix answered a *bare* typed
+        // constant's own unsignedness from `UnsignedConstScopes`, but a *qualified*
+        // reference to one — `bounds::HI`, `bounds` an inline `mod` this file itself
+        // declares — still answered `false` unconditionally, because `qualified` carried no
+        // unsignedness counterpart of its own. `_ if bounds::HI < bounds::ZERO => ..` — with
+        // `HI = 1u128 << 127` and `ZERO = 0`, both declared `u128` — stayed unresolved, and
+        // the dense `0..=2` window it guards went undetected. `MatchVisitor::qualified_unsigned`
+        // is `qualified`'s own mirror now, so `path_is_definitely_unsigned` can answer the
+        // same question for a qualified name that `UnsignedConstScopes` already answers for
+        // a bare one.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod bounds {\n    pub const HI: u128 = 1u128 << 127;\n    \
+             pub const ZERO: u128 = 0;\n}\n\n\
+             const fn qualified_typed_constant_dead_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if bounds::HI < bounds::ZERO => 999,\n        \
+             _ => 3,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

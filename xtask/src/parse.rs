@@ -1945,6 +1945,12 @@ pub fn match_expressions_with_prefix(
         self_type_path: Vec::new(),
         trait_defaults: std::collections::HashMap::new(),
         qualified: external_qualified.clone(),
+        // `external_qualified` carries no unsignedness of its own — cross-file qualified
+        // constants are not this round's scope, the same narrowing `path_is_definitely_unsigned`'s
+        // own doc comment states for a qualified reference generally. Empty here declines
+        // rather than guesses; entries this file's own `mod` declarations add below still
+        // carry it.
+        qualified_unsigned: std::collections::HashMap::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -2062,6 +2068,10 @@ pub fn qualified_constants_with_prefix(
         self_type_path: Vec::new(),
         trait_defaults: std::collections::HashMap::new(),
         qualified,
+        // Same scope `match_expressions_with_prefix`'s own seed declines: cross-file
+        // qualified constants carry no unsignedness here, only the ones this file's own
+        // `mod` declarations add below.
+        qualified_unsigned: std::collections::HashMap::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -3332,30 +3342,48 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         syn::Expr::Const(expr_const) => evaluate_block(&expr_const.block, resolve),
         // [`evaluate_index`] holds the rationale for every indexable shape this folds.
         syn::Expr::Index(indexed) => evaluate_index(indexed, resolve),
-        // Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop` —
-        // an unusual but MSRV-legal way to spell a plain value inside a position that must
-        // itself be an expression — which fell to the wildcard `_ => None` case below, the
-        // const-call, array and macro backstops all included, since a loop is none of
-        // those. Scoped to exactly the one shape that is knowably total without
-        // interpreting control flow at all: the body must hold exactly one statement, an
-        // unlabelled `break` expression carrying a value. Anything else — a conditional
-        // break, a loop that never breaks, one breaking more than once, a labelled break
-        // aimed at an outer loop — stays unresolved rather than guessed at, since deciding
-        // which of several possible breaks would fire first is exactly the kind of
-        // control-flow interpretation this scan does not attempt.
-        syn::Expr::Loop(expr_loop) => {
-            let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] =
-                expr_loop.body.stmts.as_slice()
-            else {
-                return None;
-            };
-            if break_expr.label.is_some() {
-                return None;
-            }
-            literal_or_const_value(break_expr.expr.as_ref()?, resolve)
-        }
+        // [`evaluate_loop`] holds the rationale for the one loop shape this folds.
+        syn::Expr::Loop(expr_loop) => evaluate_loop(expr_loop, resolve),
         _ => None,
     }
+}
+
+/// `expr_loop`'s own value, for the one shape this scan folds without interpreting control
+/// flow at all — factored out of [`literal_or_const_value`]'s own `Expr::Loop` case to keep
+/// that function under clippy's line count.
+///
+/// Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop` — an
+/// unusual but MSRV-legal way to spell a plain value inside a position that must itself be
+/// an expression — which fell to the wildcard `_ => None` case, the const-call, array and
+/// macro backstops all included, since a loop is none of those. Scoped to exactly the one
+/// shape that is knowably total without interpreting control flow at all: the body must hold
+/// exactly one statement, an unlabelled `break` expression carrying a value. Anything else —
+/// a conditional break, a loop that never breaks, one breaking more than once, a labelled
+/// break aimed at an outer loop — stays unresolved rather than guessed at, since deciding
+/// which of several possible breaks would fire first is exactly the kind of control-flow
+/// interpretation this scan does not attempt.
+///
+/// Codex's next-round finding: refusing *every* labelled break is stricter than the
+/// control-flow question this case actually needs to decide. `'done: loop { break 'done 0
+/// };` labels both the loop and its own break with the identical name — the break targets
+/// *this* loop, not some outer one this scan would have to interpret control flow to find —
+/// so it is exactly as total as the unlabelled shape, and `rustc` folds it to the same `0`.
+/// Only a break naming a *different* label (an outer loop's) is the real ambiguity this case
+/// exists to decline; compared by the label's own identifier, the same way two lifetimes are
+/// compared everywhere else in this scan.
+fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i128> {
+    let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] = expr_loop.body.stmts.as_slice() else {
+        return None;
+    };
+    let targets_this_loop = match (&break_expr.label, expr_loop.label.as_ref()) {
+        (None, _) => true,
+        (Some(break_label), Some(loop_label)) => break_label.ident == loop_label.name.ident,
+        (Some(_), None) => false,
+    };
+    if !targets_this_loop {
+        return None;
+    }
+    literal_or_const_value(break_expr.expr.as_ref()?, resolve)
 }
 
 /// [`literal_or_const_value`]'s own value for `expr_match`, once its scrutinee resolves
@@ -4144,17 +4172,105 @@ fn resolve_qualified_path(
     qualified.get(&tail.join("::")).copied()
 }
 
-/// `path`'s own value: [`resolve_qualified_path_via_map`]'s answer, when it has one, and
-/// [`well_known_integer_bound`] otherwise.
-///
-/// Codex's next-round finding: a local `mod u8 { pub const MIN: u8 = 0; .. }` shadows the
-/// primitive `u8` exactly as any other module shadows an ambient name, and Rust resolves
-/// `u8::MIN` written inside it to the module's own constant — but an earlier version of this
-/// function checked [`well_known_integer_bound`] *before* ever consulting `qualified` at
-/// all, so the primitive's own bound answered first regardless of what the source actually
-/// declared. Tried only once [`resolve_qualified_path_via_map`] has already failed, so a
-/// real declaration always wins and the primitive is answered only when nothing shadows it —
-/// the same reordering [`resolve_pattern_path`] gets for the identical reason.
+/// [`resolve_qualified_path`]'s own answer for whether the entry it found — the *same* one,
+/// at the *same* key, searched in the identical relative-then-joined-then-tail order — is
+/// one `qualified_unsigned` marks unsigned. Every `qualified.get` this mirrors is gated on
+/// the identical `qualified.contains_key` here, so this never reports on a key
+/// `resolve_qualified_path` itself would not have used to answer the value: a `relative` key
+/// present only in `qualified_unsigned` and not in `qualified` — which never happens given
+/// the two are inserted together, but this reads defensively rather than trusting that — is
+/// not consulted ahead of a `joined` key `resolve_qualified_path` would have found first.
+fn resolve_qualified_unsigned(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    qualified_unsigned: &std::collections::HashMap<String, bool>,
+    current_module: &[String],
+) -> bool {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let is_crate_absolute = segments.first().map(String::as_str) == Some("crate");
+    let relevant: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .skip_while(|segment| *segment == "crate" || *segment == "self")
+        .collect();
+    let Some(super_count) = (relevant.len() >= 2).then(|| {
+        relevant
+            .iter()
+            .take_while(|segment| **segment == "super")
+            .count()
+    }) else {
+        return false;
+    };
+    let Some(rest) = relevant.get(super_count..) else {
+        return false;
+    };
+    if rest.len() < 2 {
+        return false;
+    }
+    let joined = rest.join("::");
+    if !is_crate_absolute {
+        let pop = super_count.min(current_module.len());
+        if let Some(effective_module) = current_module.get(..current_module.len() - pop) {
+            if !effective_module.is_empty() {
+                let relative = format!("{}::{joined}", effective_module.join("::"));
+                if qualified.contains_key(&relative) {
+                    return qualified_unsigned.get(&relative).copied().unwrap_or(false);
+                }
+            }
+        }
+    }
+    if qualified.contains_key(&joined) {
+        return qualified_unsigned.get(&joined).copied().unwrap_or(false);
+    }
+    let tail_start = rest.len().saturating_sub(2);
+    let Some(tail) = rest.get(tail_start..) else {
+        return false;
+    };
+    let tail_key = tail.join("::");
+    qualified.contains_key(&tail_key) && qualified_unsigned.get(&tail_key).copied().unwrap_or(false)
+}
+
+/// [`resolve_qualified_unsigned`]'s own [`resolve_qualified_path_at_any_depth`]: the same
+/// depth search, re-run to find which depth's `combined_module` is the one
+/// [`resolve_qualified_path`] itself would answer from, and [`resolve_qualified_unsigned`]'s
+/// answer at that exact depth — never a different one, which is what would happen were this
+/// to search `qualified_unsigned` independently rather than re-deriving the depth the value
+/// search itself settled on.
+fn resolve_qualified_unsigned_at_any_depth(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    qualified_unsigned: &std::collections::HashMap<String, bool>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+) -> bool {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined_module = module_path.to_vec();
+        combined_module.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined_module.extend(prefix.iter().cloned());
+        }
+        if resolve_qualified_path(path, qualified, &combined_module).is_some() {
+            return resolve_qualified_unsigned(
+                path,
+                qualified,
+                qualified_unsigned,
+                &combined_module,
+            );
+        }
+    }
+    if !(function_path.is_empty() && block_path.is_empty())
+        && resolve_qualified_path(path, qualified, module_path).is_some()
+    {
+        return resolve_qualified_unsigned(path, qualified, qualified_unsigned, module_path);
+    }
+    false
+}
+
 /// `name`'s value at the module `levels_up` ancestors above the current one — `0` for the
 /// current module (`self::NAME`), `1` for its parent (`super::NAME`), and so on.
 ///
@@ -4336,6 +4452,9 @@ struct ResolutionContext<'a> {
     /// [`UnsignedConstScopes`]'s own mirror of `scopes` — [`path_is_definitely_unsigned`]'s
     /// bare-identifier case, the way `scopes` is [`resolve_pattern_path`]'s.
     scopes_unsigned: &'a UnsignedConstScopes,
+    /// `qualified`'s own unsignedness mirror — [`path_is_definitely_unsigned`]'s qualified
+    /// case, the way `scopes_unsigned` is its bare-identifier one.
+    qualified_unsigned: &'a std::collections::HashMap<String, bool>,
 }
 
 /// `path`'s own value against `qualified`, searched at every depth a bare or qualified
@@ -4560,29 +4679,68 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
 /// [`resolve_pattern_path`] performs but answering the question that function cannot: not
 /// what the constant equals, but which domain its own declaration names.
 ///
-/// Scoped to the two shapes this scan can answer without guessing: a bare name, searched
-/// through [`ConstScopes`]'s own shadowing order via [`UnsignedConstScopes`]'s identical
-/// stack; and a well-known associated bound (`u128::MAX`), whose declaring type is the
-/// path's own first segment and needs no scope at all. A qualified reference to a constant
-/// declared in another module (`indices::HI`) is not attempted — [`ConstScopes`]'s value-only
-/// map has a companion here, but the qualified map [`resolve_qualified_path`] searches does
-/// not yet — and answers `false`, the same safe default an unresolved bare name gets:
+/// Scoped to the shapes this scan can answer without guessing: a bare name, searched through
+/// [`ConstScopes`]'s own shadowing order via [`UnsignedConstScopes`]'s identical stack; a
+/// module-qualified name declared in this file's own tree, searched the identical way
+/// [`resolve_qualified_path_at_any_depth`] searches for its value, via
+/// [`resolve_qualified_unsigned_at_any_depth`]'s mirror; and a well-known associated bound
+/// (`u128::MAX`), whose declaring type is the path's own first segment and needs no scope at
+/// all — tried last, and only once the qualified search has found no real declaration, the
+/// identical ordering [`resolve_qualified_path_at_any_depth`] itself uses for the same
+/// reason. A qualified reference resolved from *outside* this file's own tree — a cross-file
+/// `external_qualified` seed neither entry point threads unsignedness through — is not
+/// attempted, and answers `false`, the same safe default an unresolved bare name gets:
 /// declining to fold an ordering guard is always sound, where guessing it is unsigned when
 /// it might not be is not.
+///
+/// Codex's next-round finding: a qualified local constant (`bounds::HI`, `bounds` an inline
+/// `mod` this file itself declares) answered `false` unconditionally, because `qualified`
+/// carried a value for it but nothing here had a way to ask whether that value's own
+/// declaration was unsigned — `path.get_ident()` is `None` for a multi-segment path, so
+/// every qualified reference fell straight to the well-known-bound check, which answers only
+/// for an *unqualified* primitive member. `MatchVisitor::qualified_unsigned` is `qualified`'s
+/// own mirror now, inserted at the identical key everywhere `qualified` itself gains one.
 fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) -> bool {
     if let Some(ident) = path.get_ident() {
         return ctx.scopes_unsigned.resolve(&ident_name(ident));
+    }
+    if resolve_qualified_unsigned_at_any_depth(
+        path,
+        ctx.qualified,
+        ctx.qualified_unsigned,
+        ctx.module_path,
+        ctx.function_path,
+        ctx.block_path,
+    ) {
+        return true;
     }
     let segments: Vec<String> = path
         .segments
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    if let [type_name, member] = segments.as_slice() {
-        return matches!(type_name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")
-            && well_known_integer_bound(type_name, member).is_some();
+    let [type_name, member] = segments.as_slice() else {
+        return false;
+    };
+    if !matches!(type_name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128") {
+        return false;
     }
-    false
+    // A real declaration anywhere in the depth search above — even one that turned out to
+    // be signed, or unsigned but already answered `true` and returned before here — must
+    // still win over the primitive's own bound, exactly as [`resolve_qualified_path_at_any_depth`]'s
+    // own fallback only answers once its whole search has failed to find *any* declaration.
+    if resolve_qualified_path_at_any_depth(
+        path,
+        ctx.qualified,
+        ctx.module_path,
+        ctx.function_path,
+        ctx.block_path,
+    )
+    .is_some()
+    {
+        return false;
+    }
+    well_known_integer_bound(type_name, member).is_some()
 }
 
 /// `trait_name`'s own default associated constants, found by the identical
@@ -4817,6 +4975,10 @@ struct MatchVisitor {
     /// `impl_const_exprs` only ever read what the impl's own item list redeclared.
     trait_defaults: std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
     qualified: std::collections::HashMap<String, i128>,
+    /// [`qualified`]'s own mirror of which of its entries are declared unsigned — the
+    /// module-qualified twin of [`Self::scopes_unsigned`], inserted at the identical key
+    /// every time `qualified` itself gains one.
+    qualified_unsigned: std::collections::HashMap<String, bool>,
     found: Vec<FoundMatch>,
 }
 
@@ -4869,10 +5031,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let mut key_path = self.module_path.clone();
         key_path.extend(self.function_path.iter().cloned());
         key_path.extend(self.block_path.iter().cloned());
+        let unsigned_names = item_const_unsigned(items);
         let scope = resolve_scope_consts(
             &OwnConsts {
                 exprs: &item_const_exprs(items),
-                unsigned: &item_const_unsigned(items),
+                unsigned: &unsigned_names,
             },
             &OuterScopes {
                 values: &self.scopes,
@@ -4886,11 +5049,20 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         key_path.push(ident_name(&node.ident));
         self.module_path.push(ident_name(&node.ident));
         for (name, value) in &scope {
-            self.qualified
-                .insert(format!("{}::{name}", key_path.join("::")), *value);
+            let key = format!("{}::{name}", key_path.join("::"));
+            self.qualified.insert(key.clone(), *value);
+            // Codex's next-round finding: `path_is_definitely_unsigned` answered `false`
+            // for every *qualified* reference, a local module's own constant
+            // (`bounds::HI`) included, because `qualified` carried no unsignedness
+            // counterpart at all — only `scopes_unsigned` did, for the bare-name case.
+            // Inserted at the identical key `qualified` itself just gained, so
+            // [`resolve_qualified_unsigned`] can answer the same question `resolve_qualified_path`
+            // does, for the same declaration.
+            self.qualified_unsigned
+                .insert(key, unsigned_names.get(name).copied().unwrap_or(false));
         }
         self.scopes.0.push(scope);
-        self.scopes_unsigned.0.push(item_const_unsigned(items));
+        self.scopes_unsigned.0.push(unsigned_names);
         self.use_scopes.0.push(item_use_imports(items));
         self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
@@ -5177,6 +5349,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 block_path: &self.block_path,
                 self_type_path: &self.self_type_path,
                 scopes_unsigned: &self.scopes_unsigned,
+                qualified_unsigned: &self.qualified_unsigned,
             };
             let resolve_value = |path: &syn::Path| resolve_pattern_path(path, &ctx);
             let resolve_unsigned = |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
@@ -5277,6 +5450,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             block_path: &self.block_path,
             self_type_path: &self.self_type_path,
             scopes_unsigned: &self.scopes_unsigned,
+            qualified_unsigned: &self.qualified_unsigned,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
@@ -5383,6 +5557,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             block_path: &self.block_path,
             self_type_path: &self.self_type_path,
             scopes_unsigned: &self.scopes_unsigned,
+            qualified_unsigned: &self.qualified_unsigned,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
