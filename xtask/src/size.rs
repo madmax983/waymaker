@@ -3401,52 +3401,153 @@ fn skip_leading_generic_params(text: &str) -> &str {
 /// round 3 found it, in the same one-line form round 1's finding was about.
 ///
 /// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
-/// attribute — and a bracket inside an *ordinary* string literal is not a bracket, so
-/// `#[expect(lint, reason = "]")]` is one too. Codex round 4 found the version that read
-/// every `]` as syntax and left the classifier standing on `")]` rather than on the item.
+/// attribute. A bracket or a quote inside a literal is not syntax, so the scan reads each
+/// literal by its own rule: an ordinary string ends at the next unescaped `"`; a raw string
+/// — `r`, zero or more `#`, then `"` — ends only at a `"` followed by that same number of
+/// `#`; and a character literal — one character or one escape between two `'` — is told
+/// apart from a lifetime by that closing `'`, so `impl<'a>` still reads as a lifetime.
+/// Rounds 4 and 6 found the ordinary-string and the raw-string gaps; #108 is the second.
 ///
-/// Two literal forms are outside it, and both leave the item **unclassified** rather than
-/// reporting a private function as public — the direction that under-reports. A `']'`
-/// *character* literal, because telling one from the lifetime in
-/// `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. And a *raw* string,
-/// because `"` both opens and closes here: `#[doc = r#"a"]b"#]` is read as ending at the
-/// quote inside it. Codex round 6 found that one, and it is issue #108.
-///
-/// Three rounds have now landed on this function, each closing one construct and leaving
-/// the next. What closes the class is lexing the attribute rather than scanning it, which
-/// is #108's own point; this reads what a reviewer can check by eye.
+/// An attribute the scan cannot finish — an unclosed bracket, string, raw string or
+/// character literal — leaves `line` untouched, so its item stays unclassified rather than
+/// being reported as public. Under-reporting is the safe direction.
 pub(crate) fn without_leading_attributes(line: &str) -> &str {
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix("#[") {
-        let mut depth = 1_u32;
-        let mut quoted = false;
-        let mut escaped = false;
-        let mut end = None;
-        for (index, character) in after.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match character {
-                '\\' if quoted => escaped = true,
-                '"' => quoted = !quoted,
-                '[' if !quoted => depth = depth.saturating_add(1),
-                ']' if !quoted => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(index.saturating_add(1));
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end.and_then(|end| after.get(end..)) else {
+        let Some(end) = attribute_body_end(after) else {
             return rest;
         };
-        rest = end.trim_start();
+        rest = after.get(end..).unwrap_or("").trim_start();
     }
     rest
+}
+
+/// Byte offset in `body` just past an attribute body's closing `]`, given the text after
+/// its opening `#[`.
+///
+/// `None` when a bracket, string, raw string or character literal never closes — the
+/// caller then leaves the line as it found it.
+fn attribute_body_end(body: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = body.char_indices().collect();
+    let mut depth = 1_u32;
+    let mut index = 0_usize;
+    let mut after_ident = false;
+    while let Some(&(byte, character)) = chars.get(index) {
+        match character {
+            '"' => {
+                index = skip_ordinary_string(&chars, index)?;
+                after_ident = false;
+                continue;
+            }
+            'r' if !after_ident => {
+                if let Some((quote, hashes)) = raw_string_open(&chars, index) {
+                    index = skip_raw_string(&chars, quote, hashes)?;
+                    after_ident = false;
+                    continue;
+                }
+            }
+            '\'' => {
+                if let Some(next) = char_literal_end(&chars, index) {
+                    index = next;
+                    after_ident = false;
+                    continue;
+                }
+            }
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(byte.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+        after_ident = character.is_alphanumeric() || character == '_';
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+/// Index in `chars` just past an ordinary string's closing `"`.
+///
+/// `open` is the index of the opening `"`. `\` protects the character after it, the same
+/// rule an ordinary string uses and a raw string never does.
+fn skip_ordinary_string(chars: &[(usize, char)], open: usize) -> Option<usize> {
+    let mut index = open.saturating_add(1);
+    loop {
+        match chars.get(index)?.1 {
+            '\\' => index = index.saturating_add(2),
+            '"' => return Some(index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+}
+
+/// Whether `chars[start]` is the `r` of a raw string — `r`, zero or more `#`, then `"`.
+///
+/// Returns the opening `"`'s index and the hash count. `start` must not follow an
+/// identifier character, which the caller checks: an `r` inside a word is not a prefix.
+fn raw_string_open(chars: &[(usize, char)], start: usize) -> Option<(usize, usize)> {
+    let mut index = start.saturating_add(1);
+    let mut hashes = 0_usize;
+    while chars
+        .get(index)
+        .is_some_and(|&(_, character)| character == '#')
+    {
+        hashes = hashes.saturating_add(1);
+        index = index.saturating_add(1);
+    }
+    (chars.get(index)?.1 == '"').then_some((index, hashes))
+}
+
+/// Index in `chars` just past a raw string's closing `"` and its matching `#` run.
+///
+/// `quote` is the opening `"`'s index and `hashes` is the count after it. The close is the
+/// first `"` followed by that many `#` — the rule the compiler itself uses, so a raw
+/// string opened with two hashes may still hold a bare `"#`, one hash, as plain content.
+fn skip_raw_string(chars: &[(usize, char)], quote: usize, hashes: usize) -> Option<usize> {
+    let mut index = quote.saturating_add(1);
+    loop {
+        if chars.get(index)?.1 == '"' {
+            let mut close = index.saturating_add(1);
+            let mut matched = 0_usize;
+            while matched < hashes && chars.get(close).is_some_and(|&(_, c)| c == '#') {
+                matched = matched.saturating_add(1);
+                close = close.saturating_add(1);
+            }
+            if matched == hashes {
+                return Some(close);
+            }
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+/// Index in `chars` just past a character literal's closing `'`, if `chars[quote]` opens
+/// one.
+///
+/// `None` for a lifetime: `'a` is a literal only when a `'` closes it within the next few
+/// characters, which is the one look-ahead that tells `'a'` from `impl<'a>` with no token
+/// boundary to read. Bounded so a stray `'` cannot run the scan to the end of the line.
+fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
+    let mut index = quote.saturating_add(1);
+    let first = chars.get(index)?.1;
+    if first == '\'' {
+        return None;
+    }
+    index = index.saturating_add(1);
+    if first == '\\' {
+        while chars
+            .get(index)
+            .is_some_and(|&(_, character)| character != '\'')
+        {
+            index = index.saturating_add(1);
+            if index > quote.saturating_add(12) {
+                return None;
+            }
+        }
+    }
+    (chars.get(index)?.1 == '\'').then_some(index.saturating_add(1))
 }
 
 /// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.

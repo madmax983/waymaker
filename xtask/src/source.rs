@@ -11370,6 +11370,46 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_quote_inside_a_raw_string_is_not_the_end_of_the_string() {
+        // Codex round 6, issue #108. `"` opens and closes an ordinary string, but a raw
+        // string ends only at `"` plus its own hash count. `r#"a"]b"#]` read as ending at
+        // the quote inside it, so the scan landed on `b"#] #[rustfmt::skip] impl` and never
+        // reached the real item.
+        let fixture = "#[doc = r#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_bracket_inside_a_raw_string_survives_any_hash_count() {
+        // A reader that only knows one hash is the obvious half-fix. Zero hashes and two
+        // hashes must both close on a real raw-string rule — first quote for zero hashes,
+        // first quote plus the matching hash run for two — and not on a quote-toggle that
+        // treats a backslash as an escape, which a raw string never does.
+        let no_hash = "#[doc = r\"a\\\"] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(no_hash).contains(&"raw".to_owned()), "{no_hash}");
+        let two_hash = "#[doc = r##\"a\\\"##] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(two_hash).contains(&"raw".to_owned()), "{two_hash}");
+    }
+
+    #[test]
+    fn a_raw_string_closes_on_its_own_hash_count_not_on_any_quote_hash_pair() {
+        // Separates "count the hashes" from "look for any `\"#`". A raw string opened
+        // with two hashes may hold a bare `"#` — one hash — as plain content.
+        let fixture = "#[doc = r##\"a\"#b\"##] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_bracket_inside_a_character_literal_is_not_the_end_of_the_attribute() {
+        // A `'…'` character literal is a fourth quoted state, and it must not be told
+        // apart from a lifetime by breaking `impl<'a>`. Issue #108.
+        let literal = "#[foo(bar = ']')] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(literal).contains(&"raw".to_owned()), "{literal}");
+        let lifetime = "#[foo(bar = \"x\")] impl<'a> Bank<'a> { pub fn raw() {} }\n";
+        assert!(counted(lifetime).contains(&"raw".to_owned()), "{lifetime}");
+    }
+
+    #[test]
     fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
         // The reader beside `public_functions` had the same blindness, and it is what
         // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
