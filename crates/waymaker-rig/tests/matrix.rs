@@ -2142,3 +2142,88 @@ fn resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cann
         dispatcher.entered
     );
 }
+
+/// `verify` does not report a reclaimed, superseded bank as one that lost its acknowledged
+/// records.
+///
+/// Distinct from [`after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig`]'s
+/// own `verify` check: that one crashes mid-swap and leaves the retiring bank intact, which
+/// `own_bank_journal` reads directly regardless of authority. This one drives the swap to
+/// completion and past it — §10 step 7, [`Installed::reclaim`] — so the retiring bank is
+/// erased media and `own_bank_journal` has nothing to read at all. `judge` still has to tell
+/// that apart from a part this run was never installed on.
+///
+/// [`Installed::reclaim`]: waymaker_flash::swap::Installed::reclaim
+#[test]
+fn verify_does_not_report_a_reclaimed_bank_as_having_lost_its_acknowledged_records() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(
+            0,
+            &mut metered,
+            &mut dispatcher,
+            &mut page,
+            ROLLOVER_EFFECTS_BEFORE,
+        ) else {
+            unreachable!("the fault-free prefix writes cleanly")
+        };
+    }
+
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let region = bank_a_region(&rig, &mut device, &mut page);
+    let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the rolled-over prefix")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    let Ok(()) = installed.reclaim() else {
+        unreachable!("a fault-free erase and barrier")
+    };
+
+    let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+        unreachable!("a judgeable part")
+    };
+    assert_eq!(
+        verdict.outcome(),
+        Outcome::Passed,
+        "the reclaimed bank's superseded history was reported lost: {verdict:?}"
+    );
+}

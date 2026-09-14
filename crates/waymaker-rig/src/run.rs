@@ -1742,8 +1742,17 @@ impl Rig {
         // walked whatever bank A held with no run-id check would read run `n - 1`'s journal
         // against run `n`'s declarations and report a §14 violation on a healthy board. An
         // uninstalled part is not a verdict about recovery — see [`uninstalled`].
+        //
+        // A single authoritative bank that is not `Self::BANK` names a second thing besides
+        // "not the bank to resume from": no crash and no ordinary `prepare` ever seals the
+        // *other* bank, so its presence is a swap having moved on, whether or not `Self::BANK`
+        // is still there to read — review found `own_bank_journal` answering `None` for this
+        // reason too, once §10 step 7 has reclaimed it, and the same false
+        // `LostAcknowledgedRecord` followed. `superseded` is that signal, kept apart from the
+        // run-id check above because it does not need `Self::BANK` to be readable at all.
+        let superseded = matches!(authority, bank::Authority::Bank { id, .. } if id != Self::BANK);
         let Some(region) = self.own_bank_journal(&mut engine, workload, page)? else {
-            return Ok(uninstalled(workload, progress, banks));
+            return Ok(uninstalled(workload, progress, banks, superseded));
         };
 
         let mut audit = Audit::new(workload, progress);
@@ -1807,25 +1816,30 @@ struct DispatchStep<'part, 'storage, S, D, C> {
     cutter: &'part mut C,
 }
 
-/// The verdict for a part this run was never installed on.
+/// The verdict for a part this run's own bank has nothing to show for.
 ///
 /// Nothing has been claimed about the run, so there is nothing recovery can have lost — but
 /// "nothing to audit" is not the same as "nothing to check", and the two things this does
 /// check are what keep it from being a hole the rig passes through.
 ///
-/// The witness is normalised rather than read. A [`Progress`] naming a *different* iteration
-/// is the previous run's, still on media because the reset landed before `prepare` erased the
-/// instrument, and on an uninstalled part that is the ordinary state rather than an
-/// instrument fault: it says nothing about this run, so this run is owed nothing. On an
-/// *installed* part the same witness is [`Breach::WitnessUnreadable`] and stays so, because
-/// `prepare` erases the instrument before it installs the bank — an installed part carrying
-/// the previous iteration's marks is an instrument that failed.
+/// The witness is normalised rather than read, and `superseded` and a *different* iteration
+/// are the two reasons it is: a [`Progress`] naming a different iteration is the previous
+/// run's, still on media because the reset landed before `prepare` erased the instrument, and
+/// `superseded` is this run's own having moved to a bank this call never reads — issue
+/// [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8, once §10 step 7 has
+/// reclaimed the bank that reached here. Both say the same thing about this run's own bank: it
+/// has nothing to say, which is the ordinary state rather than an instrument fault, so this
+/// run is owed nothing. Neither reason applies, and the witness carries marks anyway, on an
+/// *installed* part is [`Breach::WitnessUnreadable`] and stays so, because `prepare` erases the
+/// instrument before it installs the bank — an installed part carrying the previous
+/// iteration's marks is an instrument that failed.
 ///
 /// And the authority figure is zero rather than `banks`, which is the half that still bites.
 /// §14's `single-authority` asks about *this* run's authority, and a bank carrying another
 /// run's header is not it. So a rig that had begun marking a run — a witness with marks in it,
-/// or one torn mid-mark — on a part with no bank of its own is [`Breach::Authority`], which is
-/// what it is: records were being written into a journal this run does not own.
+/// or one torn mid-mark — on a part with no bank of its own, and not superseded, is
+/// [`Breach::Authority`], which is what it is: records were being written into a journal this
+/// run does not own.
 ///
 /// # Preconditions
 ///
@@ -1834,9 +1848,15 @@ struct DispatchStep<'part, 'storage, S, D, C> {
 /// report the one state [`Audit::finish`] exists to refuse as a pass whenever the witness is
 /// empty — a part prepared and not yet run — and would name the wrong number whenever it is
 /// not.
-const fn uninstalled(workload: Workload, progress: Progress, banks: usize) -> Verdict {
+const fn uninstalled(
+    workload: Workload,
+    progress: Progress,
+    banks: usize,
+    superseded: bool,
+) -> Verdict {
     let progress = match progress.iteration() {
         Some(other) if other != workload.iteration() => Progress::EMPTY,
+        _ if superseded => Progress::EMPTY,
         _ => progress,
     };
     let outcome = match Audit::new(workload, progress).finish(0) {
