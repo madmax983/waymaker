@@ -2725,6 +2725,18 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
         syn::BinOp::Le(_) => Some(i128::from(left <= right)),
         syn::BinOp::Gt(_) => Some(i128::from(left > right)),
         syn::BinOp::Ge(_) => Some(i128::from(left >= right)),
+        // Codex's next-round finding: `OFF && ON` — the logical operators, over two
+        // already-resolved `bool` constants — reached the same wildcard `_ => None` the
+        // comparison operators did before this same round's fix. This function's own
+        // caller already requires *both* operands to resolve before it is ever called
+        // (`literal_or_const_value`'s `Expr::Binary` case uses `?` on each), so the real
+        // short-circuit behaviour `&&`/`||` have in Rust — never evaluating a right side a
+        // left side already decided — is not reproduced here; that only makes this scan
+        // resolve fewer guards than `rustc` could, never the wrong value for one it does
+        // resolve, which is the same standing every other case here already has for what
+        // it declines to evaluate.
+        syn::BinOp::And(_) => Some(i128::from(left != 0 && right != 0)),
+        syn::BinOp::Or(_) => Some(i128::from(left != 0 || right != 0)),
         _ => None,
     }
 }
@@ -2927,6 +2939,13 @@ fn literal_or_const_value(
         // this resolves the index only far enough to bounds-check it against the
         // (separately resolved) repeat count, then evaluates that one shared element
         // expression rather than looking anything up positionally.
+        //
+        // Codex's next-round finding: `b"\x00"[0]` indexes a byte-string *literal*
+        // (`Expr::Lit` wrapping `syn::Lit::ByteStr`), a third indexable shape beside the
+        // two array literals above and the one this case's own bounds check does not
+        // apply to the same way — a byte string carries its own length in its bytes
+        // rather than in a separate `count` expression, so there is nothing to resolve
+        // before indexing, only a bounds check against that length.
         syn::Expr::Index(indexed) => {
             let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
             match indexed.expr.as_ref() {
@@ -2936,6 +2955,10 @@ fn literal_or_const_value(
                         usize::try_from(literal_or_const_value(&repeat.len, resolve)?).ok()?;
                     (index < len).then(|| literal_or_const_value(&repeat.expr, resolve))?
                 }
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::ByteStr(byte_str),
+                    ..
+                }) => byte_str.value().get(index).map(|&byte| i128::from(byte)),
                 _ => None,
             }
         }

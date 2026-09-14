@@ -18277,6 +18277,59 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_logically_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if OFF && ON => ..`, sitting between the numbered
+        // arms and the real wildcard, is exactly the dead code the comparison-guard fix
+        // this same round already prunes — but `evaluate_binary_op`'s own `match` had no
+        // arm for the logical operators `&&`/`||`, so `OFF && ON` fell to the wildcard
+        // `_ => None` and the guard stayed unresolved rather than provably `0`.
+        // `evaluate_binary_op` now folds both, over the same two already-resolved operand
+        // values every other operator here folds.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn logical_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst OFF: bool = false;\nconst ON: bool = true;\n\n\
+             const fn logical_dead_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => logical_dead_guard_helper(0),\n        \
+             1 => logical_dead_guard_helper(1),\n        2 => logical_dead_guard_helper(2),\n        \
+             _ if OFF && ON => 999,\n        _ => logical_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_indexed_into_a_byte_string_literal_is_reported() {
+        // Codex's next-round finding: `b"\x00"[0]` indexes a byte-string literal
+        // (`Expr::Lit` wrapping `syn::Lit::ByteStr`), a third indexable shape beside the
+        // array and repeat literals the two previous rounds already handled — which fell
+        // to the wildcard `_ => None` case in `literal_or_const_value` and left every such
+        // constant unresolved, the array-vocabulary ban included, since each declared
+        // constant's own type is a plain `u8`. The new arm reads the byte string's own
+        // bytes and bounds-checks the index against that length directly.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn byte_string_indexed_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = b\"\\x00\"[0];\n    const P1: u8 = b\"\\x01\"[0];\n    \
+             const P2: u8 = b\"\\x02\"[0];\n    const P3: u8 = b\"\\x03\"[0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
