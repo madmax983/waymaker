@@ -2623,41 +2623,79 @@ fn block_const_types(block: &syn::Block) -> std::collections::HashMap<String, St
         .collect()
 }
 
-/// The unevaluated initializer of every plain `let NAME = EXPR;` declared *directly* as a
-/// statement in `block`.
+/// The unevaluated initializer of every name a plain `let PATTERN = EXPR;` declared
+/// *directly* as a statement in `block` binds — every name [`destructured_binding`] finds in
+/// `PATTERN`, which may be more than one for an `@` binding.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let value = 0; value };` is exactly as
 /// resolvable as the local-`const` block [`evaluate_block`] already folds, but a `let`
 /// statement is not a local *item* at all (`syn::Stmt::Local`, not `syn::Stmt::Item`), so
 /// [`block_const_exprs`] never saw it and the block stayed unresolved — the const-call
-/// backstop does not catch it either, since a bare `let` is neither a call. Scoped
-/// narrowly, the same way a local `const`'s own initializer already is: the pattern must
-/// name exactly one identifier, with no destructuring and no `@` sub-pattern, and at most
-/// one layer of type ascription (`let value: u8 = 0;` is `Pat::Type` wrapping `Pat::Ident`,
-/// unwrapped here the same way this scan already unwraps a `Paren` or a `Group`); the
-/// initializer must be a plain `= EXPR` with no `let-else` diverge arm, whose value depends
-/// on a branch this scan does not evaluate. A `let mut` is not excluded — nothing in this
-/// narrow shape lets it be reassigned, since a bare assignment statement is neither this
-/// nor a local `const` item, and [`evaluate_block`]'s own statement-count check already
-/// refuses a block holding one.
+/// backstop does not catch it either, since a bare `let` is neither a call. The initializer
+/// must be a plain `= EXPR` with no `let-else` diverge arm, whose value depends on a branch
+/// this scan does not evaluate. A `let mut` is not excluded — nothing in this narrow shape
+/// lets it be reassigned, since a bare assignment statement is neither this nor a local
+/// `const` item, and [`evaluate_block`]'s own statement-count check already refuses a block
+/// holding one.
+///
+/// Codex's next-round finding: an `@` binding such as `let whole @ _ignored = 0u8;` binds
+/// *two* names to the identical value, and only one of them can be the single entry this
+/// function's own `filter_map` used to keep — whichever [`destructured_binding`] happened to
+/// return. Flattened instead: every name a pattern legally introduces is inserted, so a
+/// caller reading either the outer name or a name bound inside its sub-pattern finds it.
 fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn::Expr> {
     block
         .stmts
         .iter()
-        .filter_map(|stmt| {
+        .flat_map(|stmt| {
             let syn::Stmt::Local(local) = stmt else {
-                return None;
+                return Vec::new();
             };
             if has_cfg_test(&local.attrs) {
-                return None;
+                return Vec::new();
             }
-            let init = local.init.as_ref()?;
+            let Some(init) = local.init.as_ref() else {
+                return Vec::new();
+            };
             if init.diverge.is_some() {
-                return None;
+                return Vec::new();
             }
             destructured_binding(&local.pat, &init.expr)
         })
         .collect()
+}
+
+/// The count of every plain `let PATTERN = EXPR;` statement declared *directly* in `block`
+/// whose pattern [`destructured_binding`] finds at least one name in — the statement-counted
+/// twin of [`block_let_exprs`]'s own flattened, name-counted map.
+///
+/// Codex's next-round finding: once [`destructured_binding`] could return more than one name
+/// for a single `@`-bound statement, [`block_let_exprs`]'s own `len()` stopped being a
+/// statement count — a `let whole @ _ignored = 0u8;` contributes two entries from one
+/// statement, and [`evaluate_block`]'s own `rest.len()` check compares against the number of
+/// *statements* `block.stmts` actually holds. This is that count instead, scoped the
+/// identical way `block_let_exprs` itself is filtered, so the two stay in lock-step with
+/// what each one is really counting.
+fn block_let_statement_count(block: &syn::Block) -> usize {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return false;
+            };
+            if has_cfg_test(&local.attrs) {
+                return false;
+            }
+            let Some(init) = local.init.as_ref() else {
+                return false;
+            };
+            if init.diverge.is_some() {
+                return false;
+            }
+            !destructured_binding(&local.pat, &init.expr).is_empty()
+        })
+        .count()
 }
 
 /// `pat`'s own bound name and the value `expr` initializes it to, unwrapping a type
@@ -2691,29 +2729,43 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
 /// `is_wildcard` looks for — so the statement went uncounted anywhere and the whole block
 /// read as unresolved. This function now recurses into the sub-pattern against the same
 /// `expr` an outer bare identifier would have bound to, the same way it already recurses
-/// into a one-element tuple's own inner pattern; the outer name itself (`_whole`) is not
-/// separately recorded, since this function returns one binding per call and a name meant
-/// to be discarded is the far more common shape of an `@` binding used only to destructure.
-fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Option<(String, syn::Expr)> {
+/// into a one-element tuple's own inner pattern.
+///
+/// Codex's next-round finding: `let whole @ _ignored = 0u8; whole;` names the identical `@`
+/// shape with the *outer* name referenced instead of the inner one — this function recorded
+/// only the sub-pattern's own binding (`_ignored`), on the reasoning that a name meant to be
+/// discarded is the far more common shape of an `@` binding used only to destructure, but
+/// Rust does not care which of the two a caller goes on to read, and the outer name is a
+/// real binding exactly as much as the inner one is. Every binding a pattern legally
+/// introduces is now returned, not one: an `@` pattern yields the outer name *and* whatever
+/// its sub-pattern yields, and a pattern binding no name at all (`_`, or an unrecognised
+/// shape) yields none. [`block_let_exprs`] flattens every call's own bindings into its map
+/// instead of keeping one entry per statement, and [`block_let_statement_count`] is the
+/// statement-counting half [`evaluate_block`]'s own `rest.len()` check now reads instead of
+/// counting binding names, since one statement can bind more than one name.
+fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::Expr)> {
     match pat {
         syn::Pat::Type(pat_type) => destructured_binding(&pat_type.pat, expr),
-        syn::Pat::Ident(ident) if ident.subpat.is_none() => {
-            Some((ident_name(&ident.ident), expr.clone()))
-        }
         syn::Pat::Ident(ident) => {
-            let (_, subpat) = ident.subpat.as_ref()?;
-            destructured_binding(subpat, expr)
+            let mut bindings = vec![(ident_name(&ident.ident), expr.clone())];
+            if let Some((_, subpat)) = &ident.subpat {
+                bindings.extend(destructured_binding(subpat, expr));
+            }
+            bindings
         }
         syn::Pat::Tuple(pat_tuple) if pat_tuple.elems.len() == 1 => {
             let syn::Expr::Tuple(expr_tuple) = strip_parens(expr) else {
-                return None;
+                return Vec::new();
             };
             if expr_tuple.elems.len() != 1 {
-                return None;
+                return Vec::new();
             }
-            destructured_binding(pat_tuple.elems.first()?, expr_tuple.elems.first()?)
+            match (pat_tuple.elems.first(), expr_tuple.elems.first()) {
+                (Some(inner_pat), Some(inner_expr)) => destructured_binding(inner_pat, inner_expr),
+                _ => Vec::new(),
+            }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -3425,6 +3477,7 @@ fn resolved_local_name(
 
 fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let mut locals = block_const_exprs(block);
+    let const_item_count = locals.len();
     let lets = block_let_exprs(block);
     let combined_len = locals.len() + lets.len();
     for (name, expr) in lets {
@@ -3452,7 +3505,16 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
         .filter(|stmt| !stmt_is_cfg_test(stmt))
         .collect();
     let (tail, rest) = production_stmts.split_last()?;
-    if rest.len() != locals.len() + ignored_lets {
+    // Codex's next-round finding: `locals.len()` used to double as both "how many names are
+    // bound" and "how many statements bound them", which `destructured_binding` returning
+    // more than one name for a single `@`-bound `let` statement broke — a `let
+    // whole @ _ignored = 0u8;` is one statement contributing two entries, so comparing
+    // `rest.len()` (a statement count) against `locals.len()` (a name count) would refuse a
+    // block this shape appears in even though every statement is accounted for.
+    // `block_let_statement_count` is the statement count `block_let_exprs`'s own name count
+    // stopped being; `const_item_count` is unaffected, since a `const` item never binds more
+    // than one name.
+    if rest.len() != const_item_count + block_let_statement_count(block) + ignored_lets {
         return None;
     }
     let syn::Stmt::Expr(tail_expr, None) = tail else {

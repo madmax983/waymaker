@@ -21048,6 +21048,38 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_outer_name_lets_is_reported() {
+        // Codex's next-round finding: the earlier `@`-binding fix recursed only into the
+        // sub-pattern of `let _whole @ (x,) = ...;`, discarding the *outer* name — sound for
+        // that reproduction, where the tail referenced `x` rather than `_whole`, but wrong in
+        // general: `let whole @ _ignored = 0u8; whole` references the *outer* binding, which
+        // `destructured_binding` never recorded, so the constant stayed unresolved and the
+        // whole block read as unresolved with it. `destructured_binding` now returns every
+        // name a pattern legally binds — the outer name of an `@` pattern and whatever its
+        // sub-pattern binds — rather than one, and `block_let_exprs` flattens all of them
+        // into its map; `block_let_statement_count` is the statement-counted twin
+        // `evaluate_block`'s own `rest.len()` check now reads, since one statement can bind
+        // more than one name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_outer_name_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let whole @ _ignored = 0u8; whole };\n    \
+             const P1: u8 = { let whole @ _ignored = 1u8; whole };\n    \
+             const P2: u8 = { let whole @ _ignored = 2u8; whole };\n    \
+             const P3: u8 = { let whole @ _ignored = 3u8; whole };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
