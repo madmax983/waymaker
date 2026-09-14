@@ -2048,9 +2048,10 @@ fn lit_value(lit: &syn::Lit) -> Option<i128> {
 }
 
 /// The name of `ty`, if it is a plain, unqualified single-segment type path (`u8`, `i32`,
-/// and so on, with no generic arguments) — the only shape [`apply_integer_cast`] can act
-/// on.
-fn integer_type_name(ty: &syn::Type) -> Option<String> {
+/// and so on, with no generic arguments) — the shape [`apply_integer_cast`] acts on, and
+/// the shape a `<Type as Trait>::NAME` pattern's own `Type` needs to be for
+/// [`resolve_qself_associated_const`] to find what it was implemented for.
+fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
     let syn::Type::Path(type_path) = ty else {
         return None;
     };
@@ -2078,7 +2079,7 @@ fn integer_type_name(ty: &syn::Type) -> Option<String> {
 /// returns `None`, never the operand unchanged, because passing an unevaluated cast
 /// through is exactly the bug being fixed.
 fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
-    let name = integer_type_name(ty)?;
+    let name = single_segment_type_name(ty)?;
     let (width, signed): (u32, bool) = match name.as_str() {
         "u8" => (8, false),
         "u16" => (16, false),
@@ -2209,6 +2210,30 @@ fn literal_or_const_value(
 /// `None` for a wildcard, a wider range, a tuple, or anything else a dense table's patterns
 /// are not, and for a binding that names no known constant — that is
 /// [`is_catchall_pattern`]'s question, not this one's.
+/// `<Type as Trait>::NAME`'s own value, when `Type` is a plain single-segment type this
+/// scan has indexed a trait-associated (or inherent) constant under — the qualified-self
+/// half of [`pattern_literal`]'s `Pat::Path` case, for a pattern `syn` gives a `qself`.
+///
+/// Codex's finding: a `syn::PatPath`'s own `qself` was never read at all, so a
+/// `<u8 as Indices>::P0`-style pattern's `path` field (`Indices::P0` — the *trait's* own
+/// path, plus the member) was resolved as though it were an ordinary module-qualified
+/// reference, looking for a module literally named `Indices`. `visit_item_impl` indexes
+/// a trait impl's own associated constants the same way it already does an inherent
+/// impl's — under the *implementing type's* own name (`u8::P0`), which is also the
+/// unqualified spelling Rust itself accepts when the trait is unambiguous — so this
+/// builds that same key from the qself's own type and the path's last segment, and asks
+/// `resolve` the ordinary multi-segment question of it.
+fn resolve_qself_associated_const(
+    qself: &syn::QSelf,
+    path: &syn::Path,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let type_name = single_segment_type_name(&qself.ty)?;
+    let member = ident_name(&path.segments.last()?.ident);
+    let synthetic = syn::parse_str::<syn::Path>(&format!("{type_name}::{member}")).ok()?;
+    resolve(&synthetic)
+}
+
 fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i128>) -> Vec<i128> {
     match pattern {
         syn::Pat::Lit(literal) => lit_value(&literal.lit).into_iter().collect(),
@@ -2222,7 +2247,31 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             // the same way any other pattern here is, recursively.
             Some((_, subpat)) => pattern_literal(subpat, resolve),
         },
-        syn::Pat::Path(path) => resolve(&path.path).into_iter().collect(),
+        // Codex's finding: `<u8 as Indices>::P0` is a trait-associated constant, and
+        // this arm used to resolve `path.path` alone — `Indices::P0`, the *trait's* own
+        // path plus the member — as though it were an ordinary module-qualified
+        // reference, ignoring `path.qself` (the `<u8 as ..>` half) entirely. A module
+        // named `Indices` is never what this scan indexes, so every such arm read as
+        // unresolved. [`resolve_qself_associated_const`] is the qualified-self half.
+        syn::Pat::Path(path) => path.qself.as_ref().map_or_else(
+            || resolve(&path.path).into_iter().collect(),
+            |qself| {
+                resolve_qself_associated_const(qself, &path.path, resolve)
+                    .into_iter()
+                    .collect()
+            },
+        ),
+        // Codex's finding: `0..=1` covers two values, not one, and `rustc` still lowers
+        // a match spelling a range that way to the identical indexed table a
+        // one-value-per-arm spelling gets — this used to accept only a *singleton*
+        // closed range (`start == end`) and return nothing for any wider one, on the
+        // reasoning that a half-open range's own singleton-ness needs the pattern's real
+        // type's successor function to check. Widening a *closed* range needs no such
+        // thing: `start..=end` is exactly the consecutive integers from `start` to `end`
+        // in this scan's own `i128` representation, regardless of what the pattern's
+        // real type is, so every value in that span is generated directly. Still scoped
+        // to closed ranges alone — a half-open range (`0..2`) is left unresolved, the
+        // same standing it already had.
         syn::Pat::Range(range) if matches!(range.limits, syn::RangeLimits::Closed(_)) => {
             let Some(start) = range
                 .start
@@ -2238,11 +2287,16 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             else {
                 return Vec::new();
             };
-            if start == end {
-                vec![start]
-            } else {
-                Vec::new()
+            // Bounded before it is generated: a span too wide to fit a `usize`, or one
+            // whose width cannot even be computed, is not a dense table any real
+            // integer pattern could name, and is refused rather than attempted.
+            let fits = end
+                .checked_sub(start)
+                .is_some_and(|span| usize::try_from(span).is_ok());
+            if start > end || !fits {
+                return Vec::new();
             }
+            (start..=end).collect()
         }
         // Codex's finding: a reference pattern (`&0`) is exactly as singleton a value as
         // its own referent, over a scrutinee that is itself a reference — a shape a dense
@@ -2769,11 +2823,8 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         // Codex's finding: `Indices::P0` is an associated constant, not a module-qualified
         // one, and nothing here had ever read an `impl` block's own `const` items. Scoped
-        // to the shape the finding names and no wider: an inherent `impl` (no `trait_`,
-        // since a trait impl's own consts can come from the trait's default and this scan
-        // has no notion of one) over a plain, single-segment `Self` type — `impl some::Path
-        // { .. }` names no known type this way and is left unrecorded rather than guessed
-        // at.
+        // to a plain, single-segment `Self` type: `impl some::Path { .. }` names no known
+        // type this way and is left unrecorded rather than guessed at.
         //
         // Codex's next-round finding: `impl<T> Indices<T> { .. }` was excluded by requiring
         // the one segment to carry no generic arguments at all, even though a caller
@@ -2781,18 +2832,25 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // are on the *caller's* path and are already ignored by every reader of a
         // `syn::Path` here (`ident_name` reads a segment's identifier, never its
         // arguments), so a `Self` type's own generics are no reason to skip its constants.
-        if node.trait_.is_none() {
-            if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
-                if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-                    if let Some(segment) = type_path.path.segments.first() {
-                        let scope =
-                            resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
-                        let mut path = self.module_path.clone();
-                        path.push(ident_name(&segment.ident));
-                        for (name, value) in &scope {
-                            self.qualified
-                                .insert(format!("{}::{name}", path.join("::")), *value);
-                        }
+        //
+        // Codex's next finding after that: a *trait* impl's own constants (`impl Indices
+        // for u8 { const P0 = 0; .. }`) were skipped outright, on the reasoning that a
+        // const the impl does not redeclare could be the trait's own default, which this
+        // scan has no notion of — true, and still the standing for that one case, but it
+        // does not justify skipping the constants a trait impl *does* declare. Indexed
+        // under the *implementing type's* own name (`u8::P0`) exactly like an inherent
+        // impl's, since that is also the unqualified spelling Rust itself accepts when
+        // the trait is unambiguous, and it is what [`resolve_qself_associated_const`]
+        // looks up for the qualified `<u8 as Indices>::P0` spelling too.
+        if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
+            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+                if let Some(segment) = type_path.path.segments.first() {
+                    let scope = resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
+                    let mut path = self.module_path.clone();
+                    path.push(ident_name(&segment.ident));
+                    for (name, value) in &scope {
+                        self.qualified
+                            .insert(format!("{}::{name}", path.join("::")), *value);
                     }
                 }
             }

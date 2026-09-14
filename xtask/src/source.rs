@@ -15641,6 +15641,34 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_non_singleton_range_arm_is_reported() {
+        // Codex's thirty-fourth-round finding: `0..=1` covers two values in one arm, and
+        // `rustc` still lowers the whole match to the identical indexed table a
+        // one-value-per-arm spelling gets — `pattern_literal`'s range case only ever
+        // accepted a *singleton* closed range (`start == end`) and returned nothing for
+        // any wider one, so the arm's own two values went uncounted the same way an
+        // or-pattern's did before the thirty-second round's fix.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 2..15 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn range_pattern_table(value: u8) -> u32 {{\n    match value {{\n        \
+             0..=1 => 10,\n{arms}        _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 15-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_enum_variants_is_reported() {
         // Codex's thirtieth-round finding: `Indices::P0` names a fieldless enum variant
         // exactly the way `Pat::Path` spells a module-qualified constant, and `rustc`
@@ -16429,6 +16457,39 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_associated_constant_is_reported() {
+        // Codex's thirty-fourth-round finding: `<u8 as Indices>::P0` is a
+        // trait-associated constant, spelled with the qualified-self syntax `syn` gives
+        // a `Pat::Path` its own `qself` field for — but `pattern_literal` only ever
+        // asked `resolve` about `path.path` (`Indices::P0`, the *trait's* own path plus
+        // the member), never looking at `qself` (the `<u8 as ..>` half) at all, and
+        // `visit_item_impl` skipped a *trait* impl's own constants outright. A `u8`
+        // implementing `Indices` and declaring `P0` through `P6` directly is now indexed
+        // under `u8::P0` the way an inherent impl's constants already were, and a
+        // `<u8 as Indices>::P0` pattern resolves against that same key.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\ntrait Indices {\n    const P0: u8;\n    const P1: u8;\n    const P2: u8;\n    \
+             const P3: u8;\n    const P4: u8;\n    const P5: u8;\n    const P6: u8;\n}\n\nimpl \
+             Indices for u8 {\n    const P0: u8 = 0;\n    const P1: u8 = 1;\n    const P2: u8 \
+             = 2;\n    const P3: u8 = 3;\n    const P4: u8 = 4;\n    const P5: u8 = 5;\n    \
+             const P6: u8 = 6;\n}\n\nconst fn qself_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as Indices>::P0 => 0,\n        \
+             <u8 as Indices>::P1 => 1,\n        <u8 as Indices>::P2 => 2,\n        \
+             <u8 as Indices>::P3 => 3,\n        <u8 as Indices>::P4 => 4,\n        \
+             <u8 as Indices>::P5 => 5,\n        <u8 as Indices>::P6 => 6,\n        _ => \
+             7,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 8-arm dense match")),
             "{violations:?}"
         );
     }
