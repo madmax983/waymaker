@@ -736,23 +736,20 @@ fn anchors(sample: &str) -> Vec<Anchor> {
 /// every attribute on the function regardless of where it sits, so order was never actually
 /// load-bearing here.
 ///
-/// The line index returned on success is found by a plain text search, kept deliberately
-/// separate from the parse above: it exists only to check the test sits inside its anchor's
-/// line range, which is a *shape* question about the page, not a *does this run* one.
+/// The line index returned on success is [`crate::parse::NamedFn::line`], read off the same
+/// parsed function whose attributes decided the verdict — not found again by a second,
+/// independent text search. Two searches for "the same" declaration used to be able to
+/// answer about two different ones: `name` declared twice, once inside the anchor and once
+/// outside it, could pair one declaration's attributes with the other's position and wrongly
+/// vouch for either (issue #97, Codex review round 5).
 fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
-    let opening = format!("fn {name}(");
-    let Some(at) = sample
-        .lines()
-        .position(|line| line.trim().starts_with(&opening))
-    else {
-        return Err(format!("declares no `#[test] fn {name}`"));
-    };
     let Some(function) = crate::parse::fns_matching(sample, name, true)
         .into_iter()
         .next()
     else {
         return Err(format!("declares no `#[test] fn {name}`"));
     };
+    let at = function.line.saturating_sub(1);
     let mut tested = false;
     for attribute in &function.attrs {
         let Some(ident) = attribute.path().get_ident() else {
@@ -2564,6 +2561,29 @@ mod tests {
             "// ANCHOR: a_first_sample\n// Waymaker guarantees exactly-once delivery.\n// ANCHOR_END: a_first_sample\n#[test]",
         );
         assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name() {
+        // Codex, review round 5 of issue #97: `declares_test` used to pair the attributes
+        // of the *first* function `syn` found with the position of the *first* line a
+        // separate text search found — two independent "first" answers that can name two
+        // different declarations when a name is declared twice. A real, running
+        // `#[test] pub fn a_first_sample()` declared earlier in the file has its
+        // attributes checked; a later, non-test `fn a_first_sample()` — no `#[test]` at
+        // all — sits inside the anchor the book actually shows. The real test's
+        // attributes must not vouch for the decoy's position.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "#[test]\npub fn a_first_sample() {\n    assert!(true);\n}\n\n\
+             // ANCHOR: a_first_sample\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "a real test outside the anchor vouched for an untested decoy inside it"
+        );
     }
 
     #[test]

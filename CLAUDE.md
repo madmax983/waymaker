@@ -3235,10 +3235,28 @@ a real parser has no such thing as a line or a bracket count.
 same structural lookup the `failure-matrix` scanner already uses, made `pub(crate)` for this
 — finds the function by name and hands back its real attributes, and every attribute is
 checked regardless of order, line breaks, whitespace, a raw-identifier marker, or what a
-string literal inside it happens to contain. The line index the caller still needs, to check
-the test sits inside its anchor, is found by an unrelated plain-text search — a *shape*
-question about the page, answered the same simple way as before, kept apart from the *does
-this run* question a parser now answers. The parametrized test grew eleven cases across the
-four rounds, one or more per bug found, and every earlier one still passes unmodified against
-the `syn`-based scanner. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
-or a rule id.
+string literal inside it happens to contain.
+
+Codex found a fifth bug in the line index the caller still needs, to check the test sits
+inside its anchor: it was found by a second, independent plain-text search, kept apart from
+the attribute check on the theory that position is a *shape* question and skippability is a
+*does this run* question. Two independent searches for "the same" declaration can each answer
+about a different one when a name is declared twice — a real, running
+`#[test] pub fn a_first_sample()` declared earlier in the file (found first by `syn`, since it
+does not care about visibility) paired its own passing attributes with the position of a
+*later*, non-test `fn a_first_sample()` the text search found instead (since `pub` does not
+match a search for a bare `"fn a_first_sample("` prefix) — and that later declaration is the
+one actually sitting inside the anchor. The anchor passed while showing untested content.
+`crate::parse::NamedFn` now carries `line`, the 1-indexed source line of the exact function
+whose attributes were just checked, read off that function's own `syn` span rather than
+re-found by a second search; `proc-macro2`'s `span-locations` feature is what makes a span
+carry a real line outside an actual proc-macro, and `book`'s position check now comes from
+the one function `fns_matching` already found rather than from a search that could name
+another one entirely.
+
+The parametrized test grew eleven cases across the first four rounds, one or more per bug
+found, and every earlier one still passes unmodified against each fix in turn. The fifth bug
+was not a spelling any single attribute check could see — it was a mismatch between two
+different functions of one name — so `a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name`
+stands beside that parametrized test rather than inside it. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.

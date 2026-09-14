@@ -1097,6 +1097,14 @@ pub struct NamedFn {
     pub attrs: Vec<syn::Attribute>,
     /// The body rendered as text, with `::` normalized (see `block_text`).
     pub body: String,
+    /// The 1-indexed source line the `fn` keyword's name sits on.
+    ///
+    /// Read off the parsed item's own span rather than found again by a second,
+    /// independent text search: two searches for "the same" declaration can each answer
+    /// about a different one when a name is declared more than once, which is exactly
+    /// the ambiguity a caller matching attributes to a position must not have (issue
+    /// #97, Codex review round 5).
+    pub line: usize,
 }
 
 /// Every `fn name` in `contents`, outside `#[cfg(test)]`, in source order.
@@ -1148,6 +1156,7 @@ fn collect_fns_named(
                 found.push(NamedFn {
                     attrs: function.attrs.clone(),
                     body: block_text(&function.block),
+                    line: function.sig.ident.span().start().line,
                 });
             }
             syn::Item::Impl(implementation) => {
@@ -1162,6 +1171,7 @@ fn collect_fns_named(
                             found.push(NamedFn {
                                 attrs: method.attrs.clone(),
                                 body: block_text(&method.block),
+                                line: method.sig.ident.span().start().line,
                             });
                         }
                     }
