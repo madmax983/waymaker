@@ -18507,6 +18507,71 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_guarded_by_typed_local_constants_is_pruned_as_dead() {
+        // Codex's next-round finding: `is_definitely_unsigned` recognised a suffixed
+        // literal or a cast, but not a bare `Expr::Path` referring to an already-typed
+        // constant — `const HI: u128 = 1u128 << 127; const ZERO: u128 = 0; _ if HI < ZERO
+        // => ..` resolves both operands to values, and `HI`'s value is negative in this
+        // scan's own `i128` storage, but neither operand expression is itself a literal or
+        // a cast for that function's existing cases to read, so the guard stayed
+        // unresolved and the arm it guards was kept rather than pruned as the dead code it
+        // really is — undercounting an otherwise dense `0..=3` window by one arm.
+        // `path_is_definitely_unsigned` now answers a bare name from
+        // `UnsignedConstScopes`, the mirror of `ConstScopes` this round adds for exactly
+        // that fact, so the guard folds to `0` and the real four-arm window is restored.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_constant_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn typed_constant_dead_guard_table(nibble: u8) -> u32 {\n    \
+             const HI: u128 = 1u128 << 127;\n    const ZERO: u128 = 0;\n    \
+             match nibble {\n        0 => typed_constant_dead_guard_helper(0),\n        \
+             1 => typed_constant_dead_guard_helper(1),\n        \
+             2 => typed_constant_dead_guard_helper(2),\n        \
+             _ if HI < ZERO => 999,\n        \
+             _ => typed_constant_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_module_shadowing_a_primitive_type_name_is_respected() {
+        // Codex's next-round finding: `well_known_integer_bound` was checked before this
+        // scan ever consulted a locally declared module's own constants, so a local
+        // `mod u8 { pub const MIN: u8 = 0; pub const MAX: u8 = 2; }` — legal Rust, and
+        // resolved by `rustc` to the module's own constants rather than the primitive's —
+        // was shadowed the other way around here: the primitive's own `MIN`/`MAX` answered
+        // first regardless of what the module actually declared. A table whose numbered
+        // arms alternate `u8::MIN + n` and `u8::MAX + n` under that shadowing module reads
+        // as two widely separated sequences (based on `0` and `255`) rather than the
+        // single consecutive `0..=3` window `rustc` itself sees, and stayed undercounted.
+        // Both `resolve_pattern_path` and `resolve_qualified_path` now try every
+        // scope-dependent lookup first and fall back to the primitive's own bound only once
+        // none of them found a real declaration, so a real module always wins.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod u8 {\n    pub const MIN: u8 = 0;\n    pub const MAX: u8 = 2;\n}\n\n\
+             const fn shadowed_primitive_bound_table(nibble: u32) -> u32 {\n    \
+             const P0: u32 = u8::MIN as u32;\n    const P1: u32 = u8::MAX as u32 - 1;\n    \
+             const P2: u32 = u8::MAX as u32;\n    const P3: u32 = u8::MAX as u32 + 1;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

@@ -1920,8 +1920,14 @@ pub fn match_expressions_with_prefix(
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(
-        &item_const_exprs(&file.items),
-        &ConstScopes(Vec::new()),
+        &OwnConsts {
+            exprs: &item_const_exprs(&file.items),
+            unsigned: &item_const_unsigned(&file.items),
+        },
+        &OuterScopes {
+            values: &ConstScopes(Vec::new()),
+            unsigned: &UnsignedConstScopes::default(),
+        },
         external_qualified,
         prefix,
         &[],
@@ -1929,6 +1935,7 @@ pub fn match_expressions_with_prefix(
     );
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
+        scopes_unsigned: UnsignedConstScopes(vec![item_const_unsigned(&file.items)]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
@@ -2024,8 +2031,14 @@ pub fn qualified_constants_with_prefix(
 ) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(
-        &item_const_exprs(&file.items),
-        &ConstScopes(Vec::new()),
+        &OwnConsts {
+            exprs: &item_const_exprs(&file.items),
+            unsigned: &item_const_unsigned(&file.items),
+        },
+        &OuterScopes {
+            values: &ConstScopes(Vec::new()),
+            unsigned: &UnsignedConstScopes::default(),
+        },
         external_qualified,
         prefix,
         &[],
@@ -2039,6 +2052,7 @@ pub fn qualified_constants_with_prefix(
     }
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
+        scopes_unsigned: UnsignedConstScopes(vec![item_const_unsigned(&file.items)]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
@@ -2094,6 +2108,33 @@ impl ConstScopes {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+}
+
+/// Mirrors [`ConstScopes`]'s own stack of scopes, one level for one, but records only
+/// whether the name at that level was declared with an explicit unsigned integer type — the
+/// one fact [`is_definitely_unsigned`] needs for a bare `Expr::Path` operand and
+/// [`ConstScopes`]'s own value map does not carry, since every other reader of a resolved
+/// constant wants only its value. Pushed and popped at the identical points `ConstScopes`
+/// is, from the identical declarations ([`item_const_unsigned`] beside [`item_const_exprs`],
+/// [`block_const_unsigned`] beside [`block_const_exprs`]), so a name present in one stack's
+/// scope at a given index is present in the other's scope at the same index too — shadowing
+/// agrees between the two stacks because both are built from the same declarations in the
+/// same order.
+#[derive(Default)]
+struct UnsignedConstScopes(Vec<std::collections::HashMap<String, bool>>);
+
+impl UnsignedConstScopes {
+    /// `name`'s own declared-unsigned fact at the innermost scope that declares it,
+    /// searching outward exactly as [`ConstScopes::resolve`] does — `false` once nothing
+    /// records it, which only ever declines to fold an ordering guard rather than guessing
+    /// one is unsigned when it might not be.
+    fn resolve(&self, name: &str) -> bool {
+        self.0
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .unwrap_or(false)
     }
 }
 
@@ -2154,6 +2195,27 @@ fn item_const_exprs(items: &[syn::Item]) -> std::collections::HashMap<String, sy
             };
             (!has_cfg_test(&constant.attrs))
                 .then(|| (ident_name(&constant.ident), (*constant.expr).clone()))
+        })
+        .collect()
+}
+
+/// [`item_const_exprs`]'s own mirror for [`UnsignedConstScopes`]: every `const` declared
+/// *directly* in `items`, by name, against whether its own type ascription names one of the
+/// five unsigned fixed-width integer types — not against the value it initializes to, which
+/// this function never reads.
+fn item_const_unsigned(items: &[syn::Item]) -> std::collections::HashMap<String, bool> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Const(constant) = item else {
+                return None;
+            };
+            (!has_cfg_test(&constant.attrs)).then(|| {
+                (
+                    ident_name(&constant.ident),
+                    declared_type_is_unsigned(&constant.ty),
+                )
+            })
         })
         .collect()
 }
@@ -2220,6 +2282,26 @@ fn block_const_exprs(block: &syn::Block) -> std::collections::HashMap<String, sy
             };
             (!has_cfg_test(&constant.attrs))
                 .then(|| (ident_name(&constant.ident), (*constant.expr).clone()))
+        })
+        .collect()
+}
+
+/// [`block_const_exprs`]'s own mirror for [`UnsignedConstScopes`], the same way
+/// [`item_const_unsigned`] mirrors [`item_const_exprs`].
+fn block_const_unsigned(block: &syn::Block) -> std::collections::HashMap<String, bool> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Item(syn::Item::Const(constant)) = stmt else {
+                return None;
+            };
+            (!has_cfg_test(&constant.attrs)).then(|| {
+                (
+                    ident_name(&constant.ident),
+                    declared_type_is_unsigned(&constant.ty),
+                )
+            })
         })
         .collect()
 }
@@ -2339,6 +2421,23 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
     }
 }
 
+/// `own`'s own constant initializers alongside which of them are declared unsigned —
+/// [`item_const_exprs`]/[`item_const_unsigned`] or [`block_const_exprs`]/[`block_const_unsigned`],
+/// bundled the same reason [`Resolve`] bundles a value and an unsigned closure: reducing
+/// [`resolve_scope_consts`]'s own parameter count back under `clippy::too_many_arguments`
+/// once threading unsignedness through it gave it an eighth.
+struct OwnConsts<'a> {
+    exprs: &'a std::collections::HashMap<String, syn::Expr>,
+    unsigned: &'a std::collections::HashMap<String, bool>,
+}
+
+/// [`ConstScopes`] alongside its own [`UnsignedConstScopes`] mirror — [`OwnConsts`]'s own
+/// twin for the *outer* scope stack [`resolve_scope_consts`] searches outward through.
+struct OuterScopes<'a> {
+    values: &'a ConstScopes,
+    unsigned: &'a UnsignedConstScopes,
+}
+
 /// `own`'s constants, each resolved to an integer where its initializer allows — directly,
 /// through a chain of references to other constants `own` itself declares, through one
 /// already visible in `outer`, or through a module-qualified path already recorded in
@@ -2365,17 +2464,17 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
 /// [`resolve_qualified_path_at_any_depth`]'s full most-specific-first search, the same one
 /// [`resolve_pattern_path`] already runs for a pattern.
 fn resolve_scope_consts(
-    own: &std::collections::HashMap<String, syn::Expr>,
-    outer: &ConstScopes,
+    own: &OwnConsts<'_>,
+    outer: &OuterScopes<'_>,
     qualified: &std::collections::HashMap<String, i128>,
     module_path: &[String],
     function_path: &[String],
     block_path: &[String],
 ) -> std::collections::HashMap<String, i128> {
     let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
-    for _ in 0..own.len().max(1) {
+    for _ in 0..own.exprs.len().max(1) {
         let mut progressed = false;
-        for (name, expr) in own {
+        for (name, expr) in own.exprs {
             if resolved.contains_key(name) {
                 continue;
             }
@@ -2385,7 +2484,7 @@ fn resolve_scope_consts(
                     return resolved
                         .get(&candidate)
                         .copied()
-                        .or_else(|| outer.resolve(&candidate));
+                        .or_else(|| outer.values.resolve(&candidate));
                 }
                 resolve_qualified_path_at_any_depth(
                     path,
@@ -2395,7 +2494,28 @@ fn resolve_scope_consts(
                     block_path,
                 )
             };
-            if let Some(value) = literal_or_const_value(expr, &resolve) {
+            // Codex's next-round finding: an initializer such as `const P1: u8 = P0 + 1;`
+            // where `P0` is one of `own`'s own siblings needs no unsignedness of its own to
+            // fold (arithmetic does not care), but a *sibling's* own ordering comparison —
+            // `const P1: bool = P0 < OTHER;` — would, and a bare reference to `own`'s own
+            // declared-unsigned map answers that the same way the value lookup above
+            // answers a bare value reference. A qualified reference is not attempted here,
+            // the same scope [`path_is_definitely_unsigned`] itself declines beyond a bare
+            // name and a well-known bound — declining is always sound.
+            let resolve_unsigned = |path: &syn::Path| {
+                path.get_ident().is_some_and(|ident| {
+                    let candidate = ident_name(ident);
+                    own.unsigned
+                        .get(&candidate)
+                        .copied()
+                        .unwrap_or_else(|| outer.unsigned.resolve(&candidate))
+                })
+            };
+            let bundled = Resolve {
+                value: &resolve,
+                unsigned: &resolve_unsigned,
+            };
+            if let Some(value) = literal_or_const_value(expr, &bundled) {
                 resolved.insert(name.clone(), value);
                 progressed = true;
             }
@@ -2461,6 +2581,17 @@ fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
         return None;
     }
     type_path.path.get_ident().map(ident_name)
+}
+
+/// Whether `ty` is a plain, unqualified path naming one of the five unsigned fixed-width
+/// integer types — `u8`, `u16`, `u32`, `u64`, `u128` — the same shape [`single_segment_type_name`]
+/// already recognises, checked here against the same five names [`is_definitely_unsigned`]'s
+/// own suffix and cast cases already accept. [`item_const_unsigned`] and
+/// [`block_const_unsigned`] are what read it off a `const` item's own type ascription rather
+/// than a cast.
+fn declared_type_is_unsigned(ty: &syn::Type) -> bool {
+    single_segment_type_name(ty)
+        .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128"))
 }
 
 /// The full, dotted name of `ty`, if it is a plain, unqualified type path of any length —
@@ -2686,10 +2817,7 @@ fn as_bool_literal(expr: &syn::Expr) -> Option<bool> {
 /// Factored out of [`literal_or_const_value`]'s own `Expr::Block` case so `Expr::If`'s
 /// `then` branch — itself a plain `syn::Block` — can be evaluated the identical way,
 /// rather than duplicating the local-binding fixed point a second time.
-fn evaluate_block(
-    block: &syn::Block,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<i128> {
+fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let mut locals = block_const_exprs(block);
     let lets = block_let_exprs(block);
     let combined_len = locals.len() + lets.len();
@@ -2713,11 +2841,28 @@ fn evaluate_block(
             if resolved.contains_key(name) {
                 continue;
             }
-            let local_resolve = |path: &syn::Path| {
+            let local_resolve_value = |path: &syn::Path| {
                 path.get_ident()
                     .map(ident_name)
                     .and_then(|candidate| resolved.get(&candidate).copied())
-                    .or_else(|| resolve(path))
+                    .or_else(|| (resolve.value)(path))
+            };
+            // A name already resolved to a value in `resolved` is one of this block's own
+            // local bindings, whose declared type (if any) this function never reads — the
+            // same safe decline [`resolve_scope_consts`]'s own sibling-reference closure
+            // takes for the same reason. Anything else falls through to the outer scope's
+            // own answer, exactly as the value lookup above does.
+            let local_resolve_unsigned = |path: &syn::Path| {
+                if let Some(ident) = path.get_ident() {
+                    if resolved.contains_key(&ident_name(ident)) {
+                        return false;
+                    }
+                }
+                (resolve.unsigned)(path)
+            };
+            let local_resolve = Resolve {
+                value: &local_resolve_value,
+                unsigned: &local_resolve_unsigned,
             };
             if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
                 resolved.insert(name.clone(), value);
@@ -2728,11 +2873,23 @@ fn evaluate_block(
             break;
         }
     }
-    let block_resolve = |path: &syn::Path| {
+    let block_resolve_value = |path: &syn::Path| {
         path.get_ident()
             .map(ident_name)
             .and_then(|candidate| resolved.get(&candidate).copied())
-            .or_else(|| resolve(path))
+            .or_else(|| (resolve.value)(path))
+    };
+    let block_resolve_unsigned = |path: &syn::Path| {
+        if let Some(ident) = path.get_ident() {
+            if resolved.contains_key(&ident_name(ident)) {
+                return false;
+            }
+        }
+        (resolve.unsigned)(path)
+    };
+    let block_resolve = Resolve {
+        value: &block_resolve_value,
+        unsigned: &block_resolve_unsigned,
     };
     literal_or_const_value(tail_expr, &block_resolve)
 }
@@ -2790,12 +2947,39 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     }
 }
 
+/// Bundles the two things every constant-expression evaluator here needs about a
+/// `syn::Path` — the value it resolves to, and whether its own declaration names an
+/// unsigned integer type — behind one reference, the way [`ResolutionContext`] already
+/// bundles the loose lookup parameters a path resolver was once passed positionally.
+///
+/// Codex's next-round finding: [`is_definitely_unsigned`] recognised a suffixed literal or a
+/// cast, but not a bare `Expr::Path` referring to an already-typed constant — `const HI:
+/// u128 = 1u128 << 127; const ZERO: u128 = 0; _ if HI < ZERO => ..` resolves both operands
+/// to values, and `HI`'s value is negative in this scan's own `i128` storage, but neither
+/// operand expression is itself a literal or a cast for that function's existing cases to
+/// read. Every caller of [`literal_or_const_value`] already threads a value resolver
+/// through every recursive call; this is that same resolver widened to carry a second
+/// closure alongside it; rather than adding a second loose parameter everywhere the first
+/// one is threaded, which would touch the signature of a function like
+/// [`is_catchall_pattern`] that has no use for the second closure at all, every place that
+/// only ever *forwards* `resolve` on to a further call needs no change beyond the type this
+/// struct gives it.
+struct Resolve<'a> {
+    /// `path`'s own value, when it resolves to one.
+    value: &'a dyn Fn(&syn::Path) -> Option<i128>,
+    /// Whether `path`'s own declaration names an unsigned integer type — `false` once
+    /// nothing here can tell, which is always the sound answer for a fact this scan cannot
+    /// yet confirm, never the sound answer for one it could confirm and got wrong.
+    unsigned: &'a dyn Fn(&syn::Path) -> bool,
+}
+
 /// Whether `expr` is written with an explicit unsigned integer type — a suffixed literal
-/// (`0u128`) or a cast to one (`x as u128`) — seen through any nesting of parentheses or
-/// brace groups. The only way [`evaluate_ordering_op`] can know an operand's own *type*
-/// rather than only its resolved bit pattern, which is what lets it tell a genuinely
-/// negative value apart from an upper-half `u128` one wrapped around.
-fn is_definitely_unsigned(expr: &syn::Expr) -> bool {
+/// (`0u128`), a cast to one (`x as u128`), or a bare path whose own declaration names one
+/// (`HI`, where `const HI: u128 = ..;` is in scope) — seen through any nesting of
+/// parentheses or brace groups. The only way [`evaluate_ordering_op`] can know an operand's
+/// own *type* rather than only its resolved bit pattern, which is what lets it tell a
+/// genuinely negative value apart from an upper-half `u128` one wrapped around.
+fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
     match strip_parens(expr) {
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Int(int),
@@ -2803,6 +2987,7 @@ fn is_definitely_unsigned(expr: &syn::Expr) -> bool {
         }) => matches!(int.suffix(), "u8" | "u16" | "u32" | "u64" | "u128"),
         syn::Expr::Cast(cast) => single_segment_type_name(&cast.ty)
             .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")),
+        syn::Expr::Path(path) if path.qself.is_none() => (resolve.unsigned)(&path.path),
         _ => false,
     }
 }
@@ -2836,12 +3021,12 @@ fn evaluate_ordering_op(
     op: syn::BinOp,
     left_expr: &syn::Expr,
     right_expr: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
 ) -> Option<i128> {
     let left = literal_or_const_value(left_expr, resolve)?;
     let right = literal_or_const_value(right_expr, resolve)?;
-    if (left < 0 && !is_definitely_unsigned(left_expr))
-        || (right < 0 && !is_definitely_unsigned(right_expr))
+    if (left < 0 && !is_definitely_unsigned(left_expr, resolve))
+        || (right < 0 && !is_definitely_unsigned(right_expr, resolve))
     {
         return None;
     }
@@ -2889,7 +3074,7 @@ fn evaluate_short_circuit_op(
     is_and: bool,
     left: &syn::Expr,
     right: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
 ) -> Option<i128> {
     let left_value = literal_or_const_value(left, resolve)?;
     if is_and && left_value == 0 {
@@ -2933,10 +3118,7 @@ fn evaluate_short_circuit_op(
 /// string carries its own length in its bytes rather than in a separate `count`
 /// expression, so there is nothing to resolve before indexing, only a bounds check
 /// against that length.
-fn evaluate_index(
-    indexed: &syn::ExprIndex,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<i128> {
+fn evaluate_index(indexed: &syn::ExprIndex, resolve: &Resolve<'_>) -> Option<i128> {
     let index = usize::try_from(literal_or_const_value(&indexed.index, resolve)?).ok()?;
     match indexed.expr.as_ref() {
         syn::Expr::Array(array) => literal_or_const_value(array.elems.get(index)?, resolve),
@@ -2955,10 +3137,7 @@ fn evaluate_index(
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
-fn literal_or_const_value(
-    expr: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<i128> {
+fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i128> {
     match expr {
         syn::Expr::Lit(literal) => lit_value(&literal.lit),
         // Codex's finding: `248u8 as i8` is `-8`, not `248` — this used to discard the
@@ -2971,7 +3150,7 @@ fn literal_or_const_value(
         }
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
-        syn::Expr::Path(path) => resolve(&path.path),
+        syn::Expr::Path(path) => (resolve.value)(&path.path),
         // [`evaluate_short_circuit_op`] holds the rationale for why `&&`/`||` are not
         // folded through `evaluate_binary_op` like every other operator.
         syn::Expr::Binary(binary)
@@ -3193,10 +3372,7 @@ fn literal_or_const_value(
 /// arms are not — or the reverse — could be resolved to a value only a test build would
 /// produce, feeding a wrong constant into the density check the same
 /// [`has_cfg_test`]-filtered exclusion already protects `visit_expr_match` itself from.
-fn evaluate_match(
-    expr_match: &syn::ExprMatch,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<i128> {
+fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<i128> {
     let scrutinee = literal_or_const_value(&expr_match.expr, resolve)?;
     for arm in expr_match
         .arms
@@ -3225,13 +3401,14 @@ fn evaluate_match(
 fn match_arm_matches_constant(
     pattern: &syn::Pat,
     value: i128,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
 ) -> Option<bool> {
     match pattern {
         syn::Pat::Wild(_) => Some(true),
         syn::Pat::Lit(literal) => Some(lit_value(&literal.lit)? == value),
         syn::Pat::Ident(named) if named.subpat.is_none() && named.by_ref.is_none() => Some(
-            resolve(&syn::Path::from(named.ident.clone())).is_none_or(|resolved| resolved == value),
+            (resolve.value)(&syn::Path::from(named.ident.clone()))
+                .is_none_or(|resolved| resolved == value),
         ),
         syn::Pat::Paren(paren) => match_arm_matches_constant(&paren.pat, value, resolve),
         syn::Pat::Or(or_pattern) => {
@@ -3339,7 +3516,7 @@ fn match_arm_matches_constant(
 fn resolve_qself_associated_const(
     qself: &syn::QSelf,
     path: &syn::Path,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
     qualified: &std::collections::HashMap<String, i128>,
 ) -> Option<i128> {
     let type_name = type_path_name(&qself.ty)?;
@@ -3356,13 +3533,13 @@ fn resolve_qself_associated_const(
         scoped.push(type_name.clone());
         scoped.push(member.clone());
         if let Ok(synthetic) = syn::parse_str::<syn::Path>(&scoped.join("::")) {
-            if let Some(value) = resolve(&synthetic) {
+            if let Some(value) = (resolve.value)(&synthetic) {
                 return Some(value);
             }
         }
     }
     let synthetic = syn::parse_str::<syn::Path>(&format!("{type_name}::{member}")).ok()?;
-    if let Some(value) = resolve(&synthetic) {
+    if let Some(value) = (resolve.value)(&synthetic) {
         return Some(value);
     }
     if let Some(trait_path_len) = segment_count.checked_sub(1) {
@@ -3422,7 +3599,7 @@ const MAX_RANGE_PATTERN_VALUES: usize = 4096;
 /// — and is refused the same as zero, rather than guessing.
 fn single_discriminating_field<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
 ) -> Option<&'a syn::Pat> {
     let mut found: Option<&syn::Pat> = None;
     for elem in elems {
@@ -3439,7 +3616,7 @@ fn single_discriminating_field<'a>(
 
 fn pattern_literal(
     pattern: &syn::Pat,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+    resolve: &Resolve<'_>,
     qualified: &std::collections::HashMap<String, i128>,
 ) -> Vec<i128> {
     match pattern {
@@ -3463,9 +3640,11 @@ fn pattern_literal(
             // never be the constant `resolve` would otherwise answer for — refused here
             // rather than asked of `resolve`, which could otherwise answer from an
             // unrelated same-named constant it has no business naming.
-            None if named.by_ref.is_none() => resolve(&syn::Path::from(named.ident.clone()))
-                .into_iter()
-                .collect(),
+            None if named.by_ref.is_none() => {
+                (resolve.value)(&syn::Path::from(named.ident.clone()))
+                    .into_iter()
+                    .collect()
+            }
             None => Vec::new(),
         },
         // Codex's finding: `<u8 as Indices>::P0` is a trait-associated constant, and
@@ -3475,7 +3654,7 @@ fn pattern_literal(
         // named `Indices` is never what this scan indexes, so every such arm read as
         // unresolved. [`resolve_qself_associated_const`] is the qualified-self half.
         syn::Pat::Path(path) => path.qself.as_ref().map_or_else(
-            || resolve(&path.path).into_iter().collect(),
+            || (resolve.value)(&path.path).into_iter().collect(),
             |qself| {
                 resolve_qself_associated_const(qself, &path.path, resolve, qualified)
                     .into_iter()
@@ -3689,11 +3868,7 @@ fn pattern_literal(
 /// window one arm short) rather than being reported. `mut other` never needed the
 /// equivalent fix: `named.mutability` was never part of this guard to begin with.
 #[must_use]
-fn is_catchall_pattern(
-    pattern: &syn::Pat,
-    guarded: bool,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> bool {
+fn is_catchall_pattern(pattern: &syn::Pat, guarded: bool, resolve: &Resolve<'_>) -> bool {
     if guarded {
         return false;
     }
@@ -3707,7 +3882,7 @@ fn is_catchall_pattern(
         // two share one arm here.
         syn::Pat::Wild(_) | syn::Pat::Rest(_) => true,
         syn::Pat::Ident(named) if named.subpat.is_none() => {
-            resolve(&syn::Path::from(named.ident.clone())).is_none()
+            (resolve.value)(&syn::Path::from(named.ident.clone())).is_none()
         }
         _ => false,
     }
@@ -3717,10 +3892,7 @@ fn is_catchall_pattern(
 /// argument — seen through a set of parentheses or a brace group holding one tail
 /// expression, since a block-valued arm (`0 => { helper(0) }`) is exactly as much a call as
 /// an unwrapped one once a real parser is reading it.
-fn call_shape_of(
-    expr: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<(String, Option<i128>)> {
+fn call_shape_of(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<(String, Option<i128>)> {
     match expr {
         syn::Expr::Paren(paren) => call_shape_of(&paren.expr, resolve),
         syn::Expr::Group(group) => call_shape_of(&group.expr, resolve),
@@ -3787,10 +3959,7 @@ fn block_as_expr(block: &syn::Block) -> syn::Expr {
 /// is applied to the unresolved side before its token text is taken, the same normalisation
 /// every other literal- or constant-reading function here already applies before it looks
 /// at an expression's own shape.
-fn if_chain_condition_value(
-    cond: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<(String, i128)> {
+fn if_chain_condition_value(cond: &syn::Expr, resolve: &Resolve<'_>) -> Option<(String, i128)> {
     let cond = strip_parens(cond);
     let syn::Expr::Binary(binary) = cond else {
         return None;
@@ -3838,10 +4007,7 @@ fn strip_parens(mut expr: &syn::Expr) -> &syn::Expr {
 /// condition is not `scrutinee == literal` is not this shape at all, and a link naming a
 /// *different* scrutinee than the chain's first link is two unrelated comparisons that
 /// happen to share an `else if`, not one dense table.
-fn extract_if_chain(
-    node: &syn::ExprIf,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<(String, Vec<FoundArm>)> {
+fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String, Vec<FoundArm>)> {
     let (scrutinee, first_value) = if_chain_condition_value(&node.cond, resolve)?;
     let mut arms = vec![FoundArm {
         pattern: vec![first_value],
@@ -3925,6 +4091,13 @@ fn extract_if_chain(
 /// `crate::` now records that it was absolute before the shared strip erases the word, and
 /// skips the relative attempt outright — going straight to the plain chain, which is what
 /// lets `crate::indices::P0` keep finding a `mod indices` recorded relative to the file root.
+///
+/// This is a pure map lookup with no well-known-bound fallback of its own — deliberately,
+/// since [`resolve_qualified_path_at_any_depth`] calls this once per depth it tries, and a
+/// fallback embedded here would answer from the *first*, most deeply nested depth a real
+/// declaration might not sit at, before the outer depths where it actually does are ever
+/// tried. [`resolve_qualified_path_at_any_depth`]'s own doc comment has the finding that
+/// taught this.
 fn resolve_qualified_path(
     path: &syn::Path,
     qualified: &std::collections::HashMap<String, i128>,
@@ -3935,23 +4108,6 @@ fn resolve_qualified_path(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    // Codex's next-round finding: `const P0: u8 = u8::MIN;`, a local block-scoped
-    // constant, resolves through `resolve_scope_consts`'s own closure — which reaches
-    // this function directly through `resolve_qualified_path_at_any_depth`, never through
-    // `resolve_pattern_path`'s own well-known-bound check above it — so a second check is
-    // needed here too, for the identical reason `[`well_known_integer_bound`]`'s own doc
-    // comment already states.
-    if let [type_name, member] = segments.as_slice() {
-        if let Some(value) = well_known_integer_bound(type_name, member) {
-            return Some(value);
-        }
-    }
-    // Codex's finding: stripping `crate` the same way `self` is stripped, below, loses
-    // the one fact that made it worth reading — `crate::indices::P0` names the crate
-    // root exclusively, in real Rust, and never the current module, however deep a nested
-    // `mod outer` sits. Recorded here, before the shared strip below throws the
-    // distinction away, so `crate::` can skip the current-module-relative attempt
-    // entirely rather than racing it the way a `self`- or `super`-anchored chain does.
     let is_crate_absolute = segments.first().map(String::as_str) == Some("crate");
     let relevant: Vec<&str> = segments
         .iter()
@@ -3988,6 +4144,17 @@ fn resolve_qualified_path(
     qualified.get(&tail.join("::")).copied()
 }
 
+/// `path`'s own value: [`resolve_qualified_path_via_map`]'s answer, when it has one, and
+/// [`well_known_integer_bound`] otherwise.
+///
+/// Codex's next-round finding: a local `mod u8 { pub const MIN: u8 = 0; .. }` shadows the
+/// primitive `u8` exactly as any other module shadows an ambient name, and Rust resolves
+/// `u8::MIN` written inside it to the module's own constant — but an earlier version of this
+/// function checked [`well_known_integer_bound`] *before* ever consulting `qualified` at
+/// all, so the primitive's own bound answered first regardless of what the source actually
+/// declared. Tried only once [`resolve_qualified_path_via_map`] has already failed, so a
+/// real declaration always wins and the primitive is answered only when nothing shadows it —
+/// the same reordering [`resolve_pattern_path`] gets for the identical reason.
 /// `name`'s value at the module `levels_up` ancestors above the current one — `0` for the
 /// current module (`self::NAME`), `1` for its parent (`super::NAME`), and so on.
 ///
@@ -4152,6 +4319,7 @@ fn resolve_anchored_single_segment(
 /// reference rather than left as an ever-growing list of positional parameters — the
 /// scan environment picked up a ninth dimension (`self_type_path`) the same round
 /// `clippy::too_many_arguments` would have started flagging the loose form.
+#[derive(Clone, Copy)]
 struct ResolutionContext<'a> {
     scopes: &'a ConstScopes,
     use_scopes: &'a UseScopes,
@@ -4165,6 +4333,9 @@ struct ResolutionContext<'a> {
     /// here for a leading `Self` segment the same way `crate`/`self`/`super` are already
     /// special-cased rather than searched for by name.
     self_type_path: &'a [String],
+    /// [`UnsignedConstScopes`]'s own mirror of `scopes` — [`path_is_definitely_unsigned`]'s
+    /// bare-identifier case, the way `scopes` is [`resolve_pattern_path`]'s.
+    scopes_unsigned: &'a UnsignedConstScopes,
 }
 
 /// `path`'s own value against `qualified`, searched at every depth a bare or qualified
@@ -4183,6 +4354,19 @@ struct ResolutionContext<'a> {
 /// `enclosing_module::this_function::base::BASE`, never `enclosing_module::base::BASE`
 /// itself, and the whole initializer stayed unresolved even though the qualified map
 /// already held it.
+///
+/// Codex's next-round finding: `u8::MIN` is a real, well-known associated constant of a
+/// language primitive, tried once every depth above has already failed — but a *local*
+/// `mod u8 { pub const MIN: u8 = 0; .. }` shadows it, and an earlier version of this fix put
+/// the well-known fallback inside [`resolve_qualified_path`] itself, which this function
+/// calls once per depth: the fallback then answered from the first, most deeply nested depth
+/// tried (`module_path` plus `function_path` plus every prefix of `block_path`), before the
+/// *outer* depth where the shadowing module's own declaration was actually recorded —
+/// ordinarily `module_path` alone — was ever reached, so a real declaration lost to the
+/// primitive whenever a reference sat inside a function or a block. The fallback is tried
+/// here instead, exactly once, only after every depth above — the full search this function
+/// exists to make — has already failed, so a real declaration at *any* depth always wins and
+/// the primitive answers only when nothing anywhere shadows it.
 fn resolve_qualified_path_at_any_depth(
     path: &syn::Path,
     qualified: &std::collections::HashMap<String, i128>,
@@ -4200,10 +4384,20 @@ fn resolve_qualified_path_at_any_depth(
             return Some(value);
         }
     }
-    if function_path.is_empty() && block_path.is_empty() {
-        return None;
+    if !(function_path.is_empty() && block_path.is_empty()) {
+        if let Some(value) = resolve_qualified_path(path, qualified, module_path) {
+            return Some(value);
+        }
     }
-    resolve_qualified_path(path, qualified, module_path)
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    if let [type_name, member] = segments.as_slice() {
+        return well_known_integer_bound(type_name, member);
+    }
+    None
 }
 
 fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option<i128> {
@@ -4240,17 +4434,6 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    // Codex's next-round finding: `u8::MIN` is a real, well-known associated constant of
-    // a language primitive — not anything the scanned source tree ever declares — so no
-    // amount of collecting local, qualified or trait-default constants would ever find
-    // it, and a table whose numbered arms are spelled `u8::MIN` through `u8::MIN + 14`
-    // read as unresolved on every arm. Checked before any of the scope-dependent lookups
-    // below, since this is a fact about the language rather than about where `path` sits.
-    if let [type_name, member] = segments.as_slice() {
-        if let Some(value) = well_known_integer_bound(type_name, member) {
-            return Some(value);
-        }
-    }
     // Codex's finding: `Self::P0`, written inside the very impl that declares `P0`,
     // names no module `resolve_qualified_path`'s map could ever hold under the literal
     // spelling `Self` — `MatchVisitor::visit_item_impl` indexes the constant under the
@@ -4353,6 +4536,15 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
     // real collision between two same-named, equally-nested local modules is what this
     // fallback cannot silently paper over, because each was keyed under its own block's
     // place in the walk and neither can be reached from the other's.
+    // Codex's next-round finding: `u8::MIN` is a real, well-known associated constant of
+    // a language primitive — not anything the scanned source tree ever declares — so no
+    // amount of collecting local, qualified or trait-default constants would ever find
+    // it, and a table whose numbered arms are spelled `u8::MIN` through `u8::MIN + 14`
+    // read as unresolved on every arm. [`resolve_qualified_path_at_any_depth`] is where
+    // that fallback lives now, tried only once every depth of the search below has already
+    // failed — its own doc comment has the finding that moved it there, off a version of
+    // this function that tried it too early and let it answer ahead of a local `mod u8`
+    // shadowing the primitive.
     resolve_qualified_path_at_any_depth(
         path,
         ctx.qualified,
@@ -4360,6 +4552,37 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
         ctx.function_path,
         ctx.block_path,
     )
+}
+
+/// Whether `path`, if it resolves to a constant at all, was declared with an explicit
+/// unsigned integer type — [`is_definitely_unsigned`]'s own answer for a bare or
+/// two-segment `Expr::Path` operand, mirroring the value resolution
+/// [`resolve_pattern_path`] performs but answering the question that function cannot: not
+/// what the constant equals, but which domain its own declaration names.
+///
+/// Scoped to the two shapes this scan can answer without guessing: a bare name, searched
+/// through [`ConstScopes`]'s own shadowing order via [`UnsignedConstScopes`]'s identical
+/// stack; and a well-known associated bound (`u128::MAX`), whose declaring type is the
+/// path's own first segment and needs no scope at all. A qualified reference to a constant
+/// declared in another module (`indices::HI`) is not attempted — [`ConstScopes`]'s value-only
+/// map has a companion here, but the qualified map [`resolve_qualified_path`] searches does
+/// not yet — and answers `false`, the same safe default an unresolved bare name gets:
+/// declining to fold an ordering guard is always sound, where guessing it is unsigned when
+/// it might not be is not.
+fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) -> bool {
+    if let Some(ident) = path.get_ident() {
+        return ctx.scopes_unsigned.resolve(&ident_name(ident));
+    }
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    if let [type_name, member] = segments.as_slice() {
+        return matches!(type_name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")
+            && well_known_integer_bound(type_name, member).is_some();
+    }
+    false
 }
 
 /// `trait_name`'s own default associated constants, found by the identical
@@ -4537,6 +4760,10 @@ fn resolve_qualified_trait_defaults_at_any_depth<'a>(
 /// return a *shadowing* constant declared at a level the anchor explicitly steps past).
 struct MatchVisitor {
     scopes: ConstScopes,
+    /// [`UnsignedConstScopes`]'s own mirror of `scopes`, pushed and popped at the identical
+    /// points, from the identical declarations — [`ResolutionContext::scopes_unsigned`]'s
+    /// source.
+    scopes_unsigned: UnsignedConstScopes,
     use_scopes: UseScopes,
     module_path: Vec<String>,
     module_scope_depths: Vec<usize>,
@@ -4643,8 +4870,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         key_path.extend(self.function_path.iter().cloned());
         key_path.extend(self.block_path.iter().cloned());
         let scope = resolve_scope_consts(
-            &item_const_exprs(items),
-            &self.scopes,
+            &OwnConsts {
+                exprs: &item_const_exprs(items),
+                unsigned: &item_const_unsigned(items),
+            },
+            &OuterScopes {
+                values: &self.scopes,
+                unsigned: &self.scopes_unsigned,
+            },
             &self.qualified,
             &self.module_path,
             &self.function_path,
@@ -4657,11 +4890,13 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 .insert(format!("{}::{name}", key_path.join("::")), *value);
         }
         self.scopes.0.push(scope);
+        self.scopes_unsigned.0.push(item_const_unsigned(items));
         self.use_scopes.0.push(item_use_imports(items));
         self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
         self.module_scope_depths.pop();
         self.use_scopes.0.pop();
+        self.scopes_unsigned.0.pop();
         self.scopes.0.pop();
         self.module_path.pop();
     }
@@ -4688,8 +4923,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             key_path.extend(self.function_path.iter().cloned());
             key_path.extend(self.block_path.iter().cloned());
             let scope = resolve_scope_consts(
-                &trait_const_exprs(&node.items),
-                &self.scopes,
+                &OwnConsts {
+                    exprs: &trait_const_exprs(&node.items),
+                    unsigned: &std::collections::HashMap::new(),
+                },
+                &OuterScopes {
+                    values: &self.scopes,
+                    unsigned: &self.scopes_unsigned,
+                },
                 &self.qualified,
                 &self.module_path,
                 &self.function_path,
@@ -4813,8 +5054,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     path.extend(self.function_path.iter().cloned());
                     path.extend(self.block_path.iter().cloned());
                     scope.extend(resolve_scope_consts(
-                        &impl_const_exprs(&node.items),
-                        &self.scopes,
+                        &OwnConsts {
+                            exprs: &impl_const_exprs(&node.items),
+                            unsigned: &std::collections::HashMap::new(),
+                        },
+                        &OuterScopes {
+                            values: &self.scopes,
+                            unsigned: &self.scopes_unsigned,
+                        },
                         &self.qualified,
                         &self.module_path,
                         &self.function_path,
@@ -4929,8 +5176,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 function_path: &self.function_path,
                 block_path: &self.block_path,
                 self_type_path: &self.self_type_path,
+                scopes_unsigned: &self.scopes_unsigned,
             };
-            let resolve = |path: &syn::Path| resolve_pattern_path(path, &ctx);
+            let resolve_value = |path: &syn::Path| resolve_pattern_path(path, &ctx);
+            let resolve_unsigned = |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+            let resolve = Resolve {
+                value: &resolve_value,
+                unsigned: &resolve_unsigned,
+            };
             let mut enum_path = self.module_path.clone();
             enum_path.extend(self.function_path.iter().cloned());
             enum_path.extend(self.block_path.iter().cloned());
@@ -4967,14 +5220,21 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let scope = resolve_scope_consts(
-            &block_const_exprs(node),
-            &self.scopes,
+            &OwnConsts {
+                exprs: &block_const_exprs(node),
+                unsigned: &block_const_unsigned(node),
+            },
+            &OuterScopes {
+                values: &self.scopes,
+                unsigned: &self.scopes_unsigned,
+            },
             &self.qualified,
             &self.module_path,
             &self.function_path,
             &self.block_path,
         );
         self.scopes.0.push(scope);
+        self.scopes_unsigned.0.push(block_const_unsigned(node));
         self.use_scopes.0.push(block_use_imports(node));
         // Codex's finding: two sibling blocks of one function each declaring their own
         // local `mod indices { .. }` collided under `function_path`'s own key exactly the
@@ -5002,6 +5262,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         }
         self.block_path.pop();
         self.use_scopes.0.pop();
+        self.scopes_unsigned.0.pop();
         self.scopes.0.pop();
     }
 
@@ -5015,8 +5276,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             function_path: &self.function_path,
             block_path: &self.block_path,
             self_type_path: &self.self_type_path,
+            scopes_unsigned: &self.scopes_unsigned,
         };
-        let resolve = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
+        let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
+        let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+        let resolve = Resolve {
+            value: &resolve_value,
+            unsigned: &resolve_unsigned,
+        };
         let selector = node.expr.to_token_stream().to_string();
         // Codex's finding: an individual arm can carry its own `#[cfg(test)]`
         // (`syn::Arm` has its own `attrs`, the same as an item or a statement does),
@@ -5115,8 +5382,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             function_path: &self.function_path,
             block_path: &self.block_path,
             self_type_path: &self.self_type_path,
+            scopes_unsigned: &self.scopes_unsigned,
         };
-        let resolve = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
+        let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
+        let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
+        let resolve = Resolve {
+            value: &resolve_value,
+            unsigned: &resolve_unsigned,
+        };
         if let Some((selector, arms)) = extract_if_chain(node, &resolve) {
             self.found.push(FoundMatch { selector, arms });
             self.visit_expr(&node.cond);
