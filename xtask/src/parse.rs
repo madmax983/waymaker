@@ -1239,16 +1239,36 @@ fn find_any_opening_tag(line: &str, from: usize) -> Option<(usize, usize, &'stat
         .min_by_key(|&(start, _, _)| start)
 }
 
-/// Whether `line` contains a closing tag for `tag` (`"script"`, `"style"` or
-/// `"template"`) anywhere in it, case-insensitively.
+/// Whether `line` *itself is* a closing tag for `tag` (`"script"`, `"style"` or
+/// `"template"`), case-insensitively.
+///
+/// Required to start at byte `0` — the whole of `line`, not merely contained somewhere
+/// in it (Codex, pull request #138, round 38, finding 1, the closing-side twin of
+/// `opens_non_rendering_element`'s own fix, applied preemptively for the same reason):
+/// the callers below (`track_non_rendering_html`, `unordered_list_item_value`'s
+/// disqualify guard) only ever pass one self-contained `Event::InlineHtml` construct,
+/// never a longer line a tag can open or close partway through — that block-level case
+/// is what `find_closing_tag`'s own direct callers (`advance_past_non_rendering`) are
+/// for, searching from a cursor rather than requiring position `0`.
 fn closes_non_rendering_element(line: &str, tag: &str) -> bool {
-    find_closing_tag(line, 0, tag).is_some()
+    find_closing_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
 }
 
-/// The tag name (`"script"`, `"style"` or `"template"`) of an opening non-rendering tag
-/// found anywhere in `line`, case-insensitively.
+/// The tag name (`"script"`, `"style"` or `"template"`) of an opening non-rendering tag,
+/// if `line` *itself is* one, case-insensitively.
+///
+/// Required to start at byte `0` — the whole of `line`, not merely contained somewhere
+/// in it (Codex, pull request #138, round 38, finding 1): both callers below pass one
+/// self-contained `Event::InlineHtml` construct, and a self-contained inline construct
+/// can carry a quoted attribute whose *value* merely spells a tag opener —
+/// `<span title="<script>">decision-id headline</span>` is real, visible inline
+/// formatting a reader sees rendered as `<script>` literal text inside the title
+/// tooltip, not a genuine `<script>` element — and searching the whole string for the
+/// spelling anywhere, the way the block-level scan legitimately does across a longer
+/// line, read the browser-invisible attribute text as a real opener, suppressing the
+/// label and everything after it as though a script had truly begun.
 fn opens_non_rendering_element(line: &str) -> Option<&'static str> {
-    find_any_opening_tag(line, 0).map(|(_, _, tag)| tag)
+    find_any_opening_tag(line, 0).and_then(|(start, _, tag)| (start == 0).then_some(tag))
 }
 
 /// Opens or closes `stack` from one self-contained `Event::InlineHtml` construct —
@@ -1612,8 +1632,18 @@ fn anchor_href(html: &str) -> Option<&str> {
                 let value_start = index + marker.len();
                 let value_quote = *bytes.get(value_start)?;
                 if value_quote != b'"' && value_quote != b'\'' {
-                    index = value_start;
-                    continue;
+                    // An unquoted HTML attribute value (Codex, pull request #138, round
+                    // 38, finding 2): `<a href=tests/spine.rs>recovery proof</a>` is
+                    // real, valid HTML — a browser follows it exactly as it would a
+                    // quoted `href` — so `href=tests/spine.rs` must not be read as an
+                    // empty or absent value. It runs to the next HTML whitespace or the
+                    // tag's own closing `>`, whichever comes first; neither character is
+                    // legal inside an unquoted value.
+                    let end = html
+                        .get(value_start..)?
+                        .find(|character: char| character.is_whitespace() || character == '>')
+                        .map_or(html.len(), |offset| value_start + offset);
+                    return Some(&html[value_start..end]);
                 }
                 let value_start = value_start + 1;
                 let end = value_start + html.get(value_start..)?.find(value_quote as char)?;
@@ -2167,7 +2197,11 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // `<script>`, `<style>`, `<template>` — is excluded the same way (Codex,
             // round 30), and its own open/close tags update `open_non_rendering_tag`
             // instead of joining the cell's text: a required value placed inside one is
-            // invisible to a reader.
+            // invisible to a reader. `<br>` is a real line break, this collector's own
+            // twin of `markdown_prose`'s round-37 fix (Codex, round 38, finding 3): the
+            // fix there did not reach this independent collector, so `head<br>line`
+            // still fused into `headline` here, a literal substring a `.contains` scan
+            // could match though no reader ever sees it run together.
             Event::InlineHtml(html)
                 if !track_non_rendering_html(&html, &mut open_non_rendering_tag)
                     && in_row
@@ -2176,6 +2210,8 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                 if let Some(href) = anchor_href(&html) {
                     cell.push_str(href);
                     cell.push(' ');
+                } else if is_line_break_tag(&html) {
+                    cell.push('\n');
                 }
             }
             _ => {}

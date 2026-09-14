@@ -7195,6 +7195,42 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_tag_spelling_inside_another_tags_quoted_attribute_still_counts() {
+        // Codex, pull request #138, round 38, finding 1: `opens_non_rendering_element`
+        // searched a whole self-contained `Event::InlineHtml` construct for a tag
+        // spelling anywhere in it, not only at its own start, so a real, ordinary inline
+        // tag whose quoted attribute value merely spells one — `<span
+        // title="<script>">decision-id headline</span>` — was read as a genuine
+        // `<script>` opener. A browser renders `<span title="<script>">` as an inline
+        // span with a tooltip, showing the label plainly; treating the tooltip text as
+        // a real script open suppressed the label and everything after it, since
+        // `</span>` never matches `<script>`'s own close and the tracked state never
+        // clears. Verified via a throwaway `pulldown-cmark` probe that this source is
+        // exactly one self-contained `InlineHtml("<span title=\"<script>\">")`
+        // construct. The match is now required to start at the construct's own
+        // beginning, so quoted attribute text can no longer stand in for a real tag.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span title=\"<script>\">{} {}</span>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a tag spelling inside another tag's quoted attribute was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
     fn the_settled_decision_ids_are_unique() {
         let mut ids: Vec<&str> = SETTLED_DECISIONS.iter().map(|d| d.id).collect();
         let count = ids.len();
@@ -7707,6 +7743,58 @@ mod tests {
                 .any(|violation| violation.subject == clause.id
                     && violation.detail.contains("discharged by")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_an_unquoted_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 38, finding 2: `anchor_href` only recognized
+        // a quoted attribute value, so a legal, unquoted one — `<a
+        // href=tests/spine.rs>recovery proof</a>`, which a browser follows exactly as
+        // it would a quoted `href` — was read as carrying no destination at all. An
+        // unquoted value is not special-cased away any more; it runs to the next HTML
+        // whitespace or the tag's own closing `>`, neither of which is legal inside
+        // one.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href={}>recovery proof</a> |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_split_by_a_line_break_tag_is_reported_as_missing() {
+        // Codex, pull request #138, round 38, finding 3: the round-37 fix for `<br>`
+        // landed in `markdown_prose`; this independent collector, `table_rows`, still
+        // dropped the tag with no separator at all, so a discharge path split across a
+        // real, rendered line break — `tests/<br>spine.rs` renders as two lines,
+        // `tests/` and `spine.rs` — fused back into the literal contiguous path a
+        // `.contains` scan matched, even though a reader never sees it run together.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let (first_half, second_half) = clause
+            .discharged_by
+            .split_at(clause.discharged_by.len() / 2);
+        let split = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| {first_half}<br>{second_half} |"),
+        );
+        let violations = check_recovery_spec(Some(&split), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "a discharge path split by a `<br>` still counted: {violations:?}"
         );
     }
 
