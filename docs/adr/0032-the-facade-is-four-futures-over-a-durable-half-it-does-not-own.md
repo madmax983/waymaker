@@ -204,6 +204,15 @@ reads every declared dependency regardless of kind, and since an *enabled* optio
 dependency is then caught by both the direct check and the walk, the two findings are
 deduplicated by crate name before they are reported.
 
+**The root itself was resolved by name.** Both the direct check and the walk found
+`waymaker-drive` with a bare name search over `packages[]`, and `cargo metadata` makes no
+promise that the workspace's own package sorts ahead of a same-named dependency at another
+version or source — Codex's review found the sixth gap this way, on the same pull request.
+A decoy ahead of the real member would have let the real driver declare or reach Embassy
+with neither half noticing. `PackageGraph::find_workspace_member` closes it, checking a
+name match against `workspace_members` as well, and the walk now takes an
+already-resolved root instead of re-deriving one by name.
+
 **A second caller-owned buffer.** `Ctx` holds one for the dispatcher's answer, and the
 driver holds its own result buffer. The bytes are copied once between them. Both are the
 caller's, so §04's runtime-RAM statics gate does not move, but a device running the façade
