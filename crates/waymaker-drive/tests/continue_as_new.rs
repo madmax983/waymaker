@@ -171,6 +171,35 @@ fn install(device: &mut Device, id: BankId, generation: Generation, header: &Ban
     };
 }
 
+/// Writes a bank's header and nothing else, leaving its seal region erased.
+///
+/// The shape a device left mid-swap — staged, never sealed — rather than the finished
+/// article [`install`] and [`install_on`] both write. Used to prove that an unsealed bank's
+/// header, whatever it declares, can never cost a boot anything: [`bank::sealed_generation`]
+/// already says such a bank is not a candidate at any generation, and `read_bank` has to
+/// establish that *before* it ever holds the header's own declared length against `page`.
+fn install_header_only(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+    header: &BankHeader<'_>,
+) {
+    let region = layout.bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+}
+
 /// A device booted from bank A, generation zero, and nothing on bank B.
 fn booted() -> Device {
     let mut device = Device::new(geometry());
@@ -967,4 +996,158 @@ fn an_undersized_page_refuses_rather_than_reviving_a_retired_bank() {
     // Nothing moved: bank B, the real authority, is untouched.
     let (b_run, ..) = header_on(&mut device, BankId::B).expect("bank B is untouched");
     assert_eq!(b_run, RUN);
+}
+
+#[test]
+fn read_bank_uses_the_whole_page_for_the_header_once_the_seal_is_a_scalar() {
+    // Codex found this on round 4. The old `read_bank` reserved `seal_len` bytes out of
+    // `page` before it ever read the header, so a page sized to hold the header — and
+    // nothing besides it, not even that bank's own seal — could still be refused. The header
+    // and the seal never need to be in `page` at the same time: the seal decodes to a
+    // scalar `Seal` with no borrow of the buffer, so once it is read the whole page is free
+    // for the header. With an 8-byte program unit and a 64-byte input, the padded header
+    // needs exactly as many bytes as `page` holds; the old reservation left 16 bytes short.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    let wide_input = [b'x'; 64];
+    let header = BankHeader {
+        align: layout.align(),
+        input: &wide_input,
+        ..first_header()
+    };
+    install_on(&mut device, layout, BankId::A, Generation::FIRST, &header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(header_needed) = bank::encode_header(&header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Exactly the padded header's own length — no room for the bank's seal at all.
+    let mut page = vec![0_u8; header_needed];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: &wide_input },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "a page sized to exactly the header's own padded length must still boot, even though \
+         it has no room left over for that bank's seal: {progress:?}"
+    );
+}
+
+#[test]
+fn an_unsealed_banks_oversized_header_never_blocks_the_smaller_sealed_authority() {
+    // Codex found this on round 4, in the fix for the previous round's truncation check: it
+    // ran before the seal was ever read, so an *unsealed* bank whose stale header declares
+    // more input than this boot's page can hold produced a hard refusal — even though an
+    // unsealed bank is never a candidate at any generation and reading its header at all
+    // should have cost this boot nothing. Bank A is small and genuinely sealed, the real
+    // authority; bank B carries an oversized header with no seal behind it at all, the shape
+    // a device left mid-swap — staged, never sealed — would have.
+    let layout = layout();
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+
+    let wide_input = [b'x'; 60];
+    let wide_header = BankHeader {
+        input: &wide_input,
+        ..first_header()
+    };
+    install_header_only(&mut device, layout, BankId::B, &wide_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank A's own header and its seal, deliberately short of bank B's declared
+    // (and never-sealed) length.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank B's declared length to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "an unsealed bank's oversized header must never block booting the smaller, sealed \
+         authority: {progress:?}"
+    );
+}
+
+#[test]
+fn header_read_length_is_rounded_down_to_a_whole_read_unit() {
+    // Codex found this on round 4. Even with the seal decoded to scalar state first, a
+    // header read sized to whatever `page` happened to leave — with no rounding — can ask a
+    // conforming `StableStorage` for a length it refuses outright, even when `page` had
+    // ample room for the header several times over. 113 is not a multiple of this device's
+    // 8-byte read unit.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+    let mut page = vec![0_u8; 113];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "an ample but misaligned page must still be readable, at a length the device's own \
+         read unit accepts: {progress:?}"
+    );
 }

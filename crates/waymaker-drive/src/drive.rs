@@ -500,9 +500,10 @@ struct BankFacts {
 ///
 /// [`RecoveryError::PageTooSmall`] when `page` cannot hold the seal, or when it holds the
 /// seal but not a header whose own declared length says it needs more room than `page` gave
-/// it. Codex found both: treating either as "not a candidate" would let [`select_bank`] fall
-/// back to a lower-generation bank that did fit — silently reviving a retired run — rather
-/// than refusing an undersized page outright.
+/// it. Codex found both, and then found that the fix for the second was still wrong twice
+/// over: treating either as "not a candidate" would let [`select_bank`] fall back to a
+/// lower-generation bank that did fit — silently reviving a retired run — rather than
+/// refusing an undersized page outright.
 fn read_bank<S, C>(
     layout: BankLayout,
     id: BankId,
@@ -518,29 +519,53 @@ where
     // §10's own writer programs the seal at [`ProgramAlign::round_up`] of `SEAL_BYTES`
     // rather than `SEAL_BYTES` itself, and reads it back the same way here — a fixed
     // `[u8; SEAL_BYTES]` local is not a multiple of every geometry's read unit, and a
-    // conforming `StableStorage` may refuse a read that is not one. The header and the seal
-    // share the one page this call was handed, the same way `swap`'s own writer shares it
-    // for the seal it programs, because a device's program unit has no upper bound this
-    // driver could give a fixed local of its own.
+    // conforming `StableStorage` may refuse a read that is not one. The seal shares the one
+    // page this call was handed, the same way `swap`'s own writer shares it for the seal it
+    // programs, because a device's program unit has no upper bound this driver could give a
+    // fixed local of its own.
+    //
+    // It is read, and decoded to the scalar `Seal` it names, *before* the header ever
+    // touches `page` — Codex found both halves of what goes wrong when it is not. Decoded
+    // first, an invalid seal answers `Ok(None)` here without ever looking at this bank's
+    // header at all, so an unsealed bank — one a swap started staging and never finished
+    // sealing, say — can carry any header length whatsoever without costing this call
+    // anything: it was never a candidate, whatever its header says. And decoded to a value
+    // rather than kept as bytes, the seal's own share of `page` is free the moment this call
+    // is done with it, so the header read below gets the *whole* page rather than what a
+    // reservation for the seal left of it — which is what lets a page sized to hold a
+    // header exactly (and nothing besides, not even that bank's own seal) still read it.
     let seal_len = region.seal_bytes() as usize;
-    let Some(room_for_header) = page.len().checked_sub(seal_len) else {
+    let Some(seal_buf) = page.get_mut(..seal_len) else {
         return Err(DriveError::Recovery(RecoveryError::PageTooSmall {
             needed: seal_len,
         }));
     };
-    let header_len = room_for_header.min(payload_bytes);
-    let (header_buf, seal_page) = page.split_at_mut(header_len);
-    let Some(seal_buf) = seal_page.get_mut(..seal_len) else {
-        // Unreachable: `seal_page.len() == page.len() - header_len >= seal_len` by
-        // construction above.
+    storage
+        .read(region.seal_offset(), seal_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let Ok(seal) = bank::decode_seal_with::<C>(seal_buf) else {
+        return Ok(None);
+    };
+
+    // A whole number of the device's own read units, exactly as `recovery::Scan::stage`
+    // already rounds its page down — Codex found that a header read sized to whatever `page`
+    // happened to leave, with no such rounding, could ask a conforming `StableStorage` for a
+    // length it refuses outright even when `page` had ample room for the header.
+    let read_unit = storage.geometry().read_size();
+    let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
+    let capacity = page_bytes & !read_unit.wrapping_sub(1);
+    let header_len = (capacity.min(region.payload_bytes())) as usize;
+    let Some(header_buf) = page.get_mut(..header_len) else {
+        // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
         return Ok(None);
     };
     storage
         .read(region.base(), header_buf)
         .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
     // A header whose self-declared length reaches past what fit in `page` is refused
-    // outright rather than treated as "not a candidate" — see this function's own `Errors`
-    // section.
+    // outright rather than treated as "not a candidate" — but only now, once the seal above
+    // has already established that this bank is genuinely sealed and so is a candidate at
+    // all. See this function's own `Errors` section.
     if header_len < payload_bytes
         && matches!(
             bank::decode_header_with::<C>(header_buf),
@@ -551,12 +576,13 @@ where
             needed: payload_bytes,
         }));
     }
-    storage
-        .read(region.seal_offset(), seal_buf)
-        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
-    let Some(generation) = bank::sealed_generation_with::<C>(header_buf, seal_buf) else {
+    let Ok(expected) = bank::seal_for_with::<C>(header_buf, seal.generation) else {
         return Ok(None);
     };
+    if expected != seal {
+        return Ok(None);
+    }
+    let generation = seal.generation;
     // The seal already names this exact header's digest, so this decode cannot fail.
     // Treated as "not a candidate" rather than trusted, because the workspace denies both
     // `unwrap` and `panic!` and a decoder walking bytes off a device is the last place to
@@ -642,9 +668,17 @@ where
     W: Workflow + ?Sized,
 {
     let region = layout.bank(id);
-    let header_len = page.len().min(region.payload_bytes() as usize);
+    // Rounded down to a whole read unit, exactly as `read_bank`'s own header read is —
+    // the same fix, for the same reason: a length `read_bank` never needed to round
+    // because `select_bank` already read this bank once, but this call reads it again
+    // with its own arithmetic and a conforming `StableStorage` does not know the two
+    // calls agree.
+    let read_unit = storage.geometry().read_size();
+    let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
+    let capacity = page_bytes & !read_unit.wrapping_sub(1);
+    let header_len = (capacity.min(region.payload_bytes())) as usize;
     let Some(header_buf) = page.get_mut(..header_len) else {
-        // Unreachable: `select_bank` already read this many bytes of this same bank.
+        // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
         return Err(DriveError::NoAppendPoint);
     };
     storage
