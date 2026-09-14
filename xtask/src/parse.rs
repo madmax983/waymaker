@@ -1168,12 +1168,26 @@ fn find_opening_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
 }
 
 /// The byte range of the first closing tag for `tag` at or after `from` in `line`,
-/// case-insensitively.
+/// case-insensitively — `</tag>` or `</tag >` alike, with any whitespace HTML permits
+/// between the tag name and `>` (Codex, pull request #138, round 32, finding 2): an
+/// exact `</tag>` match left `open_non_rendering_tag` set forever against a real,
+/// legally spelled `</script >` or `</template\t>`, hiding every line after it.
 fn find_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
     let lower = line.to_ascii_lowercase();
-    let marker = format!("</{tag}>");
-    let start = from + lower.get(from..)?.find(&marker)?;
-    Some((start, start + marker.len()))
+    let marker = format!("</{tag}");
+    lower
+        .get(from..)?
+        .match_indices(&marker)
+        .find_map(|(rel, _)| {
+            let start = from + rel;
+            let after = start + marker.len();
+            let rest = lower.get(after..)?;
+            let gt = rest.find('>')?;
+            rest.get(..gt)?
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+                .then_some((start, after + gt + 1))
+        })
 }
 
 /// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
@@ -1261,35 +1275,78 @@ fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
     }
 }
 
-/// Advances past one close, or one nested reopen, of the non-rendering element `state`
-/// already carries — returning the new cursor, or `None` when neither occurs before the
-/// end of `line`, meaning the rest of the line stays hidden and `state` carries into the
-/// next line unchanged.
+/// What [`next_non_rendering_marker`] found next while a non-rendering element was open.
+enum NonRenderingAdvance {
+    /// A nested comment opened — only possible for a nesting element like `<template>`,
+    /// whose content is real, parsed HTML (Codex, round 32, finding 1). Not a real
+    /// reopen or close of the tracked element, and content-agnostic: everything here is
+    /// already hidden regardless of what the comment contains.
+    Comment(usize),
+    /// The tracked, nesting element reopened.
+    Reopen(usize),
+    /// The tracked element closed.
+    Close(usize),
+}
+
+/// The next thing relevant to a currently-open non-rendering element `tag`, at or after
+/// `cursor` in `line`.
+///
+/// For a nesting element (`<template>`, round 31, finding 3), the earliest of a comment
+/// opener, a further open of the same tag, or its close — a close tag written *inside* a
+/// comment inside the template is not a real close (round 32, finding 1):
+/// `<template><!-- </template> -->hidden</template>` keeps `hidden` inert until the
+/// real, final close. For a raw-text element (`<script>`, `<style>`), only its own
+/// close: a browser never parses anything else inside one, comment included.
+fn next_non_rendering_marker(line: &str, cursor: usize, tag: &str) -> Option<NonRenderingAdvance> {
+    let close = find_closing_tag(line, cursor, tag)
+        .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
+    if !non_rendering_element_nests(tag) {
+        return close.map(|(_, marker)| marker);
+    }
+    let reopen = find_opening_tag(line, cursor, tag)
+        .map(|(start, end)| (start, NonRenderingAdvance::Reopen(end)));
+    let comment = line[cursor..].find("<!--").map(|offset| {
+        (
+            cursor + offset,
+            NonRenderingAdvance::Comment(cursor + offset),
+        )
+    });
+    [close, reopen, comment]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(start, _)| start)
+        .map(|(_, marker)| marker)
+}
+
+/// Advances past one close, one nested reopen, or one nested comment, of the
+/// non-rendering element `state` already carries — returning the new cursor, or `None`
+/// when nothing more is found before the end of `line`, meaning the rest of the line
+/// stays hidden and `state` (and `in_html_comment`, if a comment was left open) carry
+/// into the next line unchanged.
 fn advance_past_non_rendering(
     line: &str,
     cursor: usize,
     state: &mut Option<(&'static str, u32)>,
+    in_html_comment: &mut bool,
 ) -> Option<usize> {
     let (tag, depth) = (*state)?;
-    let reopen = non_rendering_element_nests(tag)
-        .then(|| find_opening_tag(line, cursor, tag))
-        .flatten();
-    let close = find_closing_tag(line, cursor, tag);
-    let (end, opened) = match (reopen, close) {
-        (None, None) => return None,
-        (Some((_, end)), None) => (end, true),
-        (None, Some((_, end))) => (end, false),
-        (Some((open_start, open_end)), Some((close_start, close_end))) => {
-            if open_start <= close_start {
-                (open_end, true)
-            } else {
-                (close_end, false)
-            }
+    match next_non_rendering_marker(line, cursor, tag)? {
+        NonRenderingAdvance::Comment(start) => {
+            let Some(offset) = line[start..].find("-->") else {
+                *in_html_comment = true;
+                return None;
+            };
+            Some(start + offset + "-->".len())
         }
-    };
-    let depth = if opened { depth + 1 } else { depth - 1 };
-    *state = (depth > 0).then_some((tag, depth));
-    Some(end)
+        NonRenderingAdvance::Reopen(end) => {
+            *state = Some((tag, depth + 1));
+            Some(end)
+        }
+        NonRenderingAdvance::Close(end) => {
+            *state = (depth > 1).then_some((tag, depth - 1));
+            Some(end)
+        }
+    }
 }
 
 /// The visible byte ranges of one `Event::Html` line — real block-level HTML
@@ -1321,20 +1378,25 @@ fn visible_html_ranges(
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
     loop {
-        if open_non_rendering.is_some() {
-            match advance_past_non_rendering(line, cursor, open_non_rendering) {
-                Some(end) => {
-                    cursor = end;
-                    continue;
-                }
-                None => break,
-            }
-        }
+        // Checked before the open element (Codex, round 32, finding 1): a comment
+        // nested inside an open `<template>` and a comment at the top level share one
+        // flag, since the two never hold at once — resolving it first is what lets a
+        // `</template>` written *inside* such a comment be skipped rather than read as
+        // the tracked element's real close.
         if *in_html_comment {
             match line[cursor..].find("-->") {
                 Some(offset) => {
                     cursor += offset + "-->".len();
                     *in_html_comment = false;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if open_non_rendering.is_some() {
+            match advance_past_non_rendering(line, cursor, open_non_rendering, in_html_comment) {
+                Some(end) => {
+                    cursor = end;
                     continue;
                 }
                 None => break,

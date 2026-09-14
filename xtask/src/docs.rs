@@ -5313,6 +5313,76 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_template_close_tag_inside_a_comment_does_not_count() {
+        // Codex, pull request #138, round 32, finding 1: `<template>` content is real,
+        // parsed HTML — unlike `<script>`/`<style>`'s raw text — so a `</template>`
+        // written *inside* a comment there is not a real close; a browser keeps the
+        // outer template open until the genuine final close. The block form matters
+        // here: `<template>` alone on its own line is HTML block type 7, so this is one
+        // `HtmlBlock` of four separate `Event::Html` lines — `<template>`, the comment,
+        // the decision, and the real `</template>` — exercising the block-level tracker
+        // this finding is about, rather than the inline one a single-paragraph-line
+        // example would reach instead. With no second `<template` on the comment's own
+        // line to out-rank it, the close search found the literal `</template>`
+        // substring sitting inside the comment first and cleared the tracked state
+        // early, letting the decision two lines later read as ordinary visible prose
+        // while still really inside the (still open) template.
+        //
+        // `check_settled_decisions` is the vehicle, for `a_decision_after_a_commented_
+        // out_script_still_counts`'s reason: `check_deferred_questions` pre-strips
+        // comments before ever reaching `markdown_prose`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<!-- </template> -->\n{}\n</template>\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision after a template close tag inside a comment still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_script_closed_with_trailing_whitespace_does_settle() {
+        // Codex, pull request #138, round 32, finding 2: `</script >` and
+        // `</template\t>` are legally spelled close tags — HTML permits whitespace
+        // between a tag name and its `>` — but an exact `</tag>` string search never
+        // recognized either, so `open_non_rendering_tag` stayed set forever and every
+        // line after was wrongly hidden, producing a false documentation violation for
+        // a marker that really does settle the question.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-script-closed-with-whitespace.md".to_owned(),
+            contents: format!(
+                "{}\n<script>ignore this</script >\n\n{DEFERRED_QUESTION_MARKER} {}\n",
+                clean_adr("script closed with whitespace"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == question.id),
+            "a marker after a script closed with trailing whitespace did not settle: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_before_a_same_line_script_still_counts() {
         // Codex, pull request #138, round 31, finding 1: when one `Event::Html` line
         // opens and closes a non-rendering element without the whole line being
