@@ -8512,6 +8512,7 @@ fn check_integrity_check_module_tree(
         }
 
         check_checksum_module_macros(scanned, &mut violations);
+        check_checksum_module_crate_root_patterns(scanned, &mut violations);
 
         let prefix = prefixes
             .iter()
@@ -8585,6 +8586,57 @@ fn check_checksum_module_macros(
             format!(
                 "{} could not be parsed ({error}) while scanning for macros; an unreadable \
                  source fails closed rather than approving what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
+}
+
+/// [`check_integrity_check_module_tree`]'s crate-root-pattern half, factored out to keep
+/// that function under clippy's line count: every bare `crate::NAME` pattern `scanned`
+/// writes, pushed as a violation.
+///
+/// Codex's thirty-fifth-round finding: `resolve_anchored_single_segment` resolves
+/// `crate::NAME` as always-unresolved — correctly, since the checksum module is itself
+/// `crate::crc` rather than the crate's true root — but [`missing_value`] and
+/// [`fully_dense_arm_patterns`] both fail a match's *entire* dense-table check the moment
+/// any one arm is unresolved. A table built from `crate::P0` through `crate::P15` would
+/// never be recognised as dense at all, and would pass every check above by looking
+/// exactly like an ordinary match this scan simply could not follow. Rather than
+/// reasoning about what such a pattern resolves to, its mere presence is refused outright
+/// — the checksum module has every constant it needs inside the tree this scan already
+/// reads, so it has no legitimate reason to pattern-match against its crate's own root.
+fn check_checksum_module_crate_root_patterns(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::crate_root_pattern_uses(&scanned.contents) {
+        Ok(patterns) => {
+            for name in patterns {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} matches the pattern `{name}`, anchored at the crate's own \
+                         root — a constant this scan's own tree cannot see the value of, \
+                         so a match built from a run of such patterns would never be \
+                         recognised as the dense table it might be; the checksum module's \
+                         own tree holds every constant it needs, so it may pattern-match \
+                         against none outside it",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for crate-root patterns; \
+                 an unreadable source fails closed rather than approving what it cannot see",
                 scanned.path.replace('\\', "/")
             ),
         )),
@@ -16086,6 +16138,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_match_pattern_naming_the_crate_root_is_reported_even_though_it_is_never_recognised_as_dense()
+     {
+        // Codex's thirty-fifth-round finding: the previous test correctly made
+        // `crate::NAME` always fail closed to unresolved, rather than answering it by
+        // coincidence against the wrong module. But `missing_value` and
+        // `fully_dense_arm_patterns` both fail a match's *entire* dense-table check the
+        // moment any single arm is unresolved, which turns "unresolved" into
+        // "invisible": a table built from `crate::P0` through `crate::P3`, naming real
+        // constants this scan's own tree cannot see the value of, is never recognised
+        // as dense and so is never reported by the dense-match check at all — the
+        // previous test's own fixture is exactly this shape, and asserted only that the
+        // *dense-match* violation was absent, which is still true and still correct on
+        // its own terms. What was missing is a check that does not need to resolve the
+        // pattern to distrust it: a bare `crate::NAME` pattern is refused outright,
+        // regardless of whether the match around it turns out to look dense.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_qualified_pattern_table_again(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        crate::P0 => 0,\n        crate::P1 => 1,\n        \
+             crate::P2 => 2,\n        crate::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("matches the pattern `crate::P0`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_qualified_with_crate_never_resolves_relative_to_the_current_module() {
         // Codex's twenty-fifth-round finding: stripping `crate` the same way `self` is
         // stripped lost the one fact that made it worth reading — `crate::crc::indices::P0`
@@ -16495,6 +16578,52 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_in_one_function_is_not_hidden_by_a_same_named_local_module_in_another() {
+        // Codex's thirty-fifth-round finding: two different functions each declaring
+        // their own local `mod indices { .. }` recorded their constants under one
+        // identical key — `module_path::indices::P0` — because nothing distinguished
+        // which function a function-local module sat inside. The later-visited
+        // function's own values silently overwrote the earlier one's, so a match inside
+        // the *first* function read the *second* function's values instead of its own.
+        //
+        // `helper_b` is nested directly inside `helper_a`, between `helper_a`'s own
+        // `mod indices` and `helper_a`'s own match, so the corrupting insert lands
+        // exactly between the two: `helper_b`'s local `indices` gives all four constants
+        // the identical value `0`, which is not what makes this reproduction observable
+        // (a corrupted-but-still-contiguous read would still be flagged as dense) — it
+        // is chosen non-dense on purpose, so that reading it by mistake collapses
+        // `helper_a`'s four distinct arm patterns into one repeated value and the dense
+        // table search finds no contiguous window to point a wildcard at. Read
+        // correctly, `helper_a`'s own match is `0..=3` over its own `indices` and is
+        // exactly the kind of table this gate exists to catch; read from `helper_b`'s
+        // leftover values it would instead look like four duplicate arms and slip past
+        // undetected — the dangerous direction, a real table the gate silently stopped
+        // seeing rather than a table it wrongly flagged.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn helper_a(nibble: u8) -> u32 {\n    mod indices {\n        \
+             pub(crate) const P0: u8 = 0;\n        pub(crate) const P1: u8 = 1;\n        \
+             pub(crate) const P2: u8 = 2;\n        pub(crate) const P3: u8 = 3;\n    \
+             }\n\n    const fn helper_b(inner: u8) -> u32 {\n        mod indices {\n            \
+             pub(crate) const P0: u8 = 0;\n            pub(crate) const P1: u8 = 0;\n            \
+             pub(crate) const P2: u8 = 0;\n            pub(crate) const P3: u8 = \
+             0;\n        }\n        match inner & 0xF {\n            indices::P0 => 0,\n            \
+             _ => 1,\n        }\n    }\n\n    let _ = helper_b(nibble);\n    match nibble & 0xF \
+             {\n        indices::P0 => collision_helper(0),\n        indices::P1 => \
+             collision_helper(1),\n        indices::P2 => collision_helper(2),\n        \
+             indices::P3 => collision_helper(3),\n        _ => collision_helper(4),\n    \
+             }\n}\n\nconst fn collision_helper(value: u32) -> u32 {\n    value\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_singleton_range_patterns_is_reported() {
         // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
         // `Pat::Range`, including an inclusive range whose two ends are the same integer —
@@ -16508,6 +16637,36 @@ mod deferred_answer_pins {
              {\n        0..=0 => singleton_range_helper(0),\n        \
              1..=1 => singleton_range_helper(1),\n        2..=2 => \
              singleton_range_helper(2),\n        _ => singleton_range_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_wide_half_open_range_patterns_is_reported() {
+        // Codex's thirty-fifth-round finding: a *closed* range (`0..=1`) widens to every
+        // value it covers, but a half-open one (`0..2`, naming the identical two values)
+        // still fell through every arm of `pattern_literal`'s `Pat::Range` case and read
+        // as unresolved — the same shape of gap the singleton test just above this one
+        // closed for a range's own single-value form, left open for any half-open range
+        // wider than that. `rustc` lowers `0..2 | 2..4 | ...` to the identical indexed
+        // table a fully-spelled `0 | 1 | 2 | 3 | ...` gets, so a table spelled with
+        // half-open pairs is exactly as dense and needs no different treatment: each of
+        // the three numbered arms here covers two values — `0..2`, `2..4` and `4..6` —
+        // with a wildcard for the one value (`6`) none of them leaves covered, and four
+        // arms in total to clear `MINIMUM_DENSE_TABLE_ARMS`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn half_open_pair_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn half_open_pair_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0..2 => half_open_pair_helper(0),\n        \
+             2..4 => half_open_pair_helper(1),\n        4..6 => half_open_pair_helper(2),\n        \
+             _ => half_open_pair_helper(3),\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(

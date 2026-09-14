@@ -1016,6 +1016,95 @@ pub fn macro_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
     Ok(visitor.found)
 }
 
+/// Every `crate::NAME` pattern `contents` writes — a bare two-segment path, anchored at
+/// the crate root, with no qualified-self half — in source order.
+///
+/// Items and `impl` members under exactly `#[cfg(test)]` are skipped, the same
+/// structural exclusion [`macro_uses`] makes.
+///
+/// Codex's thirty-fifth-round finding: `resolve_anchored_single_segment` resolves
+/// `crate::NAME` as always-unresolved, on purpose — the checksum module is itself
+/// `crate::crc`, one submodule below the crate's true root, so `crate::NAME` names a
+/// constant this scan's own tree never reaches. But `missing_value` and
+/// `fully_dense_arm_patterns` (in `crate::source`) both fail an *entire* match as "not
+/// dense" the moment any one arm's pattern is unresolved — correct for a stray
+/// unresolvable pattern, and exactly the gap a real table could be built behind: sixteen
+/// arms reading `crate::P0` through `crate::P15`, naming real constants this scan simply
+/// cannot see the value of, pass every dense-match check here by never being recognised
+/// as dense at all. A checksum module has no legitimate reason to pattern-match on its
+/// own crate's root — every constant this scan needs to resolve lives inside the tree it
+/// already reads — so rather than reasoning about what such a pattern might resolve to,
+/// `check_checksum_module_crate_root_patterns` (also in `crate::source`) refuses its mere
+/// presence outright, the same way [`macro_uses`]'s caller refuses a macro rather than
+/// trying to see through it.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
+    struct CrateRootPatterns {
+        found: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CrateRootPatterns {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            for stmt in &node.stmts {
+                if stmt_is_cfg_test(stmt) {
+                    continue;
+                }
+                self.visit_stmt(stmt);
+            }
+        }
+
+        // `syn` gives a path pattern (`Color::Red`) and a path *expression*
+        // (`Color::Red` used as a value) the identical underlying type — `PatPath` is a
+        // type alias for `ExprPath` — so `Pat::Path`'s own generated dispatch calls
+        // `visit_expr_path` rather than a pattern-specific method, and overriding that
+        // method would catch an ordinary `crate::foo()` call just as readily as a match
+        // arm. `visit_pat` is overridden instead, matched on the `Path` variant
+        // specifically, so only a path that is actually written in pattern position is
+        // ever reported; the default recursion still runs afterward, unconditionally, so
+        // a `crate::NAME` nested inside an or-pattern or a reference pattern is still
+        // found by the same walk that reaches it.
+        fn visit_pat(&mut self, node: &'ast syn::Pat) {
+            if let syn::Pat::Path(path_expr) = node {
+                if path_expr.qself.is_none() {
+                    let segments: Vec<String> = path_expr
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| ident_name(&segment.ident))
+                        .collect();
+                    if segments.len() == 2 && segments.first().map(String::as_str) == Some("crate")
+                    {
+                        self.found.push(segments.join("::"));
+                    }
+                }
+            }
+            syn::visit::visit_pat(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = CrateRootPatterns { found: Vec::new() };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
 /// Every name a file uses: all identifiers in source order, and all paths with `use`
 /// aliases resolved.
 ///
@@ -1705,6 +1794,7 @@ pub fn match_expressions_with_prefix(
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
+        function_path: Vec::new(),
         qualified: external_qualified.clone(),
         found: Vec::new(),
     };
@@ -1773,6 +1863,7 @@ pub fn qualified_constants_with_prefix(
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
+        function_path: Vec::new(),
         qualified,
         found: Vec::new(),
     };
@@ -2198,9 +2289,10 @@ fn literal_or_const_value(
 /// the same lookup table a bare-literal version would, and was read as a range (which is
 /// genuinely not one of the shapes a dense table's *patterns* take, hence not accepted for
 /// any width wider than one value) rather than as the single integer it singles out. A
-/// half-open range (`0..1`) is not a singleton by this test even though it also names one
-/// value, because treating it as one would have to know the element type's own successor
-/// function, which this scan has no reason to.
+/// half-open range (`0..1`) is a singleton by exactly the same reasoning — it names one
+/// fewer value than its own closed twin `0..=1` — and a later round widened both closed
+/// and half-open ranges to their full span rather than singletons alone, so this is now
+/// the single-value case of that wider handling rather than a case of its own.
 ///
 /// An at-binding (`_p0 @ 0`) resolves to whatever its own subpattern does, recursively —
 /// Codex's finding: the binding name is incidental to the value the arm matches, and MSRV
@@ -2269,10 +2361,21 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // type's successor function to check. Widening a *closed* range needs no such
         // thing: `start..=end` is exactly the consecutive integers from `start` to `end`
         // in this scan's own `i128` representation, regardless of what the pattern's
-        // real type is, so every value in that span is generated directly. Still scoped
-        // to closed ranges alone — a half-open range (`0..2`) is left unresolved, the
-        // same standing it already had.
-        syn::Pat::Range(range) if matches!(range.limits, syn::RangeLimits::Closed(_)) => {
+        // real type is, so every value in that span is generated directly.
+        //
+        // Codex's next-round finding: the same reasoning applies just as directly to a
+        // *half-open* range, and the earlier caution about needing the pattern's real
+        // type's own successor function does not actually hold either of them — the
+        // successor structure this scan already relies on for a closed range's own
+        // interior values (`start`, `start + 1`, ..., `end`) is exactly the one integer
+        // ranges have, and `0..2` names precisely the two values `0..=1` does, with no
+        // further knowledge of the pattern's real type needed than the closed case
+        // already assumes. A half-open range therefore widens to the closed range one
+        // step short of its own exclusive end (`checked_sub(1)`, so an empty range like
+        // `0..0` correctly resolves to no values rather than a negative-width one), and
+        // is folded into the identical closed-range handling below rather than kept as a
+        // second, narrower case.
+        syn::Pat::Range(range) => {
             let Some(start) = range
                 .start
                 .as_deref()
@@ -2287,16 +2390,23 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             else {
                 return Vec::new();
             };
+            let inclusive_end = match range.limits {
+                syn::RangeLimits::Closed(_) => Some(end),
+                syn::RangeLimits::HalfOpen(_) => end.checked_sub(1),
+            };
+            let Some(inclusive_end) = inclusive_end else {
+                return Vec::new();
+            };
             // Bounded before it is generated: a span too wide to fit a `usize`, or one
             // whose width cannot even be computed, is not a dense table any real
             // integer pattern could name, and is refused rather than attempted.
-            let fits = end
+            let fits = inclusive_end
                 .checked_sub(start)
                 .is_some_and(|span| usize::try_from(span).is_ok());
-            if start > end || !fits {
+            if start > inclusive_end || !fits {
                 return Vec::new();
             }
-            (start..=end).collect()
+            (start..=inclusive_end).collect()
         }
         // Codex's finding: a reference pattern (`&0`) is exactly as singleton a value as
         // its own referent, over a scrutinee that is itself a reference — a shape a dense
@@ -2654,6 +2764,7 @@ fn resolve_pattern_path(
     qualified: &std::collections::HashMap<String, i128>,
     module_path: &[String],
     module_scope_depths: &[usize],
+    function_path: &[String],
 ) -> Option<i128> {
     if let Some(ident) = path.get_ident() {
         let name = ident_name(ident);
@@ -2669,6 +2780,7 @@ fn resolve_pattern_path(
                 qualified,
                 module_path,
                 module_scope_depths,
+                function_path,
             );
         }
         // Codex's finding: a name reached only through `use indices::*;` was recorded
@@ -2691,6 +2803,7 @@ fn resolve_pattern_path(
                 qualified,
                 module_path,
                 module_scope_depths,
+                function_path,
             ) {
                 return Some(value);
             }
@@ -2722,6 +2835,7 @@ fn resolve_pattern_path(
                     qualified,
                     module_path,
                     module_scope_depths,
+                    function_path,
                 ) {
                     return Some(value);
                 }
@@ -2754,6 +2868,35 @@ fn resolve_pattern_path(
     if relevant.len() == 1 {
         return relevant.first().and_then(|name| scopes.resolve(name));
     }
+    // Codex's finding: two different functions each declaring their own local
+    // `mod indices { .. }` recorded their constants under the identical key
+    // `module_path::indices::P0`, because nothing distinguished which function a
+    // function-local module sat inside — the later-visited function's values silently
+    // overwrote the earlier one's. `function_path` is appended after `module_path` here,
+    // for this lookup only, mirroring how `MatchVisitor`'s own insertion sites now build
+    // the matching key; `resolve_anchored_single_segment`, above, deliberately keeps
+    // receiving the unmodified `module_path` instead, since a function is not a module
+    // and `self`/`super`/`crate` arithmetic must not treat it as one.
+    //
+    // The function-qualified attempt is tried first and not exclusively: a function body
+    // can reference a `mod` declared at ordinary module scope — a sibling of the function
+    // itself, not nested inside it — exactly as freely as code outside any function can,
+    // and that is by far the common case in this scan's own fixtures. Requiring
+    // `function_path` to match unconditionally broke every one of those; falling back to
+    // the plain `module_path` when the function-qualified key finds nothing is what keeps
+    // both true at once, in the same order Rust's own name resolution would use: the
+    // innermost declaration in scope wins, and only a real collision between two
+    // same-named function-local modules is what this fallback cannot silently paper over,
+    // because each such module was keyed under its own function's name and neither can be
+    // reached from the other's `function_path`.
+    let mut combined_module = module_path.to_vec();
+    combined_module.extend(function_path.iter().cloned());
+    if let Some(value) = resolve_qualified_path(path, qualified, &combined_module) {
+        return Some(value);
+    }
+    if function_path.is_empty() {
+        return None;
+    }
     resolve_qualified_path(path, qualified, module_path)
 }
 
@@ -2780,6 +2923,22 @@ struct MatchVisitor {
     use_scopes: UseScopes,
     module_path: Vec<String>,
     module_scope_depths: Vec<usize>,
+    /// The stack of enclosing `fn`/method names entered so far — pushed and popped by
+    /// `visit_item_fn`/`visit_impl_item_fn` the same way `module_path` is by
+    /// `visit_item_mod`, but never mixed into `module_path` or `module_scope_depths`
+    /// themselves. Codex's finding: two *different* functions each declaring their own
+    /// local `mod indices { .. }` had their constants collide under one identical key
+    /// (`crc::indices::P0`), since neither `module_path` nor anything else recorded
+    /// which function a local module sat inside — the later-visited function's own
+    /// values silently overwrote the earlier one's, so a match inside the *first*
+    /// function could read the *second* function's values. This field is what makes the
+    /// two distinguishable, appended after `module_path` wherever a local declaration is
+    /// indexed or a bare qualified reference is looked up — but never handed to
+    /// `resolve_anchored_single_segment`, whose `self`/`super`/`crate` arithmetic is
+    /// stated purely in terms of *module* nesting and must not learn that a function
+    /// scope is a module boundary, which it is not in real Rust: `super::` inside a
+    /// function still names the function's *enclosing module*, not the function itself.
+    function_path: Vec<String>,
     qualified: std::collections::HashMap<String, i128>,
     found: Vec<FoundMatch>,
 }
@@ -2799,16 +2958,45 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         syn::visit::visit_impl_item(self, item);
     }
 
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        // Pushed and popped the same way `visit_item_mod` maintains `module_path`, so a
+        // local module declared in this function's body — and any bare or qualified
+        // reference to its constants written inside the same function — is keyed and
+        // resolved against a path that names *this* function, distinguishing it from an
+        // unrelated function elsewhere that happens to declare a same-named local module.
+        self.function_path.push(ident_name(&node.sig.ident));
+        syn::visit::visit_item_fn(self, node);
+        self.function_path.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.function_path.push(ident_name(&node.sig.ident));
+        syn::visit::visit_impl_item_fn(self, node);
+        self.function_path.pop();
+    }
+
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         let Some((_, items)) = &node.content else {
             syn::visit::visit_item_mod(self, node);
             return;
         };
         let scope = resolve_scope_consts(&item_const_exprs(items), &self.scopes);
+        // Codex's finding: two different functions each declaring their own local
+        // `mod indices { .. }` are both real modules named `indices` under the same
+        // ancestor `module_path`, so keying solely on `module_path` (below) let the
+        // later-visited function's constants silently overwrite the earlier one's under
+        // one identical string. `function_path` — empty outside any function body — is
+        // spliced in ahead of this module's own freshly pushed name so the two stay
+        // distinct, without changing `module_path` itself, which `visit_item_mod`'s own
+        // recursive walk and `resolve_ancestor_single_segment`'s ancestor arithmetic still
+        // need to see as pure module nesting.
+        let mut key_path = self.module_path.clone();
+        key_path.extend(self.function_path.iter().cloned());
+        key_path.push(ident_name(&node.ident));
         self.module_path.push(ident_name(&node.ident));
         for (name, value) in &scope {
             self.qualified
-                .insert(format!("{}::{name}", self.module_path.join("::")), *value);
+                .insert(format!("{}::{name}", key_path.join("::")), *value);
         }
         self.scopes.0.push(scope);
         self.use_scopes.0.push(item_use_imports(items));
@@ -2847,6 +3035,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 if let Some(segment) = type_path.path.segments.first() {
                     let scope = resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
                     let mut path = self.module_path.clone();
+                    path.extend(self.function_path.iter().cloned());
                     path.push(ident_name(&segment.ident));
                     for (name, value) in &scope {
                         self.qualified
@@ -2880,6 +3069,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             let use_scopes = &self.use_scopes;
             let module_path = &self.module_path;
             let module_scope_depths = &self.module_scope_depths;
+            let function_path = &self.function_path;
             let qualified_snapshot = self.qualified.clone();
             let resolve = |path: &syn::Path| {
                 resolve_pattern_path(
@@ -2889,9 +3079,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     &qualified_snapshot,
                     module_path,
                     module_scope_depths,
+                    function_path,
                 )
             };
             let mut enum_path = self.module_path.clone();
+            enum_path.extend(self.function_path.iter().cloned());
             enum_path.push(ident_name(&node.ident));
             let mut next: i128 = 0;
             let mut found = Vec::new();
@@ -2951,6 +3143,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let qualified = &self.qualified;
         let module_path = &self.module_path;
         let module_scope_depths = &self.module_scope_depths;
+        let function_path = &self.function_path;
         let resolve = move |path: &syn::Path| {
             resolve_pattern_path(
                 path,
@@ -2959,6 +3152,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 qualified,
                 module_path,
                 module_scope_depths,
+                function_path,
             )
         };
         let selector = node.expr.to_token_stream().to_string();
