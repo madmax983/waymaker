@@ -18711,6 +18711,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_blocks_with_an_ignored_let_binding_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let _ =
+        // core::marker::PhantomData::<()>; 0 };` holds a statement `block_let_exprs`
+        // correctly leaves unresolved — its pattern is `_`, binding no name a later
+        // expression could reference — but `evaluate_block`'s own statement-count check
+        // could not tell that apart from a statement it genuinely could not fold, so the
+        // whole block was refused rather than only what the wildcard binding actually
+        // costs it: nothing, since a real `let _ = EXPR;` never reads `EXPR`'s value again.
+        // `block_ignored_let_count` counts such statements instead of trying to resolve
+        // them, so the statement-count check no longer conflates "unresolvable" with
+        // "resolves to nothing on purpose".
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ignored_let_binding_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { let _ = core::marker::PhantomData::<()>; 0 };\n    \
+             const P1: u8 = { let _ = core::marker::PhantomData::<()>; 1 };\n    \
+             const P2: u8 = { let _ = core::marker::PhantomData::<()>; 2 };\n    \
+             const P3: u8 = { let _ = core::marker::PhantomData::<()>; 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_labelled_block_pattern_constants_is_reported() {
         // Codex's next-round finding: `const P0: u8 = 'value: { break 'value 0 };` is a
         // *labelled block* (stable since Rust 1.65) — the other construct, beside a loop, a

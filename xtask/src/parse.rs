@@ -2362,6 +2362,50 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
         .collect()
 }
 
+/// The count of every plain `let _ = EXPR;` declared *directly* as a statement in `block` —
+/// a value-discarding binding, counted rather than resolved, since nothing later in the
+/// block can reference a name a wildcard pattern never bound.
+///
+/// Codex's next-round finding: `const P0: u8 = { let _ = core::marker::PhantomData::<()>; 0
+/// };` holds a statement [`block_let_exprs`] correctly leaves out of its own map — its
+/// pattern is `_`, not a name that function's own binding rule can bind — but
+/// [`evaluate_block`]'s own statement-count check has no way to tell "a statement this scan
+/// cannot fold" from "a statement that folds to nothing on purpose", so the whole block was
+/// refused rather than only a block genuinely holding the former. Counted here instead of
+/// resolved: a real `let _ = EXPR;` never reads `EXPR`'s own value again, so this scan does
+/// not need to fold it either — only to know the statement was legitimately accounted for.
+/// Scoped the same way [`block_let_exprs`] is: no `#[cfg(test)]` statement, and no
+/// `let-else` diverge arm, whose reachability this scan does not decide.
+fn block_ignored_let_count(block: &syn::Block) -> usize {
+    fn is_wildcard(pat: &syn::Pat) -> bool {
+        match pat {
+            syn::Pat::Type(pat_type) => is_wildcard(&pat_type.pat),
+            syn::Pat::Wild(_) => true,
+            _ => false,
+        }
+    }
+
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return false;
+            };
+            if has_cfg_test(&local.attrs) {
+                return false;
+            }
+            let Some(init) = local.init.as_ref() else {
+                return false;
+            };
+            if init.diverge.is_some() {
+                return false;
+            }
+            is_wildcard(&local.pat)
+        })
+        .count()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -2837,8 +2881,9 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     if locals.len() != combined_len {
         return None;
     }
+    let ignored_lets = block_ignored_let_count(block);
     let (tail, rest) = block.stmts.split_last()?;
-    if rest.len() != locals.len() {
+    if rest.len() != locals.len() + ignored_lets {
         return None;
     }
     let syn::Stmt::Expr(tail_expr, None) = tail else {
