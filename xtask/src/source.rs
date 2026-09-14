@@ -8490,6 +8490,13 @@ fn check_integrity_check_module_tree(
     // `resolve_scope_consts`'s own bounded fixed point) is exact rather than a heuristic
     // cutoff, and a pass that adds nothing new stops the loop early.
     let mut qualified = std::collections::HashMap::new();
+    // Codex's next-round finding: `qualified_unsigned` was never collected here at all, so
+    // every caller downstream had nothing to thread through but an empty map — a qualified
+    // constant's own unsignedness stayed invisible to any match outside the one file that
+    // declared it, however far `qualified` itself had already reached across the tree.
+    // Collected in lockstep with `qualified`, at the identical key, from the identical
+    // fixed-point pass: `qualified_constants_with_prefix` now returns both maps together.
+    let mut qualified_unsigned = std::collections::HashMap::new();
     let prefixes = module_path_prefixes(sources, source).unwrap_or_default();
     for _ in 0..scanned_sources.len().max(1) {
         let mut progressed = false;
@@ -8498,14 +8505,18 @@ fn check_integrity_check_module_tree(
                 .iter()
                 .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
                 .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
-            if let Ok(found) = crate::parse::qualified_constants_with_prefix(
+            if let Ok((found, found_unsigned)) = crate::parse::qualified_constants_with_prefix(
                 &scanned.contents,
                 &prefix,
                 &qualified,
+                &qualified_unsigned,
             ) {
                 for (name, value) in found {
-                    if qualified.insert(name, value).is_none() {
+                    if qualified.insert(name.clone(), value).is_none() {
                         progressed = true;
+                    }
+                    if let Some(unsigned) = found_unsigned.get(&name) {
+                        qualified_unsigned.insert(name, *unsigned);
                     }
                 }
             }
@@ -8546,6 +8557,7 @@ fn check_integrity_check_module_tree(
         check_checksum_module_dense_matches(
             scanned,
             &qualified,
+            &qualified_unsigned,
             &prefix,
             &mut allowed_table_hits,
             &mut violations,
@@ -8727,6 +8739,7 @@ fn check_checksum_module_const_call_initializers(
 fn check_checksum_module_dense_matches(
     scanned: &crate::size::LayerSource,
     qualified: &std::collections::HashMap<String, i128>,
+    qualified_unsigned: &std::collections::HashMap<String, bool>,
     prefix: &[String],
     allowed_table_hits: &mut [usize],
     violations: &mut Vec<Violation>,
@@ -8734,22 +8747,26 @@ fn check_checksum_module_dense_matches(
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
-    let matches =
-        match crate::parse::match_expressions_with_prefix(&scanned.contents, qualified, prefix) {
-            Ok(matches) => matches,
-            Err(error) => {
-                violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "{} could not be parsed ({error}); an unreadable source fails closed \
+    let matches = match crate::parse::match_expressions_with_prefix(
+        &scanned.contents,
+        qualified,
+        qualified_unsigned,
+        prefix,
+    ) {
+        Ok(matches) => matches,
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} could not be parsed ({error}); an unreadable source fails closed \
                      rather than approving what it cannot see",
-                        scanned.path.replace('\\', "/")
-                    ),
-                ));
-                return;
-            }
-        };
+                    scanned.path.replace('\\', "/")
+                ),
+            ));
+            return;
+        }
+    };
     for found in &matches {
         if !has_dense_arm_patterns(found) {
             continue;
@@ -20218,6 +20235,72 @@ mod deferred_answer_pins {
              const BASE: u128 = (1u128 << 126) + (1u128 << 126);\n    \
              const P0: u128 = (BASE / BASE) * 0;\n    const P1: u128 = (BASE / BASE) * 1;\n    \
              const P2: u128 = (BASE / BASE) * 2;\n    const P3: u128 = (BASE / BASE) * 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_cross_file_qualified_typed_constant_is_pruned_as_dead() {
+        // Codex's next-round finding: an earlier round already gave `MatchVisitor` its own
+        // `qualified_unsigned` mirror of `qualified`, so a guard qualified against an
+        // *inline* `mod bounds { .. }` this same file declares already folds — but
+        // `check_integrity_check_module_tree`'s own tree-wide `qualified` map, collected
+        // from every file of the checksum module tree before any file is checked for a
+        // dense match, had no unsignedness counterpart at all: `match_expressions_with_prefix`
+        // was still seeded with an empty map regardless of what `qualified_unsigned` the
+        // visitor itself would have produced. `bounds::HI` declared in a sibling
+        // *out-of-line* `bounds.rs` therefore answered `false` for its own unsignedness no
+        // matter how it was declared, because the file that would answer honestly was never
+        // the file being checked. `qualified_constants_with_prefix` now returns its own
+        // `qualified_unsigned` alongside `qualified`, collected across the tree the same
+        // fixed-point pass already collects `qualified` with, and threaded through to
+        // `match_expressions_with_prefix` instead of an empty map.
+        let parent = format!(
+            "{}\nmod bounds;\n\nconst fn cross_file_qualified_dead_guard_table(nibble: u8) -> \
+             u32 {{\n    match nibble {{\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if bounds::HI < bounds::ZERO => 999,\n        \
+             _ => 3,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let bounds = "//! Bounds.\npub(crate) const HI: u128 = 1u128 << 127;\n\
+                       pub(crate) const ZERO: u128 = 0;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/bounds.rs", bounds),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_bitwise_negated_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `is_definitely_unsigned` recognised a suffixed
+        // literal, a cast, a bare path and a handful of binary operators, but not
+        // `Expr::Unary(Not)` — `!x` flips every bit of `x` without changing its type, so
+        // `(!0u128) >> 127` names an operand this function fell through to `false` for even
+        // though nothing about its type is ambiguous: it is exactly `0u128`'s own type.
+        // `evaluate_shift_op` therefore declined to reinterpret the shift's own left
+        // operand as `u128`, and `(!0u128) >> 127` — which is `1`, the same top bit
+        // `u128::MAX >> 127` already tests via a different route to the same all-ones
+        // pattern — stayed unresolved. `is_definitely_unsigned` now recurses through `!`
+        // the same way it already does through a binary operator's own operands.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_unsigned_shift_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = (!0u128) >> 127;\n    const P0: u128 = 40 / Q;\n    \
+             const P1: u128 = 41 / Q;\n    const P2: u128 = 42 / Q;\n    const P3: u128 = 43 / Q;\n    \
              match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
              P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
         );
