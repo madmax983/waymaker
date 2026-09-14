@@ -1,4 +1,4 @@
-# ADR 0047: the rig's four owed rows close on authority, not a mark
+# ADR 0048: the rig's four owed rows close on authority, not a mark
 
 - Status: accepted
 - Date: 2026-09-14
