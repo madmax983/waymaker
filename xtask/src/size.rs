@@ -3499,13 +3499,17 @@ fn local_module_names(source: &str) -> HashSet<String> {
 /// still fall back to the crate-wide private-trait check, exactly as before this
 /// function existed.
 ///
-/// A floor, not a proof, in two ways issue [#180](https://github.com/madmax983/waymaker/issues/180)
-/// tracks. `use_aliases` flattens every inline module's imports into one set for
-/// the whole file, so an import nested in one module can settle a name for an
-/// unrelated impl elsewhere in the same file. And a root-renaming import — `use
-/// serde as wire;` — is not credited to `wire` at all, since `external_roots`
-/// only names a dependency by its own declared name or rename, never by an
-/// import alias a file gives it.
+/// An absolute import — `use ::serde::Serialize;` — is credited whatever
+/// `external_roots` says: a leading `::` resolves through the extern prelude
+/// alone, so a program that compiles at all can only have named a real crate
+/// root there, immune to any local shadow. Codex found this on this pull
+/// request's own review, after the same fix already existed for `impl` paths.
+///
+/// A floor, not a proof, in one further way issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180) tracks. `use_aliases`
+/// flattens every inline module's imports into one set for the whole file, so an
+/// import nested in one module can settle a name for an unrelated impl elsewhere
+/// in the same file.
 fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> HashSet<String> {
     crate::parse::use_aliases(source)
         .unwrap_or_default()
@@ -3514,7 +3518,7 @@ fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> Ha
             alias
                 .target
                 .first()
-                .is_some_and(|first| external_roots.contains(first))
+                .is_some_and(|first| alias.absolute || external_roots.contains(first))
         })
         .map(|alias| alias.local)
         .collect()
@@ -7551,6 +7555,39 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["run"]);
+    }
+
+    #[test]
+    fn an_absolute_import_is_credited_despite_a_local_module_shadow() {
+        // `lib.rs` declares its own `mod serde { .. }`, shadowing `serde` in
+        // its own scope. `use ::serde::Serialize;` opts out of that shadow
+        // with a leading `::`, so the unqualified `impl Serialize for Bank`
+        // that follows still names the real dependency's trait. Codex found
+        // this on this pull request's own review, after the same fix already
+        // existed for `impl` paths.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod serde {\n\
+                       \x20   pub(crate) trait Serialize {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       use ::serde::Serialize;\n\
+                       \n\
+                       impl Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
     }
 
     #[test]
