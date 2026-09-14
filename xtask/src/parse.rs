@@ -1366,13 +1366,66 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
     Some(value.value())
 }
 
+/// True if `text` is a string or byte-string literal.
+///
+/// The four forms this function matches:
+/// - `"..."` — a string
+/// - `r"..."` or `r#"..."#` — a raw string
+/// - `b"..."` — a byte string
+/// - `br"..."` or `br#"..."#` — a raw byte string
+///
+/// A char literal (`'x'`) or a byte literal (`b'x'`) holds one character. It cannot
+/// spell a callee name. This function does not match these two forms.
+fn is_string_literal(text: &str) -> bool {
+    let text = text.strip_prefix('b').unwrap_or(text);
+    text.strip_prefix('r').map_or_else(
+        || text.starts_with('"'),
+        |rest| rest.trim_start_matches('#').starts_with('"'),
+    )
+}
+
+/// Replaces each string or byte-string literal in `stream` with an empty one.
+///
+/// Every other token stays the same. This includes a literal's own quote marks.
+///
+/// A literal token's rendered text keeps the exact text from the source file (issue
+/// #158). The text `"route via crc32(input)"` still shows the callee's name after
+/// rendering. A text scan cannot tell this mention from a real call to `crc32`. But to
+/// `rustc`, a string's content is data, not a call. This function removes the content
+/// so the scan cannot see it.
+fn blank_string_literals(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    stream.into_iter().map(blank_string_literal_tree).collect()
+}
+
+/// The one-token step for [`blank_string_literals`].
+///
+/// A group keeps its own delimiters and span. Only the tokens inside it change.
+fn blank_string_literal_tree(tree: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+    match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            let mut replaced =
+                proc_macro2::Group::new(group.delimiter(), blank_string_literals(group.stream()));
+            replaced.set_span(group.span());
+            proc_macro2::TokenTree::Group(replaced)
+        }
+        proc_macro2::TokenTree::Literal(literal) if is_string_literal(&literal.to_string()) => {
+            let mut blanked = proc_macro2::Literal::string("");
+            blanked.set_span(literal.span());
+            proc_macro2::TokenTree::Literal(blanked)
+        }
+        other => other,
+    }
+}
+
 /// The body of a function or method block as text the token-based scans understand.
 ///
 /// The statements rendered without the outer braces — the way `braced_body` returned
 /// them — with `quote`'s spaces around `::` collapsed again: the call scans look for
-/// `C::name(` and `name::<`, and the spaced rendering would hide both. What the scans
-/// do with the text is unchanged; this is only the bridge from the resolved item back
-/// to the textual analyses.
+/// `C::name(` and `name::<`, and the spaced rendering would hide both. String and
+/// byte-string literals are blanked first (issue #158). A literal is the only token
+/// whose rendered text can spell a callee's name without a real call to it. What the
+/// scans do with the text is otherwise unchanged; this is only the bridge from the
+/// resolved item back to the textual analyses.
 ///
 /// A raw marker is not stripped here (issue #90). It does not need to be: every
 /// consumer matches a substring at a token boundary, and `#` is such a boundary, so
@@ -1381,7 +1434,8 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
 fn block_text(block: &syn::Block) -> String {
     let mut body = String::new();
     for stmt in &block.stmts {
-        body.push_str(&stmt.to_token_stream().to_string());
+        let blanked = blank_string_literals(stmt.to_token_stream());
+        body.push_str(&blanked.to_string());
         body.push(' ');
     }
     body.replace(" :: ", "::")

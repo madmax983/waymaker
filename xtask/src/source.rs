@@ -12735,6 +12735,25 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_callee_name_inside_a_string_literal_is_not_a_call() {
+        // A string literal's content is data to `rustc`, never a call. The old
+        // `block_text` kept a literal's exact source text. A callee name spelled
+        // inside a string then read as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = \"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_path_qualified_delegation_is_reported() {
         // `count_tokens(body, "crc32") == 1` is satisfied by `fast::crc32(bytes)` calling a
         // Castagnoli loop in a sibling module, with `crc.rs` untouched so the other half of
