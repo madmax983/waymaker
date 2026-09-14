@@ -16,7 +16,7 @@ use waymaker_fault::Device;
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Bounds, Reserve};
 use waymaker_flash::frame::ProgramAlign;
-use waymaker_flash::recovery::JournalRegion;
+use waymaker_flash::recovery::{JournalRegion, RecoveryError};
 use waymaker_flash::storage::{Geometry, StableStorage};
 
 const WORKFLOW_KIND: u16 = 0x00A1;
@@ -66,6 +66,71 @@ fn first_header() -> BankHeader<'static> {
         input_schema: INPUT_SCHEMA,
         input: FIRST_INPUT,
     }
+}
+
+/// A geometry like [`geometry`]'s, but with a chosen read unit. [`geometry`] always uses
+/// one, which is why the seal-alignment bug Codex found needed a fixture of its own: every
+/// other test in this file reads a bank's seal on a device where a misaligned read cannot
+/// be told apart from an aligned one.
+fn geometry_with_read_size(read_size: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(8192, 4096, 8, read_size) else {
+        unreachable!("8192/4096/8/{read_size} is a legal geometry of two whole erase blocks")
+    };
+    geometry
+}
+
+fn layout_with_read_size(read_size: u32) -> BankLayout {
+    let Ok(layout) = BankLayout::new(geometry_with_read_size(read_size)) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    layout
+}
+
+fn reserve_for(layout: BankLayout) -> Reserve {
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+        unreachable!("these bounds fit this layout")
+    };
+    reserve
+}
+
+/// [`install`], against a caller-chosen layout rather than [`layout`]'s own.
+fn install_on(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    let region = layout.bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+    let Ok(seal) = bank::seal_for(header_frame, generation) else {
+        unreachable!("a header frame can be sealed")
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, layout.align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.seal_offset(), sealed),
+        device.barrier(),
+    ) else {
+        unreachable!("a generation seal is a legal program")
+    };
 }
 
 /// Installs a bank the way a previous life left it: header, barrier, seal, barrier.
@@ -800,4 +865,106 @@ fn a_failed_reclaim_does_not_turn_a_successful_migration_into_a_failure() {
         ),
         "{progress:?}"
     );
+}
+
+#[test]
+fn a_seal_read_is_aligned_to_the_devices_own_read_unit_not_a_bare_constant() {
+    // Codex found this. `bank::SEAL_BYTES` is 12, which is not a multiple of every real
+    // geometry's read unit — a device reading in units of 8, for instance — and a
+    // conforming `StableStorage` refuses a read whose length is not a multiple of it,
+    // before this driver ever gets to compare generations. `waymaker_fault::Device` is
+    // exactly such a conforming adapter, so a `Driver::at_bank` boot over one with a read
+    // unit `SEAL_BYTES` does not divide is the regression: every boot used to refuse
+    // outright, over a read this driver made rather than one the device was asked to do.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+}
+
+#[test]
+fn an_undersized_page_refuses_rather_than_reviving_a_retired_bank() {
+    // Codex found this. Bank B is authoritative — its generation is higher — but a swap
+    // once installed a longer input into it than bank A ever carried, so its header is the
+    // wider of the two. A page too small to read bank B's header back has to refuse
+    // outright rather than fall back to bank A: bank A is a real, validly sealed candidate
+    // too, just the *retired* one, and nothing below `select_bank` can tell "damaged" from
+    // "did not fit" unless `read_bank` says which.
+    let mut device = Device::new(geometry());
+    let long_input = &[b'x'; 60][..];
+    let long_header = BankHeader {
+        input: long_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &long_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&long_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank A's header and the seal, deliberately short of bank B's header.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank B's header to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { .. }))
+        ),
+        "an undersized page must refuse outright rather than silently booting bank A's \
+         retired run: {progress:?}"
+    );
+
+    // Nothing moved: bank B, the real authority, is untouched.
+    let (b_run, ..) = header_on(&mut device, BankId::B).expect("bank B is untouched");
+    assert_eq!(b_run, RUN);
 }

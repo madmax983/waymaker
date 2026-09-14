@@ -12,9 +12,9 @@ use core::mem;
 use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{
-    ActivityKind, EffectId, EffectRequest, Intent, KernelError, Next, Outcome, RecordRef,
-    ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve, VersionIntent,
-    VersionRequest,
+    ActivityKind, DecodeError, EffectId, EffectRequest, Intent, KernelError, Next, Outcome,
+    RecordRef, ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve,
+    VersionIntent, VersionRequest,
 };
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout};
@@ -489,13 +489,20 @@ struct BankFacts {
 }
 
 /// Reads bank `id`'s header and seal, and says what it is worth — [`None`] for a bank whose
-/// seal does not validate, whose header does not decode, or whose header does not fit
-/// `page`.
+/// seal does not validate or whose header does not decode.
 ///
-/// A bank failing any of those is not a candidate at any generation, exactly as
+/// A bank failing either is not a candidate at any generation, exactly as
 /// [`bank::sealed_generation_with`] documents. This function only adds the two reads that
 /// answer is read *from* rather than handed in, and keeps the scalar fields
 /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
+///
+/// # Errors
+///
+/// [`RecoveryError::PageTooSmall`] when `page` cannot hold the seal, or when it holds the
+/// seal but not a header whose own declared length says it needs more room than `page` gave
+/// it. Codex found both: treating either as "not a candidate" would let [`select_bank`] fall
+/// back to a lower-generation bank that did fit — silently reviving a retired run — rather
+/// than refusing an undersized page outright.
 fn read_bank<S, C>(
     layout: BankLayout,
     id: BankId,
@@ -507,18 +514,47 @@ where
     C: IntegrityCheck,
 {
     let region = layout.bank(id);
-    let header_len = page.len().min(region.payload_bytes() as usize);
-    let Some(header_buf) = page.get_mut(..header_len) else {
+    let payload_bytes = region.payload_bytes() as usize;
+    // §10's own writer programs the seal at [`ProgramAlign::round_up`] of `SEAL_BYTES`
+    // rather than `SEAL_BYTES` itself, and reads it back the same way here — a fixed
+    // `[u8; SEAL_BYTES]` local is not a multiple of every geometry's read unit, and a
+    // conforming `StableStorage` may refuse a read that is not one. The header and the seal
+    // share the one page this call was handed, the same way `swap`'s own writer shares it
+    // for the seal it programs, because a device's program unit has no upper bound this
+    // driver could give a fixed local of its own.
+    let seal_len = region.seal_bytes() as usize;
+    let Some(room_for_header) = page.len().checked_sub(seal_len) else {
+        return Err(DriveError::Recovery(RecoveryError::PageTooSmall {
+            needed: seal_len,
+        }));
+    };
+    let header_len = room_for_header.min(payload_bytes);
+    let (header_buf, seal_page) = page.split_at_mut(header_len);
+    let Some(seal_buf) = seal_page.get_mut(..seal_len) else {
+        // Unreachable: `seal_page.len() == page.len() - header_len >= seal_len` by
+        // construction above.
         return Ok(None);
     };
     storage
         .read(region.base(), header_buf)
         .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
-    let mut seal_buf = [0_u8; bank::SEAL_BYTES];
+    // A header whose self-declared length reaches past what fit in `page` is refused
+    // outright rather than treated as "not a candidate" — see this function's own `Errors`
+    // section.
+    if header_len < payload_bytes
+        && matches!(
+            bank::decode_header_with::<C>(header_buf),
+            Err(DecodeError::Truncated)
+        )
+    {
+        return Err(DriveError::Recovery(RecoveryError::PageTooSmall {
+            needed: payload_bytes,
+        }));
+    }
     storage
-        .read(region.seal_offset(), &mut seal_buf)
+        .read(region.seal_offset(), seal_buf)
         .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
-    let Some(generation) = bank::sealed_generation_with::<C>(header_buf, &seal_buf) else {
+    let Some(generation) = bank::sealed_generation_with::<C>(header_buf, seal_buf) else {
         return Ok(None);
     };
     // The seal already names this exact header's digest, so this decode cannot fail.
