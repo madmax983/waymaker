@@ -2549,6 +2549,48 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
         .collect()
 }
 
+/// [`block_let_exprs`]'s own mirror for a *width*-aware sibling of [`ConstTypeScopes`]:
+/// every plain `let NAME: TYPE = EXPR;` declared *directly* as a statement in `block`, by
+/// name, against its own type ascription's single-segment name — `None` when a binding
+/// carries no type ascription at all, which [`block_let_exprs`]'s own `binding_name` accepts
+/// (`Pat::Type` is optional there) but this cannot answer a width for.
+///
+/// Codex's next-round finding: `const P0: u8 = { let q: u8 = 255; !q };` names an operand
+/// [`evaluate_block`]'s own `local_resolve_width`/`block_resolve_width` closures declined
+/// unconditionally for any name already resolved as one of the block's own locals, on the
+/// reasoning that this function never read a declared type for one — true before this
+/// existed, since [`block_let_exprs`]'s own `binding_name` unwraps and discards `Pat::Type`
+/// rather than keeping it. `q`'s own ascription states the width `evaluate_bitwise_not`
+/// needs exactly as plainly as a local `const`'s own type does.
+fn block_let_types(block: &syn::Block) -> std::collections::HashMap<String, String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return None;
+            };
+            if has_cfg_test(&local.attrs) {
+                return None;
+            }
+            let init = local.init.as_ref()?;
+            if init.diverge.is_some() {
+                return None;
+            }
+            let syn::Pat::Type(pat_type) = &local.pat else {
+                return None;
+            };
+            let syn::Pat::Ident(ident) = pat_type.pat.as_ref() else {
+                return None;
+            };
+            if ident.subpat.is_some() {
+                return None;
+            }
+            single_segment_type_name(&pat_type.ty).map(|name| (ident_name(&ident.ident), name))
+        })
+        .collect()
+}
+
 /// The count of every plain `let _ = EXPR;` declared *directly* as a statement in `block` —
 /// a value-discarding binding, counted rather than resolved, since nothing later in the
 /// block can reference a name a wildcard pattern never bound.
@@ -3174,6 +3216,8 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     for (name, expr) in lets {
         locals.insert(name, expr);
     }
+    let mut local_types = block_const_types(block);
+    local_types.extend(block_let_types(block));
     if locals.len() != combined_len {
         return None;
     }
@@ -3226,12 +3270,16 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
                 }
                 (resolve.unsigned)(path)
             };
-            // The identical safe decline `local_resolve_unsigned` above takes for a
-            // let-bound local this function never reads a declared type for.
+            // A name already resolved is one of this block's own locals, whose declared
+            // type — if `local_types` recorded one, from a `const`'s own type ascription or
+            // a typed `let` — answers directly; a local this function tracked no type for
+            // (an untyped `let`) declines rather than guessing. Anything else falls through
+            // to the outer scope's own answer, exactly as the value lookup above does.
             let local_resolve_width = |path: &syn::Path| {
                 if let Some(ident) = path.get_ident() {
-                    if resolved.contains_key(&ident_name(ident)) {
-                        return None;
+                    let candidate = ident_name(ident);
+                    if resolved.contains_key(&candidate) {
+                        return local_types.get(&candidate).map(String::as_str);
                     }
                 }
                 (resolve.width)(path)
@@ -3266,8 +3314,9 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     };
     let block_resolve_width = |path: &syn::Path| {
         if let Some(ident) = path.get_ident() {
-            if resolved.contains_key(&ident_name(ident)) {
-                return None;
+            let candidate = ident_name(ident);
+            if resolved.contains_key(&candidate) {
+                return local_types.get(&candidate).map(String::as_str);
             }
         }
         (resolve.width)(path)

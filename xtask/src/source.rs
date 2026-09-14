@@ -9193,16 +9193,25 @@ const SPARSE_WINDOW_SLOTS_PER_VALUE: usize = 3;
 /// at the numbered-arm count plus one is what `missing_value` needs in order to name a
 /// single covered gap, but this function only needs to know the values fit without
 /// colliding, which the true span always answers by construction: every offset from the
-/// minimum is inside the span by definition once nothing repeats. So no window-search is
-/// needed at all — a repeated value is refused by a straightforward duplicate check — and
-/// `SPARSE_WINDOW_SLOTS_PER_VALUE` bounds how much wider than the value count the resulting
-/// span may be before this declines it. That bound serves two purposes at once: it is the
-/// density floor a real table needs, and it guards against reasoning about a window as wide
-/// as two arbitrarily far-apart values would imply, for a spread `rustc` would never
-/// compile into a table either. Unlike `missing_value`, this does not chase the wrapping
-/// arithmetic `window_layout` uses for a `u128` literal reinterpreted near the `i128`
-/// boundary — that shape and this one are not expected to coincide, and this declines
-/// rather than guesses when they might.
+/// minimum is inside the span by definition once nothing repeats. So no window-*search* for
+/// which gap the wildcard covers is needed — a repeated value is refused by a
+/// straightforward duplicate check — and `SPARSE_WINDOW_SLOTS_PER_VALUE` bounds how much
+/// wider than the value count the resulting span may be before this declines it. That bound
+/// serves two purposes at once: it is the density floor a real table needs, and it guards
+/// against reasoning about a window as wide as two arbitrarily far-apart values would imply,
+/// for a spread `rustc` would never compile into a table either.
+///
+/// Codex's next-round finding: the span itself was computed as a plain `max.checked_sub(min)`
+/// over the values sorted as ordinary signed `i128`s, which is only the window's true span
+/// when nothing straddles the point where [`lit_value`]'s own two's-complement
+/// reinterpretation of a `u128` literal at or above `2^127` turns an ascending run into one
+/// that wraps through `i128::MIN` — eight even values spanning `2^127 - 4` through
+/// `2^127 + 10` sort with the four values at or above `2^127` (each reinterpreted negative)
+/// *before* the two below it (still positive), so the plain `min`/`max` are nowhere near each
+/// other in the true circular order and `checked_sub` overflows outright, declining a window
+/// whose real span is fourteen. [`compact_span`] is the same wrapping candidate-base search
+/// [`window_layout`] already runs to answer the identical question there, reused here for a
+/// span rather than a full coverage bitmap.
 fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
     let mut values = Vec::new();
     for arm in numbered {
@@ -9220,22 +9229,39 @@ fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
     if sorted.len() != values.len() {
         return false;
     }
-    let (Some(&min), Some(&max)) = (sorted.first(), sorted.last()) else {
-        return false;
-    };
-    let Some(span) = max.checked_sub(min) else {
-        return false;
-    };
-    let Ok(span) = usize::try_from(span) else {
-        return false;
-    };
-    let Some(slots) = span.checked_add(1) else {
+    let Some(slots) = compact_span(&values) else {
         return false;
     };
     let Some(bound) = values.len().checked_mul(SPARSE_WINDOW_SLOTS_PER_VALUE) else {
         return false;
     };
     slots <= bound
+}
+
+/// The narrowest circular span (modulo `2^128`) `values` fit within — every value tried in
+/// turn as the candidate starting point, the identical search [`window_layout`] runs, since
+/// only the window's true circular start gives the tightest span and any other candidate
+/// reports one inflated by wrapping past it before reaching every value. `values` is assumed
+/// already deduplicated by its caller, the same precondition [`try_window_layout`]'s own
+/// duplicate-offset refusal exists for there.
+fn compact_span(values: &[i128]) -> Option<usize> {
+    let mut narrowest: Option<u128> = None;
+    for &base in values {
+        let mut widest_offset: u128 = 0;
+        for &value in values {
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "wrapping_sub's own two's-complement bit pattern, reinterpreted as \
+                          an unsigned circular offset from `base` rather than converted as a \
+                          value — the same reasoning try_window_layout's own cast carries"
+            )]
+            let offset = value.wrapping_sub(base) as u128;
+            widest_offset = widest_offset.max(offset);
+        }
+        narrowest = Some(narrowest.map_or(widest_offset, |current| current.min(widest_offset)));
+    }
+    let slots = narrowest?.checked_add(1)?;
+    usize::try_from(slots).ok()
 }
 
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
@@ -20525,6 +20551,71 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_typed_let_negated_initializer_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let q: u8 = 255; !q };` names an
+        // operand `evaluate_bitwise_not` cannot fold — `evaluate_block`'s own
+        // `local_resolve_width`/`block_resolve_width` closures declined unconditionally for
+        // any name already resolved as one of the block's own locals, on the reasoning that
+        // this function never read a declared type for one. True before `block_let_exprs`'s
+        // own `binding_name` was joined by a mirror that keeps the type ascription rather
+        // than discarding it: `block_let_types` reads `q`'s own `u8` the same way
+        // `block_const_types` already reads a local `const`'s.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_let_negated_initializer_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let q: u8 = 255; !q };\n    \
+             const P1: u8 = { let q: u8 = 255; !q + 1 };\n    \
+             const P2: u8 = { let q: u8 = 255; !q + 2 };\n    \
+             const P3: u8 = { let q: u8 = 255; !q + 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_but_compact_window_straddling_the_u128_sign_boundary_is_reported() {
+        // Codex's next-round finding: `compact_window_with_gaps`'s own span was
+        // `max.checked_sub(min)` over the values sorted as ordinary signed `i128`s, which is
+        // only the window's true span when nothing straddles the point where `lit_value`'s
+        // own two's-complement reinterpretation of a `u128` literal at or above `2^127` turns
+        // an ascending run into one that wraps through `i128::MIN` — eight even values
+        // spanning `2^127 - 4` through `2^127 + 10` sort with the four values at or above
+        // `2^127` (each reinterpreted negative) *before* the two below it (still positive),
+        // so the plain `min`/`max` are nowhere near each other in the true circular order and
+        // `checked_sub` overflowed outright, declining a window whose real span is fourteen.
+        // `compact_span` is the same wrapping candidate-base search `window_layout` already
+        // runs, reused here for a span rather than a full coverage bitmap.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn wrapping_compact_window_table(nibble: u128) -> u32 {\n    \
+             match nibble {\n        \
+             170141183460469231731687303715884105724u128 => 0,\n        \
+             170141183460469231731687303715884105726u128 => 1,\n        \
+             170141183460469231731687303715884105728u128 => 2,\n        \
+             170141183460469231731687303715884105730u128 => 3,\n        \
+             170141183460469231731687303715884105732u128 => 4,\n        \
+             170141183460469231731687303715884105734u128 => 5,\n        \
+             170141183460469231731687303715884105736u128 => 6,\n        \
+             170141183460469231731687303715884105738u128 => 7,\n        \
+             _ => 8,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
             "{violations:?}"
         );
     }
