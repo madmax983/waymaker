@@ -21529,6 +21529,47 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_mutation_statement_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 0; x += 1; x - 1 };` names a
+        // compound-assignment statement `evaluate_block`'s own local-resolution loop has no
+        // way to represent — that loop resolves each local from one static initializer
+        // expression, and `rest` counted the mutation statement while neither collector
+        // behind the invariant counted it, so the block refused as unresolved even though it
+        // is arithmetically resolvable. Defining `P0` through `P14` this way left every
+        // outer pattern of the dense table below unresolved. `apply_block_mutations` now
+        // applies every compound-assignment statement in source order, once the block's own
+        // declarations have resolved, by folding a synthetic binary expression through the
+        // identical operator dispatch any other expression in this scan already goes
+        // through; `block_mutation_statement_count` is the matching half of the statement
+        // count `rest` is compared against.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = {n}; x += 1; x - 1 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_compound_assignment(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

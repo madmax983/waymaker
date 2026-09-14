@@ -2891,6 +2891,113 @@ fn block_ignored_let_count(block: &syn::Block) -> usize {
         .count()
 }
 
+/// The plain, non-assigning operator `assign_op` desugars to (`AddAssign` to `+`, and so on)
+/// — one of the ten compound-assignment [`syn::BinOp`] variants, spelled as the source text
+/// [`apply_compound_assignment`] parses back into a real [`syn::BinOp`] to build a synthetic
+/// binary expression from, rather than this scan reimplementing ten operators' worth of
+/// arithmetic a second time.
+const fn plain_assign_operator_text(assign_op: &syn::BinOp) -> Option<&'static str> {
+    match assign_op {
+        syn::BinOp::AddAssign(_) => Some("+"),
+        syn::BinOp::SubAssign(_) => Some("-"),
+        syn::BinOp::MulAssign(_) => Some("*"),
+        syn::BinOp::DivAssign(_) => Some("/"),
+        syn::BinOp::RemAssign(_) => Some("%"),
+        syn::BinOp::BitXorAssign(_) => Some("^"),
+        syn::BinOp::BitAndAssign(_) => Some("&"),
+        syn::BinOp::BitOrAssign(_) => Some("|"),
+        syn::BinOp::ShlAssign(_) => Some("<<"),
+        syn::BinOp::ShrAssign(_) => Some(">>"),
+        _ => None,
+    }
+}
+
+/// `current_value assign_op= rhs_expr`'s own new value — a local's own compound assignment
+/// (`x += 1;`), folded by reusing [`literal_or_const_value`]'s own operator dispatch rather
+/// than duplicating any of it: a synthetic `syn::Expr::Binary` is built from `current_value`
+/// re-spelled as a literal (carrying `declared_type`'s own suffix when one is known, so a
+/// sign- or width-sensitive operator downstream reads the identical type information the
+/// real assignment's left-hand side would have had) and `rhs_expr` reused unchanged, joined
+/// by the plain operator [`plain_assign_operator_text`] names, then evaluated exactly as any
+/// other binary expression in this scan already would be.
+///
+/// Codex's finding: `let mut x = 0; x += 1; x - 1` names a mutation
+/// [`evaluate_block`]'s own local-resolution loop had no representation for at all — that
+/// loop treats each local as one static initializer expression, which is sound for a `let`
+/// or a `const` and says nothing about a statement that changes one afterward. Refusing
+/// silently would have been the safe answer if there were no way to fold the mutation at
+/// all, but there is one, and a `None` here reaches the identical failure mode the whole
+/// scan exists to catch: an unresolved pattern constant lets a dense-table arm's own
+/// `pattern_literal` come back empty, missed rather than reported.
+fn apply_compound_assignment(
+    current_value: i128,
+    declared_type: Option<&str>,
+    assign_op: &syn::BinOp,
+    rhs_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let op_text = plain_assign_operator_text(assign_op)?;
+    let op: syn::BinOp = syn::parse_str(op_text).ok()?;
+    let left_text = declared_type.map_or_else(
+        || current_value.to_string(),
+        |ty| format!("{current_value}{ty}"),
+    );
+    let left_expr: syn::Expr = syn::parse_str(&left_text).ok()?;
+    let synthetic = syn::Expr::Binary(syn::ExprBinary {
+        attrs: Vec::new(),
+        left: Box::new(left_expr),
+        op,
+        right: Box::new(rhs_expr.clone()),
+    });
+    literal_or_const_value(&synthetic, resolve)
+}
+
+/// `expr`'s own compound-assignment target, operator and right-hand side, when it is one —
+/// a bare, single-segment path on the left of one of the ten [`plain_assign_operator_text`]
+/// recognises, seen through any nesting of parentheses. `None` for anything else: a compound
+/// assignment to a field, an index, or a dereference names no single local this scan tracks
+/// at all, and a plain `=` assignment (`syn::Expr::Assign`, a distinct shape from every one
+/// of these) replaces rather than folds, which is a different question this function does
+/// not answer.
+fn mutation_target(expr: &syn::Expr) -> Option<(String, syn::BinOp, syn::Expr)> {
+    let syn::Expr::Binary(binary) = strip_parens(expr) else {
+        return None;
+    };
+    plain_assign_operator_text(&binary.op)?;
+    let syn::Expr::Path(path) = strip_parens(&binary.left) else {
+        return None;
+    };
+    let ident = path.path.get_ident()?;
+    Some((ident_name(ident), binary.op, (*binary.right).clone()))
+}
+
+/// Every compound-assignment statement `block` declares directly, in source order — the
+/// mutation-statement twin of [`block_let_exprs`]/[`block_const_exprs`], read the identical
+/// way: a `#[cfg(test)]`-gated one is skipped, matching every other collector here and
+/// `MatchVisitor::visit_block`'s own production walk.
+fn block_mutation_stmts(block: &syn::Block) -> Vec<(String, syn::BinOp, syn::Expr)> {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| !stmt_is_cfg_test(stmt))
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, Some(_)) = stmt else {
+                return None;
+            };
+            mutation_target(expr)
+        })
+        .collect()
+}
+
+/// [`block_mutation_stmts`]'s own statement count — [`block_let_statement_count`]'s twin,
+/// for the identical reason `evaluate_block`'s own `rest.len()` invariant needs one: every
+/// compound-assignment statement `rest` counts also has to be counted on the side answering
+/// for it, or a block holding one refuses as unresolved regardless of whether the mutation
+/// itself folds.
+fn block_mutation_statement_count(block: &syn::Block) -> usize {
+    block_mutation_stmts(block).len()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -3517,6 +3624,128 @@ fn resolved_local_name(
     resolved.contains_key(&candidate).then_some(candidate)
 }
 
+/// `locals`' own fixed-point resolution — factored out of [`evaluate_block`] to keep that
+/// function under clippy's line count: each local's own initializer is retried against the
+/// scope's own partial progress until nothing more resolves, so a local declared in terms of
+/// another declared after it in source order (`let a = b; let b = 1;` is not legal Rust, but
+/// two names each usable in the other's initializer inside one `const` block's worth of
+/// mutually-referencing constants is) does not depend on declaration order.
+fn resolve_block_locals(
+    locals: &std::collections::HashMap<String, syn::Expr>,
+    local_types: &std::collections::HashMap<String, String>,
+    resolve: &Resolve<'_>,
+) -> std::collections::HashMap<String, i128> {
+    let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
+    for _ in 0..locals.len().max(1) {
+        let mut progressed = false;
+        for (name, local_expr) in locals {
+            if resolved.contains_key(name) {
+                continue;
+            }
+            let local_resolve_value = |path: &syn::Path| {
+                path.get_ident()
+                    .map(ident_name)
+                    .and_then(|candidate| resolved.get(&candidate).copied())
+                    .or_else(|| (resolve.value)(path))
+            };
+            let local_resolve_unsigned = |path: &syn::Path| {
+                resolved_local_name(path, &resolved).map_or_else(
+                    || (resolve.unsigned)(path),
+                    |candidate| {
+                        local_types
+                            .get(&candidate)
+                            .is_some_and(|name| is_unsigned_type_name(name))
+                    },
+                )
+            };
+            let local_resolve_width = |path: &syn::Path| {
+                resolved_local_name(path, &resolved).map_or_else(
+                    || (resolve.width)(path),
+                    |candidate| local_types.get(&candidate).map(String::as_str),
+                )
+            };
+            let local_resolve = Resolve {
+                value: &local_resolve_value,
+                unsigned: &local_resolve_unsigned,
+                width: &local_resolve_width,
+            };
+            if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
+                resolved.insert(name.clone(), value);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    resolved
+}
+
+/// Applies every compound-assignment statement `block` declares, in source order, to
+/// `resolved` — factored out of [`evaluate_block`] to keep that function under clippy's line
+/// count, not because this half is any less part of the identical fix.
+///
+/// Codex's finding: `let mut x = 0; x += 1; x - 1` names a mutation [`evaluate_block`]'s own
+/// local-resolution loop has no way to represent — that loop resolves each local from one
+/// static initializer expression, and a statement that changes a local afterward is a fact
+/// about *sequence* that map has no room for. Applied here instead, once every declaration
+/// has had its own chance to resolve: each mutation's own right-hand side is resolved
+/// against the local scope as it stands *at that point* — the identical shape
+/// `evaluate_block`'s own `block_resolve` reads for the tail expression — and `resolved` is
+/// updated in place before the next mutation (or the tail) is evaluated, so `x += 1; x +=
+/// 1;` compounds rather than only the last write being seen. A mutation naming a local this
+/// scan never resolved a declaration for at all — an out-of-order reference, or one this
+/// scan's own fixed point gave up on — is refused rather than silently skipped, since
+/// skipping it would leave `x` at its *declared* value and every later read of it a value
+/// `rustc` would never produce.
+fn apply_block_mutations(
+    block: &syn::Block,
+    resolve: &Resolve<'_>,
+    local_types: &std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    for (name, op, rhs_expr) in block_mutation_stmts(block) {
+        let &current_value = resolved.get(&name)?;
+        let mutation_resolve_value = |path: &syn::Path| {
+            path.get_ident()
+                .map(ident_name)
+                .and_then(|candidate| resolved.get(&candidate).copied())
+                .or_else(|| (resolve.value)(path))
+        };
+        let mutation_resolve_unsigned = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.unsigned)(path),
+                |candidate| {
+                    local_types
+                        .get(&candidate)
+                        .is_some_and(|name| is_unsigned_type_name(name))
+                },
+            )
+        };
+        let mutation_resolve_width = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.width)(path),
+                |candidate| local_types.get(&candidate).map(String::as_str),
+            )
+        };
+        let mutation_resolve = Resolve {
+            value: &mutation_resolve_value,
+            unsigned: &mutation_resolve_unsigned,
+            width: &mutation_resolve_width,
+        };
+        let declared_type = local_types.get(&name).map(String::as_str);
+        let updated = apply_compound_assignment(
+            current_value,
+            declared_type,
+            &op,
+            &rhs_expr,
+            &mutation_resolve,
+        )?;
+        resolved.insert(name, updated);
+    }
+    Some(())
+}
+
 fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let mut locals = block_const_exprs(block);
     let const_item_count = locals.len();
@@ -3555,60 +3784,26 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // block this shape appears in even though every statement is accounted for.
     // `block_let_statement_count` is the statement count `block_let_exprs`'s own name count
     // stopped being; `const_item_count` is unaffected, since a `const` item never binds more
-    // than one name.
-    if rest.len() != const_item_count + block_let_statement_count(block) + ignored_lets {
+    // than one name. `block_mutation_statement_count` is `apply_compound_assignment`'s own
+    // half of the identical invariant: a compound-assignment statement (`x += 1;`) binds no
+    // new name at all, so it belongs on neither side of the name-counting terms, but it is
+    // still one production statement `rest` counts and one this scan now folds.
+    if rest.len()
+        != const_item_count
+            + block_let_statement_count(block)
+            + block_mutation_statement_count(block)
+            + ignored_lets
+    {
         return None;
     }
     let syn::Stmt::Expr(tail_expr, None) = tail else {
         return None;
     };
-    let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
-    for _ in 0..locals.len().max(1) {
-        let mut progressed = false;
-        for (name, local_expr) in &locals {
-            if resolved.contains_key(name) {
-                continue;
-            }
-            let local_resolve_value = |path: &syn::Path| {
-                path.get_ident()
-                    .map(ident_name)
-                    .and_then(|candidate| resolved.get(&candidate).copied())
-                    .or_else(|| (resolve.value)(path))
-            };
-            // Codex's next-round finding: unsignedness used to decline unconditionally for
-            // any locally-resolved name, left standing even after `local_types` was added to
-            // answer `local_resolve_width` the identical question below — both now answer
-            // from `local_types`, an untyped `let` still declining rather than guessing.
-            let local_resolve_unsigned = |path: &syn::Path| {
-                resolved_local_name(path, &resolved).map_or_else(
-                    || (resolve.unsigned)(path),
-                    |candidate| {
-                        local_types
-                            .get(&candidate)
-                            .is_some_and(|name| is_unsigned_type_name(name))
-                    },
-                )
-            };
-            let local_resolve_width = |path: &syn::Path| {
-                resolved_local_name(path, &resolved).map_or_else(
-                    || (resolve.width)(path),
-                    |candidate| local_types.get(&candidate).map(String::as_str),
-                )
-            };
-            let local_resolve = Resolve {
-                value: &local_resolve_value,
-                unsigned: &local_resolve_unsigned,
-                width: &local_resolve_width,
-            };
-            if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
-                resolved.insert(name.clone(), value);
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
+    let mut resolved = resolve_block_locals(&locals, &local_types, resolve);
+    // [`apply_block_mutations`]'s own doc comment holds the rationale: a compound assignment
+    // is a fact about *sequence* the loop above has no room for, so it is applied separately
+    // and afterward, once every declaration has had its own chance to resolve.
+    apply_block_mutations(block, resolve, &local_types, &mut resolved)?;
     let block_resolve_value = |path: &syn::Path| {
         path.get_ident()
             .map(ident_name)
