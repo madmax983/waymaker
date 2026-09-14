@@ -25,12 +25,14 @@
 //! is *plumb* the task's waker through to [`ActivityDispatcher::poll_dispatch`], which is
 //! the one place that knows when the world will answer.
 //!
-//! Two paths therefore register nothing. A [`Halted`] run registers nothing because the
-//! boot is over: the caller that drove it looks at the journal next. A deadline that has
-//! not passed registers nothing because there is no in-boot sleep yet — [`Journal::wait`]
-//! is asked again on the next poll, and issue
-//! [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot sleep is where a
-//! hardware alarm arrives.
+//! One path registers nothing: a [`Halted`] run, because the boot is over and the caller
+//! that drove it looks at the journal next. A deadline that has not passed is the other
+//! shape of wait, and it is not idle either — [`TimerFuture`] arms the
+//! [`Alarm`] its caller gave it with the task's own waker, so an
+//! executor that has nothing else to do can sleep the core until the interrupt fires. A
+//! firmware with no such peripheral passes [`NoAlarm`](crate::alarm::NoAlarm), and
+//! [`Journal::wait`] is asked again on the next poll exactly as it was before this
+//! capability existed. Issue [#110](https://github.com/madmax983/waymaker/issues/110).
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -41,6 +43,7 @@ use core::task::{Context as Task, Poll};
 use waymaker_core::timer::TimerSpec;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
+use crate::alarm::Alarm;
 use crate::decode::Decode;
 use crate::dispatch::{ActivityDispatcher, Produced};
 use crate::journal::{Answer, Halted, Handoff, Journal};
@@ -151,17 +154,25 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
 
     /// Ask whether `spec`'s deadline has passed.
     ///
-    /// If it has not, the run stops for this boot. The future asks again on every poll, so
-    /// a caller that drives more than one poll per boot sees the deadline pass.
+    /// If it has not, the run stops for this boot — after arming `alarm` with the ticks
+    /// still owed, so an executor with nothing else to do can sleep rather than poll again
+    /// straight away. The future still asks again on every poll regardless, so a caller
+    /// that drives more than one poll per boot sees the deadline pass, and a firmware with
+    /// no alarm peripheral passes [`NoAlarm`](crate::alarm::NoAlarm) and keeps polling.
     ///
     /// It carries no dispatcher. A deadline is not an activity: §11 measures it against a
     /// clock the journal reads, and nothing outside the device is asked.
     #[must_use]
-    pub const fn timer(&mut self, spec: TimerSpec) -> TimerFuture<'_, J> {
+    pub const fn timer<'b>(
+        &'b mut self,
+        spec: TimerSpec,
+        alarm: &'b mut dyn Alarm,
+    ) -> TimerFuture<'b, J> {
         TimerFuture {
             journal: self.journal,
             concluded: &self.conclusion,
             spec,
+            alarm,
             ended: false,
         }
     }
@@ -384,18 +395,20 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 }
 
 /// One deadline boundary.
-#[derive(Debug)]
+///
+/// Not [`Debug`](core::fmt::Debug): `alarm` is a trait object with no `Debug` bound.
 pub struct TimerFuture<'b, J: Journal> {
     journal: &'b mut J,
     concluded: &'b Option<Ending>,
     spec: TimerSpec,
+    alarm: &'b mut dyn Alarm,
     ended: bool,
 }
 
 impl<J: Journal> Future for TimerFuture<'_, J> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if me.ended || me.concluded.is_some() {
             return Poll::Pending;
@@ -403,13 +416,16 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
         // The deadline is asked again on every poll until it passes. Ending here would make
         // a retained timer future one that can never make progress within a boot, which is
         // the opposite of what §06 says a future may be.
-        match me.journal.wait(me.spec) {
-            Ok(()) => {
-                me.ended = true;
-                Poll::Ready(())
-            }
-            Err(Halted) => Poll::Pending,
+        if me.journal.wait(me.spec) == Ok(()) {
+            me.ended = true;
+            return Poll::Ready(());
         }
+        // Armed only when the halt was this deadline, and not yet elapsed: every other
+        // reason to stop has nothing here worth waking early for.
+        if let Some((kind, remaining)) = me.journal.deadline_remaining() {
+            me.alarm.wake_after(kind, remaining, task.waker());
+        }
+        Poll::Pending
     }
 }
 

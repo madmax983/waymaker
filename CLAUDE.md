@@ -1230,8 +1230,10 @@ Stated so that nobody mistakes silence for coverage:
   reader genuinely is over the bank `booted` named. The refusal that would close it is a read
   of the spare bank's seal and it cannot be made fail-closed: the header it would decode is as
   long as the previous run's input, which the caller's page need not hold. It is a
-  precondition on `Swap::beginning`, and closing it by construction is the dispatcher's, at
-  0.4 — the same standing as "nothing obliges a future dispatcher to use the gated writer".
+  precondition on `Swap::beginning` for a caller that reads it from somewhere else; issue
+  #110's `waymaker-drive::Driver::at_bank` closes it for its own callers by never reading it
+  from anywhere else — both arguments come from the same boot's own selection, never carried
+  from an earlier one.
 - **A swap step added to §10's protocol from another file, and what a swap really erases.**
   `swap-discipline` pins one file, exactly as `capacity-reserve`, `recovery-surface` and
   `storage-contract` each say of the one they pin: an `impl Prepared { pub fn commit(..) }` in
@@ -1242,6 +1244,16 @@ Stated so that nobody mistakes silence for coverage:
   `crates/waymaker-flash/tests/swap.rs`, which reads the recorded mutation sequence back, and
   `crates/waymaker-fault/tests/swap.rs`, which requires the retired bank never to return to
   authority at any crash point of the lazy erase.
+- **A crash sweep of `continue_as_new` itself.** `waymaker-drive::Driver::at_bank`'s
+  `Boundary::continue_as_new` calls the same `Swap`/`Prepared`/`Staged`/`Sealable`/`Installed`
+  typestate `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/tests/swap.rs`
+  already sweep exhaustively, unmodified — but neither sweep drives it through this driver,
+  and this driver's own bank-selection reads happen nowhere in either. What
+  `crates/waymaker-drive/tests/continue_as_new.rs` holds is the fault-free path: a real
+  two-bank device, a real swap, and the next boot reading the installed bank's own bytes
+  back. A crash landing inside the reads that pick which bank to boot from, or inside the
+  seven steps as this driver sequences them rather than as the two lower sweeps do, is not
+  yet driven anywhere.
 - **A public function added to the rig's oracle from another file.** `rig-oracle` pins three
   files — `audit.rs`, `census.rs` and `run.rs`. An `impl Audit { pub fn assume_passed(..) }`
   in a sibling module, or a `trait AuditExt` with a blanket impl, adds the escape with the
@@ -1529,9 +1541,11 @@ Stated so that nobody mistakes silence for coverage:
   already asked to be replaced. No `async fn` reaches either — both futures are `Pending`
   for ever, so no straight-line code follows the `.await` — which is why this is stated
   rather than fixed at the round it was found. Codex round 5 of #105; issue
-  [#107](https://github.com/madmax983/waymaker/issues/107), and the executor of issue
-  [#110](https://github.com/madmax983/waymaker/issues/110) is what makes cancellation a thing a
-  caller really does.
+  [#107](https://github.com/madmax983/waymaker/issues/107), and a real executor is what
+  makes cancellation a thing a caller really does. Issue
+  [#110](https://github.com/madmax983/waymaker/issues/110) turned out not to be that
+  executor — it closed rung 0.4's in-boot sleep and the `continue_as_new` join instead,
+  and this crate still has none of its own, by §02 decision 5.
 - **That the façade's journal is the driver below it.** `ctx-facade` pins two files in
   `waymaker-embassy` and six in `waymaker-drive`. It says the façade declares no authority
   and that the driver names no façade type; it cannot say that a given `Journal`
@@ -1568,22 +1582,24 @@ Stated so that nobody mistakes silence for coverage:
   what is still unaccounted is the *depth* of the chain holding them: a deeper one moves no
   writable section and no type size. The report says so where it prints the total rather
   than printing "runtime RAM: ok", and stack accounting needs a call graph.
-- **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
-  wakeups, and this crate registers none of its own: it plumbs the task's waker to
-  `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
-  answer. Two paths therefore register nothing at all — a halted boot, because there is
-  nothing left to wake, and a deadline that has not passed, because there is no in-boot
-  sleep yet. `crates/waymaker-embassy/tests/ctx.rs` measures both with a counting waker
-  rather than leaving them implied, and issue
-  [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot sleep is where a
-  hardware alarm arrives.
-- **That `continue_as_new` does anything.** `waymaker-drive`'s `Boundary::continue_as_new`
-  refuses with `DriveError::ContinueUnsupported`. §10's swap works on a *bank* and this
-  driver is pointed at a `JournalRegion`, so it cannot name the bank a swap would install
-  into. `ContinueFuture` is therefore a real future over a real boundary operation whose one
-  implementation today is a refusal, and issue
-  [#110](https://github.com/madmax983/waymaker/issues/110) is where the two are
-  joined.
+- **That the façade registers a wakeup, for an activity.** §05's Owns cell for
+  `waymaker-embassy` names wakeups, and this crate registers none of its own for an
+  activity: it plumbs the task's waker to `ActivityDispatcher::poll_dispatch`, which is the
+  one thing that knows when the world will answer. A halted boot registers nothing at all,
+  because there is nothing left to wake. `crates/waymaker-embassy/tests/ctx.rs` measures
+  both with a counting waker rather than leaving them implied. A deadline that has not
+  passed is no longer in this list: issue
+  [#110](https://github.com/madmax983/waymaker/issues/110) has `TimerFuture` arm whatever
+  `Alarm` it was given, and a firmware with none passes `NoAlarm` and gets exactly this
+  paragraph's old behaviour back.
+- **That a workflow calling `continue_as_new` can tell whether the swap it asked for
+  happened.** It cannot, by design, on either the synchronous or the async path:
+  `Boundary::continue_as_new` answers `Suspended` and `Journal::continue_as_new` answers
+  `Halted`, both with nothing else, whether the driver performed §10's swap, refused it, or
+  cannot swap at all. Only the caller of `Driver::boot`, reading its `Progress` or
+  `DriveError` after the workflow has already returned, can tell — `Progress::Migrated`
+  from a refusal, from `DriveError::Swap`, or from `DriveError::SwapStep`. A workflow that
+  needs to react differently to each has nothing here to read.
 - **A dispatch-wiring function added from a sibling module, and what a name really reaches.**
   `dispatch-wiring` pins two files, exactly as `capacity-reserve`, `recovery-surface` and
   `storage-contract` each say of the one they pin: a `trait TableExt` with a blanket impl in
@@ -3207,3 +3223,31 @@ about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline
 `swap-discipline` both still hold "the one type that may program a seal should do nothing
 else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
 that reason.
+
+Issue #110 closes the two things ADR 0032 had left as "rung 0.4's dispatcher", and they
+turned out to need no dispatcher at all. In-boot sleep is `waymaker-embassy`'s new `alarm`
+module: an `Alarm` capability — one method, `wake_after(kind, remaining, waker)` — that
+`TimerFuture` calls on a halt exactly when `Journal::deadline_remaining()` answers `Some`,
+instead of asking `wait` again straight away with nothing arming a wakeup for it.
+`NoAlarm` is the zero-cost answer for a firmware with no such peripheral, and `Boundary`
+grows the same `deadline_remaining` query so the synchronous driver answers it too. The
+`continue_as_new` join is `waymaker-drive`'s: `Driver` gains a second constructor,
+`Driver::at_bank(layout, reserve)`, that reads both banks fresh at every `boot` and keeps
+what `bank::select` decided for the length of that boot — closing the two preconditions ADR
+0022 left on `Swap::beginning`'s caller, because neither `booted` nor `run` is ever a value
+this driver could be carrying stale. `Boundary::continue_as_new` on a bank-pointed driver now
+performs the whole seven-step swap, mints the next run with the new `RunId::successor()`,
+and checks `Reserve::for_layout` before touching the device — closing issue #110's third
+precondition, that nothing obliged a capacity check before swapping. `Driver::new`, pointed
+at a fixed region, is unchanged and still refuses with `DriveError::ContinueUnsupported`: a
+region genuinely does not name a bank. The façade needed no changes of its own for this half
+— `Journal::continue_as_new` was already a pass-through to `Boundary::continue_as_new`, so a
+driver behind it that can swap makes an awaited `ctx.continue_as_new(..)` really swap,
+unchanged. `crates/waymaker-drive/tests/continue_as_new.rs` drives a real two-bank device
+through the swap and reads the installed bank's bytes back the way a cold boot has to,
+rather than trusting the call that wrote them; what it does not yet do is a crash sweep of
+`continue_as_new` itself; the seven steps it calls are already exhaustively swept one layer
+down, in `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/tests/swap.rs`,
+unmodified. Measured cost: zero bytes on every `cargo xtask size` row, and zero heap blocks
+on `cargo xtask profile`. See
+[ADR 0045](docs/adr/0045-an-alarm-is-armed-on-a-halt-and-a-driver-at-a-bank-can-swap.md).

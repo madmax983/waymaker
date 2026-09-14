@@ -1928,11 +1928,13 @@ fn ctx_facade() -> usize {
     use core::pin::pin;
     use core::task::{Context as Task, Poll, Waker};
 
-    use waymaker_core::timer::TimerSpec;
+    use waymaker_core::timer::{ClockKind, TimerSpec};
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
     use waymaker_embassy::ctx::{Conclusion, Ctx, Failure, TerminalFuture};
     use waymaker_embassy::dispatch::Produced;
-    use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
+    use waymaker_embassy::{
+        ActivityDispatcher, Alarm, Answer, Decode, Halted, Handoff, Journal, NoAlarm,
+    };
 
     /// A stand-in durable half. It writes nothing; the probe is never run.
     struct Ledger {
@@ -1989,6 +1991,14 @@ fn ctx_facade() -> usize {
         fn continue_as_new(&mut self, input: &[u8]) -> Halted {
             self.held = core::hint::black_box(input.len());
             Halted
+        }
+
+        fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+            if core::hint::black_box(self.held) == 0 {
+                None
+            } else {
+                Some((ClockKind::AFTER_BOOT, self.held as u64))
+            }
         }
     }
 
@@ -2059,9 +2069,18 @@ fn ctx_facade() -> usize {
         });
     }
     {
-        let mut deadline = pin!(ctx.timer(TimerSpec::AfterBoot {
-            ticks: core::hint::black_box(5)
-        }));
+        let mut alarm = NoAlarm;
+        alarm.wake_after(
+            ClockKind::AFTER_BOOT,
+            core::hint::black_box(5),
+            task.waker(),
+        );
+        let mut deadline = pin!(ctx.timer(
+            TimerSpec::AfterBoot {
+                ticks: core::hint::black_box(5)
+            },
+            &mut alarm
+        ));
         kept = kept.wrapping_add(match deadline.as_mut().poll(&mut task) {
             Poll::Ready(()) => 3,
             Poll::Pending => 4,

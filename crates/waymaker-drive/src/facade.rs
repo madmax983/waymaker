@@ -12,7 +12,7 @@
 //! Nothing. It renames four calls. The authority is the driver's, and the façade's own
 //! documentation says the façade has none.
 
-use waymaker_core::timer::TimerSpec;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, Outcome};
 use waymaker_embassy::journal::{Answer, Halted, Journal};
 
@@ -67,5 +67,9 @@ impl Journal for Bridge<'_> {
     fn continue_as_new(&mut self, input: &[u8]) -> Halted {
         let _ = self.boundary.continue_as_new(input);
         Halted
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        self.boundary.deadline_remaining()
     }
 }

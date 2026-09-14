@@ -18,7 +18,9 @@ use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
+use waymaker_embassy::{
+    ActivityDispatcher, Alarm, Answer, Decode, Halted, Handoff, Journal, NoAlarm,
+};
 
 const RUN: RunId = RunId(9);
 const DOWNLOAD: ActivityKind = ActivityKind(1);
@@ -51,6 +53,8 @@ struct Ledger {
     resolutions: Vec<Result<Vec<u8>, Halted>>,
     /// What `wait` answers, in order.
     waits: Vec<Result<(), Halted>>,
+    /// What `deadline_remaining` answers after the last `wait`.
+    remaining: Option<(ClockKind, u64)>,
     asked: Vec<Asked>,
     scheduled: usize,
     resolved: usize,
@@ -65,6 +69,7 @@ impl Ledger {
             handoffs: Vec::new(),
             resolutions: Vec::new(),
             waits: Vec::new(),
+            remaining: None,
             asked: Vec::new(),
             scheduled: 0,
             resolved: 0,
@@ -85,6 +90,12 @@ impl Ledger {
 
     fn waiting(mut self, waits: Vec<Result<(), Halted>>) -> Self {
         self.waits = waits;
+        self
+    }
+
+    /// What `deadline_remaining` answers once `wait` has been asked.
+    const fn remaining_after_wait(mut self, remaining: Option<(ClockKind, u64)>) -> Self {
+        self.remaining = remaining;
         self
     }
 }
@@ -138,6 +149,10 @@ impl Journal for Ledger {
     fn continue_as_new(&mut self, input: &[u8]) -> Halted {
         self.asked.push(Asked::ContinueAsNew(input.to_vec()));
         Halted
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        self.remaining
     }
 }
 
@@ -450,8 +465,9 @@ fn a_deadline_that_has_not_passed_is_asked_again_on_the_next_poll() {
     let mut world = World::silent();
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = NoAlarm;
 
-    let mut future = pin!(ctx.timer(spec));
+    let mut future = pin!(ctx.timer(spec, &mut alarm));
     let mut task = Task::from_waker(Waker::noop());
     let first = future.as_mut().poll(&mut task);
     let second = future.as_mut().poll(&mut task);
@@ -470,7 +486,7 @@ fn a_timer_reaches_the_journal_and_never_the_dispatcher() {
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
 
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
 
     assert_eq!(waited, Poll::Ready(()));
     assert_eq!(ledger.asked, vec![Asked::Wait(spec)]);
@@ -485,10 +501,100 @@ fn a_deadline_that_has_not_passed_suspends_the_run() {
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
 
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
 
     assert_eq!(waited, Poll::Pending);
     assert_eq!(spec.clock_kind(), ClockKind::AT_PERSISTENT_TIME);
+}
+
+/// An alarm that records every call it was armed with, and the waker it was handed.
+struct Recording {
+    armed: Vec<(ClockKind, u64)>,
+    kept: Option<Waker>,
+}
+
+impl Recording {
+    const fn new() -> Self {
+        Self {
+            armed: Vec::new(),
+            kept: None,
+        }
+    }
+}
+
+impl Alarm for Recording {
+    fn wake_after(&mut self, kind: ClockKind, remaining: u64, waker: &Waker) {
+        self.armed.push((kind, remaining));
+        self.kept = Some(waker.clone());
+    }
+}
+
+#[test]
+fn a_deadline_that_has_not_passed_arms_the_alarm_with_the_remaining_ticks_and_the_task_waker() {
+    // Issue #110's in-boot sleep: the one case a caller can act on by sleeping instead of
+    // polling again straight away.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Err(Halted)])
+        .remaining_after_wait(Some((ClockKind::AFTER_BOOT, 25)));
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let counter = Arc::new(Counting {
+        woken: core::sync::atomic::AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut task = Task::from_waker(&waker);
+
+    let waited = pin!(ctx.timer(spec, &mut alarm)).poll(&mut task);
+
+    assert_eq!(waited, Poll::Pending);
+    assert_eq!(alarm.armed, vec![(ClockKind::AFTER_BOOT, 25)]);
+    let kept = alarm.kept.take().expect("the alarm was armed");
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 0);
+    kept.wake();
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_deadline_that_has_passed_arms_no_alarm() {
+    // Nothing is left to wake for. Arming here would be a wakeup for an event that already
+    // happened.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Ok(())])
+        .remaining_after_wait(Some((ClockKind::AFTER_BOOT, 25)));
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let waited = poll_once(ctx.timer(spec, &mut alarm));
+
+    assert_eq!(waited, Poll::Ready(()));
+    assert!(alarm.armed.is_empty(), "an elapsed deadline arms nothing");
+}
+
+#[test]
+fn a_halt_for_another_reason_arms_no_alarm() {
+    // `Halted` alone does not mean "a deadline that has not passed". A journal that stopped
+    // for an unrelated reason has nothing here worth waking early for, and the empty
+    // `deadline_remaining` is what tells the two apart.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Err(Halted)])
+        .remaining_after_wait(None);
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let waited = poll_once(ctx.timer(spec, &mut alarm));
+
+    assert_eq!(waited, Poll::Pending);
+    assert!(alarm.armed.is_empty());
 }
 
 #[test]
@@ -765,7 +871,7 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
 
     let _ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"bad"));
     let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
     let restarted = poll_once(ctx.continue_as_new(b"next"));
 
     assert_eq!(after, Poll::Pending);

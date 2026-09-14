@@ -44,6 +44,26 @@ use crate::error::KernelError;
 #[repr(transparent)]
 pub struct RunId(pub u64);
 
+impl RunId {
+    /// The run one after this one, or [`None`] at [`u64::MAX`].
+    ///
+    /// # Postconditions
+    ///
+    /// `Some(Self(self.0 + 1))` below the ceiling, and `None` at it — never a wrapped run
+    /// id repeating one this device has already sealed a bank under. `waymaker-flash`'s
+    /// bank swap asks its caller for a next run id that is fresh for the whole device, and
+    /// cannot check that itself; a caller that always mints the next run this way keeps the
+    /// sequence strictly increasing for the device's whole life, which closes that
+    /// precondition rather than merely satisfying it once.
+    #[must_use]
+    pub const fn successor(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+}
+
 /// The position of an effect within its run's history, counting from zero.
 ///
 /// # Invariants

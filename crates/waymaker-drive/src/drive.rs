@@ -17,11 +17,13 @@ use waymaker_core::{
     VersionRequest,
 };
 use waymaker_flash::append::{AppendError, Journal};
+use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout};
 use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
-use waymaker_flash::frame;
+use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
 use waymaker_flash::storage::StableStorage;
+use waymaker_flash::swap::{Retired, Swap, SwapError, SwapStepError};
 
 use crate::activity::{Activities, Clocks, Performed};
 use crate::boundary::{Answered, Boundary, Handoff, Suspended};
@@ -39,11 +41,11 @@ pub enum Conclusion {
 
 /// How far one boot got.
 ///
-/// Three answers: the run reached a terminal record, an activity was not ready, or a
-/// deadline has not passed. The last two are both waits under a committed identity, kept
-/// apart because a caller acts on them differently — an activity may answer on the next
-/// pass, and a deadline will not answer before its own clock says so. There is no fourth —
-/// an error is the [`Err`] this is returned beside.
+/// Four answers: the run reached a terminal record, an activity was not ready, a deadline
+/// has not passed, or `continue_as_new` installed a new run. The middle two are both waits
+/// under a committed identity, kept apart because a caller acts on them differently — an
+/// activity may answer on the next pass, and a deadline will not answer before its own
+/// clock says so. There is no fifth — an error is the [`Err`] this is returned beside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Progress {
     /// The run has a terminal record, and the first `result_len` bytes of the caller's
@@ -80,6 +82,17 @@ pub enum Progress {
         clock_kind: ClockKind,
         /// Ticks of that clock still owed, as of this boot's last reading.
         remaining: u64,
+    },
+    /// [`Boundary::continue_as_new`] performed §10's swap. The run that asked is retired;
+    /// `run` is the one now installed.
+    ///
+    /// Only a driver [`at_bank`](Driver::at_bank) ever answers this — one
+    /// [`Driver::new`] cannot name the bank a swap would install into, and its
+    /// `continue_as_new` always refuses instead. The next boot of the same layout picks up
+    /// the newly authoritative bank on its own; nothing here schedules that boot.
+    Migrated {
+        /// The run [`continue_as_new`](Boundary::continue_as_new) installed.
+        run: RunId,
     },
 }
 
@@ -163,9 +176,10 @@ pub enum DriveError<E> {
     NoEffectOutstanding,
     /// §10's `continue_as_new` was asked of a driver that cannot swap banks.
     ///
-    /// See [`Boundary::continue_as_new`](crate::Boundary::continue_as_new): this driver is
-    /// pointed at a journal region rather than at a bank, so it cannot name the bank a swap
-    /// would install into.
+    /// See [`Boundary::continue_as_new`](crate::Boundary::continue_as_new): a driver built
+    /// with [`Driver::new`] is pointed at a journal region rather than at a bank, so it
+    /// cannot name the bank a swap would install into. A driver built with
+    /// [`Driver::at_bank`] never answers this.
     ContinueUnsupported,
     /// §10 refused the record, before the device was asked for anything.
     ///
@@ -174,6 +188,32 @@ pub enum DriveError<E> {
     /// the run for ever, because §08 has no edge from an unresolved effect to a terminal
     /// record, and re-performs the effect on every boot after it.
     Capacity(Refusal),
+    /// A driver [`at_bank`](Driver::at_bank) found no bank a boot could start from.
+    ///
+    /// Neither bank carries a valid seal — the ordinary state of a device nothing has
+    /// provisioned yet. Provisioning the first bank is outside this driver.
+    NoAuthoritativeBank,
+    /// A driver [`at_bank`](Driver::at_bank) found both banks validly sealed at the same
+    /// generation.
+    ///
+    /// §02 decision 7 makes a new run authoritative on its own generation seal, and a seal
+    /// that repeats a generation seals nothing. No protocol this driver runs can produce
+    /// it; a reader that reports it anyway is reporting a device this driver did not write.
+    AmbiguousAuthority,
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new)'s next run id would
+    /// wrap.
+    ///
+    /// §07's identity space is a `u64`. A device that reaches the ceiling refuses rather
+    /// than reissuing a run id it has already sealed a bank under.
+    RunIdExhausted,
+    /// §10's swap refused to begin.
+    Swap(SwapError),
+    /// §10's swap failed partway through a step.
+    ///
+    /// What is on media afterwards is deliberately not guessed at — see
+    /// [`SwapStepError`]'s own documentation. The retiring bank is untouched until the last
+    /// step, so the device still boots the old run either way.
+    SwapStep(SwapStepError<E>),
 }
 
 /// The two buffers a boot borrows.
@@ -199,15 +239,31 @@ pub struct Scratch<'a> {
     pub result: &'a mut [u8],
 }
 
+/// What a [`Driver`] is configured against.
+///
+/// Two shapes, kept apart rather than merged into one carrying an optional bank: a driver
+/// built with [`Driver::new`] is pointed at a fixed region and knows no bank at all, so its
+/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) genuinely cannot swap.
+/// One built with [`Driver::at_bank`] carries a [`BankLayout`] instead and discovers its
+/// region afresh from the device at every [`boot`](Driver::boot) — which is what keeps
+/// that discovery from ever being a value this driver could be carrying stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pointing {
+    /// A fixed journal region, and the run it belongs to.
+    Region(JournalRegion, RunId),
+    /// A device's two-bank layout. [`boot`](Driver::boot) selects the authoritative bank
+    /// itself, every time.
+    Bank(BankLayout),
+}
+
 /// A synchronous driver for one run's journal.
 ///
-/// Configuration only: the region it drives and the run that owns it. Everything that
-/// changes lives in [`boot`](Self::boot)'s stack frame, which is what makes two boots of
-/// one driver two independent replays.
+/// Configuration only: what it is pointed at. Everything that changes lives in
+/// [`boot`](Self::boot)'s stack frame, which is what makes two boots of one driver two
+/// independent replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Driver<C: IntegrityCheck = Catalogued> {
-    region: JournalRegion,
-    run: RunId,
+    pointing: Pointing,
     reserve: Reserve,
     check: PhantomData<C>,
 }
@@ -217,6 +273,12 @@ impl Driver<Catalogued> {
     #[must_use]
     pub const fn new(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
         Self::with_integrity(region, run, reserve)
+    }
+
+    /// A driver over `layout`'s two banks, sealing with the shipped integrity check.
+    #[must_use]
+    pub const fn at_bank(layout: BankLayout, reserve: Reserve) -> Self {
+        Self::at_bank_with_integrity(layout, reserve)
     }
 }
 
@@ -228,8 +290,24 @@ impl<C: IntegrityCheck> Driver<C> {
     #[must_use]
     pub const fn with_integrity(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
         Self {
-            region,
-            run,
+            pointing: Pointing::Region(region, run),
+            reserve,
+            check: PhantomData,
+        }
+    }
+
+    /// [`at_bank`](Driver::at_bank), verifying and sealing with `C`.
+    ///
+    /// Design document §10, issue [#110](https://github.com/madmax983/waymaker/issues/110).
+    /// Every [`boot`](Self::boot) reads both banks' seals fresh and replays whichever is
+    /// authoritative, so `booted` is never a value this driver could be carrying stale from
+    /// an earlier boot — and this is the one shape whose
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) performs a real
+    /// swap rather than refusing.
+    #[must_use]
+    pub const fn at_bank_with_integrity(layout: BankLayout, reserve: Reserve) -> Self {
+        Self {
+            pointing: Pointing::Bank(layout),
             reserve,
             check: PhantomData,
         }
@@ -241,16 +319,28 @@ impl<C: IntegrityCheck> Driver<C> {
         self.reserve
     }
 
-    /// The journal this driver replays and extends.
+    /// The journal this driver replays and extends, for a driver pointed at a fixed region.
+    ///
+    /// [`None`] for a driver built with [`at_bank`](Driver::at_bank): its region is not
+    /// known until [`boot`](Self::boot) has read the device.
     #[must_use]
-    pub const fn region(&self) -> JournalRegion {
-        self.region
+    pub const fn region(&self) -> Option<JournalRegion> {
+        match self.pointing {
+            Pointing::Region(region, _) => Some(region),
+            Pointing::Bank(_) => None,
+        }
     }
 
-    /// The run this driver replays.
+    /// The run this driver replays, for a driver pointed at a fixed region.
+    ///
+    /// [`None`] for a driver built with [`at_bank`](Driver::at_bank): its run is not known
+    /// until [`boot`](Self::boot) has read the device.
     #[must_use]
-    pub const fn run(&self) -> RunId {
-        self.run
+    pub const fn run(&self) -> Option<RunId> {
+        match self.pointing {
+            Pointing::Region(_, run) => Some(run),
+            Pointing::Bank(_) => None,
+        }
     }
 
     /// One boot: recover, replay, and carry the run as far as it goes.
@@ -306,10 +396,30 @@ impl<C: IntegrityCheck> Driver<C> {
                 available: result.len(),
             });
         }
-        let mut machine = ReplayMachine::new(self.run);
+        let (region, run, bank) = match self.pointing {
+            Pointing::Region(region, run) => (region, run, None),
+            Pointing::Bank(layout) => {
+                let facts = select_bank::<S, C>(layout, storage, page)?;
+                let bank = BankContext {
+                    layout,
+                    booted: Authority::Bank {
+                        id: facts.id,
+                        generation: facts.generation,
+                    },
+                    run: facts.run,
+                    region: facts.region,
+                    align: facts.align,
+                    workflow_kind: facts.workflow_kind,
+                    workflow_version: facts.workflow_version,
+                    input_schema: facts.input_schema,
+                };
+                (facts.region, facts.run, Some(bank))
+            }
+        };
+        let mut machine = ReplayMachine::new(run);
         // `storage` moves in here rather than staying a field of `Context`: see `Source`'s
         // own documentation for why one caller cannot hold it in both places at once.
-        let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(self.region, storage));
+        let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(region, storage));
 
         let recorded_version = begin(&mut source, &mut machine, workflow, page, self.reserve)?;
 
@@ -320,6 +430,7 @@ impl<C: IntegrityCheck> Driver<C> {
             result,
             source,
             reserve: self.reserve,
+            bank,
             stop: None,
             pending: None,
             versions: workflow.identity().versions,
@@ -328,6 +439,119 @@ impl<C: IntegrityCheck> Driver<C> {
         let ended = workflow.run(&mut context);
         context.conclude(ended)
     }
+}
+
+/// What a bank-pointed driver knows about the bank it booted, kept for
+/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankContext {
+    layout: BankLayout,
+    booted: Authority,
+    run: RunId,
+    region: JournalRegion,
+    align: ProgramAlign,
+    workflow_kind: u16,
+    workflow_version: u16,
+    input_schema: u16,
+}
+
+/// One bank's generation and the scalar header facts a swap needs, once its seal has been
+/// validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankFacts {
+    id: BankId,
+    generation: bank::Generation,
+    run: RunId,
+    region: JournalRegion,
+    align: ProgramAlign,
+    workflow_kind: u16,
+    workflow_version: u16,
+    input_schema: u16,
+}
+
+/// Reads bank `id`'s header and seal, and says what it is worth — [`None`] for a bank whose
+/// seal does not validate, whose header does not decode, or whose header does not fit
+/// `page`.
+///
+/// A bank failing any of those is not a candidate at any generation, exactly as
+/// [`bank::sealed_generation_with`] documents: this function only adds the two reads that
+/// answer are read from rather than handed in, and the scalar fields
+/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
+fn read_bank<S, C>(
+    layout: BankLayout,
+    id: BankId,
+    storage: &mut S,
+    page: &mut [u8],
+) -> Result<Option<BankFacts>, DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    let region = layout.bank(id);
+    let header_len = page.len().min(region.payload_bytes() as usize);
+    let Some(header_buf) = page.get_mut(..header_len) else {
+        return Ok(None);
+    };
+    storage
+        .read(region.base(), header_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let mut seal_buf = [0_u8; bank::SEAL_BYTES];
+    storage
+        .read(region.seal_offset(), &mut seal_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let Some(generation) = bank::sealed_generation_with::<C>(header_buf, &seal_buf) else {
+        return Ok(None);
+    };
+    // The seal already names this exact header's digest, so this decode cannot fail.
+    // Treated as "not a candidate" rather than trusted, because the workspace denies both
+    // `unwrap` and `panic!` and a decoder walking bytes off a device is the last place to
+    // make an exception.
+    let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
+        return Ok(None);
+    };
+    let Ok(journal) = JournalRegion::of(layout, id, &header) else {
+        return Ok(None);
+    };
+    Ok(Some(BankFacts {
+        id,
+        generation,
+        run: header.run,
+        region: journal,
+        align: header.align,
+        workflow_kind: header.workflow_kind,
+        workflow_version: header.workflow_version,
+        input_schema: header.input_schema,
+    }))
+}
+
+/// Design document §10's selection rule, over a real device: which bank a
+/// [`Driver::at_bank`] boots, and the facts it needs from it.
+fn select_bank<S, C>(
+    layout: BankLayout,
+    storage: &mut S,
+    page: &mut [u8],
+) -> Result<BankFacts, DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    let a = read_bank::<S, C>(layout, BankId::A, storage, page)?;
+    let b = read_bank::<S, C>(layout, BankId::B, storage, page)?;
+    let id = match bank::select([
+        a.map(|facts| facts.generation),
+        b.map(|facts| facts.generation),
+    ]) {
+        Authority::Unsealed => return Err(DriveError::NoAuthoritativeBank),
+        Authority::Ambiguous { .. } => return Err(DriveError::AmbiguousAuthority),
+        Authority::Bank { id, .. } => id,
+    };
+    match id {
+        BankId::A => a,
+        BankId::B => b,
+    }
+    // Unreachable: `select` names a bank only when its generation came from `Some`, which
+    // is only ever produced beside the rest of that same bank's facts.
+    .ok_or(DriveError::NoAuthoritativeBank)
 }
 
 /// Design document §06 steps 1 and 2: the run's own record, from history or newly written.
@@ -690,6 +914,8 @@ enum Stop<E> {
     },
     /// Something was refused.
     Failed(DriveError<E>),
+    /// `continue_as_new` installed a new run under this id.
+    Migrated(RunId),
 }
 
 /// The driver, as the workflow sees it.
@@ -700,6 +926,10 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     result: &'a mut [u8],
     source: Source<'a, S, C>,
     reserve: Reserve,
+    /// [`Some`] only for a driver built with [`Driver::at_bank`]. [`None`] here is what
+    /// makes [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) refuse for a
+    /// driver [`Driver::new`] pointed at a fixed region.
+    bank: Option<BankContext>,
     stop: Option<Stop<S::Error>>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
     ///
@@ -743,6 +973,10 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                     remaining,
                 });
             }
+            // The run that asked is retired either way, so there is nothing left of it to
+            // check `nothing_follows` against — that question is the *new* bank's, on its
+            // own first boot.
+            Some(Stop::Migrated(run)) => return Ok(Progress::Migrated { run }),
             Some(Stop::Finished {
                 conclusion,
                 result_len,
@@ -1612,6 +1846,69 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     }
 }
 
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
+    /// §10's swap, performed end to end: retire this bank and install `input` as a new run
+    /// in the other one.
+    ///
+    /// [`DriveError::ContinueUnsupported`] for a driver not built with
+    /// [`Driver::at_bank`]. Otherwise every field a swap needs comes from `self.bank` —
+    /// read fresh from the device this same boot — or from `self.reserve`, so none of it
+    /// can be a value a caller carried in stale. Issue
+    /// [#110](https://github.com/madmax983/waymaker/issues/110).
+    fn swap_in(&mut self, input: &[u8]) -> Result<RunId, DriveError<S::Error>> {
+        let Some(bank) = self.bank else {
+            return Err(DriveError::ContinueUnsupported);
+        };
+        // §10's reserve, consulted before the device is touched rather than left to a
+        // caller's discretion: the `Bounds` this run was priced against have to fit the
+        // bank the swap installs into, and both banks of one layout are the same size.
+        Reserve::for_layout(self.reserve.bounds(), bank.layout).map_err(DriveError::Reserve)?;
+        let next_run = bank.run.successor().ok_or(DriveError::RunIdExhausted)?;
+        let Some(storage) = take_storage(&mut self.source) else {
+            return Err(DriveError::NoAppendPoint);
+        };
+        // A throwaway scan: `Swap::beginning` only reads its region back out of `retired`
+        // and then drops it, so this reborrow's life ends there and `storage` is free for
+        // `prepare` below. See `waymaker-flash`'s `swap` module for why the later steps
+        // take a fresh argument instead of keeping this one.
+        let retired =
+            Retired::Recovery(Recovery::<_, C>::with_integrity(bank.region, &mut *storage));
+        let next_header = BankHeader {
+            run: next_run,
+            align: bank.align,
+            workflow_kind: bank.workflow_kind,
+            workflow_version: bank.workflow_version,
+            input_schema: bank.input_schema,
+            input,
+        };
+        let swap = Swap::beginning(bank.layout, bank.booted, bank.run, retired, next_header)
+            .map_err(DriveError::Swap)?;
+        let prepared = swap.prepare(storage).map_err(DriveError::SwapStep)?;
+        let staged = prepared.stage(self.page).map_err(DriveError::SwapStep)?;
+        let sealable = staged.payload_barrier().map_err(DriveError::SwapStep)?;
+        let installed = sealable.commit().map_err(DriveError::SwapStep)?;
+        installed.reclaim().map_err(DriveError::SwapStep)?;
+        Ok(next_run)
+    }
+}
+
+/// Takes the device out of `source`, whatever state it is in, and leaves
+/// [`Source::Taken`] behind.
+///
+/// [`None`] only for [`Source::Taken`] itself — every other state holds a device to give
+/// back. Used by [`Context::swap_in`], which is the boot's last act either way: nothing
+/// after it reads `source` again.
+const fn take_storage<'storage, S, C: IntegrityCheck>(
+    source: &mut Source<'storage, S, C>,
+) -> Option<&'storage mut S> {
+    match mem::replace(source, Source::Taken) {
+        Source::Scanning(recovery) => Some(recovery.into_storage()),
+        Source::Writing(storage, _reserved) => Some(storage),
+        Source::Spent(storage) => Some(storage),
+        Source::Taken => None,
+    }
+}
+
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     for Context<'_, S, A, C>
 {
@@ -1673,12 +1970,19 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended {
-        // `input` is §10's next run input. This driver reads it no further than here: it
-        // cannot name the bank the new run would be installed into.
-        let _ = input;
         if self.stop.is_none() {
-            self.stop = Some(Stop::Failed(DriveError::ContinueUnsupported));
+            self.stop = Some(match self.swap_in(input) {
+                Ok(run) => Stop::Migrated(run),
+                Err(error) => Stop::Failed(error),
+            });
         }
         Suspended::NEW
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        match self.stop {
+            Some(Stop::WaitingUntil(_, clock_kind, remaining)) => Some((clock_kind, remaining)),
+            _ => None,
+        }
     }
 }

@@ -6621,7 +6621,13 @@ const FUTURE_POLL: &str = "poll";
 ///
 /// Four, one per thing a workflow can ask for. A fifth is a question the façade would be
 /// answering for itself.
-pub const CTX_JOURNAL_SURFACE: &[&str] = &["continue_as_new", "resolve", "schedule", "wait"];
+pub const CTX_JOURNAL_SURFACE: &[&str] = &[
+    "continue_as_new",
+    "deadline_remaining",
+    "resolve",
+    "schedule",
+    "wait",
+];
 
 /// What the façade may not name, and why.
 ///
