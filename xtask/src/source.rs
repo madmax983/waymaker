@@ -20836,6 +20836,37 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_primitive_typed_constant_is_pruned_as_dead() {
+        // Codex's next-round finding: `declared_type_is_unsigned` reads a `const`'s own
+        // type ascription through `single_segment_type_name`, which only ever accepted a
+        // bare, unqualified single-segment path — `const HI: core::primitive::u128 = ...`
+        // names the identical type, spelled the canonical fully-qualified way
+        // `well_known_bound_segments` already recognises for a *bound path* rather than a
+        // type, but this function answered `None` for it regardless. `HI` therefore never
+        // recorded as unsigned, so `HI < ZERO` stayed unresolved and the arm it guards was
+        // kept rather than pruned as dead code. `single_segment_type_name` now recognises
+        // the three-segment `core::primitive::TYPE` / `std::primitive::TYPE` spelling too.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn qualified_primitive_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn qualified_primitive_dead_guard_table(nibble: u8) -> u32 {\n    \
+             const HI: core::primitive::u128 = 1u128 << 127;\n    const ZERO: u128 = 0;\n    \
+             match nibble {\n        0 => qualified_primitive_dead_guard_helper(0),\n        \
+             1 => qualified_primitive_dead_guard_helper(1),\n        \
+             2 => qualified_primitive_dead_guard_helper(2),\n        \
+             _ if HI < ZERO => 999,\n        \
+             _ => qualified_primitive_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

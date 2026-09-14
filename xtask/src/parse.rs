@@ -3051,7 +3051,19 @@ fn lit_value(lit: &syn::Lit) -> Option<i128> {
 }
 
 /// The name of `ty`, if it is a plain, unqualified single-segment type path (`u8`, `i32`,
-/// and so on, with no generic arguments) — the shape [`apply_integer_cast`] acts on.
+/// and so on, with no generic arguments) — the shape [`apply_integer_cast`] acts on — or
+/// the identical primitive spelled out in full as `core::primitive::u8` or
+/// `std::primitive::u8`, the same two canonical prefixes [`well_known_bound_segments`]
+/// already recognises for a bound path rather than a type.
+///
+/// Codex's next-round finding: `const HI: core::primitive::u128 = 1u128 << 127;` names its
+/// type this way rather than bare, which is ordinary, MSRV-legal Rust — `core::primitive`
+/// (and `std::primitive`) are real modules re-exporting every primitive under its own
+/// name — but this function answered `None` for any path longer than one segment, so
+/// `declared_type_is_unsigned` never recorded `HI` as unsigned and a guard built from it
+/// stayed unresolved. Scoped to exactly the three-segment canonical spelling, the same way
+/// [`well_known_bound_segments`]'s own four-segment case is scoped to it rather than to any
+/// path ending in the right two segments.
 fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
     let syn::Type::Path(type_path) = ty else {
         return None;
@@ -3059,7 +3071,23 @@ fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
     if type_path.qself.is_some() {
         return None;
     }
-    type_path.path.get_ident().map(ident_name)
+    if let Some(ident) = type_path.path.get_ident() {
+        return Some(ident_name(ident));
+    }
+    let segments: Vec<String> = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    match segments.as_slice() {
+        [root, primitive, name]
+            if (root == "core" || root == "std") && primitive == "primitive" =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Whether `name` is one of the five unsigned fixed-width integer type names — `u8`, `u16`,
