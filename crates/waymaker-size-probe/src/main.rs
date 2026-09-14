@@ -2117,7 +2117,7 @@ fn dispatch_wiring() -> usize {
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, RunId};
     use waymaker_embassy::ActivityDispatcher;
     use waymaker_embassy::dispatch::Produced;
-    use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+    use waymaker_embassy::wiring::{Activity, Table};
 
     /// A stand-in world. The probe is never run.
     struct Fleet(usize);
@@ -2160,9 +2160,8 @@ fn dispatch_wiring() -> usize {
         &mut out,
     ) {
         Poll::Ready(Ok(Produced::Completed(len) | Produced::Failed(len))) => len,
-        Poll::Ready(Err(Unhandled::Activity(reason))) => reason,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(kind))) => usize::from(kind.0),
-        Poll::Pending => 1,
+        Poll::Ready(Err(reason)) => reason,
+        Poll::Ready(Ok(Produced::Unserviceable)) | Poll::Pending => 1,
     };
     kept = kept.wrapping_add(table.name_of(asked).map_or(0, str::len));
     kept = kept.wrapping_add(table.world().0);

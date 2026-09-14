@@ -157,6 +157,8 @@ struct World {
     as_failure: bool,
     /// The identity each poll was handed.
     ids: Vec<EffectId>,
+    /// Whether every poll answers [`Produced::Unserviceable`].
+    unserviceable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +176,15 @@ impl World {
             reports: None,
             as_failure: false,
             ids: Vec::new(),
+            unserviceable: false,
         }
+    }
+
+    /// Answer every poll with [`Produced::Unserviceable`].
+    const fn unserviceable() -> Self {
+        let mut world = Self::silent();
+        world.unserviceable = true;
+        world
     }
 
     /// Report `len` rather than the answer's own length.
@@ -212,6 +222,9 @@ impl ActivityDispatcher for World {
     ) -> Poll<Result<Produced, Fault>> {
         self.polls += 1;
         self.ids.push(id);
+        if self.unserviceable {
+            return Poll::Ready(Ok(Produced::Unserviceable));
+        }
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
@@ -339,6 +352,26 @@ fn a_dispatcher_that_is_not_ready_records_nothing_and_leaves_the_effect_outstand
     assert_eq!(
         ledger.asked,
         vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())]
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_records_nothing_and_leaves_the_effect_outstanding() {
+    // Issue #111. An unserviceable kind stops the boot the same way a dispatcher that is
+    // not ready does. It records nothing. The effect stays outstanding under its committed
+    // identity. A later boot may still complete it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(answered, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the intent is durable, but nothing is ever resolved"
     );
 }
 

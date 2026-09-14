@@ -54,6 +54,7 @@ be superseded.
 | [0043](0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md) | The model gains banked records, a reboot, and a live compaction | accepted |
 | [0044](0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
 | [0045](0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
+| [0046](0046-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
 
 ## Reading the numbers
 

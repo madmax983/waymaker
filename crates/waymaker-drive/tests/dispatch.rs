@@ -13,6 +13,10 @@
 //!   of it.
 //! * **durable intent.** At every crash point the injector lists, every effect the world
 //!   performed has a schedule record in the prefix the crash left behind.
+//! * **an unserviceable kind, over real media.** Issue
+//!   [#111](https://github.com/madmax983/waymaker/issues/111). A table with no row commits
+//!   a schedule record and writes nothing else. A second boot, over the same device, with a
+//!   table that has the row, redelivers and completes the same effect.
 //!
 //! The façade's own sequencing is `crates/waymaker-embassy/tests/{ctx,wiring}.rs`.
 
@@ -26,11 +30,11 @@ use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::{
     Activities, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Identity, Performed,
-    Scratch, Suspended, Workflow,
+    Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+use waymaker_embassy::wiring::{Activity, Table};
 use waymaker_embassy::{ActivityDispatcher, Journal};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
@@ -54,7 +58,11 @@ const URL: &[u8] = b"fw://a";
 /// media and the scan still passed. A name that fits is a scan that can fail.
 const DOWNLOAD_NAME: &str = "dl";
 
-/// The terminal payload of a run that reached a branch this file argues is unreachable.
+/// A payload no test expects to find on media.
+///
+/// `Wired::run` writes this only on a path `Context::conclude` never reads: an outstanding
+/// effect always answers `DriveError::EffectOutstanding` first. See `Wired::run`'s own
+/// comment.
 const UNREACHED: &[u8] = &[254];
 
 /// A four-byte result bound under an eight-byte terminal bound.
@@ -171,6 +179,13 @@ impl Wired {
         }
     }
 
+    const fn with_rows(world: World, rows: &'static [Activity<World, Offline>]) -> Self {
+        Self {
+            table: Table::over(world, rows),
+            out: [0; 8],
+        }
+    }
+
     const fn world(&self) -> &World {
         self.table.world()
     }
@@ -201,11 +216,14 @@ impl Workflow for Wired {
             }
         };
         let Some(len) = ended else {
-            // Unreachable, and observable rather than silent. `work` always ends the run,
-            // its one-byte terminal payload always fits the eight-byte buffer, and this
-            // file's world always answers — so a poll that ends without a conclusion is a
-            // boundary the driver already stopped, and `Context::conclude` reads its own
-            // `stop` before it reads this value. `UNREACHED` is a byte no test expects.
+            // `work` always ends the run, and its payload always fits. This arm was once
+            // unreachable for that reason. Issue #111 opened it: an unserviceable kind can
+            // now leave `ctx.conclusion()` at `None` with the world never stalling at all.
+            // This bridge has no real `Suspended` to answer with on that path, so it
+            // answers `Ok(Outcome::Failed(UNREACHED))`. `Context::conclude` reads its own
+            // `pending` field before it reads this value. An outstanding effect there
+            // answers `DriveError::EffectOutstanding` instead. `UNREACHED` never reaches
+            // media either way.
             return Ok(Outcome::Failed(UNREACHED));
         };
         Ok(Outcome::Completed(self.out.get(..len).unwrap_or_default()))
@@ -528,10 +546,7 @@ fn a_kind_no_row_declares_stops_the_run_without_a_panic() {
         &mut out,
     );
 
-    assert_eq!(
-        answered,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(ActivityKind(99))))
-    );
+    assert_eq!(answered, Poll::Ready(Ok(Produced::Unserviceable)));
 }
 
 /// One boot over `session`, and the sequences the world was asked to perform.
@@ -624,5 +639,69 @@ fn every_effect_the_facade_dispatched_has_a_recoverable_schedule_at_every_crash_
     assert!(
         shortened > 0,
         "a sweep in which no crash ever shortened history measured nothing"
+    );
+}
+
+/// No row at all. Issue #111's firmware, before it gains `DOWNLOAD`.
+const NO_ROWS: &[Activity<World, Offline>] = &[];
+
+#[test]
+fn a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding() {
+    // Boot 1, over real media. No row answers `DOWNLOAD`. The schedule record commits, and
+    // nothing else does. `Wired::run` has no real `Suspended` for a stall the dispatcher
+    // never reports back to the driver, so it cannot answer `Progress::Waiting` here. The
+    // driver's own `pending` check answers `EffectOutstanding` instead. What matters is on
+    // media, not in this return value.
+    let mut device = Device::new(geometry());
+    let mut stranded = Wired::with_rows(World::default(), NO_ROWS);
+
+    let progress = boot(&mut device, &mut stranded);
+
+    assert!(
+        matches!(progress, Err(DriveError::EffectOutstanding)),
+        "{progress:?}"
+    );
+    assert!(stranded.world().dispatched.is_empty(), "no row ran");
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the run and the schedule only -- no outcome and no terminal record for a kind \
+         this firmware cannot service"
+    );
+
+    // Boot 2, over the same device: a firmware update adds the row.
+    let mut rescued = Wired::new(World {
+        answer: b"ok".to_vec(),
+        ..World::default()
+    });
+
+    let progress = boot(&mut device, &mut rescued);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: waymaker_drive::Conclusion::Completed,
+            result_len: 1,
+        }),
+        "the run boot 1 left outstanding now completes"
+    );
+    assert_eq!(
+        rescued.world().dispatched,
+        vec![EffectId {
+            run: RUN,
+            seq: EffectSeq(0),
+        }],
+        "the same identity boot 1's schedule record committed, redelivered and run once"
+    );
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 6],
+        "the run, the schedule, the completion, and the end"
     );
 }

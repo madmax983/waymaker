@@ -3555,3 +3555,36 @@ kind of input this design has never claimed to survive: this function's whole po
 check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #111 closes a gap ADR 0033 named in its own consequences section. The old code
+recorded a kind with no row as an `EffectFailed`, with no payload. That decision was
+permanent: §08 has no edge back from a resolved effect to an unresolved one. So no later
+firmware could complete that effect, no matter how many rows it gained. `dispatch::Produced`
+gains a third answer, `Unserviceable`, carrying no payload — the same shape §11's
+`KernelError` already uses for "this firmware cannot service this now", as distinct from
+"this firmware can never replay this history". `Ctx`'s `ActivityFuture` stops for it exactly
+as it stops for `Poll::Pending`. Neither calls `Journal::resolve`. The effect stays
+outstanding under the identity its schedule record already committed. `wiring::Table`
+answers it for a kind no row declares, in place of the `Unhandled::NoSuchActivity` it used to
+construct; since that was `Unhandled`'s only reason to exist beside wrapping a row's own
+error, `Unhandled<E>` is gone and `Table<W, E>::Error` is `E` itself. Two tests are the "done
+when", at two levels: `crates/waymaker-embassy/tests/wiring.rs`'s
+`a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_could_not` proves the
+façade's own sequencing over a fake journal, and
+`crates/waymaker-drive/tests/dispatch.rs`'s
+`a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding`
+proves the same claim over real media — a table with no row commits a schedule record and
+writes nothing else, and a second boot over the same device, with a table that has the row,
+redelivers and completes it. That second test's own boot 1 answers
+`DriveError::EffectOutstanding` rather than `Progress::Waiting`, because its `Wired::run`
+bridges the façade through `waymaker-drive`'s synchronous boundary and that bridge cannot
+build a real `Suspended` for a stall the async dispatcher never reports back to the driver;
+what the test proves rests on the journal and on boot 2, not on that return value, and
+closing the rough edge is issue #110's, not this one's. The code-flash cost is nil —
+`cargo xtask size`'s `facade` row measures 13174 B of layers both before and after, because
+removing `Unhandled`'s wrapping paid for the third `Produced` arm. One thing stays the same:
+a caller still cannot tell "the world is slow" from "no firmware will ever service this" from
+the return value alone. Both cases return `Poll::Pending` — a halted journal and an unpassed
+deadline already work the same way. Design document §13's boundary gives no reason for any
+stop, and this change adds none. See
+[ADR 0046](docs/adr/0046-an-unserviceable-kind-is-an-answer-not-a-record.md).

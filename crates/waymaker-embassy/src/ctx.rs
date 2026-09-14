@@ -25,12 +25,14 @@
 //! is *plumb* the task's waker through to [`ActivityDispatcher::poll_dispatch`], which is
 //! the one place that knows when the world will answer.
 //!
-//! Two paths therefore register nothing. A [`Halted`] run registers nothing because the
+//! Three paths therefore register nothing. A [`Halted`] run registers nothing because the
 //! boot is over: the caller that drove it looks at the journal next. A deadline that has
 //! not passed registers nothing because there is no in-boot sleep yet — [`Journal::wait`]
 //! is asked again on the next poll, and issue
 //! [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot sleep is where a
-//! hardware alarm arrives.
+//! hardware alarm arrives. An unserviceable activity kind registers nothing. No event can
+//! predict when a firmware update will arrive (issue
+//! [#111](https://github.com/madmax983/waymaker/issues/111)).
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -305,15 +307,14 @@ fn observed<T: Decode>(
     }
 }
 
-/// What the journal is told, for a length the world reported against `room`.
+/// What the journal is told, for a result or a failure of `len` bytes reported against
+/// `room`.
 ///
 /// A free function, for [`observed`]'s reason: it takes the buffer rather than `self`, so
-/// the journal borrow beside it stays disjoint.
-fn answered(produced: Produced, out: &[u8], room: usize) -> Answer<'_> {
-    let (len, completed) = match produced {
-        Produced::Completed(len) => (len, true),
-        Produced::Failed(len) => (len, false),
-    };
+/// the journal borrow beside it stays disjoint. It never sees
+/// [`Produced::Unserviceable`](crate::dispatch::Produced::Unserviceable). That answer stops
+/// the boot before this function runs. The code writes no record for it.
+fn answered(len: usize, completed: bool, out: &[u8], room: usize) -> Answer<'_> {
     if len > room {
         return Answer::Exhausted;
     }
@@ -374,9 +375,15 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         .dispatcher
                         .poll_dispatch(task, id, me.kind, me.input, into);
                     let answer = match dispatched {
-                        // The world asked to be tried again. Nothing is recorded, so the
-                        // effect stays outstanding under the identity it was committed with.
-                        Poll::Pending => return Poll::Pending,
+                        // Two cases return `Poll::Pending` here. `Poll::Pending`: the world
+                        // asked to be tried again. `Produced::Unserviceable`: this firmware
+                        // cannot service `kind`. Nothing will change that before a reboot
+                        // (issue #111). Either way, the code records nothing. The effect
+                        // stays outstanding under its committed identity. A later boot may
+                        // still complete it.
+                        Poll::Pending | Poll::Ready(Ok(Produced::Unserviceable)) => {
+                            return Poll::Pending;
+                        }
                         // The activity failed with nothing to record. It is recorded as a
                         // failure with no payload, so the run makes progress and every
                         // replay answers the same way. The error value stops here: a
@@ -386,7 +393,12 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         // A length over the bound is recorded as a failure with no payload:
                         // a truncation replays a wrong answer for ever, and a refusal
                         // strands the run. Both shapes are bounded by the same figure.
-                        Poll::Ready(Ok(produced)) => answered(produced, me.out, room),
+                        Poll::Ready(Ok(Produced::Completed(len))) => {
+                            answered(len, true, me.out, room)
+                        }
+                        Poll::Ready(Ok(Produced::Failed(len))) => {
+                            answered(len, false, me.out, room)
+                        }
                     };
                     me.stage = Stage::Ended;
                     return match me.journal.resolve(answer) {

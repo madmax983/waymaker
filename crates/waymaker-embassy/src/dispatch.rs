@@ -11,9 +11,9 @@ use waymaker_core::{ActivityKind, EffectId};
 
 /// What an activity produced, in the buffer it was handed.
 ///
-/// Two shapes, because design document §09 gives `EffectFailed` a bounded payload. Before
-/// issue [#36](https://github.com/madmax983/waymaker/issues/36) a dispatcher answered
-/// `Ok(len)` or `Err(E)`, so it could report bytes or failure and never both.
+/// Three shapes. Design document §09 gives `EffectFailed` a bounded payload. Before issue
+/// [#36](https://github.com/madmax983/waymaker/issues/36) a dispatcher answered `Ok(len)` or
+/// `Err(E)`, so it could report bytes or failure and never both.
 ///
 /// `len` is the answer's **whole** length, even when it is wider than the buffer. A length
 /// over the run's declared bound is recorded as a failure with no payload; a short answer
@@ -24,6 +24,13 @@ pub enum Produced {
     Completed(usize),
     /// Failure, with a payload: the first `len` bytes of `out`.
     Failed(usize),
+    /// This firmware cannot service the requested kind.
+    ///
+    /// It writes no record. [`Ctx`](crate::ctx::Ctx) stops the boot here, the same as
+    /// [`Poll::Pending`]. The effect stays outstanding under its committed identity. A
+    /// later boot may still complete it, if its dispatcher can service this kind. Issue
+    /// [#111](https://github.com/madmax983/waymaker/issues/111).
+    Unserviceable,
 }
 
 /// What performs an activity.
@@ -70,6 +77,11 @@ pub trait ActivityDispatcher {
     /// `task`'s waker. Nothing is recorded, and the effect stays outstanding under `id`.
     /// That is how a dispatcher asks to be tried again: this crate holds no retry policy,
     /// because §16's `retry-policy-placement` is open.
+    ///
+    /// [`Produced::Unserviceable`] means this firmware has no way to perform `kind` at all.
+    /// It is not a retry. Nothing about `id` changes before the next reboot. Use it instead
+    /// of [`Poll::Pending`] for a kind this build does not know. This lets a caller tell the
+    /// two cases apart.
     ///
     /// # Errors
     ///
