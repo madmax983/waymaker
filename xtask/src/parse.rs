@@ -4068,6 +4068,19 @@ fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -
 /// arms are not — or the reverse — could be resolved to a value only a test build would
 /// produce, feeding a wrong constant into the density check the same
 /// [`has_cfg_test`]-filtered exclusion already protects `visit_expr_match` itself from.
+///
+/// Codex's next-round finding: a guarded arm made this bail out unconditionally, even when
+/// the guard itself resolves to a compile-time constant — `_ if false => 100, _ => 0` names
+/// exactly `0`, the second arm, because a guard `rustc` can prove always false is dead code
+/// it eliminates before the match this scan is trying to fold ever lowers, the identical
+/// pruning [`MatchVisitor::visit_expr_match`] already does for a numbered table's own outer
+/// arms. Folded the same way here: an arm whose pattern does not match the scrutinee is
+/// skipped regardless of its guard, since the guard is never even evaluated for it: an arm
+/// whose pattern *does* match is selected outright when it carries no guard or one that
+/// resolves to a nonzero (`true`) value, skipped in favour of a later arm when its guard
+/// resolves to exactly `0` (`false`), and this whole function still bails out — rather than
+/// guessing which of two matching arms `rustc` would pick — the moment a matching arm's own
+/// guard cannot be resolved to a compile-time value at all.
 fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<i128> {
     let scrutinee = literal_or_const_value(&expr_match.expr, resolve)?;
     for arm in expr_match
@@ -4075,12 +4088,17 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
         .iter()
         .filter(|arm| !has_cfg_test(&arm.attrs))
     {
-        if arm.guard.is_some() {
-            return None;
+        if !match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
+            continue;
         }
-        if match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
-            return literal_or_const_value(&arm.body, resolve);
+        if let Some((_, guard_expr)) = arm.guard.as_ref() {
+            match literal_or_const_value(guard_expr, resolve) {
+                Some(0) => continue,
+                Some(_) => {}
+                None => return None,
+            }
         }
+        return literal_or_const_value(&arm.body, resolve);
     }
     None
 }

@@ -20435,6 +20435,37 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_dead_guarded_match_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { _ if false => 100, _ =>
+        // 0 };` nests a guarded arm inside the match that initializes a numbered constant —
+        // `evaluate_match` bailed out with `None` the moment it saw *any* guard at all,
+        // even one this scan can already prove always false, the identical pruning
+        // `MatchVisitor::visit_expr_match` already applies to a numbered table's own outer
+        // arms. Every one of a table's numbered arms nesting a dead-guarded match this way
+        // stayed unresolved. `evaluate_match` now folds a guard through the same
+        // `literal_or_const_value` pipeline every other constant expression here uses: an
+        // arm whose guard resolves to `0` is skipped in favour of a later one, exactly as
+        // `rustc`'s own dead-code elimination would drop it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guarded_match_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { _ if false => 100, _ => 0 };\n    \
+             const P1: u8 = match 0u8 { _ if false => 100, _ => 1 };\n    \
+             const P2: u8 = match 0u8 { _ if false => 100, _ => 2 };\n    \
+             const P3: u8 = match 0u8 { _ if false => 100, _ => 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
