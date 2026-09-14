@@ -1459,153 +1459,97 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
             .trim_end_matches(".rs");
         format!("{parent_dir}{stem}/")
     };
-    let mut found = Vec::new();
-    collect_child_modules(
-        &file.items,
-        &parent_dir,
-        &child_dir,
-        false,
-        &mut Vec::new(),
-        &mut found,
-    );
-    Ok(found)
-}
-
-/// The out-of-line `mod`s in `items`, appending to `found` in source order.
-///
-/// `parent_dir` is the declaring file's directory and `child_dir` the directory its
-/// children live in; `gated` is whether an enclosing inline module is `#[cfg(test)]`.
-/// `inline_path` is the stack of inline `mod { ... }` names entered so far — pushed and
-/// popped around the recursive call the same way [`MatchVisitor::module_path`] is, and
-/// what lets a child several inline modules deep keep every one of their names rather
-/// than only the last (Codex's finding).
-fn collect_child_modules(
-    items: &[syn::Item],
-    parent_dir: &str,
-    child_dir: &str,
-    gated: bool,
-    inline_path: &mut Vec<String>,
-    found: &mut Vec<ChildModule>,
-) {
-    for item in items {
-        collect_child_modules_from_item(item, parent_dir, child_dir, gated, inline_path, found);
+    let mut collector = ChildModuleCollector {
+        parent_dir: &parent_dir,
+        child_dir,
+        gated: false,
+        inline_path: Vec::new(),
+        found: Vec::new(),
+    };
+    for item in &file.items {
+        collector.visit_item(item);
     }
+    Ok(collector.found)
 }
 
-/// [`collect_child_modules`]'s own per-item body, factored out so it can call itself on a
-/// function or method body's local item statements as well as on a file's or an inline
-/// module's own item list.
+/// A [`syn::visit::Visit`] walk collecting every out-of-line `mod` reachable from `items`
+/// — at item level, inside an inline `mod { ... }`, or nested arbitrarily deep inside a
+/// function or method body (a block, an `if`, a `match` arm, a closure — anywhere `syn`'s
+/// own grammar allows an item statement).
 ///
-/// Codex's finding: module discovery started and stayed at `file.items`, so a `mod`
-/// declared inside a function body — legal Rust, and the one shape `rustc` requires a
-/// `#[path]` attribute for, since a block has no directory of its own to fall back to —
-/// was never seen at all. Its directory context is its enclosing function's, which is not
-/// a directory-owning scope of its own, so a function or method body is walked with
-/// `parent_dir`, `child_dir`, `gated` and `inline_path` all unchanged from what its
-/// surrounding item-level module already had; only `Item::Mod` and `Item::Fn` items in
-/// the body matter, and a nested one is reached by this function recursing into itself.
-fn collect_child_modules_from_item(
-    item: &syn::Item,
-    parent_dir: &str,
-    child_dir: &str,
+/// Codex's findings, across two rounds: the first version of this walk only read
+/// `file.items` and never entered a function body at all. A second version added a
+/// non-recursive scan of a function body's own top-level statements, and that version
+/// had two more gaps Codex found in the same round: it never descended into a block
+/// nested *inside* that body (an `if`, a `match` arm, a closure), so a `mod` declared
+/// there was still unseen; and it passed the enclosing item's own gating into a function
+/// body unconditionally, so a `#[cfg(test)] fn fixture() { .. }`'s own local modules were
+/// read as shipping code. A `syn::visit::Visit` walk closes all three at once: its own
+/// default recursion already reaches every nested block the grammar allows (an `if`'s
+/// arms, a `match`'s, a closure's body, and so on, transitively), and overriding
+/// `visit_item` once — generically, for every item kind rather than only `mod` and `fn` —
+/// folds a cfg-tested item's own gating into everything beneath it before recursing.
+struct ChildModuleCollector<'a> {
+    parent_dir: &'a str,
+    child_dir: String,
     gated: bool,
-    inline_path: &mut Vec<String>,
-    found: &mut Vec<ChildModule>,
-) {
-    match item {
-        syn::Item::Mod(module) => {
-            let name = ident_name(&module.ident);
-            let item_gated = gated || has_cfg_test(&module.attrs);
-            if let Some((_, nested)) = module.content.as_ref() {
-                // Inline: no file of its own, but its out-of-line children live under it.
-                inline_path.push(name.clone());
-                collect_child_modules(
-                    nested,
-                    parent_dir,
-                    &format!("{child_dir}{name}/"),
-                    item_gated,
-                    inline_path,
-                    found,
-                );
-                inline_path.pop();
+    inline_path: Vec<String>,
+    found: Vec<ChildModule>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ChildModuleCollector<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let was_gated = self.gated;
+        self.gated = self.gated || has_cfg_test(item_attrs(item));
+        syn::visit::visit_item(self, item);
+        self.gated = was_gated;
+    }
+
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        let name = ident_name(&module.ident);
+        if module.content.is_some() {
+            // Inline: no file of its own, but its out-of-line children live under it.
+            // `self.gated` already carries this module's own `#[cfg(test)]`, folded in by
+            // `visit_item` above before it dispatched here.
+            let nested_child_dir = format!("{}{name}/", self.child_dir);
+            let saved_child_dir = std::mem::replace(&mut self.child_dir, nested_child_dir);
+            self.inline_path.push(name);
+            syn::visit::visit_item_mod(self, module);
+            self.inline_path.pop();
+            self.child_dir = saved_child_dir;
+        } else {
+            // A `#[path]` attribute resolves against the *declaring file's* own
+            // directory at the top level (`parent_dir`), but stops being true the
+            // moment the declaration sits inside an inline `mod { ... }`: `rustc` then
+            // resolves it against that inline module's own directory instead, which is
+            // `self.child_dir` by the time this is reached — extended with each inline
+            // module's own name on the way in. `self.inline_path` being non-empty is
+            // exactly "this declaration is nested inside at least one inline module" —
+            // a function or a further-nested block carries the same `child_dir` and
+            // `inline_path` its surrounding item-level module already had, since
+            // neither is a directory-owning scope of its own, so this reads correctly
+            // for a `mod` declared arbitrarily deep inside one.
+            let path_base = if self.inline_path.is_empty() {
+                self.parent_dir
             } else {
-                // A `#[path]` attribute resolves against the *declaring file's* own
-                // directory at the top level (`parent_dir`), but Codex's finding is that
-                // this stops being true the moment the declaration sits inside an inline
-                // `mod { ... }`: `rustc` then resolves it against that inline module's own
-                // directory instead, which is `child_dir` by the time this call is
-                // reached — it was extended with each inline module's own name on the way
-                // in, one level per `inline_path.push` above. `inline_path` being
-                // non-empty is exactly "this declaration is nested inside at least one
-                // inline module" — a function body carries the same `inline_path` its
-                // surrounding item-level module had, so this reads correctly for a `mod`
-                // declared inside a function nested in an inline module too.
-                let path_base = if inline_path.is_empty() {
-                    parent_dir
-                } else {
-                    child_dir
-                };
-                let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
-                    || {
-                        vec![
-                            format!("{child_dir}{name}.rs"),
-                            format!("{child_dir}{name}/mod.rs"),
-                        ]
-                    },
-                    // `rustc` consults exactly this one path (see above): no fallback.
-                    |path| vec![normalize_path(&format!("{path_base}{path}"))],
-                );
-                found.push(ChildModule {
-                    name,
-                    inline_ancestors: inline_path.clone(),
-                    candidates,
-                    test_gated: item_gated,
-                });
-            }
-        }
-        syn::Item::Fn(function) => {
-            collect_child_modules_from_block(
-                &function.block,
-                parent_dir,
-                child_dir,
-                gated,
-                inline_path,
-                found,
+                self.child_dir.as_str()
+            };
+            let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
+                || {
+                    vec![
+                        format!("{}{name}.rs", self.child_dir),
+                        format!("{}{name}/mod.rs", self.child_dir),
+                    ]
+                },
+                // `rustc` consults exactly this one path (see above): no fallback.
+                |path| vec![normalize_path(&format!("{path_base}{path}"))],
             );
-        }
-        syn::Item::Impl(implementation) => {
-            for member in &implementation.items {
-                if let syn::ImplItem::Fn(method) = member {
-                    collect_child_modules_from_block(
-                        &method.block,
-                        parent_dir,
-                        child_dir,
-                        gated,
-                        inline_path,
-                        found,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// [`collect_child_modules_from_item`]'s block half: every local item statement in
-/// `block`, each handed to the same function that reads a file's or a module's own items —
-/// a function body is not a directory-owning scope, so nothing about the walk's context
-/// changes on the way in.
-fn collect_child_modules_from_block(
-    block: &syn::Block,
-    parent_dir: &str,
-    child_dir: &str,
-    gated: bool,
-    inline_path: &mut Vec<String>,
-    found: &mut Vec<ChildModule>,
-) {
-    for stmt in &block.stmts {
-        if let syn::Stmt::Item(item) = stmt {
-            collect_child_modules_from_item(item, parent_dir, child_dir, gated, inline_path, found);
+            self.found.push(ChildModule {
+                name,
+                inline_ancestors: self.inline_path.clone(),
+                candidates,
+                test_gated: self.gated,
+            });
         }
     }
 }
@@ -1661,11 +1605,13 @@ pub struct FoundMatch {
 
 /// One arm of a [`FoundMatch`].
 pub struct FoundArm {
-    /// The arm's pattern's own integer value — a literal, however based or suffixed, or a
-    /// path resolving to a `const` this same scan found declared with a literal
-    /// initializer (`literal_or_const_value`'s reach) — or `None` for anything else,
-    /// `_` included.
-    pub pattern: Option<i128>,
+    /// Every integer value the arm's pattern covers — a literal, however based or
+    /// suffixed, a path resolving to a `const` this same scan found declared with a
+    /// literal initializer (`literal_or_const_value`'s reach), or more than one value
+    /// when the pattern is an or-pattern (`0 | 1 => ..`) whose every alternative
+    /// resolves. Empty for anything else, `_` included, or for an or-pattern with even
+    /// one unresolved alternative.
+    pub pattern: Vec<i128>,
     /// Whether the pattern is irrefutable the way a dense table's final arm needs to be —
     /// `_`, or an unguarded binding naming no known constant — since a plain binding
     /// matches everything a wildcard does and compiles to the identical lookup table.
@@ -2101,6 +2047,79 @@ fn lit_value(lit: &syn::Lit) -> Option<i128> {
     }
 }
 
+/// The name of `ty`, if it is a plain, unqualified single-segment type path (`u8`, `i32`,
+/// and so on, with no generic arguments) — the only shape [`apply_integer_cast`] can act
+/// on.
+fn integer_type_name(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    type_path.path.get_ident().map(ident_name)
+}
+
+/// `value`'s own bit pattern, reinterpreted the way Rust's `as` operator casts one
+/// fixed-width integer type into another: truncated to the destination's own width, then
+/// sign-extended if the destination is signed and the truncated value's own high bit is
+/// set.
+///
+/// Codex's finding: `248u8 as i8` and `255u8 as i8` are `-8` and `-1`, not `248` and
+/// `255` — a `const` whose numbered arms cover `-8..=6` by casting a run of `u8` literals
+/// compiles to the identical offset-indexed table an `i8` literal sequence would, but the
+/// cast's own destination type used to be discarded entirely, passing the unsigned
+/// operand straight through.
+///
+/// Scoped to the ten fixed-width integer types (`u8`..`u128`, `i8`..`i128`): `usize` and
+/// `isize` are platform-width, which this scan has no target to measure against, so a
+/// cast to either stays unresolved rather than guessed — the same standing a call to a
+/// user-defined `const fn` already has here. A destination this scan does not resolve
+/// returns `None`, never the operand unchanged, because passing an unevaluated cast
+/// through is exactly the bug being fixed.
+fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
+    let name = integer_type_name(ty)?;
+    let (width, signed): (u32, bool) = match name.as_str() {
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" => (64, false),
+        "u128" => (128, false),
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" => (64, true),
+        "i128" => (128, true),
+        _ => return None,
+    };
+    // Both casts are the deliberate two's-complement bit reinterpretation Rust's own
+    // `as` gives an integer-to-integer cast of the same width — not a value conversion,
+    // which is what `checked_sub`/`try_from` below are for.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "the widest-width branch below reinterprets this pattern, not converts it"
+    )]
+    let bits = value as u128;
+    if width >= 128 {
+        return if signed {
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "u128 to i128 at equal width is the same reinterpretation, not a value conversion"
+            )]
+            let reinterpreted = bits as i128;
+            Some(reinterpreted)
+        } else {
+            i128::try_from(bits).ok()
+        };
+    }
+    let masked = bits & ((1_u128 << width) - 1);
+    if signed && masked & (1_u128 << (width - 1)) != 0 {
+        i128::try_from(masked).ok()?.checked_sub(1_i128 << width)
+    } else {
+        i128::try_from(masked).ok()
+    }
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -2110,7 +2129,14 @@ fn literal_or_const_value(
 ) -> Option<i128> {
     match expr {
         syn::Expr::Lit(literal) => lit_value(&literal.lit),
-        syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, resolve),
+        // Codex's finding: `248u8 as i8` is `-8`, not `248` — this used to discard the
+        // cast's own destination type and pass the operand straight through, so a
+        // `const` whose numbered arms cover `-8..=6` by casting a run of `u8` literals
+        // read as `248..=255, 0..=6` and was never recognised as the contiguous window
+        // it really is. [`apply_integer_cast`] applies the cast for real.
+        syn::Expr::Cast(cast) => {
+            apply_integer_cast(literal_or_const_value(&cast.expr, resolve)?, &cast.ty)
+        }
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
         syn::Expr::Path(path) => resolve(&path.path),
@@ -2183,32 +2209,66 @@ fn literal_or_const_value(
 /// `None` for a wildcard, a wider range, a tuple, or anything else a dense table's patterns
 /// are not, and for a binding that names no known constant — that is
 /// [`is_catchall_pattern`]'s question, not this one's.
-fn pattern_literal(
-    pattern: &syn::Pat,
-    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
-) -> Option<i128> {
+fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i128>) -> Vec<i128> {
     match pattern {
-        syn::Pat::Lit(literal) => lit_value(&literal.lit),
+        syn::Pat::Lit(literal) => lit_value(&literal.lit).into_iter().collect(),
         syn::Pat::Ident(named) if named.by_ref.is_none() => match &named.subpat {
-            None => resolve(&syn::Path::from(named.ident.clone())),
+            None => resolve(&syn::Path::from(named.ident.clone()))
+                .into_iter()
+                .collect(),
             // Codex's finding: an at-binding (`_p0 @ 0`) is exactly as singleton a pattern
             // as its own subpattern is, and MSRV-legal, unwarned Rust — the binding name
             // is incidental to the value the arm matches, so the subpattern is resolved
             // the same way any other pattern here is, recursively.
             Some((_, subpat)) => pattern_literal(subpat, resolve),
         },
-        syn::Pat::Path(path) => resolve(&path.path),
+        syn::Pat::Path(path) => resolve(&path.path).into_iter().collect(),
         syn::Pat::Range(range) if matches!(range.limits, syn::RangeLimits::Closed(_)) => {
-            let start = literal_or_const_value(range.start.as_deref()?, resolve)?;
-            let end = literal_or_const_value(range.end.as_deref()?, resolve)?;
-            (start == end).then_some(start)
+            let Some(start) = range
+                .start
+                .as_deref()
+                .and_then(|expr| literal_or_const_value(expr, resolve))
+            else {
+                return Vec::new();
+            };
+            let Some(end) = range
+                .end
+                .as_deref()
+                .and_then(|expr| literal_or_const_value(expr, resolve))
+            else {
+                return Vec::new();
+            };
+            if start == end {
+                vec![start]
+            } else {
+                Vec::new()
+            }
         }
         // Codex's finding: a reference pattern (`&0`) is exactly as singleton a value as
         // its own referent, over a scrutinee that is itself a reference — a shape a dense
         // table's own selector can be, and one `rustc` lowers to the identical indexed
         // table a by-value match would.
         syn::Pat::Reference(reference) => pattern_literal(&reference.pat, resolve),
-        _ => None,
+        // Codex's finding: `0 | 1 => VALUE` covers two values in a single arm, and
+        // `rustc` still lowers a match built this way to the identical indexed table a
+        // one-value-per-arm spelling gets — this fell to the `_ => Vec::new()` case
+        // below and read as unresolved on every arm that used it. Every alternative is
+        // resolved and flattened into one list; if any alternative does not resolve, the
+        // whole arm is treated as unresolved rather than silently counting only the
+        // alternatives that did — a partial count could make a real table look sparser
+        // than it is, in either direction.
+        syn::Pat::Or(or_pattern) => {
+            let mut values = Vec::with_capacity(or_pattern.cases.len());
+            for case in &or_pattern.cases {
+                let case_values = pattern_literal(case, resolve);
+                if case_values.is_empty() {
+                    return Vec::new();
+                }
+                values.extend(case_values);
+            }
+            values
+        }
+        _ => Vec::new(),
     }
 }
 

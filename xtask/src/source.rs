@@ -8901,9 +8901,9 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
-/// The single value in the `total`-wide window starting at the numbered arms' own lowest
-/// pattern no numbered (non-wildcard) arm's pattern names, if there is exactly one — the
-/// value a dense table's own wildcard arm covers.
+/// The single value in the window starting at the numbered arms' own lowest covered value
+/// and as wide as the number of values they cover *plus one*, that no numbered
+/// (non-wildcard) arm's pattern names — the value a dense table's own wildcard arm covers.
 ///
 /// Codex's finding: the earlier version fixed the window at the literal range
 /// `0..found.arms.len()`, on the assumption a dense table always starts at `0` — true of
@@ -8929,11 +8929,21 @@ const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 /// (which the negative value might even be) was ever found. Values now stay `i128`
 /// throughout; only the *offset* from the window's own base — never negative once `base`
 /// is truly the minimum — is narrowed to a `usize` to index `covered`.
-fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<i128> {
-    let mut values = Vec::with_capacity(numbered.len());
+///
+/// Codex's finding, again: an arm can be an or-pattern (`0 | 1 => ..`) covering more than
+/// one value, so the window's own width was never `numbered.len() + 1` — it is the *total
+/// number of values the numbered arms cover*, plus one for the wildcard. Every arm's own
+/// `pattern` list is flattened into one list of values before the window is built, rather
+/// than treating one arm as one value.
+fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
+    let mut values = Vec::new();
     for arm in numbered {
-        values.push(arm.pattern?);
+        if arm.pattern.is_empty() {
+            return None;
+        }
+        values.extend(arm.pattern.iter().copied());
     }
+    let total = values.len().checked_add(1)?;
     let base = *values.iter().min()?;
     let mut covered = vec![false; total];
     for value in values {
@@ -8953,10 +8963,12 @@ fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<i1
 }
 
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: every value of some `found.arms.len()`-wide window of consecutive
-/// integers named exactly once, whatever base the window itself sits at, whatever suffix
-/// each pattern was spelled with, and in whatever order they were written, except one left
-/// for a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
+/// into a lookup table: every value of some window of consecutive integers, as wide as
+/// the number of values the numbered arms cover plus one for the wildcard, named exactly
+/// once — whatever base the window sits at, whatever suffix each pattern was spelled
+/// with, in whatever order the arms were written, and whether one arm names one value or
+/// several (an or-pattern) — except one left for a final wildcard arm, with at least
+/// [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
 /// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
 /// [ADR 0044]'s own history on pull request #154 is why that matters: a hand-rolled
@@ -8990,7 +9002,7 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
     let Some(numbered) = found.arms.get(..last) else {
         return false;
     };
-    missing_value(numbered, total).is_some()
+    missing_value(numbered).is_some()
 }
 
 /// Whether every one of `found`'s arms calls one consistent callee with its own pattern's
@@ -9010,7 +9022,7 @@ fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
     let total = found.arms.len();
     let last = total.checked_sub(1)?;
     let numbered = found.arms.get(..last)?;
-    let wildcard_value = missing_value(numbered, total)?;
+    let wildcard_value = missing_value(numbered)?;
     let mut callee: Option<&str> = None;
     for (index, arm) in found.arms.iter().enumerate() {
         let (this_callee, argument) = arm.call.as_ref()?;
@@ -9022,7 +9034,15 @@ fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
         let expected = if index == last {
             wildcard_value
         } else {
-            arm.pattern?
+            // Codex's finding: an or-pattern arm covers more than one value, which the
+            // one permitted table (a single literal-to-literal mapping per arm) never
+            // does — such an arm cannot match the pinned shape, so this fails the
+            // comparison rather than guessing which of several values the call's own
+            // argument ought to equal.
+            let [value] = arm.pattern.as_slice() else {
+                return None;
+            };
+            *value
         };
         if *argument != Some(expected) {
             return None;
@@ -15518,6 +15538,68 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_via_cast_constants_is_reported() {
+        // Codex's thirty-second-round finding: `literal_or_const_value` discarded a
+        // cast's own destination type and passed the operand straight through, so a
+        // `const` initializer spelled as `248u8 as i8` read as `248` instead of `-8` — a
+        // table whose negative range is built this way, rather than from literal
+        // negative integers, read as `248..=255` beside `0..=6` (two disjoint ranges)
+        // instead of the one contiguous `-8..=6` it really is.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut consts = String::new();
+        let mut arms = String::new();
+        for (index, raw) in (248_u16..256).enumerate() {
+            let _ = writeln!(consts, "const N{index}: i8 = {raw}u8 as i8;");
+            let _ = writeln!(arms, "        N{index} => {index},");
+        }
+        for value in 0..7 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\n{consts}\nconst fn cast_table(value: i8) -> u32 {{\n    match value {{\n{arms}        \
+             _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_an_or_pattern_arm_is_reported() {
+        // Codex's thirty-second-round finding: `0 | 1 => VALUE` covers two values in one
+        // arm, and `rustc` still lowers the whole match to the identical indexed table a
+        // one-value-per-arm spelling gets — `Pat::Or` fell to `pattern_literal`'s
+        // catch-all and read as unresolved, so the arm's own two values (and the whole
+        // match) went uncounted. `missing_value` now sums the number of *values* the
+        // numbered arms cover rather than the number of *arms*, so an or-pattern arm's
+        // extra value correctly narrows the wildcard's own window by one.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 2..15 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn or_pattern_table(value: u8) -> u32 {{\n    match value {{\n        \
+             0 | 1 => 10,\n{arms}        _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 15-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_enum_variants_is_reported() {
         // Codex's thirtieth-round finding: `Indices::P0` names a fieldless enum variant
         // exactly the way `Pat::Path` spells a module-qualified constant, and `rustc`
@@ -16757,6 +16839,55 @@ mod deferred_answer_pins {
         assert!(
             violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
             "a #[path] module inside a function body was not traversed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_a_nested_block_is_traversed() {
+        // Codex's thirty-second-round finding: the previous round's fix only scanned a
+        // function body's own *top-level* statements, so a `mod` declared inside a
+        // further-nested block within that body — here, an `if` block — was still
+        // unseen. `ChildModuleCollector` is now a `syn::visit::Visit` walk whose default
+        // recursion already reaches every nested block the grammar allows, so no
+        // separate handling is needed for this shape at all.
+        let parent = format!(
+            "{}\nfn declares_a_module() {{\n    if true {{\n        #[path = \"table.rs\"]\n        \
+             mod table;\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside a nested block was not traversed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_inside_a_cfg_test_function_is_test_gated() {
+        // Codex's thirty-second-round finding: a `mod` declared inside a
+        // `#[cfg(test)] fn fixture() { .. }` was still walked with the enclosing
+        // *production* gating state, so `rustc` removing the whole function (and the
+        // module inside it) from a non-test build was not reflected — the module's own
+        // arrays or dense matches were scanned as shipping code. `ChildModuleCollector`'s
+        // `visit_item` now folds every item's own `#[cfg(test)]` into the gating state
+        // before recursing, `Item::Fn` included, not only `Item::Mod`.
+        let parent = format!(
+            "{}\n#[cfg(test)]\nfn fixture() {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a module inside a #[cfg(test)] function was scanned as production code: \
+             {violations:?}"
         );
     }
 
