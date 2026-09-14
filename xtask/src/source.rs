@@ -12166,6 +12166,28 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_through_a_parenthesized_type_alias_is_reported() {
+        // Codex, issue #92's sixth round: `(CheckedDispatch<'a>)` is valid Rust on a `type`
+        // alias's right-hand side — `#[allow(unused_parens)]` lets it through `-D warnings`
+        // — and `syn` represents it as `Type::Paren`, which the earlier fix's `Type::Path`
+        // match did not see through. `type_alias_target` now unwraps parens (and macro
+        // hygiene groups) recursively, so this forge is caught the same way an unparenthesized
+        // one already is.
+        let source = tests_support::clean_effect_module()
+            + "#[allow(unused_parens)]\n\
+               type Unchecked<'a> = (CheckedDispatch<'a>);\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Unchecked<'static> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_never_built_inside_perform_is_reported() {
         let source = tests_support::clean_effect_module().replace(
             "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",

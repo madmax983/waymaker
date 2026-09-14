@@ -276,6 +276,13 @@ fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
                 .map(|segment| ident_name(&segment.ident))
                 .collect(),
         ),
+        // `(CheckedDispatch<'a>)` is valid Rust — `#[allow(unused_parens)]` even lets it
+        // through `-D warnings` — and `syn` keeps the parens as their own node rather than
+        // discarding them, so the path underneath is invisible without unwrapping one more
+        // layer. `Type::Group` is the same shape, for a macro's own hygiene grouping. Both
+        // recurse, so `((CheckedDispatch))` unwraps to the same target in two hops.
+        syn::Type::Paren(inner) => type_alias_target(&inner.elem),
+        syn::Type::Group(inner) => type_alias_target(&inner.elem),
         _ => None,
     }
 }
@@ -1708,6 +1715,37 @@ mod raw_identifier_tests {
              \x20   let _ = Unchecked {};\n\
              \x20   0\n\
              }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_type_alias_still_resolves() {
+        // Codex, issue #92's sixth round: `(Foo)` is valid Rust on a `type` alias's
+        // right-hand side, `#[allow(unused_parens)]` lets it through `-D warnings`, and
+        // `syn` keeps the parens as their own `Type::Paren` node rather than discarding
+        // them — so the path underneath was invisible without unwrapping one more layer.
+        let counts = struct_literal_counts(
+            "#[allow(unused_parens)]\n\
+             type Unchecked<'a> = (Foo<'a>);\n\
+             fn forge() -> Unchecked<'static> { Unchecked {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_doubly_parenthesized_type_alias_still_resolves() {
+        // Nested parens unwrap in more than one hop.
+        let counts = struct_literal_counts(
+            "#[allow(unused_parens)]\n\
+             type Unchecked<'a> = ((Foo<'a>));\n\
+             fn forge() -> Unchecked<'static> { Unchecked {} }",
             "Foo",
             FnScope::None,
         )

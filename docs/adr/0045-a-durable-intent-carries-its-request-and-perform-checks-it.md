@@ -105,6 +105,15 @@ scope on the way back out. The fix is still in the shared mechanism rather than 
 this one pin: the same block-scoped resolution closes the gap for every construction pin
 built on `struct_literal_counts`.
 
+A sixth round found a hole in what counts as a `type` alias's right-hand side rather than in
+where it is looked for: `type Unchecked<'a> = (CheckedDispatch<'a>);` is valid Rust —
+`#[allow(unused_parens)]` lets it through `-D warnings` — and `syn` keeps the parens as their
+own `Type::Paren` node rather than discarding them, so the `Type::Path` match that reads a
+type alias's target saw nothing there and built no alias at all. `type_alias_target` now
+unwraps `Type::Paren`, and `Type::Group` beside it for the same reason (a macro's own hygiene
+grouping is the same shape), recursively — `((CheckedDispatch))` reaches the same target in
+two hops.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
