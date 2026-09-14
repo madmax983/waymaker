@@ -869,160 +869,6 @@ fn collect_future_implementors(
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>, syn::Error> {
-    /// Whether `pat`, or any sub-pattern it contains, binds a name at all.
-    ///
-    /// Issue #171's finding 1: `syn` sees a pattern's syntax, never the type of the value it
-    /// matches, and Rust's match ergonomics (RFC 2005) let that type decide what a *bare*
-    /// binding means. `let Foo { field, .. } = dispatch;` moves or copies `field` when
-    /// `dispatch` is owned — a read, safe to ignore — but binds it by mutable reference when
-    /// `dispatch: &mut Foo`, with no `ref`, `mut` or `&mut` written anywhere to tell the two
-    /// apart. An explicit `ref mut` is only the loudest of several spellings that reach a
-    /// mutable alias; a bare name and a plain `mut` reach it too, under a `&mut` scrutinee,
-    /// and nothing here can rule that scrutinee out. So every named binding on a guarded
-    /// field is reported, not only an explicit `ref mut` — the sound answer without type
-    /// inference, in the same spirit as this family's other over-broad refusals.
-    ///
-    /// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
-    /// [`syn::Pat`] variant, so a binding nested inside a struct, tuple, tuple-struct, slice
-    /// or paren pattern is found the same way regardless of how deep it sits — the traversal
-    /// is `syn`'s own, only the question asked at each identifier is new. A wildcard (`_`)
-    /// binds no name and is not reported: nothing reaches it to alias or read back.
-    fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
-        struct NamedBinding(bool);
-
-        impl<'ast> syn::visit::Visit<'ast> for NamedBinding {
-            fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
-                self.0 = true;
-                syn::visit::visit_pat_ident(self, node);
-            }
-        }
-
-        let mut visitor = NamedBinding(false);
-        visitor.visit_pat(pat);
-        visitor.0
-    }
-
-    struct Mutations<'a> {
-        names: &'a [&'a str],
-        found: Vec<String>,
-    }
-
-    impl Mutations<'_> {
-        fn note(&mut self, expr: &syn::Expr) {
-            // Walks the whole chain of field accesses, not only the outermost one:
-            // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent` and
-            // `request` are guarded *ancestors* in the same chain, and rewriting through
-            // either is the rewrite this whole family of checks exists to catch (issue #92,
-            // Codex's tenth round). Stops at the first non-field expression, which is the
-            // root the chain is built on.
-            let mut current = expr;
-            while let syn::Expr::Field(field) = current {
-                if let syn::Member::Named(ident) = &field.member {
-                    let name = ident_name(ident);
-                    if self.names.contains(&name.as_str()) {
-                        self.found.push(name);
-                    }
-                }
-                current = &field.base;
-            }
-        }
-
-        /// [`Self::note`], recursed through a destructuring assignment's own shape.
-        ///
-        /// `(dispatch.bytes, dispatch.intent) = (other, other_intent);` is valid Rust since
-        /// destructuring assignment stabilized, and its left side parses as an ordinary
-        /// `Expr::Tuple` of field-access expressions — not one `Expr::Field` chain, so
-        /// `note`'s own `while let` never matches it, and the *assignment* meaning is
-        /// something only this call site knows; the default traversal that would otherwise
-        /// reach each field walks them as plain reads (Codex review, PR #183). A struct
-        /// pattern (`Foo { bytes, .. } = dispatch;`) reuses struct-literal syntax as an
-        /// assignment target the same way, with its fields as the assignable places; `..`
-        /// carries no place of its own. An array pattern (`[a, b] = pair;`) is the third
-        /// shape `syn` allows here. Anything else — a bare place, an index, a dereference —
-        /// is a single target and goes straight to `note`.
-        fn note_assignment_target(&mut self, expr: &syn::Expr) {
-            match expr {
-                syn::Expr::Tuple(tuple) => {
-                    for element in &tuple.elems {
-                        self.note_assignment_target(element);
-                    }
-                }
-                syn::Expr::Array(array) => {
-                    for element in &array.elems {
-                        self.note_assignment_target(element);
-                    }
-                }
-                syn::Expr::Struct(structure) => {
-                    for field in &structure.fields {
-                        self.note_assignment_target(&field.expr);
-                    }
-                }
-                syn::Expr::Paren(paren) => self.note_assignment_target(&paren.expr),
-                _ => self.note(expr),
-            }
-        }
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
-            self.note_assignment_target(&node.left);
-            syn::visit::visit_expr_assign(self, node);
-        }
-
-        fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
-            if node.mutability.is_some() {
-                self.note(&node.expr);
-            }
-            syn::visit::visit_expr_reference(self, node);
-        }
-
-        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            // `x.field.clone_from(&other)` reassigns `field` through an *implicit* `&mut
-            // self` autoref: nothing in the source spells `=` or `&mut`, so this is a third
-            // route neither `visit_expr_assign` nor `visit_expr_reference` can see. Which
-            // method is called, and whether it really takes `&mut self`, needs type
-            // inference `syn` does not have — so every method call on a guarded field is
-            // refused, not only the ones a reviewer could confirm are mutating. A method
-            // called on the whole *value* (`dispatch.bytes()`, the accessor every legitimate
-            // caller already uses) has a receiver that is a plain path, not a field access,
-            // so it is unaffected.
-            self.note(&node.receiver);
-            syn::visit::visit_expr_method_call(self, node);
-        }
-
-        fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
-            // `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the
-            // pattern itself — no `Expr::Assign`, no `Expr::Reference`, and no method call
-            // anywhere, so none of the three routes above sees it. A bare `field` or a
-            // by-value `field: mut slot` reaches the same alias under match ergonomics when
-            // the scrutinee is `&mut`, a fact this scanner cannot see (issue #171's finding
-            // 1) — so every named binding is reported, not only an explicit `ref mut`. It can
-            // be arbitrarily nested (`field: Inner { deeper, .. }`), which is why this walks
-            // the whole sub-pattern rather than checking only its outermost shape.
-            if let syn::Member::Named(ident) = &node.member {
-                let name = ident_name(ident);
-                if self.names.contains(&name.as_str()) && pattern_binds_a_name(&node.pat) {
-                    self.found.push(name);
-                }
-            }
-            syn::visit::visit_field_pat(self, node);
-        }
-    }
-
     let file = parse_rust(contents)?;
     let mut visitor = Mutations {
         names,
@@ -1030,6 +876,181 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
+}
+
+/// Whether `pat`, or any sub-pattern it contains, binds a name at all.
+///
+/// Issue #171's finding 1: `syn` sees a pattern's syntax, never the type of the value it
+/// matches, and Rust's match ergonomics (RFC 2005) let that type decide what a *bare*
+/// binding means. `let Foo { field, .. } = dispatch;` moves or copies `field` when
+/// `dispatch` is owned — a read, safe to ignore — but binds it by mutable reference when
+/// `dispatch: &mut Foo`, with no `ref`, `mut` or `&mut` written anywhere to tell the two
+/// apart. An explicit `ref mut` is only the loudest of several spellings that reach a
+/// mutable alias; a bare name and a plain `mut` reach it too, under a `&mut` scrutinee,
+/// and nothing here can rule that scrutinee out. So every named binding on a guarded
+/// field is reported, not only an explicit `ref mut` — the sound answer without type
+/// inference, in the same spirit as this family's other over-broad refusals.
+///
+/// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
+/// [`syn::Pat`] variant, so a binding nested inside a struct, tuple, tuple-struct, slice
+/// or paren pattern is found the same way regardless of how deep it sits — the traversal
+/// is `syn`'s own, only the question asked at each identifier is new. A wildcard (`_`)
+/// binds no name and is not reported: nothing reaches it to alias or read back.
+fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
+    struct NamedBinding(bool);
+
+    impl<'ast> syn::visit::Visit<'ast> for NamedBinding {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            self.0 = true;
+            syn::visit::visit_pat_ident(self, node);
+        }
+    }
+
+    let mut visitor = NamedBinding(false);
+    visitor.visit_pat(pat);
+    visitor.0
+}
+
+/// [`mutated_field_names`]'s own visitor.
+struct Mutations<'a> {
+    names: &'a [&'a str],
+    found: Vec<String>,
+}
+
+impl Mutations<'_> {
+    fn note(&mut self, expr: &syn::Expr) {
+        // Walks the whole chain of field accesses, not only the outermost one:
+        // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent` and
+        // `request` are guarded *ancestors* in the same chain, and rewriting through
+        // either is the rewrite this whole family of checks exists to catch (issue #92,
+        // Codex's tenth round). Stops at the first non-field expression, which is the
+        // root the chain is built on.
+        //
+        // Parens or a macro's hygiene grouping may sit anywhere in the chain — around
+        // the whole expression (`&mut (dispatch.bytes)`) or around an intermediate base
+        // (`(dispatch).bytes`) — and `syn` keeps each as its own node rather than
+        // discarding it, the same shape `type_alias_target` already unwraps. Left
+        // unhandled, `core::mem::replace(&mut (dispatch.bytes), other)` rewrites a
+        // guarded field with the gate green (Codex review, PR #183): `node.expr` is an
+        // `Expr::Paren`, `note`'s own loop never matched anything but `Expr::Field`, and
+        // the default traversal that reaches the field underneath does not know it is
+        // being written to. Every step unwraps first, so a paren anywhere in the chain
+        // is transparent to it.
+        let mut current = Self::unwrap_parens(expr);
+        while let syn::Expr::Field(field) = current {
+            if let syn::Member::Named(ident) = &field.member {
+                let name = ident_name(ident);
+                if self.names.contains(&name.as_str()) {
+                    self.found.push(name);
+                }
+            }
+            current = Self::unwrap_parens(&field.base);
+        }
+    }
+
+    /// `expr`, with any wrapping `Expr::Paren` or `Expr::Group` stripped, recursively.
+    fn unwrap_parens(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Paren(paren) => Self::unwrap_parens(&paren.expr),
+            syn::Expr::Group(group) => Self::unwrap_parens(&group.expr),
+            _ => expr,
+        }
+    }
+
+    /// [`Self::note`], recursed through a destructuring assignment's own shape.
+    ///
+    /// `(dispatch.bytes, dispatch.intent) = (other, other_intent);` is valid Rust since
+    /// destructuring assignment stabilized, and its left side parses as an ordinary
+    /// `Expr::Tuple` of field-access expressions — not one `Expr::Field` chain, so
+    /// `note`'s own `while let` never matches it, and the *assignment* meaning is
+    /// something only this call site knows; the default traversal that would otherwise
+    /// reach each field walks them as plain reads (Codex review, PR #183). A struct
+    /// pattern (`Foo { bytes, .. } = dispatch;`) reuses struct-literal syntax as an
+    /// assignment target the same way, with its fields as the assignable places; `..`
+    /// carries no place of its own. An array pattern (`[a, b] = pair;`) is the third
+    /// shape `syn` allows here. Anything else — a bare place, an index, a dereference —
+    /// is a single target and goes straight to `note`.
+    fn note_assignment_target(&mut self, expr: &syn::Expr) {
+        match expr {
+            syn::Expr::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    self.note_assignment_target(element);
+                }
+            }
+            syn::Expr::Array(array) => {
+                for element in &array.elems {
+                    self.note_assignment_target(element);
+                }
+            }
+            syn::Expr::Struct(structure) => {
+                for field in &structure.fields {
+                    self.note_assignment_target(&field.expr);
+                }
+            }
+            syn::Expr::Paren(paren) => self.note_assignment_target(&paren.expr),
+            _ => self.note(expr),
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if has_cfg_test(item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        self.note_assignment_target(&node.left);
+        syn::visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+        if node.mutability.is_some() {
+            self.note(&node.expr);
+        }
+        syn::visit::visit_expr_reference(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // `x.field.clone_from(&other)` reassigns `field` through an *implicit* `&mut
+        // self` autoref: nothing in the source spells `=` or `&mut`, so this is a third
+        // route neither `visit_expr_assign` nor `visit_expr_reference` can see. Which
+        // method is called, and whether it really takes `&mut self`, needs type
+        // inference `syn` does not have — so every method call on a guarded field is
+        // refused, not only the ones a reviewer could confirm are mutating. A method
+        // called on the whole *value* (`dispatch.bytes()`, the accessor every legitimate
+        // caller already uses) has a receiver that is a plain path, not a field access,
+        // so it is unaffected.
+        self.note(&node.receiver);
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        // `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the
+        // pattern itself — no `Expr::Assign`, no `Expr::Reference`, and no method call
+        // anywhere, so none of the three routes above sees it. A bare `field` or a
+        // by-value `field: mut slot` reaches the same alias under match ergonomics when
+        // the scrutinee is `&mut`, a fact this scanner cannot see (issue #171's finding
+        // 1) — so every named binding is reported, not only an explicit `ref mut`. It can
+        // be arbitrarily nested (`field: Inner { deeper, .. }`), which is why this walks
+        // the whole sub-pattern rather than checking only its outermost shape.
+        if let syn::Member::Named(ident) = &node.member {
+            let name = ident_name(ident);
+            if self.names.contains(&name.as_str()) && pattern_binds_a_name(&node.pat) {
+                self.found.push(name);
+            }
+        }
+        syn::visit::visit_field_pat(self, node);
+    }
 }
 
 /// How many `fn name` items `contents` declares, at any nesting depth.
@@ -2645,6 +2666,34 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_field_behind_a_mutable_reference_is_reported() {
+        // Codex, PR #183's own review: `&mut (dispatch.bytes)` is valid Rust, and the parens
+        // are their own `Expr::Paren` node — `note`'s own loop matched only `Expr::Field`
+        // directly, so `core::mem::replace(&mut (dispatch.bytes), other)` rewrote the field
+        // with the gate green.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: Bytes) {\n\
+             \x20   core::mem::replace(&mut (dispatch.bytes), other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_base_in_a_field_chain_is_reported() {
+        // The parens can sit around an intermediate base too, not only the whole expression:
+        // `(dispatch).intent` is the same place as `dispatch.intent`.
+        let found = mutated_field_names(
+            "fn tamper(dispatch: Foo) {\n\
+             \x20   let r = &mut (dispatch).intent;\n}",
+            &["intent"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["intent"], "{found:?}");
     }
 
     #[test]
