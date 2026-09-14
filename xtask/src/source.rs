@@ -1703,6 +1703,20 @@ fn check_clock_kind_constants(code: &str) -> Vec<Violation> {
             ));
         }
     }
+    // A trait `impl` can carry an associated constant of its own, invisible to the scan
+    // above because it reads only inherent `impl` blocks. Codex found this route on this
+    // change's own PR: `impl SomeTrait for ClockKind { const RTC2: Self = Self(3); }` names
+    // a third clock kind with the constant pin above still reading only two.
+    if implements_trait_for(code, CLOCK_KIND) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{CLOCK_KIND}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the constant pin above"
+            ),
+        ));
+    }
     violations
 }
 
@@ -3262,7 +3276,12 @@ fn declared_associated_constant_values(body: &str) -> Vec<(String, String)> {
             && let Some(declaration) = rest.strip_prefix("const ")
             // `const fn` is a function, and `declared_function_names` owns those.
             && !declaration.starts_with("fn ")
-            && let Some(name) = declaration.split([':', ' ']).next()
+            && let Some(raw_name) = declaration.split([':', ' ']).next()
+            // `r#BEST_EFFORT` and `BEST_EFFORT` name the same constant: Rust's raw-identifier
+            // marker is never part of the name. Codex found this on issue #99's own PR — a
+            // raw name failed the character check below and the whole line was dropped,
+            // which for `check_clock_kind_constants` is a third clock kind nobody reported.
+            && let name = raw_name.strip_prefix("r#").unwrap_or(raw_name)
             && !name.is_empty()
             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
@@ -7828,6 +7847,21 @@ fn check_effect_methods(
             ),
         ));
     }
+    // `DurableIntent` and `Dispatchable` already refuse a trait `impl` outright, below. This
+    // is the same refusal for `Effect`, the one type here that check does not cover, and it
+    // exists for the constant ban just above rather than for the construction pin: a trait
+    // `impl` can carry an associated constant of its own, which is invisible to both the
+    // method pin and the loop above it — Codex found this route on issue #99's own PR.
+    if !EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{type_name}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the method pin and to the constant ban above it"
+            ),
+        ));
+    }
     if EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
         violations.push(Violation::new(
             RULE,
@@ -8338,7 +8372,7 @@ fn check_boundary_type_has_no_constant(
     };
     let body = inherent_impl_bodies(code, name).join("\n");
 
-    declared_associated_constants(&body)
+    let mut violations: Vec<Violation> = declared_associated_constants(&body)
         .into_iter()
         .map(|constant| {
             Violation::new(
@@ -8351,7 +8385,21 @@ fn check_boundary_type_has_no_constant(
                 ),
             )
         })
-        .collect()
+        .collect();
+    // A trait `impl` can carry an associated constant of its own, invisible to the scan
+    // above because it reads only inherent `impl` blocks. Codex found this route on issue
+    // #99's own PR, against `ClockKind`; none of `BOUNDARY_TYPES` has any backstop for it.
+    if implements_trait_for(code, name) {
+        violations.push(Violation::new(
+            rule,
+            subject,
+            format!(
+                "`{name}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the constant ban above"
+            ),
+        ));
+    }
+    violations
 }
 
 /// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
@@ -11898,6 +11946,38 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_raw_identifier_clock_kind_constant_is_reported() {
+        // Codex, on this change's own PR: `r#BEST_EFFORT` failed the character check and the
+        // whole line was dropped, so a third clock kind under a raw name went unreported.
+        // Rust resolves `r#BEST_EFFORT` and `BEST_EFFORT` to the same name.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const r#BEST_EFFORT: Self = Self(1);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("BEST_EFFORT")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_trait_impl_on_clock_kind_is_reported() {
+        // Codex, on this change's own PR: a trait `impl` can carry an associated constant
+        // of its own, invisible to a scan that reads only inherent `impl` blocks.
+        let module = tests_support::clean_timer_module()
+            + "impl Forge for ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_spec_whose_name_merely_starts_with_the_pinned_one_is_reported() {
         // Codex round 3: `starts_with` accepted `TimerSpec::AtPersistentTimeFallback`, and an
         // associated constant of that name — invisible to a method pin that reads `fn` — can
@@ -12384,6 +12464,23 @@ mod deferred_answer_pins {
                 "{visibility}: {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_trait_impl_on_effect_is_reported() {
+        // Codex, on this change's own PR: `DurableIntent` and `Dispatchable` already refuse
+        // a trait `impl` outright, but `Effect` did not — and a trait `impl` can carry an
+        // associated constant invisible to the scan above, which reads only inherent `impl`
+        // blocks.
+        let source = tests_support::clean_effect_module()
+            + "impl<C: IntegrityCheck> Forge for Effect<C> {\n    const RTC2: usize = 0;\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
     }
 
     #[test]
@@ -13907,6 +14004,24 @@ mod deferred_answer_pins {
                 "{visibility}: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_trait_impl_on_a_boundary_type_is_reported() {
+        // Codex, on this change's own PR: none of `BOUNDARY_TYPES` refuses a trait `impl`,
+        // and one can carry an associated constant invisible to the scan above, which reads
+        // only inherent `impl` blocks.
+        let mutant = format!(
+            "{}\nimpl Forge for Resolve<'_> {{\n    const RTC2: usize = 0;\n}}\n",
+            real_transition_module()
+        );
+        let violations = boundary_violations(&mutant, &real_driver_module());
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("implements a trait")),
+            "{violations:?}"
+        );
     }
 
     #[test]
