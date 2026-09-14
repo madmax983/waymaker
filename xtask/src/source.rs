@@ -17185,6 +17185,89 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_with_a_trait_in_a_nested_module_is_reported() {
+        // Codex's forty-first-round finding: `resolve_qself_associated_const` built
+        // its lookup key from the qself's own type and the member alone, discarding
+        // the trait path's own leading segments entirely — so
+        // `<u8 as defs::Indices>::P0`, naming a trait (and its impl) declared inside
+        // `mod defs`, looked up the bare `u8::P0` while `visit_item_impl` had indexed
+        // it as `defs::u8::P0`. Every numbered arm stayed unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n\n    \
+             impl Indices for u8 {\n        const P0: u8 = 0;\n        const P1: u8 = \
+             1;\n        const P2: u8 = 2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             const fn nested_trait_pattern_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        <u8 as defs::Indices>::P0 => 0,\n        \
+             <u8 as defs::Indices>::P1 => 1,\n        <u8 as defs::Indices>::P2 => \
+             2,\n        <u8 as defs::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_single_field_slice_patterns_is_reported() {
+        // Codex's forty-first-round finding: `[0]` through `[14]` over a `[u8; 1]`
+        // scrutinee is exactly as dense as the tuple, tuple-struct and named-struct
+        // forms already handled — a slice pattern is a fourth shape the
+        // discriminating-field reasoning applies to — but `Pat::Slice` had no
+        // handling at all and fell to the wildcard case.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn slice_pattern_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn slice_pattern_table(nibble: [u8; 1]) -> u32 \
+             {\n    match nibble {\n        [0] => slice_pattern_helper(0),\n        \
+             [1] => slice_pattern_helper(1),\n        [2] => \
+             slice_pattern_helper(2),\n        _ => slice_pattern_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_u128_literals_above_i128_max_is_reported() {
+        // Codex's forty-first-round finding: a `u128` literal at or above `2^127` —
+        // half of that type's own range — has no representation in this scan's own
+        // `i128`, so `base10_parse::<i128>()` fails and every arm of a table spelled
+        // with such literals stayed unresolved. `2^127`, `2^127 + 1` and `2^127 + 2`
+        // are each above `i128::MAX` (`2^127 - 1`) and are now reinterpreted as their
+        // own two's-complement bit pattern instead of rejected outright.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_upper_half_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn u128_upper_half_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105728 => \
+             u128_upper_half_helper(0),\n        \
+             170141183460469231731687303715884105729 => \
+             u128_upper_half_helper(1),\n        \
+             170141183460469231731687303715884105730 => \
+             u128_upper_half_helper(2),\n        _ => u128_upper_half_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

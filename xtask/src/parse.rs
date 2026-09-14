@@ -2287,9 +2287,29 @@ fn resolve_scope_consts(
 /// had ever looked past `syn::Lit::Int`, and a `char`'s own discriminant is no less a
 /// number than a byte's — `rustc` lowers a dense `char` match to the same indexed `.rodata`
 /// a `u8` one gets.
+///
+/// Codex's next-round finding: a `u128` literal at or above `2^127` — half of that type's
+/// own range — has no representation in this scan's own `i128`, so
+/// `base10_parse::<i128>()` fails and every arm of a table spelled with such literals
+/// stayed unresolved. Reinterpreted as its own two's-complement bit pattern instead — the
+/// same cast [`apply_integer_cast`]'s own widest-width branch already performs for a
+/// `u128 as i128` cast — which preserves both the relative order and the unit spacing of
+/// every value in `u128`'s upper half, so a window of consecutive `u128` literals up there
+/// is still a window of consecutive `i128` values to every check downstream, just one
+/// that wraps around through `i128::MIN`.
 fn lit_value(lit: &syn::Lit) -> Option<i128> {
     match lit {
-        syn::Lit::Int(int) => int.base10_parse::<i128>().ok(),
+        syn::Lit::Int(int) => int.base10_parse::<i128>().ok().or_else(|| {
+            let unsigned = int.base10_parse::<u128>().ok()?;
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "deliberate two's-complement bit reinterpretation of a value \
+                          base10_parse::<i128> already rejected as out of range, not a \
+                          value conversion"
+            )]
+            let reinterpreted = unsigned as i128;
+            Some(reinterpreted)
+        }),
         syn::Lit::Byte(byte) => Some(i128::from(byte.value())),
         syn::Lit::Char(char) => Some(i128::from(u32::from(char.value()))),
         _ => None,
@@ -2527,6 +2547,16 @@ fn literal_or_const_value(
 /// unqualified spelling Rust itself accepts when the trait is unambiguous — so this
 /// builds that same key from the qself's own type and the path's last segment, and asks
 /// `resolve` the ordinary multi-segment question of it.
+///
+/// Codex's next-round finding: that key is built with no module prefix at all, which
+/// only ever matched an impl declared at the scanned tree's own top level. A trait
+/// referenced by its own qualified path — `<u8 as defs::Indices>::P0`, naming the module
+/// `defs` the trait (and, in practice, the impl of it) is declared in — carries exactly
+/// the prefix this was missing, in `path`'s own leading segments (everything before the
+/// trait's own bare name and the member). Tried first, since it is the more specific of
+/// the two candidates; the bare, unprefixed form stays the fallback for the common case
+/// where the trait is referenced bare (`<u8 as Indices>::P0`) and both scan the same
+/// tree's own top level.
 fn resolve_qself_associated_const(
     qself: &syn::QSelf,
     path: &syn::Path,
@@ -2534,6 +2564,23 @@ fn resolve_qself_associated_const(
 ) -> Option<i128> {
     let type_name = single_segment_type_name(&qself.ty)?;
     let member = ident_name(&path.segments.last()?.ident);
+    let segment_count = path.segments.len();
+    if segment_count >= 3 {
+        let trait_module: Vec<String> = path
+            .segments
+            .iter()
+            .take(segment_count - 2)
+            .map(|segment| ident_name(&segment.ident))
+            .collect();
+        let mut scoped = trait_module;
+        scoped.push(type_name.clone());
+        scoped.push(member.clone());
+        if let Ok(synthetic) = syn::parse_str::<syn::Path>(&scoped.join("::")) {
+            if let Some(value) = resolve(&synthetic) {
+                return Some(value);
+            }
+        }
+    }
     let synthetic = syn::parse_str::<syn::Path>(&format!("{type_name}::{member}")).ok()?;
     resolve(&synthetic)
 }
@@ -2557,13 +2604,13 @@ const MAX_RANGE_PATTERN_VALUES: usize = 4096;
 /// applies to a whole arm's own pattern — or `None` when zero or more than one field
 /// qualifies.
 ///
-/// A tuple, tuple-struct, or named-field struct pattern with any number of fields, all
-/// but one of them a catch-all, is exactly as dense a table row as that one field alone:
-/// `rustc` still indexes on the one field that actually varies and ignores every field
-/// that always matches — a field's own *name*, where it has one, plays no part in this,
-/// only whether its subpattern is irrefutable. Two or more non-catch-all fields is
-/// genuinely ambiguous — nothing here says which one a table would be keyed on — and is
-/// refused the same as zero, rather than guessing.
+/// A tuple, tuple-struct, named-field struct, or slice pattern with any number of
+/// fields, all but one of them a catch-all, is exactly as dense a table row as that one
+/// field alone: `rustc` still indexes on the one field that actually varies and ignores
+/// every field that always matches — a field's own *name*, where it has one, plays no
+/// part in this, only whether its subpattern is irrefutable. Two or more non-catch-all
+/// fields is genuinely ambiguous — nothing here says which one a table would be keyed on
+/// — and is refused the same as zero, rather than guessing.
 fn single_discriminating_field<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
@@ -2737,6 +2784,15 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
             resolve,
         )
         .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+        // Codex's next-round finding: `[0]` through `[14]` over a `[u8; 1]` scrutinee,
+        // or `[0, _]` through `[14, _]` over a wider slice, is exactly as dense once
+        // more — a slice pattern is a fourth shape the discriminating-field reasoning
+        // applies to, over its own explicitly-listed elements the same way a tuple's
+        // are (a `..` rest element is simply never irrefutable by this test, so it
+        // counts as a second discriminating "field" and correctly makes such a
+        // pattern ambiguous rather than guessed at).
+        syn::Pat::Slice(pat_slice) => single_discriminating_field(&pat_slice.elems, resolve)
+            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
         // Codex's finding: `0 | 1 => VALUE` covers two values in a single arm, and
         // `rustc` still lowers a match built this way to the identical indexed table a
         // one-value-per-arm spelling gets — this fell to the `_ => Vec::new()` case
