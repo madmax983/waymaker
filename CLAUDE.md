@@ -219,7 +219,7 @@ Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that 
 operation shape the firmware issues must appear in the suite". `xtask::docs::STORAGE_SHAPES`
 holds the six shapes, the conformance crate's own `shape.rs` holds them again, and the
 `storage-shapes` rule fails a build in which this section, that table, the crate and
-[ADR 0046](docs/adr/0046-a-shape-catalogue-holds-the-suite-to-the-writers.md) stop naming the
+[ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) stop naming the
 same set.
 
 A shape is a claim about a legal call, transcribed by a reviewer from `waymaker-flash`'s
@@ -647,7 +647,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row — every row, gated or not, since issue [#115](https://github.com/madmax983/waymaker/issues/115) closed a gap where a `--report` document could omit the row with the largest delta and compose a smaller, wrong total; the document's row *set* is now held to what `matrix` derives for the workspace |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
 | Incremental code flash | ≤ 13 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic, and [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) takes it to 13 KiB for §08's versioning) |
@@ -930,7 +930,7 @@ this table is how you find out what a red build is telling you.
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
-| `storage-shapes` | Issue #130 item 2's shape catalogue and the four places it lives stop agreeing: a shape in `docs::STORAGE_SHAPES` is missing from this file, from [ADR 0046](docs/adr/0046-a-shape-catalogue-holds-the-suite-to-the-writers.md), or from `crates/waymaker-conformance/src/shape.rs`; its row here does not carry the sentence or the issuer; the count is wrong; the crate names a shape's issuer differently than the table does; the crate declares a shape the table never did; or the shape table is not where the gate looks for it. What it cannot see is inside the crate: that a declared shape is really issued by a run is `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`. |
+| `storage-shapes` | Issue #130 item 2's shape catalogue and the four places it lives stop agreeing: a shape in `docs::STORAGE_SHAPES` is missing from this file, from [ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md), or from `crates/waymaker-conformance/src/shape.rs`; its row here does not carry the sentence or the issuer; the count is wrong; the crate names a shape's issuer differently than the table does; the crate declares a shape the table never did; or the shape table is not where the gate looks for it. What it cannot see is inside the crate: that a declared shape is really issued by a run is `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
 | `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test — a conditional attribute is refused outright, because a row test is either a test or it is not (issue #97). What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
@@ -1201,17 +1201,30 @@ Stated so that nobody mistakes silence for coverage:
   in for the crate root; it is left unresolved the same way `crate::` is, rather than guessed
   against the file's own aliases. A *plain relative* path naming a sibling module declared in
   this same file — `traits::Pollable`, where `mod traits { pub use .. as Pollable; }` sits in
-  the same scope, with no `crate`/`super`/`self` prefix at all — is a distinguishable gap
-  rather than the same one: nothing outside this file is needed to resolve it, but the scope
-  stack only tracks the lexical ancestors the visitor happens to be walking through, not an
-  index of named modules reachable by segment from an arbitrary point in the tree (Codex
-  review, PR #160, round 9). Filed as issue
-  [#169](https://github.com/madmax983/waymaker/issues/169) rather than fixed in that PR: it
-  is a miss, not the false positives rounds 5 through 8 kept finding, and closing it needs a
-  materially larger mechanism than a leading-marker check. An alias declared in one module
+  the same scope, with no `crate`/`super`/`self` prefix at all — is resolved (issue
+  [#169](https://github.com/madmax983/waymaker/issues/169)): `resolve_segments` steps into a
+  sibling `mod` block by name when no alias matches, and keeps resolving there, chained
+  through as many levels of nested sibling module as the path names. Three narrower limits are
+  left where descent cannot go. An out-of-line declaration (`mod traits;`, no body in this
+  file) and a module gated on exactly `#[cfg(test)]` are both left unresolved rather than
+  guessed at. The first is because the module's real content lives in a file this per-file
+  scan never reads. The second is for `own_aliases`'s own reason (issue #51: test code is not
+  shipped code). Once resolution has stepped into a module by name it is off the lexical
+  ancestor stack, so `self::` still resolves inside it but `super::` does not. That is the
+  same residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
+  a module reached by name has no ancestor this per-file scan can identify past the point it
+  was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
-  they pin. Nor does
+  they pin. Module descent (issue #169) inherits this scanner's oldest limit rather than
+  adding a new one: `resolve_segments` has never tracked a function body's own scope, so a
+  generic parameter or a block-local item named the same as a `use` alias was already able to
+  shadow it unsoundly before #169 existed, and a sibling `mod` block reached the same way now
+  can be shadowed the same way (issue
+  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). Closing it
+  needs generic parameter lists and block-local scopes to become scopes of their own, ahead of
+  every module-level lookup — a materially larger mechanism than anything here today, the same
+  standing #169 itself had on PR #160 before it was filed rather than chased. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
   function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
   a later occurrence meant. Picking the first-declared alias can silently miss a real match;
@@ -1679,6 +1692,19 @@ Stated so that nobody mistakes silence for coverage:
   by painting the stack rather than by a call graph — see the "Stack usage" entry below — and
   that figure is the whole emulated image's, not this composed one's, so this bullet's own gap
   stands even though the workspace is no longer silent about call-chain depth everywhere.
+- **That a document's row set is complete, without a live build.** `runtime_ram_total`
+  composes the largest `Δram` of *every* row, gated or not — a per-feature row is a
+  configuration somebody ships, and §04 states one runtime-RAM ceiling for the device, not
+  one per configuration. `--report` reads a document this process did not produce, and
+  before issue [#115](https://github.com/madmax983/waymaker/issues/115) nothing checked that
+  the row set itself was complete: a document that omitted the row with the largest `Δram`
+  composed a smaller, wrong total and could pass a budget a complete document would fail.
+  `completeness_shortfalls` closes it by resolving `cargo metadata` for the workspace at
+  `--report`'s own path and holding the document's rows to what `matrix` derives from it —
+  cheap, since it links nothing, which is what keeps `--report` usable without a firmware
+  build. What it cannot see is a document read against a *different* checkout than the one
+  on disk: the comparison is against *this* workspace's `cargo metadata`, not against
+  whatever commit actually produced the document.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -3596,3 +3622,46 @@ kind of input this design has never claimed to survive: this function's whole po
 check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #115 closes a gap Codex found on the fourth review round of issue #39's own pull
+request: `SizeReport::runtime_ram_total` composed the statics term from the largest `Δram`
+of *every* row the document held, and `--report` reads a document this process did not
+produce, so nothing checked that the row *set* was the one the workspace actually derives.
+A document that left out the row with the largest `Δram` composed a smaller, wrong total and
+could pass a budget a complete document would have failed — the one figure this gate takes
+*across* rows rather than gating each row on its own.
+
+The first version of this fix took the issue's fourth, smallest option: narrow the
+composition to gated rows alone, which are pinned and required, so an omitted row could no
+longer starve it. Codex's review of that version on this pull request found the cost of
+narrowing: a per-feature row is a configuration somebody ships, and design document §04
+states one runtime-RAM ceiling for the *device*, not one per configuration — ADR 0035's own
+words for the original design were "a per-feature row is a configuration somebody ships, and
+taking the largest is the direction that fails closed". Narrowing to gated rows stopped
+gating every configuration that enables an optional feature, silently, forever, which is a
+real regression rather than only the closing of an adversarial-document hole — and it is
+exactly the cost issue #115 named for its first option and did not take.
+
+The fix taken instead is that first option, made affordable: `runtime_ram_total` composes
+the largest `Δram` of *every* row again, matching ADR 0035 unchanged, and a new function,
+`completeness_shortfalls`, closes the omission by resolving `cargo metadata` for the
+workspace and holding the document's row set to what `matrix` derives from it — a row
+`matrix` would produce and the document lacks, by name or by feature selection, is refused.
+Resolving metadata costs nothing a firmware build would: no image is linked, which is what
+keeps `--report` usable without one. `main.rs`'s `run_size` runs it alongside
+`SizeReport::shortfalls` and renders both lists as one report. `missing_rows` is refused
+outright on an empty `expected` rather than read as nothing to check — a workspace with no
+`waymaker-size-probe` has `matrix` derive no row at all, and a document from before the
+probe was removed would otherwise pass against it vacuously, the same empty matrix
+`measure_into` already refuses to link. Four tests drive it: a per-feature row's large
+`Δram` raising the total again, `missing_rows` catching a document missing a row `matrix`
+derives, catching a row whose name is reused with a narrowed feature selection, and catching
+a document read against a probe-less workspace. Review also found an out-of-scope,
+genuinely separate gap — a gated row's own `ram`/`bss` fields carry no non-zero floor,
+unlike `flash`'s — filed as issue
+[#172](https://github.com/madmax983/waymaker/issues/172) rather than folded in, since `0 B`
+is this engine's real, current statics figure and a floor there would fail every honest
+report. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id — see
+[ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md), which this
+leaves exactly as accepted.

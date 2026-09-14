@@ -633,7 +633,7 @@ pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
 /// The ADR that decides how issue #130 item 2's shape catalogue is held.
 ///
 /// Named here rather than found by prefix, for the reason [`STORAGE_CONFORMANCE_ADR`] is.
-pub const STORAGE_SHAPES_ADR: &str = "0046-a-shape-catalogue-holds-the-suite-to-the-writers.md";
+pub const STORAGE_SHAPES_ADR: &str = "0047-a-shape-catalogue-holds-the-suite-to-the-writers.md";
 
 /// Where the conformance crate's own shape table lives, relative to the workspace root.
 ///

@@ -8,7 +8,7 @@
 //!
 //! The `storage-shapes` rule of `cargo xtask check-layering` compares [`SHAPES`] against
 //! `xtask::docs::STORAGE_SHAPES`, against `CLAUDE.md`, and against
-//! [ADR 0046](https://github.com/madmax983/waymaker/blob/main/docs/adr/0046-a-shape-catalogue-holds-the-suite-to-the-writers.md),
+//! [ADR 0047](https://github.com/madmax983/waymaker/blob/main/docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md),
 //! so a shape cannot be added to one of the four and forgotten in the others. What that rule
 //! cannot see is inside this crate: `tests/shapes.rs::a_full_run_issues_every_declared_shape`
 //! is what proves a real run issues every row.

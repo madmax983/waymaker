@@ -1,4 +1,4 @@
-# ADR 0046: A shape catalogue holds the suite to the writers
+# ADR 0047: A shape catalogue holds the suite to the writers
 
 - Status: accepted
 - Date: 2026-09-14
