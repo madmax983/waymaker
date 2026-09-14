@@ -790,7 +790,7 @@ impl Witness {
                     progress = progress.accept(mark).map_err(promote)?;
                     next = index.saturating_add(1);
                 }
-                Err(_) if slot.iter().all(|byte| *byte == 0xFF) => {
+                Err(_) if slice_is_erased(slot) => {
                     self.verify_erased_to_end(storage, page, offset)?;
                     return Ok((progress, next));
                 }
@@ -846,7 +846,7 @@ impl Witness {
                 return Err(WitnessError::ShortBuffer);
             };
             storage.read(at, slice).map_err(WitnessError::Driver)?;
-            if !slice.iter().all(|byte| *byte == 0xFF) {
+            if !slice_is_erased(slice) {
                 return Err(WitnessError::Hole);
             }
             // `want` is at least one read unit whenever `at < end`, so this always advances.
@@ -857,6 +857,26 @@ impl Witness {
         }
         Ok(())
     }
+}
+
+/// Whether every byte of `bytes` reads as an erased NOR cell.
+///
+/// [`verify_erased_to_end`](Witness::verify_erased_to_end)'s own inner loop, and its doc
+/// comment already named the trade it was owed: `waymaker_flash::recovery`'s erased-tail
+/// walk and `waymaker-conformance`'s `media_is_erased` both moved from a bounds-checked,
+/// per-byte comparison to this one, and this function was the one place in the rig that had
+/// not yet — every byte of an erased cell is `0xFF`, so a whole word of them reads as
+/// [`usize::MAX`] regardless of endianness, and comparing a page one word at a time costs one
+/// comparison per word rather than one per byte. The tail that does not fill a whole word
+/// falls back to the byte-at-a-time check, which is also what a page shorter than one word
+/// runs entirely.
+fn slice_is_erased(bytes: &[u8]) -> bool {
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|&byte| byte == 0xFF)
 }
 
 /// Widens a driver-free refusal to one carrying a driver's error type.
@@ -871,5 +891,38 @@ const fn promote<E>(error: WitnessError) -> WitnessError<E> {
         WitnessError::Region => WitnessError::Region,
         WitnessError::WrongGeometry => WitnessError::WrongGeometry,
         WitnessError::Driver(never) => match never {},
+    }
+}
+
+#[cfg(test)]
+mod slice_is_erased_tests {
+    use super::slice_is_erased;
+
+    #[test]
+    fn agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        // The word-at-a-time walk must answer exactly what `iter().all(|b| *b == 0xFF)`
+        // would, at every length around a word boundary and with the one non-erased byte at
+        // every position — including inside the word-sized chunks and inside the remainder
+        // the chunking leaves over. Fixed-size rather than a `Vec`: this crate is
+        // `#![no_std]` with no allocator anywhere in it, tests included.
+        const MAX_LEN: usize = 32;
+        let word = size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [0xFF_u8; MAX_LEN];
+            assert!(
+                slice_is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !slice_is_erased(&bytes[..len]),
+                    "length {len} with byte {spoiled} programmed"
+                );
+            }
+        }
     }
 }

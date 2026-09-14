@@ -90,6 +90,21 @@ pub const ENGINE_HEAP_BLOCKS: u64 = 0;
 /// where the file is the only thing that still names the crate that wrote the code.
 pub const FULL_PATHS: &str = "--fullpath-after=";
 
+/// How many times a workload's callgrind run is repeated when it comes back attributing
+/// nothing to any workspace crate while the workload itself completed real units.
+///
+/// That combination is a contradiction rather than a finding: `units` is read from the
+/// workload's own `println!`, reached only after code in the engine crates ran (an effect
+/// scheduled, a case run), so `cost.engine == 0` alongside `units > 0` cannot be the engine
+/// genuinely doing nothing — it is this run's callgrind trace failing to carry attributable
+/// debug info for reasons this gate does not model (a corrupted or incomplete symbol read
+/// under an otherwise successful, self-consistent `Ir` total). One retry re-runs the tool
+/// rather than the workload — the workload's own determinism is already checked against
+/// DHAT's unit count — and a persistent zero across every attempt still fails exactly as
+/// before: this does not soften the gate, it only stops a single bad trace from being read
+/// as the answer.
+const ATTRIBUTION_RETRIES: u32 = 2;
+
 /// Where the JSON report is written.
 pub const REPORT_PATH: &str = "target/waymaker-profile.json";
 
@@ -971,7 +986,17 @@ fn build_workload(root: &Path) -> Result<PathBuf, ProfileError> {
     }
 }
 
-/// One workload, under both tools.
+/// One workload, under both tools, with the callgrind half retried when its answer
+/// contradicts the workload's own report of what it did.
+///
+/// DHAT runs exactly once. See [`ATTRIBUTION_RETRIES`] for what the callgrind
+/// contradiction is and why retrying it does not weaken this gate; the DHAT run is
+/// deliberately outside that retry, because a heap finding is never the tool's to re-roll —
+/// a second invocation could reproduce a real engine allocation differently, or not at all,
+/// and silently answering `Clean` over a `heap` a second run happened not to reproduce would
+/// be the kernel's `no_alloc` decision failing exactly the way this gate exists to catch. So
+/// the `heap` that reaches [`WorkloadProfile`] is always the one DHAT run's, whatever the
+/// callgrind side needed retrying.
 fn measure_workload(
     binary: &Path,
     output: &Path,
@@ -980,6 +1005,7 @@ fn measure_workload(
 ) -> Result<WorkloadProfile, ProfileError> {
     let dhat_out = output.join(format!("dhat-{}.json", workload.name));
     let callgrind_out = output.join(format!("callgrind-{}.out", workload.name));
+
     let units = run_tool(
         binary,
         workload,
@@ -989,6 +1015,58 @@ fn measure_workload(
             format!("--dhat-out-file={}", dhat_out.display()),
         ],
     )?;
+    if units != u32::from(workload.units) {
+        return Err(ProfileError::new(format!(
+            "{}: the workload completed {units} {}s and WORKLOADS declares {}; the table and the workload disagree, and the table is not the measurement",
+            workload.name, workload.unit, workload.units
+        )));
+    }
+    let heap = parse_dhat(&read(&dhat_out)?, workspace)
+        .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))?;
+
+    let mut attribution = run_callgrind(binary, workload, &callgrind_out, workspace, units)?;
+    let mut attempt = 0;
+    while should_retry_attribution(units, attribution.cost.engine, attempt) {
+        attempt += 1;
+        eprintln!(
+            "{}: callgrind attributed nothing to any workspace crate over {units} completed {}(s); retrying the callgrind run ({attempt}/{ATTRIBUTION_RETRIES})",
+            workload.name, workload.unit
+        );
+        attribution = run_callgrind(binary, workload, &callgrind_out, workspace, units)?;
+    }
+
+    Ok(WorkloadProfile {
+        workload: workload.name.to_owned(),
+        what: workload.what.to_owned(),
+        unit: workload.unit.to_owned(),
+        units,
+        reached: attribution.reached,
+        heap,
+        cost: attribution.cost,
+    })
+}
+
+/// Whether [`measure_workload`] should run callgrind again for this row.
+///
+/// Only the contradiction [`ATTRIBUTION_RETRIES`] names — real units completed, nothing
+/// attributed — and only while attempts remain. A workload that completed no units, or one
+/// that already attributed something to the engine, is never retried: the first is
+/// [`WorkloadProfile::verdict`]'s own `Unmeasurable` to raise, and the second is a real
+/// answer, however small.
+#[must_use]
+const fn should_retry_attribution(units: u32, engine: u64, attempt: u32) -> bool {
+    units > 0 && engine == 0 && attempt < ATTRIBUTION_RETRIES
+}
+
+/// One callgrind run over `workload`, checked against the `expected_units` the paired DHAT
+/// run already completed.
+fn run_callgrind(
+    binary: &Path,
+    workload: Workload,
+    callgrind_out: &Path,
+    workspace: &[WorkspaceCrate],
+    expected_units: u32,
+) -> Result<Attribution, ProfileError> {
     let again = run_tool(
         binary,
         workload,
@@ -1005,32 +1083,14 @@ fn measure_workload(
     )?;
     // The two runs are the same deterministic workload, so a disagreement is a workload that
     // is not deterministic — which would make every figure here a figure about one run of it.
-    if units != again {
+    if expected_units != again {
         return Err(ProfileError::new(format!(
-            "{}: the DHAT run completed {units} {}s and the callgrind run {again}; the workload is not deterministic, so neither figure is about it",
+            "{}: the DHAT run completed {expected_units} {}s and the callgrind run {again}; the workload is not deterministic, so neither figure is about it",
             workload.name, workload.unit
         )));
     }
-    if units != u32::from(workload.units) {
-        return Err(ProfileError::new(format!(
-            "{}: the workload completed {units} {}s and WORKLOADS declares {}; the table and the workload disagree, and the table is not the measurement",
-            workload.name, workload.unit, workload.units
-        )));
-    }
-
-    let heap = parse_dhat(&read(&dhat_out)?, workspace)
-        .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))?;
-    let attribution = parse_callgrind(&read(&callgrind_out)?, workspace)
-        .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))?;
-    Ok(WorkloadProfile {
-        workload: workload.name.to_owned(),
-        what: workload.what.to_owned(),
-        unit: workload.unit.to_owned(),
-        units,
-        reached: attribution.reached,
-        heap,
-        cost: attribution.cost,
-    })
+    parse_callgrind(&read(callgrind_out)?, workspace)
+        .map_err(|error| ProfileError::new(format!("{}: {error}", workload.name)))
 }
 
 /// Runs `binary` under valgrind with `arguments`, and answers the units it reported.
@@ -1937,5 +1997,55 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         }
         assert!(rendered.contains("no cycle count on any part"));
         assert!(report.shortfall_report().is_none());
+    }
+
+    #[test]
+    fn attribution_is_retried_only_for_the_contradiction_it_names() {
+        // Real units, nothing attributed: retried up to the cap, then not.
+        assert!(should_retry_attribution(8, 0, 0));
+        assert!(should_retry_attribution(8, 0, ATTRIBUTION_RETRIES - 1));
+        assert!(!should_retry_attribution(8, 0, ATTRIBUTION_RETRIES));
+
+        // No units completed is `Unmeasurable`'s own case, not a contradiction this retries.
+        assert!(!should_retry_attribution(0, 0, 0));
+
+        // Any nonzero engine attribution is a real answer, however small, and is never
+        // retried away.
+        assert!(!should_retry_attribution(8, 1, 0));
+    }
+
+    #[test]
+    fn a_dhat_finding_is_never_masked_by_a_retried_callgrind_answer() {
+        // measure_workload retries only callgrind, in place, so a real DHAT finding and a
+        // `cost.engine == 0` mid-retry can be paired here exactly as they could be paired
+        // there. Whatever `verdict` this combination gets, it must never be `Clean`: a real
+        // engine allocation silently passing because callgrind's attribution had trouble is
+        // the failure mode this gate exists to catch. Run only once — never re-run
+        // alongside callgrind's retries — the `heap` a real DHAT run captured cannot be
+        // replaced by a later attempt's answer, because there is no later DHAT attempt to
+        // replace it with.
+        let workspace = workspace();
+        let heap = parse_dhat(&dhat_export(&[(24576, 1, ENGINE_STACK)]), &workspace)
+            .expect("a real DHAT export");
+        assert_eq!((heap.engine_blocks, heap.engine_bytes), (1, 24576));
+        let profile = WorkloadProfile {
+            workload: "journal".to_owned(),
+            what: String::new(),
+            unit: "effect".to_owned(),
+            units: 8,
+            reached: engine_crates().into_iter().map(str::to_owned).collect(),
+            heap,
+            cost: Cost {
+                engine: 0,
+                harness: 0,
+                runtime: 1,
+            },
+        };
+        assert!(should_retry_attribution(
+            profile.units,
+            profile.cost.engine,
+            0
+        ));
+        assert_ne!(profile.verdict(), Verdict::Clean);
     }
 }

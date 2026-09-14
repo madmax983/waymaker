@@ -470,7 +470,7 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     ///
     /// On success the bank to install into is the one the device did **not** boot from, the
     /// generation is strictly greater than the one it did, the next run's id differs from
-    /// the retired one, and [`Installed::region`] is a journal that bank really has room
+    /// the retired one, and [`Installed::recovery`] is a journal that bank really has room
     /// for. Nothing has been read, programmed, erased or barriered.
     ///
     /// # Errors
@@ -753,7 +753,7 @@ impl<'storage, S: StableStorage, C: IntegrityCheck> Sealable<'_, 'storage, S, C>
     /// # Errors
     ///
     /// [`SwapStepError::Storage`] if the program or the barrier fails.
-    pub fn commit(self) -> Result<Installed<'storage, S>, SwapStepError<S::Error>> {
+    pub fn commit(self) -> Result<Installed<'storage, S, C>, SwapStepError<S::Error>> {
         self.storage
             .program(self.plan.installing.seal_offset(), self.seal)
             .map_err(SwapStepError::Storage)?;
@@ -761,14 +761,21 @@ impl<'storage, S: StableStorage, C: IntegrityCheck> Sealable<'_, 'storage, S, C>
         Ok(Installed {
             plan: self.plan,
             storage: self.storage,
+            check: PhantomData,
         })
     }
 }
 
 /// A run that is on media and authoritative, and the bank the swap replaced.
 ///
-/// §10 step 7's other half: what a caller does *after* a successful swap. It is not generic
-/// over the integrity check, because nothing left to do reads or writes a seal.
+/// §10 step 7's other half: what a caller does *after* a successful swap. This type carries
+/// the check `C` the swap sealed with. See [`recovery`](Self::recovery) for why.
+///
+/// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to drop `C`
+/// and hand back a bare `JournalRegion`. The old docs said no later step reads or writes a
+/// seal. That is true of `reclaim`. It was not true of a region a caller could read with the
+/// wrong check — so this type keeps `C` and hands back only a [`Recovery`](Self::recovery)
+/// already keyed to it.
 ///
 /// # Why it is not `Copy`
 ///
@@ -778,12 +785,15 @@ impl<'storage, S: StableStorage, C: IntegrityCheck> Sealable<'_, 'storage, S, C>
 /// of them. `Journal` is not `Copy` for the same shape of reason, one layer down.
 #[must_use = "a completed swap reports the journal the new run writes into"]
 #[derive(Debug)]
-pub struct Installed<'storage, S> {
+pub struct Installed<'storage, S, C: IntegrityCheck = Catalogued> {
     plan: Plan,
     storage: &'storage mut S,
+    /// The check this bank was sealed with. Zero-sized: [`IntegrityCheck`]'s methods take no
+    /// `self`.
+    check: PhantomData<C>,
 }
 
-impl<S> Installed<'_, S> {
+impl<S, C: IntegrityCheck> Installed<'_, S, C> {
     /// What [`bank::select`] would now say, and what the next swap begins from.
     ///
     /// Not read back from media: it is what this swap installed, and a device that
@@ -796,22 +806,6 @@ impl<S> Installed<'_, S> {
             id: self.plan.installed,
             generation: self.plan.generation,
         }
-    }
-
-    /// The journal the new run writes into.
-    ///
-    /// Validated at [`Swap::beginning`], before the erase, so this costs the caller no
-    /// second chance to get §10's chain wrong. Every byte of it is erased media: step 2
-    /// erased the whole bank and step 3 programmed only the header in front of this region,
-    /// so a [`Recovery`] over it ends [`Clean`](crate::recovery::Ending::Clean) at zero.
-    ///
-    /// A [`Journal`] is deliberately *not* handed back. [`Journal::after`] taking a finished
-    /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
-    /// and a second constructor for the writer — even one this module could prove correct —
-    /// is a second way to reach an append offset that no scan vouched for.
-    #[must_use]
-    pub const fn region(&self) -> JournalRegion {
-        self.plan.region
     }
 
     /// An effect id allocator for the run this swap installed.
@@ -835,7 +829,37 @@ impl<S> Installed<'_, S> {
     }
 }
 
-impl<S: StableStorage> Installed<'_, S> {
+impl<'storage, S: StableStorage, C: IntegrityCheck> Installed<'storage, S, C> {
+    /// A [`Recovery`] of the journal the new run writes into, keyed to the check `C` this
+    /// bank was sealed with.
+    ///
+    /// Validated at [`Swap::beginning`], before the erase, so this costs the caller no
+    /// second chance to get §10's chain wrong. Every byte of the journal is erased media:
+    /// step 2 erased the whole bank and step 3 programmed only the header in front of it, so
+    /// this recovery ends [`Clean`](crate::recovery::Ending::Clean) at zero.
+    ///
+    /// A [`Journal`] is deliberately *not* handed back. [`Journal::after`] taking a finished
+    /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
+    /// and a second constructor for the writer — even one this module could prove correct —
+    /// is a second way to reach an append offset that no scan vouched for.
+    ///
+    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to hand
+    /// back the bare [`JournalRegion`] instead. A caller could pass it to [`Recovery::new`]
+    /// by mistake. `Recovery::new` defaults to [`Catalogued`], the wrong check for a bank
+    /// sealed with another one — recovery then stops at the first frame with
+    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the journal
+    /// already keyed to the right check, so that mistake has no route left.
+    ///
+    /// Consumes `self` rather than borrowing it, for issue [#84](https://github.com/madmax983/waymaker/issues/84)'s
+    /// reason: this device is bound to `self` by the same borrow the whole swap carried, and
+    /// the [`Recovery`] this returns needs it exclusively for its own scan.
+    #[must_use]
+    pub const fn recovery(self) -> Recovery<'storage, S, C> {
+        Recovery::with_integrity(self.plan.region, self.storage)
+    }
+}
+
+impl<S: StableStorage, C: IntegrityCheck> Installed<'_, S, C> {
     /// §10 step 7: erases the bank the swap replaced.
     ///
     /// Lazy, and crash-safe by construction rather than by care. The new bank already

@@ -1186,10 +1186,10 @@ fn row_nine() -> Row {
         unreachable!("the seven steps complete on a fault-free device")
     };
     // Captured before `device` is read directly: `installed` borrows it for as long as it
-    // lives (issue #84), so the two borrows cannot overlap.
+    // lives (issue #84), and `recovery()` consumes it to hand that borrow onward, so the two
+    // borrows cannot overlap.
     let installed_authority = installed.authority();
-    let installed_region = installed.region();
-    drop(installed);
+    let installed_region = installed.recovery().region();
 
     assert_eq!(authority(&mut device, layout), installed_authority);
     let mut new_world = World::new();

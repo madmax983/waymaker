@@ -1725,14 +1725,21 @@ fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -
         Err(error) => return swap_failure_cost(error),
     };
 
-    // Everything a caller does with a completed swap: where the new run writes, what the
-    // next swap begins from, and the identity space it starts in.
-    let mut kept = (installed.region().bytes() as usize)
-        .wrapping_add(generation_cost(installed.authority()))
+    // Everything a caller does with a completed swap: what the next swap begins from, and
+    // the identity space it starts in — both `&self`, and callable before the value is
+    // spent. `recovery`, keyed to the check it was sealed with (issue #85), and `reclaim`
+    // each consume `installed` outright, since issue #84 binds the device to it for the
+    // whole of that call: only one of the two can run here, and the `black_box` is what
+    // stops the compiler from proving which, so both stay linked.
+    let mut kept = generation_cost(installed.authority())
         .wrapping_add(usize::from(installed.allocator().peek().is_some()));
-    kept = kept.wrapping_add(match installed.reclaim() {
-        Ok(()) => 1,
-        Err(error) => swap_failure_cost(error),
+    kept = kept.wrapping_add(if core::hint::black_box(true) {
+        installed.recovery().region().bytes() as usize
+    } else {
+        match installed.reclaim() {
+            Ok(()) => 1,
+            Err(error) => swap_failure_cost(error),
+        }
     });
 
     // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a

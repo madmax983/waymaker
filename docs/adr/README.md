@@ -51,7 +51,8 @@ be superseded.
 | [0040](0040-the-emulator-runs-the-rig-and-attests-to-no-board.md) | The emulator runs the rig, and attests to no board | accepted |
 | [0041](0041-the-bank-refinement-abstracts-a-real-swap.md) | The bank refinement abstracts a real swap | accepted |
 | [0042](0042-a-terminal-watchdog-reset-is-the-fault-free-run.md) | A terminal watchdog reset is the fault-free run | accepted |
-| [0043](0043-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
+| [0043](0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md) | The model gains banked records, a reboot, and a live compaction | accepted |
+| [0044](0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md) | A device is a borrow in three modules, and a value in a fourth | accepted |
 
 ## Reading the numbers
 
