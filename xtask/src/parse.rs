@@ -1437,6 +1437,13 @@ pub struct NamedFn {
     /// the ambiguity a caller matching attributes to a position must not have (issue
     /// #97, Codex review round 5).
     pub line: usize,
+    /// The 1-indexed source line of the function's closing brace.
+    ///
+    /// A caller must check both ends of an item, not only [`line`](Self::line). An
+    /// anchor can end between the `fn` keyword and the body. Then the start line does
+    /// not prove the page shows the whole function (issue #165, Codex review round 8 of
+    /// issue #97).
+    pub end_line: usize,
 }
 
 /// Every `fn name` in `contents`, outside `#[cfg(test)]`, in source order.
@@ -1489,6 +1496,7 @@ fn collect_fns_named(
                     attrs: function.attrs.clone(),
                     body: block_text(&function.block),
                     line: function.sig.fn_token.span.start().line,
+                    end_line: function.block.brace_token.span.close().start().line,
                 });
             }
             syn::Item::Impl(implementation) => {
@@ -1504,6 +1512,7 @@ fn collect_fns_named(
                                 attrs: method.attrs.clone(),
                                 body: block_text(&method.block),
                                 line: method.sig.fn_token.span.start().line,
+                                end_line: method.block.brace_token.span.close().start().line,
                             });
                         }
                     }
@@ -2415,5 +2424,32 @@ mod alias_scope_tests {
             "a sibling module's alias was reachable through an unrelated `super::` path: \
              {implementors:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod named_fn_span_tests {
+    //! Issue #165: a caller must check the whole span of an item, not only its start
+    //! line. `collect_fns_named` has two branches that build a [`NamedFn`] — one for a
+    //! free function, one for a method in an `impl` block. Both must record the real
+    //! end line, not only the start line.
+    use super::fns_matching;
+
+    #[test]
+    fn a_free_functions_end_line_is_its_own_closing_brace() {
+        let found = fns_matching("fn it_works() {\n    assert!(true);\n}\n", "it_works", true);
+        assert_eq!(found.len(), 1, "found {} functions", found.len());
+        assert_eq!(found[0].line, 1, "the `fn` keyword sits on line 1");
+        assert_eq!(found[0].end_line, 3, "the closing brace sits on line 3");
+    }
+
+    #[test]
+    fn an_impl_methods_end_line_is_its_own_closing_brace() {
+        let sample =
+            "impl Fixture {\n    #[test]\n    fn it_works() {\n        assert!(true);\n    }\n}\n";
+        let found = fns_matching(sample, "it_works", true);
+        assert_eq!(found.len(), 1, "found {} functions", found.len());
+        assert_eq!(found[0].line, 3, "the `fn` keyword sits on line 3");
+        assert_eq!(found[0].end_line, 5, "the closing brace sits on line 5");
     }
 }
