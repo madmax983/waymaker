@@ -135,6 +135,18 @@ anywhere in this file, precisely so a construction site cannot hide from a scan 
 `effect.rs` as one flat file, and a submodule added for this reason would open exactly the
 hole that rule exists to close.
 
+**An eighth round found the third route the first two left open: a method call.**
+`dispatch.bytes.clone_from(&other)` reassigns `bytes` through an *implicit* `&mut self`
+autoref — nothing in the source spells `=` or `&mut`, so neither the assignment check nor
+the reference check sees it. Which method is called, and whether it really takes `&mut
+self`, is a question `syn` cannot answer without type inference. So `mutated_field_names`
+refuses every method call whose receiver is a guarded field, not only the ones a reviewer
+could confirm mutate — over-broad by the same standing every other scanner in this
+workspace accepts, and the one that costs nothing here: no method is ever legitimately
+called directly on one of these fields anywhere in `effect.rs` today, only on the whole
+value through its own accessor (`dispatch.bytes()`, whose receiver is a plain path, not a
+field access, and stays unaffected).
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

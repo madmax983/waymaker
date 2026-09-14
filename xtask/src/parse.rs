@@ -527,14 +527,20 @@ fn collect_future_implementors(
 }
 
 /// Every name in `names` that `contents` writes to as a struct field, outside
-/// `#[cfg(test)]` — in either of the two ways a field's value can be rewritten in place
+/// `#[cfg(test)]` — in any of the three ways a field's value can be rewritten in place
 /// rather than rebuilt.
 ///
 /// A plain assignment, `x.field = value;`, is one route. A `&mut` reference taken to the
-/// field is the other — `std::mem::swap(&mut x.field, &mut y.field)`,
+/// field is the second — `std::mem::swap(&mut x.field, &mut y.field)`,
 /// `std::mem::replace(&mut x.field, value)`, and passing the reference to an arbitrary
 /// function that takes `&mut T` are all routes to the same rewrite that spell no `=` at all,
-/// and all three need a `&mut` to the field first, which is the shape this refuses.
+/// and all three need a `&mut` to the field first, which is the shape this refuses. A
+/// *method* call on the field is the third, and the one that needs neither: `x.field.
+/// clone_from(&other)` autorefs `&mut x.field` implicitly, with no `&mut` token written
+/// anywhere — so every method call on a guarded field is refused outright, since telling a
+/// mutating method from a read-only one needs type inference `syn` does not have. A method
+/// called on the whole *value* (`x.field()`, an accessor) is unaffected: its receiver is a
+/// plain path, not a field access.
 ///
 /// A name is matched on the field member alone, not on the receiver's type — `syn` sees
 /// syntax, not types, so `x.bytes = value` is refused for any `x` once `"bytes"` is in
@@ -590,6 +596,20 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
                 self.note(&node.expr);
             }
             syn::visit::visit_expr_reference(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            // `x.field.clone_from(&other)` reassigns `field` through an *implicit* `&mut
+            // self` autoref: nothing in the source spells `=` or `&mut`, so this is a third
+            // route neither `visit_expr_assign` nor `visit_expr_reference` can see. Which
+            // method is called, and whether it really takes `&mut self`, needs type
+            // inference `syn` does not have — so every method call on a guarded field is
+            // refused, not only the ones a reviewer could confirm are mutating. A method
+            // called on the whole *value* (`dispatch.bytes()`, the accessor every legitimate
+            // caller already uses) has a receiver that is a plain path, not a field access,
+            // so it is unaffected.
+            self.note(&node.receiver);
+            syn::visit::visit_expr_method_call(self, node);
         }
     }
 
@@ -1885,6 +1905,34 @@ mod raw_identifier_tests {
              \x20   fn tamper(mut dispatch: super::Foo) {\n\
              \x20       dispatch.bytes = other;\n\
              \x20   }\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_mutating_method_call_on_a_field_is_reported() {
+        // Codex, issue #92's eighth round: `x.field.clone_from(&other)` reassigns the field
+        // through an *implicit* `&mut self` autoref — no `=` and no explicit `&mut` anywhere
+        // in the source, so neither of the other two routes sees it.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, other: &Bytes) {\n\
+             \x20   dispatch.bytes.clone_from(other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_method_call_on_the_whole_value_is_not_reported() {
+        // `dispatch.bytes()` calls a method *named* `bytes` on `dispatch` — the receiver is
+        // `dispatch`, not a field access — which must stay legal: it is how every accessor in
+        // this file is called.
+        let found = mutated_field_names(
+            "fn read(dispatch: Foo) -> Bytes {\n\
+             \x20   dispatch.bytes()\n}",
             &["bytes"],
         )
         .expect("the fixture parses");

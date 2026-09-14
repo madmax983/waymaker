@@ -12275,6 +12275,22 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_mutating_method_call_is_reported() {
+        // Codex, issue #92's eighth round: `x.field.clone_from(&other)` reassigns the field
+        // through an *implicit* `&mut self` autoref — no `=`, no explicit `&mut` anywhere in
+        // the source, so neither of the previous round's two routes saw it.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn tamper<'a>(mut dispatch: CheckedDispatch<'a>, other: &'a [u8]) -> CheckedDispatch<'a> {\n\
+               \x20   dispatch.bytes.clone_from(&other);\n\
+               \x20   dispatch\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("bytes")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_never_built_inside_perform_is_reported() {
         let source = tests_support::clean_effect_module().replace(
             "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",
