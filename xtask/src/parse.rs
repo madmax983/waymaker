@@ -1382,6 +1382,14 @@ fn opens_non_rendering_element(line: &str) -> Option<&'static str> {
     find_any_opening_tag(line, 0).and_then(|(start, _, tag)| (start == 0).then_some(tag))
 }
 
+/// The name of an arbitrary element's opening tag, suppressed by its own `hidden`
+/// attribute rather than by name, if `line` *itself is* one (Codex, pull request #138,
+/// round 43, finding 2) — the inline twin of [`opens_non_rendering_element`], required
+/// to start at byte `0` for the same reason.
+fn opens_hidden_element(line: &str) -> Option<String> {
+    find_any_hidden_opening_tag(line, 0).and_then(|(start, _, name)| (start == 0).then_some(name))
+}
+
 /// Opens or closes `stack` from one self-contained `Event::InlineHtml` construct —
 /// exactly one tag, since `CommonMark`'s inline HTML grammar matches one open tag, one
 /// close tag, or one comment per event, never a run of surrounding text — returning
@@ -1429,10 +1437,25 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
             }
             true
         }
-        None => opens_non_rendering_element(html).is_some_and(|tag| {
-            stack.push(tag.to_owned());
-            true
-        }),
+        // An arbitrary element carrying its own `hidden` attribute is checked after
+        // the three fixed names, not instead of them (Codex, pull request #138, round
+        // 43, finding 2): `find_any_hidden_opening_tag`'s own doc comment already
+        // covers a tag that is both (`<template hidden>`), and the fixed check is
+        // cheaper to try first. `<span hidden>` reaching `Event::InlineHtml` —
+        // `Settles deferred question: <span hidden>\`id\`</span>` — never reached
+        // either check before this, so its own `Event::Text` body read as ordinary
+        // visible documentation evidence even though no browser ever displays it.
+        None => {
+            if let Some(tag) = opens_non_rendering_element(html) {
+                stack.push(tag.to_owned());
+                true
+            } else if let Some(name) = opens_hidden_element(html) {
+                stack.push(name);
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -1709,6 +1732,16 @@ enum NonRenderingAdvance {
 /// closer trapped inside what merely *looks* like a nested tag — `<span title="x
 /// </script>y">` — really is the close, and the quote-aware tokenizer built for
 /// `<template>`'s genuinely parsed content would skip straight over it.
+///
+/// The "further open" half also checks for a reopen of `top` *by name*, not only
+/// among the three fixed non-rendering elements (Codex, pull request #138, round 43,
+/// finding 1): `<div hidden><div>x</div>decision-id headline</div>` has an ordinary,
+/// unsuppressed `<div>` nested inside the `hidden`-tracked outer one, and reading only
+/// `find_any_opening_tag` — blind to any name outside the fixed three — never saw it,
+/// so the *inner* `</div>` was read as the outer element's own close, exposing
+/// everything after it (still really inside the hidden container) as visible prose.
+/// `<template>`'s own reopen was always covered this way already, since it is one of
+/// the three; this closes the same gap for an arbitrary `hidden`-suppressed name.
 fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
         return find_raw_text_closing_tag(line, cursor, top)
@@ -1716,8 +1749,15 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
     }
     let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    let open = find_any_opening_tag(line, cursor)
-        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag.to_owned())));
+    let fixed_open =
+        find_any_opening_tag(line, cursor).map(|(start, end, tag)| (start, end, tag.to_owned()));
+    let top_reopen =
+        find_opening_tag(line, cursor, top).map(|(start, end)| (start, end, top.to_owned()));
+    let open = [fixed_open, top_reopen]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(start, _, _)| start)
+        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag)));
     let comment =
         find_comment_opener(line, cursor).map(|start| (start, NonRenderingAdvance::Comment(start)));
     [close, open, comment]
@@ -1784,6 +1824,14 @@ struct PendingTag {
     /// off, if any — an attribute value can itself carry a tag's closing search past
     /// more than one line.
     quote: Option<u8>,
+    /// The tag's own raw text seen so far, across every line read while it stayed
+    /// unresolved (Codex, pull request #138, round 43, finding 3): whether it opens
+    /// an arbitrary `hidden`-suppressed element cannot be decided from its name
+    /// alone the way opening one of the three fixed elements can, since the
+    /// attribute itself may sit on a line after the one the tag started on —
+    /// `<div\n hidden>decision-id headline</div>` — and [`has_hidden_attribute`]
+    /// needs the tag's complete markup to answer that.
+    text: String,
 }
 
 /// The visible byte ranges of one `Event::Html` line — real block-level HTML
@@ -1849,17 +1897,31 @@ fn visible_html_ranges(
             name,
             closing,
             mut quote,
+            text,
         } = pending;
         if let Some(end) = scan_tag_close(line, 0, &mut quote) {
-            if !closing && matches!(name.as_str(), "script" | "style" | "template") {
-                open_non_rendering.push(name);
+            if !closing {
+                if matches!(name.as_str(), "script" | "style" | "template") {
+                    open_non_rendering.push(name);
+                } else if !is_void_element(&name) {
+                    // The full tag text, not just this line's own portion (Codex,
+                    // round 43, finding 3): `hidden` may sit on any line the tag
+                    // spans, not only the last one.
+                    let full_text = text + &line[..end];
+                    if has_hidden_attribute(&full_text) {
+                        open_non_rendering.push(name);
+                    }
+                }
             }
             cursor = end;
         } else {
+            let mut text = text;
+            text.push_str(line);
             *pending_tag = Some(PendingTag {
                 name,
                 closing,
                 quote,
+                text,
             });
             return spans;
         }
@@ -1916,6 +1978,7 @@ fn visible_html_ranges(
                         name,
                         closing,
                         quote,
+                        text: line[start..].to_owned(),
                     });
                     break;
                 }

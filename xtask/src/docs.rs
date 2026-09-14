@@ -7599,6 +7599,84 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_id_hidden_by_a_div_nesting_a_same_named_tag_does_not_count() {
+        // Codex, pull request #138, round 43, finding 1: the "further open" half of
+        // `next_non_rendering_marker`'s nesting branch only recognized a reopen among
+        // the three fixed non-rendering names, so `<div hidden><div>x</div>decision-id
+        // headline</div>` — an ordinary, unsuppressed `<div>` nested inside the
+        // `hidden`-tracked outer one — was invisible to it: the search for the outer
+        // element's own close found the *inner* `</div>` first and popped the tracked
+        // state early, exposing everything after it (still really inside the hidden
+        // container) as visible prose. `find_opening_tag(line, cursor, top)` is now
+        // also checked, so a reopen of an arbitrary `hidden`-suppressed name is found
+        // the same way `<template>`'s own reopen already was.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden><div>x</div>{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fifth.id),
+            "a decision id hidden by a div nesting a same-named tag still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_inside_an_inline_span() {
+        // Codex, pull request #138, round 43, finding 2: `track_non_rendering_html`'s
+        // empty-stack branch only checked `opens_non_rendering_element` (the three
+        // fixed names) to decide whether an `Event::InlineHtml` construct opens
+        // something, so `<span hidden>` — real, invisible content just like
+        // `<script>`'s, but on an arbitrary tag — was never recognized, and
+        // `- Status: <span hidden>accepted</span>` read its hidden value as an
+        // ordinary, visible one. `opens_hidden_element` is now also checked.
+        let contents = "# ADR\n\n- Status: <span hidden>accepted</span>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn a_decision_id_hidden_by_a_div_whose_hidden_attribute_is_on_a_later_line_does_not_count() {
+        // Codex, pull request #138, round 43, finding 3: `PendingTag` carried only a
+        // tag's name, closing/opening kind and quote state across a line break, not
+        // enough to tell whether it carries `hidden` when the attribute itself sits
+        // on a line after the one the tag started on — `<div\n hidden>decision-id
+        // headline</div>` resolved the pending `div` on its second line with no way
+        // to know that line had just supplied `hidden`, so the element was never
+        // tracked and its content stayed visible. `PendingTag` now accumulates the
+        // tag's own raw text across every line it spans, and `has_hidden_attribute`
+        // is checked against the complete text once the tag finally resolves.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div\n hidden>{} {}</div>\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == sixth.id),
+            "a decision id hidden by a div whose hidden attribute is on a later line \
+             still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn the_settled_decision_ids_are_unique() {
         let mut ids: Vec<&str> = SETTLED_DECISIONS.iter().map(|d| d.id).collect();
         let count = ids.len();
