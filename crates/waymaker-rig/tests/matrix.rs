@@ -2583,3 +2583,72 @@ fn resume_declaring_refuses_a_divergent_record_it_would_write_fresh() {
         "no crash point left effect 0 durable with effect 1's schedule not yet recovered"
     );
 }
+
+/// Round 9: the capacity preflight only refused a `declared` *wider* than `self.effects`, so
+/// a *narrower* one still reached the write loop. Its early records agree with this rig's
+/// own truth — a shorter run's opening effects are a prefix of a longer one's, byte for
+/// byte — so the per-record check round 8 added does not fire until the declaration's own
+/// early `RunCompleted` collides with an effect index the real run still has open,
+/// mutating and dispatching every record in between first.
+///
+/// The fix widens the preflight from "not wider" to "the same shape": `resume_declaring`
+/// only ever means to audit history against a workload that agrees with this rig's own run
+/// everywhere but the one record [`Workload::diverging`] names, and a workload of a
+/// different length is not that.
+#[test]
+fn resume_declaring_refuses_a_narrower_workload_before_dispatching_anything() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let declared = Workload::new(SEED, 0, EFFECTS - 1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Only `RunStarted` durable: every record the narrower declaration would write is
+        // fresh, so nothing but the per-record shape check can catch it.
+        if !matches!(
+            (evidence.attempted, evidence.recovered_it),
+            (Role::Start, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(matches!(outcome, Err(RigError::Workload)), "{outcome:?}");
+        assert!(
+            dispatcher.entered.is_empty(),
+            "a narrower declaration dispatched an effect before being refused"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "a narrower declaration mutated the device before being refused"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(checked > 0, "no crash point left only RunStarted durable");
+}

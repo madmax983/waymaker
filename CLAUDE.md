@@ -3715,3 +3715,16 @@ second effect's schedule — the record `diverging` changes — not yet recovere
 unfixed code answered `Ok(Completed { recovered: 3, .. })`, having written and dispatched
 the diverged record, rather than `RigError::Breach(Breach::RecordDiffers { .. })` before
 either happened.
+
+A sixth was the capacity preflight's own other half: it refused a `declared` *wider* than
+`self.effects` but let a *narrower* one through. A narrower run's opening effects are a
+byte-for-byte prefix of a longer one's, so its early records still agree with this rig's
+own truth and the per-record check above does not fire — the mutation and the dispatch it
+exists to prevent both happen for every record before the declaration's own early
+`RunCompleted` finally collides with an index the real run still has open. The preflight
+now refuses any effect count other than `self.effects`, not only a wider one:
+`resume_declaring` only ever means to audit a workload that agrees with this rig's own run
+everywhere but the one record `diverging` names, and a workload of another length is not
+that shape. Reproduced first from a crash point that left only `RunStarted` durable and a
+narrower declared workload: the unfixed code dispatched the first effect and only then
+answered `Breach::RecordDiffers` at the index where the shapes finally disagreed.
