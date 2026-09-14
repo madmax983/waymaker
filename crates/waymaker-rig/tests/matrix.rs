@@ -365,6 +365,11 @@ fn require(point: &Classified) {
         }
         Row::DuringCompletionWrite => {
             assert_eq!(evidence.activity, Activity::Returned, "{at}");
+            // What `row_of` read off the media to route this point here in the first
+            // place, checked again rather than trusted: something of the attempted
+            // completion landed, and recovery did not already hold the whole of it.
+            assert!(evidence.landed, "{at}");
+            assert!(!evidence.recovered_it, "{at}");
             match resumed {
                 // Issue #95: no writer starts a record before the one ahead of it has
                 // sealed, so a torn completion whose own reserved slot came out clean is

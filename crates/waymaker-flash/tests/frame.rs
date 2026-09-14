@@ -2173,15 +2173,20 @@ fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
     // real seal and the next two records are still out there — so the mismatch is still
     // caught, in one call to `next`, just by a different one of this reader's stop
     // conditions than before.
+    // Exact rather than loose: the wire format is frozen at v1, so this record's layout is
+    // stable, and pinning the values is what would catch a version of this fix that quietly
+    // widened the ignorable check back to "the rest of the journal" and read this mismatch
+    // as history again.
     let mut mismatched = Scan::new(&journal, ProgramAlign::BYTE);
-    let refused = mismatched.next();
-    assert!(
-        matches!(refused, Some(Err(_))),
-        "a short stride must be refused, never read as the end of history: {refused:?}"
+    assert_eq!(
+        mismatched.next(),
+        Some(Err(DecodeError::IntegrityFailed)),
+        "a short stride must be refused, never read as the end of history"
     );
-    assert!(
-        mismatched.offset() > 0,
-        "the mismatch is caught past the first record's own real content"
+    assert_eq!(
+        mismatched.offset(),
+        22,
+        "the mismatch is caught inside the first record's own real padding"
     );
     assert!(mismatched.next().is_none(), "the scan is fused");
 
