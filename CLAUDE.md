@@ -3345,6 +3345,34 @@ carrying a `qself` now fails closed to `UNRESOLVED_DERIVE` the same way a
 `super`-qualified path already does, rather than silently comparing the unqualified
 associated-type name.
 
+Round 24 found three more. `Item::Impl`, `Item::Trait`, `Item::Enum`, `Item::Type`,
+`Item::Struct` and `Item::Union` each declare their own `syn::Generics` — a type
+parameter's bounds and default, and a `where` clause predicate — and round 22's
+`generics_items` had only ever been chained into a function or method *signature*'s
+own generics; none of the six item kinds' own generics were read at all, so `struct
+Holder<T = Wrapper<{ impl Clone for Recovery { .. }; 0 }>>(T);` reached neither
+`collect_trait_implementors_in_item_body` nor `collect_child_modules`. Both gained a
+`direct_blocks_in_generics`/`generics_items` pass over each item's own `.generics`
+alongside its existing member-body pass — `collect_child_modules` needed a new
+`nested_item_bodies_for_child_modules` split out to keep that function under this
+file's own line-count lint once the six new passes joined it. The second is round 23's
+projected-associated-type finding one hop earlier: `type R = <() as Alias>::Target;`,
+after a reached file binds `Target` to `Recovery`, is legal Rust whose target is the
+same kind of projection a self-type can be — but `direct_scope_aliases`'s `Item::Type`
+arm read `target.path` and discarded `target.qself`, so `R` resolved to the unqualified
+name `Target` instead of to `Recovery` or to `UNRESOLVED_DERIVE`; a `type` alias whose
+target carries a `qself` now stores `UNRESOLVED_DERIVE` as its own target, so any
+self-type chased through it fails closed the same way. The third is a structural gap
+in `extend_with_local_scope` itself: it appended a body's own local aliases to the
+ambient table rather than having a local one *shadow* an ambient one of the same
+name, so `use core::clone::Clone as C;` at module scope beside a function body's own
+`use self::Harmless as C;` before `impl C for Recovery {}` left both bindings on the
+table — real Rust resolves the impl to the block-local `Harmless` and the ambient
+`Clone` is unreachable inside that block, but `every_resolution` still found it and
+rejected a `Recovery` that never implements `Clone`. The fix drops every ambient alias
+whose local name is redeclared in the new scope before adding the new ones, so a
+shadowed name resolves only through its innermost declaration.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

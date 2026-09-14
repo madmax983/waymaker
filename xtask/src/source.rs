@@ -11915,6 +11915,110 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_inside_a_struct_generics_default_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 24: `struct
+        // Holder<T = Wrapper<{ impl Clone for Recovery { .. }; 0 }>>(T);` buries a
+        // non-local `impl` inside a struct's own generics — a type parameter's
+        // default — exactly the way a struct's field types already could, and this
+        // walk read only the fields, never `struct_item.generics`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Wrapper<const N: usize>;\n",
+                "struct Holder<T = Wrapper<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}>>(T);\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_projected_type_alias_target_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 24: `type R = <() as
+        // Alias>::Target;`, after a reached file binds `Target` to `Recovery`, is
+        // legal Rust whose target is a projected associated type — the same shape
+        // round 23 closed for a self-type written directly as `<() as Alias>::Target`,
+        // one hop earlier, in the alias `impl Clone for R` is chased through. Reading
+        // the projection's `path` alone resolved `R` to the unqualified name `Target`
+        // instead of failing closed, so the implementation went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Alias {\n",
+                "    type Target;\n",
+                "}\n",
+                "impl Alias for () {\n",
+                "    type Target = super::Recovery;\n",
+                "}\n",
+                "type R = <() as Alias>::Target;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_block_local_alias_shadows_an_ambient_one_of_the_same_name() {
+        // Found by Codex review of this change (PR #143), round 24: module scope
+        // imports `use core::clone::Clone as C;`, and a function body imports a
+        // harmless local trait under the same local name — `use self::Harmless as
+        // C;` — before `impl C for Recovery {}`. Real Rust resolves the impl to the
+        // block-local `Harmless`, shadowing the ambient `Clone` binding for the rest
+        // of the block, but `extend_with_local_scope` used to append rather than
+        // shadow, so `every_resolution` still found the ambient `Clone` candidate
+        // alongside the local one and rejected a `Recovery` that never implements it.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use core::clone::Clone as C;\n",
+            "#[allow(non_local_definitions, dead_code)]\n",
+            "fn install() {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use self::Harmless as C;\n",
+            "    impl C for Recovery {}\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

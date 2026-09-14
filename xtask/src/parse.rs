@@ -550,14 +550,33 @@ fn direct_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> V
             }
             syn::Item::Type(type_item) => {
                 if let syn::Type::Path(target) = unwrap_type_parens(type_item.ty.as_ref()) {
-                    aliases.push(UseAlias {
-                        local: ident_name(&type_item.ident),
-                        target: target
+                    let resolved_target = if target.qself.is_some() {
+                        // Round 24 of Codex review on this change (PR #143): `type R =
+                        // <() as Alias>::Target;`, after a reached file binds `Target`
+                        // to `Recovery`, is legal Rust whose target is a projected
+                        // associated type — `syn` stores the qualified self and the
+                        // trait separately from `path`, which here is only `Target`.
+                        // Reading `path` alone resolved `R` to the unqualified name
+                        // `Target` instead of to `Recovery` or to a sentinel this
+                        // module fails closed on, so `impl Clone for R` went neither
+                        // matched nor flagged as unresolved. This is round 23's
+                        // self-type finding one hop earlier, in the alias a self-type
+                        // can be chased through rather than in the self-type itself,
+                        // and it fails closed the same way: an alias nobody can chase
+                        // to a real name resolves to `UNRESOLVED_DERIVE` rather than to
+                        // the qualifier-stripped associated type name.
+                        vec![UNRESOLVED_DERIVE.to_owned()]
+                    } else {
+                        target
                             .path
                             .segments
                             .iter()
                             .map(|segment| ident_name(&segment.ident))
-                            .collect(),
+                            .collect()
+                    };
+                    aliases.push(UseAlias {
+                        local: ident_name(&type_item.ident),
+                        target: resolved_target,
                     });
                 }
             }
@@ -729,19 +748,31 @@ fn collect_trait_implementors<'a>(
     }
 }
 
-/// Every scope-root block [`direct_blocks_in_signature`], [`direct_blocks_in_expr`] or
-/// [`direct_blocks_in_type`] can find nested inside `item`'s own body, signature,
-/// initializer, or member types, walked with [`collect_trait_implementors_in_block`]
-/// under `aliases` as the ambient scope — the block-aware replacement for what used to
-/// be a single flat item list shared by the whole item, retired in round 23 (see
-/// [`collect_trait_implementors_in_block`] for why).
+/// Every scope-root block [`direct_blocks_in_signature`], [`direct_blocks_in_expr`],
+/// [`direct_blocks_in_type`] or [`direct_blocks_in_generics`] can find nested inside
+/// `item`'s own body, signature, initializer, member types, or generics, walked with
+/// [`collect_trait_implementors_in_block`] under `aliases` as the ambient scope — the
+/// block-aware replacement for what used to be a single flat item list shared by the
+/// whole item, retired in round 23 (see [`collect_trait_implementors_in_block`] for
+/// why).
 ///
 /// Covers every shape [`collect_trait_implementors`] recurses into for a body: a free
-/// function's signature and block; an `impl` block's own methods (signature and body),
-/// associated consts' initializers, and associated types' own types; a trait's default
-/// method bodies (and every method's signature, default or not) and default associated
-/// consts; a free `const` or `static`'s initializer; an enum's variants' discriminants
-/// and fields' types; a type alias's own type; and a struct's or union's field types.
+/// function's signature and block; an `impl` block's own generics, its methods
+/// (signature and body), associated consts' initializers, and associated types' own
+/// types; a trait's own generics, its default method bodies (and every method's
+/// signature, default or not), and default associated consts; a free `const` or
+/// `static`'s initializer; an enum's own generics and its variants' discriminants and
+/// fields' types; a type alias's own generics and type; and a struct's or union's own
+/// generics and field types.
+///
+/// Round 24 of Codex review on this change (PR #143) found the generics gap: round 21
+/// added [`direct_blocks_in_signature`] for a function's or method's own parameter and
+/// return types, and round 22 chained [`direct_blocks_in_generics`] into it for that
+/// signature's own type parameters and `where` clause — but `Item::Impl`,
+/// `Item::Trait`, `Item::Enum`, `Item::Type`, `Item::Struct` and `Item::Union` each
+/// declare their *own* [`syn::Generics`] too (`struct Holder<T = Wrapper<{ impl Clone
+/// for super::Recovery { .. }; 0 }>>(T);` is the reported case), and none of those six
+/// arms read it at all.
 fn collect_trait_implementors_in_item_body<'a>(
     item: &'a syn::Item,
     aliases: &[UseAlias],
@@ -755,6 +786,7 @@ fn collect_trait_implementors_in_item_body<'a>(
             roots.push(&function.block);
         }
         syn::Item::Impl(implementation) => {
+            roots.extend(direct_blocks_in_generics(&implementation.generics));
             for member in &implementation.items {
                 match member {
                     syn::ImplItem::Fn(method) if !has_cfg_test(&method.attrs) => {
@@ -776,6 +808,7 @@ fn collect_trait_implementors_in_item_body<'a>(
             }
         }
         syn::Item::Trait(trait_item) => {
+            roots.extend(direct_blocks_in_generics(&trait_item.generics));
             for member in &trait_item.items {
                 match member {
                     syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => {
@@ -796,6 +829,7 @@ fn collect_trait_implementors_in_item_body<'a>(
         syn::Item::Const(constant) => roots.extend(direct_blocks_in_expr(&constant.expr)),
         syn::Item::Static(statik) => roots.extend(direct_blocks_in_expr(&statik.expr)),
         syn::Item::Enum(enum_item) => {
+            roots.extend(direct_blocks_in_generics(&enum_item.generics));
             for variant in enum_item
                 .variants
                 .iter()
@@ -809,8 +843,12 @@ fn collect_trait_implementors_in_item_body<'a>(
                 }
             }
         }
-        syn::Item::Type(type_item) => roots.extend(direct_blocks_in_type(&type_item.ty)),
+        syn::Item::Type(type_item) => {
+            roots.extend(direct_blocks_in_generics(&type_item.generics));
+            roots.extend(direct_blocks_in_type(&type_item.ty));
+        }
         syn::Item::Struct(struct_item) => {
+            roots.extend(direct_blocks_in_generics(&struct_item.generics));
             for field in struct_item
                 .fields
                 .iter()
@@ -820,6 +858,7 @@ fn collect_trait_implementors_in_item_body<'a>(
             }
         }
         syn::Item::Union(union_item) => {
+            roots.extend(direct_blocks_in_generics(&union_item.generics));
             for field in union_item
                 .fields
                 .named
@@ -890,9 +929,27 @@ fn collect_trait_implementors_in_block(
 ///
 /// A body is not a scope boundary in Rust, so its own local aliases join the ambient
 /// table rather than replacing it (unlike [`module_scope_aliases`]'s `Item::Mod` case).
+/// But joining is not the same as appending: real Rust *shadows* an outer binding with
+/// an inner one of the same name, for the rest of the inner scope, rather than keeping
+/// both reachable under it. Round 24 of Codex review on this change (PR #143) found
+/// that this used to append unconditionally — module scope importing
+/// `use core::clone::Clone as C;` beside a function body that imports a harmless local
+/// trait as `use self::Harmless as C;` before `impl C for Recovery {}` resolves the
+/// `impl` to the block-local `Harmless` in real Rust, but appending kept the ambient
+/// `Clone` binding reachable too, so `every_resolution`'s search still found it and
+/// rejected a `Recovery` that never implements `Clone`. Every ambient alias whose local
+/// name is redeclared here is dropped before the new ones are added, so a shadowed name
+/// resolves only through its innermost declaration, the way every other alias lookup in
+/// this module already treats "the nearest binding wins" for a *single* hop — this is
+/// that same rule applied to which binding is on the table at all.
 fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> Vec<UseAlias> {
-    let mut extended = ambient.to_vec();
-    extended.extend(direct_scope_aliases(local_items.iter().copied()));
+    let local = direct_scope_aliases(local_items.iter().copied());
+    let mut extended: Vec<UseAlias> = ambient
+        .iter()
+        .filter(|alias| !local.iter().any(|shadowing| shadowing.local == alias.local))
+        .cloned()
+        .collect();
+    extended.extend(local);
     extended
 }
 
@@ -2504,7 +2561,12 @@ fn trait_member_bodies(
 /// discriminant, or a block buried inside a type alias's own type; this walk needs
 /// the same shapes, so a `mod` declared inside one of them is not merely unresolved
 /// as a self-type but never even reached as a file at all. Round 19 found the same
-/// type-bearing shape one level over, in a struct's own field types.
+/// type-bearing shape one level over, in a struct's own field types. Round 24 found it
+/// one shape further still: `Item::Impl`, `Item::Trait`, `Item::Enum`, `Item::Type`,
+/// `Item::Struct` and `Item::Union` each declare their own [`syn::Generics`] — a type
+/// parameter's bounds and default, and a `where` clause predicate — which this walk
+/// read for none of them (a function's or method's signature is the one shape that was
+/// already covered, through [`fn_signature_type_items`]).
 fn collect_child_modules<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     parent_dir: &str,
@@ -2513,102 +2575,109 @@ fn collect_child_modules<'a>(
     found: &mut Vec<ChildModule>,
 ) {
     for item in items {
-        match item {
-            syn::Item::Mod(module) => {
-                let name = ident_name(&module.ident);
-                let item_gated = gated || has_cfg_test(&module.attrs);
-                if let Some((_, nested)) = module.content.as_ref() {
-                    // Inline: no file of its own, but its out-of-line children live
-                    // under it.
-                    collect_child_modules(
-                        nested,
-                        parent_dir,
-                        &format!("{child_dir}{name}/"),
-                        item_gated,
-                        found,
-                    );
-                } else {
-                    found.push(ChildModule {
-                        candidates: mod_candidates(module, parent_dir, child_dir, &name),
-                        name,
-                        test_gated: item_gated,
-                    });
-                }
+        let syn::Item::Mod(module) = item else {
+            for (nested_gated, nested_items) in nested_item_bodies_for_child_modules(item, gated) {
+                collect_child_modules(nested_items, parent_dir, child_dir, nested_gated, found);
             }
-            syn::Item::Fn(function) => {
-                let item_gated = gated || has_cfg_test(&function.attrs);
-                collect_child_modules(
-                    block_items(&function.block)
-                        .into_iter()
-                        .chain(fn_signature_type_items(&function.sig)),
-                    parent_dir,
-                    child_dir,
-                    item_gated,
-                    found,
-                );
-            }
-            syn::Item::Impl(implementation) => {
-                let impl_gated = gated || has_cfg_test(&implementation.attrs);
-                for (member_gated, items) in impl_member_bodies(implementation, impl_gated) {
-                    collect_child_modules(items, parent_dir, child_dir, member_gated, found);
-                }
-            }
-            syn::Item::Trait(trait_item) => {
-                let trait_gated = gated || has_cfg_test(&trait_item.attrs);
-                for (member_gated, items) in trait_member_bodies(trait_item, trait_gated) {
-                    collect_child_modules(items, parent_dir, child_dir, member_gated, found);
-                }
-            }
-            syn::Item::Const(constant) => {
-                let item_gated = gated || has_cfg_test(&constant.attrs);
-                collect_child_modules(
-                    expr_items(&constant.expr),
-                    parent_dir,
-                    child_dir,
-                    item_gated,
-                    found,
-                );
-            }
-            syn::Item::Static(statik) => {
-                let item_gated = gated || has_cfg_test(&statik.attrs);
-                collect_child_modules(
-                    expr_items(&statik.expr),
-                    parent_dir,
-                    child_dir,
-                    item_gated,
-                    found,
-                );
-            }
-            syn::Item::Enum(enum_item) => {
-                let enum_gated = gated || has_cfg_test(&enum_item.attrs);
-                for (variant_gated, items) in enum_variant_bodies(enum_item, enum_gated) {
-                    collect_child_modules(items, parent_dir, child_dir, variant_gated, found);
-                }
-            }
-            syn::Item::Type(type_item) => {
-                let item_gated = gated || has_cfg_test(&type_item.attrs);
-                collect_child_modules(
-                    type_items(&type_item.ty),
-                    parent_dir,
-                    child_dir,
-                    item_gated,
-                    found,
-                );
-            }
-            syn::Item::Struct(struct_item) => {
-                let struct_gated = gated || has_cfg_test(&struct_item.attrs);
-                for (field_gated, items) in struct_field_bodies(struct_item, struct_gated) {
-                    collect_child_modules(items, parent_dir, child_dir, field_gated, found);
-                }
-            }
-            syn::Item::Union(union_item) => {
-                let union_gated = gated || has_cfg_test(&union_item.attrs);
-                for (field_gated, items) in union_field_bodies(union_item, union_gated) {
-                    collect_child_modules(items, parent_dir, child_dir, field_gated, found);
-                }
-            }
-            _ => {}
+            continue;
+        };
+        let name = ident_name(&module.ident);
+        let item_gated = gated || has_cfg_test(&module.attrs);
+        if let Some((_, nested)) = module.content.as_ref() {
+            // Inline: no file of its own, but its out-of-line children live under it.
+            collect_child_modules(
+                nested,
+                parent_dir,
+                &format!("{child_dir}{name}/"),
+                item_gated,
+                found,
+            );
+        } else {
+            found.push(ChildModule {
+                candidates: mod_candidates(module, parent_dir, child_dir, &name),
+                name,
+                test_gated: item_gated,
+            });
         }
+    }
+}
+
+/// Every `(gated, items)` pair [`collect_child_modules`] should recurse into for one
+/// item that is not itself a `syn::Item::Mod` — split out to keep that function under
+/// this file's own line-count lint once round 24's generics arms joined it.
+///
+/// Shaped like [`collect_trait_implementors_in_item_body`], but keeps this walk's own
+/// `test_gated` tracking, which that function throws away — see the module doc for
+/// why the two scans stay separate. An `impl`, `trait`, `enum`, `struct` or `union`
+/// item's own generics — a type parameter's bounds and default, and a `where` clause
+/// predicate — can bury a `mod` the same way its members' or fields' types can, and
+/// round 24 of Codex review on this change (PR #143) found that neither this walk nor
+/// the per-member helpers below read it; each arm's own gate now covers the generics
+/// pass alongside the member-body pass.
+fn nested_item_bodies_for_child_modules(
+    item: &syn::Item,
+    gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    match item {
+        syn::Item::Fn(function) => {
+            let item_gated = gated || has_cfg_test(&function.attrs);
+            vec![(
+                item_gated,
+                block_items(&function.block)
+                    .into_iter()
+                    .chain(fn_signature_type_items(&function.sig))
+                    .collect(),
+            )]
+        }
+        syn::Item::Impl(implementation) => {
+            let impl_gated = gated || has_cfg_test(&implementation.attrs);
+            std::iter::once((impl_gated, generics_items(&implementation.generics)))
+                .chain(impl_member_bodies(implementation, impl_gated))
+                .collect()
+        }
+        syn::Item::Trait(trait_item) => {
+            let trait_gated = gated || has_cfg_test(&trait_item.attrs);
+            std::iter::once((trait_gated, generics_items(&trait_item.generics)))
+                .chain(trait_member_bodies(trait_item, trait_gated))
+                .collect()
+        }
+        syn::Item::Const(constant) => {
+            let item_gated = gated || has_cfg_test(&constant.attrs);
+            vec![(item_gated, expr_items(&constant.expr))]
+        }
+        syn::Item::Static(statik) => {
+            let item_gated = gated || has_cfg_test(&statik.attrs);
+            vec![(item_gated, expr_items(&statik.expr))]
+        }
+        syn::Item::Enum(enum_item) => {
+            let enum_gated = gated || has_cfg_test(&enum_item.attrs);
+            std::iter::once((enum_gated, generics_items(&enum_item.generics)))
+                .chain(enum_variant_bodies(enum_item, enum_gated))
+                .collect()
+        }
+        syn::Item::Type(type_item) => {
+            let item_gated = gated || has_cfg_test(&type_item.attrs);
+            vec![(
+                item_gated,
+                generics_items(&type_item.generics)
+                    .into_iter()
+                    .chain(type_items(&type_item.ty))
+                    .collect(),
+            )]
+        }
+        syn::Item::Struct(struct_item) => {
+            let struct_gated = gated || has_cfg_test(&struct_item.attrs);
+            std::iter::once((struct_gated, generics_items(&struct_item.generics)))
+                .chain(struct_field_bodies(struct_item, struct_gated))
+                .collect()
+        }
+        syn::Item::Union(union_item) => {
+            let union_gated = gated || has_cfg_test(&union_item.attrs);
+            std::iter::once((union_gated, generics_items(&union_item.generics)))
+                .chain(union_field_bodies(union_item, union_gated))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
