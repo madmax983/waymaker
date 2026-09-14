@@ -53,11 +53,12 @@ use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_flash::swap::{Retired, Swap};
 use waymaker_rig::audit::Breach;
-use waymaker_rig::cutter::{Dispatcher, NeverCut};
+use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::matrix::{Matrix, Row};
+use waymaker_rig::phase::Phase;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Resumed, Rig, RigError, Verdict};
+use waymaker_rig::run::{Resumed, Rig, RigError, Stop, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Progress as Marks, Witness, WitnessError};
@@ -2061,5 +2062,83 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     assert_eq!(
         rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
         Ok(Outcome::Breached(Breach::WitnessUnreadable))
+    );
+}
+
+/// `resume_reserved` refuses an outstanding effect's own completion without redelivering the
+/// effect first.
+///
+/// A reserve is passed in at resume time and need not be the one the prefix was written
+/// under — the prefix here is written ungated, by the plain [`Rig::iterate`], cut at effect
+/// 1's own dispatch so its schedule is durable and its completion is not. The reserve handed
+/// to `resume_reserved` then declares a zero-width effect-result bound, which refuses *any*
+/// real completion (never empty; see [`Workload::MAX_PAYLOAD_BYTES`]) regardless of how much
+/// room the journal has left — deterministic, and independent of the shared fixture's small
+/// geometry, unlike a room-based refusal.
+#[test]
+fn resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cannot_hold() {
+    let mut seed = None;
+    for candidate in 0_u64..200_000 {
+        let cut = Plan::new(candidate).cut(0);
+        if cut.phase() == Phase::Dispatch && cut.effect_index(EFFECTS) == 1 {
+            seed = Some(candidate);
+            break;
+        }
+    }
+    let Some(seed) = seed else {
+        unreachable!("some seed cuts at dispatch for effect 1")
+    };
+    let Ok(custom_rig) = Rig::new::<FaultError>(geometry(), Plan::new(seed), EFFECTS) else {
+        unreachable!("the shared geometry holds two banks and a witness")
+    };
+
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = custom_rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let mut cutter = PlannedCut::at(custom_rig.cut_at(0), EFFECTS);
+        let outcome = custom_rig.iterate(0, &mut metered, &mut dispatcher, &mut cutter, &mut page);
+        assert!(
+            matches!(
+                outcome,
+                Ok(Stop::Cut {
+                    phase: Phase::Dispatch,
+                    effect: 1
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            dispatcher.entered,
+            [0],
+            "effect 0 completed and effect 1 was not yet dispatched"
+        );
+    }
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        custom_rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let resumed = custom_rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the outstanding effect was redelivered despite the refusal: {:?}",
+        dispatcher.entered
     );
 }

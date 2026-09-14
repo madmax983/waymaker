@@ -1438,6 +1438,7 @@ impl Rig {
             });
         }
         let mut reserved = Reserved::over(journal, reserve).map_err(RigError::Reserve)?;
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
 
         let outstanding = recovered
             .checked_sub(1)
@@ -1447,6 +1448,17 @@ impl Rig {
             });
         let redelivered = match outstanding {
             Some((index, effect)) => {
+                // The record this redelivery is *for* is the completion at `recovered`, not
+                // yet written. Checked here, before the effect runs again: a reserve that
+                // will refuse it makes the redelivery pointless — the completion can never
+                // land, so nothing this call owed is repaid by performing the effect once
+                // more. Without this, every resume against such a reserve would redeliver
+                // and then refuse, forever.
+                let Some(record) = workload.record(recovered, &mut record_page) else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &record).map_err(RigError::Capacity)?;
+
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
@@ -1455,8 +1467,6 @@ impl Rig {
             }
             None => None,
         };
-
-        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
         for index in recovered..records {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
