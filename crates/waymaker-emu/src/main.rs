@@ -38,8 +38,10 @@
 //!
 //! On ARM, `#[cortex_m_rt::entry]` expands to the exported symbol the reset vector points at,
 //! and `cortex_m_semihosting::debug::exit` is how a guest tells QEMU what to exit with.
-//! Neither can be written without the attribute the workspace denies. On Xtensa there is no
-//! `cortex-m-rt` to expand: the startup in `xtensa` — installing the stack pointer, zeroing
+//! Neither can be written without the attribute the workspace denies. [`crate::stack`] is a
+//! third, ARM-only reason: reading how far a run disturbed a painted stack needs a raw fill
+//! and a raw read, named by [ADR 0045]. On Xtensa there is no `cortex-m-rt` to expand and no
+//! `stack` module to link: the startup in `xtensa` — installing the stack pointer, zeroing
 //! `.bss`, poking the UART registers — is hand-written, and hand-written it must be. The
 //! workspace manifest names this exact escape — *"`deny` keeps a documented exception a
 //! reviewable one-line `#![allow(unsafe_code)]` plus an ADR"* — and this is the one crate
@@ -47,6 +49,7 @@
 //! layer, test-support crate or firmware image links.
 //!
 //! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
+//! [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 
 #![no_std]
 #![no_main]
@@ -56,25 +59,28 @@
 // so no other target ever sees the attribute: on stable it would be a hard error.
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 // The one exception in the workspace, argued in the module documentation above and in
-// ADR 0040. `allow` rather than the `forbid` every other crate carries, because a reset
-// vector and a semihosting exit cannot be spelled without it — and scoped to a crate nothing
-// depends on and no image links. The Xtensa half of the exception is hand-written rather
-// than macro-expanded, and lives behind the `#[cfg(target_arch = "xtensa")]` gate on the
-// module below, so no ARM image can contain it.
+// ADR 0040 and ADR 0045. `allow` rather than the `forbid` every other crate carries, because
+// a reset vector, a semihosting exit and (on ARM) a stack high-water mark cannot be spelled
+// without it — and scoped to a crate nothing depends on and no image links. The Xtensa half
+// of the exception is hand-written rather than macro-expanded, and lives behind the
+// `#[cfg(target_arch = "xtensa")]` gate on the module below, so no ARM image can contain it.
 #![allow(
     unsafe_code,
-    reason = "the reset vector and the semihosting exit on ARM; the Xtensa startup's stack install, .bss zeroing and UART MMIO, gated to that target; see ADR 0040"
+    reason = "the reset vector and the semihosting exit on ARM, and there the stack high-water mark; the Xtensa startup's stack install, .bss zeroing and UART MMIO, gated to that target; see ADR 0040 and ADR 0045"
 )]
 
 pub mod boot;
 pub mod nor;
 
-// One startup per target family. The ARM half links against `cortex-m-rt`; the Xtensa half
-// spells out what that crate expands, because no equivalent exists for Xtensa. `boot` and
-// `nor` stay shared and target-independent: the rig the harness measures is the same rig on
-// all three machines.
+// One startup per target family. The ARM half links against `cortex-m-rt` and is the only
+// one that links `stack`, since the high-water-mark reading is a `cortex-m` register read
+// with no Xtensa equivalent. The Xtensa half spells out what `cortex-m-rt` expands, because
+// no equivalent exists for Xtensa. `boot` and `nor` stay shared and target-independent: the
+// rig the harness measures is the same rig on all three machines.
 #[cfg(target_arch = "arm")]
 mod arm;
+#[cfg(target_arch = "arm")]
+pub mod stack;
 #[cfg(target_arch = "xtensa")]
 mod xtensa;
 
