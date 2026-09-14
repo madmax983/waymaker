@@ -18220,6 +18220,63 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_with_a_multi_segment_qself_type_is_reported() {
+        // Codex's next-round finding: `<defs::Key as Indices>::P0` still failed after the
+        // impl-path indexing fix, because `resolve_qself_associated_const` read its own
+        // `Type` (`qself.ty`) through `single_segment_type_name`, which refuses outright
+        // the moment the self type carries more than one segment — `defs::Key` is two —
+        // and returns before ever consulting the impl-constant index at all, even though
+        // `visit_item_impl` already indexes exactly this spelling (`defs::Key::P0`) under
+        // its own third key, for the identical reason a qualified constant reference
+        // needs one. `type_path_name` replaces it: the type name this function builds its
+        // synthetic paths and suffixes from can itself be multi-segment now, and the
+        // existing qualified-path machinery finds that third key directly.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub struct Key;\n}\n\ntrait Indices {\n    const P0: u8;\n    \
+             const P1: u8;\n    const P2: u8;\n    const P3: u8;\n}\n\n\
+             impl Indices for defs::Key {\n    const P0: u8 = 0;\n    const P1: u8 = \
+             1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n}\n\n\
+             const fn qualified_qself_type_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        <defs::Key as Indices>::P0 => 0,\n        \
+             <defs::Key as Indices>::P1 => 1,\n        <defs::Key as Indices>::P2 => \
+             2,\n        <defs::Key as Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_loop_valued_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop`,
+        // which fell to the wildcard `_ => None` case in `literal_or_const_value` and left
+        // every such constant unresolved — the const-call, array and macro backstops all
+        // included, since a loop is none of those. Scoped to the one shape that is
+        // knowably total without interpreting control flow: the body must hold exactly one
+        // statement, an unlabelled `break` carrying a value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn loop_valued_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = loop { break 0 };\n    const P1: u8 = loop { break 1 };\n    \
+             const P2: u8 = loop { break 2 };\n    const P3: u8 = loop { break 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

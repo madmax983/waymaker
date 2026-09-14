@@ -2452,9 +2452,7 @@ fn lit_value(lit: &syn::Lit) -> Option<i128> {
 }
 
 /// The name of `ty`, if it is a plain, unqualified single-segment type path (`u8`, `i32`,
-/// and so on, with no generic arguments) — the shape [`apply_integer_cast`] acts on, and
-/// the shape a `<Type as Trait>::NAME` pattern's own `Type` needs to be for
-/// [`resolve_qself_associated_const`] to find what it was implemented for.
+/// and so on, with no generic arguments) — the shape [`apply_integer_cast`] acts on.
 fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
     let syn::Type::Path(type_path) = ty else {
         return None;
@@ -2463,6 +2461,41 @@ fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
         return None;
     }
     type_path.path.get_ident().map(ident_name)
+}
+
+/// The full, dotted name of `ty`, if it is a plain, unqualified type path of any length —
+/// `u8`, `Key`, or `defs::Key` — with any generic argument on any segment ignored the same
+/// way `ident_name` already ignores one for every other path this scan reads. The shape a
+/// `<Type as Trait>::NAME` pattern's own `Type` needs to be for
+/// [`resolve_qself_associated_const`] to find what it was implemented for.
+///
+/// Codex's next-round finding: `single_segment_type_name`'s own one-segment restriction
+/// refused a *qualified* `Self` type outright — `<defs::Key as Indices>::P0`'s own
+/// `qself.ty` is `defs::Key`, two segments — before `resolve_qself_associated_const` ever
+/// got to consult the impl-constant index at all, even though `MatchVisitor::visit_item_impl`
+/// already indexes exactly this spelling (`defs::Key::P0`) under its own third key, for the
+/// identical reason a qualified constant reference needs one. This is that restriction
+/// dropped: the type name this function returns can itself be multi-segment, and every
+/// synthetic path and suffix `resolve_qself_associated_const` builds from it already reads
+/// correctly whichever way — `defs::Key::P0` parses as a three-segment path exactly as
+/// `Key::P0` parses as a two-segment one, and a suffix ending `::defs::Key::P0` is matched
+/// the same substring way a suffix ending `::Key::P0` already was.
+fn type_path_name(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() || type_path.path.segments.is_empty() {
+        return None;
+    }
+    Some(
+        type_path
+            .path
+            .segments
+            .iter()
+            .map(|segment| ident_name(&segment.ident))
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
 }
 
 /// `value`'s own bit pattern, reinterpreted the way Rust's `as` operator casts one
@@ -2906,6 +2939,28 @@ fn literal_or_const_value(
                 _ => None,
             }
         }
+        // Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop` —
+        // an unusual but MSRV-legal way to spell a plain value inside a position that must
+        // itself be an expression — which fell to the wildcard `_ => None` case below, the
+        // const-call, array and macro backstops all included, since a loop is none of
+        // those. Scoped to exactly the one shape that is knowably total without
+        // interpreting control flow at all: the body must hold exactly one statement, an
+        // unlabelled `break` expression carrying a value. Anything else — a conditional
+        // break, a loop that never breaks, one breaking more than once, a labelled break
+        // aimed at an outer loop — stays unresolved rather than guessed at, since deciding
+        // which of several possible breaks would fire first is exactly the kind of
+        // control-flow interpretation this scan does not attempt.
+        syn::Expr::Loop(expr_loop) => {
+            let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] =
+                expr_loop.body.stmts.as_slice()
+            else {
+                return None;
+            };
+            if break_expr.label.is_some() {
+                return None;
+            }
+            literal_or_const_value(break_expr.expr.as_ref()?, resolve)
+        }
         _ => None,
     }
 }
@@ -3073,7 +3128,7 @@ fn resolve_qself_associated_const(
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
     qualified: &std::collections::HashMap<String, i128>,
 ) -> Option<i128> {
-    let type_name = single_segment_type_name(&qself.ty)?;
+    let type_name = type_path_name(&qself.ty)?;
     let member = ident_name(&path.segments.last()?.ident);
     let segment_count = path.segments.len();
     if segment_count >= 3 {
