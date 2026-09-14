@@ -6330,6 +6330,25 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_ignores_a_decoy_item_reached_while_an_inline_script_is_still_open() {
+        // Codex, pull request #138, round 41, finding 2: an inline non-rendering
+        // element opened on one item and left unclosed — `- Status: <script>` — only
+        // disqualified *that* item; `open_non_rendering_tag` was never pushed to at
+        // all here, unlike `markdown_prose`, `heading_lines` and `table_rows`, which
+        // all call `track_non_rendering_html` for every `Event::InlineHtml`. So the
+        // next item, `- Status: accepted`, began collecting fresh with the stack
+        // still empty, even though a browser is still in script-data state until the
+        // real `</script>` two items later — and its value won a match this function
+        // returns on immediately, before the real field further down was ever
+        // reached. The `InlineHtml` arm now calls `track_non_rendering_html`
+        // unconditionally, the same as the other three functions, so the stack opens
+        // and the next item's `Start(Tag::Item)` sees it as hidden.
+        let contents = "# ADR\n\n- Status: <script>\n\n- Status: accepted\n\n\
+                         </script>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -7435,6 +7454,42 @@ mod tests {
         assert!(
             violations.iter().any(|v| v.subject == eighth.id),
             "a decision id split by adjacent <pre> blocks still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_inside_a_script_opened_across_two_lines_does_not_count() {
+        // Codex, pull request #138, round 41, finding 1: `pulldown-cmark` splits a tag
+        // whose own closing `>` falls on a later source line into one `Event::Html`
+        // per line — `<script\n type="text/javascript">` arrives as `"<script\n"`
+        // and then `" type=\"text/javascript\">\n"` — and every scan in this module
+        // worked one line at a time, so the first line's search for the tag's close
+        // found nothing and, with nothing carried to the next line, the whole
+        // construct read as ordinary visible text: the non-rendering stack never
+        // opened at all, leaving the script's own body — including the decision id
+        // and headline placed inside it — fully visible. Verified via a throwaway
+        // `pulldown-cmark` probe that this source is one `HtmlBlock` split exactly
+        // that way. A `PendingTag` now carries the unclosed tag's name and quote
+        // state into the next line, so the stack opens once the real `>` is found
+        // there.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script\n type=\"text/javascript\">\n{} {}\n</script>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision id hidden inside a script opened across two lines still \
+             counted: {violations:?}"
         );
     }
 
