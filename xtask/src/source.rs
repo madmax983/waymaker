@@ -8489,42 +8489,7 @@ fn check_integrity_check_module_tree(
             ));
         }
 
-        for (selector, arms) in match_expressions(&scanned_code) {
-            let Some(parsed) = parse_dense_arms(arms) else {
-                continue;
-            };
-            if !has_dense_arm_patterns(&parsed) {
-                continue;
-            }
-            let arm_count = parsed.len();
-            let pinned = call_shaped_uniformly(&parsed).and_then(|callee| {
-                INTEGRITY_CHECK_TABLES.iter().position(|table| {
-                    table.selector == selector
-                        && table.helper == callee
-                        && usize::from(table.arms) == arm_count
-                })
-            });
-            match pinned {
-                Some(index) => {
-                    if let Some(count) = allowed_table_hits.get_mut(index) {
-                        *count += 1;
-                    }
-                }
-                None => violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "{} declares a {arm_count}-arm dense match over `{selector}`, which \
-                         LLVM compiles into a lookup table the same way \
-                         `INTEGRITY_CHECK_TABLES` pins `crc32_nibble_table` — and it is not \
-                         that one table, so ADR 0044's superseding decision does not cover \
-                         it; a second table is still a decision, not an optimisation, \
-                         whether its arms call a helper or carry a literal value each",
-                        scanned.path.replace('\\', "/")
-                    ),
-                )),
-            }
-        }
+        check_checksum_module_dense_matches(scanned, &mut allowed_table_hits, &mut violations);
     }
     for (table, count) in INTEGRITY_CHECK_TABLES.iter().zip(&allowed_table_hits) {
         if *count != 1 {
@@ -8543,6 +8508,70 @@ fn check_integrity_check_module_tree(
     }
 
     violations
+}
+
+/// [`check_integrity_check_module_tree`]'s dense-match half, factored out to keep that
+/// function under clippy's line count: every `match` `scanned` declares, checked against
+/// [`INTEGRITY_CHECK_TABLES`]'s one permitted shape, bumping `allowed_table_hits` for a
+/// match — so a byte-identical duplicate is still counted rather than merely permitted — and
+/// pushing a violation for anything else dense enough to be a second table.
+fn check_checksum_module_dense_matches(
+    scanned: &crate::size::LayerSource,
+    allowed_table_hits: &mut [usize],
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let matches = match crate::parse::match_expressions(&scanned.contents) {
+        Ok(matches) => matches,
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} could not be parsed ({error}); an unreadable source fails closed \
+                     rather than approving what it cannot see",
+                    scanned.path.replace('\\', "/")
+                ),
+            ));
+            return;
+        }
+    };
+    for found in &matches {
+        if !has_dense_arm_patterns(found) {
+            continue;
+        }
+        let arm_count = found.arms.len();
+        let selector = squeezed(&found.selector);
+        let pinned = call_shaped_uniformly(found).and_then(|callee| {
+            INTEGRITY_CHECK_TABLES.iter().position(|table| {
+                squeezed(table.selector) == selector
+                    && table.helper == callee
+                    && usize::from(table.arms) == arm_count
+            })
+        });
+        match pinned {
+            Some(index) => {
+                if let Some(count) = allowed_table_hits.get_mut(index) {
+                    *count += 1;
+                }
+            }
+            None => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} declares a {arm_count}-arm dense match over `{selector}`, which LLVM \
+                     compiles into a lookup table the same way `INTEGRITY_CHECK_TABLES` pins \
+                     `crc32_nibble_table` — and it is not that one table, so ADR 0044's \
+                     superseding decision does not cover it; a second table is still a \
+                     decision, not an optimisation, whether its arms call a helper or carry \
+                     a literal value each",
+                    scanned.path.replace('\\', "/")
+                ),
+            )),
+        }
+    }
 }
 
 /// [`INTEGRITY_CHECK_TABLES`]'s half of `check_integrity_check`, factored out to keep that
@@ -8778,7 +8807,7 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
     normalize(body) == normalize(&expected)
 }
 
-/// The minimum number of arms a `match` needs before [`dense_table_shape`] will call it
+/// The minimum number of arms a `match` needs before [`has_dense_arm_patterns`] will call it
 /// table-shaped.
 ///
 /// [`INTEGRITY_CHECK_TABLES`]'s one entry has sixteen. This module's own doc comment says
@@ -8788,392 +8817,45 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
-/// Whether `text` carries `=>` at bracket depth zero — the fat arrow a real match arm's
-/// pattern is separated from its value by, as opposed to one nested inside the text's own
-/// sub-expression (a nested `match`'s own arms, say). [`match_expressions`]'s guard against
-/// mistaking a block scrutinee for the arm list needs exactly this distinction: a plain
-/// `.contains("=>")` is satisfied by a `=>` buried inside a nested `match`, which is a
-/// property of the *scrutinee*'s own content rather than a signal that the candidate block
-/// holds real arms.
-#[must_use]
-fn contains_top_level_arrow(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    let mut depth = 0_i32;
-    let mut index = 0_usize;
-    while let Some(&character) = chars.get(index) {
-        match character {
-            '{' | '(' | '[' => depth += 1,
-            '}' | ')' | ']' => depth -= 1,
-            '=' if depth == 0 && chars.get(index + 1) == Some(&'>') => return true,
-            _ => {}
-        }
-        index += 1;
-    }
-    false
-}
-
-/// The content of the brace-balanced block opening at `text[open..]` — `open` must be the
-/// byte offset of the `{` itself — and the offset in `text` immediately after its matching
-/// `}`.
-#[must_use]
-fn balanced_brace_block(text: &str, open: usize) -> Option<(&str, usize)> {
-    let after_open = text.get(open + 1..)?;
-    let mut depth = 1_u32;
-    for (offset, character) in after_open.char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((after_open.get(..offset)?, open + 1 + offset + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Every `match <selector> { <arms> }` in `code`, both parts verbatim and in the order they
-/// appear.
-///
-/// Text-scanned rather than parsed with `syn`, the same way [`braced_body`] finds a named
-/// item's body: `match` is matched at a token boundary and the arm block is the first
-/// brace-balanced `{ ... }` that follows — which is exact for the simple scrutinees this
-/// module's functions use (`nibble & 0xF`, no braces of their own), and is what
-/// [`has_dense_arm_patterns`] and [`call_shaped_uniformly`] are checked against rather than
-/// assumed sound on anything wilder.
-///
-/// Codex found the one case that assumption misses: a scrutinee that is *itself* a block
-/// expression — `match { let key = nibble & 0xF; key } { 0 => .., .. }` is legal Rust, and
-/// the first `{` found belongs to the scrutinee rather than the arms. A block found there
-/// carries no `=>` of its own at the block's own nesting level, which a real arm list
-/// always does, so that is the signal used to tell the two apart: a candidate block with no
-/// *top-level* `=>` in it is taken as the scrutinee and skipped, and the *next*
-/// brace-balanced block immediately after it (whitespace aside) is tried as the arms
-/// instead. Depth rather than a plain `.contains` — Codex's second finding — because a
-/// scrutinee block can itself contain a nested `match` with arms of its own: `match { match
-/// nibble { value => value & 0xF } } { 0 => .., .. }`'s scrutinee block carries a `=>` too,
-/// nested one `match` deeper, and a presence check would have read that as "this is the arm
-/// list", accepted the scrutinee, found it not dense (one non-arm segment), and never looked
-/// at the real arms that follow — the same bypass a missing depth check leaves everywhere
-/// else in this file.
-#[must_use]
-fn match_expressions(code: &str) -> Vec<(&str, &str)> {
-    const KEYWORD: &str = "match";
-    let continues = |character: char| character.is_alphanumeric() || character == '_';
-
-    let mut found = Vec::new();
-    let mut cursor = 0_usize;
-    while let Some(relative) = code.get(cursor..).and_then(|rest| rest.find(KEYWORD)) {
-        let index = cursor + relative;
-        let Some(after_keyword) = code.get(index + KEYWORD.len()..) else {
-            break;
-        };
-        let before_boundary = code
-            .get(..index)
-            .and_then(|before| before.chars().next_back())
-            .is_none_or(|character| !continues(character));
-        let after_boundary = after_keyword
-            .chars()
-            .next()
-            .is_none_or(|character| !continues(character));
-        cursor = index + KEYWORD.len();
-        if !(before_boundary && after_boundary) {
-            continue;
-        }
-        let Some(mut open_relative) = after_keyword.find('{') else {
-            continue;
-        };
-
-        let (arms, selector_end) = loop {
-            let Some((block, after_block)) = balanced_brace_block(after_keyword, open_relative)
-            else {
-                break (None, open_relative);
-            };
-            if contains_top_level_arrow(block) {
-                break (Some(block), open_relative);
-            }
-            // Not an arm list — most likely the scrutinee is itself a block expression.
-            // The real arms are the next brace-balanced block, if one follows immediately.
-            let Some(rest) = after_keyword.get(after_block..) else {
-                break (None, open_relative);
-            };
-            let skip_ws = rest.len() - rest.trim_start().len();
-            if !rest.trim_start().starts_with('{') {
-                break (None, open_relative);
-            }
-            open_relative = after_block + skip_ws;
-        };
-        let Some(arms) = arms else {
-            continue;
-        };
-        let Some(selector) = after_keyword.get(..selector_end) else {
-            continue;
-        };
-        found.push((selector.trim(), arms));
-    }
-    found
-}
-
-/// `text`, split on its own top-level occurrences of `separator` — one that sits outside
-/// any `(...)`, `[...]` or `{...}` nesting the text opens.
-///
-/// A `match` arm's own expression can itself hold a call with a comma-separated argument
-/// list, so a plain [`str::split`] would cut an arm in the wrong place; this is what
-/// [`parse_dense_arms`] uses instead to find the commas that actually separate arms.
-#[must_use]
-fn split_top_level(text: &str, separator: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0_i32;
-    let mut start = 0_usize;
-    for (index, character) in text.char_indices() {
-        match character {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            candidate if candidate == separator && depth == 0 => {
-                if let Some(part) = text.get(start..index) {
-                    parts.push(part);
-                }
-                start = index + candidate.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if let Some(part) = text.get(start..) {
-        parts.push(part);
-    }
-    parts
-}
-
-/// A character immediately after a top-level `}` that means the brace closed a block used
-/// as an *operand* — a postfix call, index, field, method or `?`, or the left side of a
-/// binary operator — rather than the whole of an arm's value.
-///
-/// [`with_synthetic_arm_separators`] must not split here: `0 => { VALUE }.wrapping_mul(3),`
-/// is one arm expression, and cutting it in two after the block leaves neither half
-/// parseable as `pattern => expression`, which [`parse_dense_arms`] would refuse the whole
-/// match over — turning a fix for one bypass into a way to fail closed at recognising a
-/// table that really is dense, rather than one it should be a decision about.
-#[must_use]
-const fn continues_an_expression(character: char) -> bool {
-    matches!(
-        character,
-        '.' | '?'
-            | '('
-            | '['
-            | '+'
-            | '-'
-            | '*'
-            | '/'
-            | '%'
-            | '&'
-            | '|'
-            | '^'
-            | '<'
-            | '>'
-            | '='
-            | ':'
-    )
-}
-
-/// Whether `chars[start..]` begins with `keyword` at a word boundary — a keyword continuing
-/// the same expression a block just closed, invisible to [`continues_an_expression`]'s
-/// single-character check because it is spelled with letters rather than a symbol.
-///
-/// Two keywords use this. `as`: `0 => { 0x7707_3096 } as u32,` is a legal arm value — a cast
-/// applied to a block operand — and without recognising it,
-/// [`with_synthetic_arm_separators`] cuts it into a block segment and a standalone `as u32`
-/// segment, neither of which [`parse_dense_arms`] can read as `pattern => expression`, so
-/// the whole match is refused as unparseable and the module-wide scan never sees it at all.
-/// `else`: `0 => if COND { A } else { B },` is a legal arm value too — an `if` expression
-/// with a block operand of its own — and the same cut happens between `{ A }` and
-/// `else { B }` without it. Both are the same failure mode `continues_an_expression` itself
-/// exists to avoid for `.`, `?` and the rest.
-#[must_use]
-fn continues_with_keyword(chars: &[char], start: usize, keyword: &str) -> bool {
-    let letters: Vec<char> = keyword.chars().collect();
-    if !letters
-        .iter()
-        .enumerate()
-        .all(|(offset, letter)| chars.get(start + offset) == Some(letter))
-    {
-        return false;
-    }
-    !chars
-        .get(start + letters.len())
-        .is_some_and(|character| character.is_alphanumeric() || *character == '_')
-}
-
-/// `arms`, with a synthetic `,` inserted immediately after every top-level `}` that is not
-/// followed by something continuing the same expression.
-///
-/// Rust lets a block-valued match arm — `0 => { VALUE }` — omit its trailing comma, because
-/// the block already delimits it; a whole match spelled that way, arm after arm, has no
-/// top-level comma anywhere in it. Codex found that [`split_top_level`] alone therefore
-/// read such a match as one single segment, which is not the shape [`parse_dense_arms`]
-/// expects and so is not dense — a comma-less, brace-valued sixteen-arm table passed
-/// unnoticed because the scan skipped it rather than because it was judged and allowed. A
-/// block is self-delimiting, so treating its own closing brace as an arm boundary — in
-/// addition to a real comma, never instead of one — is sound rather than a guess: a comma
-/// that *is* there just produces one empty segment, which [`parse_dense_arms`] already
-/// discards. [`continues_an_expression`] is the one case that is not sound: a block used as
-/// an operand rather than as the whole arm value, where inserting a separator would cut a
-/// legal expression in two instead of recovering the boundary a comma-less arm never wrote.
-#[must_use]
-fn with_synthetic_arm_separators(arms: &str) -> String {
-    let chars: Vec<char> = arms.chars().collect();
-    let mut result = String::with_capacity(arms.len() + 8);
-    let mut depth = 0_i32;
-    let mut index = 0_usize;
-    while let Some(&character) = chars.get(index) {
-        match character {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' => depth -= 1,
-            '}' => {
-                depth -= 1;
-                result.push(character);
-                if depth == 0 {
-                    let mut lookahead = index + 1;
-                    while chars.get(lookahead).is_some_and(|c| c.is_whitespace()) {
-                        lookahead += 1;
-                    }
-                    let continues = chars
-                        .get(lookahead)
-                        .is_some_and(|c| continues_an_expression(*c))
-                        || continues_with_keyword(&chars, lookahead, "as")
-                        || continues_with_keyword(&chars, lookahead, "else");
-                    if !continues {
-                        result.push(',');
-                    }
-                }
-                index += 1;
-                continue;
-            }
-            _ => {}
-        }
-        result.push(character);
-        index += 1;
-    }
-    result
-}
-
-/// One parsed `match` arm: a pattern and the expression it maps to, exactly as source
-/// spells it — the expression's own shape (a call, a bare literal, anything else) is
-/// [`call_shape`]'s question rather than [`parse_dense_arms`]'s, so a table spelled as
-/// `0 => 0x0000_0000, 1 => 0x7707_3096, ..` is still parsed here rather than silently
-/// skipped for not being a call.
-struct DenseArm {
-    pattern: String,
-    value: String,
-}
-
-/// Parses `arms` as a sequence of [`DenseArm`]s, or `None` the moment one segment is not
-/// `pattern => expression` — a statement that is not an arm at all is not a `match`
-/// [`has_dense_arm_patterns`] has any business calling a table.
-///
-/// Owned strings rather than slices of `arms`, because [`with_synthetic_arm_separators`]
-/// builds a copy to split arms out of and a `DenseArm` cannot borrow from a value that does
-/// not outlive this call.
-#[must_use]
-fn parse_dense_arms(arms: &str) -> Option<Vec<DenseArm>> {
-    let widened = with_synthetic_arm_separators(arms);
-    let mut parsed = Vec::new();
-    for segment in split_top_level(&widened, ',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        let (pattern, value) = segment.split_once("=>")?;
-        parsed.push(DenseArm {
-            pattern: pattern.trim().to_string(),
-            value: value.trim().to_string(),
-        });
-    }
-    Some(parsed)
-}
-
-/// The integer-type suffixes a Rust integer literal may carry, checked as exact trailing
-/// matches by [`parse_integer_literal`] rather than guessed at by scanning for digits — a
-/// hex literal's own digits (`0`-`9`) overlap the digits of a suffix like `u8`, so a scan
-/// that looked for "the last digit character" would read `0xFu8`'s suffix as part of its
-/// numeral.
-const INTEGER_SUFFIXES: &[&str] = &[
-    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
-];
-
-/// Parses `text` as a Rust integer literal's *value*, whatever base or suffix it is spelled
-/// with — `0`, `0x0`, `0b0` and `0u8` all name the same arm pattern.
-///
-/// Codex found, on review of the pull request that added [`has_dense_arm_patterns`], that
-/// comparing a pattern's *spelling* against `index.to_string()` accepted only the plain
-/// decimal form: a table whose patterns were written `0x0` through `0xE` and `_` — which
-/// LLVM compiles into the identical lookup table — was not dense by that comparison and so
-/// was skipped by the scan entirely, rather than being caught as an unauthorised one.
-#[must_use]
-fn parse_integer_literal(text: &str) -> Option<u128> {
-    const RADIX_PREFIXES: &[(&str, u32)] = &[("0x", 16), ("0o", 8), ("0b", 2)];
-
-    let text = text.trim();
-    let (text, radix) = RADIX_PREFIXES
-        .iter()
-        .find_map(|(prefix, radix)| text.strip_prefix(prefix).map(|rest| (rest, *radix)))
-        .unwrap_or((text, 10));
-    let text = INTEGER_SUFFIXES
-        .iter()
-        .find_map(|suffix| text.strip_suffix(suffix))
-        .unwrap_or(text);
-    let digits: String = text.chars().filter(|character| *character != '_').collect();
-    if digits.is_empty() {
-        return None;
-    }
-    u128::from_str_radix(&digits, radix).ok()
-}
-
-/// Whether `parsed`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: `0` through `n - 2`, whatever base or suffix each is spelled with
-/// and in whatever order they are *written*, covering every value exactly once, then a
+/// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
+/// into a lookup table: `0` through `n - 2`, whatever base or suffix each was spelled with
+/// and in whatever order they were written, covering every value exactly once, then a
 /// final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
-/// Independent of what each arm's own *value* is — a call, a bare literal, anything else —
-/// because a lookup table is exactly as much of one whichever shape backs it: `0 =>
-/// 0x0000_0000, 1 => 0x7707_3096, ..` is the pattern half of a table with the call half left
-/// out, and it is the pattern half this checks. Codex found, on review of the pull request
-/// that added the call-shaped version of this check, that requiring each arm's value to be
-/// a call missed exactly that: a match whose arms are dense but whose values are literals
-/// compiles into the same rodata and is invisible to the array ban, which never sees a
-/// `match` at all.
+/// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
+/// [ADR 0044]'s own history on pull request #154 is why that matters: a hand-rolled
+/// brace-and-comma scan over the same question accumulated eight distinct bypasses in as
+/// many review rounds (a comma-less block arm, a block scrutinee, a postfixed block value,
+/// a cast, an `else`, a scrutinee with its own nested `match`, one with its own `if`/`else`,
+/// and a comma inside a turbofish), each one a shape `rustc`'s grammar disambiguates for
+/// free. Reading `syn`'s own parsed patterns and values, rather than re-deriving arm
+/// boundaries from text, closes all eight at once and needs no ninth rule for the next one.
 ///
-/// Also independent of the *order* the numbered arms are written in. Codex found, on review
-/// of the pull request that added the nibble-table pin, that comparing each arm's pattern
-/// against its own position in the source — `patterns[0]` must read `0`, `patterns[1]` must
-/// read `1`, and so on — let a match that listed the same complete, singleton set of
-/// patterns out of order, such as `1 => .., 0 => .., 2 => ..`, walk past this check entirely
-/// and so past the module-wide scan it backs: LLVM's switch-to-lookup-table pass does not
-/// care what order a `match`'s arms are written in, only that the patterns it sees are
-/// dense. This now normalises each numbered pattern to its own literal value and checks
-/// that the *set* of them is exactly `0..n - 1`, with no gap and no value repeated, rather
-/// than reading position as identity.
+/// Independent of what each arm's own *value* is — a call, a bare literal, anything else —
+/// because a lookup table is exactly as much of one whichever shape backs it, and it is the
+/// pattern half this checks; [`call_shaped_uniformly`] is the value half.
+///
+/// [ADR 0044]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
 #[must_use]
-fn has_dense_arm_patterns(parsed: &[DenseArm]) -> bool {
-    let Some(last) = parsed.len().checked_sub(1) else {
+fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
+    let Some(last) = found.arms.len().checked_sub(1) else {
         return false;
     };
-    if parsed.len() < MINIMUM_DENSE_TABLE_ARMS {
+    if found.arms.len() < MINIMUM_DENSE_TABLE_ARMS {
         return false;
     }
-    let Some(wildcard) = parsed.get(last) else {
+    let Some(wildcard) = found.arms.get(last) else {
         return false;
     };
-    if wildcard.pattern != "_" {
+    if !wildcard.is_wild {
         return false;
     }
-    let Some(numbered) = parsed.get(..last) else {
+    let Some(numbered) = found.arms.get(..last) else {
         return false;
     };
     let mut covered = vec![false; last];
     for arm in numbered {
-        let Some(value) = parse_integer_literal(&arm.pattern) else {
+        let Some(value) = arm.pattern else {
             return false;
         };
         let Ok(value) = usize::try_from(value) else {
@@ -9190,59 +8872,38 @@ fn has_dense_arm_patterns(parsed: &[DenseArm]) -> bool {
     covered.into_iter().all(|seen| seen)
 }
 
-/// Whether `expression` is a call `callee(argument)`, both trimmed — the one value shape
-/// ADR 0044 actually permits a dense-patterned table to have, as opposed to the wider set
-/// [`has_dense_arm_patterns`] alone would allow through.
-#[must_use]
-fn call_shape(expression: &str) -> Option<(&str, &str)> {
-    let open = expression.find('(')?;
-    if !expression.ends_with(')') {
-        return None;
-    }
-    let callee = expression.get(..open)?.trim();
-    if callee.is_empty() || !callee.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let argument = expression.get(open + 1..expression.len() - 1)?.trim();
-    Some((callee, argument))
-}
-
-/// Whether every one of `parsed`'s arms calls one consistent callee with its own pattern's
+/// Whether every one of `found`'s arms calls one consistent callee with its own pattern's
 /// value as the sole argument — the exact value shape [`INTEGRITY_CHECK_TABLES`] pins,
 /// checked only once [`has_dense_arm_patterns`] has already said the patterns are dense.
 /// Returns the callee when it is, so a caller can compare it and the arm count against
 /// [`INTEGRITY_CHECK_TABLES`] without caring which function, or which selector, the match
-/// happens to sit under. The argument is compared by [`parse_integer_literal`]'s value
-/// rather than by spelling, for [`has_dense_arm_patterns`]'s reason.
+/// happens to sit under.
 ///
 /// Each arm's expected argument is read from *that arm's own pattern* — the wildcard arm's
 /// from the arm count, since [`has_dense_arm_patterns`] already requires it to be the one
 /// value the numbered patterns leave uncovered — rather than from the arm's position in
-/// `parsed`. Codex's finding against [`has_dense_arm_patterns`] applies here unchanged: a
-/// match whose arms are written `1 => helper(1), 0 => helper(0), 2 => helper(2), ..` is the
-/// same table with its arms reordered, and comparing an argument against the position it
-/// happens to sit at would call it a mismatch — or, worse, a *differently* reordered value
-/// half (`1 => helper(0), 0 => helper(1), ..`) would satisfy a positional check by
-/// coincidence while calling the wrong function for each pattern.
+/// `found.arms`, so a match whose arms are written out of order is still read correctly.
 #[must_use]
-fn call_shaped_uniformly(parsed: &[DenseArm]) -> Option<&str> {
-    let last = parsed.len().checked_sub(1)?;
-    let callee = call_shape(&parsed.first()?.value)?.0;
-    for (index, arm) in parsed.iter().enumerate() {
-        let (this_callee, argument) = call_shape(&arm.value)?;
-        if this_callee != callee {
-            return None;
+fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
+    let last = found.arms.len().checked_sub(1)?;
+    let mut callee: Option<&str> = None;
+    for (index, arm) in found.arms.iter().enumerate() {
+        let (this_callee, argument) = arm.call.as_ref()?;
+        match callee {
+            None => callee = Some(this_callee.as_str()),
+            Some(expected) if expected != this_callee.as_str() => return None,
+            Some(_) => {}
         }
         let expected = if index == last {
             u128::try_from(last).ok()?
         } else {
-            parse_integer_literal(&arm.pattern)?
+            arm.pattern?
         };
-        if parse_integer_literal(argument) != Some(expected) {
+        if *argument != Some(expected) {
             return None;
         }
     }
-    Some(callee)
+    callee
 }
 
 /// The checksum module, every file its module tree reaches, and every source under a
@@ -15303,6 +14964,85 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_behind_a_conditional_scrutinee_is_reported() {
+        // Codex's eleventh-round finding: the block-scrutinee fix advanced to the "next"
+        // candidate block only when the text right after the first one started with
+        // another `{`. `match (if true { nibble } else { 0 }) { 0 => .., .. }`'s first
+        // candidate is the `if`'s own block; what follows it is `else { 0 }`, not a bare
+        // `{`, so the scan gave up on the whole match rather than trying the real arm
+        // block that follows the conditional. `crate::parse::match_expressions` closes
+        // this the way it closes every scrutinee shape at once: it reads the real match
+        // arms `syn` itself parsed, so no scrutinee expression — conditional, nested
+        // match, or anything else — can be mistaken for the arm list in the first place.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn conditional_scrutinee_table(nibble: u8) -> u32 {\n    match (if true \
+             { nibble } else { 0 }) {\n        0 => crc32_nibble(0),\n        \
+             1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_generic_argument_commas_is_reported() {
+        // Codex's eleventh-round finding: the module-wide scan split an arm's value text
+        // at every top-level comma, and a turbofish's own commas — `entry::<1, 2>()` —
+        // are exactly as "top-level" to a bracket-depth counter that does not know angle
+        // brackets are a delimiter here, so the arm was cut in half and the whole match
+        // refused as unparseable. `crate::parse::match_expressions` reads `syn`'s own
+        // parsed call expression, whose single argument list is never in doubt regardless
+        // of what its callee's turbofish contains.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn generic_argument_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0 => entry::<0, 2>(),\n        1 => entry::<1, 2>(),\n        \
+             2 => entry::<2, 2>(),\n        3 => entry::<3, 2>(),\n        \
+             _ => entry::<4, 2>(),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_constant_patterns_is_reported() {
+        // Codex's eleventh-round finding: a dense table can spell its singleton patterns
+        // through named constants — `const P0: u8 = 0;` and so on — rather than bare
+        // literals, and `parse_integer_literal` had no way to resolve an identifier to a
+        // value, so the match read as not dense and slipped through unclassified.
+        // `crate::parse::match_expressions` resolves a pattern that is a plain identifier
+        // (or a call argument that is one) against every `const` the file declares with a
+        // literal initializer, the same way it reads a bare literal — a constant pattern
+        // is exactly as much a value as its literal spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = 3;\n\
+             const fn constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => crc32_nibble(0),\n        P1 => crc32_nibble(1),\n        \
+             P2 => crc32_nibble(2),\n        P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_postfixed_block_values_is_reported() {
         // Codex's seventh-round finding, the sharper half: the synthetic-separator fix for
         // comma-less block arms used to insert a separator after *every* top-level `}`,
@@ -15331,21 +15071,20 @@ mod deferred_answer_pins {
 
     #[test]
     fn a_dense_match_with_cast_block_values_is_reported() {
-        // Codex's ninth-round finding: `continues_an_expression` checks one character at a
-        // time and so cannot see the keyword cast operator `as`, spelled with letters
-        // rather than a symbol. `0 => { 0x7707_3096 } as u32,` is a legal arm value — a
-        // cast applied to a block operand — and without recognising `as`, the
-        // synthetic-separator pass cuts it into a block segment and a standalone `as u32`
-        // segment, neither of which is `pattern => expression`; `parse_dense_arms` refused
-        // the whole match, and the module-wide scan never saw a table that really is
-        // dense. It is recognised now, and — since its values are casts rather than the
-        // one permitted call shape — reported as an unauthorised table.
+        // Codex's ninth-round finding was against a hand-rolled brace-and-comma scan that
+        // has since been replaced entirely by `crate::parse::match_expressions`, which
+        // parses the real grammar (round 11). `{ VALUE } as TYPE` turns out not to be
+        // legal Rust without its own parentheses — `rustc` itself asks for
+        // `({ VALUE }) as TYPE` — so this keeps the parenthesized, buildable form: a cast
+        // applied to a block operand as an arm's value. Dense patterns, values that are
+        // casts rather than the one permitted call shape, so reported as an unauthorised
+        // table.
         let mut source = tests_support::clean_checksum_module();
         source.push_str(
             "\nconst fn cast_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
-             0 => { 0x0000_0000 } as u32,\n        1 => { 0x7707_3096 } as u32,\n        \
-             2 => { 0xEE0E_612C } as u32,\n        3 => { 0x9909_57BA } as u32,\n        \
-             _ => { 0x0000_0000 } as u32,\n    }\n}\n",
+             0 => ({ 0x0000_0000 }) as u32,\n        1 => ({ 0x7707_3096 }) as u32,\n        \
+             2 => ({ 0xEE0E_612C }) as u32,\n        3 => ({ 0x9909_57BA }) as u32,\n        \
+             _ => ({ 0x0000_0000 }) as u32,\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
