@@ -169,12 +169,22 @@ which names no dependency on `waymaker-embassy` at all — a fact `cargo metadat
 rather than a claim a feature flag argued for, and `ctx-facade` now reads that graph
 directly rather than only the identifiers Rust source spells: Codex's review of this change
 found that a manifest edit alone, naming no crate in any `use`, passed every check here
-before this half existed. Declared dependencies only, not the full transitive closure —
+before this half existed. A direct dependency is refused in any table; a chain of
+`[dependencies]` at any depth is refused too, since a later normal dependency on some other
+crate that itself reaches the façade is exactly the edge a firmware library build would
+link, and Codex's review found the first version of this half missed it. Neither walk
+crosses a `[dev-dependencies]` or `[build-dependencies]` edge, at the root or below —
 `waymaker-drive` dev-depends on `waymaker-rig`, which itself normal-depends on
 `waymaker-embassy` for `PersistentClock` (issue #34), and that edge is neither new nor the
-façade's. `ctx-facade`'s source-level driver half keeps its shape, holding every
+façade's; the first version of this half's transitive attempt crossed it and misattributed
+that edge to `waymaker-drive` before the walk was narrowed to declared and normal-only
+reach. `ctx-facade`'s source-level driver half keeps its shape, holding every
 `waymaker-drive` module to naming no façade, but its exemption list is now empty because
-there is no in-crate module left to exempt. Moving `ota` and `provisioning`
+there is no in-crate module left to exempt — and the crate-wide vocabulary, static,
+future-set and macro bans that already held `waymaker-embassy` to no authority now hold
+`waymaker-facade-demo` to the same standard, since `Bridge` is the one other caller of this
+boundary and Codex's review found the first version of this half stopped at the crate it
+used to live in. Moving `ota` and `provisioning`
 also moved the one place either built a `Suspended`: a private field an in-crate module
 could reach directly, that a crate above `waymaker-drive` cannot. `Bridge` now keeps the
 real value the boundary returned and hands it back after a poll, rather than a value the
