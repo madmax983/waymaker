@@ -2909,9 +2909,10 @@ pub struct FailureRow {
 
 /// The ten rows of §14's failure-semantics table.
 ///
-/// Six are swept on the rig. Four are owed there — a swap workload, a capacity refusal and a
-/// divergent replay are things this rig does not do — and a row owed is a row the table says
-/// is owed, rather than one the rig's census quietly omits.
+/// All ten are swept or driven on the rig. Issue #96 closed the last four — a swap
+/// workload, a capacity refusal and a divergent replay — and a row this table ever marked
+/// `Owed` again would be one the rig's census quietly stopped reaching, not one nobody
+/// noticed.
 pub const FAILURE_ROWS: &[FailureRow] = &[
     FailureRow {
         id: "during-schedule-frame-write",
