@@ -17647,6 +17647,64 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_against_an_impl_with_a_qualified_self_type_is_reported() {
+        // Codex's forty-sixth-round finding: `impl defs::Key { .. }` — an inherent impl
+        // whose own self type is qualified rather than bare — was excluded outright by a
+        // guard requiring exactly one path segment, so every constant it declared was
+        // dropped. A qualifying prefix (`self`, `defs`, or anything else) changes nothing
+        // about the key a reference to these constants resolves against: it is still the
+        // type's own last segment, the identical bare name a single-segment `Self` type
+        // already indexes under, and `resolve_qualified_path`'s own last-two-segments
+        // fallback is what a fully qualified reference like `defs::Key::P0` already
+        // reaches it through.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub struct Key;\n}\n\n\
+             impl defs::Key {\n    pub const P0: u8 = 0;\n    pub const P1: u8 = \
+             1;\n    pub const P2: u8 = 2;\n    pub const P3: u8 = 3;\n}\n\n\
+             const fn qualified_self_type_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        defs::Key::P0 => 0,\n        defs::Key::P1 => 1,\n        \
+             defs::Key::P2 => 2,\n        defs::Key::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_provably_dead_guarded_arm_is_still_reported() {
+        // Codex's forty-sixth-round finding: `_ if false => 999`, sitting between the
+        // numbered arms and the real wildcard, is dead code `rustc` eliminates outright —
+        // but this scan recorded it as an ordinary arm with an empty pattern (a guarded
+        // `Pat::Wild` is neither the wildcard, since `is_catchall_pattern` refuses every
+        // guarded arm, nor a value-bearing one, since a bare `_` names no value), and
+        // `missing_value` requires every arm in its own numbered prefix to have a
+        // non-empty pattern — so one dead arm anywhere in that prefix silently
+        // disqualified an otherwise dense match. A guard this scan can prove is always
+        // `false` is now dropped before the arm is ever recorded, the same way `rustc`'s
+        // own dead-code elimination drops it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guarded_arm_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn dead_guarded_arm_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => dead_guarded_arm_helper(0),\n        \
+             1 => dead_guarded_arm_helper(1),\n        2 => dead_guarded_arm_helper(2),\n        \
+             _ if false => 999,\n        _ => dead_guarded_arm_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

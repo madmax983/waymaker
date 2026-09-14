@@ -3836,6 +3836,18 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // to a plain, single-segment `Self` type: `impl some::Path { .. }` names no known
         // type this way and is left unrecorded rather than guessed at.
         //
+        // Codex's forty-sixth-round finding: that scoping excluded a real shape —
+        // `impl self::Key { .. }` and `impl defs::Key { .. }` both name a perfectly
+        // ordinary type, qualified rather than bare, and every constant they declare was
+        // silently dropped. Every reference to those constants this scan can already
+        // resolve — a bare `Key::P0` where `Key` is in scope, or a qualified
+        // `defs::Key::P0` matched by [`resolve_qualified_path`]'s own last-two-segments
+        // fallback — is keyed on the type's own *last* segment, the identical bare name a
+        // single-segment `Self` type already indexes under; a qualifying prefix (`self`,
+        // `defs`, or anything else) changes nothing about that key. So the length
+        // restriction is dropped and the type's own last segment is read instead of its
+        // first, which for the single-segment case already in use are the same segment.
+        //
         // Codex's next-round finding: `impl<T> Indices<T> { .. }` was excluded by requiring
         // the one segment to carry no generic arguments at all, even though a caller
         // referencing `Indices::<u8>::P0` names the base type the same way — the arguments
@@ -3876,8 +3888,8 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // indexable impl still resolves to nothing rather than to a stale, unrelated one.
         let mut self_type_name = None;
         if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
-            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-                if let Some(segment) = type_path.path.segments.first() {
+            if type_path.qself.is_none() {
+                if let Some(segment) = type_path.path.segments.last() {
                     let trait_name = node
                         .trait_
                         .as_ref()
@@ -3925,12 +3937,38 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                         let insertion_point = trait_qualified_path.len() - 1;
                         trait_qualified_path.insert(insertion_point, trait_name.clone());
                     }
+                    // Codex's forty-sixth-round finding: `impl defs::Key { .. }`, written
+                    // outside `defs`, indexes its constants under the *impl's* own lexical
+                    // module (`crc::Key::P0` for an impl at this scanned tree's own root,
+                    // since `crc` is `INTEGRITY_CHECK_PATH`'s own seeded prefix) — not
+                    // under `defs`, which this scan has no reason to believe coincides
+                    // with wherever the impl itself happens to be written. A reference
+                    // spelled `defs::Key::P0`, matching the self type's own qualified
+                    // spelling exactly, does not share that suffix with the impl-module
+                    // key at all once the impl's own module is more than empty, so
+                    // `resolve_qualified_path`'s bare-chain lookup — an exact match on the
+                    // reference's own full path — is what has to find it. A third key,
+                    // built from the self type's own segments as written rather than from
+                    // the impl's position, is inserted whenever the self type carries more
+                    // than the one segment the existing keys already cover.
+                    let self_type_segments: Vec<String> = type_path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| ident_name(&segment.ident))
+                        .collect();
                     for (const_name, value) in &scope {
                         self.qualified
                             .insert(format!("{}::{const_name}", path.join("::")), *value);
                         if trait_name.is_some() {
                             self.qualified.insert(
                                 format!("{}::{const_name}", trait_qualified_path.join("::")),
+                                *value,
+                            );
+                        }
+                        if self_type_segments.len() > 1 {
+                            self.qualified.insert(
+                                format!("{}::{const_name}", self_type_segments.join("::")),
                                 *value,
                             );
                         }
@@ -4072,10 +4110,30 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // table whose numbered arms are all test-only and whose one production arm is
         // an unrelated wildcard was read as though every arm shipped, undercounting
         // what the real, shipped match looks like.
+        // Codex's forty-sixth-round finding: `_ if false => 999` immediately before the
+        // real wildcard is dead code `rustc` eliminates entirely, but this scan recorded
+        // it as an ordinary arm — `is_catchall_pattern` refuses every guarded arm
+        // unconditionally, so it was neither the wildcard nor a value-bearing numbered
+        // arm, and its `Pat::Wild` pattern resolves to no values at all. `missing_value`
+        // requires every arm in its own numbered prefix to have a non-empty pattern, so
+        // one dead arm anywhere in that prefix silently disqualified an otherwise dense
+        // match. A guard this scan can prove is always `false` — resolving through the
+        // identical `i128` pipeline every other constant expression here does, down to
+        // exactly `0` — names an arm that never runs, so it is dropped before `FoundArm`
+        // is ever built, the same way `rustc`'s own dead-code elimination would drop it.
+        // A guard this scan cannot resolve, or that resolves to anything but `0`, is left
+        // exactly as before: not provably dead, so not excluded.
         let arms = node
             .arms
             .iter()
             .filter(|arm| !has_cfg_test(&arm.attrs))
+            .filter(|arm| {
+                !matches!(
+                    &arm.guard,
+                    Some((_, guard_expr))
+                        if literal_or_const_value(guard_expr, &resolve) == Some(0)
+                )
+            })
             .map(|arm| FoundArm {
                 pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
                 is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), &resolve),
