@@ -3699,3 +3699,19 @@ had built their own fixtures by relying on exactly that gap — one in `resume`'
 suite, one in the rig's crash-sweep judge test — and both now reach the same device states
 through the lower-level primitives `Rig` itself writes with, rather than through the write
 path this fix closes.
+
+A fifth was `resume_declaring` itself. `recover_prefix`'s audit only compares `declared`
+against what recovery actually found, so a crash landing before
+[`Workload::diverging`](crate::workload::Workload::diverging)'s own changed index left
+nothing there for the audit to disagree with — `resume_as`'s loop then wrote the declared,
+diverged record fresh and dispatched it, same as any other never-before-recorded record.
+The fix widens what a fresh write is checked against: a record `resume_as` is about to
+write for the first time must now agree with this rig's own undiverged truth —
+`self.workload(iteration)` — before it is marked, appended or dispatched, not only with
+whatever recovery happened to find. For an ordinary `resume` the two are the same workload
+and the check never fires; `resume_declaring`'s `declared` is where it can differ.
+Reproduced first from a crash point that left the first effect durably completed and the
+second effect's schedule — the record `diverging` changes — not yet recovered at all: the
+unfixed code answered `Ok(Completed { recovered: 3, .. })`, having written and dispatched
+the diverged record, rather than `RigError::Breach(Breach::RecordDiffers { .. })` before
+either happened.

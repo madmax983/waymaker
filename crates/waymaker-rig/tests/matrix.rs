@@ -2500,3 +2500,86 @@ fn resume_declaring_refuses_a_workload_wider_than_the_rig_was_provisioned_for() 
         "no crash point left both effects durably completed with RunCompleted not yet begun"
     );
 }
+
+/// Round 8: `resume_declaring` could durably write and dispatch a divergent record that was
+/// never actually on media, if the crash it resumed from landed *before*
+/// [`Workload::diverging`]'s own changed index — `recover_prefix`'s audit only compares
+/// `declared` against what recovery actually found, so with nothing recorded yet at that
+/// index there was nothing there to disagree with, and the loop that writes what the run
+/// still owes wrote the declared, diverged record fresh and dispatched it.
+///
+/// The fix widens what a fresh write is checked against: not only must a *recovered* record
+/// agree with `declared`, a record `resume_as` is about to write for the first time must
+/// agree with this rig's own undiverged truth — `self.workload(iteration)` — before it is
+/// marked, appended, or dispatched. For an ordinary `resume` the two are the same workload
+/// and the check never fires; `resume_declaring`'s `declared` is where it can differ.
+#[test]
+fn resume_declaring_refuses_a_divergent_record_it_would_write_fresh() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(diverging_at);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Effect 0 durably completed, and effect 1's schedule — the record `declared`
+        // changes — not yet recovered at all: the gap, since nothing on media there could
+        // have disagreed with `declared` during `recover_prefix`'s own audit.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Completion(0), Activity::Returned, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(RigError::Breach(Breach::RecordDiffers { index })) if index == diverging_at
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            dispatcher.entered.is_empty(),
+            "a divergent record that was never on media was dispatched anyway"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "a divergent record that was never on media was written anyway"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left effect 0 durable with effect 1's schedule not yet recovered"
+    );
+}

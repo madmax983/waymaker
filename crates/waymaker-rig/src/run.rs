@@ -1389,16 +1389,26 @@ impl Rig {
         };
 
         let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut truth_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
         for index in recovered..records {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
-            let mark = Mark::new(iteration, index, Stage::Attempted);
-            self.mark_above(part, &mut witness, &mut known, mark, page)
-                .map_err(widen)?;
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
+            // `workload` may be `declared`, auditing history against a run whose own
+            // recovered prefix stops before `index` — nothing on media there for
+            // `recover_prefix`'s audit to have compared `declared` against. Review found
+            // that left a divergent record free to be written and dispatched fresh, so a
+            // record this loop is about to write for the first time is held to this rig's
+            // own undiverged truth here, before it is marked, appended or dispatched.
+            if self.workload(iteration).record(index, &mut truth_page) != Some(record) {
+                return Err(RigError::Breach(Breach::RecordDiffers { index }));
+            }
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
             self.append(part, &mut journal, &record, page)
                 .map_err(widen)?;
             let mark = Mark::new(iteration, index, Stage::Acknowledged);
