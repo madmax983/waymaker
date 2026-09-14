@@ -9175,11 +9175,11 @@ fn module_tree(
 /// child's own file can be scanned with the declaration's name seeded as its module-path
 /// prefix rather than as an empty one.
 ///
-/// An out-of-line module nested inside an *inline* one loses that inline module's own
-/// name from the chain — `crate::parse::child_modules` reports only the out-of-line
-/// leaf's bare name for such a case, the same limitation `module_tree`'s test-gating
-/// already carries for the identical reason. The checksum module tree this rule scans
-/// has no such nesting today.
+/// An out-of-line module nested inside an *inline* one used to lose that inline module's
+/// own name from the chain, since `crate::parse::child_modules` reported only the
+/// out-of-line leaf's bare name for such a case — Codex's next finding, closed by giving
+/// `ChildModule` its own `inline_ancestors` field and extending the chain with it here
+/// rather than pushing only `child.name`.
 ///
 /// Paths use `/` separators, the way the scan compares them.
 fn module_path_prefixes(
@@ -9204,6 +9204,12 @@ fn module_path_prefixes(
         for child in crate::parse::child_modules(&path, contents)? {
             let resolved = resolve_child(sources, &path, &child)?;
             let mut child_prefix = prefix.clone();
+            // Codex's finding: `child.name` alone is the out-of-line leaf, but a `mod
+            // outer { mod inner; }` puts `inner`'s own module path at `outer::inner`, not
+            // `inner` — `inline_ancestors` is `child_modules`'s own record of every inline
+            // `mod` this declaration sits inside, so the whole chain is carried forward
+            // rather than just its last link.
+            child_prefix.extend(child.inline_ancestors.iter().cloned());
             child_prefix.push(child.name.clone());
             stack.push((resolved, child_prefix));
         }
@@ -15540,6 +15546,68 @@ mod deferred_answer_pins {
             layer("waymaker-flash/src/crc/outer.rs", outer),
             layer("waymaker-flash/src/crc/outer/inner.rs", inner),
         ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_past_an_inline_ancestor_of_an_out_of_line_file() {
+        // Codex's twenty-fifth-round finding: `child_modules` reports only the bare name
+        // of an out-of-line `mod`, so `crc.rs`'s `mod outer { mod inner; }` used to give
+        // `inner.rs` the prefix `["inner"]` rather than `["outer", "inner"]` —
+        // `module_path_prefixes` lost `outer`'s own name entirely. `inner.rs`'s own match
+        // reads `super::indices::P0`, which needs `outer`'s own inline `mod indices` to be
+        // reachable as `outer::indices::P0` in the merged qualified map; without `outer`
+        // in the prefix, `super` had nothing correct to step up from.
+        let parent = format!(
+            "{}\nmod outer {{\n    mod indices {{\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }}\n\n    mod inner;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::indices::P0 => 0,\n        \
+                     super::indices::P1 => 1,\n        super::indices::P2 => 2,\n        \
+                     super::indices::P3 => 3,\n        _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_never_resolves_relative_to_the_current_module() {
+        // Codex's twenty-fifth-round finding: stripping `crate` the same way `self` is
+        // stripped lost the one fact that made it worth reading — `crate::indices::P0`
+        // names the crate root exclusively in real Rust, never the current module. The old
+        // code still tried the current-module-relative form *first*, so a same-named
+        // `outer::indices` with non-dense values answered before the root ever got a
+        // chance, hiding a dense table at the root. `indices` at the file root is dense
+        // (0..3); `outer::indices`, deliberately non-dense (200..203), is what a wrong
+        // resolution would find instead.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             200;\n        pub(crate) const P1: u8 = 201;\n        pub(crate) const P2: \
+             u8 = 202;\n        pub(crate) const P3: u8 = 203;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            crate::indices::P0 => 0,\n            crate::indices::P1 \
+             => 1,\n            crate::indices::P2 => 2,\n            crate::indices::P3 \
+             => 3,\n            _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations
                 .iter()

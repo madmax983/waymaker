@@ -1224,6 +1224,13 @@ pub fn declares_test(contents: &str, name: &str) -> bool {
 pub struct ChildModule {
     /// The declared `mod` name.
     pub name: String,
+    /// The names of every *inline* `mod { ... }` the declaring file nests this
+    /// declaration inside, outermost first — empty for one declared at the file's own
+    /// top level. `crc.rs`'s `mod outer { mod inner; }` gives `inner`'s own
+    /// [`ChildModule`] an `inline_ancestors` of `["outer"]`, which is what lets a caller
+    /// building this child's own module path write `outer::inner` rather than losing
+    /// `outer` the way reading `name` alone would (Codex's finding).
+    pub inline_ancestors: Vec<String>,
     /// Candidate workspace-relative paths for the child's file, in `rustc`'s probe
     /// order (see [`child_modules`]).
     pub candidates: Vec<String>,
@@ -1299,7 +1306,14 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
         format!("{parent_dir}{stem}/")
     };
     let mut found = Vec::new();
-    collect_child_modules(&file.items, &parent_dir, &child_dir, false, &mut found);
+    collect_child_modules(
+        &file.items,
+        &parent_dir,
+        &child_dir,
+        false,
+        &mut Vec::new(),
+        &mut found,
+    );
     Ok(found)
 }
 
@@ -1307,11 +1321,16 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
 ///
 /// `parent_dir` is the declaring file's directory and `child_dir` the directory its
 /// children live in; `gated` is whether an enclosing inline module is `#[cfg(test)]`.
+/// `inline_path` is the stack of inline `mod { ... }` names entered so far — pushed and
+/// popped around the recursive call the same way [`MatchVisitor::module_path`] is, and
+/// what lets a child several inline modules deep keep every one of their names rather
+/// than only the last (Codex's finding).
 fn collect_child_modules(
     items: &[syn::Item],
     parent_dir: &str,
     child_dir: &str,
     gated: bool,
+    inline_path: &mut Vec<String>,
     found: &mut Vec<ChildModule>,
 ) {
     for item in items {
@@ -1322,13 +1341,16 @@ fn collect_child_modules(
         let item_gated = gated || has_cfg_test(&module.attrs);
         if let Some((_, nested)) = module.content.as_ref() {
             // Inline: no file of its own, but its out-of-line children live under it.
+            inline_path.push(name.clone());
             collect_child_modules(
                 nested,
                 parent_dir,
                 &format!("{child_dir}{name}/"),
                 item_gated,
+                inline_path,
                 found,
             );
+            inline_path.pop();
         } else {
             let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
                 || {
@@ -1342,6 +1364,7 @@ fn collect_child_modules(
             );
             found.push(ChildModule {
                 name,
+                inline_ancestors: inline_path.clone(),
                 candidates,
                 test_gated: item_gated,
             });
@@ -1890,8 +1913,16 @@ fn call_shape_of(
 /// `outer::indices::P0`, not against `outer::inner`'s own scope or the file root. A chain
 /// with more `super`s than `current_module` has levels clamps to the file root, since there
 /// is nowhere higher to step to. What matches neither the relative form nor the plain chain
-/// still falls back to its last two segments (`module::name`), which is what lets
-/// `crate::indices::P0` keep finding a `mod indices` recorded relative to the file root.
+/// still falls back to its last two segments (`module::name`).
+///
+/// Codex's finding after *that*: a leading `crate` was stripped the same way `self` is,
+/// which throws away the one thing distinguishing them — `crate::indices::P0` names the
+/// crate root and nothing else, in real Rust, whichever module the reference sits in, but
+/// the stripped chain still tried the current-module-relative form *first*, so a same-named
+/// `outer::indices` could answer for a reference that explicitly asked to skip past it.
+/// `crate::` now records that it was absolute before the shared strip erases the word, and
+/// skips the relative attempt outright — going straight to the plain chain, which is what
+/// lets `crate::indices::P0` keep finding a `mod indices` recorded relative to the file root.
 fn resolve_qualified_path(
     path: &syn::Path,
     qualified: &std::collections::HashMap<String, u128>,
@@ -1902,6 +1933,13 @@ fn resolve_qualified_path(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
+    // Codex's finding: stripping `crate` the same way `self` is stripped, below, loses
+    // the one fact that made it worth reading — `crate::indices::P0` names the crate
+    // root exclusively, in real Rust, and never the current module, however deep a nested
+    // `mod outer` sits. Recorded here, before the shared strip below throws the
+    // distinction away, so `crate::` can skip the current-module-relative attempt
+    // entirely rather than racing it the way a `self`- or `super`-anchored chain does.
+    let is_crate_absolute = segments.first().map(String::as_str) == Some("crate");
     let relevant: Vec<&str> = segments
         .iter()
         .map(String::as_str)
@@ -1919,12 +1957,14 @@ fn resolve_qualified_path(
         return None;
     }
     let joined = rest.join("::");
-    let pop = super_count.min(current_module.len());
-    let effective_module = current_module.get(..current_module.len() - pop)?;
-    if !effective_module.is_empty() {
-        let relative = format!("{}::{joined}", effective_module.join("::"));
-        if let Some(value) = qualified.get(&relative) {
-            return Some(*value);
+    if !is_crate_absolute {
+        let pop = super_count.min(current_module.len());
+        let effective_module = current_module.get(..current_module.len() - pop)?;
+        if !effective_module.is_empty() {
+            let relative = format!("{}::{joined}", effective_module.join("::"));
+            if let Some(value) = qualified.get(&relative) {
+                return Some(*value);
+            }
         }
     }
     if let Some(value) = qualified.get(&joined) {
