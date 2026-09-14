@@ -8598,6 +8598,74 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_less_than_sign_does_not_swallow_the_count_as_markup() {
+        // Codex, pull request #138, round 47, "Distinguish literal less-than signs
+        // from tag starts": `next_tag_start` returned any `<` as an unresolved tag
+        // start, not only one a browser would actually tokenize as markup —
+        // `<div>\n2 < 3\nAll 6 recovery invariants\n</div>` has a literal `2 < 3`
+        // on its own line, and its `<` (followed by a space, not a letter or `/`)
+        // was captured as a `PendingTag` that then consumed everything through the
+        // later `</div>`'s own `>` as markup, the count included.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<div>\n2 < 3\n{count}\n</div>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_spelling_inside_a_still_open_quoted_attribute_does_not_hide_the_count() {
+        // Codex, pull request #138, round 47, "Ignore comment markers inside
+        // pending tag attributes": `next_hiding_marker`'s own comment-opener
+        // search was a raw substring search, so `<div title="<!--\ncontinued">All
+        // 6 recovery invariants</div>` — a legal, multiline tag with no complete
+        // candidate at all on its first line — had the `<!--` trapped inside its
+        // still-open quoted attribute value read as a genuine comment opener,
+        // latching `in_html_comment` for the rest of the document once no real
+        // `-->` is ever found for it.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<div title=\"<!--\ncontinued\">{count}</div>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_element_literally_named_hidden_does_not_hide_its_own_body() {
+        // Codex, pull request #138, round 47, "Skip the element name when scanning
+        // for hidden attributes": `has_hidden_attribute` accepted `<` as a valid
+        // boundary immediately before "hidden", meant to admit a genuine attribute
+        // sitting right at the very start of the attribute list — but the same
+        // allowance let the *tag's own name* be mistaken for the attribute:
+        // `<hidden>All 6 recovery invariants</hidden>` is an ordinary element
+        // literally named `hidden`, not an element carrying a `hidden` attribute,
+        // and a reader sees its body plainly.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<hidden>{count}</hidden>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_discharge_split_by_a_line_break_tag_is_reported_as_missing() {
         // Codex, pull request #138, round 38, finding 3: the round-37 fix for `<br>`
         // landed in `markdown_prose`; this independent collector, `table_rows`, still

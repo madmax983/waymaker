@@ -1352,14 +1352,22 @@ fn is_self_closing_tag(span: &str, name: &str) -> bool {
 /// Whether `span` — a complete, well-formed opening tag's own markup — carries the
 /// HTML boolean `hidden` attribute as an attribute *name* (Codex, pull request #138,
 /// round 42, finding 3): bare `hidden`, or `hidden=...` with any value, at a position
-/// preceded only by whitespace, `<` or `/` and followed only by whitespace, `=`, `/`
+/// preceded only by whitespace or `/` and followed only by whitespace, `=`, `/`
 /// or `>`. Quote-tracked so a *value* that merely spells the word — `<div
 /// title="hidden">` — is never mistaken for the attribute itself, the same discipline
 /// [`anchor_href`] already applies to `href`.
+///
+/// The scan starts after the tag's own name, not at byte `0` (Codex, pull request
+/// #138, round 47, "Skip the element name when scanning for hidden attributes"): an
+/// attribute can never appear before it, so this used to accept `<` as a boundary
+/// only to admit the case where the name itself happened to sit at the scan's own
+/// start — but that same allowance let the *name* be spelled `hidden` and mistaken
+/// for the attribute, `<hidden>visible documentation</hidden>` chief among them,
+/// which is an element named `hidden`, not a `hidden` attribute on some other one.
 fn has_hidden_attribute(span: &str) -> bool {
     let bytes = span.as_bytes();
     let mut quote: Option<u8> = None;
-    let mut index = 0;
+    let mut index = 1 + markup_tag_name(span).len();
     while let Some(&byte) = bytes.get(index) {
         match quote {
             Some(open) if byte == open => quote = None,
@@ -1373,9 +1381,7 @@ fn has_hidden_attribute(span: &str) -> bool {
                     let before_ok = index
                         .checked_sub(1)
                         .and_then(|before| bytes.get(before))
-                        .is_none_or(|&byte| {
-                            matches!(byte, b'<' | b'/' | b' ' | b'\t' | b'\n' | b'\r')
-                        });
+                        .is_none_or(|&byte| matches!(byte, b'/' | b' ' | b'\t' | b'\n' | b'\r'));
                     let after_ok = bytes.get(index + 6).is_none_or(|&byte| {
                         matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'/' | b'>')
                     });
@@ -1718,6 +1724,16 @@ fn scan_tag_close(line: &str, from: usize, quote: &mut Option<u8>) -> Option<usi
 /// starts here but this line ran out before its own `>`" (Codex, pull request #138,
 /// round 41, finding 1) — the latter is [`find_any_tag`] returning `None` too, and only
 /// this function's own `Some` distinguishes the two.
+///
+/// A `<` only counts here when a syntactically plausible tag could follow it — an
+/// ASCII letter (an opening tag's own name) or `/` (a closing tag) — not any `<`
+/// whatsoever (Codex, pull request #138, round 47, "Distinguish literal less-than
+/// signs from tag starts"): a browser tokenizes `<` as the start of markup only in
+/// those two cases, and `2 < 3` is ordinary visible text whose `<` is not one of
+/// them. Every caller of this function treats its `Some` as "an incomplete tag
+/// starts here, carry it across the line break" — reading `2 < 3`'s `<` that way
+/// swallowed everything from there to the next unrelated `>` anywhere later in the
+/// document as if it were that tag's own markup.
 fn next_tag_start(line: &str, from: usize) -> Option<usize> {
     let mut cursor = from;
     loop {
@@ -1726,7 +1742,14 @@ fn next_tag_start(line: &str, from: usize) -> Option<usize> {
             cursor = start + "<!--".len();
             continue;
         }
-        return Some(start);
+        let plausible = line
+            .as_bytes()
+            .get(start + 1)
+            .is_some_and(|&byte| byte.is_ascii_alphabetic() || byte == b'/');
+        if plausible {
+            return Some(start);
+        }
+        cursor = start + 1;
     }
 }
 
@@ -1770,7 +1793,17 @@ fn find_comment_opener(line: &str, from: usize) -> Option<usize> {
 /// win — but still ahead of `Markup`, for the same reason `Tag` is.
 fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
     let mut candidates: Vec<(usize, HidingMarker)> = Vec::new();
-    if let Some(start) = line[from..].find("<!--").map(|offset| from + offset) {
+    // Tokenized via `find_comment_opener`, not a raw substring search (Codex, pull
+    // request #138, round 47, "Ignore comment markers inside pending tag
+    // attributes"): a still-incomplete tag's own quoted attribute value can itself
+    // contain `<!--` — `<div title="<!--\ncontinued">All 6 recovery
+    // invariants</div>` has no complete tag on this line at all — and a raw search
+    // read that as a genuine comment opener, latching `in_html_comment` for the
+    // rest of the document once no real `-->` is ever found for it. The
+    // quote-aware, tag-tokenizing search correctly finds nothing here instead,
+    // falling through to the "no marker found" case, which is what carries an
+    // incomplete tag like this across the line break as a `PendingTag`.
+    if let Some(start) = find_comment_opener(line, from) {
         candidates.push((start, HidingMarker::Comment(start)));
     }
     if let Some((start, end, tag)) = find_any_opening_tag(line, from) {
