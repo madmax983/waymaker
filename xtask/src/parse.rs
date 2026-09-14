@@ -931,6 +931,7 @@ pub enum InlineCode {
 #[must_use]
 pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+    use std::fmt::Write as _;
 
     let parser = Parser::new_ext(contents, Options::empty()).into_offset_iter();
     let mut out = String::new();
@@ -1032,9 +1033,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     // Backticks kept, not just the content: row and claim scans match
                     // on a backtick-delimited id, and a bare id could be a substring
                     // of a longer one.
-                    out.push('`');
-                    out.push_str(&code);
-                    out.push('`');
+                    let _ = write!(out, "`{code}`");
                 }
             }
             // Never scanned for a comment marker of either kind, opener or closer
@@ -1109,6 +1108,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
+                    &mut foreign_content,
                 );
                 if !container_hidden {
                     append_visible_html(&mut out, &html, spans);
@@ -1171,10 +1171,11 @@ fn non_rendering_element_nests(tag: &str) -> bool {
     !matches!(tag, "script" | "style" | "title")
 }
 
-/// Whether a second `tag`, opened while one is already the innermost open non-rendering
-/// element, implicitly closes the first rather than nesting inside it — HTML5's optional
-/// end tag rules (Codex, pull request #138, round 48, "Honor implicit closes for
-/// optional-end-tag elements").
+/// Whether opening `next_tag` while `top` is already the innermost open non-rendering
+/// element implicitly closes `top` rather than nesting inside it — HTML5's per-element
+/// list of optional-end-tag rules (Codex, pull request #138, round 48, "Honor implicit
+/// closes for optional-end-tag elements"; widened round 50, "Honor implicit closes
+/// triggered by different tag names").
 ///
 /// `<li>`'s own end tag may be omitted immediately before another `<li>`, so
 /// `<ul><li hidden>hidden<li>All 6 recovery invariants</li></ul>` is not two nested `li`
@@ -1182,26 +1183,64 @@ fn non_rendering_element_nests(tag: &str) -> bool {
 /// a browser's own parser would. Treating it as a further open (as every non-raw-text
 /// same-name opener used to be) left the hidden stack open past the visible item's own
 /// single close tag, hiding the item itself and everything the document says after it.
-/// `<template>` and an arbitrary `hidden`-suppressed element are deliberately not on this
-/// list: both genuinely nest, and a repeated `<template>` (or a `<div hidden>` nested
-/// inside another) really does open a second level a browser keeps separately open.
-fn implicitly_closes_same_name(tag: &str) -> bool {
-    matches!(
-        tag,
-        "li" | "dt"
-            | "dd"
-            | "p"
-            | "option"
-            | "optgroup"
-            | "rt"
-            | "rp"
-            | "tr"
-            | "td"
-            | "th"
-            | "thead"
-            | "tbody"
-            | "tfoot"
-    )
+///
+/// A same-name reopen is not the only trigger (round 50): `<dt>` and `<dd>` close each
+/// other, not only themselves, and `<p>` closes before almost any block-starting tag at
+/// all, not only another `<p>` — `<p hidden>ignored<div>All 6 recovery
+/// invariants</div>` has its `<div>` closing the hidden `<p>` just as surely as a second
+/// `<p>` would, and checking only for `top`'s own name back left that hidden past its
+/// own implicit close, exposing nothing after it — HTML5's rules per element, not one
+/// list shared by all of them, are what `top`'s own match arm names.
+///
+/// `<template>` and an arbitrary `hidden`-suppressed element are deliberately not
+/// covered by any arm here (falling through to `false`): both genuinely nest, and a
+/// repeated `<template>` (or a `<div hidden>` nested inside another) really does open a
+/// second level a browser keeps separately open.
+fn implicitly_closed_by(top: &str, next_tag: &str) -> bool {
+    match top {
+        "li" => next_tag == "li",
+        "dt" | "dd" => matches!(next_tag, "dt" | "dd"),
+        "option" => matches!(next_tag, "option" | "optgroup"),
+        "optgroup" => next_tag == "optgroup",
+        "rt" | "rp" => matches!(next_tag, "rt" | "rp"),
+        "thead" | "tbody" => matches!(next_tag, "tbody" | "tfoot"),
+        "tfoot" => next_tag == "tbody",
+        "tr" => matches!(next_tag, "tr" | "tbody" | "thead" | "tfoot"),
+        "td" | "th" => matches!(next_tag, "td" | "th" | "tr"),
+        "p" => matches!(
+            next_tag,
+            "address"
+                | "article"
+                | "aside"
+                | "blockquote"
+                | "details"
+                | "div"
+                | "dl"
+                | "fieldset"
+                | "figcaption"
+                | "figure"
+                | "footer"
+                | "form"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "header"
+                | "hr"
+                | "main"
+                | "menu"
+                | "nav"
+                | "ol"
+                | "p"
+                | "pre"
+                | "section"
+                | "table"
+                | "ul"
+        ),
+        _ => false,
+    }
 }
 
 /// The byte range of the first well-formed opening tag for `tag` at or after `from` in
@@ -1332,6 +1371,34 @@ fn find_any_opening_tag(line: &str, from: usize) -> Option<(usize, usize, &'stat
         .min_by_key(|&(start, _, _)| start)
 }
 
+/// The byte range and lowercase name of the earliest opening tag, at or after `from` in
+/// `line`, whose name [`implicitly_closed_by`] lists as closing `top` — HTML5's
+/// per-element optional-end-tag rules, generalized from a same-name-only reopen search
+/// (Codex, pull request #138, round 50, "Honor implicit closes triggered by different
+/// tag names"): `<p hidden>ignored<div>All 6 recovery invariants</div>` has its `<div>`
+/// closing the hidden `<p>` just as surely as a second `<p>` would, and a search for
+/// only `top`'s own name never saw it. Scanned tag by tag through [`find_any_tag`], the
+/// same way [`find_any_opening_tag`]'s fixed, short list already is, since the set of
+/// names that can close a given `top` is not fixed at one.
+fn find_implicit_close_reopen(
+    line: &str,
+    from: usize,
+    top: &str,
+) -> Option<(usize, usize, String)> {
+    let mut cursor = from;
+    loop {
+        let (start, end) = find_any_tag(line, cursor)?;
+        let span = &line[start..end];
+        if !span.starts_with("</") {
+            let name = markup_tag_name(span).to_ascii_lowercase();
+            if implicitly_closed_by(top, &name) {
+                return Some((start, end, name));
+            }
+        }
+        cursor = end;
+    }
+}
+
 /// The HTML5 void elements: tags with no content and no closing tag of their own.
 /// `hidden` on one of these suppresses nothing beyond the tag's own markup, which
 /// [`is_html_block_tag`]'s sibling handling already excludes — there is no body to
@@ -1360,14 +1427,15 @@ fn is_void_element(name: &str) -> bool {
 /// />decision-id headline</div>` as carrying nothing after the tag's own markup,
 /// when the decision is really still inside the (still-open) `hidden` element.
 ///
-/// Narrower than real foreign content, which extends to every element nested inside
-/// an `<svg>` or `<math>` subtree, not only the two root names themselves — a
-/// residual limit worth documenting rather than building full namespace-region
-/// tracking for [`find_any_hidden_opening_tag`], the one construct that still relies
-/// on this narrower, root-only check. [`in_foreign_content`] closes the same gap for
-/// the fixed non-rendering elements (round 49), where the concrete case — a
-/// `<script>` or `<style>` nested inside an open `<svg>` — is common enough, and
-/// cheap enough to detect one line at a time, to be worth tracking properly instead.
+/// [`is_self_closing_tag`], built directly on this, is narrower than real foreign
+/// content on its own — self-closing honored only for the two root names, not for
+/// any element nested inside one — but [`find_any_hidden_opening_tag`]'s own two
+/// callers each guard it with the caller-carried `foreign_content` depth
+/// (round 49, "Avoid pushing self-closing scripts in foreign content"; round 50,
+/// "Skip self-closing hidden elements inside foreign content"), so an arbitrary
+/// element like `<g hidden />` nested inside an open `<svg>` is still recognized as
+/// bodyless where it matters, without this narrower root-only check needing to know
+/// about it itself.
 fn is_foreign_content_root(name: &str) -> bool {
     name.eq_ignore_ascii_case("svg") || name.eq_ignore_ascii_case("math")
 }
@@ -1378,8 +1446,8 @@ fn is_foreign_content_root(name: &str) -> bool {
 /// 2). Whether that slash is *honored* — bodyless XML-style syntax, rather than
 /// ignored the way ordinary HTML ignores it everywhere outside foreign content — is
 /// the caller's question, answered by [`is_self_closing_tag`] (a fixed tag name) or
-/// [`in_foreign_content`] (an ambient parsing context) depending on which one needs
-/// it.
+/// a caller-carried `foreign_content` depth (an ambient parsing context, tracked by
+/// [`track_foreign_content_depth`]) depending on which one needs it.
 fn ends_with_self_closing_slash(span: &str) -> bool {
     span.len()
         .checked_sub(2)
@@ -1398,46 +1466,36 @@ fn is_self_closing_tag(span: &str, name: &str) -> bool {
     is_foreign_content_root(name) && ends_with_self_closing_slash(span)
 }
 
-/// Whether byte offset `at` in `line` sits inside a still-open `<svg>` or `<math>`
-/// subtree opened earlier on the *same* line (Codex, pull request #138, round 49,
-/// "Avoid pushing self-closing scripts in foreign content").
+/// Updates `foreign_content` — a running count of how many `<svg>`/`<math>` foreign-
+/// content roots are currently open — from one already-consumed tag's own markup
+/// (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
+/// foreign content"; carried across lines round 50, "Carry foreign-content depth
+/// across raw HTML lines").
 ///
 /// HTML5 acknowledges the self-closing flag on *any* start tag — not only `<svg>` or
 /// `<math>` themselves — once the parser is inside foreign content: `<svg><script
 /// /></svg>` (likewise an SVG `<style />`) never opens a genuinely unclosed
 /// `<script>` the way a bare `<script />` does outside one, where the slash is
-/// ignored and a real `</script>` is still needed. Scanned tag by tag through the
-/// same quote-aware [`find_any_tag`] every other search in this module uses,
-/// tracking the open/close balance of the two foreign-content roots up to `at`; a
-/// root's own self-closing form (`<svg />`) never opens one, the same
-/// [`is_self_closing_tag`] check [`find_any_hidden_opening_tag`] already applies to
-/// the root itself.
+/// ignored and a real `</script>` is still needed. A root's own self-closing form
+/// (`<svg />`) never opens one, the same [`is_self_closing_tag`] check
+/// [`find_any_hidden_opening_tag`] already applies to the root itself.
 ///
-/// Same-line only, a narrower residual limit than even [`is_foreign_content_root`]'s
-/// own: `<svg>\n<script />\n</svg>`, with the root's own open tag on an earlier
-/// line, is invisible to this function the way a cross-line comment opener would be
-/// to a search with no memory of the lines before it — closing that would need
-/// foreign-content depth carried across lines the way `open_non_rendering_tag`
-/// already is, for a residual this narrow, single-line case does not yet need.
-fn in_foreign_content(line: &str, at: usize) -> bool {
-    let mut depth: u32 = 0;
-    let mut cursor = 0;
-    while let Some((start, end)) = find_any_tag(line, cursor) {
-        if start >= at {
-            break;
-        }
-        let span = &line[start..end];
-        let name = markup_tag_name(span);
-        if span.starts_with("</") {
-            if is_foreign_content_root(name) {
-                depth = depth.saturating_sub(1);
-            }
-        } else if is_foreign_content_root(name) && !ends_with_self_closing_slash(span) {
-            depth += 1;
-        }
-        cursor = end;
+/// Every caller that consumes an ordinary tag's markup calls this on it, the same way
+/// `open_non_rendering`/`open_non_rendering_tag` is threaded and updated across
+/// `Event::Html` lines and `Event::InlineHtml` constructs alike — an `<svg>` opened on
+/// one line (or in one construct) and a self-closing child reached on a later one
+/// (or in a later construct) are the same running document, not two separate
+/// searches with no memory of each other.
+fn track_foreign_content_depth(span: &str, foreign_content: &mut u32) {
+    let name = markup_tag_name(span);
+    if !is_foreign_content_root(name) {
+        return;
     }
-    depth > 0
+    if span.starts_with("</") {
+        *foreign_content = foreign_content.saturating_sub(1);
+    } else if !ends_with_self_closing_slash(span) {
+        *foreign_content += 1;
+    }
 }
 
 /// Whether `span` — a complete, well-formed opening tag's own markup — carries the
@@ -1537,19 +1595,26 @@ fn closes_non_rendering_element(line: &str, tag: &str) -> bool {
     find_closing_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
 }
 
-/// Whether `line` *itself is* a well-formed opening tag for `tag`, case-insensitively —
-/// [`closes_non_rendering_element`]'s opening twin, for a name that is not one of the
-/// fixed non-rendering ones (Codex, pull request #138, round 45, "Preserve
-/// inline nesting for hidden elements"): the
-/// block-level nesting search already reopens an arbitrary `hidden`-suppressed element
-/// by its own name (`find_opening_tag(line, cursor, top)`, round 43, finding 1), but
+/// The lowercase name of a well-formed opening tag, if `line` *itself is* one,
+/// case-insensitively — [`closes_non_rendering_element`]'s opening twin, for a name
+/// that is not one of the fixed non-rendering ones (Codex, pull request #138, round 45,
+/// "Preserve inline nesting for hidden elements"; generalized round 50, "Honor implicit
+/// closes triggered by different tag names", from checking one fixed name at a time to
+/// returning whatever name the construct actually opens): the block-level nesting
+/// search already reopens an arbitrary `hidden`-suppressed element by its own name
+/// (`find_opening_tag(line, cursor, top)`, round 43, finding 1), but
 /// `track_non_rendering_html`'s inline twin only ever checked
-/// [`opens_non_rendering_element`]'s fixed three, so an ordinary same-named child of a
+/// [`opens_non_rendering_element`]'s fixed names, so an ordinary same-named child of a
 /// `hidden`-suppressed element reaching *inline* Markdown —
 /// `<span hidden><span>x</span>decision-id headline</span>` — was never pushed, and its
-/// own close popped the outer element early, exposing text still really inside it.
-fn opens_tag_named(line: &str, tag: &str) -> bool {
-    find_opening_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
+/// own close popped the outer element early, exposing text still really inside it. The
+/// caller now also uses the returned name to decide whether it is one of a *different*
+/// name [`implicitly_closed_by`] lists for `top` — `<dt hidden>x<dd>visible` — which a
+/// same-name-only check could never recognize.
+fn opens_any_tag(line: &str) -> Option<String> {
+    let (start, end) = find_any_tag(line, 0)?;
+    (start == 0 && !line[start..end].starts_with("</"))
+        .then(|| markup_tag_name(&line[start..end]).to_ascii_lowercase())
 }
 
 /// The tag name (`"script"`, `"style"`, `"title"` or `"template"`) of an opening
@@ -1619,13 +1684,7 @@ fn track_non_rendering_html(
     if html.starts_with("<!--") {
         return true;
     }
-    if is_foreign_content_root(markup_tag_name(html)) {
-        if html.starts_with("</") {
-            *foreign_content = foreign_content.saturating_sub(1);
-        } else if !ends_with_self_closing_slash(html) {
-            *foreign_content += 1;
-        }
-    }
+    track_foreign_content_depth(html, foreign_content);
     let self_closing_in_foreign_content =
         *foreign_content > 0 && ends_with_self_closing_slash(html);
     // Cloned rather than borrowed, for the reason `advance_past_non_rendering` now
@@ -1639,24 +1698,25 @@ fn track_non_rendering_html(
                 if !self_closing_in_foreign_content {
                     stack.push(tag.to_owned());
                 }
-            } else if opens_tag_named(html, &top) {
-                if implicitly_closes_same_name(&top) {
-                    // Codex, pull request #138, round 48, "Honor implicit
-                    // closes for optional-end-tag elements": `top` does not
-                    // nest on a same-name reopen — its own end tag may be
-                    // omitted immediately before a sibling of the same
-                    // name — so this construct ends `top` rather than
-                    // opening a second one.
+            } else if closes_non_rendering_element(html, &top) {
+                stack.pop();
+            } else if let Some(next_tag) = opens_any_tag(html) {
+                if implicitly_closed_by(&top, &next_tag) {
+                    // Codex, pull request #138, round 48, "Honor implicit closes
+                    // for optional-end-tag elements", widened round 50, "Honor
+                    // implicit closes triggered by different tag names": `top`
+                    // does not nest on a reopen of one of the tags HTML5 lists as
+                    // implicitly closing it — its own end tag may be omitted
+                    // before one, whether or not it shares `top`'s own name — so
+                    // this construct ends `top` rather than opening a second one.
                     stack.pop();
-                } else {
+                } else if next_tag == top {
                     // Codex, pull request #138, round 45 ("Preserve inline
                     // nesting for hidden elements"): a same-named ordinary child of
                     // the `hidden`-suppressed `top` reopens it, the same way the
                     // block-level scan's `top_reopen` already does.
                     stack.push(top);
                 }
-            } else if closes_non_rendering_element(html, &top) {
-                stack.pop();
             }
             true
         }
@@ -1683,8 +1743,20 @@ fn track_non_rendering_html(
                     true
                 }
             } else if let Some(name) = opens_hidden_element(html) {
-                stack.push(name);
-                true
+                // Self-closing inside foreign content is not an opener here
+                // either (Codex, pull request #138, round 50, "Skip self-closing
+                // hidden elements inside foreign content"): `<svg><g
+                // hidden /></svg>` has no body and no `</g>` a document ever
+                // writes, the same as a self-closing `<script>` or `<style>`
+                // just above — the check was only ever applied to the fixed
+                // list, leaving an arbitrary `hidden`-suppressed element to wait
+                // forever for a close that never comes.
+                if self_closing_in_foreign_content {
+                    false
+                } else {
+                    stack.push(name);
+                    true
+                }
             } else {
                 false
             }
@@ -1922,7 +1994,7 @@ fn find_comment_opener(line: &str, from: usize) -> Option<usize> {
 /// checked after `Tag` — a tie between the two would mean a fixed non-rendering
 /// element also carries `hidden`, and its own, more specific handling is what should
 /// win — but still ahead of `Markup`, for the same reason `Tag` is.
-fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
+fn next_hiding_marker(line: &str, from: usize, foreign_content: u32) -> Option<HidingMarker> {
     let mut candidates: Vec<(usize, HidingMarker)> = Vec::new();
     // Tokenized via `find_comment_opener`, not a raw substring search (Codex, pull
     // request #138, round 47, "Ignore comment markers inside pending tag
@@ -1944,14 +2016,25 @@ fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
         // document ever writes, so treating it as one waited forever for a close
         // that hid everything after it to end of document. Omitted here rather
         // than pushed as `Markup` directly, so the ordinary `find_any_tag` search
-        // below still finds and strips its markup the normal way.
+        // below still finds and strips its markup the normal way. `foreign_content`
+        // is the caller's own running depth, not a re-scan of `line` (Codex, round
+        // 50, "Carry foreign-content depth across raw HTML lines"): an `<svg>`
+        // opened on an earlier `Event::Html` line is invisible to anything that
+        // only reads this one.
         let span = &line[start..end];
-        if !(ends_with_self_closing_slash(span) && in_foreign_content(line, start)) {
+        if !(ends_with_self_closing_slash(span) && foreign_content > 0) {
             candidates.push((start, HidingMarker::Tag(start, end, tag)));
         }
     }
     if let Some((start, end, name)) = find_any_hidden_opening_tag(line, from) {
-        candidates.push((start, HidingMarker::Hidden(start, end, name)));
+        // The same self-closing-in-foreign-content exemption as the fixed list just
+        // above, applied to an arbitrary `hidden`-suppressed element (Codex, round
+        // 50, "Skip self-closing hidden elements inside foreign content"): `<g
+        // hidden />` inside an `<svg>` has no body either, whatever name it carries.
+        let span = &line[start..end];
+        if !(ends_with_self_closing_slash(span) && foreign_content > 0) {
+            candidates.push((start, HidingMarker::Hidden(start, end, name)));
+        }
     }
     if let Some((start, end)) = find_any_tag(line, from) {
         candidates.push((start, HidingMarker::Markup(start, end)));
@@ -2018,14 +2101,21 @@ enum NonRenderingAdvance {
 /// `<template>`'s own reopen was always covered this way already, since it is one of
 /// the fixed ones; this closes the same gap for an arbitrary `hidden`-suppressed name.
 ///
-/// A reopen of `top` that [`implicitly_closes_same_name`] (Codex, pull request #138,
-/// round 48, "Honor implicit closes for optional-end-tag elements") is not an `Open` at
-/// all: `<li>`'s own end tag may be omitted immediately before another `<li>`, so a
-/// second `<li>` silently ends the first rather than nesting inside it, and the marker
-/// this returns for it is a `Close` at the reopening tag's own *start* — not its end, the
-/// way an explicit `</li>` resumes past itself — so the reopening tag's own markup is
-/// left for the caller's normal, unhidden processing, the same as any other ordinary tag.
-fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
+/// A reopen [`implicitly_closed_by`] `top` (Codex, pull request #138, round 48, "Honor
+/// implicit closes for optional-end-tag elements"; widened round 50, "Honor implicit
+/// closes triggered by different tag names") is not an `Open` at all: `<li>`'s own end
+/// tag may be omitted immediately before another `<li>`, and `<dt>`/`<dd>` before either
+/// of the pair, so such a reopen silently ends `top` rather than nesting inside it, and
+/// the marker this returns for it is a `Close` at the reopening tag's own *start* — not
+/// its end, the way an explicit close tag resumes past itself — so the reopening tag's
+/// own markup is left for the caller's normal, unhidden processing, the same as any
+/// other ordinary tag.
+fn next_non_rendering_marker(
+    line: &str,
+    cursor: usize,
+    top: &str,
+    foreign_content: u32,
+) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
         return find_raw_text_closing_tag(line, cursor, top).map(|(_, close)| match close {
             RawTextClose::Whole(end) => NonRenderingAdvance::Close(end),
@@ -2037,25 +2127,31 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
     // Self-closing inside foreign content is not a further open either (Codex, pull
     // request #138, round 49): `<template><svg><script /></svg></template>` has no
     // body and no `</script>` for this nested `<script>`, the same as at the top
-    // level.
+    // level. `foreign_content` is the caller's own running depth (round 50), not a
+    // re-scan of this one line.
     let fixed_open = find_any_opening_tag(line, cursor).and_then(|(start, end, tag)| {
         let span = &line[start..end];
-        if ends_with_self_closing_slash(span) && in_foreign_content(line, start) {
+        if ends_with_self_closing_slash(span) && foreign_content > 0 {
             None
         } else {
             Some((start, NonRenderingAdvance::Open(end, tag.to_owned())))
         }
     });
-    let top_reopen = find_opening_tag(line, cursor, top).map(|(start, end)| {
-        if implicitly_closes_same_name(top) {
-            (start, NonRenderingAdvance::Close(start))
-        } else {
-            (start, NonRenderingAdvance::Open(end, top.to_owned()))
-        }
-    });
+    let implicit_close = find_implicit_close_reopen(line, cursor, top)
+        .map(|(start, _, _)| (start, NonRenderingAdvance::Close(start)));
+    // Skipped when `top` is itself one of `implicitly_closed_by`'s own optional-end-tag
+    // names, since `find_implicit_close_reopen` above already covers a same-name
+    // reopen for those (`<li>` closing `<li>` is one of its own table rows) — searched
+    // separately only for a genuinely nesting element (`<template>`, or an arbitrary
+    // `hidden`-suppressed one), where a same-named child really does open a second
+    // level rather than closing the first.
+    let top_reopen = (!implicitly_closed_by(top, top))
+        .then(|| find_opening_tag(line, cursor, top))
+        .flatten()
+        .map(|(start, end)| (start, NonRenderingAdvance::Open(end, top.to_owned())));
     let comment =
         find_comment_opener(line, cursor).map(|start| (start, NonRenderingAdvance::Comment(start)));
-    [close, fixed_open, top_reopen, comment]
+    [close, fixed_open, implicit_close, top_reopen, comment]
         .into_iter()
         .flatten()
         .min_by_key(|&(start, _)| start)
@@ -2090,6 +2186,7 @@ fn advance_past_non_rendering(
     in_html_comment: &mut bool,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
+    foreign_content: u32,
 ) -> Option<usize> {
     // Cloned rather than borrowed (Codex, pull request #138, round 42, finding 3):
     // the stack widened from `Vec<&'static str>` to `Vec<String>` so it can hold an
@@ -2098,7 +2195,7 @@ fn advance_past_non_rendering(
     let top = stack.last()?.clone();
     let mut cursor = cursor;
     loop {
-        match next_non_rendering_marker(line, cursor, &top) {
+        match next_non_rendering_marker(line, cursor, &top, foreign_content) {
             Some(NonRenderingAdvance::Comment(start)) => {
                 let Some(offset) = line[start..].find("-->") else {
                     *in_html_comment = true;
@@ -2255,15 +2352,17 @@ struct PendingRawTextClose {
 /// name is still a reopen, and a matching close is still a close, neither of which the
 /// two checks below (written for the top-level, empty-stack case) know how to do.
 ///
-/// A reopen that [`implicitly_closes_same_name`] (Codex, pull request #138, round 48,
-/// "Honor implicit closes for optional-end-tag elements") pops the open one before
-/// anything else decides the reopening tag's own fate — a cross-line `<li\n
-/// class="x">` reopening a hidden `<li>` is a *sibling*, not a second `li` nested inside
-/// the hidden one, so it is then judged purely on its own `hidden` attribute below, the
-/// same as any other tag.
+/// A resolved tag [`implicitly_closed_by`] the open one (Codex, pull request #138,
+/// round 48, "Honor implicit closes for optional-end-tag elements"; widened round 50,
+/// "Honor implicit closes triggered by different tag names") pops the open one before
+/// anything else decides the resolved tag's own fate — a cross-line `<li\n class="x">`
+/// reopening a hidden `<li>`, or a cross-line `<div\n class="x">` closing a hidden `<p>`,
+/// is a *sibling*, not a child nested inside the hidden one, so it is then judged purely
+/// on its own `hidden` attribute below, the same as any other tag.
 fn resolve_pending_tag(
     line: &str,
     open_non_rendering: &mut Vec<String>,
+    foreign_content: &mut u32,
     pending: PendingTag,
 ) -> Result<usize, PendingTag> {
     let PendingTag {
@@ -2282,25 +2381,37 @@ fn resolve_pending_tag(
             text,
         });
     };
-    let matches_open_top = open_non_rendering
-        .last()
-        .is_some_and(|top| *top == name && non_rendering_element_nests(top));
+    // The full tag text, not just this line's own portion (Codex, round 43, finding
+    // 3): `hidden` may sit on any line the tag spans, not only the last one — and
+    // (round 50) so can the `/` of a foreign-content root's own cross-line
+    // self-closing form, `<svg\n/>`.
+    let full_text = text + &line[..end];
+    if closing {
+        if is_foreign_content_root(&name) {
+            *foreign_content = foreign_content.saturating_sub(1);
+        }
+    } else if is_foreign_content_root(&name) && !ends_with_self_closing_slash(&full_text) {
+        *foreign_content += 1;
+    }
+    let open_top = open_non_rendering.last().cloned();
+    let open_top_nests = open_top.as_deref().is_some_and(non_rendering_element_nests);
+    let matches_open_top = open_top.as_deref() == Some(name.as_str()) && open_top_nests;
     if closing {
         if matches_open_top {
             open_non_rendering.pop();
         }
     } else {
-        if matches_open_top && implicitly_closes_same_name(&name) {
+        let implicit_close = open_top_nests
+            && open_top
+                .as_deref()
+                .is_some_and(|top| implicitly_closed_by(top, &name));
+        if implicit_close {
             open_non_rendering.pop();
         }
-        let reopens_top = matches_open_top && !implicitly_closes_same_name(&name);
+        let reopens_top = matches_open_top && !implicit_close;
         if matches!(name.as_str(), "script" | "style" | "title" | "template") || reopens_top {
             open_non_rendering.push(name);
         } else if !is_void_element(&name) {
-            // The full tag text, not just this line's own portion (Codex, round 43,
-            // finding 3): `hidden` may sit on any line the tag spans, not only the
-            // last one.
-            let full_text = text + &line[..end];
             // Self-closing foreign content checked here too, not only in
             // `find_any_hidden_opening_tag`'s own same-line search (Codex, round 46,
             // "Skip multiline self-closing foreign hidden tags"): `<svg\n hidden />`
@@ -2321,6 +2432,7 @@ fn visible_html_ranges(
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
+    foreign_content: &mut u32,
 ) -> Vec<VisibleHtmlSpan> {
     let mut spans = Vec::new();
     // Resolved before anything else, ahead of even `pending_tag` (Codex, pull request
@@ -2348,7 +2460,7 @@ fn visible_html_ranges(
     // everything up to its resolution (this line's own bytes) is markup the same way
     // any other tag's is, never visible text (Codex, round 41, finding 1).
     if let Some(pending) = pending_tag.take() {
-        match resolve_pending_tag(line, open_non_rendering, pending) {
+        match resolve_pending_tag(line, open_non_rendering, foreign_content, pending) {
             Ok(end) => cursor = end,
             Err(unresolved) => {
                 *pending_tag = Some(unresolved);
@@ -2380,6 +2492,7 @@ fn visible_html_ranges(
                 in_html_comment,
                 pending_tag,
                 pending_raw_text_close,
+                *foreign_content,
             ) {
                 Some(end) => {
                     cursor = end;
@@ -2388,7 +2501,7 @@ fn visible_html_ranges(
                 None => break,
             }
         }
-        match next_hiding_marker(line, cursor) {
+        match next_hiding_marker(line, cursor, *foreign_content) {
             None => {
                 // `next_hiding_marker` finding nothing is ambiguous on its own: either
                 // there is no more `<` at all (the remainder really is visible text),
@@ -2442,9 +2555,11 @@ fn visible_html_ranges(
             }
             Some(HidingMarker::Markup(start, end)) => {
                 spans.push(VisibleHtmlSpan::Text(cursor..start));
-                if is_html_block_tag(&line[start..end]) || is_line_break_tag(&line[start..end]) {
+                let span = &line[start..end];
+                if is_html_block_tag(span) || is_line_break_tag(span) {
                     spans.push(VisibleHtmlSpan::Break);
                 }
+                track_foreign_content_depth(span, foreign_content);
                 cursor = end;
             }
         }
@@ -2727,12 +2842,10 @@ pub fn visible_source(contents: &str) -> String {
     let mut pending_tag: Option<PendingTag> = None;
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
     // How many `<svg>`/`<math>` foreign-content roots are currently open, carried
-    // across `Event::InlineHtml` constructs the same way `open_non_rendering` is
-    // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
-    // foreign content") — see `track_non_rendering_html`'s own doc comment. The
-    // block-level path needs no twin of its own: `hide_non_rendering_in_html_line`
-    // reads `next_hiding_marker` directly, which already re-derives this from `html`
-    // itself one line at a time.
+    // across both `Event::Html` lines and `Event::InlineHtml` constructs the same way
+    // `open_non_rendering` is (Codex, pull request #138, round 49, "Avoid pushing
+    // self-closing scripts in foreign content"; round 50, "Carry foreign-content depth
+    // across raw HTML lines") — see `track_non_rendering_html`'s own doc comment.
     let mut foreign_content: u32 = 0;
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
@@ -2832,6 +2945,7 @@ pub fn visible_source(contents: &str) -> String {
                     &mut pending_tag,
                     &mut pending_raw_text_close,
                     &mut in_template_comment,
+                    &mut foreign_content,
                     &mut hidden,
                 );
             }
@@ -2936,6 +3050,7 @@ fn hide_non_rendering_in_html_line(
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
     in_template_comment: &mut bool,
+    foreign_content: &mut u32,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let mut cursor = if let Some(pending) = pending_raw_text_close.take() {
@@ -2950,7 +3065,7 @@ fn hide_non_rendering_in_html_line(
         0
     };
     if let Some(pending) = pending_tag.take() {
-        match resolve_pending_tag(html, open_non_rendering, pending) {
+        match resolve_pending_tag(html, open_non_rendering, foreign_content, pending) {
             Ok(end) => cursor = end,
             Err(unresolved) => {
                 *pending_tag = Some(unresolved);
@@ -2972,6 +3087,7 @@ fn hide_non_rendering_in_html_line(
                 in_template_comment,
                 pending_tag,
                 pending_raw_text_close,
+                *foreign_content,
             ) {
                 Some(end) => {
                     if open_non_rendering.is_empty()
@@ -2985,7 +3101,7 @@ fn hide_non_rendering_in_html_line(
                 None => break,
             }
         }
-        match next_hiding_marker(html, cursor) {
+        match next_hiding_marker(html, cursor, *foreign_content) {
             None => break,
             // Skipped rather than hidden here: this function's caller has its own
             // block-comment search, covering every comment in the block from its own
@@ -3008,7 +3124,10 @@ fn hide_non_rendering_in_html_line(
             // An ordinary tag's own markup — kept verbatim by this function's
             // caller, `href="..."` included — so there is nothing to hide here, only
             // to step past.
-            Some(HidingMarker::Markup(_, end)) => cursor = end,
+            Some(HidingMarker::Markup(start, end)) => {
+                track_foreign_content_depth(&html[start..end], foreign_content);
+                cursor = end;
+            }
         }
     }
 }
@@ -3108,6 +3227,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
+                    &mut foreign_content,
                 );
             }
             // A fenced block or blockquote opening while an item is being collected
@@ -3343,6 +3463,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
+                    &mut foreign_content,
                 );
             }
             Event::InlineHtml(html) => {
@@ -3452,6 +3573,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
+                    &mut foreign_content,
                 );
             }
             Event::Start(Tag::CodeBlock(kind)) => {

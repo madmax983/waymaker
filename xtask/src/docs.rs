@@ -7627,6 +7627,101 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_self_closing_hidden_element_inside_svg_still_counts() {
+        // Codex, pull request #138, round 50, "Skip self-closing hidden elements
+        // inside foreign content": `<g>` is not in `VOID_ELEMENTS` and is not one
+        // of the fixed non-rendering names, so `<svg><g hidden /></svg>` — a
+        // self-closing arbitrary `hidden`-suppressed element inside foreign
+        // content — was pushed onto the hidden stack regardless of the trailing
+        // `/`, waiting forever for a `</g>` this document never writes and hiding
+        // the decision that immediately follows `</svg>` to end of document. The
+        // round-49 foreign-content guard was only ever applied to the fixed list.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><g hidden /></svg>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_dd_implicitly_closing_a_hidden_dt_still_counts() {
+        // Codex, pull request #138, round 50, "Honor implicit closes triggered by
+        // different tag names": `<dt>` and `<dd>` close each other, not only
+        // themselves — `<dt hidden>ignored<dd>All 6 recovery invariants` has its
+        // `<dd>` ending the hidden `<dt>` just as surely as another `<dt>` would,
+        // but the round-48 reopen check only recognized a *same-name* reopen, so
+        // the hidden stack stayed open past the `<dd>` and the decision after it
+        // stayed hidden. A leading `x` keeps this construct from starting a
+        // block-level `HtmlBlock` at all — `<dt>` is one of `HTML_BLOCK_TAG_NAMES`
+        // — so it reaches `track_non_rendering_html`'s inline path, the one this
+        // finding is about.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\nx<dt hidden>ignored<dd>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_svg_still_counts() {
+        // Codex, pull request #138, round 50, "Carry foreign-content depth across
+        // raw HTML lines": the round-49 fix re-scanned only the *current*
+        // `Event::Html` line for an unclosed `<svg>`/`<math>`, so
+        // `<svg>\n<script />\n</svg>` — with `<svg>` alone on its own line,
+        // satisfying `CommonMark` §4.6 type 7 and starting a real `HtmlBlock` that
+        // continues line by line with no blank line to end it — had the
+        // `<script />` line's own scan find no opener at all, since the real one
+        // sits on the *previous* line. The self-closing script was misread as a
+        // genuinely open one, hiding the decision that follows `</svg>` on the
+        // third line. Fixed by carrying a running `foreign_content` depth across
+        // `Event::Html` lines the same way `open_non_rendering` already is.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg>\n<script />\n</svg>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_raw_text_end_tag_trapped_in_a_quoted_attribute_still_counts() {
         // Codex, pull request #138, round 40, finding 3: `find_closing_tag`'s
         // quote-aware tokenization, built for `<template>`'s genuinely parsed
