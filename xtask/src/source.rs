@@ -8845,10 +8845,40 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
+/// The single value in `0..found.arms.len()` no numbered (non-wildcard) arm's pattern
+/// names, if there is exactly one — the value a dense table's own wildcard arm covers.
+///
+/// Codex's finding: the earlier version fixed that value at `found.arms.len() - 1`, on the
+/// assumption a dense table's catch-all always sits at the top of the range. ADR 0044's own
+/// nibble table happens to be written that way, but nothing about the shape it compiles
+/// into requires it — a table whose numbered arms spell `1..=15` and whose `_` covers `0`
+/// folds into the identical lookup table LLVM builds for the other order, over the same
+/// full range `0..found.arms.len()` rather than only the range the numbered arms happen to
+/// leave below their own count. Returns `None` when a numbered arm's pattern is missing,
+/// out of that range, or repeated, or when more than one value in the range is left
+/// uncovered — a real gap rather than one arm's worth of slack for the wildcard.
+fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<usize> {
+    let mut covered = vec![false; total];
+    for arm in numbered {
+        let value = usize::try_from(arm.pattern?).ok()?;
+        let slot = covered.get_mut(value)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+    }
+    let mut gaps = covered.iter().enumerate().filter(|(_, seen)| !**seen);
+    let (gap, _) = gaps.next()?;
+    if gaps.next().is_some() {
+        return None;
+    }
+    Some(gap)
+}
+
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
-/// into a lookup table: `0` through `n - 2`, whatever base or suffix each was spelled with
-/// and in whatever order they were written, covering every value exactly once, then a
-/// final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
+/// into a lookup table: every value of `0..found.arms.len()` named exactly once, whatever
+/// base or suffix each was spelled with and in whatever order they were written, except one
+/// left for a final wildcard arm, with at least [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
 /// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
 /// [ADR 0044]'s own history on pull request #154 is why that matters: a hand-rolled
@@ -8866,10 +8896,11 @@ const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 /// [ADR 0044]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
 #[must_use]
 fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
-    let Some(last) = found.arms.len().checked_sub(1) else {
+    let total = found.arms.len();
+    let Some(last) = total.checked_sub(1) else {
         return false;
     };
-    if found.arms.len() < MINIMUM_DENSE_TABLE_ARMS {
+    if total < MINIMUM_DENSE_TABLE_ARMS {
         return false;
     }
     let Some(wildcard) = found.arms.get(last) else {
@@ -8881,23 +8912,7 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
     let Some(numbered) = found.arms.get(..last) else {
         return false;
     };
-    let mut covered = vec![false; last];
-    for arm in numbered {
-        let Some(value) = arm.pattern else {
-            return false;
-        };
-        let Ok(value) = usize::try_from(value) else {
-            return false;
-        };
-        let Some(slot) = covered.get_mut(value) else {
-            return false;
-        };
-        if *slot {
-            return false;
-        }
-        *slot = true;
-    }
-    covered.into_iter().all(|seen| seen)
+    missing_value(numbered, total).is_some()
 }
 
 /// Whether every one of `found`'s arms calls one consistent callee with its own pattern's
@@ -8908,12 +8923,16 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
 /// happens to sit under.
 ///
 /// Each arm's expected argument is read from *that arm's own pattern* — the wildcard arm's
-/// from the arm count, since [`has_dense_arm_patterns`] already requires it to be the one
-/// value the numbered patterns leave uncovered — rather than from the arm's position in
-/// `found.arms`, so a match whose arms are written out of order is still read correctly.
+/// from [`missing_value`], since [`has_dense_arm_patterns`] already requires it to be the
+/// one value the numbered patterns leave uncovered, wherever in the range that value falls
+/// — rather than from the arm's position in `found.arms`, so a match whose arms are written
+/// out of order is still read correctly.
 #[must_use]
 fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
-    let last = found.arms.len().checked_sub(1)?;
+    let total = found.arms.len();
+    let last = total.checked_sub(1)?;
+    let numbered = found.arms.get(..last)?;
+    let wildcard_value = missing_value(numbered, total)?;
     let mut callee: Option<&str> = None;
     for (index, arm) in found.arms.iter().enumerate() {
         let (this_callee, argument) = arm.call.as_ref()?;
@@ -8923,7 +8942,7 @@ fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
             Some(_) => {}
         }
         let expected = if index == last {
-            u128::try_from(last).ok()?
+            u128::try_from(wildcard_value).ok()?
         } else {
             arm.pattern?
         };
@@ -15263,6 +15282,69 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_relative_to_its_own_enclosing_module_is_reported() {
+        // Codex's sixteenth-round finding: `resolve_qualified_path` only ever looked up a
+        // stripped chain against the file root (or, failing that, its own last two
+        // segments), never against the match's own enclosing module. `indices::P0` written
+        // inside `mod outer` resolves in Rust against `outer`'s own scope — `outer::P0`'s
+        // sibling `outer::indices` — not against a top-level `mod indices` of the same
+        // name, so a table nested one module deep had every arm read as unresolved and the
+        // whole match skipped. `indices` is declared *inside* `outer` here, with no
+        // same-named module at the file root to be confused with by the old fallback.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            indices::P0 => super::crc32_nibble(0),\n            \
+             indices::P1 => super::crc32_nibble(1),\n            indices::P2 => \
+             super::crc32_nibble(2),\n            indices::P3 => super::crc32_nibble(3),\n            \
+             _ => super::crc32_nibble(4),\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_whose_catchall_covers_the_lowest_value_is_reported() {
+        // Codex's sixteenth-round finding: the missing value the wildcard arm covers was
+        // fixed at `arms.len() - 1`, on the assumption a dense table's catch-all always
+        // sits at the top of the range. A table whose numbered arms spell `1..=15` and
+        // whose `_` covers `0` folds into the identical 16-entry lookup table LLVM builds
+        // for the other order, over the same nibble mask — `missing_value` now finds
+        // whichever single value in `0..arms.len()` the numbered arms leave uncovered,
+        // wherever it falls, rather than assuming it is always the last one. The helper is
+        // named differently from the pinned table's own `crc32_nibble` so this is judged
+        // purely on arm-count-versus-pin, not folded into "a second copy of the one
+        // permitted table" by also matching its helper and selector.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 1..16 {
+            let _ = writeln!(arms, "        {value} => low_catchall_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn low_catchall_helper(nibble: u32) -> u32 {{\n    nibble\n}}\n\nconst \
+             fn low_catchall_table(nibble: u8) -> u32 {{\n    match nibble & 0xF {{\n{arms}        \
+             _ => low_catchall_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
             "{violations:?}"
         );
     }

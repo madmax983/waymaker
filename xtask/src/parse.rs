@@ -1742,13 +1742,23 @@ fn call_shape_of(
 /// wrong for `indices::P0`, which `Pat::Path`/`Expr::Path` parse as a *multi*-segment path
 /// that a single-identifier lookup (`path.get_ident()`) simply refuses to look at, silently
 /// treating a qualified constant pattern as unresolved rather than as the value it names. A
-/// leading `crate`/`self` is stripped before joining, since it names no module of its own;
-/// a `super` is not resolved positionally, so a chain that does not match in full falls back
-/// to its last two segments (`module::name`), which is what lets `crate::indices::P0` and
-/// `super::indices::P0` both still find a `mod indices` recorded relative to the file root.
+/// leading `crate`/`self` is stripped before joining, since it names no module of its own.
+///
+/// Codex's next-round finding: a *relative* reference is not always the file-root path it
+/// happens to share a spelling with. `indices::P0` written inside `mod outer` resolves in
+/// Rust against `outer`'s own scope — `outer::indices::P0` — not against a top-level
+/// `mod indices` of the same name, because plain module-relative resolution consults the
+/// current module's own items rather than the file root. So the stripped chain is tried
+/// first as itself, then with `current_module` — [`MatchVisitor::module_path`] at the
+/// match's own position — prepended, which is what a bare or `self`-relative path actually
+/// resolves against. A `super` is not resolved positionally, so a chain that does not match
+/// either way falls back to its last two segments (`module::name`), which is what lets
+/// `crate::indices::P0` and `super::indices::P0` both still find a `mod indices` recorded
+/// relative to the file root.
 fn resolve_qualified_path(
     path: &syn::Path,
     qualified: &std::collections::HashMap<String, u128>,
+    current_module: &[String],
 ) -> Option<u128> {
     let segments: Vec<String> = path
         .segments
@@ -1763,8 +1773,15 @@ fn resolve_qualified_path(
     if relevant.len() < 2 {
         return None;
     }
-    if let Some(value) = qualified.get(&relevant.join("::")) {
+    let joined = relevant.join("::");
+    if let Some(value) = qualified.get(&joined) {
         return Some(*value);
+    }
+    if !current_module.is_empty() {
+        let relative = format!("{}::{joined}", current_module.join("::"));
+        if let Some(value) = qualified.get(&relative) {
+            return Some(*value);
+        }
     }
     let tail_start = relevant.len().saturating_sub(2);
     let tail = relevant.get(tail_start..)?;
@@ -1834,6 +1851,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
         let scopes = &self.scopes;
         let qualified = &self.qualified;
+        let module_path = &self.module_path;
         let resolve = move |path: &syn::Path| {
             if let Some(ident) = path.get_ident() {
                 return scopes.resolve(&ident_name(ident));
@@ -1855,7 +1873,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             if relevant.len() == 1 {
                 return relevant.first().and_then(|name| scopes.resolve(name));
             }
-            resolve_qualified_path(path, qualified)
+            resolve_qualified_path(path, qualified, module_path)
         };
         let selector = node.expr.to_token_stream().to_string();
         let arms = node
