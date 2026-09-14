@@ -1412,3 +1412,102 @@ fn the_reported_size_is_rounded_up_so_a_caller_retrying_with_it_exactly_converge
          {progress2:?}"
     );
 }
+
+#[test]
+fn a_stale_oversized_bank_never_inflates_the_reported_size_the_real_authority_needs() {
+    // Codex found this on round 7: when *both* banks are oversized for the initial page,
+    // the old code reported whichever needed more room, even when that was the retired,
+    // lower-generation bank -- forcing a caller through an allocation the real authority
+    // never needed at all. The higher claimed generation is the one worth asking for room
+    // to validate: if it turns out genuine, the guarded Found/Oversized arm above says the
+    // lower one's own requirement never matters again.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    // Bank A: the retired run, generation FIRST, with by far the wider header.
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+    // Bank B: the real authority, one generation higher, with a much smaller header.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(wide_padded) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(wide_needed) = bank::header_len_of(&staging[..wide_padded]) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected \
+                       prefix"
+        )
+    };
+    let Ok(short_padded) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(short_needed) = bank::header_len_of(&staging[..short_padded]) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected \
+                       prefix"
+        )
+    };
+    assert!(
+        short_needed < wide_needed,
+        "the fixture needs the authority's header to need less room than the retired one's"
+    );
+
+    // Enough to read either bank's checksum-protected prefix, short of what either one
+    // actually needs in full.
+    let mut page = vec![0_u8; bank::HEADER_PREFIX_BYTES + 4];
+    assert!(
+        page.len() < short_needed,
+        "the fixture needs the page to be short of even the smaller header"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("both banks being oversized must still refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, short_needed,
+        "the reported figure must be the higher-generation (real authority) bank's own \
+         requirement, not the retired bank's larger one"
+    );
+
+    // Retrying with enough room for the real authority's own header must now boot it --
+    // padded, since a boot does more with `page` than validate the header alone, and
+    // `short_needed` is deliberately the smaller, *unpadded* figure `header_len_of` answers.
+    let mut page2 = vec![0_u8; short_padded];
+    let mut result2 = [0_u8; 16];
+    let progress2 = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page2,
+            result: &mut result2,
+        },
+    );
+    assert!(
+        matches!(
+            progress2,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "retrying with exactly the real authority's own requirement must boot it: {progress2:?}"
+    );
+}

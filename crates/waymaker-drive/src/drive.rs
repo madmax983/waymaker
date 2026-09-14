@@ -704,10 +704,28 @@ fn resolve_bank_read<E>(a: BankRead, b: BankRead) -> Result<BankFacts, DriveErro
             },
             BankRead::Found(facts),
         ) if claimed_generation < facts.generation => Ok(facts),
-        (BankRead::Oversized { needed: a, .. }, BankRead::Oversized { needed: b, .. }) => {
-            Err(DriveError::Recovery(RecoveryError::PageTooSmall {
-                needed: a.max(b),
-            }))
+        (
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed: needed_a,
+            },
+            BankRead::Oversized {
+                claimed_generation: generation_b,
+                needed: needed_b,
+            },
+        ) => {
+            // The higher claimed generation is the one worth asking a caller for room to
+            // validate: if it turns out genuine, the guarded arm above says the other
+            // bank's own requirement never matters again. Codex found that reporting
+            // whichever bank needed *more* room — the larger of the two, regardless of
+            // which one that was — could ask a caller for room a retired bank's own stale,
+            // oversized header needed and the real authority never did.
+            let needed = if generation_a >= generation_b {
+                needed_a
+            } else {
+                needed_b
+            };
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
         }
         (BankRead::Oversized { needed, .. }, _) | (_, BankRead::Oversized { needed, .. }) => {
             Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
