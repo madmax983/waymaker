@@ -38,6 +38,12 @@ embedded-storage = { version = "0.3.1", optional = true }
 [target.'cfg(target_arch = "arm")'.dependencies]
 cortex-m-rt = "0.7.6"
 cortex-m-semihosting = "0.5.0"
+# `register::msp::read` — the real stack pointer, so `stack::paint` and
+# `stack::high_water_mark` measure from where the core actually is rather than from where a
+# compiler happened to place a local. Already in the dependency graph through `cortex-m-rt`;
+# this names it directly rather than reaching for a transitive crate. ARM-only for the same
+# reason as the two above: nothing about it applies to the Xtensa build. ADR 0045.
+cortex-m = "0.7.9"
 
 [features]
 default = []

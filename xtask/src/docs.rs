@@ -7301,7 +7301,12 @@ mod tests {
         let Some(row) = FAILURE_ROWS.first() else {
             unreachable!("the table has ten rows")
         };
-        for attribute in ["#[ignore]", "#[cfg(any())]"] {
+        for attribute in [
+            "#[ignore]",
+            "#[cfg(any())]",
+            // Issue #97: a skippable test must not vouch for its row.
+            "#[cfg_attr(all(), ignore)]",
+        ] {
             let mut inputs = matrix_inputs();
             inputs.failure_model_tests = inputs
                 .failure_model_tests
